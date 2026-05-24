@@ -49,3 +49,5 @@ fate_oia/**/__pycache__/
 fate_oia/**/*.pyc
 tests/**/__pycache__/
 tests/**/*.pyc
+
+.background_runs/
