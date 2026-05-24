@@ -1,3 +1,22 @@
+<!-- FATE-OIA README BLOCK -->
+# FATE-OIA: BDD-OIA Action/Reason Classification and Faithful Grounding Extensions
+
+This repository is a FATE-OIA worktree derived from SNNA. The original SNNA README is preserved below for reproducibility, but the FATE entry points are the package modules under `fate_oia/`.
+
+## Current FATE-OIA scope
+
+- Multi-label BDD-OIA action/reason dataset loader: `fate_oia/datasets/bdd_oia_multitask.py`.
+- BDD100K object/lane/drivable grounding index: `fate_oia/datasets/bdd100k_grounding.py`.
+- Correct sigmoid multi-label metrics and threshold tuning: `fate_oia/metrics.py`, `fate_oia/threshold_tuning.py`.
+- SNNA-25 baseline head and training/evaluation entry points:
+  - `python -m fate_oia.engine.train_snna25 --help`
+  - `python -m fate_oia.engine.eval_snna25 --help`
+- Label-query/provenance feature modules for later full FATE-OIA experiments under `fate_oia/models/`.
+
+## Important limits
+
+BDD-OIA action and reason targets are multi-label; use sigmoid/BCE or ASL, not softmax. BDD100K semantic segmentation is only available for a small subset, so reports must say object/lane/drivable grounding unless a subset-only semantic analysis is explicitly used.
+
 # Noise-free Explanation for Driving Action Prediction
 
 ## Introduction
