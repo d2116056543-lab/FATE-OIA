@@ -15,7 +15,9 @@ import utils
 import vision_transformer as vits
 from fate_oia.datasets.bdd_oia_multitask import BDDOIAMultiTaskDataset
 from fate_oia.engine.eval_snna25 import evaluate_snna25
+from fate_oia.datasets.bdd100k_grounding import load_bdd100k_objects
 from fate_oia.grounding.losses import attention_grounding_bce
+from fate_oia.grounding.mask_builder import objects_to_mask
 from fate_oia.losses.asymmetric_loss import AsymmetricLossMultiLabel
 from fate_oia.models.fate_oia_model import FATEOIAFeatureModel
 from fate_oia.models.token_provenance import keep_merge_tokens, recover_attribution
@@ -76,6 +78,52 @@ def make_multilabel_criterion(args) -> nn.Module:
     if args.loss == "asl":
         return AsymmetricLossMultiLabel(gamma_pos=args.asl_gamma_pos, gamma_neg=args.asl_gamma_neg, clip=args.asl_clip)
     return nn.BCEWithLogitsLoss()
+def load_grounding_cache(path: str) -> dict[str, dict[str, Any]]:
+    if not path:
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    with Path(path).open("r", encoding="utf-8-sig") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            rec = json.loads(line)
+            fn = rec.get("file_name")
+            if fn:
+                out[str(fn)] = rec
+    return out
+
+
+def compute_grounding_loss(
+    label_attention: torch.Tensor | None,
+    batch: dict[str, Any],
+    grounding_cache: dict[str, dict[str, Any]],
+    args,
+    device: torch.device,
+) -> torch.Tensor:
+    if label_attention is None or not grounding_cache:
+        return torch.zeros((), device=device)
+    attn_maps = attention_to_patch_map(label_attention, slice(0, args.action_dim + args.reason_dim), args.image_height, args.image_width, args.patch_size)
+    losses = []
+    categories = set(x.strip() for x in args.grounding_categories.split(",") if x.strip()) if args.grounding_categories else None
+    file_names = batch.get("file_name", [])
+    if isinstance(file_names, str):
+        file_names = [file_names]
+    for i, fn in enumerate(file_names):
+        rec = grounding_cache.get(str(fn))
+        if not rec or not rec.get("label_json"):
+            continue
+        try:
+            objects = load_bdd100k_objects(rec["label_json"])
+            target = objects_to_mask(objects, (args.grounding_image_width, args.grounding_image_height), attn_maps.shape[-2:], categories=categories).to(device)
+        except Exception:
+            continue
+        if float(target.sum().item()) <= 0:
+            continue
+        losses.append(attention_grounding_bce(attn_maps[i], target))
+    if not losses:
+        return torch.zeros((), device=device)
+    return torch.stack(losses).mean()
+
 
 
 def compress_tokens(tokens: torch.Tensor, keep_ratio: float, num_summary_tokens: int, min_tokens: int) -> tuple[torch.Tensor, torch.Tensor | None, dict[str, Any]]:
@@ -149,7 +197,7 @@ def counterfactual_deletion_loss(model: nn.Module, tokens: torch.Tensor, labels:
     return F.relu(margin + base_loss.detach() - masked_loss)
 
 
-def run_epoch(args, backbone, model, loader, criterion, optimizer, device, train: bool) -> dict[str, Any]:
+def run_epoch(args, backbone, model, loader, criterion, optimizer, device, train: bool, grounding_cache: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
     model.train(train)
     total_loss = 0.0
     count = 0
@@ -171,8 +219,11 @@ def run_epoch(args, backbone, model, loader, criterion, optimizer, device, train
         if args.loss_counterfactual > 0:
             cf_loss = counterfactual_deletion_loss(model, tokens, labels, main_loss, args.action_dim, args.counterfactual_topk_ratio)
             loss = loss + args.loss_counterfactual * cf_loss
-        # Grounding loss is optional and only activates when an external loop supplies masks.
-        # This script records attention/provenance so grounding can be audited offline.
+        grounding_loss = original_tokens.new_zeros(())
+        if args.loss_grounding > 0 and grounding_cache:
+            recovered_attn = recover_label_attention(out.get("attention"), provenance, original_tokens.shape[1])
+            grounding_loss = compute_grounding_loss(recovered_attn, batch, grounding_cache, args, device)
+            loss = loss + args.loss_grounding * grounding_loss
         if train:
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -193,6 +244,7 @@ def run_epoch(args, backbone, model, loader, criterion, optimizer, device, train
                 "main_loss": float(main_loss.item()),
                 "r2a_loss": float(r2a_loss.item()),
                 "cf_loss": float(cf_loss.item()),
+                "grounding_loss": float(grounding_loss.item()) if "grounding_loss" in locals() else 0.0,
                 "batch_size": bs,
                 "token_stats": token_stats,
             }), flush=True)
@@ -226,6 +278,11 @@ def main() -> None:
     ap.add_argument("--asl_clip", type=float, default=0.05)
     ap.add_argument("--loss_reason_to_action", type=float, default=0.1)
     ap.add_argument("--loss_counterfactual", type=float, default=0.0)
+    ap.add_argument("--loss_grounding", type=float, default=0.0)
+    ap.add_argument("--grounding_cache_jsonl", default="")
+    ap.add_argument("--grounding_categories", default="person,rider,bike,car,bus,truck,motor,traffic light,traffic sign,lane/crosswalk")
+    ap.add_argument("--grounding_image_width", type=int, default=1280)
+    ap.add_argument("--grounding_image_height", type=int, default=720)
     ap.add_argument("--counterfactual_topk_ratio", type=float, default=0.15)
     ap.add_argument("--token_keep_ratio", type=float, default=1.0)
     ap.add_argument("--num_summary_tokens", type=int, default=4)
@@ -250,11 +307,14 @@ def main() -> None:
     criterion = make_multilabel_criterion(args)
     train_loader = make_loader(args, "train", True)
     val_loader = make_loader(args, "val", False)
+    grounding_cache = load_grounding_cache(args.grounding_cache_jsonl) if args.grounding_cache_jsonl else {}
+    if args.loss_grounding > 0 and not grounding_cache:
+        print(json.dumps({"event": "fate_oia_grounding_disabled", "reason": "empty_grounding_cache"}), flush=True)
     best = -1.0
     history = []
     for epoch in range(args.epochs):
-        train_stats = run_epoch(args, backbone, model, train_loader, criterion, optimizer, device, True)
-        val_stats = run_epoch(args, backbone, model, val_loader, criterion, optimizer, device, False)
+        train_stats = run_epoch(args, backbone, model, train_loader, criterion, optimizer, device, True, grounding_cache)
+        val_stats = run_epoch(args, backbone, model, val_loader, criterion, optimizer, device, False, grounding_cache)
         score = float(val_stats["metrics"].get("Act_mF1", 0.0)) + float(val_stats["metrics"].get("Exp_mF1", 0.0))
         row = {"epoch": epoch, "train_loss": train_stats["loss"], "val_loss": val_stats["loss"], "val_metrics": val_stats["metrics"], "selection_score": score}
         history.append(row)
