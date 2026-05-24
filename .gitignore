@@ -43,3 +43,9 @@ __pycache__/
 !fate_oia/losses/**
 !fate_oia/engine/
 !fate_oia/engine/**
+
+# Re-ignore generated Python artifacts after package unignore rules.
+fate_oia/**/__pycache__/
+fate_oia/**/*.pyc
+tests/**/__pycache__/
+tests/**/*.pyc
