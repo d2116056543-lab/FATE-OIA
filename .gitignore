@@ -33,3 +33,13 @@ repro_runs/
 __pycache__/
 *.pyc
 
+
+# Keep package code directories trackable even though root assets are ignored.
+!fate_oia/datasets/
+!fate_oia/datasets/**
+!fate_oia/models/
+!fate_oia/models/**
+!fate_oia/losses/
+!fate_oia/losses/**
+!fate_oia/engine/
+!fate_oia/engine/**
