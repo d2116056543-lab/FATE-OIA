@@ -1,0 +1,6 @@
+extends: fate_oia_base.yaml
+data:
+  action_dim: 4
+  reason_dim: 21
+model:
+  mode: snna25

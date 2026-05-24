@@ -1,0 +1,5 @@
+# Soft analysis prior only; do not force these as hard causal rules.
+stop_related: [3, 4, 5, 6, 7, 8]
+left_related: [9, 10, 11, 12, 13, 14]
+right_related: [15, 16, 17, 18, 19, 20]
+forward_related: [0, 1, 2]

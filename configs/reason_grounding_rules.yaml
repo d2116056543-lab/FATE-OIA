@@ -1,0 +1,11 @@
+# Map reason indices to BDD100K object/lane/drivable categories for grounding analysis.
+reason_to_bdd100k_categories:
+  2: ["area/drivable", "area/alternative"]
+  3: ["traffic light"]
+  4: ["traffic sign"]
+  5: ["car", "truck", "bus", "train"]
+  6: ["person"]
+  7: ["rider", "bike", "motor"]
+  8: ["car", "truck", "bus", "person", "rider", "bike", "motor"]
+  11: ["lane/single white", "lane/double white", "lane/single yellow", "lane/double yellow", "lane/road curb"]
+  17: ["lane/single white", "lane/double white", "lane/single yellow", "lane/double yellow", "lane/road curb"]

@@ -1,0 +1,16 @@
+data:
+  data_root: dataset/BDD-OIA
+  raw_oia_root: raw_data/BDD-OIA
+  raw_bdd100k_root: raw_data/BDD100K
+  action_dim: 4
+  reason_dim: 21
+  image_size: [360, 640]
+train:
+  loss: bce
+  tune_thresholds_on_val: true
+  select_by: val_act_map
+model:
+  backbone: snna_vit_s8
+  label_query: false
+  reason_to_action: false
+  token_compression: none

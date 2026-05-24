@@ -1,4 +1,4 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
+﻿# Copyright (c) Facebook, Inc. and its affiliates.
 # 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -111,10 +111,16 @@ def eval_linear(args):
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs, eta_min=0)
 
-    # Optionally resume from a checkpoint
+    # Optionally resume from a checkpoint.
+    # SNNA latest checkpoint with legacy 360 fallback: the original code saved
+    # checkpoint.pth.tar but attempted to resume 360_checkpoint.pth.tar.
     to_restore = {"epoch": 0, "best_acc": 0.}
+    resume_path = os.path.join(args.output_dir, "checkpoint.pth.tar")
+    legacy_resume_path = os.path.join(args.output_dir, "360_checkpoint.pth.tar")
+    if not os.path.isfile(resume_path) and os.path.isfile(legacy_resume_path):
+        resume_path = legacy_resume_path
     utils.restart_from_checkpoint(
-        os.path.join(args.output_dir, "360_checkpoint.pth.tar"),
+        resume_path,
         run_variables=to_restore,
         state_dict=linear_classifier,
         optimizer=optimizer,
@@ -134,6 +140,7 @@ def eval_linear(args):
         if epoch % args.val_freq == 0 or epoch == args.epochs - 1:
             test_stats = validate_network(val_loader, model, linear_classifier, args.n_last_blocks, args.avgpool_patchtokens)
             print(f"Accuracy at epoch {epoch} of the network on the {len(dataset_val)} test images: {test_stats['acc']:.1f}%")
+            is_best = test_stats["acc"] >= best_acc
             best_acc = max(best_acc, test_stats["acc"])
             print(f'Max accuracy so far: {best_acc:.2f}%')
             log_stats = {**{k: v for k, v in log_stats.items()},
@@ -148,7 +155,11 @@ def eval_linear(args):
                 "scheduler": scheduler.state_dict(),
                 "best_acc": best_acc,
             }
-            torch.save(save_dict, os.path.join(args.output_dir, "checkpoint.pth.tar"))
+            latest_path = os.path.join(args.output_dir, "checkpoint.pth.tar")
+            torch.save(save_dict, latest_path)
+            torch.save(save_dict, os.path.join(args.output_dir, "360_checkpoint.pth.tar"))
+            if 'is_best' in locals() and is_best:
+                torch.save(save_dict, os.path.join(args.output_dir, "checkpoint_best.pth.tar"))
     print("Training of the supervised linear classifier on frozen features completed.\n"
                 "Test accuracy: {acc:.1f}".format(acc=best_acc))
 
@@ -292,3 +303,4 @@ if __name__ == '__main__':
     parser.add_argument('--evaluate', dest='evaluate', action='store_true', help='evaluate model on validation set')
     args = parser.parse_args()
     eval_linear(args)
+

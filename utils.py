@@ -1,4 +1,4 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
+﻿# Copyright (c) Facebook, Inc. and its affiliates.
 # 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -486,8 +486,9 @@ def init_distributed_mode(args):
         print('Does not support training without GPU.')
         sys.exit(1)
 
+    dist_backend = os.environ.get("SNNA_DIST_BACKEND", "nccl")
     dist.init_process_group(
-        backend="nccl",
+        backend=dist_backend,
         init_method=args.dist_url,
         world_size=args.world_size,
         rank=args.rank,
@@ -835,3 +836,4 @@ def multi_scale(samples, model):
     v /= 3
     v /= v.norm()
     return v
+
