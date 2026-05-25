@@ -231,7 +231,7 @@ def scheduled_keep_ratio(args, epoch: int) -> float:
     return float(args.compression_keep_ratio_start + t * (args.compression_keep_ratio_final - args.compression_keep_ratio_start))
 
 
-def compress_tokens(tokens: torch.Tensor, keep_ratio: float, num_summary_tokens: int, min_tokens: int, token_compression: str = "none") -> tuple[torch.Tensor, torch.Tensor | None, dict[str, Any]]:
+def compress_tokens(tokens: torch.Tensor, keep_ratio: float, num_summary_tokens: int, min_tokens: int, token_compression: str = "keep_merge") -> tuple[torch.Tensor, torch.Tensor | None, dict[str, Any]]:
     if token_compression == "none" or keep_ratio >= 0.999:
         return tokens, None, {"enabled": False, "original_tokens": int(tokens.shape[1]), "reduced_tokens": int(tokens.shape[1])}
     cls = tokens[:, :1]
