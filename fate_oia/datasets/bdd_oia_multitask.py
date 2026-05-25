@@ -152,7 +152,11 @@ class BDDOIAMultiTaskDataset(Dataset):
         if self.load_image:
             from PIL import Image
             img = Image.open(s.image_path).convert("RGB")
-            item["image"] = self.transform(img) if self.transform else img
+            transformed = self.transform(img) if self.transform else img
+            if isinstance(transformed, tuple) and len(transformed) == 2:
+                item["image"], item["image_meta"] = transformed
+            else:
+                item["image"] = transformed
         return item
 
     def audit(self) -> dict[str, Any]:

@@ -18,8 +18,14 @@ training:
   num_workers: 4
   loss_action: 1.0
   loss_reason: 1.5
-  loss_r2a_gt: 0.2
-  loss_action_agree: 0.05
+  loss_action_visual: 0.05
+  loss_r2a_gt: 0.10
+  loss_action_agree: 0.01
+  include_fused_branch_loss: false
   loss_grounding: 0.0
   loss_counterfactual: 0.0
   token_compression: none
+  compression_start_epoch: 8
+  compression_warmup_epochs: 6
+  compression_keep_ratio_start: 0.85
+  compression_keep_ratio_final: 0.65
