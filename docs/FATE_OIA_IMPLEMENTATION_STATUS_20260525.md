@@ -113,3 +113,62 @@ The full method code path is implemented and smoke-tested, but final paper-style
 - final `checkpoint_best.pth` / `checkpoint_latest.pth`
 - full val/test action/reason metrics
 - trained-checkpoint grounding and counterfactual faithfulness reports
+
+## 2026-05-25 Gap Closure Update
+
+The latest GPTPro audit identified two remaining FATE-OIA code-level gaps:
+
+- counterfactual deletion loss needed an explicit gradient verification;
+- grounding needed to be label-conditioned by reason-specific BDD100K category rules, not only a global average-attention mask.
+
+Both are now implemented and verified.
+
+### New/Updated Code
+
+- `fate_oia/engine/train_fate_oia.py`
+  - Added `--grounding_mode global|label|both`, default `both`.
+  - Added `--reason_grounding_rules`, default `configs/reason_grounding_rules.yaml`.
+  - Added robust loading of reason-to-BDD100K category mappings.
+  - Label-conditioned grounding uses attention label index `action_dim + reason_idx` and only applies categories mapped to the active reason label.
+  - Batch logs now include per-reason grounding stats, for example `reason_3_count` and `reason_4_count`.
+
+- `tests/test_fate_oia_full_training_utils.py`
+  - Added `counterfactual_deletion_loss` gradient test.
+  - Added label-conditioned grounding test with a positive reason-to-person mask.
+
+### Verification
+
+Targeted tests:
+
+```text
+tests/test_fate_oia_full_training_utils.py: 6 passed
+```
+
+Broader selected tests:
+
+```text
+17 passed
+```
+
+Real full-model smoke:
+
+```text
+event=fate_oia_batch train=true step=0
+event=fate_oia_batch train=true step=1
+event=fate_oia_batch train=false step=0
+event=fate_oia_batch train=false step=1
+event=fate_oia_epoch epoch=0
+token compression: 785 original tokens -> 395 reduced tokens
+label-conditioned grounding observed:
+  reason_3_count = 1
+  reason_4_count = 1
+```
+
+Fresh GitHub clone compile:
+
+```text
+FATE-OIA commit 63a9c33ad4801b327d81637e623260abe51a7d84
+py_compile PASS
+```
+
+Boundary remains unchanged: this is code/smoke completeness, not final trained-result completeness.
