@@ -1,0 +1,9 @@
+stage: OIA-5
+description: Rationale-aware token compression with warmup, optionally distilled from full-token teacher.
+train_module: fate_oia.engine.train_fate_oia
+token_compression: keep_merge
+compression_start_epoch: 1
+compression_keep_ratio_start: 0.75
+compression_keep_ratio_final: 0.60
+compression_warmup_epochs: 2
+num_summary_tokens: 1

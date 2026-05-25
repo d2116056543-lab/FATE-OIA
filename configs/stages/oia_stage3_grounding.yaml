@@ -1,0 +1,7 @@
+stage: OIA-3
+description: Label-conditioned object/poly/drivable grounding, only when masks are nonempty.
+train_module: fate_oia.engine.train_fate_oia
+loss_grounding: 0.001
+grounding_mode: both
+loss_counterfactual: 0.0
+token_compression: none

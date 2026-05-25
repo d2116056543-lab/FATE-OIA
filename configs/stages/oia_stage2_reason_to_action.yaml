@@ -1,0 +1,10 @@
+stage: OIA-2
+description: Enable concept bottleneck action_reason branch and fused action metrics.
+train_module: fate_oia.engine.train_fate_oia
+use_label_query: true
+use_reason_to_action: true
+loss_r2a_gt: 0.2
+loss_action_agree: 0.05
+loss_grounding: 0.0
+loss_counterfactual: 0.0
+token_compression: none

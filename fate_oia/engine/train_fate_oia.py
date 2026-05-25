@@ -23,15 +23,13 @@ from fate_oia.grounding.mask_builder import objects_to_mask
 from fate_oia.losses.asymmetric_loss import AsymmetricLossMultiLabel
 from fate_oia.models.fate_oia_model import FATEOIAFeatureModel
 from fate_oia.models.token_provenance import keep_merge_tokens, recover_attribution
+from fate_oia.transforms import AspectRatioLetterboxTransform, FixedSizeResizeTransform
 
 
-def build_transform(image_height: int, image_width: int):
-    from torchvision import transforms
-    return transforms.Compose([
-        transforms.Resize((image_height, image_width)),
-        transforms.ToTensor(),
-        transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
-    ])
+def build_transform(image_height: int, image_width: int, patch_size: int = 8, preserve_aspect_ratio: bool = True):
+    if preserve_aspect_ratio:
+        return AspectRatioLetterboxTransform(image_height=image_height, image_width=image_width, patch_size=patch_size)
+    return FixedSizeResizeTransform(image_height=image_height, image_width=image_width, patch_size=patch_size)
 
 
 def build_backbone(args, device: torch.device) -> tuple[nn.Module, int]:
@@ -69,7 +67,7 @@ def make_loader(args, split: str, shuffle: bool) -> DataLoader:
         action_dim=args.action_dim,
         reason_dim=args.reason_dim,
         load_image=True,
-        transform=build_transform(args.image_height, args.image_width),
+        transform=build_transform(args.image_height, args.image_width, args.patch_size, args.preserve_aspect_ratio),
     )
     max_samples = args.max_train_samples if split == "train" else args.max_val_samples
     ds = limited(ds, max_samples)
@@ -147,6 +145,8 @@ def load_reason_grounding_rules(path: str, reason_dim: int) -> dict[int, set[str
             continue
         if idx < 0 or idx >= reason_dim:
             continue
+        if isinstance(value, dict):
+            value = value.get("target_categories") or value.get("categories") or value.get("bdd100k_categories") or []
         if isinstance(value, str):
             cats = {value}
         else:
@@ -219,8 +219,20 @@ def compute_grounding_loss(
 
 
 
-def compress_tokens(tokens: torch.Tensor, keep_ratio: float, num_summary_tokens: int, min_tokens: int) -> tuple[torch.Tensor, torch.Tensor | None, dict[str, Any]]:
-    if keep_ratio >= 0.999:
+def scheduled_keep_ratio(args, epoch: int) -> float:
+    if args.token_compression == "none":
+        return 1.0
+    if epoch < args.compression_start_epoch:
+        return 1.0
+    warm = max(int(args.compression_warmup_epochs), 0)
+    if warm <= 0:
+        return float(args.compression_keep_ratio_final)
+    t = min(max(epoch - args.compression_start_epoch, 0), warm) / float(warm)
+    return float(args.compression_keep_ratio_start + t * (args.compression_keep_ratio_final - args.compression_keep_ratio_start))
+
+
+def compress_tokens(tokens: torch.Tensor, keep_ratio: float, num_summary_tokens: int, min_tokens: int, token_compression: str = "none") -> tuple[torch.Tensor, torch.Tensor | None, dict[str, Any]]:
+    if token_compression == "none" or keep_ratio >= 0.999:
         return tokens, None, {"enabled": False, "original_tokens": int(tokens.shape[1]), "reduced_tokens": int(tokens.shape[1])}
     cls = tokens[:, :1]
     patch = tokens[:, 1:]
@@ -275,6 +287,29 @@ def reason_to_action_consistency_loss(action_logits: torch.Tensor, r2a_logits: t
     return F.binary_cross_entropy_with_logits(r2a_logits, torch.sigmoid(action_logits).detach())
 
 
+def action_branch_losses(
+    out: dict[str, torch.Tensor],
+    action_target: torch.Tensor,
+    loss_r2a_gt: float = 0.2,
+    loss_action_agree: float = 0.05,
+) -> dict[str, torch.Tensor]:
+    visual = out.get("action_visual_logits", out["action_logits"])
+    reason = out.get("action_reason_logits", out.get("reason_to_action_logits", out["action_logits"]))
+    fused = out.get("action_fused_logits", out["action_logits"])
+    visual_loss = F.binary_cross_entropy_with_logits(visual, action_target)
+    reason_loss = F.binary_cross_entropy_with_logits(reason, action_target)
+    fused_loss = F.binary_cross_entropy_with_logits(fused, action_target)
+    agree = F.mse_loss(torch.sigmoid(visual), torch.sigmoid(reason))
+    total = fused_loss + 0.5 * visual_loss + float(loss_r2a_gt) * reason_loss + float(loss_action_agree) * agree
+    return {
+        "action_total": total,
+        "action_visual_loss": visual_loss,
+        "action_reason_loss": reason_loss,
+        "action_fused_loss": fused_loss,
+        "action_agree_loss": agree,
+    }
+
+
 def counterfactual_deletion_loss(model: nn.Module, tokens: torch.Tensor, labels: torch.Tensor, base_loss: torch.Tensor, action_dim: int, topk_ratio: float = 0.15, margin: float = 0.02) -> torch.Tensor:
     with torch.no_grad():
         out = model(tokens)
@@ -294,11 +329,14 @@ def counterfactual_deletion_loss(model: nn.Module, tokens: torch.Tensor, labels:
     return F.relu(margin + base_loss.detach() - masked_loss)
 
 
-def run_epoch(args, backbone, model, loader, criterion, optimizer, device, train: bool, grounding_cache: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
+def run_epoch(args, backbone, model, loader, criterion, optimizer, device, train: bool, grounding_cache: dict[str, dict[str, Any]] | None = None, epoch: int = 0) -> dict[str, Any]:
     model.train(train)
     total_loss = 0.0
     count = 0
     logits_all: list[torch.Tensor] = []
+    visual_logits_all: list[torch.Tensor] = []
+    reason_action_logits_all: list[torch.Tensor] = []
+    fused_logits_all: list[torch.Tensor] = []
     labels_all: list[torch.Tensor] = []
     stats_rows: list[dict[str, Any]] = []
     for step, batch in enumerate(loader):
@@ -306,12 +344,25 @@ def run_epoch(args, backbone, model, loader, criterion, optimizer, device, train
         labels = labels_from_batch(batch).to(device, non_blocking=True)
         with torch.no_grad():
             original_tokens = extract_tokens(backbone, images, args.n_last_blocks)
-        tokens, provenance, token_stats = compress_tokens(original_tokens, args.token_keep_ratio, args.num_summary_tokens, args.min_tokens)
+        keep_ratio = scheduled_keep_ratio(args, epoch)
+        tokens, provenance, token_stats = compress_tokens(original_tokens, keep_ratio, args.num_summary_tokens, args.min_tokens, args.token_compression)
         out = model(tokens)
-        logits = torch.cat([out["action_logits"], out["reason_logits"]], dim=1)
+        logits = torch.cat([out["action_fused_logits"], out["reason_logits"]], dim=1)
         main_loss = criterion(logits, labels)
-        r2a_loss = reason_to_action_consistency_loss(out["action_logits"], out["reason_to_action_logits"])
-        loss = main_loss + args.loss_reason_to_action * r2a_loss
+        branch = action_branch_losses(
+            out,
+            labels[:, : args.action_dim],
+            loss_r2a_gt=args.loss_r2a_gt,
+            loss_action_agree=args.loss_action_agree,
+        )
+        r2a_loss = reason_to_action_consistency_loss(out["action_visual_logits"], out["action_reason_logits"])
+        if args.r2a_consistency_mode == "detach_mimic":
+            action_extra = args.loss_reason_to_action * r2a_loss
+        elif args.r2a_consistency_mode == "none":
+            action_extra = logits.new_zeros(())
+        else:
+            action_extra = branch["action_total"]
+        loss = main_loss + action_extra
         cf_loss = original_tokens.new_zeros(())
         if args.loss_counterfactual > 0:
             cf_loss = counterfactual_deletion_loss(model, tokens, labels, main_loss, args.action_dim, args.counterfactual_topk_ratio)
@@ -331,6 +382,9 @@ def run_epoch(args, backbone, model, loader, criterion, optimizer, device, train
         total_loss += float(loss.item()) * bs
         count += bs
         logits_all.append(logits.detach().cpu())
+        visual_logits_all.append(out["action_visual_logits"].detach().cpu())
+        reason_action_logits_all.append(out["action_reason_logits"].detach().cpu())
+        fused_logits_all.append(out["action_fused_logits"].detach().cpu())
         labels_all.append(labels.detach().cpu())
         if len(stats_rows) < args.max_saved_token_stats:
             stats_rows.append({k: (int(v) if isinstance(v, int) else v) for k, v in token_stats.items()})
@@ -342,6 +396,7 @@ def run_epoch(args, backbone, model, loader, criterion, optimizer, device, train
                 "loss": float(loss.item()),
                 "main_loss": float(main_loss.item()),
                 "r2a_loss": float(r2a_loss.item()),
+                "action_branch_loss": float(branch["action_total"].item()),
                 "cf_loss": float(cf_loss.item()),
                 "grounding_loss": float(grounding_loss.item()) if "grounding_loss" in locals() else 0.0,
                 "grounding_stats": grounding_stats,
@@ -351,7 +406,17 @@ def run_epoch(args, backbone, model, loader, criterion, optimizer, device, train
     logits_tensor = torch.cat(logits_all, 0) if logits_all else torch.empty(0, args.action_dim + args.reason_dim)
     labels_tensor = torch.cat(labels_all, 0) if labels_all else torch.empty(0, args.action_dim + args.reason_dim)
     metrics = evaluate_snna25(logits_tensor, labels_tensor, args.action_dim, threshold_mode=args.threshold_mode, fixed_threshold=args.eval_threshold)["metrics"]
-    return {"loss": total_loss / max(count, 1), "count": count, "metrics": metrics, "logits": logits_tensor, "labels": labels_tensor, "token_stats": stats_rows}
+    branch_metrics: dict[str, dict[str, float]] = {}
+    if labels_tensor.numel() > 0:
+        reason_part = logits_tensor[:, args.action_dim:]
+        for name, action_logits in [
+            ("action_visual", torch.cat(visual_logits_all, 0)),
+            ("action_reason", torch.cat(reason_action_logits_all, 0)),
+            ("action_fused", torch.cat(fused_logits_all, 0)),
+        ]:
+            branch_logits = torch.cat([action_logits, reason_part], dim=1)
+            branch_metrics[name] = evaluate_snna25(branch_logits, labels_tensor, args.action_dim, threshold_mode=args.threshold_mode, fixed_threshold=args.eval_threshold)["metrics"]
+    return {"loss": total_loss / max(count, 1), "count": count, "metrics": metrics, "branch_metrics": branch_metrics, "logits": logits_tensor, "labels": labels_tensor, "token_stats": stats_rows}
 
 
 def main() -> None:
@@ -368,6 +433,8 @@ def main() -> None:
     ap.add_argument("--reason_dim", type=int, default=21)
     ap.add_argument("--image_height", type=int, default=224)
     ap.add_argument("--image_width", type=int, default=224)
+    ap.add_argument("--preserve_aspect_ratio", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--letterbox", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--batch_size", type=int, default=8)
     ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--lr", type=float, default=1e-4)
@@ -377,6 +444,9 @@ def main() -> None:
     ap.add_argument("--asl_gamma_neg", type=float, default=4.0)
     ap.add_argument("--asl_clip", type=float, default=0.05)
     ap.add_argument("--loss_reason_to_action", type=float, default=0.1)
+    ap.add_argument("--loss_r2a_gt", type=float, default=0.2)
+    ap.add_argument("--loss_action_agree", type=float, default=0.05)
+    ap.add_argument("--r2a_consistency_mode", choices=["none", "detach_mimic", "gt", "gt_and_agree"], default="gt_and_agree")
     ap.add_argument("--loss_counterfactual", type=float, default=0.0)
     ap.add_argument("--loss_grounding", type=float, default=0.0)
     ap.add_argument("--grounding_cache_jsonl", default="")
@@ -386,8 +456,20 @@ def main() -> None:
     ap.add_argument("--grounding_image_width", type=int, default=1280)
     ap.add_argument("--grounding_image_height", type=int, default=720)
     ap.add_argument("--counterfactual_topk_ratio", type=float, default=0.15)
+    ap.add_argument("--use_label_query", action="store_true", default=True)
+    ap.add_argument("--use_reason_to_action", action="store_true", default=True)
+    ap.add_argument("--token_compression", choices=["none", "keep_merge"], default="none")
     ap.add_argument("--token_keep_ratio", type=float, default=1.0)
-    ap.add_argument("--num_summary_tokens", type=int, default=4)
+    ap.add_argument("--compression_start_epoch", type=int, default=999999)
+    ap.add_argument("--compression_keep_ratio_start", type=float, default=0.75)
+    ap.add_argument("--compression_keep_ratio_final", type=float, default=0.5)
+    ap.add_argument("--compression_warmup_epochs", type=int, default=1)
+    ap.add_argument("--token_score_mode", choices=["norm", "label_attention", "grounding_prior", "hybrid"], default="norm")
+    ap.add_argument("--token_score_alpha_label", type=float, default=1.0)
+    ap.add_argument("--token_score_beta_grounding", type=float, default=0.5)
+    ap.add_argument("--token_score_gamma_uncertainty", type=float, default=0.2)
+    ap.add_argument("--token_score_delta_norm", type=float, default=0.1)
+    ap.add_argument("--num_summary_tokens", type=int, default=1)
     ap.add_argument("--min_tokens", type=int, default=16)
     ap.add_argument("--threshold_mode", choices=["fixed", "global", "per_label"], default="fixed")
     ap.add_argument("--eval_threshold", type=float, default=0.5)
@@ -404,7 +486,7 @@ def main() -> None:
     (out_dir / "args.json").write_text(json.dumps(vars(args), indent=2), encoding="utf-8")
     device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
     backbone, dim = build_backbone(args, device)
-    model = FATEOIAFeatureModel(dim=dim, action_dim=args.action_dim, reason_dim=args.reason_dim, use_label_query=True).to(device)
+    model = FATEOIAFeatureModel(dim=dim, action_dim=args.action_dim, reason_dim=args.reason_dim, use_label_query=args.use_label_query).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     criterion = make_multilabel_criterion(args)
     train_loader = make_loader(args, "train", True)
@@ -418,10 +500,10 @@ def main() -> None:
     best = -1.0
     history = []
     for epoch in range(args.epochs):
-        train_stats = run_epoch(args, backbone, model, train_loader, criterion, optimizer, device, True, grounding_cache)
-        val_stats = run_epoch(args, backbone, model, val_loader, criterion, optimizer, device, False, grounding_cache)
+        train_stats = run_epoch(args, backbone, model, train_loader, criterion, optimizer, device, True, grounding_cache, epoch)
+        val_stats = run_epoch(args, backbone, model, val_loader, criterion, optimizer, device, False, grounding_cache, epoch)
         score = float(val_stats["metrics"].get("Act_mF1", 0.0)) + float(val_stats["metrics"].get("Exp_mF1", 0.0))
-        row = {"epoch": epoch, "train_loss": train_stats["loss"], "val_loss": val_stats["loss"], "val_metrics": val_stats["metrics"], "selection_score": score}
+        row = {"epoch": epoch, "train_loss": train_stats["loss"], "val_loss": val_stats["loss"], "val_metrics": val_stats["metrics"], "val_branch_metrics": val_stats.get("branch_metrics", {}), "selection_score": score}
         history.append(row)
         with (out_dir / "metrics.jsonl").open("a", encoding="utf-8") as f:
             f.write(json.dumps(row) + "\n")

@@ -4,6 +4,7 @@ import torch
 from torch import nn
 
 from fate_oia.models.label_query_head import LabelQueryHead
+from fate_oia.models.reason_to_action_bottleneck import ReasonToActionBottleneck
 
 
 class FATEOIAFeatureModel(nn.Module):
@@ -24,20 +25,43 @@ class FATEOIAFeatureModel(nn.Module):
             self.pool = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, dim), nn.GELU())
             self.action_head = nn.Linear(dim, action_dim)
             self.reason_head = nn.Linear(dim, reason_dim)
-        self.reason_to_action = nn.Sequential(nn.Linear(reason_dim, dim), nn.GELU(), nn.Linear(dim, action_dim))
+        self.reason_to_action = ReasonToActionBottleneck(reason_dim=reason_dim, action_dim=action_dim, hidden_dim=dim)
+        self.fusion_gate = nn.Sequential(nn.Linear(dim * 2, dim), nn.GELU(), nn.Linear(dim, action_dim), nn.Sigmoid())
 
     def forward(self, tokens: torch.Tensor) -> dict[str, torch.Tensor]:
         if self.use_label_query:
             out = self.label_head(tokens)
             logits = out["logits"]
-            action_logits = logits[:, : self.action_dim]
+            action_visual_logits = logits[:, : self.action_dim]
             reason_logits = logits[:, self.action_dim :]
-            r2a = self.reason_to_action(torch.sigmoid(reason_logits))
-            return {**out, "action_logits": action_logits, "reason_logits": reason_logits, "reason_to_action_logits": r2a}
+            label_tokens = out["label_tokens"]
+            action_summary = label_tokens[:, : self.action_dim].mean(1)
+            reason_summary = label_tokens[:, self.action_dim :].mean(1)
+            action_reason_logits = self.reason_to_action(reason_logits)
+            gate = self.fusion_gate(torch.cat([action_summary, reason_summary], dim=-1))
+            action_fused_logits = gate * action_visual_logits + (1.0 - gate) * action_reason_logits
+            return {
+                **out,
+                "action_logits": action_fused_logits,
+                "action_visual_logits": action_visual_logits,
+                "action_reason_logits": action_reason_logits,
+                "action_fused_logits": action_fused_logits,
+                "reason_logits": reason_logits,
+                "reason_to_action_logits": action_reason_logits,
+                "fusion_gate": gate,
+            }
         pooled = self.pool(tokens.mean(1))
         reason_logits = self.reason_head(pooled)
+        action_visual_logits = self.action_head(pooled)
+        action_reason_logits = self.reason_to_action(reason_logits)
+        gate = torch.sigmoid(action_visual_logits.new_zeros(action_visual_logits.shape))
+        action_fused_logits = gate * action_visual_logits + (1.0 - gate) * action_reason_logits
         return {
-            "action_logits": self.action_head(pooled),
+            "action_logits": action_fused_logits,
+            "action_visual_logits": action_visual_logits,
+            "action_reason_logits": action_reason_logits,
+            "action_fused_logits": action_fused_logits,
             "reason_logits": reason_logits,
-            "reason_to_action_logits": self.reason_to_action(torch.sigmoid(reason_logits)),
+            "reason_to_action_logits": action_reason_logits,
+            "fusion_gate": gate,
         }

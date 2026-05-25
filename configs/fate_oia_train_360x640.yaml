@@ -1,0 +1,25 @@
+model:
+  patch_size: 8
+  action_dim: 4
+  reason_dim: 21
+  use_label_query: true
+  use_reason_to_action: true
+data:
+  preserve_aspect_ratio: true
+  letterbox: true
+  resize_short: 360
+  resize_long: 640
+  image_height: 360
+  image_width: 640
+training:
+  batch_size: 1
+  gradient_accumulation_steps: 8
+  amp: true
+  num_workers: 4
+  loss_action: 1.0
+  loss_reason: 1.5
+  loss_r2a_gt: 0.2
+  loss_action_agree: 0.05
+  loss_grounding: 0.0
+  loss_counterfactual: 0.0
+  token_compression: none
