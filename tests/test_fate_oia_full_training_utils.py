@@ -68,8 +68,9 @@ def test_label_conditioned_grounding_uses_positive_reason(tmp_path):
         encoding="utf-8",
     )
     rules_yaml = tmp_path / "rules.yaml"
-    rules_yaml.write_text('reason_to_bdd100k_categories:\\n  6: ["person"]\\n', encoding="utf-8")
+    rules_yaml.write_text('reason_to_bdd100k_categories:\n  6: ["person"]\n', encoding="utf-8")
     rules = load_reason_grounding_rules(str(rules_yaml), reason_dim=21)
+    assert rules == {6: {"person"}}
     args = Namespace(
         action_dim=4,
         reason_dim=21,

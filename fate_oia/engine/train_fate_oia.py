@@ -108,6 +108,10 @@ def load_reason_grounding_rules(path: str, reason_dim: int) -> dict[int, set[str
     if not p.exists():
         return {}
     text = p.read_text(encoding="utf-8-sig")
+    # Some generated smoke configs may arrive with escaped newlines. Treat
+    # those as real YAML line breaks rather than silently disabling grounding.
+    if "\\n" in text and "\n" not in text:
+        text = text.replace("\\n", "\n")
     data: dict[str, Any] | None = None
     try:
         import yaml  # type: ignore
