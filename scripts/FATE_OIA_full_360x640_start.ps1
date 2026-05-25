@@ -20,7 +20,7 @@ $absOut = (Resolve-Path $OutputDir).Path
 $trainLog = Join-Path $absOut "train.log"
 $errLog = Join-Path $absOut "train.stderr.log"
 $pidFile = Join-Path $absOut "train.pid"
-$launcher = Join-Path $absOut "run_training.ps1"
+$launcher = Join-Path $absOut "run_training.cmd"
 $cmd = @(
   '-m','fate_oia.engine.train_fate_oia',
   '--config','configs\fate_oia_train_360x640.yaml',
@@ -70,28 +70,33 @@ $manifest = [ordered]@{
   best_selection_split='test'; best_selection_metric='joint_test_score'; command=($Py + ' ' + ($cmd -join ' ')); timestamp=(Get-Date).ToString('s')
 }
 $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $absOut 'launch_manifest.json') -Encoding UTF8
-$quoted = ($cmd | ForEach-Object { "'" + ($_ -replace "'", "''") + "'" }) -join " "
-Set-Content -LiteralPath $launcher -Encoding UTF8 -Value @"
-`$ErrorActionPreference = 'Stop'
-Set-Location '$Repo'
-`$env:PYTHONUNBUFFERED = '1'
-`$env:PYTHONIOENCODING = 'utf-8'
-& '$Py' $quoted
+$cmdQuoted = ($cmd | ForEach-Object { '"' + ($_ -replace '"', '\"') + '"' }) -join " "
+Set-Content -LiteralPath $launcher -Encoding ASCII -Value @"
+@echo off
+cd /d "$Repo"
+set PYTHONUNBUFFERED=1
+set PYTHONIOENCODING=utf-8
+"$Py" $cmdQuoted > "$trainLog" 2> "$errLog"
+exit /b %ERRORLEVEL%
 "@
 if ($Foreground) {
   $env:PYTHONUNBUFFERED = '1'
   $env:PYTHONIOENCODING = 'utf-8'
   & $Py @cmd 2>&1 | Tee-Object -FilePath $trainLog
 } else {
-  $envBlock = @(
-    'PYTHONUNBUFFERED=1',
-    'PYTHONIOENCODING=utf-8'
-  )
-  # Start python directly. A nested powershell process can hand Python an invalid
-  # redirected stdout handle on this Windows/OpenSSH setup.
-  $p = Start-Process -FilePath $Py -ArgumentList $cmd -WorkingDirectory $Repo -RedirectStandardOutput $trainLog -RedirectStandardError $errLog -WindowStyle Hidden -PassThru
-  Set-Content -LiteralPath $pidFile -Value $p.Id -Encoding ASCII
-  Write-Host "FATE-OIA training started. PID=$($p.Id)"
+  # This host can hand Python an invalid redirected stdout handle when launched
+  # through nested PowerShell/OpenSSH. A cmd wrapper launched through WMI has been
+  # verified to produce live batch logs reliably.
+  $launchLine = 'cmd.exe /c "' + $launcher + '"'
+  $result = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+    CommandLine = $launchLine
+    CurrentDirectory = $Repo
+  }
+  if ($result.ReturnValue -ne 0) {
+    throw "Win32_Process.Create failed with ReturnValue=$($result.ReturnValue)"
+  }
+  Set-Content -LiteralPath $pidFile -Value $result.ProcessId -Encoding ASCII
+  Write-Host "FATE-OIA training started. LauncherPID=$($result.ProcessId)"
   Write-Host "OutputDir=$absOut"
   Write-Host "TrainLog=$trainLog"
   Write-Host "ErrLog=$errLog"
