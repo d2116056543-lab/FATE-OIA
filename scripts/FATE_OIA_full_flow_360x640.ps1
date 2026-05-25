@@ -4,7 +4,7 @@ param(
   [string]$GroundingCache = $env:FATE_OIA_GROUNDING_CACHE,
   [int]$Epochs = $(if ($env:FATE_OIA_EPOCHS) { [int]$env:FATE_OIA_EPOCHS } else { 30 }),
   [int]$BatchSize = $(if ($env:FATE_OIA_BATCH_SIZE) { [int]$env:FATE_OIA_BATCH_SIZE } else { 1 }),
-  [int]$GradAccum = $(if ($env:FATE_OIA_GRAD_ACCUM) { [int]$env:FATE_OIA_GRAD_ACCUM } else { 8 })
+  [int]$GradAccum = $(if ($env:FATE_OIA_GRAD_ACCUM) { [int]$env:FATE_OIA_GRAD_ACCUM } else { 32 })
 )
 
 $ErrorActionPreference = "Stop"
@@ -22,15 +22,21 @@ Write-Host "output_dir=$OutputDir"
 Write-Host "pretrained_weights=$PretrainedWeights"
 Write-Host "grounding_cache=$GroundingCache"
 Write-Host "epochs=$Epochs batch_size=$BatchSize grad_accum=$GradAccum"
+Write-Host "effective_batch_size=$($BatchSize * $GradAccum) reference_effective_batch=32"
 Write-Host "compression=keep_merge compression_start_epoch=8 keep_ratio=0.85->0.65"
 
 $cmd = @(
   "-m", "fate_oia.engine.train_fate_oia",
+  "--config", "configs\fate_oia_train_360x640.yaml",
   "--output_dir", $OutputDir,
   "--pretrained_weights", $PretrainedWeights,
   "--epochs", "$Epochs",
   "--batch_size", "$BatchSize",
   "--gradient_accumulation_steps", "$GradAccum",
+  "--auto_scale_lr",
+  "--reference_effective_batch", "32",
+  "--base_head_lr_at_reference_batch", "0.0003",
+  "--max_head_lr", "0.0005",
   "--image_height", "360",
   "--image_width", "640",
   "--preserve_aspect_ratio",
@@ -45,8 +51,8 @@ $cmd = @(
   "--compression_keep_ratio_start", "0.85",
   "--compression_keep_ratio_final", "0.65",
   "--num_summary_tokens", "1",
-  "--loss_grounding", "0.001",
-  "--loss_counterfactual", "0.01",
+  "--loss_grounding", "0.0005",
+  "--loss_counterfactual", "0.005",
   "--cf_mask_fill", "mean",
   "--device", "cuda"
 )
