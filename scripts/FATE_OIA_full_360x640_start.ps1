@@ -74,12 +74,22 @@ $quoted = ($cmd | ForEach-Object { "'" + ($_ -replace "'", "''") + "'" }) -join 
 Set-Content -LiteralPath $launcher -Encoding UTF8 -Value @"
 `$ErrorActionPreference = 'Stop'
 Set-Location '$Repo'
+`$env:PYTHONUNBUFFERED = '1'
+`$env:PYTHONIOENCODING = 'utf-8'
 & '$Py' $quoted
 "@
 if ($Foreground) {
-  & powershell -NoProfile -ExecutionPolicy Bypass -File $launcher 2>&1 | Tee-Object -FilePath $trainLog
+  $env:PYTHONUNBUFFERED = '1'
+  $env:PYTHONIOENCODING = 'utf-8'
+  & $Py @cmd 2>&1 | Tee-Object -FilePath $trainLog
 } else {
-  $p = Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',$launcher) -RedirectStandardOutput $trainLog -RedirectStandardError $errLog -WindowStyle Hidden -PassThru
+  $envBlock = @(
+    'PYTHONUNBUFFERED=1',
+    'PYTHONIOENCODING=utf-8'
+  )
+  # Start python directly. A nested powershell process can hand Python an invalid
+  # redirected stdout handle on this Windows/OpenSSH setup.
+  $p = Start-Process -FilePath $Py -ArgumentList $cmd -WorkingDirectory $Repo -RedirectStandardOutput $trainLog -RedirectStandardError $errLog -WindowStyle Hidden -PassThru
   Set-Content -LiteralPath $pidFile -Value $p.Id -Encoding ASCII
   Write-Host "FATE-OIA training started. PID=$($p.Id)"
   Write-Host "OutputDir=$absOut"
