@@ -13,7 +13,11 @@ data:
   image_width: 640
 training:
   batch_size: 1
-  gradient_accumulation_steps: 8
+  gradient_accumulation_steps: 32
+  auto_scale_lr: true
+  reference_effective_batch: 32
+  base_head_lr_at_reference_batch: 0.0003
+  max_head_lr: 0.0005
   amp: true
   num_workers: 4
   loss_action: 1.0

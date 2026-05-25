@@ -4,10 +4,12 @@ import torch
 from argparse import Namespace
 
 from fate_oia.engine.train_fate_oia import (
+    apply_config_defaults,
     action_branch_losses,
     compress_tokens,
     compute_grounding_loss,
     counterfactual_deletion_loss,
+    load_config_defaults,
     load_reason_grounding_rules,
     reason_to_action_consistency_loss,
     recover_label_attention,
@@ -15,6 +17,7 @@ from fate_oia.engine.train_fate_oia import (
     write_epoch_artifacts,
 )
 from fate_oia.models.fate_oia_model import FATEOIAFeatureModel
+from fate_oia.utils.lr_scaling import compute_lr_scaling, effective_batch_size, scale_lr_linear
 
 
 def test_compress_tokens_preserves_cls_and_provenance_rows():
@@ -40,6 +43,40 @@ def test_compression_schedule_is_disabled_before_start_epoch():
     assert scheduled_keep_ratio(args, 0) == 1.0
     assert scheduled_keep_ratio(args, 8) == 0.85
     assert scheduled_keep_ratio(args, 14) == 0.65
+
+
+def test_lr_scaling_effective_batch_and_cap():
+    assert effective_batch_size(per_gpu_batch_size=2, gradient_accumulation_steps=16, num_gpus=1) == 32
+    assert scale_lr_linear(3e-4, effective_batch=32, reference_effective_batch=32) == 3e-4
+    result = compute_lr_scaling(
+        per_gpu_batch_size=4,
+        gradient_accumulation_steps=8,
+        reference_effective_batch=32,
+        base_lr_at_reference_batch=3e-4,
+        max_lr=5e-4,
+    )
+    assert result.effective_batch_size == 32
+    assert result.lr_actual == 3e-4
+    capped = compute_lr_scaling(
+        per_gpu_batch_size=4,
+        gradient_accumulation_steps=16,
+        reference_effective_batch=32,
+        base_lr_at_reference_batch=3e-4,
+        max_lr=5e-4,
+    )
+    assert capped.effective_batch_size == 64
+    assert capped.lr_actual == 5e-4
+
+
+def test_config_defaults_apply_when_cli_does_not_override(tmp_path, monkeypatch):
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text("data:\n  image_height: 360\ntraining:\n  batch_size: 2\n  auto_scale_lr: true\n", encoding="utf-8")
+    args = Namespace(config=str(cfg), image_height=224, batch_size=8, auto_scale_lr=False)
+    monkeypatch.setattr("sys.argv", ["train_fate_oia.py", "--config", str(cfg)])
+    apply_config_defaults(args, load_config_defaults(str(cfg)))
+    assert args.image_height == 360
+    assert args.batch_size == 2
+    assert args.auto_scale_lr is True
 
 
 def test_fate_oia_feature_model_outputs_attention_and_r2a():

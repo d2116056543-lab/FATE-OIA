@@ -26,6 +26,7 @@ from fate_oia.losses.asymmetric_loss import AsymmetricLossMultiLabel
 from fate_oia.models.fate_oia_model import FATEOIAFeatureModel
 from fate_oia.models.token_provenance import keep_merge_tokens, recover_attribution
 from fate_oia.transforms import AspectRatioLetterboxTransform, FixedSizeResizeTransform
+from fate_oia.utils.lr_scaling import compute_lr_scaling
 
 
 def build_transform(image_height: int, image_width: int, patch_size: int = 8, preserve_aspect_ratio: bool = True, return_meta: bool = True):
@@ -80,6 +81,61 @@ def make_multilabel_criterion(args) -> nn.Module:
     if args.loss == "asl":
         return AsymmetricLossMultiLabel(gamma_pos=args.asl_gamma_pos, gamma_neg=args.asl_gamma_neg, clip=args.asl_clip)
     return nn.BCEWithLogitsLoss()
+
+
+def load_config_defaults(path: str) -> dict[str, Any]:
+    if not path:
+        return {}
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Config file not found: {path}")
+    text = p.read_text(encoding="utf-8-sig")
+    try:
+        import yaml  # type: ignore
+
+        loaded = yaml.safe_load(text) or {}
+    except Exception:
+        loaded = {}
+        current_section = None
+        for raw in text.splitlines():
+            if not raw.strip() or raw.strip().startswith("#"):
+                continue
+            if not raw.startswith(" ") and raw.rstrip().endswith(":"):
+                current_section = raw.strip()[:-1]
+                loaded[current_section] = {}
+                continue
+            if current_section and ":" in raw:
+                key, value = raw.strip().split(":", 1)
+                value = value.strip()
+                if value.lower() in {"true", "false"}:
+                    parsed: Any = value.lower() == "true"
+                else:
+                    try:
+                        parsed = int(value)
+                    except ValueError:
+                        try:
+                            parsed = float(value)
+                        except ValueError:
+                            parsed = value.strip("\"'")
+                loaded[current_section][key.strip()] = parsed
+    flat: dict[str, Any] = {}
+    if isinstance(loaded, dict):
+        for value in loaded.values():
+            if isinstance(value, dict):
+                flat.update(value)
+    return flat
+
+
+def apply_config_defaults(args, config_defaults: dict[str, Any]) -> None:
+    if not config_defaults:
+        return
+    cli_tokens = set(sys.argv[1:])
+    for key, value in config_defaults.items():
+        if not hasattr(args, key):
+            continue
+        if f"--{key}" in cli_tokens:
+            continue
+        setattr(args, key, value)
 def load_grounding_cache(path: str) -> dict[str, dict[str, Any]]:
     if not path:
         return {}
@@ -506,6 +562,36 @@ def build_run_manifest(args, output_dir: Path, train_count: int, val_count: int,
         "is_smoke": bool(is_smoke),
         "max_train_samples": int(args.max_train_samples),
         "max_val_samples": int(args.max_val_samples),
+        "num_gpus": int(getattr(args, "num_gpus", 1)),
+        "per_gpu_batch_size": int(args.batch_size),
+        "gradient_accumulation_steps": int(args.gradient_accumulation_steps),
+        "effective_batch_size": int(getattr(args, "effective_batch_size", args.batch_size * max(1, args.gradient_accumulation_steps))),
+        "reference_effective_batch": int(getattr(args, "reference_effective_batch", 32)),
+        "base_lr_at_reference_batch": float(getattr(args, "base_head_lr_at_reference_batch", args.lr)),
+        "lr_actual": float(args.lr),
+        "backbone_lr": 0.0,
+        "optimizer": "AdamW",
+        "scheduler": "none",
+        "mixed_precision": False,
+        "loss_divided_by_accumulation": True,
+        "token_compression": {
+            "mode": args.token_compression,
+            "compression_start_epoch": int(args.compression_start_epoch),
+            "compression_warmup_epochs": int(args.compression_warmup_epochs),
+            "compression_keep_ratio_start": float(args.compression_keep_ratio_start),
+            "compression_keep_ratio_final": float(args.compression_keep_ratio_final),
+            "token_score_mode": args.token_score_mode,
+        },
+        "grounding": {
+            "mode": args.grounding_mode,
+            "loss_grounding": float(args.loss_grounding),
+            "grounding_cache_jsonl": args.grounding_cache_jsonl,
+        },
+        "counterfactual": {
+            "loss_counterfactual": float(args.loss_counterfactual),
+            "cf_mask_fill": args.cf_mask_fill,
+            "counterfactual_topk_ratio": float(args.counterfactual_topk_ratio),
+        },
     }
 
 
@@ -697,6 +783,11 @@ def run_epoch(args, backbone, model, loader, criterion, optimizer, device, train
             "action_branch_total": float(branch["action_branch_total"].detach().item()),
             "cf_loss": float(cf_loss.detach().item()),
             "grounding_loss": float(grounding_loss.detach().item()) if isinstance(grounding_loss, torch.Tensor) else 0.0,
+            "total_loss": float(loss.detach().item()),
+            "lr": float(getattr(args, "lr", 0.0)),
+            "grad_norm": None,
+            "effective_batch_size": int(getattr(args, "effective_batch_size", bs * accum)),
+            "loss_divided_by_accumulation": True,
         })
         if grounding_stats:
             grounding_rows.append({"train": train, "epoch": epoch, "step": step, **grounding_stats})
@@ -755,6 +846,7 @@ def run_epoch(args, backbone, model, loader, criterion, optimizer, device, train
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Train full FATE-OIA token model with label-query, reason-to-action, optional compression and counterfactual loss.")
+    ap.add_argument("--config", default="", help="Optional YAML config. CLI flags override matching config keys.")
     ap.add_argument("--data_root", default="dataset/BDD-OIA")
     ap.add_argument("--raw_root", default="raw_data/BDD-OIA")
     ap.add_argument("--output_dir", required=True)
@@ -773,6 +865,10 @@ def main() -> None:
     ap.add_argument("--gradient_accumulation_steps", type=int, default=1)
     ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--auto_scale_lr", action=argparse.BooleanOptionalAction, default=False)
+    ap.add_argument("--reference_effective_batch", type=int, default=32)
+    ap.add_argument("--base_head_lr_at_reference_batch", type=float, default=3e-4)
+    ap.add_argument("--max_head_lr", type=float, default=5e-4)
     ap.add_argument("--weight_decay", type=float, default=1e-4)
     ap.add_argument("--loss", choices=["bce", "asl"], default="asl")
     ap.add_argument("--asl_gamma_pos", type=float, default=0.0)
@@ -819,6 +915,22 @@ def main() -> None:
     ap.add_argument("--log_every", type=int, default=20)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
+    apply_config_defaults(args, load_config_defaults(args.config))
+
+    args.num_gpus = 1
+    lr_info = compute_lr_scaling(
+        per_gpu_batch_size=args.batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        reference_effective_batch=args.reference_effective_batch,
+        base_lr_at_reference_batch=args.base_head_lr_at_reference_batch,
+        num_gpus=args.num_gpus,
+        auto_scale_lr=args.auto_scale_lr,
+        current_lr=args.lr,
+        max_lr=args.max_head_lr,
+    )
+    args.effective_batch_size = lr_info.effective_batch_size
+    if args.auto_scale_lr:
+        args.lr = lr_info.lr_actual
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
