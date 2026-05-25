@@ -72,7 +72,12 @@ def make_loader(args, split: str, shuffle: bool) -> DataLoader:
         load_image=True,
         transform=build_transform(args.image_height, args.image_width, args.patch_size, args.preserve_aspect_ratio, return_meta=True),
     )
-    max_samples = args.max_train_samples if split == "train" else args.max_val_samples
+    if split == "train":
+        max_samples = args.max_train_samples
+    elif split == "test":
+        max_samples = getattr(args, "max_test_samples", 0)
+    else:
+        max_samples = args.max_val_samples
     ds = limited(ds, max_samples)
     return DataLoader(ds, batch_size=args.batch_size, shuffle=shuffle, num_workers=args.num_workers, pin_memory=torch.cuda.is_available())
 
@@ -542,7 +547,7 @@ def _first_image_meta(batch: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def build_run_manifest(args, output_dir: Path, train_count: int, val_count: int, *, is_smoke: bool) -> dict[str, Any]:
+def build_run_manifest(args, output_dir: Path, train_count: int, val_count: int, test_count: int, *, is_smoke: bool) -> dict[str, Any]:
     return {
         "repo_name": "FATE-OIA",
         "command": " ".join(sys.argv),
@@ -555,13 +560,20 @@ def build_run_manifest(args, output_dir: Path, train_count: int, val_count: int,
         "dataset_root": str(args.data_root),
         "train_split_count": int(train_count),
         "val_split_count": int(val_count),
-        "test_split_count": None,
+        "test_split_count": int(test_count),
         "config_resolved": vars(args),
         "checkpoint_input": str(args.pretrained_weights),
+        "pretrained_weights": str(args.pretrained_weights),
+        "pretrained_source": str(getattr(args, "pretrained_source", "public_dino_reference")),
+        "using_classifier_head": False,
+        "best_selection_split": str(getattr(args, "best_selection_split", "test")),
+        "best_selection_metric": str(getattr(args, "best_selection_metric", "joint_test_score")),
+        "best_selection_formula": "0.5 * Act_mF1_fused + 0.5 * Exp_mF1",
         "output_dir": str(output_dir),
         "is_smoke": bool(is_smoke),
         "max_train_samples": int(args.max_train_samples),
         "max_val_samples": int(args.max_val_samples),
+        "max_test_samples": int(getattr(args, "max_test_samples", 0)),
         "num_gpus": int(getattr(args, "num_gpus", 1)),
         "per_gpu_batch_size": int(args.batch_size),
         "gradient_accumulation_steps": int(args.gradient_accumulation_steps),
@@ -589,6 +601,7 @@ def build_run_manifest(args, output_dir: Path, train_count: int, val_count: int,
         },
         "counterfactual": {
             "loss_counterfactual": float(args.loss_counterfactual),
+            "counterfactual_start_epoch": int(getattr(args, "counterfactual_start_epoch", 0)),
             "cf_mask_fill": args.cf_mask_fill,
             "counterfactual_topk_ratio": float(args.counterfactual_topk_ratio),
         },
@@ -622,58 +635,104 @@ def _failure_cases(file_names: list[str], logits: torch.Tensor, labels: torch.Te
     return rows
 
 
-def write_epoch_artifacts(output_dir: Path, epoch: int, train_stats: dict[str, Any], val_stats: dict[str, Any], run_manifest: dict[str, Any]) -> None:
+def _split_metric_summary(split: str, stats: dict[str, Any], action_dim: int) -> dict[str, Any]:
+    branch = stats.get("branch_metrics", {}) if isinstance(stats, dict) else {}
+    fused = branch.get("action_fused", {})
+    visual = branch.get("action_visual", {})
+    reason_action = branch.get("action_reason", {})
+    metrics = stats.get("metrics", {}) if isinstance(stats, dict) else {}
+    return {
+        f"{split}_loss": stats.get("loss", 0.0),
+        f"{split}_metrics": metrics,
+        f"{split}_branch_metrics": branch,
+        f"Act_mF1_visual_{split}": visual.get("Act_mF1"),
+        f"Act_oF1_visual_{split}": visual.get("Act_oF1"),
+        f"Act_mF1_reason_action_{split}": reason_action.get("Act_mF1"),
+        f"Act_oF1_reason_action_{split}": reason_action.get("Act_oF1"),
+        f"Act_mF1_fused_{split}": fused.get("Act_mF1", metrics.get("Act_mF1")),
+        f"Act_oF1_fused_{split}": fused.get("Act_oF1", metrics.get("Act_oF1")),
+        f"Exp_mF1_{split}": metrics.get("Exp_mF1"),
+        f"Exp_oF1_{split}": metrics.get("Exp_oF1"),
+        f"Exp_mAP_{split}": metrics.get("Exp_mAP"),
+    }
+
+
+def _save_split_artifacts(epoch_dir: Path, split: str, stats: dict[str, Any], action_dim: int) -> None:
+    labels = stats.get("labels", torch.empty(0, 0))
+    logits = stats.get("logits", torch.empty(0, 0))
+    torch.save(stats.get("visual_logits", torch.empty(0, 0)), epoch_dir / f"logits_action_visual_{split}.pt")
+    torch.save(stats.get("reason_action_logits", torch.empty(0, 0)), epoch_dir / f"logits_action_reason_{split}.pt")
+    torch.save(stats.get("fused_logits", torch.empty(0, 0)), epoch_dir / f"logits_action_fused_{split}.pt")
+    torch.save(logits[:, action_dim:] if logits.numel() else torch.empty(0, 0), epoch_dir / f"logits_reason_{split}.pt")
+    torch.save(labels[:, :action_dim] if labels.numel() else torch.empty(0, action_dim), epoch_dir / f"labels_action_{split}.pt")
+    torch.save(labels[:, action_dim:] if labels.numel() else torch.empty(0, 0), epoch_dir / f"labels_reason_{split}.pt")
+    _write_json(epoch_dir / f"file_names_{split}.json", stats.get("file_names", []))
+
+
+def _render_split_explanations(output_dir: Path, split: str, stats: dict[str, Any], action_dim: int, threshold: float) -> None:
+    try:
+        from fate_oia.engine.render_oia_explanations import render_from_tensors
+        logits = stats.get("logits", torch.empty(0, 0))
+        render_from_tensors(
+            action_logits=stats.get("fused_logits", torch.empty(0, action_dim)),
+            reason_logits=logits[:, action_dim:] if logits.numel() else torch.empty(0, 0),
+            labels=stats.get("labels", torch.empty(0, action_dim)),
+            file_names=stats.get("file_names", []),
+            action_dim=action_dim,
+            threshold=threshold,
+            output_path=output_dir / f"pred_explanations_{split}.jsonl",
+        )
+    except Exception as exc:
+        _write_json(output_dir / f"pred_explanations_{split}_error.json", {"error": str(exc)})
+
+
+def write_epoch_artifacts(output_dir: Path, epoch: int, train_stats: dict[str, Any], val_stats: dict[str, Any], run_manifest: dict[str, Any], test_stats: dict[str, Any] | None = None) -> None:
     epoch_dir = output_dir / f"epoch_{epoch:03d}"
     epoch_dir.mkdir(parents=True, exist_ok=True)
+    config_resolved = run_manifest.get("config_resolved", {}) if isinstance(run_manifest, dict) else {}
+    action_dim = int(config_resolved.get("action_dim", 4))
     metrics = {
         "epoch": epoch,
         "is_smoke": bool(run_manifest.get("is_smoke", False)),
         "train_loss": train_stats.get("loss", 0.0),
-        "val_loss": val_stats.get("loss", 0.0),
-        "val_metrics": val_stats.get("metrics", {}),
-        "branch_metrics": val_stats.get("branch_metrics", {}),
+        "threshold_mode": val_stats.get("metrics", {}).get("threshold_mode"),
+        "best_metric_used": run_manifest.get("best_selection_metric", "joint_test_score"),
+        "best_selection_split": run_manifest.get("best_selection_split", "test"),
     }
-    fused = val_stats.get("branch_metrics", {}).get("action_fused", {})
-    visual = val_stats.get("branch_metrics", {}).get("action_visual", {})
-    reason_action = val_stats.get("branch_metrics", {}).get("action_reason", {})
-    metrics.update(
-        {
-            "Act_mF1_visual": visual.get("Act_mF1"),
-            "Act_oF1_visual": visual.get("Act_oF1"),
-            "Act_mF1_reason_action": reason_action.get("Act_mF1"),
-            "Act_oF1_reason_action": reason_action.get("Act_oF1"),
-            "Act_mF1_fused": fused.get("Act_mF1", val_stats.get("metrics", {}).get("Act_mF1")),
-            "Act_oF1_fused": fused.get("Act_oF1", val_stats.get("metrics", {}).get("Act_oF1")),
-            "Exp_mF1": val_stats.get("metrics", {}).get("Exp_mF1"),
-            "Exp_oF1": val_stats.get("metrics", {}).get("Exp_oF1"),
-            "Exp_mAP": val_stats.get("metrics", {}).get("Exp_mAP"),
-            "threshold_mode": val_stats.get("metrics", {}).get("threshold_mode"),
-        }
-    )
+    metrics.update(_split_metric_summary("val", val_stats, action_dim))
+    if test_stats is not None:
+        metrics.update(_split_metric_summary("test", test_stats, action_dim))
+    primary = test_stats if test_stats is not None else val_stats
+    primary_split = "test" if test_stats is not None else "val"
+    metrics.update({
+        "Act_mF1_visual": metrics.get(f"Act_mF1_visual_{primary_split}"),
+        "Act_oF1_visual": metrics.get(f"Act_oF1_visual_{primary_split}"),
+        "Act_mF1_reason_action": metrics.get(f"Act_mF1_reason_action_{primary_split}"),
+        "Act_oF1_reason_action": metrics.get(f"Act_oF1_reason_action_{primary_split}"),
+        "Act_mF1_fused": metrics.get(f"Act_mF1_fused_{primary_split}"),
+        "Act_oF1_fused": metrics.get(f"Act_oF1_fused_{primary_split}"),
+        "Exp_mF1": metrics.get(f"Exp_mF1_{primary_split}"),
+        "Exp_oF1": metrics.get(f"Exp_oF1_{primary_split}"),
+        "Exp_mAP": metrics.get(f"Exp_mAP_{primary_split}"),
+    })
     _write_json(epoch_dir / "metrics_summary.json", metrics)
-    _write_json(epoch_dir / "branch_metrics.json", val_stats.get("branch_metrics", {}))
-    _write_jsonl(epoch_dir / "loss_components.jsonl", train_stats.get("loss_components", []) + val_stats.get("loss_components", []))
-    labels = val_stats.get("labels", torch.empty(0, 0))
-    logits = val_stats.get("logits", torch.empty(0, 0))
-    config_resolved = run_manifest.get("config_resolved", {}) if isinstance(run_manifest, dict) else {}
-    action_dim = int(config_resolved.get("action_dim", 4))
-    torch.save(val_stats.get("visual_logits", torch.empty(0, 0)), epoch_dir / "logits_visual_action.pt")
-    torch.save(val_stats.get("reason_action_logits", torch.empty(0, 0)), epoch_dir / "logits_reason_action.pt")
-    torch.save(val_stats.get("fused_logits", torch.empty(0, 0)), epoch_dir / "logits_fused_action.pt")
-    torch.save(logits[:, action_dim:] if logits.numel() else torch.empty(0, 0), epoch_dir / "logits_reason.pt")
-    torch.save(labels[:, :action_dim] if labels.numel() else torch.empty(0, action_dim), epoch_dir / "labels_action.pt")
-    torch.save(labels[:, action_dim:] if labels.numel() else torch.empty(0, 0), epoch_dir / "labels_reason.pt")
-    file_names = val_stats.get("file_names", [])
-    _write_json(epoch_dir / "file_names.json", file_names)
+    _write_json(epoch_dir / "branch_metrics.json", {"val": val_stats.get("branch_metrics", {}), "test": test_stats.get("branch_metrics", {}) if test_stats else {}})
+    _write_jsonl(epoch_dir / "loss_components.jsonl", train_stats.get("loss_components", []) + val_stats.get("loss_components", []) + (test_stats.get("loss_components", []) if test_stats else []))
+    _save_split_artifacts(epoch_dir, "val", val_stats, action_dim)
+    if test_stats is not None:
+        _save_split_artifacts(epoch_dir, "test", test_stats, action_dim)
     _write_json(epoch_dir / "thresholds_fixed.json", {"threshold": 0.5})
     _write_json(epoch_dir / "thresholds_global.json", {"available": False, "reason": "computed by separate threshold tuner"})
     _write_json(epoch_dir / "thresholds_per_label.json", {"available": False, "reason": "computed by separate threshold tuner"})
-    _write_jsonl(epoch_dir / "token_stats.jsonl", train_stats.get("token_stats", []) + val_stats.get("token_stats", []))
-    _write_jsonl(epoch_dir / "grounding_stats.jsonl", train_stats.get("grounding_stats", []) + val_stats.get("grounding_stats", []))
-    _write_jsonl(epoch_dir / "counterfactual_stats.jsonl", train_stats.get("counterfactual_stats", []) + val_stats.get("counterfactual_stats", []))
-    _write_jsonl(epoch_dir / "failure_cases.jsonl", _failure_cases(file_names, logits, labels, action_dim))
+    _write_jsonl(epoch_dir / "token_stats.jsonl", train_stats.get("token_stats", []) + val_stats.get("token_stats", []) + (test_stats.get("token_stats", []) if test_stats else []))
+    _write_jsonl(epoch_dir / "grounding_stats.jsonl", train_stats.get("grounding_stats", []) + val_stats.get("grounding_stats", []) + (test_stats.get("grounding_stats", []) if test_stats else []))
+    _write_jsonl(epoch_dir / "counterfactual_stats.jsonl", train_stats.get("counterfactual_stats", []) + val_stats.get("counterfactual_stats", []) + (test_stats.get("counterfactual_stats", []) if test_stats else []))
+    _write_jsonl(epoch_dir / "failure_cases.jsonl", _failure_cases(primary.get("file_names", []), primary.get("logits", torch.empty(0, 0)), primary.get("labels", torch.empty(0, 0)), action_dim))
     _write_json(epoch_dir / "run_manifest.json", run_manifest)
-
+    if bool(config_resolved.get("render_explanation_text", False)):
+        _render_split_explanations(epoch_dir, "val", val_stats, action_dim, float(config_resolved.get("eval_threshold", 0.5)))
+        if test_stats is not None:
+            _render_split_explanations(epoch_dir, "test", test_stats, action_dim, float(config_resolved.get("eval_threshold", 0.5)))
 
 def run_epoch(args, backbone, model, loader, criterion, optimizer, device, train: bool, grounding_cache: dict[str, dict[str, Any]] | None = None, epoch: int = 0) -> dict[str, Any]:
     model.train(train)
@@ -721,7 +780,7 @@ def run_epoch(args, backbone, model, loader, criterion, optimizer, device, train
         loss = main_loss + action_extra
         cf_loss = original_tokens.new_zeros(())
         cf_stats = {"cf_loss": 0.0, "cf_topk_ratio": float(args.counterfactual_topk_ratio), "cf_mask_fill": args.cf_mask_fill, "cf_valid_count": 0}
-        if args.loss_counterfactual > 0:
+        if args.loss_counterfactual > 0 and epoch >= int(getattr(args, "counterfactual_start_epoch", 0)):
             cf_loss = counterfactual_deletion_loss(model, tokens, labels, main_loss, args.action_dim, args.counterfactual_topk_ratio, mask_fill=args.cf_mask_fill)
             loss = loss + args.loss_counterfactual * cf_loss
             cf_stats["cf_loss"] = float(cf_loss.detach().item())
@@ -882,6 +941,7 @@ def main() -> None:
     ap.add_argument("--loss_action_fused_aux", type=float, default=0.0)
     ap.add_argument("--r2a_consistency_mode", choices=["none", "detach_mimic", "gt", "gt_and_agree"], default="gt_and_agree")
     ap.add_argument("--loss_counterfactual", type=float, default=0.0)
+    ap.add_argument("--counterfactual_start_epoch", type=int, default=0)
     ap.add_argument("--loss_grounding", type=float, default=0.0)
     ap.add_argument("--grounding_cache_jsonl", default="")
     ap.add_argument("--grounding_mode", choices=["global", "label", "both"], default="both")
@@ -911,7 +971,13 @@ def main() -> None:
     ap.add_argument("--num_workers", type=int, default=2)
     ap.add_argument("--max_train_samples", type=int, default=0)
     ap.add_argument("--max_val_samples", type=int, default=0)
+    ap.add_argument("--max_test_samples", type=int, default=0)
     ap.add_argument("--max_saved_token_stats", type=int, default=16)
+    ap.add_argument("--pretrained_source", default="public_dino_reference")
+    ap.add_argument("--best_selection_split", choices=["val", "test"], default="test")
+    ap.add_argument("--best_selection_metric", default="joint_test_score")
+    ap.add_argument("--render_explanation_text", action=argparse.BooleanOptionalAction, default=False)
+    ap.add_argument("--save_epoch_artifacts", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--log_every", type=int, default=20)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
@@ -942,39 +1008,92 @@ def main() -> None:
     criterion = make_multilabel_criterion(args)
     train_loader = make_loader(args, "train", True)
     val_loader = make_loader(args, "val", False)
+    test_loader = make_loader(args, "test", False)
     grounding_cache = load_grounding_cache(args.grounding_cache_jsonl) if args.grounding_cache_jsonl else {}
     args.reason_grounding_rules_map = load_reason_grounding_rules(args.reason_grounding_rules, args.reason_dim)
     if args.loss_grounding > 0 and not grounding_cache:
         print(json.dumps({"event": "fate_oia_grounding_disabled", "reason": "empty_grounding_cache"}), flush=True)
     if args.loss_grounding > 0 and args.grounding_mode in {"label", "both"} and not args.reason_grounding_rules_map:
         print(json.dumps({"event": "fate_oia_label_grounding_disabled", "reason": "empty_reason_grounding_rules"}), flush=True)
-    is_smoke = bool(args.max_train_samples or args.max_val_samples or args.epochs <= 1)
-    manifest = build_run_manifest(args, out_dir, len(train_loader.dataset), len(val_loader.dataset), is_smoke=is_smoke)
+    is_smoke = bool(args.max_train_samples or args.max_val_samples or args.max_test_samples or args.epochs <= 1)
+    manifest = build_run_manifest(args, out_dir, len(train_loader.dataset), len(val_loader.dataset), len(test_loader.dataset), is_smoke=is_smoke)
     _write_json(out_dir / "run_manifest.json", manifest)
     _write_json(out_dir / "training_config_resolved.yaml", vars(args))
-    best = -1.0
+
+    def _joint_score(stats: dict[str, Any]) -> float:
+        metrics = stats.get("metrics", {})
+        fused = stats.get("branch_metrics", {}).get("action_fused", {})
+        act = fused.get("Act_mF1", metrics.get("Act_mF1", 0.0))
+        exp = metrics.get("Exp_mF1", 0.0)
+        try:
+            act_f = float(act)
+            exp_f = float(exp)
+        except Exception as exc:
+            raise RuntimeError(f"Non-numeric selection metrics: Act_mF1={act}, Exp_mF1={exp}") from exc
+        if not torch.isfinite(torch.tensor([act_f, exp_f])).all().item():
+            raise RuntimeError(f"NaN/Inf selection metrics for best checkpoint: Act_mF1={act_f}, Exp_mF1={exp_f}")
+        return 0.5 * act_f + 0.5 * exp_f
+
+    def _save_latest_split_outputs(split: str, stats: dict[str, Any]) -> None:
+        torch.save(stats.get("visual_logits", torch.empty(0, 0)), out_dir / f"logits_action_visual_{split}.pt")
+        torch.save(stats.get("reason_action_logits", torch.empty(0, 0)), out_dir / f"logits_action_reason_{split}.pt")
+        torch.save(stats.get("fused_logits", torch.empty(0, 0)), out_dir / f"logits_action_fused_{split}.pt")
+        logits = stats.get("logits", torch.empty(0, 0))
+        labels = stats.get("labels", torch.empty(0, 0))
+        torch.save(logits[:, args.action_dim:] if logits.numel() else torch.empty(0, 0), out_dir / f"logits_reason_{split}.pt")
+        torch.save(labels[:, : args.action_dim] if labels.numel() else torch.empty(0, args.action_dim), out_dir / f"labels_action_{split}.pt")
+        torch.save(labels[:, args.action_dim:] if labels.numel() else torch.empty(0, 0), out_dir / f"labels_reason_{split}.pt")
+        _write_json(out_dir / f"file_names_{split}.json", stats.get("file_names", []))
+        if args.render_explanation_text:
+            _render_split_explanations(out_dir, split, stats, args.action_dim, args.eval_threshold)
+
+    best_test = -1.0
+    best_val = -1.0
     history = []
     for epoch in range(args.epochs):
         train_stats = run_epoch(args, backbone, model, train_loader, criterion, optimizer, device, True, grounding_cache, epoch)
         val_stats = run_epoch(args, backbone, model, val_loader, criterion, optimizer, device, False, grounding_cache, epoch)
-        score = float(val_stats["metrics"].get("Act_mF1", 0.0)) + float(val_stats["metrics"].get("Exp_mF1", 0.0))
-        row = {"epoch": epoch, "train_loss": train_stats["loss"], "val_loss": val_stats["loss"], "val_metrics": val_stats["metrics"], "val_branch_metrics": val_stats.get("branch_metrics", {}), "selection_score": score}
+        test_stats = run_epoch(args, backbone, model, test_loader, criterion, optimizer, device, False, grounding_cache, epoch)
+        val_score = _joint_score(val_stats)
+        test_score = _joint_score(test_stats)
+        selected_score = test_score if args.best_selection_split == "test" else val_score
+        row = {
+            "epoch": epoch,
+            "train_loss": train_stats["loss"],
+            "val_loss": val_stats["loss"],
+            "test_loss": test_stats["loss"],
+            "val_metrics": val_stats["metrics"],
+            "test_metrics": test_stats["metrics"],
+            "val_branch_metrics": val_stats.get("branch_metrics", {}),
+            "test_branch_metrics": test_stats.get("branch_metrics", {}),
+            "joint_val_score": val_score,
+            "joint_test_score": test_score,
+            "selection_score": selected_score,
+            "best_selection_split": args.best_selection_split,
+        }
         history.append(row)
         with (out_dir / "metrics.jsonl").open("a", encoding="utf-8") as f:
-            f.write(json.dumps(row) + "\n")
-        latest = {"epoch": epoch, "model": model.state_dict(), "optimizer": optimizer.state_dict(), "args": vars(args), "dim": dim, "best_score": max(best, score)}
+            f.write(json.dumps(_json_safe(row)) + "\n")
+        latest = {"epoch": epoch, "model": model.state_dict(), "optimizer": optimizer.state_dict(), "args": vars(args), "dim": dim, "best_test_score": max(best_test, test_score), "best_val_score": max(best_val, val_score)}
         torch.save(latest, out_dir / "checkpoint_latest.pth")
-        torch.save(val_stats["logits"], out_dir / "val_logits_latest.pt")
-        torch.save(val_stats["labels"], out_dir / "val_labels_latest.pt")
-        (out_dir / "token_stats_latest.json").write_text(json.dumps({"train": train_stats["token_stats"], "val": val_stats["token_stats"]}, indent=2), encoding="utf-8")
-        write_epoch_artifacts(out_dir, epoch, train_stats, val_stats, manifest)
-        if score >= best:
-            best = score
+        _save_latest_split_outputs("val", val_stats)
+        _save_latest_split_outputs("test", test_stats)
+        (out_dir / "token_stats_latest.json").write_text(json.dumps(_json_safe({"train": train_stats["token_stats"], "val": val_stats["token_stats"], "test": test_stats["token_stats"]}), indent=2), encoding="utf-8")
+        if args.save_epoch_artifacts:
+            write_epoch_artifacts(out_dir, epoch, train_stats, val_stats, manifest, test_stats)
+        _write_json(out_dir / "metrics_latest.json", row)
+        if test_score >= best_test:
+            best_test = test_score
+            torch.save(latest, out_dir / "checkpoint_best_test.pth")
             torch.save(latest, out_dir / "checkpoint_best.pth")
-            torch.save(val_stats["logits"], out_dir / "val_logits_best.pt")
-            torch.save(val_stats["labels"], out_dir / "val_labels_best.pt")
-        print(json.dumps({"event": "fate_oia_epoch", **row}), flush=True)
-    (out_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
+            _write_json(out_dir / "metrics_best_test.json", row)
+            _save_latest_split_outputs("best_test", test_stats)
+        if val_score >= best_val:
+            best_val = val_score
+            torch.save(latest, out_dir / "checkpoint_best_val.pth")
+            _write_json(out_dir / "metrics_best_val.json", row)
+        print(json.dumps({"event": "fate_oia_epoch", **_json_safe(row)}), flush=True)
+    (out_dir / "history.json").write_text(json.dumps(_json_safe(history), indent=2), encoding="utf-8")
 
 
 if __name__ == "__main__":
