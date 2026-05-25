@@ -660,13 +660,28 @@ def _split_metric_summary(split: str, stats: dict[str, Any], action_dim: int) ->
 def _save_split_artifacts(epoch_dir: Path, split: str, stats: dict[str, Any], action_dim: int) -> None:
     labels = stats.get("labels", torch.empty(0, 0))
     logits = stats.get("logits", torch.empty(0, 0))
-    torch.save(stats.get("visual_logits", torch.empty(0, 0)), epoch_dir / f"logits_action_visual_{split}.pt")
-    torch.save(stats.get("reason_action_logits", torch.empty(0, 0)), epoch_dir / f"logits_action_reason_{split}.pt")
-    torch.save(stats.get("fused_logits", torch.empty(0, 0)), epoch_dir / f"logits_action_fused_{split}.pt")
-    torch.save(logits[:, action_dim:] if logits.numel() else torch.empty(0, 0), epoch_dir / f"logits_reason_{split}.pt")
-    torch.save(labels[:, :action_dim] if labels.numel() else torch.empty(0, action_dim), epoch_dir / f"labels_action_{split}.pt")
-    torch.save(labels[:, action_dim:] if labels.numel() else torch.empty(0, 0), epoch_dir / f"labels_reason_{split}.pt")
+    visual = stats.get("visual_logits", torch.empty(0, 0))
+    reason_action = stats.get("reason_action_logits", torch.empty(0, 0))
+    fused = stats.get("fused_logits", torch.empty(0, 0))
+    reason_logits = logits[:, action_dim:] if logits.numel() else torch.empty(0, 0)
+    labels_action = labels[:, :action_dim] if labels.numel() else torch.empty(0, action_dim)
+    labels_reason = labels[:, action_dim:] if labels.numel() else torch.empty(0, 0)
+    torch.save(visual, epoch_dir / f"logits_action_visual_{split}.pt")
+    torch.save(reason_action, epoch_dir / f"logits_action_reason_{split}.pt")
+    torch.save(fused, epoch_dir / f"logits_action_fused_{split}.pt")
+    torch.save(reason_logits, epoch_dir / f"logits_reason_{split}.pt")
+    torch.save(labels_action, epoch_dir / f"labels_action_{split}.pt")
+    torch.save(labels_reason, epoch_dir / f"labels_reason_{split}.pt")
     _write_json(epoch_dir / f"file_names_{split}.json", stats.get("file_names", []))
+    if split == "val":
+        # Backward-compatible names used by existing diagnostics/tests.
+        torch.save(visual, epoch_dir / "logits_visual_action.pt")
+        torch.save(reason_action, epoch_dir / "logits_reason_action.pt")
+        torch.save(fused, epoch_dir / "logits_fused_action.pt")
+        torch.save(reason_logits, epoch_dir / "logits_reason.pt")
+        torch.save(labels_action, epoch_dir / "labels_action.pt")
+        torch.save(labels_reason, epoch_dir / "labels_reason.pt")
+        _write_json(epoch_dir / "file_names.json", stats.get("file_names", []))
 
 
 def _render_split_explanations(output_dir: Path, split: str, stats: dict[str, Any], action_dim: int, threshold: float) -> None:
