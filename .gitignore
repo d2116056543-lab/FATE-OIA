@@ -51,3 +51,4 @@ tests/**/__pycache__/
 tests/**/*.pyc
 
 .background_runs/
+docs/FATE_*_IMPLEMENTATION_STATUS_*.md
