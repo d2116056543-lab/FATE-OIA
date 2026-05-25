@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import ast
 import argparse
 import json
 import math
+import re
 from pathlib import Path
 from typing import Any
 
@@ -93,36 +95,123 @@ def load_grounding_cache(path: str) -> dict[str, dict[str, Any]]:
     return out
 
 
+def load_reason_grounding_rules(path: str, reason_dim: int) -> dict[int, set[str]]:
+    """Load reason-index -> BDD100K category mappings.
+
+    The config file is intentionally tiny YAML. PyYAML is used when available,
+    with a conservative line parser fallback so training does not depend on a
+    new package just for this mapping.
+    """
+    if not path:
+        return {}
+    p = Path(path)
+    if not p.exists():
+        return {}
+    text = p.read_text(encoding="utf-8-sig")
+    data: dict[str, Any] | None = None
+    try:
+        import yaml  # type: ignore
+
+        loaded = yaml.safe_load(text) or {}
+        data = loaded.get("reason_to_bdd100k_categories", loaded) if isinstance(loaded, dict) else {}
+    except Exception:
+        data = {}
+        in_mapping = False
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if stripped.startswith("reason_to_bdd100k_categories"):
+                in_mapping = True
+                continue
+            if not in_mapping:
+                continue
+            m = re.match(r"^(\d+)\s*:\s*(\[.*\])\s*$", stripped)
+            if not m:
+                continue
+            try:
+                data[m.group(1)] = ast.literal_eval(m.group(2))
+            except Exception:
+                continue
+    rules: dict[int, set[str]] = {}
+    if not isinstance(data, dict):
+        return rules
+    for key, value in data.items():
+        try:
+            idx = int(key)
+        except Exception:
+            continue
+        if idx < 0 or idx >= reason_dim:
+            continue
+        if isinstance(value, str):
+            cats = {value}
+        else:
+            cats = {str(x) for x in value or [] if str(x)}
+        if cats:
+            rules[idx] = cats
+    return rules
+
+
 def compute_grounding_loss(
     label_attention: torch.Tensor | None,
     batch: dict[str, Any],
     grounding_cache: dict[str, dict[str, Any]],
     args,
     device: torch.device,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, dict[str, float]]:
     if label_attention is None or not grounding_cache:
-        return torch.zeros((), device=device)
-    attn_maps = attention_to_patch_map(label_attention, slice(0, args.action_dim + args.reason_dim), args.image_height, args.image_width, args.patch_size)
+        return torch.zeros((), device=device), {}
+    global_attn_maps = attention_to_patch_map(label_attention, slice(0, args.action_dim + args.reason_dim), args.image_height, args.image_width, args.patch_size)
     losses = []
+    stats: dict[str, float] = {}
     categories = set(x.strip() for x in args.grounding_categories.split(",") if x.strip()) if args.grounding_categories else None
     file_names = batch.get("file_name", [])
     if isinstance(file_names, str):
         file_names = [file_names]
+    reasons = batch.get("reason")
+    if isinstance(reasons, torch.Tensor):
+        reasons = reasons.detach().cpu()
+    reason_rules = getattr(args, "reason_grounding_rules_map", {}) or {}
+    grounding_mode = getattr(args, "grounding_mode", "both")
     for i, fn in enumerate(file_names):
         rec = grounding_cache.get(str(fn))
         if not rec or not rec.get("label_json"):
             continue
         try:
             objects = load_bdd100k_objects(rec["label_json"])
-            target = objects_to_mask(objects, (args.grounding_image_width, args.grounding_image_height), attn_maps.shape[-2:], categories=categories).to(device)
         except Exception:
             continue
-        if float(target.sum().item()) <= 0:
-            continue
-        losses.append(attention_grounding_bce(attn_maps[i], target))
+        if grounding_mode in {"global", "both"}:
+            try:
+                target = objects_to_mask(objects, (args.grounding_image_width, args.grounding_image_height), global_attn_maps.shape[-2:], categories=categories).to(device)
+            except Exception:
+                target = None
+            if target is not None and float(target.sum().item()) > 0:
+                losses.append(attention_grounding_bce(global_attn_maps[i], target))
+                stats["global_count"] = stats.get("global_count", 0.0) + 1.0
+        if grounding_mode in {"label", "both"} and reason_rules and reasons is not None:
+            reason_vec = reasons[i] if i < len(reasons) else None
+            if reason_vec is None:
+                continue
+            for reason_idx, reason_categories in reason_rules.items():
+                if reason_idx >= len(reason_vec) or float(reason_vec[reason_idx]) <= 0:
+                    continue
+                label_idx = args.action_dim + int(reason_idx)
+                reason_attn = attention_to_patch_map(label_attention, label_idx, args.image_height, args.image_width, args.patch_size)
+                try:
+                    target = objects_to_mask(objects, (args.grounding_image_width, args.grounding_image_height), reason_attn.shape[-2:], categories=reason_categories).to(device)
+                except Exception:
+                    continue
+                if float(target.sum().item()) <= 0:
+                    continue
+                loss_i = attention_grounding_bce(reason_attn[i], target)
+                losses.append(loss_i)
+                key = f"reason_{reason_idx}_count"
+                stats[key] = stats.get(key, 0.0) + 1.0
+                stats[f"reason_{reason_idx}_loss_sum"] = stats.get(f"reason_{reason_idx}_loss_sum", 0.0) + float(loss_i.detach().item())
     if not losses:
-        return torch.zeros((), device=device)
-    return torch.stack(losses).mean()
+        return torch.zeros((), device=device), stats
+    return torch.stack(losses).mean(), stats
 
 
 
@@ -161,9 +250,13 @@ def recover_label_attention(attention: torch.Tensor | None, provenance: torch.Te
     return recovered
 
 
-def attention_to_patch_map(label_attention: torch.Tensor, label_slice: slice, image_height: int, image_width: int, patch_size: int) -> torch.Tensor:
+def attention_to_patch_map(label_attention: torch.Tensor, label_indices: slice | int | list[int], image_height: int, image_width: int, patch_size: int) -> torch.Tensor:
     # label_attention: [B,L,N_original]. Drop CLS and average selected labels.
-    patch_scores = label_attention[:, label_slice, 1:].mean(1)
+    if isinstance(label_indices, int):
+        patch_scores = label_attention[:, label_indices, 1:]
+    else:
+        selected = label_attention[:, label_indices, 1:]
+        patch_scores = selected.mean(1)
     h = image_height // patch_size
     w = image_width // patch_size
     if patch_scores.shape[1] != h * w:
@@ -222,8 +315,10 @@ def run_epoch(args, backbone, model, loader, criterion, optimizer, device, train
         grounding_loss = original_tokens.new_zeros(())
         if args.loss_grounding > 0 and grounding_cache:
             recovered_attn = recover_label_attention(out.get("attention"), provenance, original_tokens.shape[1])
-            grounding_loss = compute_grounding_loss(recovered_attn, batch, grounding_cache, args, device)
+            grounding_loss, grounding_stats = compute_grounding_loss(recovered_attn, batch, grounding_cache, args, device)
             loss = loss + args.loss_grounding * grounding_loss
+        else:
+            grounding_stats = {}
         if train:
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -245,6 +340,7 @@ def run_epoch(args, backbone, model, loader, criterion, optimizer, device, train
                 "r2a_loss": float(r2a_loss.item()),
                 "cf_loss": float(cf_loss.item()),
                 "grounding_loss": float(grounding_loss.item()) if "grounding_loss" in locals() else 0.0,
+                "grounding_stats": grounding_stats,
                 "batch_size": bs,
                 "token_stats": token_stats,
             }), flush=True)
@@ -280,6 +376,8 @@ def main() -> None:
     ap.add_argument("--loss_counterfactual", type=float, default=0.0)
     ap.add_argument("--loss_grounding", type=float, default=0.0)
     ap.add_argument("--grounding_cache_jsonl", default="")
+    ap.add_argument("--grounding_mode", choices=["global", "label", "both"], default="both")
+    ap.add_argument("--reason_grounding_rules", default="configs/reason_grounding_rules.yaml")
     ap.add_argument("--grounding_categories", default="person,rider,bike,car,bus,truck,motor,traffic light,traffic sign,lane/crosswalk")
     ap.add_argument("--grounding_image_width", type=int, default=1280)
     ap.add_argument("--grounding_image_height", type=int, default=720)
@@ -308,8 +406,11 @@ def main() -> None:
     train_loader = make_loader(args, "train", True)
     val_loader = make_loader(args, "val", False)
     grounding_cache = load_grounding_cache(args.grounding_cache_jsonl) if args.grounding_cache_jsonl else {}
+    args.reason_grounding_rules_map = load_reason_grounding_rules(args.reason_grounding_rules, args.reason_dim)
     if args.loss_grounding > 0 and not grounding_cache:
         print(json.dumps({"event": "fate_oia_grounding_disabled", "reason": "empty_grounding_cache"}), flush=True)
+    if args.loss_grounding > 0 and args.grounding_mode in {"label", "both"} and not args.reason_grounding_rules_map:
+        print(json.dumps({"event": "fate_oia_label_grounding_disabled", "reason": "empty_reason_grounding_rules"}), flush=True)
     best = -1.0
     history = []
     for epoch in range(args.epochs):

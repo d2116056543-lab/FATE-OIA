@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import torch
+from argparse import Namespace
 
 from fate_oia.engine.train_fate_oia import (
     compress_tokens,
+    compute_grounding_loss,
+    counterfactual_deletion_loss,
+    load_reason_grounding_rules,
     reason_to_action_consistency_loss,
     recover_label_attention,
 )
@@ -43,3 +47,48 @@ def test_reason_to_action_consistency_loss_is_scalar():
     loss = reason_to_action_consistency_loss(torch.randn(5, 4), torch.randn(5, 4))
     assert loss.ndim == 0
     assert torch.isfinite(loss)
+
+
+def test_counterfactual_deletion_loss_backpropagates_to_model():
+    torch.manual_seed(0)
+    model = FATEOIAFeatureModel(dim=8, action_dim=4, reason_dim=21, use_label_query=True)
+    tokens = torch.randn(2, 7, 8)
+    labels = torch.randint(0, 2, (2, 25)).float()
+    base_loss = torch.tensor(0.0)
+    loss = counterfactual_deletion_loss(model, tokens, labels, base_loss, action_dim=4, topk_ratio=0.5, margin=10.0)
+    loss.backward()
+    grad_norm = sum(float(p.grad.detach().abs().sum().item()) for p in model.parameters() if p.grad is not None)
+    assert grad_norm > 0
+
+
+def test_label_conditioned_grounding_uses_positive_reason(tmp_path):
+    label_json = tmp_path / "sample.json"
+    label_json.write_text(
+        '{"frames":[{"objects":[{"category":"person","box2d":{"x1":0,"y1":0,"x2":8,"y2":8}}]}]}',
+        encoding="utf-8",
+    )
+    rules_yaml = tmp_path / "rules.yaml"
+    rules_yaml.write_text('reason_to_bdd100k_categories:\\n  6: ["person"]\\n', encoding="utf-8")
+    rules = load_reason_grounding_rules(str(rules_yaml), reason_dim=21)
+    args = Namespace(
+        action_dim=4,
+        reason_dim=21,
+        image_height=16,
+        image_width=16,
+        patch_size=8,
+        grounding_image_width=16,
+        grounding_image_height=16,
+        grounding_categories="person",
+        grounding_mode="label",
+        reason_grounding_rules_map=rules,
+    )
+    attention = torch.zeros(1, 25, 5)
+    attention[:, :, 1:] = 0.25
+    batch = {
+        "file_name": ["sample.jpg"],
+        "reason": torch.tensor([[0, 0, 0, 0, 0, 0, 1] + [0] * 14], dtype=torch.float32),
+    }
+    cache = {"sample.jpg": {"file_name": "sample.jpg", "label_json": str(label_json)}}
+    loss, stats = compute_grounding_loss(attention, batch, cache, args, torch.device("cpu"))
+    assert torch.isfinite(loss)
+    assert stats["reason_6_count"] == 1.0
