@@ -84,6 +84,15 @@ def test_config_defaults_apply_when_cli_does_not_override(tmp_path, monkeypatch)
     assert args.auto_scale_lr is True
 
 
+def test_config_defaults_respect_boolean_optional_negative_flag(tmp_path, monkeypatch):
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text("training:\n  auto_scale_lr: true\n", encoding="utf-8")
+    args = Namespace(config=str(cfg), auto_scale_lr=False)
+    monkeypatch.setattr("sys.argv", ["train_fate_oia.py", "--config", str(cfg), "--no-auto_scale_lr"])
+    apply_config_defaults(args, load_config_defaults(str(cfg)))
+    assert args.auto_scale_lr is False
+
+
 def test_fate_oia_feature_model_outputs_attention_and_r2a():
     model = FATEOIAFeatureModel(dim=16, action_dim=4, reason_dim=21, use_label_query=True)
     out = model(torch.randn(3, 10, 16))

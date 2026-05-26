@@ -248,7 +248,7 @@ def apply_config_defaults(args, config_defaults: dict[str, Any]) -> None:
     for key, value in config_defaults.items():
         if not hasattr(args, key):
             continue
-        if f"--{key}" in cli_tokens:
+        if f"--{key}" in cli_tokens or f"--no-{key}" in cli_tokens:
             continue
         setattr(args, key, value)
 def load_grounding_cache(path: str) -> dict[str, dict[str, Any]]:
