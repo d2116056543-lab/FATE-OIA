@@ -26,6 +26,8 @@ if ($Run -eq "status") {
   Write-Host "  powershell -NoProfile -ExecutionPolicy Bypass -File scripts\FATE_OIA_runB_e13_const_lr1e4.ps1"
   Write-Host "  powershell -NoProfile -ExecutionPolicy Bypass -File scripts\FATE_OIA_runC_e13_cosine_labelcorr.ps1"
   Write-Host "  powershell -NoProfile -ExecutionPolicy Bypass -File scripts\FATE_OIA_runD_e13_cosine_labelcorr_uncertainty.ps1"
+  Write-Host ""
+  Write-Host "Run E/F are intentionally not auto-launched here: lane/drivable and softplus CF require their audit gates first."
   exit 0
 }
 
