@@ -440,7 +440,42 @@ def compute_grounding_loss(
                 label_idx = args.action_dim + int(reason_idx)
                 reason_attn = attention_to_patch_map(label_attention, label_idx, args.image_height, args.image_width, args.patch_size)
                 try:
-                    target = objects_to_mask(objects, (args.grounding_image_width, args.grounding_image_height), reason_attn.shape[-2:], categories=reason_categories).to(device)
+                    output_hw = reason_attn.shape[-2:]
+                    target_object = objects_to_mask(
+                        objects,
+                        (args.grounding_image_width, args.grounding_image_height),
+                        output_hw,
+                        categories=reason_categories,
+                        include_box2d=True,
+                        include_poly2d=False,
+                        include_drivable=False,
+                        include_lane=False,
+                    ).to(device)
+                    target_lane = objects_to_mask(
+                        objects,
+                        (args.grounding_image_width, args.grounding_image_height),
+                        output_hw,
+                        categories=reason_categories,
+                        include_box2d=False,
+                        include_poly2d=True,
+                        include_drivable=False,
+                        include_lane=True,
+                    ).to(device)
+                    target_drivable = objects_to_mask(
+                        objects,
+                        (args.grounding_image_width, args.grounding_image_height),
+                        output_hw,
+                        categories=reason_categories,
+                        include_box2d=False,
+                        include_poly2d=True,
+                        include_drivable=True,
+                        include_lane=False,
+                    ).to(device)
+                    if any(str(cat).startswith("area/") for cat in reason_categories):
+                        drv_map = rec.get("drivable_map")
+                        if drv_map and Path(str(drv_map)).exists():
+                            target_drivable = torch.maximum(target_drivable, drivable_map_to_mask(str(drv_map), output_hw).to(device))
+                    target = torch.maximum(torch.maximum(target_object, target_lane), target_drivable)
                 except Exception:
                     continue
                 if float(target.sum().item()) <= 0:
@@ -452,6 +487,16 @@ def compute_grounding_loss(
                 key = f"reason_{reason_idx}_count"
                 stats[key] = stats.get(key, 0.0) + 1.0
                 stats[f"reason_{reason_idx}_loss_sum"] = stats.get(f"reason_{reason_idx}_loss_sum", 0.0) + float(loss_i.detach().item())
+                if float(target_object.sum().item()) > 0:
+                    stats[f"reason_{reason_idx}_object_count"] = stats.get(f"reason_{reason_idx}_object_count", 0.0) + 1.0
+                if float(target_lane.sum().item()) > 0:
+                    stats[f"reason_{reason_idx}_lane_count"] = stats.get(f"reason_{reason_idx}_lane_count", 0.0) + 1.0
+                    stats["grounding_lane_count"] += 1.0
+                    stats["lane_iou_sum"] = stats.get("lane_iou_sum", 0.0) + float(mask_iou(reason_attn[i].detach(), target_lane.detach()))
+                if float(target_drivable.sum().item()) > 0:
+                    stats[f"reason_{reason_idx}_drivable_count"] = stats.get(f"reason_{reason_idx}_drivable_count", 0.0) + 1.0
+                    stats["grounding_drivable_count"] += 1.0
+                    stats["drivable_iou_sum"] = stats.get("drivable_iou_sum", 0.0) + float(mask_iou(reason_attn[i].detach(), target_drivable.detach()))
                 stats["grounding_valid_count"] += 1.0
                 stats["grounding_label_count"] += 1.0
     if not losses:

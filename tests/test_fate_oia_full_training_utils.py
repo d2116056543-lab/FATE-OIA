@@ -302,3 +302,57 @@ def test_label_conditioned_grounding_uses_positive_reason(tmp_path):
     loss, stats = compute_grounding_loss(attention, batch, cache, args, torch.device("cpu"))
     assert torch.isfinite(loss)
     assert stats["reason_6_count"] == 1.0
+
+
+def test_label_conditioned_grounding_uses_lane_and_drivable_targets(tmp_path):
+    label_json = tmp_path / "sample.json"
+    label_json.write_text(
+        '{"frames":[{"objects":['
+        '{"category":"lane/single white","poly2d":[{"vertices":[[0,8],[16,8],[16,12],[0,12]],"closed":true}]},'
+        '{"category":"area/drivable","poly2d":[{"vertices":[[0,12],[16,12],[16,16],[0,16]],"closed":true}]}'
+        ']}]}',
+        encoding="utf-8",
+    )
+    drive_map = tmp_path / "drive.png"
+    from PIL import Image
+
+    image = Image.new("L", (16, 16), 0)
+    for x in range(16):
+        for y in range(12, 16):
+            image.putpixel((x, y), 1)
+    image.save(drive_map)
+    rules_yaml = tmp_path / "rules.yaml"
+    rules_yaml.write_text(
+        'reason_to_bdd100k_categories:\n'
+        '  2: ["area/drivable"]\n'
+        '  11: ["lane/single white"]\n',
+        encoding="utf-8",
+    )
+    rules = load_reason_grounding_rules(str(rules_yaml), reason_dim=21)
+    args = Namespace(
+        action_dim=4,
+        reason_dim=21,
+        image_height=16,
+        image_width=16,
+        patch_size=8,
+        grounding_image_width=16,
+        grounding_image_height=16,
+        grounding_categories="",
+        grounding_mode="label",
+        reason_grounding_rules_map=rules,
+    )
+    attention = torch.zeros(1, 25, 5)
+    attention[:, :, 1:] = 0.25
+    reason = torch.zeros(1, 21)
+    reason[0, 2] = 1.0
+    reason[0, 11] = 1.0
+    batch = {"file_name": ["sample.jpg"], "reason": reason}
+    cache = {"sample.jpg": {"file_name": "sample.jpg", "label_json": str(label_json), "drivable_map": str(drive_map)}}
+    loss, stats = compute_grounding_loss(attention, batch, cache, args, torch.device("cpu"))
+    assert torch.isfinite(loss)
+    assert stats["reason_2_count"] == 1.0
+    assert stats["reason_2_drivable_count"] == 1.0
+    assert stats["reason_11_count"] == 1.0
+    assert stats["reason_11_lane_count"] == 1.0
+    assert stats["grounding_drivable_count"] >= 1.0
+    assert stats["grounding_lane_count"] >= 1.0
