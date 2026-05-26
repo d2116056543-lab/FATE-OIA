@@ -24,6 +24,7 @@ from fate_oia.datasets.bdd100k_grounding import load_bdd100k_objects
 from fate_oia.grounding.losses import attention_grounding_bce, mask_iou, pointing_game_hit
 from fate_oia.grounding.mask_builder import drivable_map_to_mask, objects_to_mask
 from fate_oia.losses.asymmetric_loss import AsymmetricLossMultiLabel
+from fate_oia.losses.logit_adjustment import apply_logit_adjustment, logit_adjustment_from_prior
 from fate_oia.losses.task_balance import UncertaintyTaskBalancer
 from fate_oia.models.fate_oia_model import FATEOIAFeatureModel
 from fate_oia.models.token_provenance import keep_merge_tokens, recover_attribution
@@ -327,6 +328,67 @@ def load_reason_grounding_rules(path: str, reason_dim: int) -> dict[int, set[str
         if cats:
             rules[idx] = cats
     return rules
+
+
+def _load_json_or_tensor(path: str | Path) -> Any:
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Required file not found: {p}")
+    if p.suffix.lower() in {".pt", ".pth"}:
+        return torch.load(p, map_location="cpu")
+    with p.open("r", encoding="utf-8-sig") as f:
+        return json.load(f)
+
+
+def load_label_bias_matrix(path: str, mode: str, num_labels: int) -> torch.Tensor | None:
+    if not path or mode == "none":
+        return None
+    data = _load_json_or_tensor(path)
+    key_candidates = {
+        "pmi": ("pmi_bias", "pmi_bias_matrix", "pmi"),
+        "cooccur": ("conditional_log_bias", "conditional_bias", "cooccur_bias", "cooccurrence_bias"),
+    }.get(mode, ())
+    matrix = None
+    if isinstance(data, dict):
+        for key in key_candidates:
+            if key in data:
+                matrix = data[key]
+                break
+        if matrix is None and "bias_matrix" in data:
+            matrix = data["bias_matrix"]
+    else:
+        matrix = data
+    if matrix is None:
+        raise ValueError(f"No {mode} label-correlation bias matrix found in {path}")
+    tensor = torch.as_tensor(matrix, dtype=torch.float32)
+    if tuple(tensor.shape) != (num_labels, num_labels):
+        raise ValueError(f"Label bias matrix must be [{num_labels},{num_labels}], got {tuple(tensor.shape)}")
+    return tensor
+
+
+def load_reason_logit_adjustment(path: str, reason_dim: int, tau: float) -> torch.Tensor | None:
+    if not path:
+        return None
+    data = _load_json_or_tensor(path)
+    if isinstance(data, dict):
+        values = (
+            data.get("reason_prior")
+            or data.get("reason_priors")
+            or data.get("prior")
+            or data.get("reason_positive_rate")
+        )
+        if values is None and "reason_positive_counts" in data:
+            counts = torch.as_tensor(data["reason_positive_counts"], dtype=torch.float32)
+            total = float(data.get("num_samples", data.get("train_count", counts.max().item() if counts.numel() else 1.0)))
+            values = (counts / max(total, 1.0)).tolist()
+    else:
+        values = data
+    if values is None:
+        raise ValueError(f"No reason prior/count vector found in {path}")
+    prior = torch.as_tensor(values, dtype=torch.float32)
+    if prior.numel() != reason_dim:
+        raise ValueError(f"Reason prior must have {reason_dim} values, got {prior.numel()}")
+    return logit_adjustment_from_prior(prior, tau=tau)
 
 
 def compute_grounding_loss(
@@ -844,6 +906,22 @@ def build_run_manifest(args, output_dir: Path, train_count: int, val_count: int,
             "layers": int(getattr(args, "label_correlation_layers", 1)),
             "heads": int(getattr(args, "label_correlation_heads", 4)),
             "bias": str(getattr(args, "label_correlation_bias", "none")),
+            "bias_path": str(getattr(args, "label_correlation_bias_path", "")),
+            "bias_weight": float(getattr(args, "label_correlation_bias_weight", 0.0)),
+            "residual_init": float(getattr(args, "label_correlation_residual_init", 1.0)),
+        },
+        "fusion": {
+            "mode": str(getattr(args, "fusion_mode", "learned_gate")),
+            "fixed_alpha": float(getattr(args, "fusion_fixed_alpha", 0.0)),
+            "gate_floor": float(getattr(args, "fusion_gate_floor", 0.0)),
+            "loss_gate_balance": float(getattr(args, "loss_gate_balance", 0.0)),
+            "loss_gate_entropy": float(getattr(args, "loss_gate_entropy", 0.0)),
+        },
+        "reason_loss": {
+            "mode": str(getattr(args, "reason_loss", "asl")),
+            "reason_loss_weight": float(getattr(args, "reason_loss_weight", 1.0)),
+            "reason_logit_adjust_tau": float(getattr(args, "reason_logit_adjust_tau", 0.3)),
+            "reason_prior_path": str(getattr(args, "reason_prior_path", "")),
         },
         "task_balance": str(getattr(args, "task_balance", "none")),
     }
@@ -938,14 +1016,18 @@ def fusion_diagnostics(out: dict[str, torch.Tensor]) -> dict[str, float]:
         "fused_equals_visual_rate": float((torch.abs(fused - visual) < 1.0e-4).float().mean().detach().item()),
     }
     if gate is not None:
+        gate_detached = gate.detach()
         stats.update(
             {
-                "fusion_gate_mean": float(gate.detach().mean().item()),
-                "fusion_gate_std": float(gate.detach().std(unbiased=False).item()),
-                "fusion_gate_min": float(gate.detach().min().item()),
-                "fusion_gate_max": float(gate.detach().max().item()),
+                "fusion_gate_mean": float(gate_detached.mean().item()),
+                "fusion_gate_std": float(gate_detached.std(unbiased=False).item()),
+                "fusion_gate_min": float(gate_detached.min().item()),
+                "fusion_gate_max": float(gate_detached.max().item()),
             }
         )
+        if gate_detached.ndim == 2:
+            for action_idx in range(gate_detached.shape[1]):
+                stats[f"fusion_gate_mean_action_{action_idx}"] = float(gate_detached[:, action_idx].mean().item())
     return stats
 
 
@@ -1063,9 +1145,20 @@ def run_epoch(args, backbone, model, loader, criterion, optimizer, device, train
         fusion_batch_stats = fusion_diagnostics(out)
         fusion_rows.append({"train": train, "epoch": epoch, "step": step, **fusion_batch_stats})
         logits = torch.cat([out["action_fused_logits"], out["reason_logits"]], dim=1)
-        main_loss = criterion(logits, labels)
+        reason_logits_for_loss = out["reason_logits"]
+        reason_logit_adjustment = getattr(args, "reason_logit_adjustment", None)
+        if str(getattr(args, "reason_loss", "asl")) == "asl_logit_adjust" and reason_logit_adjustment is not None:
+            reason_logits_for_loss = apply_logit_adjustment(
+                reason_logits_for_loss,
+                reason_logit_adjustment.to(device=device, dtype=reason_logits_for_loss.dtype),
+                sign="subtract",
+            )
         action_main_loss = criterion(out["action_fused_logits"], labels[:, : args.action_dim])
-        reason_main_loss = criterion(out["reason_logits"], labels[:, args.action_dim :])
+        reason_main_loss = criterion(reason_logits_for_loss, labels[:, args.action_dim :])
+        if float(getattr(args, "reason_loss_weight", 1.0)) != 1.0 or str(getattr(args, "reason_loss", "asl")) == "asl_logit_adjust":
+            main_loss = action_main_loss + float(getattr(args, "reason_loss_weight", 1.0)) * reason_main_loss
+        else:
+            main_loss = criterion(logits, labels)
         branch = action_branch_losses(
             out,
             labels[:, : args.action_dim],
@@ -1096,6 +1189,17 @@ def run_epoch(args, backbone, model, loader, criterion, optimizer, device, train
             grounding_loss, grounding_stats = compute_grounding_loss(recovered_attn, batch, grounding_cache, args, device)
         else:
             grounding_stats = {}
+        gate_balance_loss = logits.new_zeros(())
+        gate_entropy_loss = logits.new_zeros(())
+        gate = out.get("fusion_gate")
+        if gate is not None and float(getattr(args, "loss_gate_balance", 0.0)) > 0:
+            gate_balance_loss = (gate.mean() - float(getattr(args, "fusion_gate_target", 0.5))).pow(2)
+            action_extra = action_extra + float(args.loss_gate_balance) * gate_balance_loss
+        if gate is not None and float(getattr(args, "loss_gate_entropy", 0.0)) > 0:
+            gate_clamped = gate.clamp(1e-6, 1.0 - 1e-6)
+            entropy = -(gate_clamped * gate_clamped.log() + (1.0 - gate_clamped) * (1.0 - gate_clamped).log()).mean()
+            gate_entropy_loss = -entropy
+            action_extra = action_extra + float(args.loss_gate_entropy) * gate_entropy_loss
         task_balance_components: dict[str, torch.Tensor] = {}
         if task_balancer is not None:
             balanced_losses = {
@@ -1160,6 +1264,8 @@ def run_epoch(args, backbone, model, loader, criterion, optimizer, device, train
             "action_fused_loss_main_only": float(branch["action_fused_loss_main_only"].detach().item()),
             "action_fused_aux_loss": float(branch["action_fused_aux_loss"].detach().item()),
             "action_agree_loss": float(branch["action_agree_loss"].detach().item()),
+            "gate_balance_loss": float(gate_balance_loss.detach().item()),
+            "gate_entropy_loss": float(gate_entropy_loss.detach().item()),
             "action_branch_total": float(branch["action_branch_total"].detach().item()),
             "cf_loss": float(cf_loss.detach().item()),
             "grounding_loss": float(grounding_loss.detach().item()) if isinstance(grounding_loss, torch.Tensor) else 0.0,
@@ -1275,6 +1381,12 @@ def main() -> None:
     ap.add_argument("--include_fused_branch_loss", action=argparse.BooleanOptionalAction, default=False)
     ap.add_argument("--loss_action_fused_aux", type=float, default=0.0)
     ap.add_argument("--r2a_consistency_mode", choices=["none", "detach_mimic", "gt", "gt_and_agree"], default="gt_and_agree")
+    ap.add_argument("--fusion_mode", choices=["learned_gate", "gated_floor", "fixed_alpha", "reason_only", "visual_only"], default="learned_gate")
+    ap.add_argument("--fusion_fixed_alpha", type=float, default=0.0)
+    ap.add_argument("--fusion_gate_floor", type=float, default=0.0)
+    ap.add_argument("--fusion_gate_target", type=float, default=0.5)
+    ap.add_argument("--loss_gate_balance", type=float, default=0.0)
+    ap.add_argument("--loss_gate_entropy", type=float, default=0.0)
     ap.add_argument("--loss_counterfactual", type=float, default=0.0)
     ap.add_argument("--counterfactual_start_epoch", type=int, default=0)
     ap.add_argument("--counterfactual_eval", action=argparse.BooleanOptionalAction, default=False)
@@ -1293,7 +1405,15 @@ def main() -> None:
     ap.add_argument("--label_correlation_layers", type=int, default=1)
     ap.add_argument("--label_correlation_heads", type=int, default=4)
     ap.add_argument("--label_correlation_dropout", type=float, default=0.1)
-    ap.add_argument("--label_correlation_bias", choices=["none"], default="none")
+    ap.add_argument("--label_correlation_bias", choices=["none", "cooccur", "pmi"], default="none")
+    ap.add_argument("--label_correlation_bias_path", default="")
+    ap.add_argument("--label_correlation_bias_weight", type=float, default=0.0)
+    ap.add_argument("--label_correlation_residual_init", type=float, default=1.0)
+    ap.add_argument("--label_correlation_residual_learnable", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--reason_loss", choices=["asl", "asl_logit_adjust"], default="asl")
+    ap.add_argument("--reason_logit_adjust_tau", type=float, default=0.3)
+    ap.add_argument("--reason_prior_path", default="")
+    ap.add_argument("--reason_loss_weight", type=float, default=1.0)
     ap.add_argument("--task_balance", choices=["none", "uncertainty"], default="none")
     ap.add_argument("--token_compression", choices=["none", "keep_merge"], default="none")
     ap.add_argument("--token_keep_ratio", type=float, default=1.0)
@@ -1348,6 +1468,16 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "args.json").write_text(json.dumps(vars(args), indent=2), encoding="utf-8")
     device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
+    label_bias_matrix = load_label_bias_matrix(
+        args.label_correlation_bias_path,
+        args.label_correlation_bias,
+        args.action_dim + args.reason_dim,
+    )
+    args.reason_logit_adjustment = load_reason_logit_adjustment(
+        args.reason_prior_path,
+        args.reason_dim,
+        args.reason_logit_adjust_tau,
+    ) if args.reason_loss == "asl_logit_adjust" else None
     backbone, dim = build_backbone(args, device)
     model = FATEOIAFeatureModel(
         dim=dim,
@@ -1359,6 +1489,13 @@ def main() -> None:
         label_correlation_heads=args.label_correlation_heads,
         label_correlation_dropout=args.label_correlation_dropout,
         label_correlation_bias=args.label_correlation_bias,
+        label_correlation_bias_matrix=label_bias_matrix,
+        label_correlation_bias_weight=args.label_correlation_bias_weight,
+        label_correlation_residual_init=args.label_correlation_residual_init,
+        label_correlation_residual_learnable=args.label_correlation_residual_learnable,
+        fusion_mode=args.fusion_mode,
+        fusion_fixed_alpha=args.fusion_fixed_alpha,
+        fusion_gate_floor=args.fusion_gate_floor,
     ).to(device)
     task_balancer = UncertaintyTaskBalancer(("action", "reason", "r2a", "grounding")).to(device) if args.task_balance == "uncertainty" else None
     optimizer_params = list(model.parameters()) + (list(task_balancer.parameters()) if task_balancer is not None else [])
