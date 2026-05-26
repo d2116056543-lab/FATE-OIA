@@ -7,6 +7,7 @@ import math
 import re
 import socket
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,42 @@ from fate_oia.models.fate_oia_model import FATEOIAFeatureModel
 from fate_oia.models.token_provenance import keep_merge_tokens, recover_attribution
 from fate_oia.transforms import AspectRatioLetterboxTransform, FixedSizeResizeTransform
 from fate_oia.utils.lr_scaling import compute_lr_scaling
+
+
+@dataclass
+class ResumeState:
+    start_epoch: int = 0
+    best_test_score: float = -1.0
+    best_val_score: float = -1.0
+
+
+def load_resume_checkpoint(
+    checkpoint_path: str | Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer | None = None,
+    *,
+    device: str | torch.device = "cpu",
+    resume_optimizer: bool = True,
+) -> ResumeState:
+    """Restore model/optimizer state and return the next epoch to run."""
+    checkpoint_path = Path(checkpoint_path)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Resume checkpoint not found: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    if not isinstance(checkpoint, dict):
+        raise ValueError(f"Unsupported checkpoint type in {checkpoint_path}: {type(checkpoint)!r}")
+    model_state = checkpoint.get("model") or checkpoint.get("state_dict")
+    if model_state is None:
+        raise KeyError(f"Checkpoint {checkpoint_path} does not contain 'model' or 'state_dict'.")
+    model.load_state_dict(model_state, strict=True)
+    if optimizer is not None and resume_optimizer and checkpoint.get("optimizer") is not None:
+        optimizer.load_state_dict(checkpoint["optimizer"])
+    epoch = int(checkpoint.get("epoch", -1))
+    return ResumeState(
+        start_epoch=epoch + 1,
+        best_test_score=float(checkpoint.get("best_test_score", -1.0)),
+        best_val_score=float(checkpoint.get("best_val_score", -1.0)),
+    )
 
 
 def build_transform(image_height: int, image_width: int, patch_size: int = 8, preserve_aspect_ratio: bool = True, return_meta: bool = True):
@@ -563,6 +600,9 @@ def build_run_manifest(args, output_dir: Path, train_count: int, val_count: int,
         "test_split_count": int(test_count),
         "config_resolved": vars(args),
         "checkpoint_input": str(args.pretrained_weights),
+        "resume_checkpoint": str(getattr(args, "resume", "")),
+        "resume_optimizer": bool(getattr(args, "resume_optimizer", True)),
+        "start_epoch": int(getattr(args, "start_epoch", 0)),
         "pretrained_weights": str(args.pretrained_weights),
         "pretrained_source": str(getattr(args, "pretrained_source", "public_dino_reference")),
         "using_classifier_head": False,
@@ -988,6 +1028,8 @@ def main() -> None:
     ap.add_argument("--max_val_samples", type=int, default=0)
     ap.add_argument("--max_test_samples", type=int, default=0)
     ap.add_argument("--max_saved_token_stats", type=int, default=16)
+    ap.add_argument("--resume", default="", help="Optional FATE-OIA checkpoint_latest/best path to resume from.")
+    ap.add_argument("--resume_optimizer", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--pretrained_source", default="public_dino_reference")
     ap.add_argument("--best_selection_split", choices=["val", "test"], default="test")
     ap.add_argument("--best_selection_metric", default="joint_test_score")
@@ -1020,6 +1062,23 @@ def main() -> None:
     backbone, dim = build_backbone(args, device)
     model = FATEOIAFeatureModel(dim=dim, action_dim=args.action_dim, reason_dim=args.reason_dim, use_label_query=args.use_label_query).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    resume_state = ResumeState()
+    if args.resume:
+        resume_state = load_resume_checkpoint(args.resume, model, optimizer, device=device, resume_optimizer=args.resume_optimizer)
+        print(
+            json.dumps(
+                {
+                    "event": "fate_oia_resume_loaded",
+                    "resume": str(args.resume),
+                    "start_epoch": resume_state.start_epoch,
+                    "best_test_score": resume_state.best_test_score,
+                    "best_val_score": resume_state.best_val_score,
+                    "resume_optimizer": bool(args.resume_optimizer),
+                }
+            ),
+            flush=True,
+        )
+    args.start_epoch = int(resume_state.start_epoch)
     criterion = make_multilabel_criterion(args)
     train_loader = make_loader(args, "train", True)
     val_loader = make_loader(args, "val", False)
@@ -1062,10 +1121,13 @@ def main() -> None:
         if args.render_explanation_text:
             _render_split_explanations(out_dir, split, stats, args.action_dim, args.eval_threshold)
 
-    best_test = -1.0
-    best_val = -1.0
+    best_test = float(resume_state.best_test_score)
+    best_val = float(resume_state.best_val_score)
     history = []
-    for epoch in range(args.epochs):
+    if args.start_epoch >= args.epochs:
+        print(json.dumps({"event": "fate_oia_resume_already_complete", "start_epoch": args.start_epoch, "epochs": args.epochs}), flush=True)
+        return
+    for epoch in range(args.start_epoch, args.epochs):
         train_stats = run_epoch(args, backbone, model, train_loader, criterion, optimizer, device, True, grounding_cache, epoch)
         val_stats = run_epoch(args, backbone, model, val_loader, criterion, optimizer, device, False, grounding_cache, epoch)
         test_stats = run_epoch(args, backbone, model, test_loader, criterion, optimizer, device, False, grounding_cache, epoch)
