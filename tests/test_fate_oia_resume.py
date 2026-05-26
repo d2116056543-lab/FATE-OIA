@@ -18,6 +18,7 @@ def test_load_resume_checkpoint_restores_model_optimizer_and_epoch(tmp_path):
         "epoch": 4,
         "model": source.state_dict(),
         "optimizer": optimizer.state_dict(),
+        "scheduler_state_dict": {"last_epoch": 4},
         "best_test_score": 0.42,
         "best_val_score": 0.37,
     }
@@ -31,6 +32,8 @@ def test_load_resume_checkpoint_restores_model_optimizer_and_epoch(tmp_path):
     assert state.start_epoch == 5
     assert state.best_test_score == 0.42
     assert state.best_val_score == 0.37
+    assert state.optimizer_restored is True
+    assert state.scheduler_state == {"last_epoch": 4}
     for expected, actual in zip(source.parameters(), target.parameters()):
         assert torch.allclose(expected, actual)
     assert target_optimizer.state_dict()["state"]

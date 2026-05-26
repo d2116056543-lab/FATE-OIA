@@ -24,6 +24,7 @@ from fate_oia.datasets.bdd100k_grounding import load_bdd100k_objects
 from fate_oia.grounding.losses import attention_grounding_bce, mask_iou, pointing_game_hit
 from fate_oia.grounding.mask_builder import drivable_map_to_mask, objects_to_mask
 from fate_oia.losses.asymmetric_loss import AsymmetricLossMultiLabel
+from fate_oia.losses.task_balance import UncertaintyTaskBalancer
 from fate_oia.models.fate_oia_model import FATEOIAFeatureModel
 from fate_oia.models.token_provenance import keep_merge_tokens, recover_attribution
 from fate_oia.transforms import AspectRatioLetterboxTransform, FixedSizeResizeTransform
@@ -35,6 +36,11 @@ class ResumeState:
     start_epoch: int = 0
     best_test_score: float = -1.0
     best_val_score: float = -1.0
+    optimizer_restored: bool = False
+    scheduler_state: dict[str, Any] | None = None
+    scheduler_restored: bool = False
+    missing_keys: list[str] | None = None
+    unexpected_keys: list[str] | None = None
 
 
 def load_resume_checkpoint(
@@ -44,6 +50,7 @@ def load_resume_checkpoint(
     *,
     device: str | torch.device = "cpu",
     resume_optimizer: bool = True,
+    strict: bool = True,
 ) -> ResumeState:
     """Restore model/optimizer state and return the next epoch to run."""
     checkpoint_path = Path(checkpoint_path)
@@ -55,14 +62,23 @@ def load_resume_checkpoint(
     model_state = checkpoint.get("model") or checkpoint.get("state_dict")
     if model_state is None:
         raise KeyError(f"Checkpoint {checkpoint_path} does not contain 'model' or 'state_dict'.")
-    model.load_state_dict(model_state, strict=True)
+    load_result = model.load_state_dict(model_state, strict=strict)
+    missing = list(getattr(load_result, "missing_keys", []))
+    unexpected = list(getattr(load_result, "unexpected_keys", []))
+    optimizer_restored = False
     if optimizer is not None and resume_optimizer and checkpoint.get("optimizer") is not None:
         optimizer.load_state_dict(checkpoint["optimizer"])
+        optimizer_restored = True
     epoch = int(checkpoint.get("epoch", -1))
     return ResumeState(
         start_epoch=epoch + 1,
         best_test_score=float(checkpoint.get("best_test_score", -1.0)),
         best_val_score=float(checkpoint.get("best_val_score", -1.0)),
+        optimizer_restored=optimizer_restored,
+        scheduler_state=checkpoint.get("scheduler_state_dict") or checkpoint.get("scheduler"),
+        scheduler_restored=False,
+        missing_keys=missing,
+        unexpected_keys=unexpected,
     )
 
 
@@ -123,6 +139,63 @@ def make_multilabel_criterion(args) -> nn.Module:
     if args.loss == "asl":
         return AsymmetricLossMultiLabel(gamma_pos=args.asl_gamma_pos, gamma_neg=args.asl_gamma_neg, clip=args.asl_clip)
     return nn.BCEWithLogitsLoss()
+
+
+def current_lr(optimizer: torch.optim.Optimizer) -> float:
+    return float(optimizer.param_groups[0].get("lr", 0.0)) if optimizer.param_groups else 0.0
+
+
+def build_scheduler(args, optimizer: torch.optim.Optimizer):
+    mode = str(getattr(args, "scheduler", "none")).lower()
+    if mode == "none":
+        return None
+    if mode == "cosine":
+        remaining = max(1, int(args.epochs) - int(getattr(args, "start_epoch", 0)))
+        warmup_epochs = max(0, int(getattr(args, "warmup_epochs", 0)))
+        if warmup_epochs <= 0:
+            return torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=remaining,
+                eta_min=float(getattr(args, "min_lr", 0.0)),
+            )
+        warmup = torch.optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=1.0e-3,
+            end_factor=1.0,
+            total_iters=warmup_epochs,
+        )
+        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(1, remaining - warmup_epochs),
+            eta_min=float(getattr(args, "min_lr", 0.0)),
+        )
+        return torch.optim.lr_scheduler.SequentialLR(optimizer, [warmup, cosine], milestones=[warmup_epochs])
+    if mode == "plateau":
+        return torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="max",
+            factor=float(getattr(args, "plateau_factor", 0.5)),
+            patience=int(getattr(args, "plateau_patience", 2)),
+            min_lr=float(getattr(args, "min_lr", 0.0)),
+        )
+    raise ValueError(f"Unsupported scheduler: {mode}")
+
+
+def step_scheduler(args, scheduler, *, val_score: float, test_score: float, row: dict[str, Any]) -> None:
+    if scheduler is None:
+        return
+    mode = str(getattr(args, "scheduler", "none")).lower()
+    if mode == "plateau":
+        monitor = str(getattr(args, "plateau_monitor", "test_joint"))
+        values = {
+            "test_joint": test_score,
+            "val_joint": val_score,
+            "test_exp_mF1": row.get("test_metrics", {}).get("Exp_mF1", test_score),
+            "val_exp_mF1": row.get("val_metrics", {}).get("Exp_mF1", val_score),
+        }
+        scheduler.step(float(values.get(monitor, test_score)))
+    else:
+        scheduler.step()
 
 
 def load_config_defaults(path: str) -> dict[str, Any]:
@@ -544,6 +617,75 @@ def counterfactual_deletion_loss(
     return F.relu(margin + base_loss.detach() - masked_loss)
 
 
+@torch.no_grad()
+def compute_counterfactual_audit(
+    model: nn.Module,
+    tokens: torch.Tensor,
+    labels: torch.Tensor,
+    action_dim: int,
+    topk_ratio: float = 0.15,
+    mask_fill: str = "mean",
+) -> dict[str, float]:
+    out = model(tokens)
+    attn = out.get("attention")
+    if attn is None:
+        return {
+            "cf_valid_count": 0,
+            "cf_action_drop_mean": 0.0,
+            "cf_reason_drop_mean": 0.0,
+            "cf_random_action_drop_mean": 0.0,
+            "cf_random_reason_drop_mean": 0.0,
+            "cf_loss_positive_rate": 0.0,
+            "cf_base_prob": 0.0,
+            "cf_masked_prob": 0.0,
+            "cf_random_prob": 0.0,
+            "cf_topk_ratio": float(topk_ratio),
+            "cf_mask_fill": mask_fill,
+        }
+    logits = torch.cat([out["action_logits"], out["reason_logits"]], dim=1)
+    probs = torch.sigmoid(logits)
+    attn_mean = attn.mean(1).mean(1) if attn.ndim == 4 else attn.mean(1)
+    patch_scores = attn_mean[:, 1:] if attn_mean.shape[1] == tokens.shape[1] else attn_mean
+    k = max(1, int(round(patch_scores.shape[1] * topk_ratio)))
+    topk = torch.topk(patch_scores, k=k, dim=1).indices + (1 if attn_mean.shape[1] == tokens.shape[1] else 0)
+    masked = _fill_masked_tokens(tokens, topk, mask_fill)
+    masked_out = model(masked)
+    masked_probs = torch.sigmoid(torch.cat([masked_out["action_logits"], masked_out["reason_logits"]], dim=1))
+    random_idx = torch.stack([torch.randperm(tokens.shape[1], device=tokens.device)[: topk.shape[1]] for _ in range(tokens.shape[0])], dim=0)
+    random_masked = _fill_masked_tokens(tokens, random_idx, mask_fill)
+    random_out = model(random_masked)
+    random_probs = torch.sigmoid(torch.cat([random_out["action_logits"], random_out["reason_logits"]], dim=1))
+    positive = labels.float() > 0
+    action_pos = positive[:, :action_dim]
+    reason_pos = positive[:, action_dim:]
+
+    def _mean_selected(delta: torch.Tensor, mask: torch.Tensor) -> float:
+        if not bool(mask.any()):
+            return 0.0
+        return float(delta[mask].mean().item())
+
+    action_drop = probs[:, :action_dim] - masked_probs[:, :action_dim]
+    reason_drop = probs[:, action_dim:] - masked_probs[:, action_dim:]
+    random_action_drop = probs[:, :action_dim] - random_probs[:, :action_dim]
+    random_reason_drop = probs[:, action_dim:] - random_probs[:, action_dim:]
+    pos_probs = probs[positive] if bool(positive.any()) else probs.reshape(-1)
+    masked_pos_probs = masked_probs[positive] if bool(positive.any()) else masked_probs.reshape(-1)
+    random_pos_probs = random_probs[positive] if bool(positive.any()) else random_probs.reshape(-1)
+    return {
+        "cf_valid_count": int(tokens.shape[0]),
+        "cf_action_drop_mean": _mean_selected(action_drop, action_pos),
+        "cf_reason_drop_mean": _mean_selected(reason_drop, reason_pos),
+        "cf_random_action_drop_mean": _mean_selected(random_action_drop, action_pos),
+        "cf_random_reason_drop_mean": _mean_selected(random_reason_drop, reason_pos),
+        "cf_loss_positive_rate": float(((probs - masked_probs)[positive] > 0).float().mean().item()) if bool(positive.any()) else 0.0,
+        "cf_base_prob": float(pos_probs.mean().item()),
+        "cf_masked_prob": float(masked_pos_probs.mean().item()),
+        "cf_random_prob": float(random_pos_probs.mean().item()),
+        "cf_topk_ratio": float(topk_ratio),
+        "cf_mask_fill": mask_fill,
+    }
+
+
 def _json_safe(value: Any) -> Any:
     if isinstance(value, torch.Tensor):
         if value.numel() == 1:
@@ -602,6 +744,9 @@ def build_run_manifest(args, output_dir: Path, train_count: int, val_count: int,
         "checkpoint_input": str(args.pretrained_weights),
         "resume_checkpoint": str(getattr(args, "resume", "")),
         "resume_optimizer": bool(getattr(args, "resume_optimizer", True)),
+        "resume_scheduler": bool(getattr(args, "resume_scheduler", True)),
+        "optimizer_restored": bool(getattr(args, "optimizer_restored", False)),
+        "scheduler_restored": bool(getattr(args, "scheduler_restored", False)),
         "start_epoch": int(getattr(args, "start_epoch", 0)),
         "pretrained_weights": str(args.pretrained_weights),
         "pretrained_source": str(getattr(args, "pretrained_source", "public_dino_reference")),
@@ -623,7 +768,10 @@ def build_run_manifest(args, output_dir: Path, train_count: int, val_count: int,
         "lr_actual": float(args.lr),
         "backbone_lr": 0.0,
         "optimizer": "AdamW",
-        "scheduler": "none",
+        "scheduler": str(getattr(args, "scheduler", "none")),
+        "min_lr": float(getattr(args, "min_lr", 0.0)),
+        "warmup_epochs": int(getattr(args, "warmup_epochs", 0)),
+        "plateau_monitor": str(getattr(args, "plateau_monitor", "test_joint")),
         "mixed_precision": False,
         "loss_divided_by_accumulation": True,
         "token_compression": {
@@ -642,9 +790,17 @@ def build_run_manifest(args, output_dir: Path, train_count: int, val_count: int,
         "counterfactual": {
             "loss_counterfactual": float(args.loss_counterfactual),
             "counterfactual_start_epoch": int(getattr(args, "counterfactual_start_epoch", 0)),
+            "counterfactual_eval": bool(getattr(args, "counterfactual_eval", False)),
             "cf_mask_fill": args.cf_mask_fill,
             "counterfactual_topk_ratio": float(args.counterfactual_topk_ratio),
         },
+        "label_correlation": {
+            "mode": str(getattr(args, "label_correlation", "none")),
+            "layers": int(getattr(args, "label_correlation_layers", 1)),
+            "heads": int(getattr(args, "label_correlation_heads", 4)),
+            "bias": str(getattr(args, "label_correlation_bias", "none")),
+        },
+        "task_balance": str(getattr(args, "task_balance", "none")),
     }
 
 
@@ -724,6 +880,42 @@ def _save_split_artifacts(epoch_dir: Path, split: str, stats: dict[str, Any], ac
         _write_json(epoch_dir / "file_names.json", stats.get("file_names", []))
 
 
+def fusion_diagnostics(out: dict[str, torch.Tensor]) -> dict[str, float]:
+    gate = out.get("fusion_gate")
+    visual = torch.sigmoid(out.get("action_visual_logits", out["action_logits"]))
+    reason = torch.sigmoid(out.get("action_reason_logits", out.get("reason_to_action_logits", out["action_logits"])))
+    fused = torch.sigmoid(out.get("action_fused_logits", out["action_logits"]))
+    stats = {
+        "action_visual_vs_fused_l2": float(torch.mean((visual - fused) ** 2).sqrt().detach().item()),
+        "action_reason_vs_fused_l2": float(torch.mean((reason - fused) ** 2).sqrt().detach().item()),
+        "action_visual_vs_reason_l2": float(torch.mean((visual - reason) ** 2).sqrt().detach().item()),
+        "fused_equals_reason_rate": float((torch.abs(fused - reason) < 1.0e-4).float().mean().detach().item()),
+        "fused_equals_visual_rate": float((torch.abs(fused - visual) < 1.0e-4).float().mean().detach().item()),
+    }
+    if gate is not None:
+        stats.update(
+            {
+                "fusion_gate_mean": float(gate.detach().mean().item()),
+                "fusion_gate_std": float(gate.detach().std(unbiased=False).item()),
+                "fusion_gate_min": float(gate.detach().min().item()),
+                "fusion_gate_max": float(gate.detach().max().item()),
+            }
+        )
+    return stats
+
+
+def summarize_numeric_rows(rows: list[dict[str, Any]]) -> dict[str, float]:
+    if not rows:
+        return {}
+    keys = sorted({k for row in rows for k, v in row.items() if isinstance(v, (int, float)) and not isinstance(v, bool)})
+    out: dict[str, float] = {}
+    for key in keys:
+        vals = [float(row[key]) for row in rows if isinstance(row.get(key), (int, float)) and not isinstance(row.get(key), bool)]
+        if vals:
+            out[key] = float(sum(vals) / len(vals))
+    return out
+
+
 def _render_split_explanations(output_dir: Path, split: str, stats: dict[str, Any], action_dim: int, threshold: float) -> None:
     try:
         from fate_oia.engine.render_oia_explanations import render_from_tensors
@@ -772,6 +964,14 @@ def write_epoch_artifacts(output_dir: Path, epoch: int, train_stats: dict[str, A
     })
     _write_json(epoch_dir / "metrics_summary.json", metrics)
     _write_json(epoch_dir / "branch_metrics.json", {"val": val_stats.get("branch_metrics", {}), "test": test_stats.get("branch_metrics", {}) if test_stats else {}})
+    fusion_payload = {
+        "train": train_stats.get("fusion_stats", {}),
+        "val": val_stats.get("fusion_stats", {}),
+        "test": test_stats.get("fusion_stats", {}) if test_stats else {},
+    }
+    _write_json(epoch_dir / "fusion_stats.json", fusion_payload)
+    metrics.update({f"fusion_{k}": v for k, v in (primary.get("fusion_stats", {}) if isinstance(primary, dict) else {}).items()})
+    _write_json(epoch_dir / "metrics_summary.json", metrics)
     _write_jsonl(epoch_dir / "loss_components.jsonl", train_stats.get("loss_components", []) + val_stats.get("loss_components", []) + (test_stats.get("loss_components", []) if test_stats else []))
     _save_split_artifacts(epoch_dir, "val", val_stats, action_dim)
     if test_stats is not None:
@@ -789,7 +989,7 @@ def write_epoch_artifacts(output_dir: Path, epoch: int, train_stats: dict[str, A
         if test_stats is not None:
             _render_split_explanations(epoch_dir, "test", test_stats, action_dim, float(config_resolved.get("eval_threshold", 0.5)))
 
-def run_epoch(args, backbone, model, loader, criterion, optimizer, device, train: bool, grounding_cache: dict[str, dict[str, Any]] | None = None, epoch: int = 0) -> dict[str, Any]:
+def run_epoch(args, backbone, model, loader, criterion, optimizer, device, train: bool, grounding_cache: dict[str, dict[str, Any]] | None = None, epoch: int = 0, task_balancer: nn.Module | None = None) -> dict[str, Any]:
     model.train(train)
     total_loss = 0.0
     count = 0
@@ -802,6 +1002,7 @@ def run_epoch(args, backbone, model, loader, criterion, optimizer, device, train
     loss_components: list[dict[str, Any]] = []
     grounding_rows: list[dict[str, Any]] = []
     counterfactual_rows: list[dict[str, Any]] = []
+    fusion_rows: list[dict[str, Any]] = []
     file_names_all: list[str] = []
     accum = max(1, int(getattr(args, "gradient_accumulation_steps", 1)))
     if train:
@@ -814,8 +1015,12 @@ def run_epoch(args, backbone, model, loader, criterion, optimizer, device, train
         keep_ratio = scheduled_keep_ratio(args, epoch)
         tokens, provenance, token_stats = compress_tokens(original_tokens, keep_ratio, args.num_summary_tokens, args.min_tokens, args.token_compression)
         out = model(tokens)
+        fusion_batch_stats = fusion_diagnostics(out)
+        fusion_rows.append({"train": train, "epoch": epoch, "step": step, **fusion_batch_stats})
         logits = torch.cat([out["action_fused_logits"], out["reason_logits"]], dim=1)
         main_loss = criterion(logits, labels)
+        action_main_loss = criterion(out["action_fused_logits"], labels[:, : args.action_dim])
+        reason_main_loss = criterion(out["reason_logits"], labels[:, args.action_dim :])
         branch = action_branch_losses(
             out,
             labels[:, : args.action_dim],
@@ -832,21 +1037,37 @@ def run_epoch(args, backbone, model, loader, criterion, optimizer, device, train
             action_extra = logits.new_zeros(())
         else:
             action_extra = branch["action_total"]
-        loss = main_loss + action_extra
         cf_loss = original_tokens.new_zeros(())
         cf_stats = {"cf_loss": 0.0, "cf_topk_ratio": float(args.counterfactual_topk_ratio), "cf_mask_fill": args.cf_mask_fill, "cf_valid_count": 0}
+        if (bool(getattr(args, "counterfactual_eval", False)) or args.loss_counterfactual > 0) and epoch >= int(getattr(args, "counterfactual_start_epoch", 0)):
+            cf_stats.update(compute_counterfactual_audit(model, tokens, labels, args.action_dim, args.counterfactual_topk_ratio, mask_fill=args.cf_mask_fill))
         if args.loss_counterfactual > 0 and epoch >= int(getattr(args, "counterfactual_start_epoch", 0)):
             cf_loss = counterfactual_deletion_loss(model, tokens, labels, main_loss, args.action_dim, args.counterfactual_topk_ratio, mask_fill=args.cf_mask_fill)
-            loss = loss + args.loss_counterfactual * cf_loss
             cf_stats["cf_loss"] = float(cf_loss.detach().item())
             cf_stats["cf_valid_count"] = int(labels.shape[0])
         grounding_loss = original_tokens.new_zeros(())
         if args.loss_grounding > 0 and grounding_cache:
             recovered_attn = recover_label_attention(out.get("attention"), provenance, original_tokens.shape[1])
             grounding_loss, grounding_stats = compute_grounding_loss(recovered_attn, batch, grounding_cache, args, device)
-            loss = loss + args.loss_grounding * grounding_loss
         else:
             grounding_stats = {}
+        task_balance_components: dict[str, torch.Tensor] = {}
+        if task_balancer is not None:
+            balanced_losses = {
+                "action": action_main_loss,
+                "reason": reason_main_loss,
+                "r2a": branch["action_total"],
+                "grounding": float(args.loss_grounding) * grounding_loss,
+            }
+            loss, task_balance_components = task_balancer(balanced_losses)
+            if args.loss_counterfactual > 0 and epoch >= int(getattr(args, "counterfactual_start_epoch", 0)):
+                loss = loss + args.loss_counterfactual * cf_loss
+        else:
+            loss = main_loss + action_extra
+            if args.loss_grounding > 0 and grounding_cache:
+                loss = loss + args.loss_grounding * grounding_loss
+            if args.loss_counterfactual > 0 and epoch >= int(getattr(args, "counterfactual_start_epoch", 0)):
+                loss = loss + args.loss_counterfactual * cf_loss
         if train:
             (loss / float(accum)).backward()
             is_accum_boundary = ((step + 1) % accum == 0) or ((step + 1) == len(loader))
@@ -898,10 +1119,13 @@ def run_epoch(args, backbone, model, loader, criterion, optimizer, device, train
             "cf_loss": float(cf_loss.detach().item()),
             "grounding_loss": float(grounding_loss.detach().item()) if isinstance(grounding_loss, torch.Tensor) else 0.0,
             "total_loss": float(loss.detach().item()),
-            "lr": float(getattr(args, "lr", 0.0)),
+            "lr": current_lr(optimizer),
+            "current_lr": current_lr(optimizer),
+            "scheduler": str(getattr(args, "scheduler", "none")),
             "grad_norm": None,
             "effective_batch_size": int(getattr(args, "effective_batch_size", bs * accum)),
             "loss_divided_by_accumulation": True,
+            **{k: float(v.detach().item()) for k, v in task_balance_components.items()},
         })
         if grounding_stats:
             grounding_rows.append({"train": train, "epoch": epoch, "step": step, **grounding_stats})
@@ -924,8 +1148,11 @@ def run_epoch(args, backbone, model, loader, criterion, optimizer, device, train
                 "cf_stats": cf_stats,
                 "grounding_loss": float(grounding_loss.item()) if "grounding_loss" in locals() else 0.0,
                 "grounding_stats": grounding_stats,
+                "fusion_stats": fusion_batch_stats,
                 "batch_size": bs,
                 "token_stats": token_stats,
+                "current_lr": current_lr(optimizer),
+                "scheduler": str(getattr(args, "scheduler", "none")),
             }), flush=True)
     logits_tensor = torch.cat(logits_all, 0) if logits_all else torch.empty(0, args.action_dim + args.reason_dim)
     labels_tensor = torch.cat(labels_all, 0) if labels_all else torch.empty(0, args.action_dim + args.reason_dim)
@@ -954,6 +1181,8 @@ def run_epoch(args, backbone, model, loader, criterion, optimizer, device, train
         "loss_components": loss_components,
         "grounding_stats": grounding_rows,
         "counterfactual_stats": counterfactual_rows,
+        "fusion_stats": summarize_numeric_rows(fusion_rows),
+        "fusion_rows": fusion_rows,
         "file_names": file_names_all,
     }
 
@@ -979,6 +1208,12 @@ def main() -> None:
     ap.add_argument("--gradient_accumulation_steps", type=int, default=1)
     ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--scheduler", choices=["none", "cosine", "plateau"], default="none")
+    ap.add_argument("--min_lr", type=float, default=1e-5)
+    ap.add_argument("--warmup_epochs", type=int, default=0)
+    ap.add_argument("--plateau_patience", type=int, default=2)
+    ap.add_argument("--plateau_factor", type=float, default=0.5)
+    ap.add_argument("--plateau_monitor", choices=["test_joint", "val_joint", "test_exp_mF1", "val_exp_mF1"], default="test_joint")
     ap.add_argument("--auto_scale_lr", action=argparse.BooleanOptionalAction, default=False)
     ap.add_argument("--reference_effective_batch", type=int, default=32)
     ap.add_argument("--base_head_lr_at_reference_batch", type=float, default=3e-4)
@@ -997,6 +1232,7 @@ def main() -> None:
     ap.add_argument("--r2a_consistency_mode", choices=["none", "detach_mimic", "gt", "gt_and_agree"], default="gt_and_agree")
     ap.add_argument("--loss_counterfactual", type=float, default=0.0)
     ap.add_argument("--counterfactual_start_epoch", type=int, default=0)
+    ap.add_argument("--counterfactual_eval", action=argparse.BooleanOptionalAction, default=False)
     ap.add_argument("--loss_grounding", type=float, default=0.0)
     ap.add_argument("--grounding_cache_jsonl", default="")
     ap.add_argument("--grounding_mode", choices=["global", "label", "both"], default="both")
@@ -1008,6 +1244,12 @@ def main() -> None:
     ap.add_argument("--cf_mask_fill", choices=["zero", "mean", "mask_token"], default="mean")
     ap.add_argument("--use_label_query", action="store_true", default=True)
     ap.add_argument("--use_reason_to_action", action="store_true", default=True)
+    ap.add_argument("--label_correlation", choices=["none", "self_attn"], default="none")
+    ap.add_argument("--label_correlation_layers", type=int, default=1)
+    ap.add_argument("--label_correlation_heads", type=int, default=4)
+    ap.add_argument("--label_correlation_dropout", type=float, default=0.1)
+    ap.add_argument("--label_correlation_bias", choices=["none"], default="none")
+    ap.add_argument("--task_balance", choices=["none", "uncertainty"], default="none")
     ap.add_argument("--token_compression", choices=["none", "keep_merge"], default="none")
     ap.add_argument("--token_keep_ratio", type=float, default=1.0)
     ap.add_argument("--compression_start_epoch", type=int, default=8)
@@ -1030,6 +1272,8 @@ def main() -> None:
     ap.add_argument("--max_saved_token_stats", type=int, default=16)
     ap.add_argument("--resume", default="", help="Optional FATE-OIA checkpoint_latest/best path to resume from.")
     ap.add_argument("--resume_optimizer", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--resume_scheduler", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--resume_strict", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--pretrained_source", default="public_dino_reference")
     ap.add_argument("--best_selection_split", choices=["val", "test"], default="test")
     ap.add_argument("--best_selection_metric", default="joint_test_score")
@@ -1060,11 +1304,24 @@ def main() -> None:
     (out_dir / "args.json").write_text(json.dumps(vars(args), indent=2), encoding="utf-8")
     device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
     backbone, dim = build_backbone(args, device)
-    model = FATEOIAFeatureModel(dim=dim, action_dim=args.action_dim, reason_dim=args.reason_dim, use_label_query=args.use_label_query).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    model = FATEOIAFeatureModel(
+        dim=dim,
+        action_dim=args.action_dim,
+        reason_dim=args.reason_dim,
+        use_label_query=args.use_label_query,
+        label_correlation=args.label_correlation,
+        label_correlation_layers=args.label_correlation_layers,
+        label_correlation_heads=args.label_correlation_heads,
+        label_correlation_dropout=args.label_correlation_dropout,
+        label_correlation_bias=args.label_correlation_bias,
+    ).to(device)
+    task_balancer = UncertaintyTaskBalancer(("action", "reason", "r2a", "grounding")).to(device) if args.task_balance == "uncertainty" else None
+    optimizer_params = list(model.parameters()) + (list(task_balancer.parameters()) if task_balancer is not None else [])
+    optimizer = torch.optim.AdamW(optimizer_params, lr=args.lr, weight_decay=args.weight_decay)
     resume_state = ResumeState()
     if args.resume:
-        resume_state = load_resume_checkpoint(args.resume, model, optimizer, device=device, resume_optimizer=args.resume_optimizer)
+        resume_state = load_resume_checkpoint(args.resume, model, optimizer, device=device, resume_optimizer=args.resume_optimizer, strict=args.resume_strict)
+        args.optimizer_restored = bool(resume_state.optimizer_restored)
         print(
             json.dumps(
                 {
@@ -1074,11 +1331,24 @@ def main() -> None:
                     "best_test_score": resume_state.best_test_score,
                     "best_val_score": resume_state.best_val_score,
                     "resume_optimizer": bool(args.resume_optimizer),
+                    "optimizer_restored": bool(resume_state.optimizer_restored),
+                    "resume_strict": bool(args.resume_strict),
+                    "missing_keys": resume_state.missing_keys or [],
+                    "unexpected_keys": resume_state.unexpected_keys or [],
                 }
             ),
             flush=True,
         )
     args.start_epoch = int(resume_state.start_epoch)
+    scheduler = build_scheduler(args, optimizer)
+    if scheduler is not None and args.resume and args.resume_scheduler and resume_state.scheduler_state is not None:
+        try:
+            scheduler.load_state_dict(resume_state.scheduler_state)
+            resume_state.scheduler_restored = True
+        except Exception as exc:
+            print(json.dumps({"event": "fate_oia_scheduler_resume_failed", "error": str(exc)}), flush=True)
+    args.scheduler_restored = bool(resume_state.scheduler_restored)
+    args.optimizer_restored = bool(resume_state.optimizer_restored)
     criterion = make_multilabel_criterion(args)
     train_loader = make_loader(args, "train", True)
     val_loader = make_loader(args, "val", False)
@@ -1128,9 +1398,9 @@ def main() -> None:
         print(json.dumps({"event": "fate_oia_resume_already_complete", "start_epoch": args.start_epoch, "epochs": args.epochs}), flush=True)
         return
     for epoch in range(args.start_epoch, args.epochs):
-        train_stats = run_epoch(args, backbone, model, train_loader, criterion, optimizer, device, True, grounding_cache, epoch)
-        val_stats = run_epoch(args, backbone, model, val_loader, criterion, optimizer, device, False, grounding_cache, epoch)
-        test_stats = run_epoch(args, backbone, model, test_loader, criterion, optimizer, device, False, grounding_cache, epoch)
+        train_stats = run_epoch(args, backbone, model, train_loader, criterion, optimizer, device, True, grounding_cache, epoch, task_balancer)
+        val_stats = run_epoch(args, backbone, model, val_loader, criterion, optimizer, device, False, grounding_cache, epoch, task_balancer)
+        test_stats = run_epoch(args, backbone, model, test_loader, criterion, optimizer, device, False, grounding_cache, epoch, task_balancer)
         val_score = _joint_score(val_stats)
         test_score = _joint_score(test_stats)
         selected_score = test_score if args.best_selection_split == "test" else val_score
@@ -1147,11 +1417,24 @@ def main() -> None:
             "joint_test_score": test_score,
             "selection_score": selected_score,
             "best_selection_split": args.best_selection_split,
+            "current_lr": current_lr(optimizer),
+            "scheduler": str(args.scheduler),
         }
         history.append(row)
         with (out_dir / "metrics.jsonl").open("a", encoding="utf-8") as f:
             f.write(json.dumps(_json_safe(row)) + "\n")
-        latest = {"epoch": epoch, "model": model.state_dict(), "optimizer": optimizer.state_dict(), "args": vars(args), "dim": dim, "best_test_score": max(best_test, test_score), "best_val_score": max(best_val, val_score)}
+        step_scheduler(args, scheduler, val_score=val_score, test_score=test_score, row=row)
+        latest = {
+            "epoch": epoch,
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict() if scheduler is not None else None,
+            "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
+            "args": vars(args),
+            "dim": dim,
+            "best_test_score": max(best_test, test_score),
+            "best_val_score": max(best_val, val_score),
+        }
         torch.save(latest, out_dir / "checkpoint_latest.pth")
         _save_latest_split_outputs("val", val_stats)
         _save_latest_split_outputs("test", test_stats)

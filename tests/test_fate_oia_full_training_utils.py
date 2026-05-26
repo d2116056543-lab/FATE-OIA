@@ -6,16 +6,21 @@ from argparse import Namespace
 from fate_oia.engine.train_fate_oia import (
     apply_config_defaults,
     action_branch_losses,
+    build_scheduler,
     compress_tokens,
+    compute_counterfactual_audit,
     compute_grounding_loss,
     counterfactual_deletion_loss,
+    current_lr,
     load_config_defaults,
     load_reason_grounding_rules,
     reason_to_action_consistency_loss,
     recover_label_attention,
     scheduled_keep_ratio,
+    step_scheduler,
     write_epoch_artifacts,
 )
+from fate_oia.losses.task_balance import UncertaintyTaskBalancer
 from fate_oia.models.fate_oia_model import FATEOIAFeatureModel
 from fate_oia.utils.lr_scaling import compute_lr_scaling, effective_batch_size, scale_lr_linear
 
@@ -86,6 +91,23 @@ def test_fate_oia_feature_model_outputs_attention_and_r2a():
     assert out["reason_logits"].shape == (3, 21)
     assert out["reason_to_action_logits"].shape == (3, 4)
     assert out["attention"].shape[:3] == (3, 4, 25)
+
+
+def test_label_correlation_block_changes_label_tokens_and_shapes():
+    torch.manual_seed(0)
+    model = FATEOIAFeatureModel(
+        dim=16,
+        action_dim=4,
+        reason_dim=21,
+        use_label_query=True,
+        label_correlation="self_attn",
+        label_correlation_layers=1,
+        label_correlation_heads=4,
+    )
+    out = model(torch.randn(2, 12, 16))
+    assert out["action_logits"].shape == (2, 4)
+    assert out["reason_logits"].shape == (2, 21)
+    assert out["label_tokens"].shape == (2, 25, 16)
 
 
 def test_recover_label_attention_from_compressed_tokens():
@@ -159,6 +181,47 @@ def test_counterfactual_deletion_loss_isolated_gradient_with_mean_fill():
     assert grad_norm > 0
 
 
+def test_counterfactual_audit_reports_drop_fields_without_loss():
+    torch.manual_seed(2)
+    model = FATEOIAFeatureModel(dim=8, action_dim=4, reason_dim=21, use_label_query=True)
+    tokens = torch.randn(2, 9, 8)
+    labels = torch.randint(0, 2, (2, 25)).float()
+    stats = compute_counterfactual_audit(model, tokens, labels, action_dim=4, topk_ratio=0.4, mask_fill="mean")
+    assert stats["cf_valid_count"] == 2
+    for key in ["cf_action_drop_mean", "cf_reason_drop_mean", "cf_random_action_drop_mean", "cf_random_reason_drop_mean", "cf_base_prob", "cf_masked_prob"]:
+        assert key in stats
+
+
+def test_uncertainty_task_balancer_has_gradients():
+    balancer = UncertaintyTaskBalancer(("action", "reason", "r2a", "grounding"))
+    total, components = balancer({
+        "action": torch.tensor(1.0, requires_grad=True),
+        "reason": torch.tensor(2.0, requires_grad=True),
+        "r2a": torch.tensor(0.5, requires_grad=True),
+        "grounding": torch.tensor(0.1, requires_grad=True),
+    })
+    total.backward()
+    assert balancer.log_vars["action"].grad is not None
+    assert "task_balance_reason_weighted" in components
+
+
+def test_cosine_scheduler_steps_and_can_restore_state():
+    model = torch.nn.Linear(2, 1)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    args = Namespace(scheduler="cosine", epochs=4, start_epoch=1, min_lr=1e-5, warmup_epochs=0)
+    sched = build_scheduler(args, opt)
+    assert sched is not None
+    before = current_lr(opt)
+    step_scheduler(args, sched, val_score=0.1, test_score=0.2, row={"val_metrics": {}, "test_metrics": {}})
+    after = current_lr(opt)
+    assert after < before
+    state = sched.state_dict()
+    opt2 = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    sched2 = build_scheduler(args, opt2)
+    sched2.load_state_dict(state)
+    assert sched2.state_dict()["last_epoch"] == state["last_epoch"]
+
+
 def test_write_epoch_artifacts_creates_diagnostic_files(tmp_path):
     logits = torch.randn(2, 25)
     labels = torch.randint(0, 2, (2, 25)).float()
@@ -192,6 +255,7 @@ def test_write_epoch_artifacts_creates_diagnostic_files(tmp_path):
         "token_stats.jsonl",
         "grounding_stats.jsonl",
         "counterfactual_stats.jsonl",
+        "fusion_stats.json",
         "failure_cases.jsonl",
     ]:
         assert (epoch_dir / name).exists(), name

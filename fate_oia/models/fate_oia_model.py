@@ -4,6 +4,7 @@ import torch
 from torch import nn
 
 from fate_oia.models.label_query_head import LabelQueryHead
+from fate_oia.models.label_correlation import LabelCorrelationBlock
 from fate_oia.models.reason_to_action_bottleneck import ReasonToActionBottleneck
 
 
@@ -14,13 +15,38 @@ class FATEOIAFeatureModel(nn.Module):
     compatible with SNNA checkpoints that are still being trained.
     """
 
-    def __init__(self, dim: int = 384, action_dim: int = 4, reason_dim: int = 21, use_label_query: bool = True) -> None:
+    def __init__(
+        self,
+        dim: int = 384,
+        action_dim: int = 4,
+        reason_dim: int = 21,
+        use_label_query: bool = True,
+        label_correlation: str = "none",
+        label_correlation_layers: int = 1,
+        label_correlation_heads: int = 4,
+        label_correlation_dropout: float = 0.1,
+        label_correlation_bias: str = "none",
+    ) -> None:
         super().__init__()
         self.action_dim = action_dim
         self.reason_dim = reason_dim
         self.use_label_query = use_label_query
+        self.label_correlation_mode = label_correlation
         if use_label_query:
             self.label_head = LabelQueryHead(dim, action_dim + reason_dim)
+            if label_correlation == "self_attn":
+                self.label_correlation = LabelCorrelationBlock(
+                    dim=dim,
+                    num_labels=action_dim + reason_dim,
+                    num_heads=label_correlation_heads,
+                    num_layers=label_correlation_layers,
+                    dropout=label_correlation_dropout,
+                    bias_mode=label_correlation_bias,
+                )
+            elif label_correlation == "none":
+                self.label_correlation = nn.Identity()
+            else:
+                raise ValueError(f"Unsupported label_correlation mode: {label_correlation}")
         else:
             self.pool = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, dim), nn.GELU())
             self.action_head = nn.Linear(dim, action_dim)
@@ -31,10 +57,10 @@ class FATEOIAFeatureModel(nn.Module):
     def forward(self, tokens: torch.Tensor) -> dict[str, torch.Tensor]:
         if self.use_label_query:
             out = self.label_head(tokens)
-            logits = out["logits"]
+            label_tokens = self.label_correlation(out["label_tokens"])
+            logits = self.label_head.cls(label_tokens).squeeze(-1)
             action_visual_logits = logits[:, : self.action_dim]
             reason_logits = logits[:, self.action_dim :]
-            label_tokens = out["label_tokens"]
             action_summary = label_tokens[:, : self.action_dim].mean(1)
             reason_summary = label_tokens[:, self.action_dim :].mean(1)
             action_reason_logits = self.reason_to_action(reason_logits)
@@ -42,6 +68,8 @@ class FATEOIAFeatureModel(nn.Module):
             action_fused_logits = gate * action_visual_logits + (1.0 - gate) * action_reason_logits
             return {
                 **out,
+                "logits": logits,
+                "label_tokens": label_tokens,
                 "action_logits": action_fused_logits,
                 "action_visual_logits": action_visual_logits,
                 "action_reason_logits": action_reason_logits,
