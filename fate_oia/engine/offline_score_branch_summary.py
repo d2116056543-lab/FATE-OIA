@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import json
@@ -36,6 +36,13 @@ def summarize(alpha_json: str, threshold_json: str, failure_json: str, output_js
         threshold_gain = float(per_exp or 0.0) - float(fixed_exp or 0.0)
     tail_mean_ap = float(failure.get("tail_mean_AP", 0.0) or 0.0)
     tail_best_f1 = float(failure.get("tail_best_possible_F1", failure.get("tail_mean_best_F1", 0.0)) or 0.0)
+    failure_rows = failure.get("rows", []) or []
+    tail_rows = [r for r in failure_rows if r.get("group") == "tail"]
+    if tail_rows:
+        aps = [float(r.get("AP", 0.0) or 0.0) for r in tail_rows]
+        best_f1s = [float(r.get("best_F1", 0.0) or 0.0) for r in tail_rows]
+        tail_mean_ap = sum(aps) / max(len(aps), 1)
+        tail_best_f1 = sum(best_f1s) / max(len(best_f1s), 1)
     out = {
         "best_alpha": best_alpha_row.get("alpha"),
         "best_joint": best_alpha_row.get("joint"),
