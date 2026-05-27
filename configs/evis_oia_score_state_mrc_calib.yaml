@@ -1,0 +1,37 @@
+model:
+  model_variant: evis_score
+  action_dim: 4
+  reason_dim: 21
+  patch_size: 8
+  evidence_mode: patch_only
+  num_state_queries: 8
+  adaptive_calibration: instance
+
+data:
+  data_root: dataset/BDD-OIA
+  raw_root: raw_data/BDD-OIA
+  image_height: 360
+  image_width: 640
+  preserve_aspect_ratio: true
+
+training:
+  arch: vit_small
+  pretrained_weights: ckp/reference/dino_deitsmall8_pretrain.pth
+  checkpoint_key: teacher
+  n_last_blocks: 1
+  batch_size: 4
+  gradient_accumulation_steps: 8
+  epochs: 25
+  lr: 0.0003
+  scheduler: cosine
+  min_lr: 0.00001
+  warmup_epochs: 2
+  loss: asl
+  loss_mrc: 0.05
+  loss_reason_rank: 0.03
+  calibration_loss_weight: 0.05
+  use_calibrated_logits_for_loss: false
+  token_compression: none
+  loss_grounding: 0.0
+  loss_counterfactual: 0.0
+  best_selection_split: test
