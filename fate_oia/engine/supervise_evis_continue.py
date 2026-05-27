@@ -217,7 +217,8 @@ def run_s4_audit(args: argparse.Namespace, out_dir: Path, best_run_dir: Path, de
         ]
         for cmd in cmds:
             code, _ = run_foreground(cmd, Path(args.fate_oia_dir), out_dir / "foreground_continue.log")
-            result["threshold_audit" if "offline_threshold_sweep" in cmd else "failure_audit"] = code == 0
+            module = cmd[cmd.index("-m") + 1] if "-m" in cmd else ""
+            result["threshold_audit" if module.endswith("offline_threshold_sweep") else "failure_audit"] = code == 0
     else:
         result["logits_missing"] = True
     visual_cmd = [
