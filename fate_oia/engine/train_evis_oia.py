@@ -108,7 +108,16 @@ def make_parser() -> argparse.ArgumentParser:
     ap.add_argument("--max_test_samples", type=int, default=0)
     ap.add_argument("--resume", default="")
     ap.add_argument("--best_selection_split", choices=["val", "test"], default="test")
-    ap.add_argument("--best_selection_metric", default="joint_calibrated_or_raw")
+    ap.add_argument("--best_selection_metric", default="joint_raw")
+    ap.add_argument("--early_stop_against_reference", action=argparse.BooleanOptionalAction, default=False)
+    ap.add_argument("--reference_joint", type=float, default=0.5478436350822449)
+    ap.add_argument("--reference_exp_mf1", type=float, default=0.38130074739456177)
+    ap.add_argument("--early_stop_min_epochs", type=int, default=12)
+    ap.add_argument("--early_stop_patience", type=int, default=2)
+    ap.add_argument("--early_stop_joint_margin", type=float, default=0.005)
+    ap.add_argument("--early_stop_exp_margin", type=float, default=0.005)
+    ap.add_argument("--early_stop_required_joint_gain", type=float, default=0.005)
+    ap.add_argument("--early_stop_required_exp_gain", type=float, default=0.010)
     ap.add_argument("--log_every", type=int, default=20)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return ap
@@ -175,6 +184,54 @@ def split_metrics(action_logits: torch.Tensor, reason_logits: torch.Tensor, labe
 
 def joint(metrics: dict[str, Any]) -> float:
     return 0.5 * float(metrics.get("Act_mF1", 0.0)) + 0.5 * float(metrics.get("Exp_mF1", 0.0))
+
+
+def selection_score(row: dict[str, Any], metric: str) -> float:
+    if metric == "joint_calibrated":
+        return float(row.get("joint_calibrated", 0.0) or 0.0)
+    if metric == "joint_calibrated_or_raw":
+        return float(row.get("joint_calibrated", row.get("joint_raw", 0.0)) or 0.0)
+    if metric in row:
+        return float(row.get(metric, 0.0) or 0.0)
+    return float(row.get("joint_raw", 0.0) or 0.0)
+
+
+def early_stop_decision(args: argparse.Namespace, epoch: int, best_raw: dict[str, Any], stale_epochs: int) -> dict[str, Any] | None:
+    if not args.early_stop_against_reference:
+        return None
+    if epoch + 1 < int(args.early_stop_min_epochs):
+        return None
+    best_joint = float(best_raw.get("joint_raw", 0.0) or 0.0)
+    best_exp = float(best_raw.get("Exp_mF1_raw", 0.0) or 0.0)
+    lags_reference = (
+        best_joint < float(args.reference_joint) - float(args.early_stop_joint_margin)
+        and best_exp < float(args.reference_exp_mf1) - float(args.early_stop_exp_margin)
+    )
+    no_gate = (
+        best_joint < float(args.reference_joint) + float(args.early_stop_required_joint_gain)
+        and best_exp < float(args.reference_exp_mf1) + float(args.early_stop_required_exp_gain)
+    )
+    stale = stale_epochs >= int(args.early_stop_patience)
+    if lags_reference:
+        return {
+            "event": "early_stop",
+            "reason": "below_reference_after_min_epochs",
+            "epoch": epoch,
+            "best_joint_raw": best_joint,
+            "best_exp_mF1_raw": best_exp,
+            "reference_joint": args.reference_joint,
+            "reference_exp_mF1": args.reference_exp_mf1,
+        }
+    if no_gate and stale:
+        return {
+            "event": "early_stop",
+            "reason": "no_gate_improvement_patience",
+            "epoch": epoch,
+            "best_joint_raw": best_joint,
+            "best_exp_mF1_raw": best_exp,
+            "stale_epochs": stale_epochs,
+        }
+    return None
 
 
 def run_epoch(args, backbone, model, loader, criterion, optimizer, device, train: bool, epoch: int) -> dict[str, Any]:
@@ -259,6 +316,9 @@ def main() -> None:
     train_loader=make_loader(args,"train",True); val_loader=make_loader(args,"val",False); test_loader=make_loader(args,"test",False)
     man=manifest(args,out_dir,len(train_loader.dataset),len(val_loader.dataset),len(test_loader.dataset),model); write_json(out_dir/"run_manifest.json",man)
     best_test=-1.0; best_val=-1.0; history=[]
+    best_raw_test=-1.0
+    best_raw_test_row: dict[str, Any] = {}
+    stale_raw_epochs = 0
     for epoch in range(args.epochs):
         if torch.cuda.is_available(): torch.cuda.reset_peak_memory_stats()
         train=run_epoch(args,backbone,model,train_loader,criterion,optimizer,device,True,epoch)
@@ -272,8 +332,15 @@ def main() -> None:
         for row in train["evidence_rows"]+val["evidence_rows"]+test["evidence_rows"]: append_jsonl(out_dir/"diagnostics"/"evidence_diagnostics.jsonl", row)
         for row in train["calibration_rows"]+val["calibration_rows"]+test["calibration_rows"]: append_jsonl(out_dir/"diagnostics"/"calibration_diagnostics.jsonl", row)
         save_logits(out_dir,"test",test); save_logits(out_dir,"val",val)
-        test_score = rows[-1]["joint_calibrated"] if args.adaptive_calibration != "none" else rows[-1]["joint_raw"]
-        val_score = rows[1]["joint_calibrated"] if args.adaptive_calibration != "none" else rows[1]["joint_raw"]
+        test_score = selection_score(rows[-1], args.best_selection_metric)
+        val_score = selection_score(rows[1], args.best_selection_metric)
+        raw_test_score = float(rows[-1].get("joint_raw", 0.0) or 0.0)
+        if raw_test_score > best_raw_test:
+            best_raw_test = raw_test_score
+            best_raw_test_row = dict(rows[-1])
+            stale_raw_epochs = 0
+        else:
+            stale_raw_epochs += 1
         ckpt={"epoch":epoch,"model":model.state_dict(),"optimizer":optimizer.state_dict(),"scheduler":scheduler.state_dict() if scheduler else None,"args":vars(args),"dim":dim,"best_test_score":max(best_test,test_score),"best_val_score":max(best_val,val_score)}
         torch.save(ckpt,out_dir/"checkpoint_latest.pth")
         write_json(out_dir/"metrics_latest.json", rows[-1])
@@ -282,8 +349,13 @@ def main() -> None:
         if val_score >= best_val:
             best_val=val_score; torch.save(ckpt,out_dir/"checkpoint_best_val.pth"); write_json(out_dir/"metrics_best_val.json", rows[1])
         hist={"event":"evis_oia_epoch","epoch":epoch,"train_loss":train["loss"],"val":rows[1],"test":rows[-1],"best_test":best_test,"best_val":best_val,"current_lr":lr}
-        history.append(hist); append_jsonl(out_dir/"supervisor_decisions.jsonl", {"event":"epoch_complete","epoch":epoch,"test_score":test_score,"best_test":best_test})
+        history.append(hist); append_jsonl(out_dir/"supervisor_decisions.jsonl", {"event":"epoch_complete","epoch":epoch,"test_score":test_score,"best_test":best_test,"best_raw_test":best_raw_test,"best_raw_test_row":best_raw_test_row})
         print(json.dumps(hist, ensure_ascii=False), flush=True)
+        stop = early_stop_decision(args, epoch, best_raw_test_row, stale_raw_epochs)
+        if stop is not None:
+            append_jsonl(out_dir/"supervisor_decisions.jsonl", stop)
+            print(json.dumps(stop, ensure_ascii=False), flush=True)
+            break
         if scheduler is not None:
             step_scheduler(args,scheduler,val_score=val_score,test_score=test_score,row={"test_metrics":{"Exp_mF1":rows[-1]["Exp_mF1_calibrated"]},"val_metrics":{"Exp_mF1":rows[1]["Exp_mF1_calibrated"]}})
     write_json(out_dir/"history.json", history)

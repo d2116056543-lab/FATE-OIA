@@ -61,13 +61,40 @@ def latest_test_metrics(run_dir: Path) -> dict:
 
 
 def best_test_metrics(run_dir: Path) -> dict:
-    p = run_dir / "metrics_best_test.json"
-    return load_json(p)
+    p = run_dir / "metrics_summary.jsonl"
+    rows = []
+    if p.exists():
+        for line in p.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                row = json.loads(line)
+                if row.get("split") == "test":
+                    rows.append(row)
+    if rows:
+        return max(rows, key=lambda r: float(r.get("joint_raw", 0.0) or 0.0))
+    return load_json(run_dir / "metrics_best_test.json")
 
 
 def run_training(args, out_dir: Path, name: str, extra: list[str]) -> tuple[int, Path]:
     run_dir = out_dir / name
-    cmd = [args.python,"-m","fate_oia.engine.train_evis_oia","--config","configs/evis_oia_score_patch.yaml","--output_dir",str(run_dir),"--batch_size",str(args.batch_size),"--gradient_accumulation_steps",str(args.grad_accum),"--epochs",str(args.s1_epochs),"--num_workers",str(args.num_workers),"--log_every","50",*extra]
+    cmd = [
+        args.python,"-m","fate_oia.engine.train_evis_oia",
+        "--config","configs/evis_oia_score_patch.yaml",
+        "--output_dir",str(run_dir),
+        "--batch_size",str(args.batch_size),
+        "--gradient_accumulation_steps",str(args.grad_accum),
+        "--epochs",str(args.s1_epochs),
+        "--num_workers",str(args.num_workers),
+        "--log_every","50",
+        "--best_selection_metric","joint_raw",
+        "--early_stop_against_reference",
+        "--reference_joint",str(args.reference_joint),
+        "--reference_exp_mf1",str(args.reference_exp_mf1),
+        "--early_stop_min_epochs",str(args.early_stop_min_epochs),
+        "--early_stop_patience",str(args.early_stop_patience),
+        "--early_stop_joint_margin",str(args.early_stop_joint_margin),
+        "--early_stop_exp_margin",str(args.early_stop_exp_margin),
+        *extra,
+    ]
     code = run_foreground(cmd, Path(args.fate_oia_dir), out_dir/"foreground_supervisor.log")
     return code, run_dir
 
@@ -84,6 +111,12 @@ def main() -> None:
     ap.add_argument("--grad_accum", type=int, default=8)
     ap.add_argument("--num_workers", type=int, default=2)
     ap.add_argument("--s1_epochs", type=int, default=25)
+    ap.add_argument("--reference_joint", type=float, default=0.5478436350822449)
+    ap.add_argument("--reference_exp_mf1", type=float, default=0.38130074739456177)
+    ap.add_argument("--early_stop_min_epochs", type=int, default=12)
+    ap.add_argument("--early_stop_patience", type=int, default=2)
+    ap.add_argument("--early_stop_joint_margin", type=float, default=0.005)
+    ap.add_argument("--early_stop_exp_margin", type=float, default=0.005)
     ap.add_argument("--smoke", action=argparse.BooleanOptionalAction, default=False)
     args = ap.parse_args()
     root = Path(args.root)
@@ -105,14 +138,22 @@ def main() -> None:
         raise SystemExit(code)
     best = best_test_metrics(s1_dir); latest = latest_test_metrics(s1_dir)
     decisions.open("a",encoding="utf-8").write(json.dumps({"event":"S1_complete","best":best,"latest":latest}, ensure_ascii=False)+"\n")
-    run_c_joint = 0.5478436350822449; run_c_exp = 0.38130074739456177
-    s1_joint = float(best.get("joint_calibrated", best.get("joint_raw", 0.0)) or 0.0)
-    s1_exp = float(best.get("Exp_mF1_calibrated", best.get("Exp_mF1_raw", 0.0)) or 0.0)
+    threshold_diag = load_json(out_dir/"S0_runC_diagnostics"/"threshold_sweep_test.json")
+    run_c_joint = float(args.reference_joint)
+    run_c_exp = float(args.reference_exp_mf1)
+    run_c_ap = float(threshold_diag.get("fixed", {}).get("metrics", {}).get("Exp_mAP", 0.0) or 0.0)
+    s1_joint = float(best.get("joint_raw", 0.0) or 0.0)
+    s1_exp = float(best.get("Exp_mF1_raw", 0.0) or 0.0)
+    s1_ap = float(best.get("Exp_mAP_raw", 0.0) or 0.0)
     if s1_joint >= run_c_joint + 0.005 or s1_exp >= run_c_exp + 0.010:
         code, s2_dir = run_training(args, out_dir, "S2_train_gt_eval_patch", ["--evidence_mode","train_gt_eval_patch","--adaptive_calibration","global","--epochs","12",*max_train])
         decisions.open("a",encoding="utf-8").write(json.dumps({"event":"S2_complete","code":code,"best":best_test_metrics(s2_dir)}, ensure_ascii=False)+"\n")
+    elif s1_ap >= run_c_ap + 0.005 and s1_exp < run_c_exp + 0.010:
+        decisions.open("a",encoding="utf-8").write(json.dumps({"event":"S2_skipped","reason":"S1 AP improved but F1 did not pass Run C gate; route to S3 calibration","s1_joint":s1_joint,"s1_exp":s1_exp,"s1_ap":s1_ap,"run_c_ap":run_c_ap}, ensure_ascii=False)+"\n")
+        code, s3_dir = run_training(args, out_dir, "S3_adaptive_calibration", ["--evidence_mode","patch_only","--adaptive_calibration","instance","--epochs","12","--calibration_loss_weight","0.10",*max_train])
+        decisions.open("a",encoding="utf-8").write(json.dumps({"event":"S3_complete","code":code,"best":best_test_metrics(s3_dir)}, ensure_ascii=False)+"\n")
     else:
-        decisions.open("a",encoding="utf-8").write(json.dumps({"event":"S2_skipped","reason":"S1 did not exceed Run C gates","s1_joint":s1_joint,"s1_exp":s1_exp}, ensure_ascii=False)+"\n")
+        decisions.open("a",encoding="utf-8").write(json.dumps({"event":"S2_S3_skipped","reason":"S1 did not exceed Run C gates and AP did not justify calibration branch","s1_joint":s1_joint,"s1_exp":s1_exp,"s1_ap":s1_ap,"run_c_ap":run_c_ap}, ensure_ascii=False)+"\n")
     # S3/S4 are represented as decision-stage artifacts if S1 fails the gate.
     decisions.open("a",encoding="utf-8").write(json.dumps({"event":"S3_S4_decision","reason":"Run explainability/calibration audit only after a fair EviS checkpoint beats gate or user requests audit."}, ensure_ascii=False)+"\n")
     append(root/"progress.md", f"\n## {datetime.now():%Y-%m-%d %H:%M:%S} EviS supervisor completed decision chain\n- Output: `{out_dir}`\n- S1 best: `{best}`\n- S2/S3/S4 decisions recorded in `supervisor_decisions.jsonl`.\n")
