@@ -381,6 +381,12 @@ def load_reason_logit_adjustment(path: str, reason_dim: int, tau: float) -> torc
             counts = torch.as_tensor(data["reason_positive_counts"], dtype=torch.float32)
             total = float(data.get("num_samples", data.get("train_count", counts.max().item() if counts.numel() else 1.0)))
             values = (counts / max(total, 1.0)).tolist()
+        if values is None and "positive_counts" in data:
+            counts = torch.as_tensor(data["positive_counts"], dtype=torch.float32)
+            if counts.numel() >= reason_dim:
+                counts = counts[-reason_dim:]
+                total = float(data.get("num_samples", data.get("train_count", counts.max().item() if counts.numel() else 1.0)))
+                values = (counts / max(total, 1.0)).tolist()
     else:
         values = data
     if values is None:

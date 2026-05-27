@@ -114,7 +114,41 @@ def run_diagnostics(run_c_epoch_dir: Path, output_dir: Path) -> dict[str, Any]:
     return summary
 
 
-def build_run_command(branch: str, repo: Path, output_dir: Path, checkpoint: Path, summary: dict[str, Any]) -> list[str]:
+def ensure_label_cooccurrence(repo: Path, output_root: Path) -> Path:
+    bias_path = repo / output_root / "fate_oia_train_label_cooccurrence.json"
+    if bias_path.exists():
+        return bias_path
+    bias_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        sys.executable,
+        "-m",
+        "fate_oia.engine.build_label_cooccurrence",
+        "--data_root",
+        "dataset/BDD-OIA",
+        "--raw_root",
+        "raw_data/BDD-OIA",
+        "--split",
+        "train",
+        "--action_dim",
+        "4",
+        "--reason_dim",
+        "21",
+        "--output",
+        str(bias_path),
+    ]
+    subprocess.check_call(cmd, cwd=str(repo))
+    return bias_path
+
+
+def build_run_command(
+    branch: str,
+    repo: Path,
+    output_dir: Path,
+    checkpoint: Path,
+    summary: dict[str, Any],
+    *,
+    label_bias_path: Path | None = None,
+) -> list[str]:
     base = [
         sys.executable,
         "-m",
@@ -174,12 +208,35 @@ def build_run_command(branch: str, repo: Path, output_dir: Path, checkpoint: Pat
         "joint_test_score",
         "--device",
         "cuda",
+        "--log_every",
+        "1",
     ]
     if branch == "run_g_fusion_fix":
         alpha = str(summary.get("best_alpha", 0.1))
         base.extend(["--fusion_mode", "fixed_alpha", "--fusion_fixed_alpha", alpha])
     elif branch == "run_h_cooccur_longtail":
-        base.extend(["--fusion_mode", "reason_only", "--label_correlation_bias", "pmi", "--label_correlation_bias_weight", "0.05"])
+        if label_bias_path is None:
+            raise ValueError("Run H requires a real label co-occurrence/PMI bias file.")
+        base.extend(
+            [
+                "--fusion_mode",
+                "reason_only",
+                "--label_correlation_bias",
+                "pmi",
+                "--label_correlation_bias_path",
+                str(label_bias_path),
+                "--label_correlation_bias_weight",
+                "0.05",
+                "--reason_loss",
+                "asl_logit_adjust",
+                "--reason_prior_path",
+                str(label_bias_path),
+                "--reason_logit_adjust_tau",
+                "0.2",
+                "--reason_loss_weight",
+                "1.25",
+            ]
+        )
     return base
 
 
@@ -236,7 +293,10 @@ def main() -> None:
         return
     run_name = summary["recommended_next_run"]
     run_output = repo / args.output_root / f"fate_oia_{run_name}_{timestamp}"
-    cmd = build_run_command(run_name, repo, run_output, checkpoint, summary)
+    label_bias_path = ensure_label_cooccurrence(repo, repo / args.output_root) if run_name == "run_h_cooccur_longtail" else None
+    if label_bias_path is not None:
+        _write_jsonl(events, {"event": "label_bias_ready", "timestamp": _now(), "path": str(label_bias_path)})
+    cmd = build_run_command(run_name, repo, run_output, checkpoint, summary, label_bias_path=label_bias_path)
     code = supervise_child(cmd, repo, events)
     (output / "experiment_summary.json").write_text(
         json.dumps({"diagnostics": summary, "run_output": str(run_output), "returncode": code}, ensure_ascii=False, indent=2),
@@ -246,4 +306,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

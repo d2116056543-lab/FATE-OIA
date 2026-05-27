@@ -33,6 +33,10 @@ def main() -> None:
     payload = {
         "num_samples": stats.num_samples,
         "positive_counts": stats.positive_counts.tolist(),
+        "reason_positive_counts": stats.positive_counts[args.action_dim : args.action_dim + args.reason_dim].tolist(),
+        "reason_prior": (
+            stats.positive_counts[args.action_dim : args.action_dim + args.reason_dim] / max(float(stats.num_samples), 1.0)
+        ).tolist(),
         "conditional_log_bias": conditional_bias_matrix(stats).tolist(),
         "pmi_bias": pmi_bias_matrix(stats).tolist(),
     }
@@ -44,4 +48,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
