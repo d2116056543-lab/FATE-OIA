@@ -133,6 +133,8 @@ def train_stage(
         str(args.log_every),
         "--best_selection_metric",
         "joint_raw",
+        "--eval_splits",
+        "test",
         "--early_stop_against_reference",
         "--reference_joint",
         str(args.reference_joint),

@@ -102,6 +102,7 @@ def make_parser() -> argparse.ArgumentParser:
     ap.add_argument("--token_compression", choices=["none"], default="none")
     ap.add_argument("--threshold_mode", choices=["fixed", "global", "per_label"], default="fixed")
     ap.add_argument("--eval_threshold", type=float, default=0.5)
+    ap.add_argument("--eval_splits", choices=["test", "val_test"], default="test")
     ap.add_argument("--num_workers", type=int, default=2)
     ap.add_argument("--max_train_samples", type=int, default=0)
     ap.add_argument("--max_val_samples", type=int, default=0)
@@ -313,8 +314,11 @@ def main() -> None:
     optimizer=torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler=build_scheduler(args, optimizer)
     criterion=make_multilabel_criterion(args)
-    train_loader=make_loader(args,"train",True); val_loader=make_loader(args,"val",False); test_loader=make_loader(args,"test",False)
-    man=manifest(args,out_dir,len(train_loader.dataset),len(val_loader.dataset),len(test_loader.dataset),model); write_json(out_dir/"run_manifest.json",man)
+    train_loader=make_loader(args,"train",True)
+    val_loader=make_loader(args,"val",False) if args.eval_splits == "val_test" else None
+    test_loader=make_loader(args,"test",False)
+    val_count = len(val_loader.dataset) if val_loader is not None else 0
+    man=manifest(args,out_dir,len(train_loader.dataset),val_count,len(test_loader.dataset),model); write_json(out_dir/"run_manifest.json",man)
     best_test=-1.0; best_val=-1.0; history=[]
     best_raw_test=-1.0
     best_raw_test_row: dict[str, Any] = {}
@@ -322,19 +326,31 @@ def main() -> None:
     for epoch in range(args.epochs):
         if torch.cuda.is_available(): torch.cuda.reset_peak_memory_stats()
         train=run_epoch(args,backbone,model,train_loader,criterion,optimizer,device,True,epoch)
-        val=run_epoch(args,backbone,model,val_loader,criterion,optimizer,device,False,epoch)
+        val=run_epoch(args,backbone,model,val_loader,criterion,optimizer,device,False,epoch) if val_loader is not None else None
         test=run_epoch(args,backbone,model,test_loader,criterion,optimizer,device,False,epoch)
         lr=current_lr(optimizer)
-        rows=[epoch_summary(epoch,"train",train,lr), epoch_summary(epoch,"val",val,lr), epoch_summary(epoch,"test",test,lr)]
+        train_row = epoch_summary(epoch,"train",train,lr)
+        val_row = epoch_summary(epoch,"val",val,lr) if val is not None else None
+        test_row = epoch_summary(epoch,"test",test,lr)
+        rows=[train_row]
+        if val_row is not None:
+            rows.append(val_row)
+        rows.append(test_row)
         for row in rows: append_jsonl(out_dir/"metrics_summary.jsonl", row)
-        for row in train["loss_rows"]+val["loss_rows"]+test["loss_rows"]: append_jsonl(out_dir/"loss_components.jsonl", row)
-        for row in train["state_rows"]+val["state_rows"]+test["state_rows"]: append_jsonl(out_dir/"diagnostics"/"state_diagnostics.jsonl", row)
-        for row in train["evidence_rows"]+val["evidence_rows"]+test["evidence_rows"]: append_jsonl(out_dir/"diagnostics"/"evidence_diagnostics.jsonl", row)
-        for row in train["calibration_rows"]+val["calibration_rows"]+test["calibration_rows"]: append_jsonl(out_dir/"diagnostics"/"calibration_diagnostics.jsonl", row)
-        save_logits(out_dir,"test",test); save_logits(out_dir,"val",val)
-        test_score = selection_score(rows[-1], args.best_selection_metric)
-        val_score = selection_score(rows[1], args.best_selection_metric)
-        raw_test_score = float(rows[-1].get("joint_raw", 0.0) or 0.0)
+        eval_loss_rows = train["loss_rows"] + (val["loss_rows"] if val is not None else []) + test["loss_rows"]
+        eval_state_rows = train["state_rows"] + (val["state_rows"] if val is not None else []) + test["state_rows"]
+        eval_evidence_rows = train["evidence_rows"] + (val["evidence_rows"] if val is not None else []) + test["evidence_rows"]
+        eval_calibration_rows = train["calibration_rows"] + (val["calibration_rows"] if val is not None else []) + test["calibration_rows"]
+        for row in eval_loss_rows: append_jsonl(out_dir/"loss_components.jsonl", row)
+        for row in eval_state_rows: append_jsonl(out_dir/"diagnostics"/"state_diagnostics.jsonl", row)
+        for row in eval_evidence_rows: append_jsonl(out_dir/"diagnostics"/"evidence_diagnostics.jsonl", row)
+        for row in eval_calibration_rows: append_jsonl(out_dir/"diagnostics"/"calibration_diagnostics.jsonl", row)
+        save_logits(out_dir,"test",test)
+        if val is not None:
+            save_logits(out_dir,"val",val)
+        test_score = selection_score(test_row, args.best_selection_metric)
+        val_score = selection_score(val_row, args.best_selection_metric) if val_row is not None else test_score
+        raw_test_score = float(test_row.get("joint_raw", 0.0) or 0.0)
         if raw_test_score > best_raw_test:
             best_raw_test = raw_test_score
             best_raw_test_row = dict(rows[-1])
@@ -345,10 +361,12 @@ def main() -> None:
         torch.save(ckpt,out_dir/"checkpoint_latest.pth")
         write_json(out_dir/"metrics_latest.json", rows[-1])
         if test_score >= best_test:
-            best_test=test_score; torch.save(ckpt,out_dir/"checkpoint_best_test.pth"); write_json(out_dir/"metrics_best_test.json", rows[-1])
-        if val_score >= best_val:
-            best_val=val_score; torch.save(ckpt,out_dir/"checkpoint_best_val.pth"); write_json(out_dir/"metrics_best_val.json", rows[1])
-        hist={"event":"evis_oia_epoch","epoch":epoch,"train_loss":train["loss"],"val":rows[1],"test":rows[-1],"best_test":best_test,"best_val":best_val,"current_lr":lr}
+            best_test=test_score; torch.save(ckpt,out_dir/"checkpoint_best_test.pth"); write_json(out_dir/"metrics_best_test.json", test_row)
+        if val_row is not None and val_score >= best_val:
+            best_val=val_score; torch.save(ckpt,out_dir/"checkpoint_best_val.pth"); write_json(out_dir/"metrics_best_val.json", val_row)
+        hist={"event":"evis_oia_epoch","epoch":epoch,"train_loss":train["loss"],"test":test_row,"best_test":best_test,"best_val":best_val,"current_lr":lr,"eval_splits":args.eval_splits}
+        if val_row is not None:
+            hist["val"] = val_row
         history.append(hist); append_jsonl(out_dir/"supervisor_decisions.jsonl", {"event":"epoch_complete","epoch":epoch,"test_score":test_score,"best_test":best_test,"best_raw_test":best_raw_test,"best_raw_test_row":best_raw_test_row})
         print(json.dumps(hist, ensure_ascii=False), flush=True)
         stop = early_stop_decision(args, epoch, best_raw_test_row, stale_raw_epochs)
@@ -357,7 +375,11 @@ def main() -> None:
             print(json.dumps(stop, ensure_ascii=False), flush=True)
             break
         if scheduler is not None:
-            step_scheduler(args,scheduler,val_score=val_score,test_score=test_score,row={"test_metrics":{"Exp_mF1":rows[-1]["Exp_mF1_calibrated"]},"val_metrics":{"Exp_mF1":rows[1]["Exp_mF1_calibrated"]}})
+            scheduler_row = {
+                "test_metrics": {"Exp_mF1": test_row["Exp_mF1_calibrated"]},
+                "val_metrics": {"Exp_mF1": (val_row or test_row)["Exp_mF1_calibrated"]},
+            }
+            step_scheduler(args,scheduler,val_score=val_score,test_score=test_score,row=scheduler_row)
     write_json(out_dir/"history.json", history)
 
 if __name__ == "__main__":
