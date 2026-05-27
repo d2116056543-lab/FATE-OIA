@@ -26,6 +26,14 @@ def summarize(alpha_json: str, threshold_json: str, failure_json: str, output_js
         or threshold.get("per_label_gain_mF1")
         or 0.0
     )
+    if not threshold_gain and "fixed" in threshold and "per_label" in threshold:
+        fixed_metrics = threshold.get("fixed", {}).get("metrics", {})
+        per_metrics = threshold.get("per_label", {}).get("metrics", {})
+        fixed_exp = fixed_metrics.get("Exp_mF1") or fixed_metrics.get("Exp_mF1".replace("Exp", "Exp_")) or 0.0
+        per_exp = per_metrics.get("Exp_mF1") or per_metrics.get("Exp_mF1".replace("Exp", "Exp_")) or 0.0
+        # Existing threshold_sweep prefixes keys as Exp_mF1, Exp_mAP, etc.;
+        # keep the fallback explicit for old artifacts.
+        threshold_gain = float(per_exp or 0.0) - float(fixed_exp or 0.0)
     tail_mean_ap = float(failure.get("tail_mean_AP", 0.0) or 0.0)
     tail_best_f1 = float(failure.get("tail_best_possible_F1", failure.get("tail_mean_best_F1", 0.0)) or 0.0)
     out = {
