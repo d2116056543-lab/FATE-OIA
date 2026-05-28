@@ -72,13 +72,32 @@ def _best(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return max(rows, key=lambda r: (float(r.get("test_joint", -1e9)), float(r.get("test_Exp_mF1", -1e9))))
 
 
-def _command(args: argparse.Namespace, output_dir: Path, *, batch_size: int, accum: int, epochs: int, smoke: bool) -> list[str]:
+def next_epoch_command(
+    *,
+    python_executable: str,
+    train_module: str,
+    output_dir: Path,
+    epoch: int,
+    base_args: list[str],
+) -> list[str]:
     cmd = [
-        sys.executable,
+        python_executable,
         "-m",
-        "fate_oia.engine.train_score_v2_oia",
+        train_module,
         "--output_dir",
         str(output_dir),
+        "--epochs",
+        str(epoch),
+        *base_args,
+    ]
+    latest = output_dir / "checkpoint_latest.pth"
+    if latest.exists():
+        cmd += ["--resume", str(latest)]
+    return cmd
+
+
+def _base_train_args(args: argparse.Namespace, *, batch_size: int, accum: int, smoke: bool) -> list[str]:
+    base = [
         "--data_root",
         args.data_root,
         "--raw_root",
@@ -91,8 +110,6 @@ def _command(args: argparse.Namespace, output_dir: Path, *, batch_size: int, acc
         str(batch_size),
         "--gradient_accumulation_steps",
         str(accum),
-        "--epochs",
-        str(epochs),
         "--lr",
         str(args.lr),
         "--num_workers",
@@ -105,13 +122,63 @@ def _command(args: argparse.Namespace, output_dir: Path, *, batch_size: int, acc
         "frozen",
     ]
     if smoke:
-        cmd += ["--max_train_samples", str(args.smoke_train_samples), "--max_test_samples", str(args.smoke_test_samples)]
+        base += ["--scheduler_total_epochs", "1"]
+        base += ["--max_train_samples", str(args.smoke_train_samples), "--max_test_samples", str(args.smoke_test_samples)]
     else:
+        base += ["--scheduler_total_epochs", str(args.max_epochs)]
         if args.stage1_max_train_samples > 0:
-            cmd += ["--max_train_samples", str(args.stage1_max_train_samples)]
+            base += ["--max_train_samples", str(args.stage1_max_train_samples)]
         if args.stage1_max_test_samples > 0:
-            cmd += ["--max_test_samples", str(args.stage1_max_test_samples)]
-    return cmd
+            base += ["--max_test_samples", str(args.stage1_max_test_samples)]
+    return base
+
+
+def _command(args: argparse.Namespace, output_dir: Path, *, batch_size: int, accum: int, epochs: int, smoke: bool) -> list[str]:
+    return next_epoch_command(
+        python_executable=sys.executable,
+        train_module="fate_oia.engine.train_score_v2_oia",
+        output_dir=output_dir,
+        epoch=epochs,
+        base_args=_base_train_args(args, batch_size=batch_size, accum=accum, smoke=smoke),
+    )
+
+
+def _run_stage1_epoch_loop(args: argparse.Namespace, root: Path, stage_dir: Path, *, batch_size: int, accum: int) -> tuple[int, Path, dict[str, Any], ScoreV2Decision]:
+    last_code = 0
+    best: dict[str, Any] = {}
+    decision = ScoreV2Decision(True, "Stage1 continues.", None)
+    base_args = _base_train_args(args, batch_size=batch_size, accum=accum, smoke=False)
+    for epoch in range(1, int(args.max_epochs) + 1):
+        cmd = next_epoch_command(
+            python_executable=sys.executable,
+            train_module="fate_oia.engine.train_score_v2_oia",
+            output_dir=stage_dir,
+            epoch=epoch,
+            base_args=base_args,
+        )
+        _append_jsonl(root / "supervisor_decisions.jsonl", {"event": "stage1_epoch_start", "epoch": epoch, "cmd": cmd, "output_dir": str(stage_dir)})
+        last_code = _run_child(cmd, root)
+        if last_code != 0:
+            _append_jsonl(root / "supervisor_decisions.jsonl", {"event": "stage1_epoch_failed", "epoch": epoch, "returncode": last_code})
+            return last_code, stage_dir, best, ScoreV2Decision(False, f"Stage1 child failed at epoch {epoch}.", None)
+        rows = _read_metrics(stage_dir / "metrics_summary.jsonl")
+        if not rows:
+            _append_jsonl(root / "supervisor_decisions.jsonl", {"event": "stage1_epoch_no_metrics", "epoch": epoch})
+            return 1, stage_dir, best, ScoreV2Decision(False, f"Stage1 produced no metrics after epoch {epoch}.", None)
+        latest = rows[-1]
+        best = _best(rows)
+        decision = score_v2_stage1_decision(
+            epoch,
+            float(best.get("test_joint", -1.0)),
+            float(best.get("test_Exp_mF1", -1.0)),
+            float(best.get("test_Exp_mAP", -1.0)),
+        )
+        payload = {"event": "stage1_epoch_decision", "epoch": epoch, "latest": latest, "best": best, **asdict(decision)}
+        _append_jsonl(root / "supervisor_decisions.jsonl", payload)
+        print(json.dumps(payload, ensure_ascii=False), flush=True)
+        if not decision.continue_stage:
+            return 0, stage_dir, best, decision
+    return last_code, stage_dir, best, decision
 
 
 def main() -> None:
@@ -149,37 +216,27 @@ def main() -> None:
         print("[supervisor] smoke complete; --allow_training not set, stopping before Stage1.", flush=True)
         return
     stage1_dir = root / "stage1_frozen"
-    code = _run_child(
-        _command(args, stage1_dir, batch_size=args.batch_size, accum=args.gradient_accumulation_steps, epochs=args.max_epochs, smoke=False),
+    code, stage1_dir, best, decision = _run_stage1_epoch_loop(
+        args,
         root,
+        stage1_dir,
+        batch_size=args.batch_size,
+        accum=args.gradient_accumulation_steps,
     )
     if code != 0:
         # Basic OOM fallback: rerun once with same effective batch if the first attempt failed.
         _append_jsonl(root / "supervisor_decisions.jsonl", {"event": "stage1_failed", "returncode": code, "fallback": "batch2_accum16"})
         fallback_dir = root / "stage1_frozen_fallback_b2"
-        code = _run_child(
-            _command(
-                args,
-                fallback_dir,
-                batch_size=args.fallback_batch_size,
-                accum=args.fallback_gradient_accumulation_steps,
-                epochs=args.max_epochs,
-                smoke=False,
-            ),
+        code, stage1_dir, best, decision = _run_stage1_epoch_loop(
+            args,
             root,
+            fallback_dir,
+            batch_size=args.fallback_batch_size,
+            accum=args.fallback_gradient_accumulation_steps,
         )
-        stage1_dir = fallback_dir
-    rows = _read_metrics(stage1_dir / "metrics_summary.jsonl")
-    best = _best(rows)
     if not best:
         _append_jsonl(root / "supervisor_decisions.jsonl", {"event": "no_metrics_after_stage1", "returncode": code})
         raise SystemExit(code or 1)
-    decision = score_v2_stage1_decision(
-        int(best.get("epoch", 0)),
-        float(best.get("test_joint", -1.0)),
-        float(best.get("test_Exp_mF1", -1.0)),
-        float(best.get("test_Exp_mAP", -1.0)),
-    )
     _append_jsonl(root / "supervisor_decisions.jsonl", {"event": "stage1_decision", "best": best, **asdict(decision)})
     print(json.dumps({"event": "score_v2_supervisor_complete", "best": best, "decision": asdict(decision)}, ensure_ascii=False), flush=True)
 

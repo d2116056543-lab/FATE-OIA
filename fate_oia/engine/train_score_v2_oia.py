@@ -270,11 +270,12 @@ def build_manifest(args, output_dir: Path, train_count: int, val_count: int, tes
     }
 
 
-def save_checkpoint(path: Path, model, optimizer, epoch: int, best_score: float, manifest: dict[str, Any], metrics: dict[str, Any]) -> None:
+def save_checkpoint(path: Path, model, optimizer, scheduler, epoch: int, best_score: float, manifest: dict[str, Any], metrics: dict[str, Any]) -> None:
     torch.save(
         {
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict() if scheduler is not None else None,
             "epoch": epoch,
             "best_test_score": best_score,
             "manifest": manifest,
@@ -282,6 +283,18 @@ def save_checkpoint(path: Path, model, optimizer, epoch: int, best_score: float,
         },
         path,
     )
+
+
+def load_checkpoint(path: Path, model, optimizer, scheduler, device: torch.device, *, resume_optimizer: bool = True) -> tuple[int, float]:
+    checkpoint = torch.load(path, map_location=device)
+    model.load_state_dict(checkpoint["model"])
+    if resume_optimizer and "optimizer" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer"])
+    if resume_optimizer and scheduler is not None and checkpoint.get("scheduler") is not None:
+        scheduler.load_state_dict(checkpoint["scheduler"])
+    epoch = int(checkpoint.get("epoch", 0))
+    best_score = float(checkpoint.get("best_test_score", -math.inf))
+    return epoch + 1, best_score
 
 
 def main() -> None:
@@ -304,6 +317,9 @@ def main() -> None:
     ap.add_argument("--batch_size", type=int, default=4)
     ap.add_argument("--gradient_accumulation_steps", type=int, default=8)
     ap.add_argument("--epochs", type=int, default=20)
+    ap.add_argument("--scheduler_total_epochs", type=int, default=0)
+    ap.add_argument("--resume", default="")
+    ap.add_argument("--resume_optimizer", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--weight_decay", type=float, default=0.05)
     ap.add_argument("--warmup_epochs", type=int, default=1)
@@ -358,8 +374,12 @@ def main() -> None:
         )
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, args.epochs), eta_min=args.min_lr)
+    scheduler_total_epochs = int(args.scheduler_total_epochs) if int(args.scheduler_total_epochs) > 0 else int(args.epochs)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, scheduler_total_epochs), eta_min=args.min_lr)
     manifest = build_manifest(args, out, len(train_ds), len(val_ds), len(test_ds))
+    manifest["resume"] = args.resume
+    manifest["resume_optimizer"] = bool(args.resume_optimizer)
+    manifest["scheduler_total_epochs"] = scheduler_total_epochs
     _write_json(out / "run_manifest.json", manifest)
     _write_json(out / "args.json", vars(args))
     write_fingerprint(out / "config_fingerprint.json", manifest)
@@ -367,7 +387,26 @@ def main() -> None:
     if run_c_manifest.exists():
         _write_json(out / "diff_vs_runC_config.json", diff_configs(json.loads(run_c_manifest.read_text(encoding="utf-8")), manifest))
     best_test = -math.inf
-    for epoch in range(1, args.epochs + 1):
+    start_epoch = 1
+    if args.resume:
+        start_epoch, best_test = load_checkpoint(Path(args.resume), model, optimizer, scheduler, device, resume_optimizer=bool(args.resume_optimizer))
+        print(
+            json.dumps(
+                {
+                    "event": "score_v2_resume",
+                    "resume": args.resume,
+                    "start_epoch": start_epoch,
+                    "best_test_score": best_test,
+                    "scheduler_total_epochs": scheduler_total_epochs,
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+    if start_epoch > args.epochs:
+        print(json.dumps({"event": "score_v2_resume_noop", "start_epoch": start_epoch, "epochs": args.epochs}), flush=True)
+        return
+    for epoch in range(start_epoch, args.epochs + 1):
         train_stats = train_one_epoch(args, backbone, model, train_loader, optimizer, device, epoch, out)
         test_stats = evaluate(args, backbone, model, test_loader, device, "test", epoch, out)
         val_stats = evaluate(args, backbone, model, val_loader, device, "val", epoch, out) if val_loader is not None else None
@@ -390,12 +429,12 @@ def main() -> None:
             row.update({"val_joint": val_stats["joint"], "val_Exp_mF1": val_stats["Exp_mF1"], "val_Exp_mAP": val_stats["Exp_mAP"]})
         _append_jsonl(out / "metrics_summary.jsonl", row)
         _write_json(out / f"epoch_{epoch:03d}" / "metrics_summary.json", row)
-        save_checkpoint(out / "checkpoint_latest.pth", model, optimizer, epoch, best_test, manifest, row)
         if row["test_joint"] > best_test:
             best_test = row["test_joint"]
-            save_checkpoint(out / "checkpoint_best_test.pth", model, optimizer, epoch, best_test, manifest, row)
+            save_checkpoint(out / "checkpoint_best_test.pth", model, optimizer, scheduler, epoch, best_test, manifest, row)
             # Test-only default: keep a diagnostic val-best placeholder if val is not evaluated.
-            save_checkpoint(out / "checkpoint_best_val.pth", model, optimizer, epoch, best_test, manifest, row)
+            save_checkpoint(out / "checkpoint_best_val.pth", model, optimizer, scheduler, epoch, best_test, manifest, row)
+        save_checkpoint(out / "checkpoint_latest.pth", model, optimizer, scheduler, epoch, best_test, manifest, row)
         print(json.dumps({"event": "score_v2_epoch", **row}), flush=True)
     print(json.dumps({"event": "score_v2_training_complete", "best_test_joint": best_test, "output_dir": str(out)}), flush=True)
 
