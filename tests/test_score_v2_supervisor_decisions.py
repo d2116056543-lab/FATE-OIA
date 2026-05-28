@@ -16,13 +16,13 @@ def test_stage1_does_not_stop_before_min_gate_epoch_when_far_below_run_c() -> No
 
 def test_stage1_stops_at_min_gate_epoch_when_far_below_run_c_and_no_ap_gain() -> None:
     decision = score_v2_stage1_decision(
-        epoch=14,
+        epoch=20,
         best_joint=RUN_C_REFERENCE["joint"] - 0.04,
         best_exp_mf1=RUN_C_REFERENCE["exp_mf1"] - 0.03,
         best_exp_map=RUN_C_REFERENCE["exp_map"] - 0.01,
     )
     assert not decision.continue_stage
-    assert "epoch 14" in decision.reason
+    assert "epoch 20" in decision.reason
 
 
 def test_stage1_continues_when_ap_improves_even_if_f1_lags() -> None:

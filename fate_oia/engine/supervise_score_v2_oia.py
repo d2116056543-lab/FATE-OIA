@@ -28,7 +28,7 @@ def score_v2_stage1_decision(
     best_exp_mf1: float,
     best_exp_map: float,
     *,
-    min_gate_epoch: int = 14,
+    min_gate_epoch: int = 20,
 ) -> ScoreV2Decision:
     if epoch < min_gate_epoch:
         return ScoreV2Decision(True, f"Stage1 warmup continues before epoch {min_gate_epoch}.", None)
@@ -217,7 +217,7 @@ def main() -> None:
     ap.add_argument("--fallback_batch_size", type=int, default=2)
     ap.add_argument("--fallback_gradient_accumulation_steps", type=int, default=16)
     ap.add_argument("--max_epochs", type=int, default=20)
-    ap.add_argument("--stage1_min_gate_epoch", type=int, default=14)
+    ap.add_argument("--stage1_min_gate_epoch", type=int, default=20)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--num_workers", type=int, default=2)
     ap.add_argument("--log_every", type=int, default=20)
