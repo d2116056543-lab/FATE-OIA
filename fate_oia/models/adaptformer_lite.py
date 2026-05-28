@@ -7,7 +7,7 @@ from torch import nn
 class AdaptFormerLite(nn.Module):
     """Small bottleneck adapter kept disabled for the first ScoreV2 run."""
 
-    def __init__(self, dim: int, bottleneck_dim: int = 64, dropout: float = 0.0, init_scale: float = 0.0) -> None:
+    def __init__(self, dim: int, bottleneck_dim: int = 64, dropout: float = 0.0, init_scale: float = 1e-3) -> None:
         super().__init__()
         self.adapter = nn.Sequential(
             nn.LayerNorm(dim),

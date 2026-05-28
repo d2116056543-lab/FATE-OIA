@@ -37,10 +37,15 @@ class ScoreV2OIAModel(nn.Module):
             action_dim=config.action_dim,
             dropout=config.dropout,
         )
-        self.adapter = (
-            AdaptFormerLite(config.dim, bottleneck_dim=config.adaptformer_bottleneck_dim, dropout=config.dropout)
+        self.layer_adapters = (
+            nn.ModuleList(
+                [
+                    AdaptFormerLite(config.dim, bottleneck_dim=config.adaptformer_bottleneck_dim, dropout=config.dropout)
+                    for _ in range(config.n_last_blocks)
+                ]
+            )
             if config.use_adaptformer
-            else nn.Identity()
+            else nn.ModuleList()
         )
         self.decoder = StrongLabelDecoder(
             dim=config.dim,
@@ -52,8 +57,12 @@ class ScoreV2OIAModel(nn.Module):
         )
 
     def forward(self, dino_layers: list[torch.Tensor] | tuple[torch.Tensor, ...]) -> dict[str, torch.Tensor | str]:
+        if self.config.use_adaptformer:
+            if len(dino_layers) != len(self.layer_adapters):
+                raise ValueError(f"Expected {len(self.layer_adapters)} adapted layers, got {len(dino_layers)}")
+            dino_layers = [adapter(layer) for adapter, layer in zip(self.layer_adapters, dino_layers)]
         fused = self.fusion(dino_layers)
-        tokens = self.adapter(fused["tokens"])
+        tokens = fused["tokens"]
         label_queries = self.queries(tokens.shape[0], device=tokens.device)
         decoded = self.decoder(label_queries, tokens)
         decoded["layer_weights"] = fused["layer_weights"]

@@ -283,6 +283,24 @@ def build_manifest(args, output_dir: Path, train_count: int, val_count: int, tes
     }
 
 
+def build_score_v2_optimizer(model: nn.Module, *, lr_head: float, lr_adapter: float, weight_decay: float) -> torch.optim.Optimizer:
+    adapter_params = []
+    head_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if "layer_adapters" in name:
+            adapter_params.append(param)
+        else:
+            head_params.append(param)
+    groups = []
+    if head_params:
+        groups.append({"params": head_params, "lr": float(lr_head), "weight_decay": float(weight_decay), "name": "head"})
+    if adapter_params:
+        groups.append({"params": adapter_params, "lr": float(lr_adapter), "weight_decay": float(weight_decay), "name": "adapter"})
+    return torch.optim.AdamW(groups, lr=float(lr_head), weight_decay=float(weight_decay))
+
+
 def save_checkpoint(path: Path, model, optimizer, scheduler, epoch: int, best_score: float, manifest: dict[str, Any], metrics: dict[str, Any]) -> None:
     torch.save(
         {
@@ -298,16 +316,34 @@ def save_checkpoint(path: Path, model, optimizer, scheduler, epoch: int, best_sc
     )
 
 
-def load_checkpoint(path: Path, model, optimizer, scheduler, device: torch.device, *, resume_optimizer: bool = True) -> tuple[int, float]:
+def load_checkpoint(
+    path: Path,
+    model,
+    optimizer,
+    scheduler,
+    device: torch.device,
+    *,
+    resume_optimizer: bool = True,
+    allow_partial: bool = False,
+    model_only: bool = False,
+) -> tuple[int, float, dict[str, Any]]:
     checkpoint = torch.load(path, map_location=device)
-    model.load_state_dict(checkpoint["model"])
+    load_result = model.load_state_dict(checkpoint["model"], strict=not allow_partial)
+    info = {
+        "missing_keys": list(load_result.missing_keys),
+        "unexpected_keys": list(load_result.unexpected_keys),
+        "allow_partial": bool(allow_partial),
+        "model_only": bool(model_only),
+    }
+    if model_only:
+        return 1, -math.inf, info
     if resume_optimizer and "optimizer" in checkpoint:
         optimizer.load_state_dict(checkpoint["optimizer"])
     if resume_optimizer and scheduler is not None and checkpoint.get("scheduler") is not None:
         scheduler.load_state_dict(checkpoint["scheduler"])
     epoch = int(checkpoint.get("epoch", 0))
     best_score = float(checkpoint.get("best_test_score", -math.inf))
-    return epoch + 1, best_score
+    return epoch + 1, best_score, info
 
 
 def main() -> None:
@@ -333,7 +369,11 @@ def main() -> None:
     ap.add_argument("--scheduler_total_epochs", type=int, default=0)
     ap.add_argument("--resume", default="")
     ap.add_argument("--resume_optimizer", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--resume_model_only", action=argparse.BooleanOptionalAction, default=False)
+    ap.add_argument("--allow_partial_resume", action=argparse.BooleanOptionalAction, default=False)
     ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--lr_head", type=float, default=0.0)
+    ap.add_argument("--lr_adapter", type=float, default=2e-5)
     ap.add_argument("--weight_decay", type=float, default=0.05)
     ap.add_argument("--warmup_epochs", type=int, default=1)
     ap.add_argument("--min_lr", type=float, default=1e-5)
@@ -386,13 +426,19 @@ def main() -> None:
             use_adaptformer=args.stage == "adaptformer",
         )
     ).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    lr_head = float(args.lr_head) if float(args.lr_head) > 0 else float(args.lr)
+    optimizer = build_score_v2_optimizer(model, lr_head=lr_head, lr_adapter=args.lr_adapter, weight_decay=args.weight_decay)
     scheduler_total_epochs = int(args.scheduler_total_epochs) if int(args.scheduler_total_epochs) > 0 else int(args.epochs)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, scheduler_total_epochs), eta_min=args.min_lr)
     manifest = build_manifest(args, out, len(train_ds), len(val_ds), len(test_ds))
     manifest["resume"] = args.resume
     manifest["resume_optimizer"] = bool(args.resume_optimizer)
+    manifest["resume_model_only"] = bool(args.resume_model_only)
+    manifest["allow_partial_resume"] = bool(args.allow_partial_resume)
     manifest["scheduler_total_epochs"] = scheduler_total_epochs
+    manifest["lr_head"] = lr_head
+    manifest["lr_adapter"] = args.lr_adapter if args.stage == "adaptformer" else 0.0
+    manifest["optimizer_param_groups"] = [{"name": group.get("name", ""), "lr": group["lr"], "weight_decay": group.get("weight_decay", 0.0), "param_count": len(group["params"])} for group in optimizer.param_groups]
     _write_json(out / "run_manifest.json", manifest)
     _write_json(out / "args.json", vars(args))
     write_fingerprint(out / "config_fingerprint.json", manifest)
@@ -402,7 +448,17 @@ def main() -> None:
     best_test = -math.inf
     start_epoch = 1
     if args.resume:
-        start_epoch, best_test = load_checkpoint(Path(args.resume), model, optimizer, scheduler, device, resume_optimizer=bool(args.resume_optimizer))
+        start_epoch, best_test, resume_info = load_checkpoint(
+            Path(args.resume),
+            model,
+            optimizer,
+            scheduler,
+            device,
+            resume_optimizer=bool(args.resume_optimizer),
+            allow_partial=bool(args.allow_partial_resume),
+            model_only=bool(args.resume_model_only),
+        )
+        _write_json(out / "resume_info.json", resume_info)
         print(
             json.dumps(
                 {
@@ -411,6 +467,7 @@ def main() -> None:
                     "start_epoch": start_epoch,
                     "best_test_score": best_test,
                     "scheduler_total_epochs": scheduler_total_epochs,
+                    "resume_info": resume_info,
                 },
                 ensure_ascii=False,
             ),
