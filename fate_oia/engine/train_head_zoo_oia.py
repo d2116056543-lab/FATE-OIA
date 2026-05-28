@@ -309,6 +309,8 @@ def main() -> None:
     ap.add_argument("--max_train_samples", type=int, default=0)
     ap.add_argument("--max_val_samples", type=int, default=0)
     ap.add_argument("--max_test_samples", type=int, default=0)
+    ap.add_argument("--tail_aware_sampler", action=argparse.BooleanOptionalAction, default=False)
+    ap.add_argument("--tail_sampler_power", type=float, default=0.5)
     ap.add_argument("--eval_splits", choices=["test", "val_test"], default="test")
     ap.add_argument("--log_every", type=int, default=80)
     ap.add_argument("--grad_clip", type=float, default=1.0)
