@@ -78,22 +78,22 @@ def _load_branch(run_dir: str | Path, *, split: str, prefer_fused_action: bool) 
     root = Path(run_dir)
     if prefer_fused_action:
         action_candidates = [
-            f"logits_action_fused_{split}.pt",
-            f"logits_action_{split}.pt",
             f"logits_action_fused_best_{split}.pt",
             f"logits_action_best_{split}.pt",
+            f"logits_action_fused_{split}.pt",
+            f"logits_action_{split}.pt",
         ]
     else:
         action_candidates = [
-            f"logits_action_{split}.pt",
-            f"logits_action_fused_{split}.pt",
             f"logits_action_best_{split}.pt",
             f"logits_action_fused_best_{split}.pt",
+            f"logits_action_{split}.pt",
+            f"logits_action_fused_{split}.pt",
         ]
-    reason_candidates = [f"logits_reason_{split}.pt", f"logits_reason_best_{split}.pt"]
-    label_action_candidates = [f"labels_action_{split}.pt", f"labels_action_best_{split}.pt"]
-    label_reason_candidates = [f"labels_reason_{split}.pt", f"labels_reason_best_{split}.pt"]
-    name_candidates = [f"file_names_{split}.json", f"file_names_best_{split}.json"]
+    reason_candidates = [f"logits_reason_best_{split}.pt", f"logits_reason_{split}.pt"]
+    label_action_candidates = [f"labels_action_best_{split}.pt", f"labels_action_{split}.pt"]
+    label_reason_candidates = [f"labels_reason_best_{split}.pt", f"labels_reason_{split}.pt"]
+    name_candidates = [f"file_names_best_{split}.json", f"file_names_{split}.json"]
     root_best_required = [
         f"logits_reason_best_{split}.pt",
         f"labels_action_best_{split}.pt",
