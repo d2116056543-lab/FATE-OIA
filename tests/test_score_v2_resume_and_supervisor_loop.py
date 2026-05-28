@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fate_oia.engine.supervise_score_v2_oia import next_epoch_command
+from fate_oia.engine.supervise_score_v2_oia import next_epoch_command, next_training_epoch
 
 
 def test_next_epoch_command_uses_resume_after_first_checkpoint(tmp_path: Path) -> None:
@@ -30,3 +30,8 @@ def test_next_epoch_command_uses_resume_after_first_checkpoint(tmp_path: Path) -
     assert "2" in cmd
     assert "--resume" in cmd
     assert str(latest) in cmd
+
+
+def test_next_training_epoch_continues_after_existing_metrics() -> None:
+    assert next_training_epoch([]) == 1
+    assert next_training_epoch([{"epoch": 1}, {"epoch": 5}]) == 6

@@ -22,12 +22,21 @@ class ScoreV2Decision:
     next_stage: str | None = None
 
 
-def score_v2_stage1_decision(epoch: int, best_joint: float, best_exp_mf1: float, best_exp_map: float) -> ScoreV2Decision:
-    if epoch >= 5 and best_joint < RUN_C_REFERENCE["joint"] - 0.020 and best_exp_map < RUN_C_REFERENCE["exp_map"] + 0.003:
-        return ScoreV2Decision(False, "Stage1 stopped at epoch 5 gate: joint far below Run C and AP did not improve.", None)
-    if epoch >= 8 and best_joint < RUN_C_REFERENCE["joint"] - 0.010 and best_exp_map < RUN_C_REFERENCE["exp_map"] + 0.005:
-        return ScoreV2Decision(False, "Stage1 stopped at epoch 8 gate: no close trend to Run C.", None)
-    if epoch >= 10 and best_exp_map > RUN_C_REFERENCE["exp_map"] + 0.010 and best_exp_mf1 <= RUN_C_REFERENCE["exp_mf1"]:
+def score_v2_stage1_decision(
+    epoch: int,
+    best_joint: float,
+    best_exp_mf1: float,
+    best_exp_map: float,
+    *,
+    min_gate_epoch: int = 14,
+) -> ScoreV2Decision:
+    if epoch < min_gate_epoch:
+        return ScoreV2Decision(True, f"Stage1 warmup continues before epoch {min_gate_epoch}.", None)
+    if best_joint < RUN_C_REFERENCE["joint"] - 0.020 and best_exp_map < RUN_C_REFERENCE["exp_map"] + 0.003:
+        return ScoreV2Decision(False, f"Stage1 stopped at epoch {epoch} gate: joint far below Run C and AP did not improve.", None)
+    if best_joint < RUN_C_REFERENCE["joint"] - 0.010 and best_exp_map < RUN_C_REFERENCE["exp_map"] + 0.005:
+        return ScoreV2Decision(False, f"Stage1 stopped at epoch {epoch} gate: no close trend to Run C.", None)
+    if best_exp_map > RUN_C_REFERENCE["exp_map"] + 0.010 and best_exp_mf1 <= RUN_C_REFERENCE["exp_mf1"]:
         return ScoreV2Decision(False, "Stage1 AP improved but F1 lags; route to calibration analysis.", "calibration_analysis")
     return ScoreV2Decision(True, "Stage1 continues.", None)
 
@@ -70,6 +79,12 @@ def _best(rows: list[dict[str, Any]]) -> dict[str, Any]:
     if not rows:
         return {}
     return max(rows, key=lambda r: (float(r.get("test_joint", -1e9)), float(r.get("test_Exp_mF1", -1e9))))
+
+
+def next_training_epoch(rows: list[dict[str, Any]]) -> int:
+    if not rows:
+        return 1
+    return max(int(row.get("epoch", 0)) for row in rows) + 1
 
 
 def next_epoch_command(
@@ -148,7 +163,15 @@ def _run_stage1_epoch_loop(args: argparse.Namespace, root: Path, stage_dir: Path
     best: dict[str, Any] = {}
     decision = ScoreV2Decision(True, "Stage1 continues.", None)
     base_args = _base_train_args(args, batch_size=batch_size, accum=accum, smoke=False)
-    for epoch in range(1, int(args.max_epochs) + 1):
+    existing_rows = _read_metrics(stage_dir / "metrics_summary.jsonl")
+    start_epoch = next_training_epoch(existing_rows)
+    if existing_rows:
+        best = _best(existing_rows)
+        _append_jsonl(
+            root / "supervisor_decisions.jsonl",
+            {"event": "stage1_resume_existing_metrics", "start_epoch": start_epoch, "best": best, "output_dir": str(stage_dir)},
+        )
+    for epoch in range(start_epoch, int(args.max_epochs) + 1):
         cmd = next_epoch_command(
             python_executable=sys.executable,
             train_module="fate_oia.engine.train_score_v2_oia",
@@ -172,6 +195,7 @@ def _run_stage1_epoch_loop(args: argparse.Namespace, root: Path, stage_dir: Path
             float(best.get("test_joint", -1.0)),
             float(best.get("test_Exp_mF1", -1.0)),
             float(best.get("test_Exp_mAP", -1.0)),
+            min_gate_epoch=int(args.stage1_min_gate_epoch),
         )
         payload = {"event": "stage1_epoch_decision", "epoch": epoch, "latest": latest, "best": best, **asdict(decision)}
         _append_jsonl(root / "supervisor_decisions.jsonl", payload)
@@ -193,6 +217,7 @@ def main() -> None:
     ap.add_argument("--fallback_batch_size", type=int, default=2)
     ap.add_argument("--fallback_gradient_accumulation_steps", type=int, default=16)
     ap.add_argument("--max_epochs", type=int, default=20)
+    ap.add_argument("--stage1_min_gate_epoch", type=int, default=14)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--num_workers", type=int, default=2)
     ap.add_argument("--log_every", type=int, default=20)
