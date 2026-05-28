@@ -76,7 +76,6 @@ def _find_file(base: Path, candidates: list[str]) -> Path:
 
 def _load_branch(run_dir: str | Path, *, split: str, prefer_fused_action: bool) -> dict[str, Any]:
     root = Path(run_dir)
-    base = _best_epoch_dir(root, split)
     if prefer_fused_action:
         action_candidates = [
             f"logits_action_fused_{split}.pt",
@@ -91,12 +90,27 @@ def _load_branch(run_dir: str | Path, *, split: str, prefer_fused_action: bool) 
             f"logits_action_best_{split}.pt",
             f"logits_action_fused_best_{split}.pt",
         ]
+    reason_candidates = [f"logits_reason_{split}.pt", f"logits_reason_best_{split}.pt"]
+    label_action_candidates = [f"labels_action_{split}.pt", f"labels_action_best_{split}.pt"]
+    label_reason_candidates = [f"labels_reason_{split}.pt", f"labels_reason_best_{split}.pt"]
+    name_candidates = [f"file_names_{split}.json", f"file_names_best_{split}.json"]
+    root_best_required = [
+        f"logits_reason_best_{split}.pt",
+        f"labels_action_best_{split}.pt",
+        f"labels_reason_best_{split}.pt",
+        f"file_names_best_{split}.json",
+    ]
+    root_best_action_ok = any((root / name).exists() for name in action_candidates if f"_best_{split}" in name)
+    if root_best_action_ok and all((root / name).exists() for name in root_best_required):
+        base = root
+    else:
+        base = _best_epoch_dir(root, split)
     paths = {
         "action_logits": _find_file(base, action_candidates),
-        "reason_logits": _find_file(base, [f"logits_reason_{split}.pt", f"logits_reason_best_{split}.pt"]),
-        "action_labels": _find_file(base, [f"labels_action_{split}.pt", f"labels_action_best_{split}.pt"]),
-        "reason_labels": _find_file(base, [f"labels_reason_{split}.pt", f"labels_reason_best_{split}.pt"]),
-        "file_names": _find_file(base, [f"file_names_{split}.json", f"file_names_best_{split}.json"]),
+        "reason_logits": _find_file(base, reason_candidates),
+        "action_labels": _find_file(base, label_action_candidates),
+        "reason_labels": _find_file(base, label_reason_candidates),
+        "file_names": _find_file(base, name_candidates),
     }
     return {
         "root": str(root),

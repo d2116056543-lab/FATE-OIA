@@ -66,3 +66,34 @@ def test_phase_b_sweep_aligns_file_names_and_writes_plan_outputs(tmp_path):
     assert payload["decision"]["logit_fusion_promising"] is True
     assert payload["best_fusion"]["Exp_mF1"] > payload["run_c_fixed"]["Exp_mF1"]
 
+
+def test_phase_b_prefers_root_best_test_artifacts_over_metrics_epoch(tmp_path):
+    names = ["a.jpg", "b.jpg", "c.jpg", "d.jpg"]
+    run_c = tmp_path / "run_c"
+    s1 = tmp_path / "s1"
+    output = tmp_path / "phase_b"
+    run_c.mkdir()
+    s1.mkdir()
+    _write_branch(run_c, 16, names=names, order=[0, 1, 2, 3], reason_good=False)
+    best_epoch = _write_branch(run_c, 14, names=names, order=[0, 1, 2, 3], reason_good=True)
+    for source_name, best_name in [
+        ("logits_action_fused_test.pt", "logits_action_fused_best_test.pt"),
+        ("logits_reason_test.pt", "logits_reason_best_test.pt"),
+        ("labels_action_test.pt", "labels_action_best_test.pt"),
+        ("labels_reason_test.pt", "labels_reason_best_test.pt"),
+    ]:
+        (run_c / best_name).write_bytes((best_epoch / source_name).read_bytes())
+    (run_c / "file_names_best_test.json").write_text((best_epoch / "file_names_test.json").read_text(encoding="utf-8"), encoding="utf-8")
+    _write_branch(s1, 19, names=names, order=[0, 1, 2, 3], reason_good=False)
+
+    payload = run_phase_b_fusion_sweep(
+        run_c_dir=run_c,
+        s1_dir=s1,
+        output_dir=output,
+        split="test",
+        action_dim=4,
+        reason_dim=21,
+    )
+
+    assert payload["inputs"]["run_c"]["epoch_dir"] == str(run_c)
+    assert payload["run_c_fixed"]["Exp_mF1"] > payload["score_v2_fixed"]["Exp_mF1"]
