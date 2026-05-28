@@ -106,6 +106,11 @@ def _command(args: argparse.Namespace, output_dir: Path, *, batch_size: int, acc
     ]
     if smoke:
         cmd += ["--max_train_samples", str(args.smoke_train_samples), "--max_test_samples", str(args.smoke_test_samples)]
+    else:
+        if args.stage1_max_train_samples > 0:
+            cmd += ["--max_train_samples", str(args.stage1_max_train_samples)]
+        if args.stage1_max_test_samples > 0:
+            cmd += ["--max_test_samples", str(args.stage1_max_test_samples)]
     return cmd
 
 
@@ -126,6 +131,8 @@ def main() -> None:
     ap.add_argument("--log_every", type=int, default=20)
     ap.add_argument("--smoke_train_samples", type=int, default=8)
     ap.add_argument("--smoke_test_samples", type=int, default=8)
+    ap.add_argument("--stage1_max_train_samples", type=int, default=0)
+    ap.add_argument("--stage1_max_test_samples", type=int, default=0)
     ap.add_argument("--allow_training", action="store_true")
     args = ap.parse_args()
 
