@@ -49,3 +49,8 @@ def test_compute_loss_contains_rank_and_sigmoid_f1_terms():
     assert parts["ranking_loss"] >= 0
     assert parts["sigmoid_f1_loss"] >= 0
     assert parts["aux"] == 0.25
+
+
+def test_head_zoo_training_parser_exposes_scheduler_total_epochs():
+    source = __import__("pathlib").Path("fate_oia/engine/train_head_zoo_oia.py").read_text(encoding="utf-8")
+    assert "--scheduler_total_epochs" in source

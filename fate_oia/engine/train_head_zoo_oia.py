@@ -284,6 +284,7 @@ def main() -> None:
     ap.add_argument("--batch_size", type=int, default=4)
     ap.add_argument("--gradient_accumulation_steps", type=int, default=8)
     ap.add_argument("--epochs", type=int, default=15)
+    ap.add_argument("--scheduler_total_epochs", type=int, default=0)
     ap.add_argument("--resume", default="")
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--weight_decay", type=float, default=0.05)
@@ -341,8 +342,10 @@ def main() -> None:
         mrc_mask_ratio=args.mrc_mask_ratio,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, args.epochs), eta_min=args.min_lr)
+    scheduler_total_epochs = int(args.scheduler_total_epochs) if int(args.scheduler_total_epochs) > 0 else int(args.epochs)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, scheduler_total_epochs), eta_min=args.min_lr)
     manifest = build_manifest(args, out, len(train_ds), len(val_ds), len(test_ds))
+    manifest["scheduler_total_epochs"] = scheduler_total_epochs
     _write_json(out / "run_manifest.json", manifest)
     _write_json(out / "args.json", vars(args))
     write_fingerprint(out / "config_fingerprint.json", manifest)

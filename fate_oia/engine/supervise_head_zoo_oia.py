@@ -136,6 +136,8 @@ def run_head(args: argparse.Namespace, head_name: str) -> dict[str, Any]:
             args.pretrained_weights,
             "--epochs",
             str(epoch),
+            "--scheduler_total_epochs",
+            str(args.extension_epoch),
             "--batch_size",
             str(batch_size),
             "--gradient_accumulation_steps",
