@@ -34,3 +34,25 @@ def test_score_v2_model_forward_uses_multi_layer_tokens() -> None:
     assert out["reason_logits"].shape == (2, 21)
     assert out["layer_weights"].shape == (3,)
     assert out["score_v2_stage"] == "score_v2_patch_only"
+
+
+def test_score_v2_adaptformer_uses_one_adapter_per_selected_layer() -> None:
+    cfg = ScoreV2OIAConfig(
+        dim=8,
+        action_dim=4,
+        reason_dim=3,
+        n_last_blocks=4,
+        num_heads=2,
+        decoder_self_layers=1,
+        use_adaptformer=True,
+        adaptformer_bottleneck_dim=4,
+    )
+    model = ScoreV2OIAModel(cfg)
+    layers = [torch.randn(2, 5, 8) for _ in range(4)]
+    out = model(layers)
+    assert out["score_v2_stage"] == "score_v2_adaptformer"
+    assert len(model.layer_adapters) == 4
+    assert all(float(adapter.scale.detach()) > 0 for adapter in model.layer_adapters)
+    loss = out["reason_logits"].sum() + out["action_logits"].sum()
+    loss.backward()
+    assert any(param.grad is not None for adapter in model.layer_adapters for param in adapter.parameters())
