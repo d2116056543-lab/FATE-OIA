@@ -37,6 +37,11 @@ def _best(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return max(rows, key=lambda row: (float(row.get("test_joint", -1e9)), float(row.get("test_Exp_mF1", -1e9)))) if rows else {}
 
 
+def _next_epoch(rows: list[dict[str, Any]]) -> int:
+    finished = [int(row.get("epoch", 0)) for row in rows if int(row.get("epoch", 0)) > 0]
+    return max(finished, default=0) + 1
+
+
 def score_v2_stage2_decision(
     *,
     epoch: int,
@@ -143,7 +148,11 @@ def run_stage2(args: argparse.Namespace, batch_size: int, accum: int) -> int:
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
     _append_jsonl(out / "supervisor_decisions.jsonl", {"event": "stage2_supervisor_started", "time": datetime.now().isoformat(), "stage1_checkpoint": args.stage1_checkpoint, "run_c_reference": RUN_C_REFERENCE})
-    for epoch in range(1, int(args.max_epochs) + 1):
+    existing_rows = _read_metrics(out / "metrics_summary.jsonl")
+    start_epoch = _next_epoch(existing_rows)
+    if start_epoch > 1:
+        _append_jsonl(out / "supervisor_decisions.jsonl", {"event": "stage2_resume_existing_run", "next_epoch": start_epoch, "existing_best": _best(existing_rows)})
+    for epoch in range(start_epoch, int(args.max_epochs) + 1):
         cmd = _epoch_command(args, out, epoch, batch_size, accum)
         _append_jsonl(out / "supervisor_decisions.jsonl", {"event": "stage2_epoch_start", "epoch": epoch, "cmd": cmd})
         code = _run_child(cmd, out)

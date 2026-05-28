@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from fate_oia.engine.supervise_score_v2_oia import next_epoch_command, next_training_epoch
-from fate_oia.engine.supervise_score_v2_stage2_oia import score_v2_stage2_decision
+from fate_oia.engine.supervise_score_v2_stage2_oia import _next_epoch, score_v2_stage2_decision
 
 
 def test_next_epoch_command_uses_resume_after_first_checkpoint(tmp_path: Path) -> None:
@@ -36,6 +36,11 @@ def test_next_epoch_command_uses_resume_after_first_checkpoint(tmp_path: Path) -
 def test_next_training_epoch_continues_after_existing_metrics() -> None:
     assert next_training_epoch([]) == 1
     assert next_training_epoch([{"epoch": 1}, {"epoch": 5}]) == 6
+
+
+def test_stage2_next_epoch_continues_existing_output_dir() -> None:
+    assert _next_epoch([]) == 1
+    assert _next_epoch([{"epoch": 1}, {"epoch": 7}]) == 8
 
 
 def test_stage2_decision_waits_until_min_gate_epoch_and_stops_bad_plateau() -> None:
