@@ -18,6 +18,7 @@ import vision_transformer as vits
 from fate_oia.datasets.bdd_oia_multitask import BDDOIAMultiTaskDataset
 from fate_oia.datasets.tail_aware_sampler import build_tail_aware_sampler
 from fate_oia.engine.eval_score_calibrated import evaluate_score_logits
+from fate_oia.engine.score_v2_diagnostics import write_score_v2_epoch_diagnostics
 from fate_oia.losses.asymmetric_loss import AsymmetricLossMultiLabel
 from fate_oia.losses.reason_ranking_loss import reason_pairwise_ranking_loss
 from fate_oia.losses.sigmoid_f1_loss import sigmoid_macro_f1_loss
@@ -171,6 +172,18 @@ def evaluate(args, backbone, model, loader, device, split: str, epoch: int, outp
     _write_json(epoch_dir / f"metrics_fixed_{split}.json", fixed)
     _write_json(epoch_dir / f"metrics_global_threshold_{split}.json", global_eval)
     _write_json(epoch_dir / f"metrics_per_label_threshold_{split}.json", per_label)
+    write_score_v2_epoch_diagnostics(
+        epoch_dir,
+        run_dir=output_dir,
+        split=split,
+        action_logits=action_logits,
+        reason_logits=reason_logits,
+        labels_action=labels_action,
+        labels_reason=labels_reason,
+        file_names=names,
+        tail_reason_indices=args.tail_reason_indices,
+        n_last_blocks=args.n_last_blocks,
+    )
     stats = _split_stats(split, fixed, global_eval, per_label)
     stats["loss"] = sum(losses) / max(1, len(losses))
     return stats | {
