@@ -1,7 +1,0 @@
-stage: OIA-4
-description: Counterfactual deletion loss after a warm checkpoint.
-train_module: fate_oia.engine.train_fate_oia
-loss_counterfactual: 0.01
-counterfactual_topk_ratio: 0.10
-mask_strategy: background
-token_compression: none

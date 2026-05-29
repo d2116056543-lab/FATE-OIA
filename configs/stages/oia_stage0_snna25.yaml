@@ -1,6 +1,0 @@
-stage: OIA-0
-description: SNNA25 baseline with frozen backbone and 25-label head.
-train_module: fate_oia.engine.train_snna25
-loss_grounding: 0.0
-loss_counterfactual: 0.0
-token_compression: none

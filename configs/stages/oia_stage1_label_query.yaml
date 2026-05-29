@@ -1,9 +1,0 @@
-stage: OIA-1
-description: Label-query action/reason model without compression or counterfactual loss.
-train_module: fate_oia.engine.train_fate_oia
-use_label_query: true
-loss_r2a_gt: 0.0
-loss_action_agree: 0.0
-loss_grounding: 0.0
-loss_counterfactual: 0.0
-token_compression: none

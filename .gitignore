@@ -1,4 +1,4 @@
-
+﻿
 
 
 # FATE local datasets / assets / generated outputs
@@ -52,3 +52,7 @@ tests/**/*.pyc
 
 .background_runs/
 docs/FATE_*_IMPLEMENTATION_STATUS_*.md
+run_c_artifacts/
+runc_outputs/
+*.log
+

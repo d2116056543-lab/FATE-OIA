@@ -1,0 +1,42 @@
+﻿Run C minimal reproduction worktree
+
+Purpose:
+  This worktree keeps only the code path required to reproduce and continue Run C:
+  BDD-OIA loader, DINO ViT-S/8 backbone glue, FATE-OIA Run C model, train/eval code,
+  Run C 360x640 config, and two PowerShell entrypoints.
+
+Not copied:
+  Full datasets, raw data, public DINO weight file, grounding cache source, unrelated
+  SNNA/FATE experiments, HeadZoo/ScoreV2/EviS modules, tests, docs, and generated runs.
+
+Local ignored artifacts:
+  run_c_artifacts/checkpoint_best_test.pth
+  run_c_artifacts/args.json
+  run_c_artifacts/training_config_resolved.yaml
+  run_c_artifacts/run_manifest.json
+  run_c_artifacts/metrics_best_test.json
+
+External paths used by scripts:
+  E:\sbw\FATE_Drive\fate_oia_worktree\dataset\BDD-OIA
+  E:\sbw\FATE_Drive\fate_oia_worktree\raw_data\BDD-OIA
+  E:\sbw\FATE_Drive\fate_oia_worktree\ckp\reference\dino_deitsmall8_pretrain.pth
+  E:\sbw\FATE_Drive\fate_oia_worktree\.background_runs\fate_oia_grounding_cache_20260525.jsonl
+
+Commands:
+  Check readiness:
+    E:\Anaconda\envs\sbw39\python.exe tools\check_runc_ready.py
+
+  Reproduce Run C test metrics only, no training:
+    powershell -NoProfile -ExecutionPolicy Bypass -File scripts_runc\run_c_eval_test.ps1
+
+  Continue training from Run C checkpoint_best_test.pth:
+    powershell -NoProfile -ExecutionPolicy Bypass -File scripts_runc\run_c_continue_train.ps1
+
+  Smoke one continuation epoch on tiny subsets:
+    powershell -NoProfile -ExecutionPolicy Bypass -File scripts_runc\run_c_continue_train.ps1 -Epochs 16 -MaxTrainSamples 4 -MaxValSamples 4 -MaxTestSamples 4
+
+Expected strict test reproduction:
+  joint_test_score = 0.5478436350822449
+  Act_mF1 = 0.714386522769928
+  Exp_mF1 = 0.38130074739456177
+  Exp_mAP diff must be < 1e-5

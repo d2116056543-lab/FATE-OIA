@@ -1,3 +1,0 @@
-extends: fate_oia_base.yaml
-model:
-  mode: snna4_corrected
