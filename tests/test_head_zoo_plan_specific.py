@@ -86,3 +86,16 @@ def test_ml_decoder_uses_fixed_label_group_projection_matrix():
     projection = head.label_to_group_projection
     assert projection.shape == (25, 8)
     assert torch.allclose(projection.sum(dim=1), torch.ones(25))
+
+
+def test_ctran_samples_action_and_reason_reveal_masks_separately():
+    torch.manual_seed(15)
+    tokens = torch.randn(3, 9, 384)
+    labels = _labels(batch_size=3)
+    head = CTranMaskedHead(dim=384, action_dim=4, reason_dim=21, reveal_prob=0.5)
+    head.train()
+    head(tokens, labels=labels)
+    assert hasattr(head, "last_reveal_mask")
+    assert head.last_reveal_mask.shape == (3, 25)
+    assert hasattr(head, "action_reveal_prob")
+    assert hasattr(head, "reason_reveal_prob")

@@ -21,6 +21,8 @@ class CTranMaskedHead(BaseOIAHead):
         self.action_dim = int(action_dim)
         self.reason_dim = int(reason_dim)
         self.num_labels = self.action_dim + self.reason_dim
+        self.action_reveal_prob = float(reveal_prob)
+        self.reason_reveal_prob = float(reveal_prob)
         self.reveal_prob = float(reveal_prob)
         self.label_embed = nn.Embedding(self.num_labels, dim)
         self.state_embed = nn.Embedding(3, dim)  # negative, positive, unknown
@@ -32,7 +34,10 @@ class CTranMaskedHead(BaseOIAHead):
     def _states(self, labels: torch.Tensor | None, batch: int, device: torch.device) -> torch.Tensor:
         if (not self.training) or labels is None:
             return torch.full((batch, self.num_labels), 2, dtype=torch.long, device=device)
-        reveal = torch.rand(batch, self.num_labels, device=device) < self.reveal_prob
+        action_reveal = torch.rand(batch, self.action_dim, device=device) < self.action_reveal_prob
+        reason_reveal = torch.rand(batch, self.reason_dim, device=device) < self.reason_reveal_prob
+        reveal = torch.cat([action_reveal, reason_reveal], dim=1)
+        self.last_reveal_mask = reveal.detach()
         values = torch.where(labels.float() > 0, torch.ones_like(labels, dtype=torch.long), torch.zeros_like(labels, dtype=torch.long))
         return torch.where(reveal, values, torch.full_like(values, 2))
 
