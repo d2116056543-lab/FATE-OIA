@@ -19,6 +19,8 @@ class MLDecoderHead(BaseOIAHead):
         nn.init.trunc_normal_(self.group_queries, std=0.02)
         self.attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
         self.norm = nn.LayerNorm(dim)
+        self.label_embed = nn.Parameter(torch.empty(self.num_labels, dim))
+        nn.init.trunc_normal_(self.label_embed, std=0.02)
         self.label_group_logits = nn.Parameter(torch.zeros(self.num_labels, self.groups))
         self.label_proj = nn.Linear(dim, 1)
 
@@ -29,6 +31,8 @@ class MLDecoderHead(BaseOIAHead):
         group_tokens = self.norm(group_tokens)
         weights = torch.softmax(self.label_group_logits, dim=1)
         label_tokens = torch.einsum("lg,bgd->bld", weights, group_tokens)
+        label_tokens = self.norm(label_tokens + self.label_embed.unsqueeze(0))
         logits = self.label_proj(label_tokens).squeeze(-1)
         label_attn = torch.einsum("lg,bgn->bln", weights, attn)
+        label_attn = label_attn / label_attn.sum(dim=-1, keepdim=True).clamp_min(1e-6)
         return with_common_fields(logits, self.action_dim, label_tokens=label_tokens, attention=label_attn, aux_losses={})

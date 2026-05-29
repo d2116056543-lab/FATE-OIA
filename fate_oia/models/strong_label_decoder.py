@@ -52,6 +52,7 @@ class StrongLabelDecoder(nn.Module):
         label_tokens = self.self_encoder(label_tokens)
         label_tokens = self.out_norm(label_tokens)
         logits = self.label_classifier(label_tokens).squeeze(-1)
+        attn = attn / attn.sum(dim=-1, keepdim=True).clamp_min(1e-6)
         return {
             "logits": logits,
             "action_logits": logits[:, : self.action_dim],

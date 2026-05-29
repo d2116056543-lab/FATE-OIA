@@ -136,9 +136,21 @@ def _split_stats(split: str, fixed: dict, global_eval: dict, per_label: dict) ->
     }
 
 
+def eval_variants_from_head_output(out: dict[str, Any]) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+    """Return named action/reason logits variants for evaluation and artifact writes."""
+    variants = {"calibrated": (out["action_logits"], out["reason_logits"])}
+    if "raw_action_logits" in out and "raw_reason_logits" in out:
+        variants["raw"] = (out["raw_action_logits"], out["raw_reason_logits"])
+    elif "raw_logits" in out:
+        raw_action, raw_reason = out["raw_logits"][:, :4], out["raw_logits"][:, 4:]
+        variants["raw"] = (raw_action, raw_reason)
+    return variants
+
+
 def evaluate(args, backbone, model, loader, device, split: str, epoch: int, output_dir: Path) -> dict[str, Any]:
     model.eval()
     action_logits_all, reason_logits_all, labels_action_all, labels_reason_all = [], [], [], []
+    raw_action_logits_all, raw_reason_logits_all = [], []
     names: list[str] = []
     criterion = make_loss(args)
     losses: list[float] = []
@@ -148,10 +160,15 @@ def evaluate(args, backbone, model, loader, device, split: str, epoch: int, outp
             labels = labels_from_batch(batch).to(device, non_blocking=True)
             layers = extract_multilayer_tokens(backbone, images, args.n_last_blocks)
             out = model(layers)
-            logits = torch.cat([out["action_logits"], out["reason_logits"]], dim=1)
+            variants = eval_variants_from_head_output(out)
+            action_eval, reason_eval = variants["calibrated"]
+            logits = torch.cat([action_eval, reason_eval], dim=1)
             losses.append(float(criterion(logits, labels).item()))
-            action_logits_all.append(out["action_logits"].detach().cpu())
-            reason_logits_all.append(out["reason_logits"].detach().cpu())
+            action_logits_all.append(action_eval.detach().cpu())
+            reason_logits_all.append(reason_eval.detach().cpu())
+            if "raw" in variants:
+                raw_action_logits_all.append(variants["raw"][0].detach().cpu())
+                raw_reason_logits_all.append(variants["raw"][1].detach().cpu())
             labels_action_all.append(labels[:, : args.action_dim].detach().cpu())
             labels_reason_all.append(labels[:, args.action_dim :].detach().cpu())
             names.extend([str(x) for x in batch.get("file_name", [])])
@@ -174,6 +191,27 @@ def evaluate(args, backbone, model, loader, device, split: str, epoch: int, outp
     _write_json(epoch_dir / f"metrics_per_label_threshold_{split}.json", per_label)
     _write_json(epoch_dir / "threshold_sweep_test.json" if split == "test" else epoch_dir / f"threshold_sweep_{split}.json", {"fixed": fixed, "global": global_eval, "per_label": per_label})
     stats = _split_stats(split, fixed, global_eval, per_label)
+    if raw_action_logits_all:
+        raw_action_logits = torch.cat(raw_action_logits_all, 0)
+        raw_reason_logits = torch.cat(raw_reason_logits_all, 0)
+        raw_fixed = evaluate_score_logits(raw_action_logits, raw_reason_logits, labels_action, labels_reason, threshold_mode="fixed")
+        raw_global = evaluate_score_logits(raw_action_logits, raw_reason_logits, labels_action, labels_reason, threshold_mode="global")
+        raw_per_label = evaluate_score_logits(raw_action_logits, raw_reason_logits, labels_action, labels_reason, threshold_mode="per_label")
+        torch.save(raw_action_logits, epoch_dir / f"logits_action_raw_{split}.pt")
+        torch.save(raw_reason_logits, epoch_dir / f"logits_reason_raw_{split}.pt")
+        _write_json(epoch_dir / f"metrics_fixed_raw_{split}.json", raw_fixed)
+        _write_json(epoch_dir / f"metrics_global_threshold_raw_{split}.json", raw_global)
+        _write_json(epoch_dir / f"metrics_per_label_threshold_raw_{split}.json", raw_per_label)
+        _write_json(epoch_dir / f"threshold_sweep_raw_{split}.json", {"fixed": raw_fixed, "global": raw_global, "per_label": raw_per_label})
+        raw_stats = _split_stats(f"raw_{split}", raw_fixed, raw_global, raw_per_label)
+        stats.update({
+            "raw_joint": raw_stats["joint"],
+            "raw_Act_mF1": raw_stats["Act_mF1"],
+            "raw_Exp_mF1": raw_stats["Exp_mF1"],
+            "raw_Exp_mAP": raw_stats["Exp_mAP"],
+            "raw_global_Exp_mF1": raw_stats["global_Exp_mF1"],
+            "raw_per_label_Exp_mF1": raw_stats["per_label_Exp_mF1"],
+        })
     stats["loss"] = sum(losses) / max(1, len(losses))
     return stats
 
@@ -376,6 +414,9 @@ def main() -> None:
             "lr": float(optimizer.param_groups[0]["lr"]),
             "gpu_peak_memory_gb": float(torch.cuda.max_memory_allocated() / (1024**3)) if torch.cuda.is_available() else 0.0,
         }
+        for key in ("raw_joint", "raw_Act_mF1", "raw_Exp_mF1", "raw_Exp_mAP", "raw_global_Exp_mF1", "raw_per_label_Exp_mF1"):
+            if key in test_stats:
+                row[f"test_{key}"] = test_stats[key]
         if val_stats is not None:
             row.update({"val_joint": val_stats["joint"], "val_Exp_mF1": val_stats["Exp_mF1"], "val_Exp_mAP": val_stats["Exp_mAP"]})
         _append_jsonl(out / "metrics_summary.jsonl", row)
