@@ -20,7 +20,8 @@ def test_q2l_decoder_has_two_self_layers_and_label_attention():
     tokens = torch.randn(2, 13, 384)
     head = Q2LDecoderHead(dim=384, action_dim=4, reason_dim=21, num_heads=6, self_layers=2)
     out = head(tokens)
-    assert len(head.decoder.self_encoder.layers) == 2
+    assert isinstance(head.decoder.decoder, torch.nn.TransformerDecoder)
+    assert len(head.decoder.decoder.layers) == 2
     assert out["logits"].shape == (2, 25)
     assert out["label_tokens"].shape == (2, 25, 384)
     assert out["attention"].shape == (2, 25, 13)
@@ -69,3 +70,19 @@ def test_calibrated_head_exposes_raw_and_calibrated_eval_variants():
     assert variants["raw"][0].shape == (2, 4)
     assert variants["raw"][1].shape == (2, 21)
     assert not torch.allclose(variants["calibrated"][1], variants["raw"][1])
+
+
+def test_q2l_uses_real_transformer_decoder_not_simplified_encoder():
+    head = Q2LDecoderHead(dim=384, action_dim=4, reason_dim=21, num_heads=6, self_layers=2)
+    assert isinstance(head.decoder.decoder, torch.nn.TransformerDecoder)
+    assert len(head.decoder.decoder.layers) == 2
+
+
+def test_ml_decoder_uses_fixed_label_group_projection_matrix():
+    head = MLDecoderHead(dim=384, action_dim=4, reason_dim=21, groups=8)
+    param_names = {name for name, _ in head.named_parameters()}
+    assert "label_group_logits" not in param_names
+    assert hasattr(head, "label_to_group_projection")
+    projection = head.label_to_group_projection
+    assert projection.shape == (25, 8)
+    assert torch.allclose(projection.sum(dim=1), torch.ones(25))

@@ -21,7 +21,10 @@ class MLDecoderHead(BaseOIAHead):
         self.norm = nn.LayerNorm(dim)
         self.label_embed = nn.Parameter(torch.empty(self.num_labels, dim))
         nn.init.trunc_normal_(self.label_embed, std=0.02)
-        self.label_group_logits = nn.Parameter(torch.zeros(self.num_labels, self.groups))
+        projection = torch.zeros(self.num_labels, self.groups)
+        for label_idx in range(self.num_labels):
+            projection[label_idx, label_idx % self.groups] = 1.0
+        self.register_buffer("label_to_group_projection", projection, persistent=True)
         self.label_proj = nn.Linear(dim, 1)
 
     def forward(self, tokens: torch.Tensor, labels: torch.Tensor | None = None, **kwargs):
@@ -29,7 +32,7 @@ class MLDecoderHead(BaseOIAHead):
         q = self.group_queries.unsqueeze(0).expand(b, -1, -1)
         group_tokens, attn = self.attn(q, tokens, tokens, need_weights=True, average_attn_weights=True)
         group_tokens = self.norm(group_tokens)
-        weights = torch.softmax(self.label_group_logits, dim=1)
+        weights = self.label_to_group_projection.to(dtype=group_tokens.dtype, device=group_tokens.device)
         label_tokens = torch.einsum("lg,bgd->bld", weights, group_tokens)
         label_tokens = self.norm(label_tokens + self.label_embed.unsqueeze(0))
         logits = self.label_proj(label_tokens).squeeze(-1)
