@@ -83,6 +83,22 @@ def load_resume_checkpoint(
     )
 
 
+def checkpoint_uses_legacy_label_correlation(checkpoint_path: str | Path) -> bool:
+    """Return True when a checkpoint was saved with the Run C legacy label block."""
+    if not checkpoint_path:
+        return False
+    path = Path(checkpoint_path)
+    if not path.exists():
+        return False
+    checkpoint = torch.load(path, map_location="cpu")
+    if not isinstance(checkpoint, dict):
+        return False
+    state = checkpoint.get("model") or checkpoint.get("state_dict") or {}
+    if not isinstance(state, dict):
+        return False
+    return any(str(key).startswith("label_correlation.encoder.") for key in state.keys())
+
+
 def build_transform(image_height: int, image_width: int, patch_size: int = 8, preserve_aspect_ratio: bool = True, return_meta: bool = True):
     if preserve_aspect_ratio:
         return AspectRatioLetterboxTransform(image_height=image_height, image_width=image_width, patch_size=patch_size, return_meta=return_meta)
@@ -1407,7 +1423,7 @@ def main() -> None:
     ap.add_argument("--cf_mask_fill", choices=["zero", "mean", "mask_token"], default="mean")
     ap.add_argument("--use_label_query", action="store_true", default=True)
     ap.add_argument("--use_reason_to_action", action="store_true", default=True)
-    ap.add_argument("--label_correlation", choices=["none", "self_attn"], default="none")
+    ap.add_argument("--label_correlation", choices=["none", "self_attn", "self_attn_legacy"], default="none")
     ap.add_argument("--label_correlation_layers", type=int, default=1)
     ap.add_argument("--label_correlation_heads", type=int, default=4)
     ap.add_argument("--label_correlation_dropout", type=float, default=0.1)
@@ -1472,8 +1488,13 @@ def main() -> None:
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "args.json").write_text(json.dumps(vars(args), indent=2), encoding="utf-8")
     device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
+    if args.resume and args.label_correlation == "self_attn" and checkpoint_uses_legacy_label_correlation(args.resume):
+        args.label_correlation = "self_attn_legacy"
+        args.label_correlation_legacy_detected = True
+    else:
+        args.label_correlation_legacy_detected = False
+    (out_dir / "args.json").write_text(json.dumps(vars(args), indent=2), encoding="utf-8")
     label_bias_matrix = load_label_bias_matrix(
         args.label_correlation_bias_path,
         args.label_correlation_bias,

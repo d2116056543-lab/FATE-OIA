@@ -4,7 +4,7 @@ import torch
 from torch import nn
 
 from fate_oia.models.label_query_head import LabelQueryHead
-from fate_oia.models.label_correlation import LabelCorrelationBlock
+from fate_oia.models.label_correlation import LabelCorrelationBlock, LegacyLabelCorrelationBlock
 from fate_oia.models.reason_to_action_bottleneck import ReasonToActionBottleneck
 
 
@@ -58,6 +58,15 @@ class FATEOIAFeatureModel(nn.Module):
                     bias_weight=label_correlation_bias_weight,
                     residual_init=label_correlation_residual_init,
                     residual_learnable=label_correlation_residual_learnable,
+                )
+            elif label_correlation == "self_attn_legacy":
+                self.label_correlation = LegacyLabelCorrelationBlock(
+                    dim=dim,
+                    num_labels=action_dim + reason_dim,
+                    num_heads=label_correlation_heads,
+                    num_layers=label_correlation_layers,
+                    dropout=label_correlation_dropout,
+                    bias_mode=label_correlation_bias,
                 )
             elif label_correlation == "none":
                 self.label_correlation = nn.Identity()
