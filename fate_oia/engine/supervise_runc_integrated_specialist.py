@@ -146,7 +146,7 @@ def main() -> int:
         payload = {"event": "training_launched", "time": datetime.now().isoformat(), "pid": int(launch_payload["ProcessId"]), "output_dir": str(out_dir), "stdout": str(stdout), "stderr": str(stderr), "cmd": cmd, "launcher": launch_payload}
         write_jsonl(out_dir / "supervisor_decisions.jsonl", payload)
         write_jsonl(decisions, payload)
-        append_progress(f"## {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - RunC integrated specialist background launch\n- Worktree: {ROOT}\n- PID: {proc.pid}\n- Output: {out_dir}\n- Stdout: {stdout}\n- Stderr: {stderr}\n- Launch gate: py_compile PASS, pytest PASS, parity PASS, REVIEW_PASS present.")
+        append_progress(f"## {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - RunC integrated specialist background launch\n- Worktree: {ROOT}\n- PID: {payload['pid']}\n- Output: {out_dir}\n- Stdout: {stdout}\n- Stderr: {stderr}\n- Launch gate: py_compile PASS, pytest PASS, parity PASS, REVIEW_PASS present.")
         print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
     return 0
 
