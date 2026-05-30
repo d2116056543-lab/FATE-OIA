@@ -353,6 +353,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--best_selection_split", choices=["test"], default="test")
     ap.add_argument("--best_selection_metric", default="test_joint_composite")
+    ap.add_argument("--resume_checkpoint", default="")
     return ap.parse_args()
 
 
@@ -377,6 +378,24 @@ def main() -> None:
     model = CAFEOIAModel(dim=dim, action_dim=args.action_dim, reason_dim=args.reason_dim).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = PlateauRollback(opt, monitor="test_joint_composite")
+    start_epoch = 0
+    best_test = -1e9
+    best_cal = -1e9
+    if args.resume_checkpoint:
+        resume_path = Path(args.resume_checkpoint)
+        ckpt = torch.load(resume_path, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        if "optimizer" in ckpt:
+            opt.load_state_dict(ckpt["optimizer"])
+        start_epoch = int(ckpt.get("epoch", -1)) + 1
+        best_test = float(ckpt.get("best_test_score", -1e9))
+        best_cal = best_test
+        scheduler_state = ckpt.get("scheduler_state")
+        if isinstance(scheduler_state, dict):
+            scheduler.state.best_score = float(scheduler_state.get("best_score", best_test))
+            scheduler.state.bad_epochs = int(scheduler_state.get("bad_epochs", 0))
+        else:
+            scheduler.state.best_score = best_test
     criterion = make_multilabel_criterion(args)
     train_loader = make_loader(args, "train", True)
     val_loader = make_loader(args, "val", False)
@@ -394,13 +413,13 @@ def main() -> None:
         "train_count": len(train_loader.dataset),
         "val_count_diagnostic": len(val_loader.dataset),
         "test_count": len(test_loader.dataset),
+        "resume_checkpoint": args.resume_checkpoint,
+        "start_epoch": start_epoch,
     }
     write_json(out_dir / "run_manifest.json", manifest)
     write_json(out_dir / "config_resolved.yaml", vars(args))
-    best_test = -1e9
-    best_cal = -1e9
     history: list[dict[str, Any]] = []
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         train_stats = run_epoch(args, backbone, model, train_loader, criterion, opt, device, True, grounding_cache, epoch)
         val_stats = run_epoch(args, backbone, model, val_loader, criterion, opt, device, False, grounding_cache, epoch)
         test_stats = run_epoch(args, backbone, model, test_loader, criterion, opt, device, False, grounding_cache, epoch)
@@ -422,7 +441,15 @@ def main() -> None:
         append_jsonl(out_dir / "metrics.jsonl", row)
         append_jsonl(out_dir / "supervisor_decisions.jsonl", {"epoch": epoch, "decision": "continue", "monitor": "test_joint_composite", "score": score})
         history.append(row)
-        latest = {"epoch": epoch, "model": model.state_dict(), "optimizer": opt.state_dict(), "args": vars(args), "dim": dim, "best_test_score": max(best_test, score)}
+        latest = {
+            "epoch": epoch,
+            "model": model.state_dict(),
+            "optimizer": opt.state_dict(),
+            "scheduler_state": vars(scheduler.state),
+            "args": vars(args),
+            "dim": dim,
+            "best_test_score": max(best_test, score),
+        }
         torch.save(latest, out_dir / "checkpoint_latest.pth")
         write_json(out_dir / "metrics_latest.json", row)
         save_epoch_artifacts(out_dir, epoch, train_stats, test_stats, val_stats, manifest)

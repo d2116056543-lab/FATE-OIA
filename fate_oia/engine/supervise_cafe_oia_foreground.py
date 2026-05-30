@@ -49,6 +49,8 @@ def _build_train_cmd(args: argparse.Namespace, out: Path, batch_size: int, grad_
         cmd += ["--max_val_samples", str(args.max_val_samples)]
     if args.max_test_samples:
         cmd += ["--max_test_samples", str(args.max_test_samples)]
+    if args.resume_checkpoint:
+        cmd += ["--resume_checkpoint", args.resume_checkpoint]
     return cmd
 
 
@@ -102,6 +104,7 @@ def main() -> None:
     ap.add_argument("--max_train_samples", type=int, default=0)
     ap.add_argument("--max_val_samples", type=int, default=0)
     ap.add_argument("--max_test_samples", type=int, default=0)
+    ap.add_argument("--resume_checkpoint", default="")
     args = ap.parse_args()
     root = Path.cwd()
     out = Path(args.output_dir)

@@ -6,7 +6,8 @@ param(
   [int]$GradAccum = 16,
   [int]$MaxTrainSamples = 0,
   [int]$MaxValSamples = 0,
-  [int]$MaxTestSamples = 0
+  [int]$MaxTestSamples = 0,
+  [string]$ResumeCheckpoint = ""
 )
 
 Set-StrictMode -Version Latest
@@ -31,7 +32,7 @@ $argsList = @(
 if ($MaxTrainSamples -gt 0) { $argsList += @("--max_train_samples", "$MaxTrainSamples") }
 if ($MaxValSamples -gt 0) { $argsList += @("--max_val_samples", "$MaxValSamples") }
 if ($MaxTestSamples -gt 0) { $argsList += @("--max_test_samples", "$MaxTestSamples") }
+if ($ResumeCheckpoint) { $argsList += @("--resume_checkpoint", $ResumeCheckpoint) }
 
 Write-Host "CAFE foreground output: $out"
 & E:\Anaconda\envs\sbw39\python.exe @argsList
-
