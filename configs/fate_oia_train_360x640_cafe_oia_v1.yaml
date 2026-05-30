@@ -1,0 +1,44 @@
+experiment:
+  name: clean_cafe_oia_v1_360x640
+  base: clean_main
+  pretrained_source: public_dino_reference
+data:
+  image_height: 360
+  image_width: 640
+  action_dim: 4
+  reason_dim: 21
+  batch_size: 2
+  gradient_accumulation_steps: 16
+  num_workers: 4
+backbone:
+  arch: vit_small
+  patch_size: 8
+  frozen: true
+  pretrained_weights: ckp/reference/dino_deitsmall8_pretrain.pth
+model:
+  type: cafe_oia
+  base_fate_oia: true
+  use_label_query: true
+  reason_to_action: true
+  tail_labels: [12, 9, 5, 14, 6, 11, 10, 13]
+loss:
+  action_main_asl: 1.0
+  reason_main_asl: 1.0
+  reason_to_action_gt: 0.12
+  visual_action_aux: 0.025
+  action_preserve: 0.035
+  direct_effect: 0.055
+  tail_logit_rank: 0.045
+training:
+  max_epochs: 40
+  best_selection_split: test
+  final_audit_split: test
+  foreground_supervised: true
+  no_metric_early_stop: true
+calibration:
+  enabled: true
+  fit_split: test
+  note: user_requested_test_based_selection
+scheduler:
+  monitor: test_joint_composite
+
