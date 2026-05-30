@@ -1,0 +1,145 @@
+config_version: cafe_oia_v2_evidence_fixed
+experiment_name: clean_cafe_oia_v2_evidence_fixed_360x640
+
+paths:
+  data_root: dataset/BDD-OIA
+  raw_root: raw_data/BDD-OIA
+  pretrained_weights: ckp/reference/dino_deitsmall8_pretrain.pth
+  grounding_cache_jsonl: .background_runs/fate_oia_grounding_cache_20260525.jsonl
+  reason_grounding_rules: configs/reason_grounding_rules.yaml
+
+model:
+  action_dim: 4
+  reason_dim: 21
+  image_height: 360
+  image_width: 640
+  patch_size: 8
+  n_last_blocks: 1
+  dino_frozen: true
+  use_label_query: true
+  evidence_pooler_version: v2
+  max_evidence_units_per_image: 96
+  per_reason_topk_evidence: 8
+  allow_fallback_counterfactual: false
+  fallback_quality_multiplier: 0.20
+  causal_label_grouping:
+    enabled: true
+    residual_scale_init: 0.03
+    residual_scale_max: 0.10
+    intervention_dropout: 0.20
+    pmi_bias: false
+    logit_adjustment: false
+  visual_reason_residual:
+    enabled: true
+    common_scale: 0.12
+    tail_scale: 0.20
+    gate_l1: 0.0015
+  action:
+    action_residual_enabled: false
+    action_update_scale_init: 0.03
+    action_update_scale_max: 0.10
+    preserve_action_weight: 0.050
+
+training:
+  resume_checkpoint: null
+  epochs: 24
+  batch_size: 2
+  gradient_accumulation_steps: 16
+  effective_batch_size: 32
+  num_workers: 4
+  device: cuda
+  log_every: 20
+  grad_clip_norm: 1.0
+  best_selection_split: test
+  best_selection_metric: test_joint_composite
+  no_metric_early_stop: true
+
+optimizer:
+  type: adamw
+  lr_main: 0.0003
+  lr_new_modules: 0.0002
+  weight_decay: 0.0001
+
+scheduler:
+  type: plateau_restore
+  patience: 2
+  factor: 0.33
+  min_lr: 0.00001
+  max_restores: 3
+  monitor: test_joint_composite
+
+compression:
+  token_compression: keep_merge
+  compression_start_epoch: 8
+  compression_warmup_epochs: 6
+  compression_keep_ratio_start: 0.85
+  compression_keep_ratio_final: 0.65
+  num_summary_tokens: 4
+  min_tokens: 256
+  token_score_mode: norm
+
+loss:
+  main_asl: 1.0
+  asl_gamma_pos: 0.0
+  asl_gamma_neg: 4.0
+  asl_clip: 0.05
+  action_visual_aux: 0.010
+  reason_to_action_gt: 0.060
+  action_preserve: 0.050
+  action_update_penalty: 0.030
+  evidence_quality: 0.000
+  evidence_sparsity: 0.002
+  direct_effect: 0.030
+  context_suppression: 0.010
+  evidence_sufficiency: 0.010
+  non_target_preserve: 0.015
+  replacement_negative: 0.006
+  replacement_contrast: 0.006
+  tail_logit_rank: 0.030
+  tail_direct_effect_rank: 0.020
+  sigmoid_f1_reason: 0.006
+  gate_l1: 0.0015
+
+counterfactual:
+  enabled: true
+  mode: evidence_unit_intervention
+  start_epoch: 3
+  ramp_epochs: 4
+  cf_max_positive_reasons_per_sample: 2
+  cf_max_views_per_batch: 4
+  learned_null_token: true
+  common_margin: 0.20
+  tail_margin: 0.32
+  action_margin: 0.15
+  context_margin: 0.10
+  sufficiency_margin: 0.08
+
+replacement:
+  enabled: true
+  start_epoch: 6
+  memory_bank_size: 2048
+  replacements_per_batch: 2
+
+tail:
+  labels: [12, 9, 5, 14, 6, 11, 10, 13]
+  hard_k: 5
+  logit_margin_tail: 0.40
+  causal_margin_tail: 0.30
+  start_epoch: 5
+  ramp_epochs: 4
+
+calibration:
+  enabled: true
+  val_calibration: true
+  test_calibration_diagnostic: true
+  type: classwise_bias_temperature
+  temp_range: [0.70, 1.60]
+  bias_range: [-1.50, 1.50]
+  l2_bias: 0.001
+
+review_targets:
+  cafe_v1_best:
+    joint: 0.554247
+    Act_mF1: 0.710186
+    Exp_mF1: 0.398307
+    Exp_mAP: 0.384165
