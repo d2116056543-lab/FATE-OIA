@@ -43,12 +43,12 @@ model:
 training:
   resume_checkpoint: null
   epochs: 24
-  batch_size: 2
-  gradient_accumulation_steps: 16
+  batch_size: 4
+  gradient_accumulation_steps: 8
   effective_batch_size: 32
   num_workers: 4
   device: cuda
-  log_every: 20
+  log_every: 200
   grad_clip_norm: 1.0
   best_selection_split: test
   best_selection_metric: test_joint_composite
