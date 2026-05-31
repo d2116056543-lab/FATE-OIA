@@ -1,5 +1,5 @@
 from __future__ import annotations
-import argparse, subprocess, sys
+import argparse, os, subprocess, sys
 from pathlib import Path
 from fate_oia.utils.config_io import load_yaml_config
 from fate_oia.utils.trace_artifacts import append_jsonl, write_json
@@ -30,25 +30,41 @@ def main(argv=None):
     if args.require_review_pass and not pre.exists():
         raise SystemExit("Missing REVIEW_PASS_TRACE_OIA.txt; refusing training.")
     out = Path(args.output_dir); out.mkdir(parents=True, exist_ok=True)
+    lock_path = Path(".background_runs/trace_oia_v1_active.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_fd = None
+    try:
+        lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(lock_fd, f"pid={os.getpid()} output_dir={out}\n".encode("utf-8"))
+    except FileExistsError as exc:
+        raise SystemExit(f"Existing TRACE-OIA lock detected at {lock_path}; remove it only after confirming no TRACE run is active.") from exc
     cfg = load_yaml_config(args.config)
     cache_cfg = cfg.get("feature_cache", {}) if isinstance(cfg, dict) else {}
     cache_required = bool(cache_cfg.get("build_before_training", True))
     required_hit_rate = float(cache_cfg.get("required_hit_rate", 0.99))
     cache_dir = args.cache_dir or str(out / "dino_token_cache")
     write_json(out / "supervisor_manifest.json", {"foreground": True, "require_review_pass": args.require_review_pass, "review_pass_path": str(pre), "best_selection_split": "test", "epochs": args.epochs, "cache_build_before_training": cache_required and not args.skip_cache_build, "cache_dir": cache_dir, "cache_batch_size": args.cache_batch_size, "train_batch_size": args.batch_size})
-    if cache_required and not args.skip_cache_build:
-        cache_cmd = [sys.executable, "-m", "fate_oia.engine.build_trace_oia_token_cache", "--config", args.config, "--output_dir", str(out), "--cache_dir", cache_dir, "--batch_size", str(args.cache_batch_size), "--device", args.device, "--required_hit_rate", str(required_hit_rate), "--max_train_samples", str(args.max_train_samples), "--max_test_samples", str(args.max_test_samples)]
-        append_jsonl(out / "supervisor_decisions.jsonl", {"event": "cache_build_start", "cmd": cache_cmd})
-        cache_code = stream_command(cache_cmd, Path.cwd(), out / "foreground_stdout.log")
-        append_jsonl(out / "supervisor_decisions.jsonl", {"event": "cache_build_exit", "code": cache_code})
-        if cache_code != 0:
-            raise SystemExit(cache_code)
-    cmd = [sys.executable, "-m", "fate_oia.engine.train_trace_oia", "--config", args.config, "--output_dir", str(out), "--cache_dir", cache_dir, "--epochs", str(args.epochs), "--batch_size", str(args.batch_size), "--gradient_accumulation_steps", str(args.grad_accum), "--device", args.device, "--max_train_samples", str(args.max_train_samples), "--max_test_samples", str(args.max_test_samples)]
-    code = stream_command(cmd, Path.cwd(), out / "foreground_stdout.log"); append_jsonl(out / "supervisor_decisions.jsonl", {"event": "process_exit", "code": code})
-    if code != 0 and args.batch_size != args.fallback_batch_size:
-        cmd = [sys.executable, "-m", "fate_oia.engine.train_trace_oia", "--config", args.config, "--output_dir", str(out), "--cache_dir", cache_dir, "--epochs", str(args.epochs), "--batch_size", str(args.fallback_batch_size), "--gradient_accumulation_steps", str(args.fallback_grad_accum), "--device", args.device, "--max_train_samples", str(args.max_train_samples), "--max_test_samples", str(args.max_test_samples)]
-        code = stream_command(cmd, Path.cwd(), out / "foreground_stdout.log"); append_jsonl(out / "supervisor_decisions.jsonl", {"event": "fallback_exit", "code": code})
-    raise SystemExit(code)
+    try:
+        if cache_required and not args.skip_cache_build:
+            cache_cmd = [sys.executable, "-m", "fate_oia.engine.build_trace_oia_token_cache", "--config", args.config, "--output_dir", str(out), "--cache_dir", cache_dir, "--batch_size", str(args.cache_batch_size), "--device", args.device, "--required_hit_rate", str(required_hit_rate), "--max_train_samples", str(args.max_train_samples), "--max_test_samples", str(args.max_test_samples)]
+            append_jsonl(out / "supervisor_decisions.jsonl", {"event": "cache_build_start", "cmd": cache_cmd})
+            cache_code = stream_command(cache_cmd, Path.cwd(), out / "foreground_stdout.log")
+            append_jsonl(out / "supervisor_decisions.jsonl", {"event": "cache_build_exit", "code": cache_code})
+            if cache_code != 0:
+                raise SystemExit(cache_code)
+        cmd = [sys.executable, "-m", "fate_oia.engine.train_trace_oia", "--config", args.config, "--output_dir", str(out), "--cache_dir", cache_dir, "--epochs", str(args.epochs), "--batch_size", str(args.batch_size), "--gradient_accumulation_steps", str(args.grad_accum), "--device", args.device, "--max_train_samples", str(args.max_train_samples), "--max_test_samples", str(args.max_test_samples)]
+        code = stream_command(cmd, Path.cwd(), out / "foreground_stdout.log"); append_jsonl(out / "supervisor_decisions.jsonl", {"event": "process_exit", "code": code})
+        if code != 0 and args.batch_size != args.fallback_batch_size:
+            cmd = [sys.executable, "-m", "fate_oia.engine.train_trace_oia", "--config", args.config, "--output_dir", str(out), "--cache_dir", cache_dir, "--epochs", str(args.epochs), "--batch_size", str(args.fallback_batch_size), "--gradient_accumulation_steps", str(args.fallback_grad_accum), "--device", args.device, "--max_train_samples", str(args.max_train_samples), "--max_test_samples", str(args.max_test_samples)]
+            code = stream_command(cmd, Path.cwd(), out / "foreground_stdout.log"); append_jsonl(out / "supervisor_decisions.jsonl", {"event": "fallback_exit", "code": code})
+        raise SystemExit(code)
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 if __name__ == "__main__":
