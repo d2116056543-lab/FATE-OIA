@@ -1,0 +1,46 @@
+﻿config_version: trace_oia_v1_proto_transport
+experiment_name: trace_oia_v1_proto_transport_360x640_cache_fulltoken
+paths:
+  data_root: E:/sbw/BDD-OIA
+  raw_root: E:/sbw/BDD-OIA
+  pretrained_weights: C:/Users/Lenovo/.cache/torch/hub/checkpoints/dino_deitsmall8_pretrain.pth
+  grounding_cache_jsonl: E:/sbw/FATE_Drive/fate_oia_clean_cafe_oia_v1_worktree/.background_runs/fate_oia_grounding_cache_20260525.jsonl
+  reason_grounding_rules: configs/reason_grounding_rules.yaml
+model:
+  action_dim: 4
+  reason_dim: 21
+  image_height: 360
+  image_width: 640
+  patch_size: 8
+  arch: vit_small
+  token_compression: none
+  action_final_mode: base_only
+training:
+  epochs: 20
+  batch_size: 8
+  gradient_accumulation_steps: 4
+  fallback_batch_size: 4
+  fallback_gradient_accumulation_steps: 8
+  effective_batch_size: 32
+  num_workers: 4
+  device: cuda
+  log_every: 200
+  best_selection_split: test
+  best_selection_metric: test_joint_composite
+  no_metric_early_stop: true
+optimizer:
+  lr_base_head: 0.0003
+  lr_prototype: 0.0002
+  lr_transport: 0.0002
+  weight_decay: 0.0001
+feature_cache:
+  enabled: true
+  build_before_training: true
+  required_hit_rate: 0.99
+calibration:
+  enabled: true
+  fit_split: test
+  test_calibration_diagnostic: true
+tail:
+  labels: [12, 9, 5, 14, 6, 11, 10, 13]
+
