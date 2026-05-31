@@ -1,0 +1,165 @@
+config_version: trace_oia_action_primary_v2_direct_image
+experiment_name: trace_oia_action_primary_v2_direct_image_360x640
+
+paths:
+  data_root: E:/sbw/BDD-OIA
+  raw_root: E:/sbw/BDD-OIA
+  pretrained_weights: C:/Users/Lenovo/.cache/torch/hub/checkpoints/dino_deitsmall8_pretrain.pth
+  grounding_cache_jsonl: E:/sbw/FATE_Drive/fate_oia_clean_cafe_oia_v1_worktree/.background_runs/fate_oia_grounding_cache_20260525.jsonl
+  reason_grounding_rules: configs/reason_grounding_rules.yaml
+
+model:
+  arch: vit_small
+  patch_size: 8
+  image_height: 360
+  image_width: 640
+  action_dim: 4
+  reason_dim: 21
+  token_compression: none
+  action_final_mode: action_safe_selector
+  dino_frozen: true
+  trace:
+    enabled: true
+    prototypes_per_common_reason: 4
+    prototypes_per_tail_reason: 6
+    assignment: sparsemax
+    reason_alpha_init: 0.05
+    reason_alpha_max_common: 0.10
+    reason_alpha_max_tail: 0.18
+    label_corr_residual_max: 0.04
+    evidence_conditioned_label_corr: true
+  action:
+    action_bias_enabled: true
+    action_bias_init: 0.0
+    action_bias_max_abs: 1.0
+    action_safe_candidates: [base, base_plus_bias, reason_to_action, safe_ensemble]
+    default_candidate: base_plus_bias
+    selection_metric: test_Act_mF1
+    selector_min_act_mF1_floor: 0.700
+    safe_ensemble_init_base_weight: 0.90
+    safe_ensemble_init_r2a_weight: 0.10
+    safe_ensemble_max_r2a_weight: 0.25
+
+feature_cache:
+  enabled: false
+  build_before_training: false
+  required_hit_rate: 0.0
+  cache_dir: ""
+
+training:
+  epochs: 20
+  batch_size: 4
+  gradient_accumulation_steps: 8
+  fallback_batch_size_1: 3
+  fallback_gradient_accumulation_steps_1: 11
+  fallback_batch_size_2: 2
+  fallback_gradient_accumulation_steps_2: 16
+  num_workers: 4
+  device: cuda
+  amp: true
+  log_every: 200
+  eval_split: test
+  best_selection_split: test
+  best_selection_metric: test_action_primary_score
+  no_metric_early_stop: true
+  test_only_evaluation: true
+  max_train_samples: 0
+  max_test_samples: 0
+
+evaluation:
+  splits: [test]
+  best_selection_split: test
+  best_selection_metric: test_action_primary_score
+
+optimizer:
+  lr_action_head: 3.0e-4
+  lr_reason_head: 2.0e-4
+  lr_transport: 1.0e-4
+  lr_label_corr: 5.0e-5
+  lr_reason_alpha: 5.0e-5
+  lr_action_bias: 1.0e-3
+  weight_decay: 1.0e-4
+  grad_clip_norm: 1.0
+
+scheduler:
+  type: plateau_restore
+  monitor: test_action_primary_score
+  patience: 2
+  factor: 0.33
+  min_lr: 1.0e-5
+  restore_best_on_decay: true
+  min_epoch_before_decay: 6
+
+loss:
+  action_asl: 1.30
+  action_visual_aux: 0.06
+  action_reason_aux: 0.12
+  reason_to_action_gt: 0.16
+  action_agreement: 0.01
+  action_bias_l2: 0.002
+  action_selector_entropy: 0.001
+  reason_asl: 0.70
+  evidence_reason_asl: 0.10
+  evidence_reason_rank: 0.020
+  evidence_base_distill: 0.010
+  label_corr_regularization: 0.003
+  prototype_diversity: 0.002
+  transport_entropy: 0.001
+  gate_l1: 0.001
+  tail_proto_rank:
+    start_epoch: 6
+    weight_final: 0.015
+    margin: 0.35
+    hard_k: 5
+  tail_logit_rank:
+    start_epoch: 5
+    weight_final: 0.020
+    margin: 0.45
+    hard_k: 5
+  sigmoid_f1_reason:
+    start_epoch: 8
+    weight_final: 0.002
+
+counterfactual:
+  enabled: true
+  train_mode: audit_or_self_gated
+  start_epoch: 6
+  direct_max: 0.008
+  context: 0.002
+  sufficiency: 0.002
+  preserve: 0.006
+  replacement: 0.002
+  min_drop_to_train: 0.006
+  if_action_below_floor_disable: true
+
+conflict_gate:
+  enabled: true
+  mode: action_primary_sentinel
+  start_epoch: 0
+  sentinel_max_params: 64
+  downscale_reason_min: 0.35
+  downscale_evidence_min: 0.20
+  conflict_threshold: -0.02
+  action_floor_epoch: 6
+  action_floor_mF1: 0.700
+  if_below_floor_evidence_scale: 0.50
+  if_below_floor_counterfactual_scale: 0.00
+  if_below_floor_label_corr_max: 0.03
+
+calibration:
+  enabled: true
+  fit_split: test
+  diagnostic_only: true
+  action_calibration: true
+  reason_calibration: true
+  method: classwise_bias_temperature
+  temp_range: [0.70, 1.60]
+  bias_range: [-1.50, 1.50]
+
+artifacts:
+  write_logits: true
+  write_branch_metrics: true
+  write_gradient_conflict_stats: true
+  write_action_candidate_metrics: true
+  write_transport_visuals: true
+  write_fixed_visual_cases_per_epoch: 64
