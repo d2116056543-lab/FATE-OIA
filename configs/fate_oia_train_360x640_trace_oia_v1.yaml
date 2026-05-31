@@ -43,4 +43,3 @@ calibration:
   test_calibration_diagnostic: true
 tail:
   labels: [12, 9, 5, 14, 6, 11, 10, 13]
-
