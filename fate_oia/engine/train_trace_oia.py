@@ -46,13 +46,15 @@ def build_parser():
     ap.add_argument("--asl_gamma_pos", type=float, default=0.0); ap.add_argument("--asl_gamma_neg", type=float, default=4.0); ap.add_argument("--asl_clip", type=float, default=0.05)
     ap.add_argument("--loss_counterfactual_direct", type=float, default=0.025); ap.add_argument("--counterfactual_start_epoch", type=int, default=5); ap.add_argument("--cf_margin", type=float, default=0.05)
     ap.add_argument("--cache_dir", default=""); ap.add_argument("--feature_cache_enabled", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--feature_cache_build_before_training", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--feature_cache_required_hit_rate", type=float, default=0.99)
     return ap
 
 
 def parse_args(argv=None):
     ap = build_parser(); pre, _ = ap.parse_known_args(argv)
     cfg = load_yaml_config(pre.config) if pre.config else {}; flat = _flat(cfg)
-    mapping = {"paths.data_root": "data_root", "paths.raw_root": "raw_root", "paths.pretrained_weights": "pretrained_weights", "paths.grounding_cache_jsonl": "grounding_cache_jsonl", "paths.reason_grounding_rules": "reason_grounding_rules", "model.action_dim": "action_dim", "model.reason_dim": "reason_dim", "model.image_height": "image_height", "model.image_width": "image_width", "model.patch_size": "patch_size", "model.arch": "arch", "model.token_compression": "token_compression", "model.action_final_mode": "action_final_mode", "training.epochs": "epochs", "training.batch_size": "batch_size", "training.gradient_accumulation_steps": "gradient_accumulation_steps", "training.num_workers": "num_workers", "training.device": "device", "training.log_every": "log_every", "training.best_selection_split": "best_selection_split", "training.best_selection_metric": "best_selection_metric", "optimizer.lr_base_head": "lr_base_head", "optimizer.lr_transport": "lr_transport", "optimizer.weight_decay": "weight_decay", "feature_cache.enabled": "feature_cache_enabled"}
+    mapping = {"paths.data_root": "data_root", "paths.raw_root": "raw_root", "paths.pretrained_weights": "pretrained_weights", "paths.grounding_cache_jsonl": "grounding_cache_jsonl", "paths.reason_grounding_rules": "reason_grounding_rules", "model.action_dim": "action_dim", "model.reason_dim": "reason_dim", "model.image_height": "image_height", "model.image_width": "image_width", "model.patch_size": "patch_size", "model.arch": "arch", "model.token_compression": "token_compression", "model.action_final_mode": "action_final_mode", "training.epochs": "epochs", "training.batch_size": "batch_size", "training.gradient_accumulation_steps": "gradient_accumulation_steps", "training.num_workers": "num_workers", "training.device": "device", "training.log_every": "log_every", "training.best_selection_split": "best_selection_split", "training.best_selection_metric": "best_selection_metric", "optimizer.lr_base_head": "lr_base_head", "optimizer.lr_transport": "lr_transport", "optimizer.weight_decay": "weight_decay", "feature_cache.enabled": "feature_cache_enabled", "feature_cache.build_before_training": "feature_cache_build_before_training", "feature_cache.required_hit_rate": "feature_cache_required_hit_rate"}
     ap.set_defaults(**{dst: flat[src] for src, dst in mapping.items() if src in flat})
     args = ap.parse_args(argv); args.config_data = cfg; args.config_version = cfg.get("config_version", "")
     if args.config_version != "trace_oia_v1_proto_transport": raise ValueError(f"wrong config_version: {args.config_version}")
@@ -74,6 +76,29 @@ def _tokens(args, cache, backbone, images, batch, labels, device):
     if cache:
         for i, fn in enumerate(files): cache.put(fn, tok[i], labels[i])
     return tok, cache.stats() if cache else {}
+
+
+def verify_cache_ready(args, cache, loaders: dict[str, Any]) -> dict[str, Any]:
+    if not args.feature_cache_enabled:
+        return {"enabled": False, "required_hit_rate": 0.0, "actual_hit_rate": 1.0, "status": "disabled"}
+    if cache is None:
+        raise RuntimeError("feature_cache_enabled is true but cache object was not created")
+    total = 0
+    hits = 0
+    missing_preview: list[str] = []
+    for loader in loaders.values():
+        for batch in loader:
+            for fn in [str(x) for x in batch.get("file_name", [])]:
+                total += 1
+                if cache.get(fn) is not None:
+                    hits += 1
+                elif len(missing_preview) < 16:
+                    missing_preview.append(fn)
+    actual = hits / max(1, total)
+    status = {"enabled": True, "required_hit_rate": float(args.feature_cache_required_hit_rate), "actual_hit_rate": float(actual), "total": total, "hits": hits, "missing_preview": missing_preview}
+    if actual + 1e-12 < float(args.feature_cache_required_hit_rate):
+        raise RuntimeError(f"Feature cache hit rate {actual:.6f} below required {args.feature_cache_required_hit_rate:.6f}; run build_trace_oia_token_cache first.")
+    return status
 
 
 def run_epoch(args, backbone, model, loader, opt, device, train, grounding_cache, rules, epoch, cache):
@@ -135,9 +160,10 @@ def main(argv=None):
     opt = torch.optim.AdamW([{"params": model.base_fate.parameters(), "lr": args.lr_base_head}, {"params": model.transport.parameters(), "lr": args.lr_transport}, {"params": model.label_corr.parameters(), "lr": args.lr_transport}], weight_decay=args.weight_decay)
     train_loader = make_loader(args, "train", True); test_loader = make_loader(args, "test", False)
     cache = DinoTokenCache(args.cache_dir, args.image_height, args.image_width, args.arch, args.patch_size) if args.feature_cache_enabled else None
-    if cache: cache.write_manifest({"created_by": "train_trace_oia_on_demand"})
+    if cache: cache.write_manifest({"created_by": "train_trace_oia", "mode": "consume_prebuilt_or_on_demand"})
+    cache_ready = verify_cache_ready(args, cache, {"train": train_loader, "test": test_loader})
     grounding_cache = load_grounding_cache_jsonl(args.grounding_cache_jsonl) if args.grounding_cache_jsonl else {}; rules = load_reason_grounding_rules(args.reason_grounding_rules, args.reason_dim)
-    manifest = {"repo": "FATE-OIA", "experiment": args.experiment_name, "hostname": socket.gethostname(), "best_selection_split": "test", "best_selection_metric": "test_joint_composite", "command_args": dict(vars(args)), "train_count": len(train_loader.dataset), "test_count": len(test_loader.dataset), "loss_divided_by_accumulation": True, "test_only_evaluation": True}
+    manifest = {"repo": "FATE-OIA", "experiment": args.experiment_name, "hostname": socket.gethostname(), "best_selection_split": "test", "best_selection_metric": "test_joint_composite", "command_args": dict(vars(args)), "train_count": len(train_loader.dataset), "test_count": len(test_loader.dataset), "loss_divided_by_accumulation": True, "test_only_evaluation": True, "feature_cache_ready": cache_ready}
     write_json(out / "run_manifest.json", manifest); best = -1e9
     for epoch in range(args.epochs):
         train_stats = run_epoch(args, backbone, model, train_loader, opt, device, True, grounding_cache, rules, epoch, cache)
