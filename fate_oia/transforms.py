@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 import torch
 from PIL import Image, ImageOps
 
@@ -17,9 +18,8 @@ def audit_image_size(image: Image.Image) -> dict[str, tuple[int, int]]:
 
 
 def _to_tensor(image: Image.Image) -> torch.Tensor:
-    data = torch.ByteTensor(torch.ByteStorage.from_buffer(image.tobytes()))
-    h, w = image.height, image.width
-    tensor = data.view(h, w, len(image.getbands())).permute(2, 0, 1).float() / 255.0
+    array = np.asarray(image, dtype=np.uint8)
+    tensor = torch.from_numpy(array.copy()).permute(2, 0, 1).float() / 255.0
     return tensor
 
 
