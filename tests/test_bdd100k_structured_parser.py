@@ -25,6 +25,7 @@ def test_parser_reads_boxes_poly_and_drivable(tmp_path: Path) -> None:
                         "objects": [
                             {"category": "car", "box2d": {"x1": 1, "y1": 2, "x2": 10, "y2": 20}},
                             {"category": "lane/crosswalk", "poly2d": [{"vertices": [[1, 1], [2, 2], [3, 1]], "closed": True}]},
+                            {"category": "area/drivable", "poly2d": [[1, 1, "L"], [4, 1, "L"], [4, 4, "L"]]},
                         ]
                     }
                 ],
@@ -37,8 +38,8 @@ def test_parser_reads_boxes_poly_and_drivable(tmp_path: Path) -> None:
     rec = idx.lookup("sample_1.jpg", "test")
     assert rec.label_path is not None
     assert rec.box_count == 1
-    assert len(rec.lanes) == 1
+    assert len(rec.lanes) == 2
     assert rec.has_drivable
     audit = idx.audit_samples(["sample_1.jpg"], "test")
     assert audit["matched_count"] == 1
-    assert audit["lane_count"] == 1
+    assert audit["lane_count"] == 2

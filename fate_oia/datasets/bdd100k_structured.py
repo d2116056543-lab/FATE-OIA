@@ -24,6 +24,14 @@ def _safe_load_json(path: Path) -> dict[str, Any]:
 
 
 def _poly_vertices(poly: Any) -> list[tuple[float, float]]:
+    if isinstance(poly, list):
+        pts: list[tuple[float, float]] = []
+        for item in poly:
+            if isinstance(item, dict) and "x" in item and "y" in item:
+                pts.append((float(item["x"]), float(item["y"])))
+            elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                pts.append((float(item[0]), float(item[1])))
+        return pts
     if not isinstance(poly, dict):
         return []
     raw = poly.get("vertices") or poly.get("poly2d") or poly.get("points") or []
@@ -186,7 +194,10 @@ class BDD100KStructuredIndex:
                     }
                 )
             if isinstance(poly_raw, list):
-                for poly in poly_raw:
+                poly_items = poly_raw
+                if poly_raw and isinstance(poly_raw[0], (list, tuple)) and len(poly_raw[0]) >= 2:
+                    poly_items = [poly_raw]
+                for poly in poly_items:
                     verts = _poly_vertices(poly)
                     if not verts:
                         record.warnings.append(f"unparsed_poly2d:{category or 'unknown'}")
