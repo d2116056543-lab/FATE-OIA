@@ -39,6 +39,17 @@ def _limit(ds, n: int):
     return Subset(ds, range(min(n, len(ds)))) if n and n > 0 else ds
 
 
+def is_full_goal_run(args: argparse.Namespace) -> bool:
+    """Only the formal 24-epoch test-only full run may write GOAL_COMPLETED."""
+    return (
+        args.epochs >= 24
+        and args.max_train_samples <= 0
+        and args.max_test_samples <= 0
+        and args.test_only_evaluation
+        and args.best_selection_split == "test"
+    )
+
+
 def make_loader(args: argparse.Namespace, split: str, shuffle: bool) -> DataLoader:
     transform = AspectRatioLetterboxTransform(args.image_height, args.image_width, patch_size=args.patch_size, return_meta=True)
     ds = CAREMoEOIADataset(
@@ -264,7 +275,20 @@ def main() -> None:
             torch.save(ckpt, out_dir / "checkpoint_best_test.pth")
             write_json(out_dir / "metrics_best_test.json", metrics)
         print(f"epoch={epoch} test_joint={metrics['test_standard_joint']:.6f} Act={metrics['Act_guarded_mF1']:.6f} Exp={metrics['Exp_mF1']:.6f} ExpAP={metrics['Exp_mAP']:.6f}", flush=True)
-    write_json(out_dir / "GOAL_COMPLETED_CARE_MOE_OIA_V1.json", {"completed_epochs": args.epochs, "best_test_standard_joint": best, "output_dir": str(out_dir)})
+    completion_payload = {
+        "completed_epochs": args.epochs,
+        "best_test_standard_joint": best,
+        "output_dir": str(out_dir),
+        "max_train_samples": args.max_train_samples,
+        "max_test_samples": args.max_test_samples,
+        "test_only_evaluation": args.test_only_evaluation,
+        "best_selection_split": args.best_selection_split,
+    }
+    if is_full_goal_run(args):
+        write_json(out_dir / "GOAL_COMPLETED_CARE_MOE_OIA_V1.json", completion_payload)
+    else:
+        completion_payload["reason"] = "smoke_or_partial_run_not_goal_completion"
+        write_json(out_dir / "SMOKE_COMPLETED_CARE_MOE_OIA_V1.json", completion_payload)
 
 
 if __name__ == "__main__":

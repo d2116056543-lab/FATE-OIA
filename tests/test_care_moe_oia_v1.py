@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import argparse
+
 import torch
 
+from fate_oia.engine.train_care_moe_oia import is_full_goal_run
 from fate_oia.models.care_moe_oia_model import CAREMoEOIAModel
 from fate_oia.losses.care_moe_losses import evidence_bag_loss
 
@@ -37,3 +40,30 @@ def test_evidence_bag_loss_has_gradient():
     loss = evidence_bag_loss(out, reason, out["active_reason_mask"])
     loss.backward()
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.expert_router.parameters())
+
+
+def test_goal_completed_only_for_full_24_epoch_test_run():
+    full = argparse.Namespace(
+        epochs=24,
+        max_train_samples=0,
+        max_test_samples=0,
+        test_only_evaluation=True,
+        best_selection_split="test",
+    )
+    smoke = argparse.Namespace(
+        epochs=1,
+        max_train_samples=16,
+        max_test_samples=16,
+        test_only_evaluation=True,
+        best_selection_split="test",
+    )
+    wrong_split = argparse.Namespace(
+        epochs=24,
+        max_train_samples=0,
+        max_test_samples=0,
+        test_only_evaluation=True,
+        best_selection_split="val",
+    )
+    assert is_full_goal_run(full)
+    assert not is_full_goal_run(smoke)
+    assert not is_full_goal_run(wrong_split)
