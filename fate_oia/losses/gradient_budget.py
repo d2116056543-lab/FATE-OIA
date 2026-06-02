@@ -1,15 +1,14 @@
 from __future__ import annotations
 
+import math
+from typing import Iterable
+
 import torch
 
 
-def finite_or_zero(loss: torch.Tensor) -> torch.Tensor:
-    return torch.where(torch.isfinite(loss), loss, torch.zeros_like(loss))
-
-
-def grad_norm(parameters) -> float:
+def grad_norm(parameters: Iterable[torch.nn.Parameter]) -> float:
     total = 0.0
     for p in parameters:
         if p.grad is not None:
-            total += float(p.grad.detach().norm().cpu().item()) ** 2
-    return total ** 0.5
+            total += float(p.grad.detach().pow(2).sum().cpu())
+    return math.sqrt(total)
