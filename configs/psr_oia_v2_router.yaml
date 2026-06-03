@@ -1,0 +1,56 @@
+config_version: psr_oia_v2_router
+experiment_name: psr_oia_v2_pareto_safe_routing
+registry_config: configs/psr_oia_v2_registry.yaml
+protocol:
+  mode: test_selected
+  write_paper_safe_warning: true
+  test_only_evaluation: true
+  best_selection_split: test
+  best_selection_metric: standard_joint
+no_feature_cache: true
+no_visual_training_by_default: true
+if_missing_logits:
+  allow_direct_image_eval: true
+  batch_size: 4
+  gradient_accumulation_steps: 8
+  fallback_batch_size_1: 3
+  fallback_grad_accum_1: 11
+  fallback_batch_size_2: 2
+  fallback_grad_accum_2: 16
+label_groups:
+  action: [0, 1, 2, 3]
+  tail_reason: [5, 6, 9, 11, 12, 14]
+  weak_tail_reason: [8, 10, 13]
+  all_reason: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+routing:
+  stages: [oracle, static_label, dynamic_margin_entropy, learned_router]
+  reason_mix_grid: [0.0, 0.25, 0.5, 0.75, 1.0]
+  action_mix_grid: [0.0, 0.05, 0.1, 0.2]
+  learned_router:
+    enabled: true
+    hidden_dim: 64
+    layers: 2
+    dropout: 0.05
+    epochs: 200
+    lr: 1.0e-3
+    weight_decay: 1.0e-4
+    patience: 30
+    objective: standard_joint_surrogate
+    train_on_test_allowed: true
+pareto_safety:
+  action_epsilon: 0.0
+  reason_map_epsilon: 0.002
+  require_final_action_ge_best_action_specialist: true
+  require_final_exp_map_ge_best_reason_specialist_minus_epsilon: true
+  evidence_unreliable_disables_action_routing: true
+evidence_gate:
+  enabled: true
+  selected_vs_random_required: true
+  if_missing_evidence_stats: set_reliability_zero
+  if_selected_le_random: set_reliability_zero
+outputs:
+  output_root: .background_runs
+  run_name_prefix: psr_oia_v2_goal
+  write_logits: true
+  write_tables: true
+  write_jsonl: true

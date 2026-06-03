@@ -1,0 +1,54 @@
+config_version: psr_oia_v2_registry
+bdd_oia_root: E:/sbw/BDD-OIA
+bdd100k_root: E:/sbw/BDD100K
+test_only_evaluation: true
+feature_cache_enabled: false
+alignment:
+  require_same_file_names: true
+  require_same_labels: true
+  action_dim: 4
+  reason_dim: 21
+candidates:
+  action_specialists:
+    - name: runc_epoch14
+      priority: 100
+      required: true
+      type: run_dir_or_checkpoint
+      search:
+        run_dir_glob:
+          - E:/sbw/FATE_Drive/fate_oia_worktree/.background_runs/fate_oia_runC_e13_cosine_labelcorr_20260526_191938
+      if_missing: try_eval_checkpoint_direct_image
+    - name: labelcorr_action_visual
+      priority: 90
+      required: false
+      type: run_dir
+      search:
+        run_dir_glob:
+          - E:/sbw/FATE_Drive/fate_oia_care_moe_oia_v1_worktree/.background_runs/labelcorr_action_visual_testonly_20e_20260603_095024
+      if_missing: skip_with_warning
+    - name: care_act_best
+      priority: 70
+      required: false
+      type: run_dir
+      search:
+        run_dir_glob:
+          - E:/sbw/FATE_Drive/fate_oia_care_moe_oia_v1_worktree/.background_runs/care_act_oia_v1_full_24e_20260602_220229
+      if_missing: skip_with_warning
+  explanation_specialists:
+    - name: care_moe_best
+      priority: 100
+      required: true
+      type: run_dir
+      search:
+        run_dir_glob:
+          - E:/sbw/FATE_Drive/fate_oia_care_moe_oia_v1_worktree/.background_runs/care_moe_oia_v1_full_24e_20260602_133951
+      if_missing: error
+  calibration_specialists:
+    - name: p1_tail_calibration
+      priority: 100
+      required: false
+      type: cached_logits
+      search:
+        run_dir_glob:
+          - E:/sbw/FATE_Drive/fate_oia_worktree/.background_runs/fate_oia_tail_adapter_20260528_foreground/P1_calibration_only
+      if_missing: skip_with_warning
