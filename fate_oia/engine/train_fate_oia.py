@@ -99,6 +99,24 @@ def make_multilabel_criterion(args) -> nn.Module:
     return nn.BCEWithLogitsLoss()
 
 
+def current_lr(optimizer: torch.optim.Optimizer) -> float:
+    return float(optimizer.param_groups[0].get("lr", 0.0)) if optimizer.param_groups else 0.0
+
+
+def build_scheduler(args, optimizer: torch.optim.Optimizer, start_epoch: int = 0):
+    mode = str(getattr(args, "scheduler", "none")).lower()
+    if mode == "none":
+        return None
+    if mode == "cosine":
+        total_remaining = max(1, int(args.epochs) - int(start_epoch))
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=total_remaining,
+            eta_min=float(getattr(args, "min_lr", 0.0)),
+        )
+    raise ValueError(f"Unsupported scheduler={mode}")
+
+
 def empty_eval_stats(args) -> dict[str, Any]:
     return {
         "loss": 0.0,
@@ -902,7 +920,7 @@ def run_epoch(args, backbone, model, loader, criterion, optimizer, device, train
             "cf_loss": float(cf_loss.detach().item()),
             "grounding_loss": float(grounding_loss.detach().item()) if isinstance(grounding_loss, torch.Tensor) else 0.0,
             "total_loss": float(loss.detach().item()),
-            "lr": float(getattr(args, "lr", 0.0)),
+            "lr": current_lr(optimizer),
             "grad_norm": None,
             "effective_batch_size": int(getattr(args, "effective_batch_size", bs * accum)),
             "loss_divided_by_accumulation": True,
@@ -932,6 +950,7 @@ def run_epoch(args, backbone, model, loader, criterion, optimizer, device, train
                 "grounding_loss": float(grounding_loss.item()) if "grounding_loss" in locals() else 0.0,
                 "grounding_stats": grounding_stats,
                 "batch_size": bs,
+                "lr": current_lr(optimizer),
                 "token_stats": token_stats,
             }), flush=True)
     logits_tensor = torch.cat(logits_all, 0) if logits_all else torch.empty(0, args.action_dim + args.reason_dim)
@@ -986,6 +1005,10 @@ def main() -> None:
     ap.add_argument("--gradient_accumulation_steps", type=int, default=1)
     ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--scheduler", choices=["none", "cosine"], default="none")
+    ap.add_argument("--min_lr", type=float, default=0.0)
+    ap.add_argument("--resume_checkpoint", default="")
+    ap.add_argument("--resume_optimizer", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--auto_scale_lr", action=argparse.BooleanOptionalAction, default=False)
     ap.add_argument("--reference_effective_batch", type=int, default=32)
     ap.add_argument("--base_head_lr_at_reference_batch", type=float, default=3e-4)
@@ -1094,6 +1117,29 @@ def main() -> None:
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     criterion = make_multilabel_criterion(args)
+    start_epoch = 0
+    best_test = -1.0
+    best_val = -1.0
+    if args.resume_checkpoint:
+        ckpt_path = Path(args.resume_checkpoint)
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"resume_checkpoint not found: {ckpt_path}")
+        ckpt = torch.load(str(ckpt_path), map_location=device)
+        missing, unexpected = model.load_state_dict(ckpt.get("model", ckpt), strict=False)
+        if missing or unexpected:
+            print(json.dumps({"event": "resume_state_dict_non_strict", "missing": missing, "unexpected": unexpected}), flush=True)
+        if args.resume_optimizer and isinstance(ckpt, dict) and "optimizer" in ckpt:
+            try:
+                optimizer.load_state_dict(ckpt["optimizer"])
+                for group in optimizer.param_groups:
+                    group["lr"] = args.lr
+            except Exception as exc:
+                print(json.dumps({"event": "resume_optimizer_skipped", "reason": str(exc)}), flush=True)
+        start_epoch = int(ckpt.get("epoch", -1)) + 1 if isinstance(ckpt, dict) else 0
+        best_test = float(ckpt.get("best_test_score", -1.0)) if isinstance(ckpt, dict) else -1.0
+        best_val = float(ckpt.get("best_val_score", -1.0)) if isinstance(ckpt, dict) else -1.0
+        args.resumed_from_epoch = start_epoch - 1
+    scheduler = build_scheduler(args, optimizer, start_epoch=start_epoch)
     train_loader = make_loader(args, "train", True)
     val_loader = make_loader(args, "val", False) if "val" in eval_splits else None
     test_loader = make_loader(args, "test", False) if "test" in eval_splits else None
@@ -1142,10 +1188,8 @@ def main() -> None:
         if args.render_explanation_text:
             _render_split_explanations(out_dir, split, stats, args.action_dim, args.eval_threshold)
 
-    best_test = -1.0
-    best_val = -1.0
     history = []
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         train_stats = run_epoch(args, backbone, model, train_loader, criterion, optimizer, device, True, grounding_cache, epoch)
         val_stats = run_epoch(args, backbone, model, val_loader, criterion, optimizer, device, False, grounding_cache, epoch) if val_loader is not None else empty_eval_stats(args)
         test_stats = run_epoch(args, backbone, model, test_loader, criterion, optimizer, device, False, grounding_cache, epoch) if test_loader is not None else None
@@ -1165,11 +1209,22 @@ def main() -> None:
             "joint_test_score": test_score,
             "selection_score": selected_score,
             "best_selection_split": args.best_selection_split,
+            "lr": current_lr(optimizer),
+            "scheduler": args.scheduler,
         }
         history.append(row)
         with (out_dir / "metrics.jsonl").open("a", encoding="utf-8") as f:
             f.write(json.dumps(_json_safe(row)) + "\n")
-        latest = {"epoch": epoch, "model": model.state_dict(), "optimizer": optimizer.state_dict(), "args": vars(args), "dim": dim, "best_test_score": max(best_test, test_score), "best_val_score": max(best_val, val_score)}
+        latest = {
+            "epoch": epoch,
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict() if scheduler is not None else None,
+            "args": vars(args),
+            "dim": dim,
+            "best_test_score": max(best_test, test_score),
+            "best_val_score": max(best_val, val_score),
+        }
         torch.save(latest, out_dir / "checkpoint_latest.pth")
         _save_latest_split_outputs("val", val_stats)
         if test_stats is not None:
@@ -1189,6 +1244,8 @@ def main() -> None:
             best_val = val_score
             torch.save(latest, out_dir / "checkpoint_best_val.pth")
             _write_json(out_dir / "metrics_best_val.json", row)
+        if scheduler is not None:
+            scheduler.step()
         print(json.dumps({"event": "fate_oia_epoch", **_json_safe(row)}), flush=True)
     (out_dir / "history.json").write_text(json.dumps(_json_safe(history), indent=2), encoding="utf-8")
 

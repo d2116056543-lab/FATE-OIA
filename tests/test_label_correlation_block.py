@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import torch
+from argparse import Namespace
 
-from fate_oia.engine.train_fate_oia import empty_eval_stats, parse_eval_splits
+from fate_oia.engine.train_fate_oia import build_scheduler, empty_eval_stats, parse_eval_splits
 from fate_oia.models.fate_oia_model import FATEOIAFeatureModel
 from fate_oia.models.label_correlation import LabelCorrelationBlock
 
@@ -54,3 +55,14 @@ def test_eval_splits_parser_and_empty_stats_are_test_only_safe():
     stats = empty_eval_stats(Args())
     assert stats["logits"].shape == (0, 25)
     assert stats["fused_logits"].shape == (0, 4)
+
+
+def test_cosine_scheduler_can_start_from_resume_epoch():
+    model = torch.nn.Linear(2, 1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    args = Namespace(scheduler="cosine", epochs=20, min_lr=1e-5)
+    scheduler = build_scheduler(args, optimizer, start_epoch=15)
+    assert scheduler is not None
+    assert scheduler.T_max == 5
+    scheduler.step()
+    assert optimizer.param_groups[0]["lr"] < 1e-4
