@@ -56,6 +56,17 @@ def labels_from_batch(batch: dict[str, torch.Tensor]) -> torch.Tensor:
     return torch.cat([batch["action"].float(), batch["reason"].float()], dim=1)
 
 
+def parse_eval_splits(value: str) -> set[str]:
+    splits = {part.strip().lower() for part in str(value).split(",") if part.strip()}
+    allowed = {"val", "test"}
+    unknown = splits - allowed
+    if unknown:
+        raise ValueError(f"Unsupported eval_splits entries: {sorted(unknown)}")
+    if not splits:
+        raise ValueError("eval_splits must include at least one of val,test")
+    return splits
+
+
 def limited(dataset, max_samples: int):
     if max_samples and max_samples > 0:
         return Subset(dataset, list(range(min(max_samples, len(dataset)))))
@@ -86,6 +97,25 @@ def make_multilabel_criterion(args) -> nn.Module:
     if args.loss == "asl":
         return AsymmetricLossMultiLabel(gamma_pos=args.asl_gamma_pos, gamma_neg=args.asl_gamma_neg, clip=args.asl_clip)
     return nn.BCEWithLogitsLoss()
+
+
+def empty_eval_stats(args) -> dict[str, Any]:
+    return {
+        "loss": 0.0,
+        "count": 0,
+        "metrics": {},
+        "branch_metrics": {},
+        "logits": torch.empty(0, args.action_dim + args.reason_dim),
+        "visual_logits": torch.empty(0, args.action_dim),
+        "reason_action_logits": torch.empty(0, args.action_dim),
+        "fused_logits": torch.empty(0, args.action_dim),
+        "labels": torch.empty(0, args.action_dim + args.reason_dim),
+        "token_stats": [],
+        "loss_components": [],
+        "grounding_stats": [],
+        "counterfactual_stats": [],
+        "file_names": [],
+    }
 
 
 def load_config_defaults(path: str) -> dict[str, Any]:
@@ -775,7 +805,18 @@ def run_epoch(args, backbone, model, loader, criterion, optimizer, device, train
         tokens, provenance, token_stats = compress_tokens(original_tokens, keep_ratio, args.num_summary_tokens, args.min_tokens, args.token_compression)
         out = model(tokens)
         logits = torch.cat([out["action_fused_logits"], out["reason_logits"]], dim=1)
-        main_loss = criterion(logits, labels)
+        full_main_loss = criterion(logits, labels)
+        if float(getattr(args, "main_action_loss_weight", 1.0)) != 1.0 or float(getattr(args, "main_reason_loss_weight", 1.0)) != 1.0:
+            action_main_loss = criterion(out["action_fused_logits"], labels[:, : args.action_dim])
+            reason_main_loss = criterion(out["reason_logits"], labels[:, args.action_dim :])
+            main_loss = (
+                float(args.main_action_loss_weight) * action_main_loss
+                + float(args.main_reason_loss_weight) * reason_main_loss
+            )
+        else:
+            action_main_loss = full_main_loss.new_zeros(())
+            reason_main_loss = full_main_loss.new_zeros(())
+            main_loss = full_main_loss
         branch = action_branch_losses(
             out,
             labels[:, : args.action_dim],
@@ -848,6 +889,9 @@ def run_epoch(args, backbone, model, loader, criterion, optimizer, device, train
             "step": step,
             "loss": float(loss.detach().item()),
             "main_loss": float(main_loss.detach().item()),
+            "full_main_loss": float(full_main_loss.detach().item()),
+            "main_action_loss": float(action_main_loss.detach().item()),
+            "main_reason_loss": float(reason_main_loss.detach().item()),
             "r2a_loss": float(r2a_loss.detach().item()),
             "action_visual_loss": float(branch["action_visual_loss"].detach().item()),
             "action_reason_loss": float(branch["action_reason_loss"].detach().item()),
@@ -873,6 +917,9 @@ def run_epoch(args, backbone, model, loader, criterion, optimizer, device, train
                 "step": step,
                 "loss": float(loss.item()),
                 "main_loss": float(main_loss.item()),
+                "full_main_loss": float(full_main_loss.item()),
+                "main_action_loss": float(action_main_loss.item()),
+                "main_reason_loss": float(reason_main_loss.item()),
                 "r2a_loss": float(r2a_loss.item()),
                 "action_branch_total": float(branch["action_branch_total"].item()),
                 "action_visual_loss": float(branch["action_visual_loss"].item()),
@@ -968,6 +1015,15 @@ def main() -> None:
     ap.add_argument("--cf_mask_fill", choices=["zero", "mean", "mask_token"], default="mean")
     ap.add_argument("--use_label_query", action="store_true", default=True)
     ap.add_argument("--use_reason_to_action", action="store_true", default=True)
+    ap.add_argument("--use_label_correlation", action=argparse.BooleanOptionalAction, default=False)
+    ap.add_argument("--label_correlation_layers", type=int, default=1)
+    ap.add_argument("--label_correlation_heads", type=int, default=4)
+    ap.add_argument("--label_correlation_dropout", type=float, default=0.1)
+    ap.add_argument("--fusion_mode", choices=["learned", "visual", "reason", "fixed_alpha", "gated_floor"], default="learned")
+    ap.add_argument("--fusion_fixed_alpha", type=float, default=0.5)
+    ap.add_argument("--fusion_gate_floor", type=float, default=0.0)
+    ap.add_argument("--main_action_loss_weight", type=float, default=1.0)
+    ap.add_argument("--main_reason_loss_weight", type=float, default=1.0)
     ap.add_argument("--token_compression", choices=["none", "keep_merge"], default="none")
     ap.add_argument("--token_keep_ratio", type=float, default=1.0)
     ap.add_argument("--compression_start_epoch", type=int, default=8)
@@ -990,6 +1046,7 @@ def main() -> None:
     ap.add_argument("--max_saved_token_stats", type=int, default=16)
     ap.add_argument("--pretrained_source", default="public_dino_reference")
     ap.add_argument("--best_selection_split", choices=["val", "test"], default="test")
+    ap.add_argument("--eval_splits", default="val,test")
     ap.add_argument("--best_selection_metric", default="joint_test_score")
     ap.add_argument("--render_explanation_text", action=argparse.BooleanOptionalAction, default=False)
     ap.add_argument("--save_epoch_artifacts", action=argparse.BooleanOptionalAction, default=True)
@@ -1015,15 +1072,31 @@ def main() -> None:
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    eval_splits = parse_eval_splits(args.eval_splits)
+    args.eval_splits_resolved = sorted(eval_splits)
+    if args.best_selection_split not in eval_splits:
+        raise ValueError(f"best_selection_split={args.best_selection_split} is not enabled by eval_splits={args.eval_splits}")
     (out_dir / "args.json").write_text(json.dumps(vars(args), indent=2), encoding="utf-8")
     device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
     backbone, dim = build_backbone(args, device)
-    model = FATEOIAFeatureModel(dim=dim, action_dim=args.action_dim, reason_dim=args.reason_dim, use_label_query=args.use_label_query).to(device)
+    model = FATEOIAFeatureModel(
+        dim=dim,
+        action_dim=args.action_dim,
+        reason_dim=args.reason_dim,
+        use_label_query=args.use_label_query,
+        use_label_correlation=args.use_label_correlation,
+        label_correlation_layers=args.label_correlation_layers,
+        label_correlation_heads=args.label_correlation_heads,
+        label_correlation_dropout=args.label_correlation_dropout,
+        fusion_mode=args.fusion_mode,
+        fusion_fixed_alpha=args.fusion_fixed_alpha,
+        fusion_gate_floor=args.fusion_gate_floor,
+    ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     criterion = make_multilabel_criterion(args)
     train_loader = make_loader(args, "train", True)
-    val_loader = make_loader(args, "val", False)
-    test_loader = make_loader(args, "test", False)
+    val_loader = make_loader(args, "val", False) if "val" in eval_splits else None
+    test_loader = make_loader(args, "test", False) if "test" in eval_splits else None
     grounding_cache = load_grounding_cache(args.grounding_cache_jsonl) if args.grounding_cache_jsonl else {}
     args.reason_grounding_rules_map = load_reason_grounding_rules(args.reason_grounding_rules, args.reason_dim)
     if args.loss_grounding > 0 and not grounding_cache:
@@ -1031,7 +1104,14 @@ def main() -> None:
     if args.loss_grounding > 0 and args.grounding_mode in {"label", "both"} and not args.reason_grounding_rules_map:
         print(json.dumps({"event": "fate_oia_label_grounding_disabled", "reason": "empty_reason_grounding_rules"}), flush=True)
     is_smoke = bool(args.max_train_samples or args.max_val_samples or args.max_test_samples or args.epochs <= 1)
-    manifest = build_run_manifest(args, out_dir, len(train_loader.dataset), len(val_loader.dataset), len(test_loader.dataset), is_smoke=is_smoke)
+    manifest = build_run_manifest(
+        args,
+        out_dir,
+        len(train_loader.dataset),
+        len(val_loader.dataset) if val_loader is not None else 0,
+        len(test_loader.dataset) if test_loader is not None else 0,
+        is_smoke=is_smoke,
+    )
     _write_json(out_dir / "run_manifest.json", manifest)
     _write_json(out_dir / "training_config_resolved.yaml", vars(args))
 
@@ -1067,10 +1147,10 @@ def main() -> None:
     history = []
     for epoch in range(args.epochs):
         train_stats = run_epoch(args, backbone, model, train_loader, criterion, optimizer, device, True, grounding_cache, epoch)
-        val_stats = run_epoch(args, backbone, model, val_loader, criterion, optimizer, device, False, grounding_cache, epoch)
-        test_stats = run_epoch(args, backbone, model, test_loader, criterion, optimizer, device, False, grounding_cache, epoch)
-        val_score = _joint_score(val_stats)
-        test_score = _joint_score(test_stats)
+        val_stats = run_epoch(args, backbone, model, val_loader, criterion, optimizer, device, False, grounding_cache, epoch) if val_loader is not None else empty_eval_stats(args)
+        test_stats = run_epoch(args, backbone, model, test_loader, criterion, optimizer, device, False, grounding_cache, epoch) if test_loader is not None else None
+        val_score = _joint_score(val_stats) if val_loader is not None else -1.0
+        test_score = _joint_score(test_stats) if test_stats is not None else -1.0
         selected_score = test_score if args.best_selection_split == "test" else val_score
         row = {
             "epoch": epoch,
@@ -1092,8 +1172,9 @@ def main() -> None:
         latest = {"epoch": epoch, "model": model.state_dict(), "optimizer": optimizer.state_dict(), "args": vars(args), "dim": dim, "best_test_score": max(best_test, test_score), "best_val_score": max(best_val, val_score)}
         torch.save(latest, out_dir / "checkpoint_latest.pth")
         _save_latest_split_outputs("val", val_stats)
-        _save_latest_split_outputs("test", test_stats)
-        (out_dir / "token_stats_latest.json").write_text(json.dumps(_json_safe({"train": train_stats["token_stats"], "val": val_stats["token_stats"], "test": test_stats["token_stats"]}), indent=2), encoding="utf-8")
+        if test_stats is not None:
+            _save_latest_split_outputs("test", test_stats)
+        (out_dir / "token_stats_latest.json").write_text(json.dumps(_json_safe({"train": train_stats["token_stats"], "val": val_stats["token_stats"], "test": test_stats["token_stats"] if test_stats is not None else []}), indent=2), encoding="utf-8")
         if args.save_epoch_artifacts:
             write_epoch_artifacts(out_dir, epoch, train_stats, val_stats, manifest, test_stats)
         _write_json(out_dir / "metrics_latest.json", row)
@@ -1102,7 +1183,8 @@ def main() -> None:
             torch.save(latest, out_dir / "checkpoint_best_test.pth")
             torch.save(latest, out_dir / "checkpoint_best.pth")
             _write_json(out_dir / "metrics_best_test.json", row)
-            _save_latest_split_outputs("best_test", test_stats)
+            if test_stats is not None:
+                _save_latest_split_outputs("best_test", test_stats)
         if val_score >= best_val:
             best_val = val_score
             torch.save(latest, out_dir / "checkpoint_best_val.pth")
