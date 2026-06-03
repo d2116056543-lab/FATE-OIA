@@ -183,10 +183,22 @@ def apply_config_defaults(args, config_defaults: dict[str, Any]) -> None:
     if not config_defaults:
         return
     cli_tokens = set(sys.argv[1:])
+
+    def _cli_overrode(key: str) -> bool:
+        positive = f"--{key}"
+        negative = f"--no-{key}"
+        return any(
+            token == positive
+            or token.startswith(f"{positive}=")
+            or token == negative
+            or token.startswith(f"{negative}=")
+            for token in cli_tokens
+        )
+
     for key, value in config_defaults.items():
         if not hasattr(args, key):
             continue
-        if f"--{key}" in cli_tokens:
+        if _cli_overrode(key):
             continue
         setattr(args, key, value)
 def load_grounding_cache(path: str) -> dict[str, dict[str, Any]]:

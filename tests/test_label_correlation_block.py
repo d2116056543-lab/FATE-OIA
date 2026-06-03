@@ -3,7 +3,12 @@ from __future__ import annotations
 import torch
 from argparse import Namespace
 
-from fate_oia.engine.train_fate_oia import build_scheduler, empty_eval_stats, parse_eval_splits
+from fate_oia.engine.train_fate_oia import (
+    apply_config_defaults,
+    build_scheduler,
+    empty_eval_stats,
+    parse_eval_splits,
+)
 from fate_oia.models.fate_oia_model import FATEOIAFeatureModel
 from fate_oia.models.label_correlation import LabelCorrelationBlock
 
@@ -66,3 +71,14 @@ def test_cosine_scheduler_can_start_from_resume_epoch():
     assert scheduler.T_max == 5
     scheduler.step()
     assert optimizer.param_groups[0]["lr"] < 1e-4
+
+
+def test_boolean_no_flag_prevents_config_default_override(monkeypatch):
+    args = Namespace(auto_scale_lr=False, lr=1e-4)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["train_fate_oia.py", "--config", "configs/fate_oia_train_360x640.yaml", "--no-auto_scale_lr", "--lr", "0.0001"],
+    )
+    apply_config_defaults(args, {"auto_scale_lr": True, "lr": 3e-4})
+    assert args.auto_scale_lr is False
+    assert args.lr == 1e-4
