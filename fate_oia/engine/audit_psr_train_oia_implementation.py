@@ -47,10 +47,15 @@ def check_source_static() -> list[str]:
     failures: list[str] = []
     train_src = _read("fate_oia/engine/train_psr_train_oia.py")
     supervisor_src = _read("fate_oia/engine/supervise_psr_train_oia_foreground.py")
-    forbidden_train = ["resume_checkpoint", "registry_config", "logits_action_", "logits_reason_", "torch.load("]
+    forbidden_train = ["resume_checkpoint", "registry_config", "logits_action_", "logits_reason_"]
     for token in forbidden_train:
         if token in train_src:
             failures.append(f"train_psr_train_oia.py contains forbidden old-artifact token: {token}")
+    if "torch.load(" in train_src and "resume_psr_train_checkpoint" not in train_src:
+        failures.append("torch.load is only allowed for same-output-dir resume_psr_train_checkpoint")
+    for token in ["same_output_dir_psr_train_checkpoint_only", "old RunC/CARE checkpoints are not allowed"]:
+        if token not in train_src:
+            failures.append(f"safe same-run resume guard missing: {token}")
     for token in ["Start-Process", "Start-Job", "nohup", "-WindowStyle Hidden"]:
         if token.lower() in supervisor_src.lower():
             failures.append(f"supervisor contains forbidden background token: {token}")

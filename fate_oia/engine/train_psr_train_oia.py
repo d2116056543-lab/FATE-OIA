@@ -150,7 +150,7 @@ def run_epoch(args, backbone, model, loader, optimizer, device, epoch: int, trai
     }
 
 
-def save_split_outputs(out_dir: Path, split: str, stats: dict[str, Any]) -> None:
+def save_split_outputs(out_dir: Path, split: str, stats: dict[str, Any], action_dim: int) -> None:
     tensors = stats["outputs"]
     torch.save(tensors["final_action_logits"], out_dir / f"logits_final_action_{split}.pt")
     torch.save(tensors["final_reason_logits"], out_dir / f"logits_final_reason_{split}.pt")
@@ -160,8 +160,8 @@ def save_split_outputs(out_dir: Path, split: str, stats: dict[str, Any]) -> None
     torch.save(tensors["e_reason_logits"], out_dir / f"logits_e_reason_{split}.pt")
     torch.save(tensors["c_reason_logits"], out_dir / f"logits_c_reason_{split}.pt")
     labels = stats["labels"]
-    torch.save(labels[:, :4], out_dir / f"labels_action_{split}.pt")
-    torch.save(labels[:, 4:], out_dir / f"labels_reason_{split}.pt")
+    torch.save(labels[:, :action_dim], out_dir / f"labels_action_{split}.pt")
+    torch.save(labels[:, action_dim:], out_dir / f"labels_reason_{split}.pt")
     _write_json(out_dir / f"file_names_{split}.json", stats["file_names"])
 
 
@@ -171,7 +171,7 @@ def save_epoch_artifacts(out_dir: Path, epoch: int, train_stats: dict[str, Any],
     _write_json(e_dir / "metrics_summary.json", {"epoch": epoch, "train_loss": train_stats["loss"], "test": test_stats["metrics"], "branch_metrics": test_stats["branch_metrics"], "joint_test_score": test_stats["joint"]})
     for row in train_stats["loss_components"]:
         _append_jsonl(e_dir / "loss_components.jsonl", row)
-    save_split_outputs(e_dir, "test", test_stats)
+    save_split_outputs(e_dir, "test", test_stats, int(manifest["config_resolved"]["action_dim"]))
     _write_json(e_dir / "run_manifest.json", manifest)
 
 
@@ -190,6 +190,8 @@ def build_manifest(args: argparse.Namespace, out_dir: Path, train_count: int, te
         "raw_root": args.raw_root,
         "pretrained_weights": args.pretrained_weights,
         "initialization_policy": "DINO_pretrained_only_no_old_checkpoint_resume",
+        "resume_policy": "same_output_dir_psr_train_checkpoint_only",
+        "resume_psr_train_checkpoint": args.resume_psr_train_checkpoint,
         "uses_old_logits_for_training": False,
         "uses_feature_cache": False,
         "eval_splits": ["test"],
@@ -249,6 +251,7 @@ def main() -> None:
     ap.add_argument("--max_train_samples", type=int, default=0)
     ap.add_argument("--max_test_samples", type=int, default=0)
     ap.add_argument("--log_every", type=int, default=60)
+    ap.add_argument("--resume_psr_train_checkpoint", default="")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
     global _DEFAULTS
@@ -277,12 +280,32 @@ def main() -> None:
     backbone, dim = build_backbone(args, device)
     model = PSRTrainOIAFeatureModel(dim=dim, action_dim=args.action_dim, reason_dim=args.reason_dim, action_delta_cap=args.action_delta_cap, specialist_warmup_epochs=args.specialist_warmup_epochs, router_warmup_epochs=args.router_warmup_epochs).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    start_epoch = 0
+    best_score = -1.0
+    if args.resume_psr_train_checkpoint:
+        resume_path = Path(args.resume_psr_train_checkpoint)
+        if not resume_path.exists():
+            raise FileNotFoundError(f"resume_psr_train_checkpoint does not exist: {resume_path}")
+        if resume_path.resolve().parent != out_dir.resolve():
+            raise ValueError("resume_psr_train_checkpoint must be inside the same output_dir; old RunC/CARE checkpoints are not allowed")
+        resume = torch.load(resume_path, map_location=device)
+        model.load_state_dict(resume["model"], strict=True)
+        if "optimizer" in resume:
+            optimizer.load_state_dict(resume["optimizer"])
+        start_epoch = int(resume.get("epoch", -1)) + 1
+        best_score = float(resume.get("best_test_score", -1.0))
+        print(json.dumps({
+            "event": "psr_train_resume",
+            "resume_psr_train_checkpoint": str(resume_path),
+            "start_epoch": start_epoch,
+            "best_test_score": best_score,
+            "same_output_dir_only": True,
+        }, ensure_ascii=False), flush=True)
     train_loader = make_loader(args, "train", True)
     test_loader = make_loader(args, "test", False)
     manifest = build_manifest(args, out_dir, len(train_loader.dataset), len(test_loader.dataset))
     _write_json(out_dir / "run_manifest.json", manifest)
-    best_score = -1.0
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         train_stats = run_epoch(args, backbone, model, train_loader, optimizer, device, epoch, True)
         test_stats = run_epoch(args, backbone, model, test_loader, optimizer, device, epoch, False)
         row = {
@@ -298,8 +321,15 @@ def main() -> None:
         _append_jsonl(out_dir / "metrics_summary.jsonl", row)
         _write_json(out_dir / "metrics_latest.json", row)
         save_epoch_artifacts(out_dir, epoch, train_stats, test_stats, manifest)
-        save_split_outputs(out_dir, "test", test_stats)
-        ckpt = {"epoch": epoch, "model": model.state_dict(), "optimizer": optimizer.state_dict(), "args": vars(args), "best_test_score": max(best_score, test_stats["joint"])}
+        save_split_outputs(out_dir, "test", test_stats, args.action_dim)
+        ckpt = {
+            "epoch": epoch,
+            "method": "PSR-Train OIA V1",
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "args": vars(args),
+            "best_test_score": max(best_score, test_stats["joint"]),
+        }
         torch.save(ckpt, out_dir / "checkpoint_latest.pth")
         if test_stats["joint"] >= best_score:
             best_score = test_stats["joint"]
