@@ -18,6 +18,7 @@ from fate_oia.datasets.bdd_oia_multitask import BDDOIAMultiTaskDataset
 from fate_oia.engine.eval_snna25 import evaluate_snna25
 from fate_oia.engine.train_fate_oia import build_backbone, build_transform, extract_tokens
 from fate_oia.losses.cagrad_lite import clip_shared_gradient_budget
+from fate_oia.losses.pcgrad_lite import assign_pcgrad_lite, compute_pcgrad_lite
 from fate_oia.losses.p3le_pair_losses import p3le_pair_loss
 from fate_oia.models.p3le_pair_oia_model import P3LEPairOIAFeatureModel
 from fate_oia.utils.p3le_pair_artifacts import append_jsonl, save_logits_artifacts, summarize_scalar_rows, write_json
@@ -91,9 +92,10 @@ class BDD100KWeakEvidencePriorBuilder:
             "drivable": [1, 19, 20],
         }
 
-    def _prior_for_file(self, file_name: str) -> torch.Tensor:
+    def _prior_and_groups_for_file(self, file_name: str) -> tuple[torch.Tensor, dict[str, float]]:
         if file_name in self.cache:
-            return self.cache[file_name].clone()
+            prior = self.cache[file_name].clone()
+            return prior, self._groups_from_prior(prior)
         prior = torch.zeros(self.reason_dim, dtype=torch.float32)
         paths = self.index.lookup(file_name)
         categories: set[str] = set()
@@ -108,17 +110,70 @@ class BDD100KWeakEvidencePriorBuilder:
                 for idx in self.reason_groups[group]:
                     if idx < self.reason_dim:
                         prior[idx] = 1.0
+        lower_categories = " ".join(sorted(categories))
+        directional_groups = {
+            "left_related": [10, 13, 16],
+            "right_related": [11, 13, 17],
+            "turn_related": [10, 11, 13, 16, 17],
+            "obstacle_related": [1, 2, 5, 6, 8, 9, 12, 14, 19, 20],
+            "traffic_control_related": [0, 3, 4, 7, 15, 18],
+        }
+        if "left" in lower_categories or "lane" in lower_categories:
+            for idx in directional_groups["left_related"]:
+                if idx < self.reason_dim:
+                    prior[idx] = max(float(prior[idx]), 0.5)
+        if "right" in lower_categories or "lane" in lower_categories:
+            for idx in directional_groups["right_related"]:
+                if idx < self.reason_dim:
+                    prior[idx] = max(float(prior[idx]), 0.5)
+        if categories.intersection(self.category_groups["vehicle"] | self.category_groups["vulnerable"]):
+            for idx in directional_groups["obstacle_related"]:
+                if idx < self.reason_dim:
+                    prior[idx] = max(float(prior[idx]), 0.5)
+        if categories.intersection(self.category_groups["traffic"]):
+            for idx in directional_groups["traffic_control_related"]:
+                if idx < self.reason_dim:
+                    prior[idx] = max(float(prior[idx]), 0.5)
         if paths.drivable_map:
             for idx in self.reason_groups["drivable"]:
                 if idx < self.reason_dim:
                     prior[idx] = 1.0
         self.cache[file_name] = prior
-        return prior.clone()
+        return prior.clone(), self._groups_from_prior(prior)
 
-    def __call__(self, file_names: list[str], device: torch.device) -> torch.Tensor:
+    def _groups_from_prior(self, prior: torch.Tensor) -> dict[str, float]:
+        groups = {
+            "traffic": self.reason_groups["traffic"],
+            "vehicle": self.reason_groups["vehicle"],
+            "vulnerable": self.reason_groups["vulnerable"],
+            "lane": self.reason_groups["lane"],
+            "drivable": self.reason_groups["drivable"],
+            "left_related": [10, 13, 16],
+            "right_related": [11, 13, 17],
+            "turn_related": [10, 11, 13, 16, 17],
+            "obstacle_related": [1, 2, 5, 6, 8, 9, 12, 14, 19, 20],
+            "traffic_control_related": [0, 3, 4, 7, 15, 18],
+        }
+        out = {}
+        for name, indices in groups.items():
+            valid = [idx for idx in indices if idx < self.reason_dim]
+            out[f"bdd100k_prior_{name}_rate"] = float(prior[valid].mean()) if valid else 0.0
+        return out
+
+    def __call__(self, file_names: list[str], device: torch.device) -> tuple[torch.Tensor, dict[str, float]]:
         if not file_names:
-            return torch.zeros(0, self.reason_dim, device=device)
-        return torch.stack([self._prior_for_file(str(name)) for name in file_names], dim=0).to(device)
+            return torch.zeros(0, self.reason_dim, device=device), {}
+        priors = []
+        group_rows = []
+        for name in file_names:
+            prior, groups = self._prior_and_groups_for_file(str(name))
+            priors.append(prior)
+            group_rows.append(groups)
+        stats = {}
+        if group_rows:
+            for key in group_rows[0]:
+                stats[key] = sum(row[key] for row in group_rows) / len(group_rows)
+        return torch.stack(priors, dim=0).to(device), stats
 
 
 def combined(action_logits: torch.Tensor, reason_logits: torch.Tensor) -> torch.Tensor:
@@ -178,12 +233,23 @@ def run_epoch(args, backbone, model, loader, optimizer, scheduler, device, epoch
             labels = torch.cat([action, reason], dim=1)
             fn = batch.get("file_name", [])
             file_name_list = [str(x) for x in (fn if not isinstance(fn, str) else [fn])]
-            evidence_prior = evidence_prior_builder(file_name_list, device) if evidence_prior_builder is not None else None
+            evidence_prior = None
+            evidence_prior_stats = {}
+            if evidence_prior_builder is not None:
+                evidence_prior, evidence_prior_stats = evidence_prior_builder(file_name_list, device)
             tokens = extract_tokens(backbone, images, args.n_last_blocks)
             outputs = model(tokens, action_labels=action, reason_labels=reason, evidence_prior=evidence_prior, epoch=epoch)
-            loss, parts = p3le_pair_loss(outputs, action, reason, args)
+            loss, parts, loss_tensors = p3le_pair_loss(outputs, action, reason, args, return_tensors=True)
             if train:
+                shared_params = list(model.shared_parameters_for_budget())
+                pcgrad_projected, pcgrad_stats = compute_pcgrad_lite(
+                    [loss_tensors["action_task_loss"] / float(accum), loss_tensors["reason_task_loss"] / float(accum), loss_tensors["pair_task_loss"] / float(accum)],
+                    shared_params,
+                    retain_graph=True,
+                )
                 (loss / float(accum)).backward()
+                assign_pcgrad_lite(shared_params, pcgrad_projected)
+                parts.update(pcgrad_stats)
                 if ((step + 1) % accum == 0) or ((step + 1) == len(loader)):
                     shared_norm = clip_shared_gradient_budget(model.shared_parameters_for_budget(), args.shared_grad_budget_norm)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -194,6 +260,7 @@ def run_epoch(args, backbone, model, loader, optimizer, scheduler, device, epoch
             total_loss += float(loss.detach().cpu()) * batch_size
             total_count += batch_size
             parts.update({"epoch": epoch, "step": step, "train": bool(train), "lr": current_lr(optimizer), "batch_size": batch_size})
+            parts.update(evidence_prior_stats)
             losses.append(parts)
             if train and step % int(args.log_every) == 0:
                 print(json.dumps({"event": "p3le_pair_batch", **parts}, ensure_ascii=False), flush=True)
@@ -217,13 +284,16 @@ def run_epoch(args, backbone, model, loader, optimizer, scheduler, device, epoch
         for name, (ak, rk) in branch_defs.items():
             branch_metrics[name] = metrics_for(outputs_all[ak], outputs_all[rk], labels_all, args)
         action_guard_applied = False
-        if args.enable_action_guard and branch_metrics["action_specialist"]["Act_mF1"] > branch_metrics["final"]["Act_mF1"] + args.action_guard_min_delta:
-            outputs_all["final_action_logits"] = outputs_all["action_specialist_logits"]
+        pre_guard_final_act = branch_metrics["final"]["Act_mF1"]
+        if args.enable_action_guard and branch_metrics["base"]["Act_mF1"] > branch_metrics["final"]["Act_mF1"] + args.action_guard_min_delta:
+            outputs_all["final_action_logits"] = outputs_all["base_action_logits"]
             branch_metrics["final"] = metrics_for(outputs_all["final_action_logits"], outputs_all["final_reason_logits"], labels_all, args)
             action_guard_applied = True
         branch_metrics["router_guard"] = {
             "action_guard_applied": action_guard_applied,
-            "guard_source": "action_specialist" if action_guard_applied else "router_final",
+            "guard_source": "base_action_logits" if action_guard_applied else "router_final",
+            "base_Act_mF1": branch_metrics["base"]["Act_mF1"],
+            "pre_guard_final_Act_mF1": pre_guard_final_act,
         }
         metrics = branch_metrics["final"]
     return {
@@ -258,13 +328,18 @@ def save_epoch(args, out_dir: Path, epoch: int, train_stats: dict[str, Any], tes
     write_json(epoch_dir / "tail_group_metrics.json", tail)
     loss_summary = summarize_scalar_rows(train_stats["loss_rows"])
     write_json(epoch_dir / "pair_tensor_stats.json", {k: loss_summary.get(k, 0.0) for k in ["pair_tensor_mean", "pair_tensor_std", "pair_seed_loss", "pair_consistency_loss"]})
+    write_json(epoch_dir / "pair_sparse_stats.json", {k: loss_summary.get(k, 0.0) for k in ["pair_sparse_action_topk", "pair_sparse_reason_topk", "pair_sparse_action_weight_mean", "pair_sparse_reason_weight_mean"]})
     write_json(epoch_dir / "reason_reliability_stats.json", {k: loss_summary.get(k, 0.0) for k in ["q_mean", "q_min", "q_max", "q_entropy"]})
-    write_json(epoch_dir / "evidence_bag_stats.json", {k: loss_summary.get(k, 0.0) for k in ["evidence_bag_loss", "evidence_selected_mean", "evidence_random_mean", "evidence_lambda_active"]})
+    write_json(epoch_dir / "evidence_bag_stats.json", {k: loss_summary.get(k, 0.0) for k in ["evidence_bag_loss", "evidence_selected_mean", "evidence_random_mean", "evidence_lambda_active", "bdd100k_prior_positive_rate"]})
+    write_json(epoch_dir / "bdd100k_prior_group_stats.json", {k: v for k, v in loss_summary.items() if k.startswith("bdd100k_prior_")})
     write_json(epoch_dir / "selected_vs_random_evidence_stats.json", {k: loss_summary.get(k, 0.0) for k in ["evidence_selected_mean", "evidence_random_mean", "evidence_lambda_active", "bdd100k_prior_positive_rate"]})
     router_stats = {k: loss_summary.get(k, 0.0) for k in ["router_scale", "action_gate_mean", "reason_gate_mean", "pareto_action_loss", "pareto_reason_loss"]}
     router_stats.update(branch_metrics.get("router_guard", {}))
     write_json(epoch_dir / "router_stats.json", router_stats)
-    write_json(epoch_dir / "action_set_stats.json", {k: loss_summary.get(k, 0.0) for k in ["action_set_loss"]})
+    write_json(epoch_dir / "route_anchor_stats.json", branch_metrics.get("router_guard", {}))
+    write_json(epoch_dir / "router_gate_entropy.json", {k: loss_summary.get(k, 0.0) for k in ["action_gate_entropy", "reason_gate_entropy", "gate_entropy"]})
+    write_json(epoch_dir / "grad_conflict_stats.json", {k: loss_summary.get(k, 0.0) for k in ["pcgrad_task_count", "pcgrad_conflict_count", "pcgrad_mean_dot_before", "pcgrad_grad_norm_before", "pcgrad_grad_norm_after", "shared_grad_norm_before_budget"]})
+    write_json(epoch_dir / "action_set_stats.json", {k: loss_summary.get(k, 0.0) for k in ["action_set_loss", "action_prototype_usage_max", "action_prototype_usage_entropy"]})
     (epoch_dir / "failure_cases.jsonl").write_text("", encoding="utf-8")
     visual_dir = epoch_dir / "visual_samples"
     visual_dir.mkdir(exist_ok=True)
@@ -275,8 +350,10 @@ def save_epoch(args, out_dir: Path, epoch: int, train_stats: dict[str, Any], tes
         ("router_stats.jsonl", {"epoch": epoch, **(json.loads((epoch_dir / "router_stats.json").read_text(encoding="utf-8")))}),
         ("tail_metrics.jsonl", {"epoch": epoch, **tail}),
         ("pair_stats.jsonl", {"epoch": epoch, **(json.loads((epoch_dir / "pair_tensor_stats.json").read_text(encoding="utf-8")))}),
+        ("pair_sparse_stats.jsonl", {"epoch": epoch, **(json.loads((epoch_dir / "pair_sparse_stats.json").read_text(encoding="utf-8")))}),
         ("reliability_stats.jsonl", {"epoch": epoch, **(json.loads((epoch_dir / "reason_reliability_stats.json").read_text(encoding="utf-8")))}),
         ("selected_vs_random_evidence.jsonl", {"epoch": epoch, **(json.loads((epoch_dir / "selected_vs_random_evidence_stats.json").read_text(encoding="utf-8")))}),
+        ("grad_conflict_stats.jsonl", {"epoch": epoch, **(json.loads((epoch_dir / "grad_conflict_stats.json").read_text(encoding="utf-8")))}),
     ]:
         append_jsonl(out_dir / name, data)
     write_json(epoch_dir / "run_manifest.json", manifest)
@@ -416,9 +493,26 @@ def main() -> None:
     manifest = build_manifest(args, out_dir, len(train_loader.dataset), len(test_loader.dataset))
     write_json(out_dir / "run_manifest.json", manifest)
     best_score = -1.0
+    action_guard_streak = 0
     for epoch in range(args.epochs):
         train_stats = run_epoch(args, backbone, model, train_loader, optimizer, scheduler, device, epoch, True)
         test_stats = run_epoch(args, backbone, model, test_loader, optimizer, scheduler, device, epoch, False)
+        guard_info = test_stats.get("branch_metrics", {}).get("router_guard", {})
+        if epoch >= 21 and guard_info.get("action_guard_applied", False):
+            action_guard_streak += 1
+        else:
+            action_guard_streak = 0
+        router_decay_event = None
+        if action_guard_streak >= 2:
+            model.action_router_runtime_multiplier = max(0.125, float(model.action_router_runtime_multiplier) * 0.5)
+            router_decay_event = {
+                "event": "action_router_scale_decay",
+                "epoch": epoch,
+                "action_router_runtime_multiplier": float(model.action_router_runtime_multiplier),
+                "reason": "final_action_underperformed_base_action_for_2_epochs",
+            }
+            append_jsonl(out_dir / "router_decay_events.jsonl", router_decay_event)
+            action_guard_streak = 0
         scheduler.step()
         row = {
             "epoch": epoch,
@@ -429,6 +523,8 @@ def main() -> None:
             "branch_metrics": test_stats["branch_metrics"],
             "lr": current_lr(optimizer),
             "best_selection_split": "test",
+            "action_router_runtime_multiplier": float(model.action_router_runtime_multiplier),
+            "router_decay_event": router_decay_event,
         }
         append_jsonl(out_dir / "metrics_summary.jsonl", row)
         write_json(out_dir / "metrics_summary.json", row)

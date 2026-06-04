@@ -61,6 +61,7 @@ def check_static() -> list[str]:
         "fate_oia/models/p3le_shared_encoder.py",
         "fate_oia/models/p3le_progressive_experts.py",
         "fate_oia/models/p3le_pair_head.py",
+        "fate_oia/models/p3le_pair_sparse_context.py",
         "fate_oia/models/p3le_reason_reliability.py",
         "fate_oia/models/p3le_action_set_head.py",
         "fate_oia/models/p3le_router.py",
@@ -68,6 +69,7 @@ def check_static() -> list[str]:
         "fate_oia/models/p3le_evidence_bag.py",
         "fate_oia/losses/p3le_pair_losses.py",
         "fate_oia/losses/cagrad_lite.py",
+        "fate_oia/losses/pcgrad_lite.py",
         "fate_oia/engine/train_p3le_pair_oia.py",
         "fate_oia/engine/supervise_p3le_pair_oia_foreground.py",
     ]
@@ -77,9 +79,12 @@ def check_static() -> list[str]:
     model_src = read_rel("fate_oia/models/p3le_pair_oia_model.py")
     expert_src = read_rel("fate_oia/models/p3le_progressive_experts.py")
     pair_src = read_rel("fate_oia/models/p3le_pair_head.py")
+    pair_sparse_src = read_rel("fate_oia/models/p3le_pair_sparse_context.py")
     loss_src = read_rel("fate_oia/losses/p3le_pair_losses.py")
+    pcgrad_src = read_rel("fate_oia/losses/pcgrad_lite.py")
     evidence_src = read_rel("fate_oia/models/p3le_evidence_bag.py")
     router_src = read_rel("fate_oia/models/p3le_router.py")
+    action_set_src = read_rel("fate_oia/models/p3le_action_set_head.py")
     train_src = read_rel("fate_oia/engine/train_p3le_pair_oia.py")
     for token in ["action_visual_logits", "reason_to_action_logits", "action_fused_logits", "reason_logits"]:
         if token not in read_rel("fate_oia/models/p3le_shared_encoder.py"):
@@ -89,20 +94,34 @@ def check_static() -> list[str]:
             failures.append(f"PLE expert missing: {token}")
     if "pair_tensor" not in pair_src or "action_dim" not in pair_src or "reason_dim" not in pair_src:
         failures.append("pair tensor head implementation is incomplete")
+    if "action_sparse_context" not in pair_src or "reason_sparse_context" not in pair_src or "SparseRegionAttention" not in pair_sparse_src:
+        failures.append("pair head must consume sparse visual context through PairSparseContext")
     if "positive action x positive reason" not in pair_src:
         failures.append("pair seed code must document that it does not hard-label all positive action x reason pairs")
     if "reason_reliability" not in model_src or "q.detach()" not in loss_src:
         failures.append("q_r reliability must exist and weight reason supervision")
+    if "pair_targets = pair_targets * q_pair" not in loss_src:
+        failures.append("pair seed loss must be reliability-masked")
     if "never modifies action logits" not in evidence_src or "evidence_lambda_active" not in evidence_src:
         failures.append("evidence bag must be weak and selected<=random-gated")
     if "BDD100KGroundingIndex" not in train_src or "use_bdd100k_evidence_prior" not in train_src:
         failures.append("BDD100K weak evidence prior must be wired into training")
-    if "a_action +" not in router_src or "action_residual_cap" not in router_src:
-        failures.append("Router_A must anchor on A_action with bounded residual")
-    if "action_guard_applied" not in train_src or "enable_action_guard" not in train_src:
-        failures.append("Router_A test-selection guard must be wired")
+    if "base_action +" not in router_src or "action_residual_cap" not in router_src:
+        failures.append("Router_A must anchor on base_action with bounded residual")
+    if "base_reason +" not in router_src:
+        failures.append("Router_R must anchor on base_reason")
+    if "branch_metrics[\"base\"][\"Act_mF1\"]" not in train_src or "base_action_logits" not in train_src:
+        failures.append("Router_A test-selection guard must compare base action against final action")
+    if "compute_pcgrad_lite" not in train_src or "assign_pcgrad_lite" not in train_src or "torch.autograd.grad" not in pcgrad_src:
+        failures.append("PCGrad-lite conflict-aware shared gradient update must be wired")
+    if "register_buffer(\"prototype_vectors\"" not in action_set_src:
+        failures.append("Action-set prototypes must be dataset-prior buffers, not random parameters")
+    if "left_related" not in train_src or "right_related" not in train_src or "turn_related" not in train_src:
+        failures.append("Evidence prior builder must expose directional group stats")
+    if "gate_entropy" not in router_src or "temperature_action" not in router_src:
+        failures.append("Router gate temperature and entropy diagnostics must exist")
     if "clip_shared_gradient_budget" not in train_src:
-        failures.append("gradient-budget fallback must be wired in training")
+        failures.append("gradient-budget fallback must remain after PCGrad-lite")
     if "make_loader(args, \"test\"" not in train_src:
         failures.append("test-only loader must be wired")
     for forbidden in ["resume_checkpoint", "registry_config", "logits_action_", "logits_reason_", "feature_cache=True"]:
@@ -152,6 +171,7 @@ def check_compile_and_tests(output_dir: Path) -> list[str]:
         "fate_oia/models/p3le_shared_encoder.py",
         "fate_oia/models/p3le_progressive_experts.py",
         "fate_oia/models/p3le_pair_head.py",
+        "fate_oia/models/p3le_pair_sparse_context.py",
         "fate_oia/models/p3le_reason_reliability.py",
         "fate_oia/models/p3le_action_set_head.py",
         "fate_oia/models/p3le_router.py",
@@ -159,6 +179,7 @@ def check_compile_and_tests(output_dir: Path) -> list[str]:
         "fate_oia/models/p3le_evidence_bag.py",
         "fate_oia/losses/p3le_pair_losses.py",
         "fate_oia/losses/cagrad_lite.py",
+        "fate_oia/losses/pcgrad_lite.py",
         "fate_oia/engine/train_p3le_pair_oia.py",
         "fate_oia/engine/audit_p3le_pair_oia_implementation.py",
         "fate_oia/engine/supervise_p3le_pair_oia_foreground.py",
@@ -223,6 +244,11 @@ def run_smoke(config: Path, output_dir: Path, device: str) -> list[str]:
         "metrics_summary.jsonl",
         "epoch_000/branch_metrics.json",
         "epoch_000/pair_tensor_stats.json",
+        "epoch_000/pair_sparse_stats.json",
+        "epoch_000/grad_conflict_stats.json",
+        "epoch_000/route_anchor_stats.json",
+        "epoch_000/router_gate_entropy.json",
+        "epoch_000/bdd100k_prior_group_stats.json",
         "epoch_000/reason_reliability_stats.json",
         "epoch_000/evidence_bag_stats.json",
         "epoch_000/router_stats.json",

@@ -5,6 +5,8 @@ from collections.abc import Iterable
 
 import torch
 
+from fate_oia.losses.pcgrad_lite import apply_pcgrad_lite, assign_pcgrad_lite, compute_pcgrad_lite
+
 
 def clip_shared_gradient_budget(parameters: Iterable[torch.nn.Parameter], max_norm: float = 1.0) -> float:
     params = [p for p in parameters if p.grad is not None]

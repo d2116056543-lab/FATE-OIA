@@ -1,6 +1,7 @@
 import torch
 
 from fate_oia.losses.p3le_pair_losses import p3le_pair_loss
+from fate_oia.losses.pcgrad_lite import compute_pcgrad_lite
 from fate_oia.models.p3le_pair_oia_model import P3LEPairOIAFeatureModel
 
 
@@ -31,10 +32,22 @@ def test_pair_loss_has_gradients_and_q_weighted_reason_terms():
     prior = torch.zeros(2, 21)
     prior[:, [5, 6, 9]] = 1.0
     out = model(torch.randn(2, 17, 32), action, reason, evidence_prior=prior, epoch=12)
-    loss, parts = p3le_pair_loss(out, action, reason, Args())
+    loss, parts, tensors = p3le_pair_loss(out, action, reason, Args(), return_tensors=True)
     loss.backward()
     assert float(loss.detach()) > 0
     assert "pair_seed_loss" in parts
     assert "q_mean" in parts
     assert "bdd100k_prior_positive_rate" in parts
+    assert "pair_stage_active" in parts
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.router.parameters())
+
+
+def test_pcgrad_lite_computes_conflict_stats():
+    linear = torch.nn.Linear(3, 1)
+    x = torch.randn(4, 3)
+    y1 = linear(x).mean()
+    y2 = -linear(x).mean()
+    projected, stats = compute_pcgrad_lite([y1, y2], linear.parameters(), retain_graph=True)
+    assert projected
+    assert stats["pcgrad_task_count"] == 2.0
+    assert "pcgrad_conflict_count" in stats

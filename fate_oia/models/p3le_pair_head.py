@@ -19,7 +19,18 @@ class PairAwareTensorHead(nn.Module):
         self.action_support = nn.Linear(action_dim, action_dim)
         self.reason_support = nn.Linear(reason_dim, reason_dim)
 
-    def forward(self, action_tokens: torch.Tensor, reason_tokens: torch.Tensor, shared_context: torch.Tensor) -> dict[str, torch.Tensor]:
+    def forward(
+        self,
+        action_tokens: torch.Tensor,
+        reason_tokens: torch.Tensor,
+        shared_context: torch.Tensor,
+        action_sparse_context: torch.Tensor | None = None,
+        reason_sparse_context: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        if action_sparse_context is not None:
+            action_tokens = action_tokens + action_sparse_context
+        if reason_sparse_context is not None:
+            reason_tokens = reason_tokens + reason_sparse_context
         a = self.action_proj(action_tokens)
         r = self.reason_proj(reason_tokens)
         c = self.context_proj(shared_context).unsqueeze(1).unsqueeze(2)

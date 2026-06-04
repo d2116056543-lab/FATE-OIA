@@ -25,3 +25,14 @@ def test_train_script_uses_test_loader_not_val_loader():
     assert "feature_cache=True" not in src
     assert "BDD100KWeakEvidencePriorBuilder" in src
     assert "action_guard_applied" in src
+    assert 'branch_metrics["base"]["Act_mF1"]' in src
+    assert "compute_pcgrad_lite" in src
+    assert "pair_sparse_stats.json" in src
+    assert "router_gate_entropy.json" in src
+    assert "grad_conflict_stats.json" in src
+
+
+def test_action_set_uses_dataset_prior_buffer():
+    src = Path("fate_oia/models/p3le_action_set_head.py").read_text(encoding="utf-8")
+    assert 'register_buffer("prototype_vectors"' in src
+    assert "nn.Parameter(torch.randn" not in src

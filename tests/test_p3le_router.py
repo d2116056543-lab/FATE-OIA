@@ -12,10 +12,14 @@ def test_router_anchors_action_with_bounded_residual():
         torch.randn(2, 4),
         torch.randn(2, 21),
         torch.randn(2, 4),
+        torch.randn(2, 21),
+        torch.randn(2, 4),
         torch.rand(2, 21),
         torch.randn(2, 32),
-        router_scale=1.0,
+        action_router_scale=1.0,
+        reason_router_scale=1.0,
     )
     delta = (out["final_action_logits"] - a_action).abs().max()
     assert float(delta) <= 0.041
     assert tuple(out["final_reason_logits"].shape) == (2, 21)
+    assert "gate_entropy" in out

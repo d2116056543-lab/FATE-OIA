@@ -1,6 +1,7 @@
 import torch
 
 from fate_oia.models.p3le_pair_head import PairAwareTensorHead, build_pair_seed_targets
+from fate_oia.models.p3le_pair_sparse_context import PairSparseContext
 
 
 def test_pair_tensor_shape_and_low_risk_seed_targets():
@@ -13,3 +14,20 @@ def test_pair_tensor_shape_and_low_risk_seed_targets():
     targets = build_pair_seed_targets(action, reason)
     assert targets.sum() > 0
     assert targets.sum() < float(action.sum() * reason.sum())
+
+
+def test_pair_sparse_context_feeds_pair_head():
+    action_tokens = torch.randn(2, 4, 32)
+    reason_tokens = torch.randn(2, 21, 32)
+    tokens = torch.randn(2, 17, 32)
+    sparse = PairSparseContext(dim=32, topk=5)(action_tokens, reason_tokens, tokens)
+    head = PairAwareTensorHead(dim=32, action_dim=4, reason_dim=21, rank=8)
+    out = head(
+        action_tokens,
+        reason_tokens,
+        torch.randn(2, 32),
+        action_sparse_context=sparse["action_sparse_context"],
+        reason_sparse_context=sparse["reason_sparse_context"],
+    )
+    assert tuple(out["pair_tensor"].shape) == (2, 4, 21)
+    assert tuple(sparse["action_sparse_indices"].shape) == (2, 4, 5)

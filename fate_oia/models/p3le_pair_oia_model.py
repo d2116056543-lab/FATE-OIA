@@ -6,6 +6,7 @@ from torch import nn
 from fate_oia.models.p3le_action_set_head import ActionSetHead
 from fate_oia.models.p3le_evidence_bag import WeakEvidenceBagRegularizer
 from fate_oia.models.p3le_pair_head import PairAwareTensorHead
+from fate_oia.models.p3le_pair_sparse_context import PairSparseContext
 from fate_oia.models.p3le_progressive_experts import ProgressiveLayeredExperts
 from fate_oia.models.p3le_reason_reliability import ReasonReliabilityHead
 from fate_oia.models.p3le_router import ParetoSafeRouter
@@ -30,16 +31,21 @@ class P3LEPairOIAFeatureModel(nn.Module):
         self.reason_head = nn.Linear(dim, 1)
         self.action_aux_reason = nn.Linear(dim, 1)
         self.reason_aux_action = nn.Linear(dim, 1)
+        self.pair_sparse_context = PairSparseContext(dim, topk=64)
         self.pair_head = PairAwareTensorHead(dim, action_dim, reason_dim, rank=32)
         self.action_set_head = ActionSetHead(dim, action_dim, num_prototypes=8)
         self.evidence_bag = WeakEvidenceBagRegularizer(dim, reason_dim)
         self.reliability = ReasonReliabilityHead(dim, reason_dim, tail_indices=tail_indices)
         self.router = ParetoSafeRouter(dim, action_dim, reason_dim, action_residual_cap=action_residual_cap)
+        self.action_router_runtime_multiplier = 1.0
 
-    def router_scale_for_epoch(self, epoch: int, router_start_epoch: int = 11, router_warmup_epochs: int = 5) -> float:
+    def router_scales_for_epoch(self, epoch: int, router_start_epoch: int = 11, router_warmup_epochs: int = 5) -> tuple[float, float]:
+        if epoch < 5:
+            return 0.0, 0.0
         if epoch < router_start_epoch:
-            return 0.0 if epoch < 5 else 0.5
-        return min(1.0, (epoch - router_start_epoch + 1) / max(1, router_warmup_epochs))
+            return 0.0, 0.5
+        scale = min(1.0, (epoch - router_start_epoch + 1) / max(1, router_warmup_epochs))
+        return scale * float(self.action_router_runtime_multiplier), scale
 
     def shared_parameters_for_budget(self):
         yield from self.shared_encoder.parameters()
@@ -63,7 +69,14 @@ class P3LEPairOIAFeatureModel(nn.Module):
         r_reason = self.reason_head(r_tokens).squeeze(-1)
         a_reason_aux = self.action_aux_reason(r_tokens).squeeze(-1)
         r_action_aux = self.reason_aux_action(a_tokens).squeeze(-1)
-        pair = self.pair_head(a_tokens, r_tokens, base["shared_context"])
+        pair_sparse = self.pair_sparse_context(a_tokens, r_tokens, tokens)
+        pair = self.pair_head(
+            a_tokens,
+            r_tokens,
+            base["shared_context"],
+            action_sparse_context=pair_sparse["action_sparse_context"],
+            reason_sparse_context=pair_sparse["reason_sparse_context"],
+        )
         action_set = self.action_set_head(a_tokens)
         evidence = self.evidence_bag(tokens, r_tokens, reason_labels, evidence_prior=evidence_prior)
         action_agreement = torch.sigmoid(a_action).detach()
@@ -76,7 +89,10 @@ class P3LEPairOIAFeatureModel(nn.Module):
             epoch=epoch,
             warmup_epochs=5,
         )
+        action_router_scale, reason_router_scale = self.router_scales_for_epoch(epoch)
         router = self.router(
+            base["action_fused_logits"],
+            base["reason_logits"],
             a_action,
             r_reason,
             pair["pair_action_support"],
@@ -84,11 +100,13 @@ class P3LEPairOIAFeatureModel(nn.Module):
             action_set["action_set_logits"],
             reliability["reason_reliability"],
             base["shared_context"],
-            self.router_scale_for_epoch(epoch),
+            action_router_scale,
+            reason_router_scale,
         )
         return {
             **base,
             **experts,
+            **pair_sparse,
             **pair,
             **action_set,
             **evidence,
@@ -102,5 +120,6 @@ class P3LEPairOIAFeatureModel(nn.Module):
             "r_action_aux_logits": r_action_aux,
             "action_logits": router["final_action_logits"],
             "reason_logits": router["final_reason_logits"],
+            "epoch_tensor": tokens.new_tensor(float(epoch)),
             "single_model_p3le_pair": tokens.new_tensor(1.0),
         }
