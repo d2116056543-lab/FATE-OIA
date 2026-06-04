@@ -1,0 +1,62 @@
+model:
+  method: p3le_pair_oia_v1
+  arch: vit_small
+  patch_size: 8
+  n_last_blocks: 1
+  action_dim: 4
+  reason_dim: 21
+  action_residual_cap: 0.04
+  tail_indices: [5, 6, 9, 10, 11, 12, 13, 14]
+
+data:
+  data_root: E:/sbw/BDD-OIA
+  raw_root: E:/sbw/BDD-OIA
+  bdd100k_root: E:/sbw/BDD100K
+  pretrained_weights: E:/sbw/SNNA_repro/SNNA/ckp/reference/dino_deitsmall8_pretrain.pth
+  checkpoint_key: teacher
+  image_height: 360
+  image_width: 640
+  preserve_aspect_ratio: true
+  feature_cache: false
+  token_compression: none
+
+training:
+  epochs: 28
+  batch_size: 4
+  gradient_accumulation_steps: 8
+  num_workers: 4
+  lr: 0.0003
+  shared_lr: 0.0002
+  router_lr: 0.0002
+  min_lr: 0.00001
+  warmup_epochs: 2
+  weight_decay: 0.05
+  router_weight_decay: 0.01
+  grad_clip: 1.0
+  shared_grad_budget_norm: 1.0
+  log_every: 120
+
+loss:
+  asl_gamma_pos: 0.0
+  asl_gamma_neg: 4.0
+  asl_clip: 0.05
+  loss_action_gt: 1.0
+  loss_reason_gt: 1.0
+  loss_a_action: 0.5
+  loss_r_reason: 0.5
+  loss_a_reason: 0.05
+  loss_r_action: 0.0
+  loss_action_set: 0.1
+  loss_pair_seed: 0.05
+  loss_pair_consistency: 0.02
+  loss_evidence_bag: 0.01
+  loss_q_entropy: 0.001
+  loss_pareto: 0.1
+  pareto_margin_action: 0.005
+  pareto_margin_reason: 0.005
+
+evaluation:
+  test_only_evaluation: true
+  best_selection_split: test
+  best_selection_metric: joint_test_score
+  eval_threshold: 0.5
