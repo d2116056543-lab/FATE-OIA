@@ -13,6 +13,7 @@ from fate_oia.models.ceai_pair_sparse_attention import TaskGuidedPairSparseAtten
 from fate_oia.models.ceai_router import ParetoSafeRouter
 from fate_oia.models.ceai_scene_state import SceneStatePrototypeTransformer
 from fate_oia.models.fate_oia_model import FATEOIAFeatureModel
+from fate_oia.utils.ceai_readiness import default_readiness_state
 
 
 class CEAIOIAFeatureModel(nn.Module):
@@ -62,10 +63,12 @@ class CEAIOIAFeatureModel(nn.Module):
     def _readiness(self, pair_attn: dict[str, Any], rel: dict[str, Any], readiness_state: dict[str, Any] | None) -> dict[str, Any]:
         if readiness_state is not None:
             return readiness_state
+        state = default_readiness_state()
         concentration = pair_attn["attention_concentration"].detach().mean()
         q_std = rel["pair_reliability"].detach().std(unbiased=False)
-        r2a_active = bool(concentration >= 0.08 and q_std >= 0.015)
-        return {"r2a_active": r2a_active, "pair_attention_concentration": float(concentration.cpu()), "q_ar_std": float(q_std.cpu())}
+        state["pair_attention_concentration"] = float(concentration.cpu())
+        state["q_ar_std"] = float(q_std.cpu())
+        return state
 
     def forward(self, tokens: torch.Tensor, bdd100k_scene_state: dict[str, torch.Tensor] | None = None, labels: dict[str, torch.Tensor] | None = None, readiness_state: dict[str, Any] | None = None) -> dict[str, Any]:
         base = self.base_model(tokens)

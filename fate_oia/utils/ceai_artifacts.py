@@ -36,3 +36,37 @@ def write_jsonl(path: str | Path, rows: list[Any]) -> None:
     with path.open("w", encoding="utf-8") as f:
         for row in rows:
             f.write(json.dumps(json_safe(row), ensure_ascii=False) + "\n")
+
+
+def make_selected_vs_random_evidence_stats(
+    selected_mean: float | None,
+    random_mean: float | None,
+    *,
+    computed: bool,
+    margin: float = 0.01,
+) -> dict[str, Any]:
+    if not computed:
+        return {
+            "available": False,
+            "reason": "not_computed_in_ceai_v1_1",
+            "evidence_gate_active": False,
+            "selected_mean": None,
+            "random_mean": None,
+        }
+    if selected_mean == 0.0 and random_mean == 0.0:
+        return {
+            "available": False,
+            "reason": "degenerate_zero_zero_not_evidence",
+            "evidence_gate_active": False,
+            "selected_mean": None,
+            "random_mean": None,
+        }
+    selected = float(selected_mean)
+    random = float(random_mean)
+    return {
+        "available": True,
+        "metric_type": "scene_state_proxy_not_deletion",
+        "selected_mean": selected,
+        "random_mean": random,
+        "evidence_gate_active": bool(selected > random + float(margin)),
+    }

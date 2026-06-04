@@ -144,9 +144,9 @@ def main() -> None:
     ap.add_argument("--test_only", action="store_true")
     ap.add_argument("--goal_mode", action="store_true")
     args = ap.parse_args()
-    preflight = Path(".background_runs/ceai_oia_v1_preflight")
-    smoke = Path(".background_runs/ceai_oia_v1_smoke")
-    full = Path(".background_runs/ceai_oia_v1_full_32")
+    preflight = Path(".background_runs/ceai_oia_v1_1_preflight")
+    smoke = Path(".background_runs/ceai_oia_v1_1_smoke")
+    full = Path(".background_runs/ceai_oia_v1_1_full_32")
     preflight.mkdir(parents=True, exist_ok=True)
     decisions = preflight / "supervisor_decisions.jsonl"
     append_event(
@@ -227,11 +227,11 @@ def main() -> None:
         decisions,
         tag="audit",
     )
-    pass_file = preflight / "REVIEW_PASS_CEAI_OIA_V1.txt"
+    pass_file = preflight / "REVIEW_PASS_CEAI_OIA_V1_1.txt"
     if args.require_review_pass and not pass_file.exists():
-        raise RuntimeError("REVIEW_PASS_CEAI_OIA_V1.txt missing; refusing full training")
+        raise RuntimeError("REVIEW_PASS_CEAI_OIA_V1_1.txt missing; refusing full training")
     completed_dir = run_full_with_oom_fallbacks(py, args, decisions, full)
-    (completed_dir / "GOAL_COMPLETED_CEAI_OIA_V1.json").write_text(
+    (completed_dir / "GOAL_COMPLETED_CEAI_OIA_V1_1.json").write_text(
         json.dumps({"status": "complete", "epochs": args.epochs, "output_dir": str(completed_dir)}, indent=2),
         encoding="utf-8",
     )

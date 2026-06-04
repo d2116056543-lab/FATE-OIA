@@ -42,19 +42,22 @@ class ParetoSafeRouter(nn.Module):
         pair_action = (pair_support * pair_reliability).mean(dim=2)
         action_aux = action_set_logits if action_set_logits is not None else action_specialist_logits
         action_gate = self.action_gate(torch.cat([base_action_logits, action_aux, rel_a.mean(dim=1, keepdim=True), rel_a.std(dim=1, keepdim=True)], dim=-1))
-        if bool(readiness.get("r2a_active", False)):
-            action_delta = self.action_cap * torch.tanh(action_gate * (0.5 * (action_aux - base_action_logits) + 0.5 * pair_action))
+        action_scale = float(readiness.get("router_action_scale", 0.0))
+        if bool(readiness.get("r2a_active", False)) and action_scale > 0.0:
+            action_delta = action_scale * self.action_cap * torch.tanh(action_gate * (0.5 * (action_aux - base_action_logits) + 0.5 * pair_action))
         else:
             action_delta = base_action_logits.new_zeros(base_action_logits.shape)
-        # Required anchor: final action is always base_action_logits + action_delta.
         final_action_logits = base_action_logits + action_delta
 
         q_r = reason_reliability if reason_reliability is not None else pair_reliability.max(dim=1).values
         reason_pair = (pair_support * pair_reliability).mean(dim=1)
         reason_gate = self.reason_gate(torch.cat([base_reason_logits, reason_specialist_logits, q_r], dim=-1))
-        raw_reason_delta = reason_gate * (reason_specialist_logits - base_reason_logits + reason_pair)
-        if tail_delta is not None:
-            raw_reason_delta = raw_reason_delta + q_r * tail_delta
+        if bool(readiness.get("router_reason_active", True)):
+            raw_reason_delta = reason_gate * (reason_specialist_logits - base_reason_logits + reason_pair)
+            if tail_delta is not None:
+                raw_reason_delta = raw_reason_delta + q_r * tail_delta
+        else:
+            raw_reason_delta = torch.zeros_like(base_reason_logits)
         cap = torch.full_like(raw_reason_delta, self.reason_cap)
         for idx in self.tail_indices:
             if 0 <= idx < cap.shape[1]:
@@ -67,6 +70,7 @@ class ParetoSafeRouter(nn.Module):
             "action_delta_abs_max": float(action_delta.detach().abs().max().cpu()),
             "reason_delta_abs_max": float(reason_delta.detach().abs().max().cpu()),
             "readiness_r2a": float(1.0 if bool(readiness.get("r2a_active", False)) else 0.0),
+            "router_action_scale": float(action_scale),
             "guarded_action_branch": "final",
         }
         return {

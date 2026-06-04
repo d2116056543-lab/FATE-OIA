@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import socket
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -14,13 +15,14 @@ from torch.utils.data import DataLoader, Subset
 import utils
 import vision_transformer as vits
 from fate_oia.datasets.bdd_oia_multitask import BDDOIAMultiTaskDataset
-from fate_oia.datasets.bdd100k_scene_state import BDD100KSceneStateIndex
+from fate_oia.datasets.bdd100k_scene_state import BDD100KSceneStateIndex, SCENE_STATE_NAMES
 from fate_oia.engine.eval_snna25 import evaluate_snna25
 from fate_oia.losses.ceai_losses import ceai_main_loss, ceai_regularizer_losses, compute_total_loss_with_gradient_budget
 from fate_oia.losses.pcgrad_lite import apply_pcgrad_lite
 from fate_oia.models.ceai_oia_model import CEAIOIAFeatureModel
 from fate_oia.transforms import AspectRatioLetterboxTransform
-from fate_oia.utils.ceai_artifacts import write_json, write_jsonl, json_safe
+from fate_oia.utils.ceai_artifacts import make_selected_vs_random_evidence_stats, write_json, write_jsonl, json_safe
+from fate_oia.utils.ceai_readiness import compute_trainer_readiness_state, default_readiness_state
 
 
 def load_config_flat(path: str | Path) -> dict[str, Any]:
@@ -39,14 +41,6 @@ def load_config_flat(path: str | Path) -> dict[str, Any]:
             else:
                 flat[k] = v
     return flat
-
-
-def apply_config(args: argparse.Namespace) -> argparse.Namespace:
-    cfg = load_config_flat(args.config) if args.config else {}
-    for k, v in cfg.items():
-        if hasattr(args, k) and getattr(args, k) == parser_defaults().get(k):
-            setattr(args, k, v)
-    return args
 
 
 def parser_defaults() -> dict[str, Any]:
@@ -144,12 +138,54 @@ def set_lrs(optimizer: torch.optim.Optimizer, args, epoch: int) -> float:
     return float(optimizer.param_groups[0]["lr"])
 
 
-def scene_targets_for(index: BDD100KSceneStateIndex, batch: dict[str, Any], device: torch.device) -> dict[str, torch.Tensor]:
+def scene_targets_for(index: BDD100KSceneStateIndex, batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
     fns = [str(x) for x in batch["file_name"]]
     return index.batch_targets(fns, device=device)
 
 
-def run_epoch(args, backbone, model, loader, optimizer, device, epoch: int, train: bool, scene_index: BDD100KSceneStateIndex) -> dict[str, Any]:
+def _mean(rows: list[dict[str, Any]], key: str, default: float = 0.0) -> float:
+    vals = [float(r.get(key, default)) for r in rows if key in r]
+    return sum(vals) / max(len(vals), 1)
+
+
+def _scene_proxy_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
+    counts: dict[str, float] = {}
+    missing = 0
+    weak_drivable = 0
+    for row in records:
+        missing += int(bool(row.get("missing", False)))
+        for k, v in (row.get("counts") or {}).items():
+            counts[k] = counts.get(k, 0.0) + float(v)
+        q = row.get("proxy_quality") or {}
+        weak_drivable += int(q.get("direct_drivable_proxy") == "weak_drivable_map_presence")
+    n = max(len(records), 1)
+    return {
+        "available": True,
+        "scene_state_names": SCENE_STATE_NAMES,
+        "record_count": len(records),
+        "missing_count": missing,
+        "mean_counts": {k: v / n for k, v in counts.items()},
+        "weak_drivable_proxy_count": weak_drivable,
+        "geometry_sources": {
+            "object_geometry": "box2d_center",
+            "lane_geometry": "poly2d_mean_x",
+            "direct_drivable_proxy": "weak_drivable_map_presence_if_map_found",
+        },
+    }
+
+
+def run_epoch(
+    args,
+    backbone,
+    model,
+    loader,
+    optimizer,
+    device,
+    epoch: int,
+    train: bool,
+    scene_index: BDD100KSceneStateIndex,
+    readiness_state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     model.train(train)
     losses = []
     rows = []
@@ -162,40 +198,69 @@ def run_epoch(args, backbone, model, loader, optimizer, device, epoch: int, trai
     labels_all = []
     file_names: list[str] = []
     diag_acc: dict[str, list[float]] = {}
+    scene_records: list[dict[str, Any]] = []
     if train:
         optimizer.zero_grad(set_to_none=True)
+    shared_params = model.shared_parameters_for_pcgrad()
     for step, batch in enumerate(loader):
         images = batch["image"].to(device, non_blocking=True)
         labels = labels_from_batch(batch, device)
         with torch.no_grad():
             tokens = extract_tokens(backbone, images, args.n_last_blocks)
         scene_targets = scene_targets_for(scene_index, batch, device)
-        out = model(tokens, bdd100k_scene_state=scene_targets)
+        scene_records.extend(list(scene_targets.get("records", [])))
+        out = model(tokens, bdd100k_scene_state=scene_targets, readiness_state=readiness_state)
         main = ceai_main_loss(out, labels)
         regs = ceai_regularizer_losses(out, labels, scene_targets, config=vars(args))
-        total, stat = compute_total_loss_with_gradient_budget(main, regs, gradient_budget_rho=args.gradient_budget_rho)
+        total, stat = compute_total_loss_with_gradient_budget(
+            main,
+            regs,
+            gradient_budget_rho=args.gradient_budget_rho,
+            shared_params=shared_params if train else None,
+        )
         total_for_backward = total / max(args.gradient_accumulation_steps, 1)
+        pc_stats: dict[str, Any] = {
+            "pcgrad_task_count": 0,
+            "pcgrad_conflict_count": 0,
+            "conflict_count": 0,
+            "projection_applied_count": 0,
+            "pcgrad_mean_dot": 0.0,
+            "grad_accumulation_steps": int(args.gradient_accumulation_steps),
+            "accumulated_microbatches": 1,
+            "overwrote_existing_grad": False,
+        }
         if train:
             total_for_backward.backward(retain_graph=bool(args.pcgrad_enabled))
-            pc_stats = {"pcgrad_task_count": 0, "pcgrad_conflict_count": 0, "pcgrad_mean_dot": 0.0}
             if args.pcgrad_enabled:
-                shared = model.shared_parameters_for_pcgrad()
                 aux_combined = sum(regs.values()) if regs else total.new_zeros(())
-                pc_stats = apply_pcgrad_lite([main["action_main_loss"], main["reason_main_loss"], aux_combined], shared, retain_graph=True)
+                pc_stats = apply_pcgrad_lite(
+                    [main["action_main_loss"], main["reason_main_loss"], aux_combined],
+                    shared_params,
+                    retain_graph=True,
+                    grad_accumulation_steps=args.gradient_accumulation_steps,
+                )
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
-        else:
-            pc_stats = {"pcgrad_task_count": 0, "pcgrad_conflict_count": 0, "pcgrad_mean_dot": 0.0}
         losses.append(float(total.detach().cpu()))
-        row = {**{k: float(v.detach().cpu()) for k, v in main.items()}, **stat, **pc_stats, "epoch": epoch, "step": step, "split": "train" if train else "test", "lr": float(optimizer.param_groups[0]["lr"])}
+        row = {
+            **{k: float(v.detach().cpu()) for k, v in main.items()},
+            **stat,
+            **pc_stats,
+            "epoch": epoch,
+            "step": step,
+            "split": "train" if train else "test",
+            "lr": float(optimizer.param_groups[0]["lr"]),
+        }
         rows.append(row)
         for k, v in out["diagnostics"].items():
             if isinstance(v, dict):
                 for kk, vv in v.items():
                     if isinstance(vv, (float, int, bool)):
                         diag_acc.setdefault(f"{k}.{kk}", []).append(float(vv))
+            elif isinstance(v, (float, int, bool)):
+                diag_acc.setdefault(k, []).append(float(v))
         logits_final_a.append(out["final_action_logits"].detach().cpu())
         logits_final_r.append(out["final_reason_logits"].detach().cpu())
         logits_base_a.append(out["base_action_logits"].detach().cpu())
@@ -206,6 +271,10 @@ def run_epoch(args, backbone, model, loader, optimizer, device, epoch: int, trai
         file_names.extend([str(x) for x in batch["file_name"]])
         if train and args.log_every > 0 and (step + 1) % args.log_every == 0:
             print(json.dumps({"event": "ceai_batch", "epoch": epoch, "batch": step + 1, "loss": losses[-1], "lr": optimizer.param_groups[0]["lr"]}), flush=True)
+    if train and rows and (len(rows) % max(args.gradient_accumulation_steps, 1)) != 0:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
     la = torch.cat(logits_final_a, dim=0) if logits_final_a else torch.empty(0, args.action_dim)
     lr = torch.cat(logits_final_r, dim=0) if logits_final_r else torch.empty(0, args.reason_dim)
     labels = torch.cat(labels_all, dim=0) if labels_all else torch.empty(0, args.action_dim + args.reason_dim)
@@ -223,6 +292,7 @@ def run_epoch(args, backbone, model, loader, optimizer, device, epoch: int, trai
         "metrics": metrics,
         "branch_metrics": branch,
         "diag": diag_mean,
+        "scene_proxy_summary": _scene_proxy_summary(scene_records),
         "logits_action_final": la,
         "logits_reason_final": lr,
         "logits_action_base": torch.cat(logits_base_a) if logits_base_a else torch.empty(0, args.action_dim),
@@ -232,7 +302,31 @@ def run_epoch(args, backbone, model, loader, optimizer, device, epoch: int, trai
     }
 
 
-def write_epoch_artifacts(out_dir: Path, epoch: int, row: dict[str, Any], train_stats: dict[str, Any], test_stats: dict[str, Any], manifest: dict[str, Any]) -> None:
+def _cfg_get(args, key: str, default: Any = None) -> Any:
+    return args.get(key, default) if isinstance(args, dict) else getattr(args, key, default)
+
+def _aggregate_pcgrad(rows: list[dict[str, Any]], args) -> dict[str, Any]:
+    return {
+        "pcgrad_task_count": int(max([r.get("pcgrad_task_count", 0) for r in rows] or [0])),
+        "conflict_count": float(sum(float(r.get("conflict_count", r.get("pcgrad_conflict_count", 0))) for r in rows)),
+        "projection_applied_count": float(sum(float(r.get("projection_applied_count", 0)) for r in rows)),
+        "grad_accumulation_steps": int(_cfg_get(args, "gradient_accumulation_steps", 1)),
+        "accumulated_microbatches": int(len(rows)),
+        "overwrote_existing_grad": bool(any(bool(r.get("overwrote_existing_grad", False)) for r in rows)),
+    }
+
+
+def _aggregate_grad_budget(rows: list[dict[str, Any]], args) -> dict[str, Any]:
+    return {
+        "norm_main": _mean(rows, "norm_main"),
+        "norm_aux": _mean(rows, "norm_aux"),
+        "budget_scale": _mean(rows, "budget_scale"),
+        "rho": float(_cfg_get(args, "gradient_budget_rho", 0.15)),
+        "used_true_grad_norm": bool(all(bool(r.get("used_true_grad_norm", False)) for r in rows if "used_true_grad_norm" in r)),
+    }
+
+
+def write_epoch_artifacts(out_dir: Path, epoch: int, row: dict[str, Any], train_stats: dict[str, Any], test_stats: dict[str, Any], manifest: dict[str, Any], readiness_state: dict[str, Any]) -> None:
     e = out_dir / f"epoch_{epoch:03d}"
     e.mkdir(parents=True, exist_ok=True)
     write_json(e / "metrics_summary.json", row)
@@ -240,8 +334,9 @@ def write_epoch_artifacts(out_dir: Path, epoch: int, row: dict[str, Any], train_
     write_jsonl(e / "loss_components.jsonl", train_stats["loss_components"] + test_stats["loss_components"])
     diag = test_stats["diag"]
     files = {
-        "readiness_stats.json": {"readiness": {k: v for k, v in diag.items() if "readiness" in k or "q_ar_std" in k}},
+        "readiness_stats.json": {"readiness": readiness_state, "diagnostic_means": {k: v for k, v in diag.items() if "readiness" in k or "q_ar" in k or "pair_attention" in k}},
         "scene_state_stats.json": {k: v for k, v in diag.items() if "scene" in k},
+        "scene_state_proxy_stats.json": test_stats["scene_proxy_summary"],
         "implicit_prototype_stats.json": {k: v for k, v in diag.items() if "implicit" in k},
         "action_set_stats.json": {k: v for k, v in diag.items() if "action_set" in k},
         "expert_usage_stats.json": {k: v for k, v in diag.items() if "expert" in k or "token_delta" in k},
@@ -249,9 +344,11 @@ def write_epoch_artifacts(out_dir: Path, epoch: int, row: dict[str, Any], train_
         "pair_attention_stats.json": {k: v for k, v in diag.items() if "pair_attention" in k},
         "pair_reliability_stats.json": {k: v for k, v in diag.items() if "pair_reliability" in k or "q_ar" in k or "q_r" in k},
         "router_stats.json": {k: v for k, v in diag.items() if "router" in k or "delta" in k or "readiness_r2a" in k},
-        "grad_conflict_stats.json": {"pcgrad_conflict_count": sum(x.get("pcgrad_conflict_count", 0) for x in train_stats["loss_components"]), "pcgrad_task_count": 3},
-        "bdd100k_scene_state_stats.json": {"scene_state_valid": True},
-        "selected_vs_random_evidence_stats.json": {"evidence_selected_mean": 0.0, "evidence_random_mean": 0.0, "evidence_gate_active": False},
+        "grad_conflict_stats.json": _aggregate_pcgrad(train_stats["loss_components"], manifest["config_resolved"]),
+        "pcgrad_accum_stats.json": _aggregate_pcgrad(train_stats["loss_components"], manifest["config_resolved"]),
+        "grad_budget_stats.json": _aggregate_grad_budget(train_stats["loss_components"], manifest["config_resolved"]),
+        "bdd100k_scene_state_stats.json": test_stats["scene_proxy_summary"],
+        "selected_vs_random_evidence_stats.json": make_selected_vs_random_evidence_stats(None, None, computed=False),
         "run_manifest_epoch.json": manifest,
     }
     for name, obj in files.items():
@@ -261,7 +358,7 @@ def write_epoch_artifacts(out_dir: Path, epoch: int, row: dict[str, Any], train_
 
 def build_parser() -> argparse.ArgumentParser:
     d = parser_defaults()
-    ap = argparse.ArgumentParser(description="Train CEAI-OIA V1 with direct image DINO tokens and test-only evaluation.")
+    ap = argparse.ArgumentParser(description="Train CEAI-OIA V1.1 with direct image DINO tokens and test-only evaluation.")
     ap.add_argument("--config", required=True)
     ap.add_argument("--output_dir", required=True)
     for k, v in d.items():
@@ -290,12 +387,7 @@ def main() -> None:
     ap = build_parser()
     args = ap.parse_args()
     cfg = load_config_flat(args.config)
-    cli = set()
-    import sys
-
-    for tok in sys.argv[1:]:
-        if tok.startswith("--"):
-            cli.add(tok[2:])
+    cli = {tok[2:] for tok in sys.argv[1:] if tok.startswith("--")}
     for k, v in cfg.items():
         if hasattr(args, k) and k not in cli:
             setattr(args, k, v)
@@ -315,7 +407,7 @@ def main() -> None:
     scene_index = BDD100KSceneStateIndex(args.bdd100k_root)
     manifest = {
         "repo_name": "FATE-OIA",
-        "method": "CEAI-OIA V1",
+        "method": "CEAI-OIA V1.1",
         "hostname": socket.gethostname(),
         "command": " ".join(sys.argv),
         "feature_cache_enabled": False,
@@ -330,20 +422,22 @@ def main() -> None:
     write_json(out_dir / "run_manifest.json", manifest)
     best = -1.0
     history = []
+    readiness_state = default_readiness_state()
+    action_drop_epochs = 0
     for epoch in range(args.epochs):
         lr_now = set_lrs(opt, args, epoch)
-        train_stats = run_epoch(args, backbone, model, train_loader, opt, device, epoch, True, scene_index)
+        train_stats = run_epoch(args, backbone, model, train_loader, opt, device, epoch, True, scene_index, readiness_state=readiness_state)
         with torch.no_grad():
-            test_stats = run_epoch(args, backbone, model, test_loader, opt, device, epoch, False, scene_index)
+            test_stats = run_epoch(args, backbone, model, test_loader, opt, device, epoch, False, scene_index, readiness_state=readiness_state)
         tm = test_stats["metrics"]
         joint = 0.5 * float(tm.get("Act_mF1", 0.0)) + 0.5 * float(tm.get("Exp_mF1", 0.0))
-        row = {"epoch": epoch, "train_loss": train_stats["loss"], "test_loss": test_stats["loss"], "joint_test_score": joint, "test_metrics": tm, "branch_metrics": test_stats["branch_metrics"], "diag": test_stats["diag"], "lr": lr_now}
+        row = {"epoch": epoch, "train_loss": train_stats["loss"], "test_loss": test_stats["loss"], "joint_test_score": joint, "test_metrics": tm, "branch_metrics": test_stats["branch_metrics"], "diag": test_stats["diag"], "readiness_state_used": readiness_state, "lr": lr_now}
         history.append(row)
         with (out_dir / "metrics_summary.jsonl").open("a", encoding="utf-8") as f:
             f.write(json.dumps(json_safe(row), ensure_ascii=False) + "\n")
         write_json(out_dir / "metrics_summary.json", row)
         write_json(out_dir / "metrics_latest.json", row)
-        write_epoch_artifacts(out_dir, epoch, row, train_stats, test_stats, manifest)
+        write_epoch_artifacts(out_dir, epoch, row, train_stats, test_stats, manifest, readiness_state)
         latest = {"epoch": epoch, "model": model.state_dict(), "optimizer": opt.state_dict(), "args": vars(args), "dim": dim, "best_test_score": max(best, joint)}
         torch.save(latest, out_dir / "checkpoint_latest.pth")
         torch.save(test_stats["logits_action_final"], out_dir / "logits_action_final_test.pt")
@@ -357,7 +451,10 @@ def main() -> None:
             torch.save(latest, out_dir / "checkpoint_best_test.pth")
             torch.save(latest, out_dir / "checkpoint_best.pth")
             write_json(out_dir / "metrics_best_test.json", row)
-        print(json.dumps({"event": "ceai_epoch", "epoch": epoch, "joint": joint, "Act_mF1": tm.get("Act_mF1"), "Exp_mF1": tm.get("Exp_mF1"), "Exp_mAP": tm.get("Exp_mAP"), "lr": lr_now}), flush=True)
+        next_state = compute_trainer_readiness_state(row, previous_action_drop_epochs=action_drop_epochs, evidence_gate_ok=False, evidence_not_used_for_action=True)
+        action_drop_epochs = int(next_state.get("action_drop_epochs", 0))
+        readiness_state = next_state
+        print(json.dumps({"event": "ceai_epoch", "epoch": epoch, "joint": joint, "Act_mF1": tm.get("Act_mF1"), "Exp_mF1": tm.get("Exp_mF1"), "Exp_mAP": tm.get("Exp_mAP"), "lr": lr_now, "next_r2a_active": readiness_state.get("r2a_active"), "router_action_scale": readiness_state.get("router_action_scale")}), flush=True)
     write_json(out_dir / "history.json", history)
 
 

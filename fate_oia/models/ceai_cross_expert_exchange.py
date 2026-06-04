@@ -23,16 +23,18 @@ class ControlledCrossExpertExchange(nn.Module):
         action_detached = action_tokens.detach()
         msg_r, _ = self.a2r(self.norm_r(reason_tokens), self.norm_a(action_detached), self.norm_a(action_detached), need_weights=False)
         a2r_gate = self.a2r_gate(reason_tokens)
-        reason_out = reason_tokens + self.a2r_max_scale * a2r_gate * msg_r
+        a2r_scale = self.a2r_max_scale if bool(readiness.get("a2r_active", True)) else 0.0
+        reason_out = reason_tokens + a2r_scale * a2r_gate * msg_r
         r2a_active = bool(readiness.get("r2a_active", False))
+        r2a_scale = float(readiness.get("reason_feedback_scale", 0.0 if not r2a_active else 1.0))
         if q_ar is None:
             rel = action_tokens.new_zeros(action_tokens.shape[0], self.action_dim, 1)
         else:
             rel = q_ar.detach().mean(dim=2, keepdim=True).clamp(0.0, 1.0)
-        if r2a_active:
+        if r2a_active and r2a_scale > 0.0:
             msg_a, _ = self.r2a(self.norm_a(action_tokens), self.norm_r(reason_out.detach()), self.norm_r(reason_out.detach()), need_weights=False)
             gate = torch.sigmoid(self.r2a_gate(action_tokens).mean(dim=-1, keepdim=True)) * rel
-            action_out = action_tokens + self.r2a_max_scale * gate * torch.tanh(msg_a)
+            action_out = action_tokens + self.r2a_max_scale * r2a_scale * gate * torch.tanh(msg_a)
         else:
             gate = action_tokens.new_zeros(action_tokens.shape[0], self.action_dim, 1)
             action_out = action_tokens
