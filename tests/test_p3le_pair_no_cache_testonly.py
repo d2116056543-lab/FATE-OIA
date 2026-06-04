@@ -26,10 +26,12 @@ def test_train_script_uses_test_loader_not_val_loader():
     assert "BDD100KWeakEvidencePriorBuilder" in src
     assert "action_guard_applied" in src
     assert 'branch_metrics["base"]["Act_mF1"]' in src
-    assert "compute_pcgrad_lite" in src
+    assert "apply_pcgrad_lite(" in src
     assert "pair_sparse_stats.json" in src
     assert "router_gate_entropy.json" in src
     assert "grad_conflict_stats.json" in src
+    assert "action_set_usage_stats.json" in src
+    assert "pair_reliability_stats.json" in src
 
 
 def test_action_set_uses_dataset_prior_buffer():

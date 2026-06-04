@@ -100,22 +100,26 @@ def check_static() -> list[str]:
         failures.append("pair seed code must document that it does not hard-label all positive action x reason pairs")
     if "reason_reliability" not in model_src or "q.detach()" not in loss_src:
         failures.append("q_r reliability must exist and weight reason supervision")
-    if "pair_targets = pair_targets * q_pair" not in loss_src:
+    if "pair_targets = pair_targets * pair_seed_gate" not in loss_src or "evidence_active" not in loss_src:
         failures.append("pair seed loss must be reliability-masked")
     if "never modifies action logits" not in evidence_src or "evidence_lambda_active" not in evidence_src:
         failures.append("evidence bag must be weak and selected<=random-gated")
     if "BDD100KGroundingIndex" not in train_src or "use_bdd100k_evidence_prior" not in train_src:
         failures.append("BDD100K weak evidence prior must be wired into training")
-    if "base_action +" not in router_src or "action_residual_cap" not in router_src:
-        failures.append("Router_A must anchor on base_action with bounded residual")
-    if "base_reason +" not in router_src:
-        failures.append("Router_R must anchor on base_reason")
+    if "base_action" not in router_src or "base_reason" not in router_src:
+        failures.append("router must consume base_action and base_reason")
+    if "final_action = base_action" not in router_src or "action_residual_cap" not in router_src:
+        failures.append("Router_A must anchor final_action on base_action with bounded residual")
+    if "final_reason = base_reason" not in router_src:
+        failures.append("Router_R must anchor final_reason on base_reason")
     if "branch_metrics[\"base\"][\"Act_mF1\"]" not in train_src or "base_action_logits" not in train_src:
         failures.append("Router_A test-selection guard must compare base action against final action")
-    if "compute_pcgrad_lite" not in train_src or "assign_pcgrad_lite" not in train_src or "torch.autograd.grad" not in pcgrad_src:
-        failures.append("PCGrad-lite conflict-aware shared gradient update must be wired")
+    if "apply_pcgrad_lite(" not in train_src or "torch.autograd.grad" not in pcgrad_src:
+        failures.append("PCGrad-lite must be explicitly applied on shared params through apply_pcgrad_lite")
     if "register_buffer(\"prototype_vectors\"" not in action_set_src:
         failures.append("Action-set prototypes must be dataset-prior buffers, not random parameters")
+    if "prototype_residual" not in action_set_src:
+        failures.append("Action-set head must keep only a small residual around fixed data-prior prototypes")
     if "left_related" not in train_src or "right_related" not in train_src or "turn_related" not in train_src:
         failures.append("Evidence prior builder must expose directional group stats")
     if "gate_entropy" not in router_src or "temperature_action" not in router_src:
@@ -247,9 +251,10 @@ def run_smoke(config: Path, output_dir: Path, device: str) -> list[str]:
         "epoch_000/pair_sparse_stats.json",
         "epoch_000/grad_conflict_stats.json",
         "epoch_000/route_anchor_stats.json",
+        "epoch_000/action_set_usage_stats.json",
+        "epoch_000/pair_reliability_stats.json",
         "epoch_000/router_gate_entropy.json",
         "epoch_000/bdd100k_prior_group_stats.json",
-        "epoch_000/reason_reliability_stats.json",
         "epoch_000/evidence_bag_stats.json",
         "epoch_000/router_stats.json",
         "epoch_000/logits/action_final_test.pt",
@@ -265,6 +270,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Audit P3LE-PAIR-OIA V1 implementation before training.")
     ap.add_argument("--config", required=True)
     ap.add_argument("--output_dir", required=True)
+    ap.add_argument("--run_dir", default="")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--canonical_read_confirmed", action=argparse.BooleanOptionalAction, default=False)
     ap.add_argument("--skip_smoke", action=argparse.BooleanOptionalAction, default=False)
@@ -281,7 +287,21 @@ def main() -> None:
     failures.extend(check_static())
     failures.extend(check_model())
     failures.extend(check_compile_and_tests(out_dir))
-    if not args.skip_smoke:
+    if args.run_dir:
+        smoke_dir = Path(args.run_dir)
+        required = [
+            "run_manifest.json",
+            "metrics_summary.jsonl",
+            "epoch_000/pair_sparse_stats.json",
+            "epoch_000/grad_conflict_stats.json",
+            "epoch_000/route_anchor_stats.json",
+            "epoch_000/action_set_usage_stats.json",
+            "epoch_000/pair_reliability_stats.json",
+        ]
+        for rel in required:
+            if not (smoke_dir / rel).exists():
+                failures.append(f"run_dir missing artifact: {rel}")
+    elif not args.skip_smoke:
         failures.extend(run_smoke(ROOT / args.config, out_dir, args.device))
     report = {"status": "fail" if failures else "pass", "failures": failures, "branch": branch}
     write_json(out_dir / "audit_report.json", report)
@@ -289,10 +309,12 @@ def main() -> None:
     write_json(out_dir / "artifact_schema_check.json", {"smoke_checked": not args.skip_smoke, "failures": failures})
     if failures:
         (out_dir / "REVIEW_FAIL_P3LE_PAIR_OIA_V1.txt").write_text("\n".join(failures), encoding="utf-8")
+        write_json(out_dir / "REVIEW_FAIL_P3LE_PAIR_OIA_V1_1.json", {"failures": failures})
         print(json.dumps(report, ensure_ascii=False, indent=2))
         raise SystemExit(1)
     (out_dir / "REVIEW_PASS_P3LE_PAIR_OIA_V1.txt").write_text("REVIEW_PASS_P3LE_PAIR_OIA_V1", encoding="utf-8")
-    print("REVIEW_PASS_P3LE_PAIR_OIA_V1")
+    (out_dir / "REVIEW_PASS_P3LE_PAIR_OIA_V1_1.txt").write_text("REVIEW_PASS_P3LE_PAIR_OIA_V1_1", encoding="utf-8")
+    print("REVIEW_PASS_P3LE_PAIR_OIA_V1_1")
 
 
 if __name__ == "__main__":

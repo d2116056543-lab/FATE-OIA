@@ -25,6 +25,7 @@ class ActionSetHead(nn.Module):
             priors = priors[:, :action_dim]
         self.num_prototypes = int(min(num_prototypes, priors.shape[0]))
         self.register_buffer("prototype_vectors", priors[: self.num_prototypes].clone())
+        self.prototype_residual = nn.Parameter(torch.zeros_like(self.prototype_vectors))
         self.score = nn.Linear(dim, self.num_prototypes)
         self.residual = nn.Sequential(nn.Linear(dim, dim // 2), nn.GELU(), nn.Linear(dim // 2, action_dim))
 
@@ -32,7 +33,8 @@ class ActionSetHead(nn.Module):
         summary = action_tokens.mean(dim=1)
         prototype_scores = self.score(summary)
         usage = torch.softmax(prototype_scores, dim=-1)
-        prior_logits = torch.matmul(prototype_scores, self.prototype_vectors)
+        proto = self.prototype_vectors + self.prototype_residual
+        prior_logits = torch.matmul(prototype_scores, proto)
         action_set_logits = prior_logits + 0.05 * self.residual(summary)
         return {
             "action_set_logits": action_set_logits,

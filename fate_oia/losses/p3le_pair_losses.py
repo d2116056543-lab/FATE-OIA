@@ -38,17 +38,20 @@ def p3le_pair_loss(outputs: dict[str, torch.Tensor], action: torch.Tensor, reaso
     epoch = int(float(outputs.get("epoch_tensor", final_action.new_tensor(0.0)).detach().cpu()))
     pair_targets = build_pair_seed_targets(action, reason, action.shape[1], reason.shape[1])
     q_pair = q.detach().unsqueeze(1)
-    pair_targets = pair_targets * q_pair
-    pair_weights = 0.25 + 0.75 * q_pair
+    evidence_active = outputs["evidence_lambda_active"].detach().clamp(0.0, 1.0)
+    pair_seed_gate = q_pair * evidence_active
+    pair_targets = pair_targets * pair_seed_gate
+    pair_weights = (0.25 + 0.75 * q_pair) * evidence_active
     tail_indices = getattr(args, "tail_indices", [])
+    tail_pair_seed_weight_mean = pair_seed_gate.new_tensor(0.0)
     if tail_indices:
         tail_weight = torch.ones_like(pair_weights)
         valid_tail = [idx for idx in tail_indices if idx < tail_weight.shape[-1]]
         if valid_tail:
             tail_weight[:, :, valid_tail] = 0.5
+            tail_pair_seed_weight_mean = (pair_seed_gate[:, :, valid_tail] * tail_weight[:, :, valid_tail]).mean()
         pair_weights = pair_weights * tail_weight
     pair_bce = F.binary_cross_entropy_with_logits(outputs["pair_tensor"], pair_targets, reduction="none")
-    evidence_active = outputs["evidence_lambda_active"].detach()
     pair_loss = (pair_bce * pair_weights).mean() * (0.5 + 0.5 * evidence_active)
     pair_consistency = (
         F.mse_loss(outputs["pair_action_support"].sigmoid(), action.float())
@@ -111,6 +114,9 @@ def p3le_pair_loss(outputs: dict[str, torch.Tensor], action: torch.Tensor, reaso
         "q_mean": float(q.detach().mean().cpu()),
         "q_min": float(q.detach().min().cpu()),
         "q_max": float(q.detach().max().cpu()),
+        "mean_reason_reliability": float(q.detach().mean().cpu()),
+        "mean_pair_seed_weight": float(pair_seed_gate.detach().mean().cpu()),
+        "tail_pair_seed_weight_mean": float(tail_pair_seed_weight_mean.detach().cpu()),
         "pair_tensor_mean": float(outputs["pair_tensor"].detach().mean().cpu()),
         "pair_tensor_std": float(outputs["pair_tensor"].detach().std(unbiased=False).cpu()),
         "evidence_selected_mean": float(outputs["evidence_selected_mean"].detach().cpu()),
@@ -124,6 +130,11 @@ def p3le_pair_loss(outputs: dict[str, torch.Tensor], action: torch.Tensor, reaso
         "action_prototype_usage_max": float(outputs.get("action_prototype_usage", final_action.new_zeros(1)).detach().max().cpu()),
         "action_prototype_usage_entropy": float((-(outputs.get("action_prototype_usage", final_action.new_ones(1) / 1.0).detach().clamp(1e-6, 1.0) * outputs.get("action_prototype_usage", final_action.new_ones(1) / 1.0).detach().clamp(1e-6, 1.0).log()).sum(dim=-1).mean()).cpu()) if "action_prototype_usage" in outputs else 0.0,
     }
+    if "action_prototype_usage_mean" in outputs:
+        usage_mean = outputs["action_prototype_usage_mean"].detach()
+        for idx in range(int(usage_mean.numel())):
+            parts[f"action_prototype_usage_freq_{idx}"] = float(usage_mean[idx].cpu())
+        parts["action_prototype_top_index"] = float(torch.argmax(usage_mean).cpu())
     if return_tensors:
         tensor_parts = {
             "action_task_loss": action_loss + float(args.loss_a_action) * a_action_loss + float(args.loss_action_set) * action_set_loss,

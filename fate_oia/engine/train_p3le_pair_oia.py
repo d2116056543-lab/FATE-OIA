@@ -18,7 +18,7 @@ from fate_oia.datasets.bdd_oia_multitask import BDDOIAMultiTaskDataset
 from fate_oia.engine.eval_snna25 import evaluate_snna25
 from fate_oia.engine.train_fate_oia import build_backbone, build_transform, extract_tokens
 from fate_oia.losses.cagrad_lite import clip_shared_gradient_budget
-from fate_oia.losses.pcgrad_lite import assign_pcgrad_lite, compute_pcgrad_lite
+from fate_oia.losses.pcgrad_lite import apply_pcgrad_lite
 from fate_oia.losses.p3le_pair_losses import p3le_pair_loss
 from fate_oia.models.p3le_pair_oia_model import P3LEPairOIAFeatureModel
 from fate_oia.utils.p3le_pair_artifacts import append_jsonl, save_logits_artifacts, summarize_scalar_rows, write_json
@@ -242,13 +242,12 @@ def run_epoch(args, backbone, model, loader, optimizer, scheduler, device, epoch
             loss, parts, loss_tensors = p3le_pair_loss(outputs, action, reason, args, return_tensors=True)
             if train:
                 shared_params = list(model.shared_parameters_for_budget())
-                pcgrad_projected, pcgrad_stats = compute_pcgrad_lite(
+                (loss / float(accum)).backward(retain_graph=True)
+                pcgrad_stats = apply_pcgrad_lite(
                     [loss_tensors["action_task_loss"] / float(accum), loss_tensors["reason_task_loss"] / float(accum), loss_tensors["pair_task_loss"] / float(accum)],
                     shared_params,
                     retain_graph=True,
                 )
-                (loss / float(accum)).backward()
-                assign_pcgrad_lite(shared_params, pcgrad_projected)
                 parts.update(pcgrad_stats)
                 if ((step + 1) % accum == 0) or ((step + 1) == len(loader)):
                     shared_norm = clip_shared_gradient_budget(model.shared_parameters_for_budget(), args.shared_grad_budget_norm)
@@ -294,6 +293,14 @@ def run_epoch(args, backbone, model, loader, optimizer, scheduler, device, epoch
             "guard_source": "base_action_logits" if action_guard_applied else "router_final",
             "base_Act_mF1": branch_metrics["base"]["Act_mF1"],
             "pre_guard_final_Act_mF1": pre_guard_final_act,
+            "base_action_mf1": branch_metrics["base"]["Act_mF1"],
+            "action_specialist_mf1": branch_metrics["action_specialist"]["Act_mF1"],
+            "final_action_mf1": branch_metrics["final"]["Act_mF1"],
+            "base_reason_mf1": branch_metrics["base"]["Exp_mF1"],
+            "reason_specialist_mf1": branch_metrics["reason_specialist"]["Exp_mF1"],
+            "final_reason_mf1": branch_metrics["final"]["Exp_mF1"],
+            "action_guard_used_base_count": 1 if action_guard_applied else 0,
+            "action_guard_used_final_count": 0 if action_guard_applied else 1,
         }
         metrics = branch_metrics["final"]
     return {
@@ -329,7 +336,12 @@ def save_epoch(args, out_dir: Path, epoch: int, train_stats: dict[str, Any], tes
     loss_summary = summarize_scalar_rows(train_stats["loss_rows"])
     write_json(epoch_dir / "pair_tensor_stats.json", {k: loss_summary.get(k, 0.0) for k in ["pair_tensor_mean", "pair_tensor_std", "pair_seed_loss", "pair_consistency_loss"]})
     write_json(epoch_dir / "pair_sparse_stats.json", {k: loss_summary.get(k, 0.0) for k in ["pair_sparse_action_topk", "pair_sparse_reason_topk", "pair_sparse_action_weight_mean", "pair_sparse_reason_weight_mean"]})
-    write_json(epoch_dir / "reason_reliability_stats.json", {k: loss_summary.get(k, 0.0) for k in ["q_mean", "q_min", "q_max", "q_entropy"]})
+    pair_reliability_stats = {
+        k: loss_summary.get(k, 0.0)
+        for k in ["q_mean", "q_min", "q_max", "q_entropy", "mean_reason_reliability", "mean_pair_seed_weight", "tail_pair_seed_weight_mean"]
+    }
+    write_json(epoch_dir / "reason_reliability_stats.json", pair_reliability_stats)
+    write_json(epoch_dir / "pair_reliability_stats.json", pair_reliability_stats)
     write_json(epoch_dir / "evidence_bag_stats.json", {k: loss_summary.get(k, 0.0) for k in ["evidence_bag_loss", "evidence_selected_mean", "evidence_random_mean", "evidence_lambda_active", "bdd100k_prior_positive_rate"]})
     write_json(epoch_dir / "bdd100k_prior_group_stats.json", {k: v for k, v in loss_summary.items() if k.startswith("bdd100k_prior_")})
     write_json(epoch_dir / "selected_vs_random_evidence_stats.json", {k: loss_summary.get(k, 0.0) for k in ["evidence_selected_mean", "evidence_random_mean", "evidence_lambda_active", "bdd100k_prior_positive_rate"]})
@@ -338,8 +350,33 @@ def save_epoch(args, out_dir: Path, epoch: int, train_stats: dict[str, Any], tes
     write_json(epoch_dir / "router_stats.json", router_stats)
     write_json(epoch_dir / "route_anchor_stats.json", branch_metrics.get("router_guard", {}))
     write_json(epoch_dir / "router_gate_entropy.json", {k: loss_summary.get(k, 0.0) for k in ["action_gate_entropy", "reason_gate_entropy", "gate_entropy"]})
-    write_json(epoch_dir / "grad_conflict_stats.json", {k: loss_summary.get(k, 0.0) for k in ["pcgrad_task_count", "pcgrad_conflict_count", "pcgrad_mean_dot_before", "pcgrad_grad_norm_before", "pcgrad_grad_norm_after", "shared_grad_norm_before_budget"]})
-    write_json(epoch_dir / "action_set_stats.json", {k: loss_summary.get(k, 0.0) for k in ["action_set_loss", "action_prototype_usage_max", "action_prototype_usage_entropy"]})
+    write_json(
+        epoch_dir / "grad_conflict_stats.json",
+        {
+            k: loss_summary.get(k, 0.0)
+            for k in [
+                "pcgrad_task_count",
+                "pcgrad_conflict_count",
+                "pcgrad_mean_dot_before",
+                "pcgrad_grad_norm_before",
+                "pcgrad_grad_norm_after",
+                "pairwise_negative_dot_count",
+                "mean_conflict_strength",
+                "projection_applied_count",
+                "shared_grad_norm_before_budget",
+            ]
+        },
+    )
+    usage_freq = {k: loss_summary.get(k, 0.0) for k in loss_summary if k.startswith("action_prototype_usage_freq_")}
+    action_set_usage_stats = {
+        "action_set_loss": loss_summary.get("action_set_loss", 0.0),
+        "action_prototype_usage_max": loss_summary.get("action_prototype_usage_max", 0.0),
+        "action_prototype_usage_entropy": loss_summary.get("action_prototype_usage_entropy", 0.0),
+        "action_prototype_top_index": loss_summary.get("action_prototype_top_index", 0.0),
+        "usage_frequencies": usage_freq,
+    }
+    write_json(epoch_dir / "action_set_stats.json", action_set_usage_stats)
+    write_json(epoch_dir / "action_set_usage_stats.json", action_set_usage_stats)
     (epoch_dir / "failure_cases.jsonl").write_text("", encoding="utf-8")
     visual_dir = epoch_dir / "visual_samples"
     visual_dir.mkdir(exist_ok=True)
@@ -352,6 +389,8 @@ def save_epoch(args, out_dir: Path, epoch: int, train_stats: dict[str, Any], tes
         ("pair_stats.jsonl", {"epoch": epoch, **(json.loads((epoch_dir / "pair_tensor_stats.json").read_text(encoding="utf-8")))}),
         ("pair_sparse_stats.jsonl", {"epoch": epoch, **(json.loads((epoch_dir / "pair_sparse_stats.json").read_text(encoding="utf-8")))}),
         ("reliability_stats.jsonl", {"epoch": epoch, **(json.loads((epoch_dir / "reason_reliability_stats.json").read_text(encoding="utf-8")))}),
+        ("pair_reliability_stats.jsonl", {"epoch": epoch, **(json.loads((epoch_dir / "pair_reliability_stats.json").read_text(encoding="utf-8")))}),
+        ("action_set_usage_stats.jsonl", {"epoch": epoch, **(json.loads((epoch_dir / "action_set_usage_stats.json").read_text(encoding="utf-8")))}),
         ("selected_vs_random_evidence.jsonl", {"epoch": epoch, **(json.loads((epoch_dir / "selected_vs_random_evidence_stats.json").read_text(encoding="utf-8")))}),
         ("grad_conflict_stats.jsonl", {"epoch": epoch, **(json.loads((epoch_dir / "grad_conflict_stats.json").read_text(encoding="utf-8")))}),
     ]:

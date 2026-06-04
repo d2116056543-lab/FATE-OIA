@@ -70,7 +70,7 @@ def main() -> None:
     if code != 0:
         append_jsonl(decisions, {"event": "audit_failed", "exit_code": code})
         raise SystemExit(code)
-    pass_file = output_dir / "preflight_audit" / "REVIEW_PASS_P3LE_PAIR_OIA_V1.txt"
+    pass_file = output_dir / "preflight_audit" / "REVIEW_PASS_P3LE_PAIR_OIA_V1_1.txt"
     if args.require_review_pass and not pass_file.exists():
         append_jsonl(decisions, {"event": "review_pass_missing", "path": str(pass_file)})
         raise SystemExit(2)

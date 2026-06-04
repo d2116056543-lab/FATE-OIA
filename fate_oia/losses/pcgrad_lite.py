@@ -38,6 +38,7 @@ def compute_pcgrad_lite(
     projected = [grad.clone() for grad in task_grads]
     dot_values = []
     conflict_count = 0
+    conflict_strengths = []
     for i in range(len(projected)):
         for j in range(len(task_grads)):
             if i == j:
@@ -45,6 +46,7 @@ def compute_pcgrad_lite(
             dot = torch.dot(projected[i], task_grads[j])
             dot_values.append(float(dot.detach().cpu()))
             if dot < 0:
+                conflict_strengths.append(float((-dot).detach().cpu()))
                 projected[i] = projected[i] - dot / (torch.dot(task_grads[j], task_grads[j]) + eps) * task_grads[j]
                 conflict_count += 1
     merged = torch.stack(projected, dim=0).mean(dim=0)
@@ -55,6 +57,9 @@ def compute_pcgrad_lite(
         "pcgrad_mean_dot_before": float(sum(dot_values) / len(dot_values)) if dot_values else 0.0,
         "pcgrad_grad_norm_before": float(norm_before.detach().cpu()),
         "pcgrad_grad_norm_after": float(merged.norm().detach().cpu()),
+        "pairwise_negative_dot_count": float(conflict_count),
+        "projection_applied_count": float(conflict_count),
+        "mean_conflict_strength": float(sum(conflict_strengths) / len(conflict_strengths)) if conflict_strengths else 0.0,
     }
     return _unflatten_grad(merged, params), stats
 
@@ -66,6 +71,7 @@ def assign_pcgrad_lite(parameters, projected_grads: list[torch.Tensor]) -> None:
 
 
 def apply_pcgrad_lite(losses: list[torch.Tensor], parameters, retain_graph: bool = True) -> dict[str, float]:
-    projected, stats = compute_pcgrad_lite(losses, parameters, retain_graph=retain_graph)
-    assign_pcgrad_lite(parameters, projected)
+    params = list(parameters)
+    projected, stats = compute_pcgrad_lite(losses, params, retain_graph=retain_graph)
+    assign_pcgrad_lite(params, projected)
     return stats

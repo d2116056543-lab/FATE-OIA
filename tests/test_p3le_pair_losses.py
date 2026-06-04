@@ -1,7 +1,7 @@
 import torch
 
 from fate_oia.losses.p3le_pair_losses import p3le_pair_loss
-from fate_oia.losses.pcgrad_lite import compute_pcgrad_lite
+from fate_oia.losses.pcgrad_lite import apply_pcgrad_lite, compute_pcgrad_lite
 from fate_oia.models.p3le_pair_oia_model import P3LEPairOIAFeatureModel
 
 
@@ -51,3 +51,6 @@ def test_pcgrad_lite_computes_conflict_stats():
     assert projected
     assert stats["pcgrad_task_count"] == 2.0
     assert "pcgrad_conflict_count" in stats
+    assert "pairwise_negative_dot_count" in stats
+    stats2 = apply_pcgrad_lite([y1, y2], linear.parameters(), retain_graph=True)
+    assert "projection_applied_count" in stats2
