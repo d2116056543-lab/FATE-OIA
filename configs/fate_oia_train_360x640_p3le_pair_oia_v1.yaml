@@ -34,7 +34,7 @@ training:
   router_weight_decay: 0.01
   grad_clip: 1.0
   shared_grad_budget_norm: 1.0
-  log_every: 120
+  log_every: 200
 
 loss:
   asl_gamma_pos: 0.0

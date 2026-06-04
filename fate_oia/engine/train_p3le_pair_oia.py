@@ -497,7 +497,7 @@ def main() -> None:
     ap.add_argument("--token_compression", default="none")
     ap.add_argument("--max_train_samples", type=int, default=0)
     ap.add_argument("--max_test_samples", type=int, default=0)
-    ap.add_argument("--log_every", type=int, default=120)
+    ap.add_argument("--log_every", type=int, default=200)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
     defaults = vars(ap.parse_args(["--output_dir", "__dummy__"]))
@@ -575,6 +575,30 @@ def main() -> None:
             torch.save(ckpt, out_dir / "checkpoint_best_test.pth")
             torch.save(ckpt, out_dir / "checkpoint_best.pth")
             write_json(out_dir / "metrics_best_test.json", row)
+        metrics = test_stats["metrics"]
+        guard = test_stats.get("branch_metrics", {}).get("router_guard", {})
+        print(
+            json.dumps(
+                {
+                    "event": "p3le_pair_epoch_summary",
+                    "epoch": epoch,
+                    "train_loss": train_stats["loss"],
+                    "test_loss": test_stats["loss"],
+                    "joint_test_score": test_stats["joint"],
+                    "best_test_score": best_score,
+                    "Act_mF1": metrics.get("Act_mF1"),
+                    "Act_oF1": metrics.get("Act_oF1"),
+                    "Exp_mF1": metrics.get("Exp_mF1"),
+                    "Exp_oF1": metrics.get("Exp_oF1"),
+                    "Exp_mAP": metrics.get("Exp_mAP"),
+                    "lr": current_lr(optimizer),
+                    "action_guard_applied": guard.get("action_guard_applied"),
+                    "action_router_runtime_multiplier": float(model.action_router_runtime_multiplier),
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
         print(json.dumps({"event": "p3le_pair_epoch", **row}, ensure_ascii=False), flush=True)
     write_json(out_dir / "GOAL_COMPLETED_P3LE_PAIR_OIA_V1.json", {"best_test_score": best_score, "output_dir": str(out_dir), "test_only": True})
 
