@@ -95,8 +95,12 @@ def check_static() -> list[str]:
         failures.append("q_r reliability must exist and weight reason supervision")
     if "never modifies action logits" not in evidence_src or "evidence_lambda_active" not in evidence_src:
         failures.append("evidence bag must be weak and selected<=random-gated")
+    if "BDD100KGroundingIndex" not in train_src or "use_bdd100k_evidence_prior" not in train_src:
+        failures.append("BDD100K weak evidence prior must be wired into training")
     if "a_action +" not in router_src or "action_residual_cap" not in router_src:
         failures.append("Router_A must anchor on A_action with bounded residual")
+    if "action_guard_applied" not in train_src or "enable_action_guard" not in train_src:
+        failures.append("Router_A test-selection guard must be wired")
     if "clip_shared_gradient_budget" not in train_src:
         failures.append("gradient-budget fallback must be wired in training")
     if "make_loader(args, \"test\"" not in train_src:

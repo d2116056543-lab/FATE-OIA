@@ -47,7 +47,14 @@ class P3LEPairOIAFeatureModel(nn.Module):
         yield from self.ple.shared_2.parameters()
         yield from self.pair_head.parameters()
 
-    def forward(self, tokens: torch.Tensor, action_labels: torch.Tensor | None = None, reason_labels: torch.Tensor | None = None, epoch: int = 0) -> dict[str, torch.Tensor]:
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        action_labels: torch.Tensor | None = None,
+        reason_labels: torch.Tensor | None = None,
+        evidence_prior: torch.Tensor | None = None,
+        epoch: int = 0,
+    ) -> dict[str, torch.Tensor]:
         base = self.shared_encoder(tokens)
         experts = self.ple(base["action_tokens"], base["reason_tokens"], base["shared_context"])
         a_tokens = experts["action_tokens"]
@@ -58,7 +65,7 @@ class P3LEPairOIAFeatureModel(nn.Module):
         r_action_aux = self.reason_aux_action(a_tokens).squeeze(-1)
         pair = self.pair_head(a_tokens, r_tokens, base["shared_context"])
         action_set = self.action_set_head(a_tokens)
-        evidence = self.evidence_bag(tokens, r_tokens, reason_labels)
+        evidence = self.evidence_bag(tokens, r_tokens, reason_labels, evidence_prior=evidence_prior)
         action_agreement = torch.sigmoid(a_action).detach()
         reliability = self.reliability(
             r_tokens,

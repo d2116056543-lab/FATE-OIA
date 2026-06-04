@@ -94,5 +94,6 @@ def p3le_pair_loss(outputs: dict[str, torch.Tensor], action: torch.Tensor, reaso
         "evidence_selected_mean": float(outputs["evidence_selected_mean"].detach().cpu()),
         "evidence_random_mean": float(outputs["evidence_random_mean"].detach().cpu()),
         "evidence_lambda_active": float(outputs["evidence_lambda_active"].detach().cpu()),
+        "bdd100k_prior_positive_rate": float(outputs["bdd100k_prior_positive_rate"].detach().cpu()),
     }
     return total, parts

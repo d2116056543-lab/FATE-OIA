@@ -14,6 +14,8 @@ def test_config_is_no_cache_test_only_and_best_on_test():
     assert flat["test_only_evaluation"] is True
     assert flat["best_selection_split"] == "test"
     assert flat["batch_size"] * flat["gradient_accumulation_steps"] == 32
+    assert flat["use_bdd100k_evidence_prior"] is True
+    assert flat["enable_action_guard"] is True
 
 
 def test_train_script_uses_test_loader_not_val_loader():
@@ -21,3 +23,5 @@ def test_train_script_uses_test_loader_not_val_loader():
     assert 'make_loader(args, "test", False)' in src
     assert 'make_loader(args, "val"' not in src
     assert "feature_cache=True" not in src
+    assert "BDD100KWeakEvidencePriorBuilder" in src
+    assert "action_guard_applied" in src

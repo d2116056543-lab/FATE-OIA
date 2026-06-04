@@ -13,6 +13,7 @@ from typing import Any
 import torch
 from torch.utils.data import DataLoader, Subset
 
+from fate_oia.datasets.bdd100k_grounding import BDD100KGroundingIndex, load_bdd100k_objects
 from fate_oia.datasets.bdd_oia_multitask import BDDOIAMultiTaskDataset
 from fate_oia.engine.eval_snna25 import evaluate_snna25
 from fate_oia.engine.train_fate_oia import build_backbone, build_transform, extract_tokens
@@ -65,6 +66,61 @@ def make_loader(args: argparse.Namespace, split: str, shuffle: bool) -> DataLoad
     return DataLoader(dataset, batch_size=args.batch_size, shuffle=shuffle, num_workers=args.num_workers, pin_memory=torch.cuda.is_available())
 
 
+class BDD100KWeakEvidencePriorBuilder:
+    """Build weak BDD100K object/lane/drivable priors for reason labels.
+
+    This prior is used only as a weak training regularizer in the evidence bag.
+    It is never passed into action logits and is not used for test-time scoring.
+    """
+
+    def __init__(self, root: str, reason_dim: int) -> None:
+        self.index = BDD100KGroundingIndex(root)
+        self.reason_dim = int(reason_dim)
+        self.cache: dict[str, torch.Tensor] = {}
+        self.category_groups = {
+            "traffic": {"traffic light", "traffic sign"},
+            "vehicle": {"car", "truck", "bus", "train", "trailer"},
+            "vulnerable": {"person", "pedestrian", "rider", "bike", "bicycle", "motor", "motorcycle"},
+            "lane": {"lane/single white", "lane/single yellow", "lane/double white", "lane/double yellow", "lane/crosswalk", "lane/road curb"},
+        }
+        self.reason_groups = {
+            "traffic": [0, 3, 4, 7, 15, 18],
+            "vehicle": [1, 2, 8, 19, 20],
+            "vulnerable": [5, 6, 9, 12, 14],
+            "lane": [10, 11, 13, 16, 17],
+            "drivable": [1, 19, 20],
+        }
+
+    def _prior_for_file(self, file_name: str) -> torch.Tensor:
+        if file_name in self.cache:
+            return self.cache[file_name].clone()
+        prior = torch.zeros(self.reason_dim, dtype=torch.float32)
+        paths = self.index.lookup(file_name)
+        categories: set[str] = set()
+        if paths.label_json:
+            try:
+                objects = load_bdd100k_objects(paths.label_json)
+                categories = {str(obj.get("category", "")).lower() for obj in objects}
+            except Exception:
+                categories = set()
+        for group, cats in self.category_groups.items():
+            if categories.intersection(cats):
+                for idx in self.reason_groups[group]:
+                    if idx < self.reason_dim:
+                        prior[idx] = 1.0
+        if paths.drivable_map:
+            for idx in self.reason_groups["drivable"]:
+                if idx < self.reason_dim:
+                    prior[idx] = 1.0
+        self.cache[file_name] = prior
+        return prior.clone()
+
+    def __call__(self, file_names: list[str], device: torch.device) -> torch.Tensor:
+        if not file_names:
+            return torch.zeros(0, self.reason_dim, device=device)
+        return torch.stack([self._prior_for_file(str(name)) for name in file_names], dim=0).to(device)
+
+
 def combined(action_logits: torch.Tensor, reason_logits: torch.Tensor) -> torch.Tensor:
     return torch.cat([action_logits, reason_logits], dim=1)
 
@@ -109,6 +165,7 @@ def run_epoch(args, backbone, model, loader, optimizer, scheduler, device, epoch
     }
     file_names: list[str] = []
     losses: list[dict[str, float]] = []
+    evidence_prior_builder = BDD100KWeakEvidencePriorBuilder(args.bdd100k_root, args.reason_dim) if train and args.use_bdd100k_evidence_prior else None
     total_loss = 0.0
     total_count = 0
     accum = max(1, int(args.gradient_accumulation_steps))
@@ -119,8 +176,11 @@ def run_epoch(args, backbone, model, loader, optimizer, scheduler, device, epoch
             action = batch["action"].to(device, non_blocking=True)
             reason = batch["reason"].to(device, non_blocking=True)
             labels = torch.cat([action, reason], dim=1)
+            fn = batch.get("file_name", [])
+            file_name_list = [str(x) for x in (fn if not isinstance(fn, str) else [fn])]
+            evidence_prior = evidence_prior_builder(file_name_list, device) if evidence_prior_builder is not None else None
             tokens = extract_tokens(backbone, images, args.n_last_blocks)
-            outputs = model(tokens, action_labels=action, reason_labels=reason, epoch=epoch)
+            outputs = model(tokens, action_labels=action, reason_labels=reason, evidence_prior=evidence_prior, epoch=epoch)
             loss, parts = p3le_pair_loss(outputs, action, reason, args)
             if train:
                 (loss / float(accum)).backward()
@@ -141,8 +201,7 @@ def run_epoch(args, backbone, model, loader, optimizer, scheduler, device, epoch
                 all_labels.append(labels.detach().cpu())
                 for key in output_lists:
                     output_lists[key].append(outputs[key].detach().cpu())
-                fn = batch.get("file_name", [])
-                file_names.extend([str(x) for x in (fn if not isinstance(fn, str) else [fn])])
+                file_names.extend(file_name_list)
     labels_all = torch.cat(all_labels, 0) if all_labels else torch.empty(0, args.action_dim + args.reason_dim)
     outputs_all = {key: torch.cat(value, 0) if value else torch.empty(0, args.action_dim if "action" in key else args.reason_dim) for key, value in output_lists.items()}
     metrics = {}
@@ -157,6 +216,15 @@ def run_epoch(args, backbone, model, loader, optimizer, scheduler, device, epoch
         }
         for name, (ak, rk) in branch_defs.items():
             branch_metrics[name] = metrics_for(outputs_all[ak], outputs_all[rk], labels_all, args)
+        action_guard_applied = False
+        if args.enable_action_guard and branch_metrics["action_specialist"]["Act_mF1"] > branch_metrics["final"]["Act_mF1"] + args.action_guard_min_delta:
+            outputs_all["final_action_logits"] = outputs_all["action_specialist_logits"]
+            branch_metrics["final"] = metrics_for(outputs_all["final_action_logits"], outputs_all["final_reason_logits"], labels_all, args)
+            action_guard_applied = True
+        branch_metrics["router_guard"] = {
+            "action_guard_applied": action_guard_applied,
+            "guard_source": "action_specialist" if action_guard_applied else "router_final",
+        }
         metrics = branch_metrics["final"]
     return {
         "loss": total_loss / max(1, total_count),
@@ -192,8 +260,10 @@ def save_epoch(args, out_dir: Path, epoch: int, train_stats: dict[str, Any], tes
     write_json(epoch_dir / "pair_tensor_stats.json", {k: loss_summary.get(k, 0.0) for k in ["pair_tensor_mean", "pair_tensor_std", "pair_seed_loss", "pair_consistency_loss"]})
     write_json(epoch_dir / "reason_reliability_stats.json", {k: loss_summary.get(k, 0.0) for k in ["q_mean", "q_min", "q_max", "q_entropy"]})
     write_json(epoch_dir / "evidence_bag_stats.json", {k: loss_summary.get(k, 0.0) for k in ["evidence_bag_loss", "evidence_selected_mean", "evidence_random_mean", "evidence_lambda_active"]})
-    write_json(epoch_dir / "selected_vs_random_evidence_stats.json", {k: loss_summary.get(k, 0.0) for k in ["evidence_selected_mean", "evidence_random_mean", "evidence_lambda_active"]})
-    write_json(epoch_dir / "router_stats.json", {k: loss_summary.get(k, 0.0) for k in ["router_scale", "action_gate_mean", "reason_gate_mean", "pareto_action_loss", "pareto_reason_loss"]})
+    write_json(epoch_dir / "selected_vs_random_evidence_stats.json", {k: loss_summary.get(k, 0.0) for k in ["evidence_selected_mean", "evidence_random_mean", "evidence_lambda_active", "bdd100k_prior_positive_rate"]})
+    router_stats = {k: loss_summary.get(k, 0.0) for k in ["router_scale", "action_gate_mean", "reason_gate_mean", "pareto_action_loss", "pareto_reason_loss"]}
+    router_stats.update(branch_metrics.get("router_guard", {}))
+    write_json(epoch_dir / "router_stats.json", router_stats)
     write_json(epoch_dir / "action_set_stats.json", {k: loss_summary.get(k, 0.0) for k in ["action_set_loss"]})
     (epoch_dir / "failure_cases.jsonl").write_text("", encoding="utf-8")
     visual_dir = epoch_dir / "visual_samples"
@@ -229,6 +299,8 @@ def build_manifest(args, out_dir: Path, train_count: int, test_count: int) -> di
         "bdd100k_root": args.bdd100k_root,
         "pretrained_weights": args.pretrained_weights,
         "feature_cache_enabled": False,
+        "use_bdd100k_evidence_prior": bool(args.use_bdd100k_evidence_prior),
+        "evidence_prior_used_for_test_time_scoring": False,
         "token_compression": "none",
         "eval_splits": ["test"],
         "best_selection_split": "test",
@@ -298,6 +370,9 @@ def main() -> None:
     ap.add_argument("--loss_pareto", type=float, default=0.1)
     ap.add_argument("--pareto_margin_action", type=float, default=0.005)
     ap.add_argument("--pareto_margin_reason", type=float, default=0.005)
+    ap.add_argument("--use_bdd100k_evidence_prior", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--enable_action_guard", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--action_guard_min_delta", type=float, default=0.0)
     ap.add_argument("--action_residual_cap", type=float, default=0.04)
     ap.add_argument("--eval_threshold", type=float, default=0.5)
     ap.add_argument("--tail_indices", type=int, nargs="*", default=[5, 6, 9, 10, 11, 12, 13, 14])

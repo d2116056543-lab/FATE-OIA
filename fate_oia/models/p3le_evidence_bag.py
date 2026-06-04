@@ -20,7 +20,13 @@ class WeakEvidenceBagRegularizer(nn.Module):
         self.sparse_attention = SparseRegionAttention(dim, topk=topk)
         self.score = nn.Linear(dim, 1)
 
-    def forward(self, tokens: torch.Tensor, reason_tokens: torch.Tensor, reason_labels: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        reason_tokens: torch.Tensor,
+        reason_labels: torch.Tensor | None = None,
+        evidence_prior: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
         sparse = self.sparse_attention(reason_tokens, tokens)
         selected_score = self.score(sparse["pooled"]).squeeze(-1)
         # Deterministic random-like baseline: roll token order by half length.
@@ -30,6 +36,7 @@ class WeakEvidenceBagRegularizer(nn.Module):
         selected_mean = selected_score.sigmoid().mean()
         random_mean = random_score.sigmoid().mean()
         active = (selected_mean > random_mean).to(tokens.dtype)
+        prior_rate = selected_score.new_zeros(())
         if reason_labels is None:
             loss = selected_score.new_zeros(())
         else:
@@ -37,6 +44,12 @@ class WeakEvidenceBagRegularizer(nn.Module):
             margin = 0.05
             loss = torch.relu(random_score - selected_score + margin)
             loss = (loss * reason_labels.float()).mean() * active
+            if evidence_prior is not None:
+                prior = evidence_prior.float().clamp(0.0, 1.0)
+                prior_rate = prior.mean()
+                prior_targets = torch.maximum(prior, reason_labels.float() * 0.0)
+                prior_loss = torch.nn.functional.binary_cross_entropy_with_logits(selected_score, prior_targets)
+                loss = loss + 0.25 * prior_loss * active
         return {
             "evidence_selected_score": selected_score,
             "evidence_random_score": random_score,
@@ -45,4 +58,5 @@ class WeakEvidenceBagRegularizer(nn.Module):
             "evidence_lambda_active": active,
             "evidence_loss": loss,
             "evidence_indices": sparse["indices"],
+            "bdd100k_prior_positive_rate": prior_rate,
         }

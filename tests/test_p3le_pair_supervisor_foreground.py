@@ -9,3 +9,9 @@ def test_supervisor_and_powershell_script_forbid_background_launching():
     script = Path("scripts/FATE_OIA_p3le_pair_oia_v1_foreground.ps1").read_text(encoding="utf-8")
     assert "Start-Process" not in script
     assert "Start-Job" not in script
+    assert 'Alias("GradAccum")' in script
+    assert "$BDD100KRoot" in script
+    assert "$BDDOIARoot" in script
+    assert "$NoFeatureCache" in script
+    assert "$TestOnly" in script
+    assert "$GoalMode" in script

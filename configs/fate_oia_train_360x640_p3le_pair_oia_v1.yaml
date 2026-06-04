@@ -54,6 +54,9 @@ loss:
   loss_pareto: 0.1
   pareto_margin_action: 0.005
   pareto_margin_reason: 0.005
+  use_bdd100k_evidence_prior: true
+  enable_action_guard: true
+  action_guard_min_delta: 0.0
 
 evaluation:
   test_only_evaluation: true
