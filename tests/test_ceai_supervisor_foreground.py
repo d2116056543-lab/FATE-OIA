@@ -19,3 +19,10 @@ def test_supervisor_implements_real_oom_fallback_and_test_only_launch():
     assert "cuda out of memory" in src.lower()
     assert '"--best_selection_split"' in src and '"test"' in src
     assert "feature_cache" not in src or "no_feature_cache" in src
+    assert "default=str" in src
+
+
+def test_launcher_propagates_python_exit_code():
+    src = Path("scripts/FATE_OIA_ceai_oia_v1_foreground.ps1").read_text(encoding="utf-8")
+    assert "$LASTEXITCODE" in src
+    assert "exit $LASTEXITCODE" in src

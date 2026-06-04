@@ -10,7 +10,7 @@ from pathlib import Path
 def append_event(decisions: Path, row: dict) -> None:
     decisions.parent.mkdir(parents=True, exist_ok=True)
     with decisions.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
 
 
 def run_capture(cmd: list[str], decisions: Path, *, tag: str) -> tuple[int, str]:

@@ -36,3 +36,6 @@ if ($NoFeatureCache) { $cmd += "--no_feature_cache" }
 if ($TestOnly) { $cmd += "--test_only" }
 if ($GoalMode) { $cmd += "--goal_mode" }
 & $py @cmd
+if ($LASTEXITCODE -ne 0) {
+  exit $LASTEXITCODE
+}
