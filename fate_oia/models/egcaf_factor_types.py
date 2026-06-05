@@ -23,6 +23,7 @@ class FactorBatch:
     reliability_init: torch.Tensor
     valid_mask: torch.Tensor
     metadata: dict[str, Any] | None = None
+    action_ids: torch.Tensor | None = None
 
     def to(self, device: torch.device | str) -> "FactorBatch":
         return FactorBatch(
@@ -34,7 +35,14 @@ class FactorBatch:
             self.reliability_init.to(device),
             self.valid_mask.to(device),
             self.metadata or {},
+            self.action_ids.to(device) if self.action_ids is not None else None,
         )
+
+
+def _action_ids_or_default(batch: FactorBatch) -> torch.Tensor:
+    if batch.action_ids is not None:
+        return batch.action_ids
+    return torch.full_like(batch.source_ids, -1)
 
 
 def concatenate_factor_batches(batches: list[FactorBatch]) -> FactorBatch:
@@ -49,6 +57,7 @@ def concatenate_factor_batches(batches: list[FactorBatch]) -> FactorBatch:
         torch.cat([b.reliability_init for b in batches], 1),
         torch.cat([b.valid_mask for b in batches], 1),
         {"sources": [b.metadata for b in batches]},
+        torch.cat([_action_ids_or_default(b) for b in batches], 1),
     )
 
 
@@ -67,7 +76,10 @@ def gather_factors_by_indices(factors: FactorBatch, indices: torch.Tensor) -> Fa
     typ = torch.gather(factors.type_logits, 1, flat.unsqueeze(-1).expand(-1, -1, t)).reshape(*indices.shape, t)
     rel = torch.gather(factors.reliability_init, 1, flat).reshape(indices.shape)
     valid = torch.gather(factors.valid_mask, 1, flat).reshape(indices.shape)
-    return FactorBatch(emb, masks, boxes, src, typ, rel, valid, {"gather_indices": indices.detach().cpu().tolist()[:2]})
+    action_ids = None
+    if factors.action_ids is not None:
+        action_ids = torch.gather(factors.action_ids, 1, flat).reshape(indices.shape)
+    return FactorBatch(emb, masks, boxes, src, typ, rel, valid, {"gather_indices_shape": list(indices.shape)}, action_ids)
 
 
 def mask_factors(factors: FactorBatch, keep_mask: torch.Tensor) -> FactorBatch:
@@ -90,6 +102,7 @@ def factor_to_json_records(
     records: list[dict[str, Any]] = []
     bsz = min(int(factors.embeddings.shape[0]), max_samples)
     type_ids = factors.type_logits.argmax(-1).detach().cpu()
+    action_ids = factors.action_ids.detach().cpu() if factors.action_ids is not None else None
     for b in range(bsz):
         if selected_indices is None:
             for i in range(int(factors.embeddings.shape[1])):
@@ -98,6 +111,7 @@ def factor_to_json_records(
                     "factor_index": int(i),
                     "source": SOURCE_NAMES.get(int(factors.source_ids[b, i].item()), "unknown"),
                     "type": FACTOR_TYPE_NAMES[int(type_ids[b, i].item())],
+                    "action_conditioned_id": int(action_ids[b, i].item()) if action_ids is not None else -1,
                     "box": [float(x) for x in factors.boxes[b, i].detach().cpu()],
                     "valid": bool(factors.valid_mask[b, i].item()),
                     "weight": None,
@@ -113,8 +127,10 @@ def factor_to_json_records(
                         "factor_index": i,
                         "source": SOURCE_NAMES.get(int(factors.source_ids[b, i].item()), "unknown"),
                         "type": FACTOR_TYPE_NAMES[int(type_ids[b, i].item())],
+                        "action_conditioned_id": int(action_ids[b, i].item()) if action_ids is not None else -1,
                         "box": [float(x) for x in factors.boxes[b, i].detach().cpu()],
                         "valid": bool(factors.valid_mask[b, i].item()),
                         "weight": float(selected_weights[b, a, k].detach().cpu()) if selected_weights is not None else None,
                     })
     return records
+

@@ -5,7 +5,6 @@ import json
 import math
 import socket
 import sys
-import time
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +12,7 @@ import torch
 from torch.utils.data import DataLoader, Subset
 
 from fate_oia.datasets.bdd_oia_multitask import BDDOIAMultiTaskDataset
+from fate_oia.datasets.bdd100k_scene_state_proxy import BDD100KSceneStateWeakLabelProvider
 from fate_oia.engine.eval_egcaf_oia import evaluate_logits
 from fate_oia.losses.egcaf_losses import EGCafLoss
 from fate_oia.models.egcaf_oia_model import EGCafOIAModel
@@ -36,7 +36,7 @@ def _apply_defaults(args: argparse.Namespace, cfg: dict[str, Any]) -> argparse.N
     if isinstance(getattr(args, "image_size", None), list):
         args.image_height, args.image_width = int(args.image_size[0]), int(args.image_size[1])
     if isinstance(getattr(args, "hook_layers", None), str):
-        args.hook_layers = [int(x) for x in args.hook_layers.replace("[","").replace("]","").split(",") if x.strip()]
+        args.hook_layers = [int(x) for x in args.hook_layers.replace("[", "").replace("]", "").split(",") if x.strip()]
     return args
 
 
@@ -74,18 +74,19 @@ def evaluate(model: EGCafOIAModel, loader: DataLoader, device: torch.device, out
         if last_outputs is None:
             last_outputs = {k: (v.detach().cpu() if torch.is_tensor(v) else v) for k, v in outputs.items() if k not in {"reason_attention", "reason_memory_tokens"}}
     tensors = {
-        "action_core": torch.cat(ac), "action_final": torch.cat(af), "guarded_action": torch.cat(ag),
-        "reason": torch.cat(rr), "labels_action": torch.cat(ya), "labels_reason": torch.cat(yr),
+        "action_core": torch.cat(ac),
+        "action_final": torch.cat(af),
+        "guarded_action": torch.cat(ag),
+        "reason": torch.cat(rr),
+        "labels_action": torch.cat(ya),
+        "labels_reason": torch.cat(yr),
     }
     result = evaluate_logits(tensors["action_core"], tensors["action_final"], tensors["guarded_action"], tensors["reason"], tensors["labels_action"], tensors["labels_reason"])
     if out_dir:
-        logit_dir = out_dir / "logits"; logit_dir.mkdir(parents=True, exist_ok=True)
-        torch.save(tensors["action_core"], logit_dir / "action_core_test.pt")
-        torch.save(tensors["action_final"], logit_dir / "action_final_test.pt")
-        torch.save(tensors["guarded_action"], logit_dir / "guarded_action_test.pt")
-        torch.save(tensors["reason"], logit_dir / "reason_test.pt")
-        torch.save(tensors["labels_action"], logit_dir / "labels_action_test.pt")
-        torch.save(tensors["labels_reason"], logit_dir / "labels_reason_test.pt")
+        logit_dir = out_dir / "logits"
+        logit_dir.mkdir(parents=True, exist_ok=True)
+        for key, tensor in tensors.items():
+            torch.save(tensor, logit_dir / f"{key}_test.pt")
         (logit_dir / "file_names_test.json").write_text(json.dumps(names, ensure_ascii=False), encoding="utf-8")
     return result, tensors, last_outputs or {}
 
@@ -104,22 +105,48 @@ def _set_lr(opt: torch.optim.Optimizer, lr: float) -> None:
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
     device = torch.device(args.device if torch.cuda.is_available() and args.device == "cuda" else "cpu")
-    out = Path(args.output_dir); out.mkdir(parents=True, exist_ok=True)
+    out = Path(args.output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    provider = BDD100KSceneStateWeakLabelProvider(args.bdd100k_root)
     write_json(out / "run_manifest.json", {
-        "repo": "FATE-OIA", "method": "EG-CAF-OIA V1", "command": " ".join(sys.argv),
-        "hostname": socket.gethostname(), "python": sys.executable, "device": str(device),
-        "direct_image_training": True, "no_feature_cache": bool(args.no_feature_cache), "test_only_eval": bool(args.test_only),
-        "best_selection_split": "test", "batch_size": args.batch_size, "gradient_accumulation_steps": args.gradient_accumulation_steps,
-        "image_height": args.image_height, "image_width": args.image_width, "pretrained_weights": args.pretrained_weights,
+        "repo": "FATE-OIA",
+        "method": "EG-CAF-OIA V1.1",
+        "command": " ".join(sys.argv),
+        "hostname": socket.gethostname(),
+        "python": sys.executable,
+        "device": str(device),
+        "direct_image_training": True,
+        "no_feature_cache": bool(args.no_feature_cache),
+        "test_only_eval": bool(args.test_only),
+        "best_selection_split": "test",
+        "batch_size": args.batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "image_height": args.image_height,
+        "image_width": args.image_width,
+        "pretrained_weights": args.pretrained_weights,
+        "bdd100k_scene_state_weak_labels": bool(args.bdd100k_root),
+        "residual_enabled": bool(args.residual_enabled),
+        "v1_1_patch_requirements": "enabled",
     })
     train_loader = make_loader(args, "train", True)
     test_loader = make_loader(args, "test", False)
     model = EGCafOIAModel(
-        action_dim=args.action_dim, reason_dim=args.reason_dim, hidden_dim=args.hidden_dim,
-        pretrained_weights=args.pretrained_weights, patch_size=args.patch_size, hook_layers=args.hook_layers,
-        lightweight_backbone=args.lightweight_backbone, residual_cap=args.residual_cap,
+        action_dim=args.action_dim,
+        reason_dim=args.reason_dim,
+        hidden_dim=args.hidden_dim,
+        pretrained_weights=args.pretrained_weights,
+        patch_size=args.patch_size,
+        hook_layers=args.hook_layers,
+        lightweight_backbone=args.lightweight_backbone,
+        residual_cap=args.residual_cap,
+        residual_enabled=args.residual_enabled,
     ).to(device)
-    criterion = EGCafLoss(rho=args.auxiliary_budget_rho, sufficiency_weight=args.sufficiency_weight, comprehensiveness_weight=args.comprehensiveness_weight)
+    criterion = EGCafLoss(
+        rho=args.auxiliary_budget_rho,
+        sufficiency_weight=args.sufficiency_weight,
+        comprehensiveness_weight=args.comprehensiveness_weight,
+        scene_state_weight=args.scene_state_weight,
+    )
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr, weight_decay=args.weight_decay)
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda" and args.amp))
     best = -1e9
@@ -131,99 +158,114 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         running = []
         opt.zero_grad(set_to_none=True)
         for step, batch in enumerate(train_loader, 1):
-            images, y_action, y_reason, _ = _batch_to_device(batch, device)
+            images, y_action, y_reason, file_names = _batch_to_device(batch, device)
+            scene_targets, scene_available = provider.batch(file_names, device)
             with torch.cuda.amp.autocast(enabled=(device.type == "cuda" and args.amp)):
-                outputs = model(images, return_artifacts=(step == 1), mode="train")
-                loss, stats = criterion(outputs, y_action, y_reason, shared_params=list(model.actor.parameters()) + list(model.reason_decoder.parameters()))
+                outputs = model(images, bdd100k_scene_state=scene_targets, return_artifacts=(step == 1), mode="train")
+                loss, stats = criterion(
+                    outputs,
+                    y_action,
+                    y_reason,
+                    shared_params=list(model.actor.parameters()) + list(model.reason_decoder.parameters()),
+                    scene_state_targets=scene_targets,
+                    scene_state_available=scene_available,
+                )
                 loss = loss / args.gradient_accumulation_steps
             scaler.scale(loss).backward()
             if step % args.gradient_accumulation_steps == 0:
-                scaler.unscale_(opt)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-                scaler.step(opt); scaler.update(); opt.zero_grad(set_to_none=True)
-            running.append(stats["total_loss"])
+                scaler.step(opt)
+                scaler.update()
+                opt.zero_grad(set_to_none=True)
+                # Real trainer-level reliability update from FactorJudge action-GT loss drops.
+                model.selector.update_reliability(
+                    faith_delta=stats["selected_vs_random_action_loss_drop"],
+                    help_delta=max(stats["selected_vs_random_action_loss_drop"], 0.0),
+                    hurt_delta=max(-stats["selected_vs_random_action_loss_drop"], 0.0),
+                )
+            running.append(stats)
             if step % args.print_every == 0:
-                print(f"epoch={epoch} batch={step}/{len(train_loader)} loss={sum(running)/len(running):.5f} lr={lr:.8f}", flush=True)
-            if args.max_train_batches and step >= args.max_train_batches:
-                break
+                print(
+                    f"epoch={epoch} batch={step}/{len(train_loader)} loss={stats['total_loss']:.4f} "
+                    f"sel-vs-rand={stats['selected_vs_random_action_loss_drop']:.4f} "
+                    f"lambda_exp={float(outputs['lambda_exp'].detach().mean().cpu()):.4f}",
+                    flush=True,
+                )
         epoch_dir = out / f"epoch_{epoch:03d}"
         metrics, _, eval_outputs = evaluate(model, test_loader, device, epoch_dir)
-        flat = {
-            "epoch": epoch,
-            "train_loss": float(sum(running) / max(len(running), 1)),
-            "lr": lr,
-            "action_core_mF1": metrics["action_core"]["Act_mF1"],
-            "action_final_mF1": metrics["action_final"]["Act_mF1"],
-            "guarded_action_mF1": metrics["guarded_action"]["Act_mF1"],
-            "Exp_mF1": metrics["reason"]["Exp_mF1"],
-            "Exp_mAP": metrics["reason"]["Exp_mAP"],
-            "joint_core": metrics["joint_core"],
-            "joint_final": metrics["joint_final"],
-            "joint_guarded": metrics["joint_guarded"],
-        }
-        eval_outputs["gradient_budget_stats"] = {"available": True, "last_batch": stats}
-        write_epoch_factor_artifacts(epoch_dir, eval_outputs, flat)
-        write_json(epoch_dir / "metrics.json", flat)
+        latest_stats = running[-1] if running else {}
+        eval_outputs["factor_judge_stats"] = outputs.get("factor_judge_stats", {})
+        eval_outputs["gradient_budget_stats"] = {k: latest_stats.get(k) for k in ["norm_main", "norm_aux", "budget_scale", "rho", "used_true_grad_norm"]}
+        write_epoch_factor_artifacts(epoch_dir, eval_outputs, metrics)
+        write_json(epoch_dir / "loss_components.json", latest_stats)
+        joint = float(metrics.get("joint_guarded", metrics.get("joint_final", -1e9)))
+        row = {"epoch": epoch, "lr": lr, **metrics, **latest_stats}
+        history.append(row)
         with (out / "metrics_summary.jsonl").open("a", encoding="utf-8") as f:
-            f.write(json.dumps(flat, ensure_ascii=False) + "\n")
-        torch.save({"model": model.state_dict(), "epoch": epoch, "metrics": flat}, out / "checkpoint_latest.pth")
-        score = flat["joint_guarded"]
-        if score > best:
-            best = score
-            torch.save({"model": model.state_dict(), "epoch": epoch, "metrics": flat}, out / "checkpoint_best_test.pth")
-            write_json(out / "best_metrics.json", flat)
-        history.append(flat)
-        write_json(out / "history.json", history)
-        print(f"epoch={epoch} TEST joint_guarded={flat['joint_guarded']:.6f} action_core={flat['action_core_mF1']:.6f} action_final={flat['action_final_mF1']:.6f} guarded={flat['guarded_action_mF1']:.6f} Exp_mF1={flat['Exp_mF1']:.6f} Exp_mAP={flat['Exp_mAP']:.6f}", flush=True)
-    return history[-1] if history else {}
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        torch.save({"model": model.state_dict(), "epoch": epoch, "metrics": metrics}, out / "checkpoint_latest.pth")
+        if joint > best:
+            best = joint
+            torch.save({"model": model.state_dict(), "epoch": epoch, "metrics": metrics}, out / "checkpoint_best_test.pth")
+            write_json(out / "metrics_best_test.json", row)
+        print(
+            f"EVAL epoch={epoch} joint_guarded={joint:.6f} "
+            f"action_core_mF1={metrics.get('action_core_mF1', 0):.6f} "
+            f"action_guarded_mF1={metrics.get('guarded_action_mF1', 0):.6f} "
+            f"Exp_mF1={metrics.get('Exp_mF1', 0):.6f} Exp_mAP={metrics.get('Exp_mAP', 0):.6f}",
+            flush=True,
+        )
+    write_json(out / "history.json", history)
+    return {"output_dir": str(out), "best": best, "epochs": args.epochs}
 
 
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="")
-    ap.add_argument("--data_root", default=r"E:\sbw\BDD-OIA\data")
-    ap.add_argument("--raw_root", default=r"E:\sbw\BDD-OIA")
-    ap.add_argument("--output_dir", default=r".background_runs\egcaf_oia_v1_full")
-    ap.add_argument("--pretrained_weights", default=r"ckp\reference\dino_deitsmall8_pretrain.pth")
-    ap.add_argument("--device", default="cuda")
-    ap.add_argument("--epochs", type=int, default=28)
-    ap.add_argument("--batch_size", type=int, default=4)
-    ap.add_argument("--gradient_accumulation_steps", "--grad_accum", dest="gradient_accumulation_steps", type=int, default=8)
+    ap.add_argument("--data_root", default="data")
+    ap.add_argument("--raw_root", default=".")
+    ap.add_argument("--bdd100k_root", default=r"E:\sbw\BDD100K")
+    ap.add_argument("--pretrained_weights", default="ckp/reference/dino_deitsmall8_pretrain.pth")
+    ap.add_argument("--output_dir", default=r".background_runs\egcaf_oia_v1_smoke")
+    ap.add_argument("--epochs", type=int, default=1)
+    ap.add_argument("--batch_size", type=int, default=2)
+    ap.add_argument("--gradient_accumulation_steps", type=int, default=2)
     ap.add_argument("--num_workers", type=int, default=0)
-    ap.add_argument("--max_train_samples", type=int, default=0)
-    ap.add_argument("--max_test_samples", type=int, default=0)
-    ap.add_argument("--max_train_batches", type=int, default=0)
+    ap.add_argument("--device", default="cuda")
+    ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--min_lr", type=float, default=1e-5)
+    ap.add_argument("--warmup_epochs", type=int, default=1)
+    ap.add_argument("--weight_decay", type=float, default=0.05)
+    ap.add_argument("--amp", action="store_true")
     ap.add_argument("--image_height", type=int, default=360)
     ap.add_argument("--image_width", type=int, default=640)
+    ap.add_argument("--image_size", nargs="*", type=int)
     ap.add_argument("--patch_size", type=int, default=8)
     ap.add_argument("--action_dim", type=int, default=4)
     ap.add_argument("--reason_dim", type=int, default=21)
     ap.add_argument("--hidden_dim", type=int, default=256)
-    ap.add_argument("--hook_layers", type=int, nargs="*", default=[3,6,9,12])
-    ap.add_argument("--lr", type=float, default=2.5e-4)
-    ap.add_argument("--min_lr", type=float, default=1e-5)
-    ap.add_argument("--warmup_epochs", type=int, default=2)
-    ap.add_argument("--weight_decay", type=float, default=0.05)
-    ap.add_argument("--grad_clip", type=float, default=1.0)
-    ap.add_argument("--auxiliary_budget_rho", type=float, default=0.10)
-    ap.add_argument("--sufficiency_weight", type=float, default=0.10)
-    ap.add_argument("--comprehensiveness_weight", type=float, default=0.10)
-    ap.add_argument("--residual_cap", type=float, default=0.03)
-    ap.add_argument("--print_every", type=int, default=200)
-    ap.add_argument("--amp", action="store_true", default=True)
+    ap.add_argument("--hook_layers", nargs="*", type=int, default=[3, 6, 9, 12])
+    ap.add_argument("--max_train_samples", type=int, default=0)
+    ap.add_argument("--max_test_samples", type=int, default=0)
     ap.add_argument("--no_feature_cache", action="store_true")
     ap.add_argument("--test_only", action="store_true")
     ap.add_argument("--lightweight_backbone", action="store_true")
+    ap.add_argument("--residual_cap", type=float, default=0.03)
+    ap.add_argument("--residual_enabled", action="store_true", default=False)
+    ap.add_argument("--auxiliary_budget_rho", type=float, default=0.10)
+    ap.add_argument("--sufficiency_weight", type=float, default=0.10)
+    ap.add_argument("--comprehensiveness_weight", type=float, default=0.10)
+    ap.add_argument("--scene_state_weight", type=float, default=0.05)
+    ap.add_argument("--print_every", type=int, default=200)
     return ap
 
 
 def main() -> None:
-    parser = build_parser()
-    args = parser.parse_args()
-    cfg = _load_yaml_flat(args.config)
-    args = _apply_defaults(args, cfg)
+    ap = build_parser()
+    args = ap.parse_args()
+    args = _apply_defaults(args, _load_yaml_flat(args.config))
     run(args)
 
 
 if __name__ == "__main__":
     main()
+
