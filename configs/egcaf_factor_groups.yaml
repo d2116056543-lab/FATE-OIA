@@ -1,0 +1,8 @@
+# External weak grouping only. Raw BDD-OIA JSON stores 21 index positions and no official readable reason names.
+reason_groups:
+  traffic: [0, 1, 2, 3]
+  obstacle: [4, 5, 7, 15]
+  vulnerable: [6, 8, 16]
+  lane_left: [9, 10, 11]
+  lane_right: [12, 13, 14]
+  global_drivable: [17, 18, 19, 20]

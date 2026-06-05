@@ -1,0 +1,8 @@
+scene_states:
+  traffic_control_present: [traffic light, traffic sign]
+  front_vehicle_or_obstacle: [car, truck, bus, motor]
+  vulnerable_user_front: [person, rider, bike]
+  left_lane_structure: [lane, road curb]
+  right_lane_structure: [lane, road curb]
+  lower_center_drivable: [drivable]
+notes: BDD100K scene-state proxy is train-time weak geometry only; it is not passed to test forward.
