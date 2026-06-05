@@ -177,10 +177,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 scaler.update()
                 opt.zero_grad(set_to_none=True)
                 # Real trainer-level reliability update from FactorJudge action-GT loss drops.
+                judge_tensors = outputs.get("factor_judge_stats", {})
+                per_action_drop = judge_tensors.get("selected_vs_random_action_loss_drop_per_action", torch.tensor(stats["selected_vs_random_action_loss_drop"], device=device))
                 model.selector.update_reliability(
-                    faith_delta=stats["selected_vs_random_action_loss_drop"],
-                    help_delta=max(stats["selected_vs_random_action_loss_drop"], 0.0),
-                    hurt_delta=max(-stats["selected_vs_random_action_loss_drop"], 0.0),
+                    faith_delta=per_action_drop,
+                    help_delta=torch.relu(per_action_drop),
+                    hurt_delta=torch.relu(-per_action_drop),
+                    selected_type_ids=outputs.get("selected_factor_types"),
                 )
             running.append(stats)
             if step % args.print_every == 0:

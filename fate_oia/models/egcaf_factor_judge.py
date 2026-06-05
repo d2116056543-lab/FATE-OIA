@@ -37,6 +37,18 @@ class FactorJudge(nn.Module):
         loss_without_random = self.criterion(without_random_logits, y_action)
         suff = torch.relu(loss_selected - loss_all + self.margin)
         comp = torch.relu(self.margin + loss_without_random - loss_without_selected)
+        per_action_all = torch.nn.functional.binary_cross_entropy_with_logits(all_logits, y_action, reduction="none")
+        per_action_without_selected = torch.nn.functional.binary_cross_entropy_with_logits(without_selected_logits, y_action, reduction="none")
+        per_action_without_random = torch.nn.functional.binary_cross_entropy_with_logits(without_random_logits, y_action, reduction="none")
+        drop_selected_per_action = (per_action_without_selected - per_action_all).detach().mean(0)
+        drop_random_per_action = (per_action_without_random - per_action_all).detach().mean(0)
+        selected_vs_random_per_action = drop_selected_per_action - drop_random_per_action
+        per_action_all = torch.nn.functional.binary_cross_entropy_with_logits(all_logits, y_action, reduction="none")
+        per_action_without_selected = torch.nn.functional.binary_cross_entropy_with_logits(without_selected_logits, y_action, reduction="none")
+        per_action_without_random = torch.nn.functional.binary_cross_entropy_with_logits(without_random_logits, y_action, reduction="none")
+        drop_selected_per_action = (per_action_without_selected - per_action_all).detach().mean(0)
+        drop_random_per_action = (per_action_without_random - per_action_all).detach().mean(0)
+        selected_vs_random_per_action = drop_selected_per_action - drop_random_per_action
         drop_selected = loss_without_selected.detach() - loss_all.detach()
         drop_random = loss_without_random.detach() - loss_all.detach()
         selected_vs_random = drop_selected - drop_random
@@ -47,6 +59,12 @@ class FactorJudge(nn.Module):
             "drop_selected_loss": drop_selected,
             "drop_random_loss": drop_random,
             "selected_vs_random_action_loss_drop": selected_vs_random,
+            "drop_selected_loss_per_action": drop_selected_per_action,
+            "drop_random_loss_per_action": drop_random_per_action,
+            "selected_vs_random_action_loss_drop_per_action": selected_vs_random_per_action,
+            "drop_selected_loss_per_action": drop_selected_per_action,
+            "drop_random_loss_per_action": drop_random_per_action,
+            "selected_vs_random_action_loss_drop_per_action": selected_vs_random_per_action,
             "drop_selected": drop_selected,
             "drop_random": drop_random,
             "faith_score": selected_vs_random,

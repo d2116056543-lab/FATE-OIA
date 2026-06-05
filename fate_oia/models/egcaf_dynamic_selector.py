@@ -106,11 +106,40 @@ class ExplanationGuidedDynamicFactorSelector(nn.Module):
         }
 
     @torch.no_grad()
-    def update_reliability(self, faith_delta: torch.Tensor | float, help_delta: torch.Tensor | float, hurt_delta: torch.Tensor | float, decay: float = 0.90) -> None:
-        fd = torch.as_tensor(faith_delta, device=self.faith_ema.device, dtype=self.faith_ema.dtype).mean()
-        hd = torch.as_tensor(help_delta, device=self.help_ema.device, dtype=self.help_ema.dtype).mean()
-        ud = torch.as_tensor(hurt_delta, device=self.hurt_ema.device, dtype=self.hurt_ema.dtype).mean()
-        self.faith_ema.mul_(decay).add_((1 - decay) * fd)
-        self.help_ema.mul_(decay).add_((1 - decay) * hd)
-        self.hurt_ema.mul_(decay).add_((1 - decay) * ud)
+    def update_reliability(
+        self,
+        faith_delta: torch.Tensor | float,
+        help_delta: torch.Tensor | float,
+        hurt_delta: torch.Tensor | float,
+        selected_type_ids: torch.Tensor | None = None,
+        decay: float = 0.90,
+    ) -> None:
+        fd = torch.as_tensor(faith_delta, device=self.faith_ema.device, dtype=self.faith_ema.dtype)
+        hd = torch.as_tensor(help_delta, device=self.help_ema.device, dtype=self.help_ema.dtype)
+        ud = torch.as_tensor(hurt_delta, device=self.hurt_ema.device, dtype=self.hurt_ema.dtype)
+        self.faith_ema.mul_(decay)
+        self.help_ema.mul_(decay)
+        self.hurt_ema.mul_(decay)
+        if selected_type_ids is None:
+            self.faith_ema.add_((1 - decay) * fd.mean())
+            self.help_ema.add_((1 - decay) * hd.mean())
+            self.hurt_ema.add_((1 - decay) * ud.mean())
+            return
+        type_ids = selected_type_ids.to(self.faith_ema.device).long().clamp(0, self.faith_ema.shape[1] - 1)
+        action_count = self.faith_ema.shape[0]
+        if fd.ndim == 0:
+            fd = fd.repeat(action_count)
+            hd = hd.repeat(action_count)
+            ud = ud.repeat(action_count)
+        fd = fd.flatten()[:action_count]
+        hd = hd.flatten()[:action_count]
+        ud = ud.flatten()[:action_count]
+        for action_id in range(action_count):
+            ids = type_ids[:, action_id].reshape(-1)
+            for type_id in ids.unique():
+                mask = ids == type_id
+                if mask.any():
+                    self.faith_ema[action_id, type_id] += (1 - decay) * fd[action_id]
+                    self.help_ema[action_id, type_id] += (1 - decay) * hd[action_id]
+                    self.hurt_ema[action_id, type_id] += (1 - decay) * ud[action_id]
 

@@ -52,3 +52,29 @@ def test_model_outputs_v1_1_reason_factor_attention_and_residual_off():
     assert "z_all" in out and "z_without_selected" in out and "z_without_random" in out
     assert out["factor_bank_stats"]["action_specific_maps_preserved"] is True
 
+
+
+def test_scene_state_provider_indexed_geometry(tmp_path):
+    from fate_oia.datasets.bdd100k_scene_state_proxy import BDD100KSceneStateWeakLabelProvider
+    root = tmp_path / "bdd"
+    label_dir = root / "bdd100k_labels" / "bdd100k" / "labels" / "100k" / "train"
+    label_dir.mkdir(parents=True)
+    (label_dir / "abc.json").write_text(
+        '{"frames":[{"objects":[{"category":"car","box2d":{"x1":500,"y1":350,"x2":700,"y2":500}},'
+        '{"category":"person","box2d":{"x1":50,"y1":10,"x2":80,"y2":60}},'
+        '{"category":"lane/single white","poly2d":[{"vertices":[[100,600],[300,650]]}]},'
+        '{"category":"lane/single yellow","poly2d":[[1000,600,"L"],[1100,650,"L"]]}]}]}',
+        encoding="utf-8",
+    )
+    drive_dir = root / "bdd100k_drivable_maps" / "bdd100k" / "drivable_maps" / "color_labels" / "train"
+    drive_dir.mkdir(parents=True)
+    (drive_dir / "abc_drivable_color.png").write_bytes(b"x")
+    provider = BDD100KSceneStateWeakLabelProvider(root)
+    assert "abc" in provider.label_index
+    assert "abc" in provider.drivable_stems
+    vec, ok = provider.lookup("abc_1.jpg")
+    assert ok is True
+    assert vec[1] == 1  # centered vehicle
+    assert vec[2] == 0  # far upper-left person is not a vulnerable road user cue
+    assert vec[3] == 1 and vec[4] == 1
+    assert vec[5] == 1
