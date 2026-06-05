@@ -26,6 +26,7 @@ class EGCafOIAModel(nn.Module):
         lightweight_backbone: bool = False,
         residual_cap: float = 0.03,
         residual_enabled: bool = False,
+        sparse_method: str = "entmax15",
     ) -> None:
         super().__init__()
         hook_layers = hook_layers or [3, 6, 9, 12]
@@ -33,7 +34,7 @@ class EGCafOIAModel(nn.Module):
         self.adapter = EGCafDrivingDenseAdapter(input_dim=384, hidden_dim=hidden_dim, num_actions=action_dim, layer_names=[f"layer_{i}" for i in hook_layers])
         self.factor_bank = DrivingFactorCandidateBank(hidden_dim=hidden_dim, num_actions=action_dim)
         self.pre_reason = nn.Linear(hidden_dim, reason_dim)
-        self.selector = ExplanationGuidedDynamicFactorSelector(hidden_dim=hidden_dim, action_dim=action_dim, reason_dim=reason_dim)
+        self.selector = ExplanationGuidedDynamicFactorSelector(hidden_dim=hidden_dim, action_dim=action_dim, reason_dim=reason_dim, sparse_method=sparse_method)
         self.actor = FactorActor(hidden_dim=hidden_dim, action_dim=action_dim, residual_cap=residual_cap, residual_enabled_default=residual_enabled)
         self.reason_decoder = ReasonFromFactorDecoder(hidden_dim=hidden_dim, reason_dim=reason_dim, action_dim=action_dim)
         self.action_dim = action_dim

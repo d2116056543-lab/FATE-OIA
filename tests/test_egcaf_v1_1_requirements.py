@@ -78,3 +78,24 @@ def test_scene_state_provider_indexed_geometry(tmp_path):
     assert vec[2] == 0  # far upper-left person is not a vulnerable road user cue
     assert vec[3] == 1 and vec[4] == 1
     assert vec[5] == 1
+
+
+def test_supervisor_uses_v1_1_review_pass_and_data_roots():
+    from pathlib import Path
+    text = Path("fate_oia/engine/supervise_egcaf_oia_foreground.py").read_text(encoding="utf-8")
+    assert "REVIEW_PASS_EGCAF_OIA_V1_1.txt" in text
+    assert "egcaf_oia_v1_1_preflight" in text
+    assert "--data_root" in text and "--raw_root" in text and "--bdd100k_root" in text
+    script = Path("scripts/FATE_OIA_egcaf_oia_v1_foreground.ps1").read_text(encoding="utf-8")
+    assert "$BDDOIARoot\data" in script
+    assert "Start-Process" not in script and "Start-Job" not in script
+
+
+def test_sparse_method_is_plumbed_from_trainer_to_model():
+    from pathlib import Path
+    train = Path("fate_oia/engine/train_egcaf_oia.py").read_text(encoding="utf-8")
+    model = Path("fate_oia/models/egcaf_oia_model.py").read_text(encoding="utf-8")
+    assert "--sparse_method" in train
+    assert "sparse_method=args.sparse_method" in train
+    assert "sparse_method: str" in model
+    assert "sparse_method=sparse_method" in model

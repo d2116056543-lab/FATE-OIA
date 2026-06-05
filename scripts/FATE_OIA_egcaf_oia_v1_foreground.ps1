@@ -13,7 +13,8 @@ param(
   [switch]$NoFeatureCache,
   [switch]$TestOnly,
   [switch]$GoalMode,
-  [switch]$RequireReviewPass
+  [switch]$RequireReviewPass,
+  [int]$PrintEvery = 200
 )
 $ErrorActionPreference = "Stop"
 $py = "E:\Anaconda\envs\sbw39\python.exe"
@@ -29,7 +30,11 @@ Write-Host "Config=$Config Epochs=$Epochs BatchSize=$BatchSize GradAccum=$GradAc
   --fallback_batch_size2 $FallbackBatchSize2 `
   --fallback_gradient_accumulation_steps2 $FallbackGradAccum2 `
   --device $Device `
-  --output_dir ".background_runs\egcaf_oia_v1_full_28" `
+  --output_dir ".background_runs\egcaf_oia_v1_1_full_28" `
+  --data_root "$BDDOIARoot\data" `
+  --raw_root "$BDDOIARoot" `
+  --bdd100k_root "$BDD100KRoot" `
+  --print_every $PrintEvery `
   --require_review_pass `
   --no_feature_cache `
   --test_only `

@@ -140,6 +140,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         lightweight_backbone=args.lightweight_backbone,
         residual_cap=args.residual_cap,
         residual_enabled=args.residual_enabled,
+        sparse_method=args.sparse_method,
     ).to(device)
     criterion = EGCafLoss(
         rho=args.auxiliary_budget_rho,
@@ -254,6 +255,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--lightweight_backbone", action="store_true")
     ap.add_argument("--residual_cap", type=float, default=0.03)
     ap.add_argument("--residual_enabled", action="store_true", default=False)
+    ap.add_argument("--sparse_method", default="entmax15", choices=["entmax15", "sparsemax"])
     ap.add_argument("--auxiliary_budget_rho", type=float, default=0.10)
     ap.add_argument("--sufficiency_weight", type=float, default=0.10)
     ap.add_argument("--comprehensiveness_weight", type=float, default=0.10)

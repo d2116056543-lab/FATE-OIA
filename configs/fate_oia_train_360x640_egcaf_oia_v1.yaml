@@ -24,3 +24,4 @@ scene_state_weight: 0.05
 print_every: 200
 notes: "EG-CAF V1.1 direct image, no cache, test-only; residual disabled by default."
 
+amp: true

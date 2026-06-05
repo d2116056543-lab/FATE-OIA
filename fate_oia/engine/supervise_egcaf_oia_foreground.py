@@ -36,13 +36,17 @@ def main() -> None:
     ap.add_argument("--fallback_gradient_accumulation_steps2", type=int, default=16)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--output_dir", default=r".background_runs\egcaf_oia_v1_full_28")
+    ap.add_argument("--data_root", default=r"E:\sbw\BDD-OIA\data")
+    ap.add_argument("--raw_root", default=r"E:\sbw\BDD-OIA")
+    ap.add_argument("--bdd100k_root", default=r"E:\sbw\BDD100K")
+    ap.add_argument("--print_every", type=int, default=200)
     ap.add_argument("--require_review_pass", action="store_true")
     ap.add_argument("--no_feature_cache", action="store_true")
     ap.add_argument("--test_only", action="store_true")
     ap.add_argument("--goal_mode", action="store_true")
     args = ap.parse_args()
     root = Path.cwd()
-    preflight = root / ".background_runs" / "egcaf_oia_v1_preflight" / "REVIEW_PASS_EGCAF_OIA_V1.txt"
+    preflight = root / ".background_runs" / "egcaf_oia_v1_1_preflight" / "REVIEW_PASS_EGCAF_OIA_V1_1.txt"
     decisions = root / args.output_dir / "supervisor_decisions.jsonl"
     if args.require_review_pass and not preflight.exists():
         raise SystemExit(f"Missing required review pass: {preflight}")
@@ -58,12 +62,16 @@ def main() -> None:
             sys.executable, "-m", "fate_oia.engine.train_egcaf_oia",
             "--config", args.config,
             "--output_dir", out_dir,
+            "--data_root", args.data_root,
+            "--raw_root", args.raw_root,
+            "--bdd100k_root", args.bdd100k_root,
             "--epochs", str(args.epochs),
             "--batch_size", str(batch_size),
             "--gradient_accumulation_steps", str(accum),
             "--device", args.device,
             "--no_feature_cache",
             "--test_only",
+            "--print_every", str(args.print_every),
         ]
         append_decision(decisions, {"event": "attempt_start", "name": name, "batch_size": batch_size, "grad_accum": accum, "output_dir": out_dir})
         rc = stream(cmd, root, decisions)
@@ -75,7 +83,7 @@ def main() -> None:
         raise SystemExit(rc)
     goal = root / args.output_dir / "GOAL_COMPLETED_EGCAF_OIA_V1.json"
     if args.goal_mode:
-        goal.write_text(json.dumps({"completed": True, "epochs": args.epochs, "review_pass": str(preflight)}, indent=2), encoding="utf-8")
+        goal.write_text(json.dumps({"completed": True, "epochs": args.epochs, "review_pass": str(preflight), "method": "EG-CAF-OIA V1.1"}, indent=2), encoding="utf-8")
 
 
 if __name__ == "__main__":
