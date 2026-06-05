@@ -21,6 +21,7 @@ class EGCafOIAModel(nn.Module):
         reason_dim: int = 21,
         hidden_dim: int = 256,
         pretrained_weights: str = "ckp/reference/dino_deitsmall8_pretrain.pth",
+        checkpoint_key: str = "teacher",
         patch_size: int = 8,
         hook_layers: list[int] | None = None,
         lightweight_backbone: bool = False,
@@ -30,7 +31,13 @@ class EGCafOIAModel(nn.Module):
     ) -> None:
         super().__init__()
         hook_layers = hook_layers or [3, 6, 9, 12]
-        self.extractor = EGCafDinoMultiLayerExtractor(pretrained_weights=pretrained_weights, patch_size=patch_size, hook_layers=hook_layers, lightweight=lightweight_backbone)
+        self.extractor = EGCafDinoMultiLayerExtractor(
+            pretrained_weights=pretrained_weights,
+            checkpoint_key=checkpoint_key,
+            patch_size=patch_size,
+            hook_layers=hook_layers,
+            lightweight=lightweight_backbone,
+        )
         self.adapter = EGCafDrivingDenseAdapter(input_dim=384, hidden_dim=hidden_dim, num_actions=action_dim, layer_names=[f"layer_{i}" for i in hook_layers])
         self.factor_bank = DrivingFactorCandidateBank(hidden_dim=hidden_dim, num_actions=action_dim)
         self.pre_reason = nn.Linear(hidden_dim, reason_dim)

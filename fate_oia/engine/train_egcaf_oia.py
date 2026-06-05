@@ -124,6 +124,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "image_height": args.image_height,
         "image_width": args.image_width,
         "pretrained_weights": args.pretrained_weights,
+        "checkpoint_key": args.checkpoint_key,
         "bdd100k_scene_state_weak_labels": bool(args.bdd100k_root),
         "residual_enabled": bool(args.residual_enabled),
         "v1_1_patch_requirements": "enabled",
@@ -135,6 +136,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         reason_dim=args.reason_dim,
         hidden_dim=args.hidden_dim,
         pretrained_weights=args.pretrained_weights,
+        checkpoint_key=args.checkpoint_key,
         patch_size=args.patch_size,
         hook_layers=args.hook_layers,
         lightweight_backbone=args.lightweight_backbone,
@@ -229,6 +231,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--raw_root", default=".")
     ap.add_argument("--bdd100k_root", default=r"E:\sbw\BDD100K")
     ap.add_argument("--pretrained_weights", default="ckp/reference/dino_deitsmall8_pretrain.pth")
+    ap.add_argument("--checkpoint_key", default="teacher")
     ap.add_argument("--output_dir", default=r".background_runs\egcaf_oia_v1_smoke")
     ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--batch_size", type=int, default=2)

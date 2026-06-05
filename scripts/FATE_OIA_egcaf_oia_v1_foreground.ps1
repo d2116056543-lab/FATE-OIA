@@ -10,6 +10,8 @@ param(
   [string]$Device = "cuda",
   [string]$BDD100KRoot = "E:\sbw\BDD100K",
   [string]$BDDOIARoot = "E:\sbw\BDD-OIA",
+  [string]$PretrainedWeights = "ckp/reference/dino_deitsmall8_pretrain.pth",
+  [string]$CheckpointKey = "teacher",
   [switch]$NoFeatureCache,
   [switch]$TestOnly,
   [switch]$GoalMode,
@@ -20,6 +22,7 @@ $ErrorActionPreference = "Stop"
 $py = "E:\Anaconda\envs\sbw39\python.exe"
 Write-Host "EG-CAF foreground supervisor starting"
 Write-Host "Config=$Config Epochs=$Epochs BatchSize=$BatchSize GradAccum=$GradAccum Device=$Device"
+Write-Host "PretrainedWeights=$PretrainedWeights CheckpointKey=$CheckpointKey"
 & $py -m fate_oia.engine.supervise_egcaf_oia_foreground `
   --config $Config `
   --epochs $Epochs `
@@ -34,6 +37,8 @@ Write-Host "Config=$Config Epochs=$Epochs BatchSize=$BatchSize GradAccum=$GradAc
   --data_root "$BDDOIARoot\data" `
   --raw_root "$BDDOIARoot" `
   --bdd100k_root "$BDD100KRoot" `
+  --pretrained_weights "$PretrainedWeights" `
+  --checkpoint_key "$CheckpointKey" `
   --print_every $PrintEvery `
   --require_review_pass `
   --no_feature_cache `

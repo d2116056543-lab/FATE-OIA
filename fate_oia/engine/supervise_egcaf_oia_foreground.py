@@ -39,6 +39,8 @@ def main() -> None:
     ap.add_argument("--data_root", default=r"E:\sbw\BDD-OIA\data")
     ap.add_argument("--raw_root", default=r"E:\sbw\BDD-OIA")
     ap.add_argument("--bdd100k_root", default=r"E:\sbw\BDD100K")
+    ap.add_argument("--pretrained_weights", default="ckp/reference/dino_deitsmall8_pretrain.pth")
+    ap.add_argument("--checkpoint_key", default="teacher")
     ap.add_argument("--print_every", type=int, default=200)
     ap.add_argument("--require_review_pass", action="store_true")
     ap.add_argument("--no_feature_cache", action="store_true")
@@ -65,6 +67,8 @@ def main() -> None:
             "--data_root", args.data_root,
             "--raw_root", args.raw_root,
             "--bdd100k_root", args.bdd100k_root,
+            "--pretrained_weights", args.pretrained_weights,
+            "--checkpoint_key", args.checkpoint_key,
             "--epochs", str(args.epochs),
             "--batch_size", str(batch_size),
             "--gradient_accumulation_steps", str(accum),
