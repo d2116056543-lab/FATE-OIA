@@ -30,6 +30,10 @@ def main() -> None:
     ap.add_argument("--epochs", type=int, default=28)
     ap.add_argument("--batch_size", type=int, default=4)
     ap.add_argument("--gradient_accumulation_steps", type=int, default=8)
+    ap.add_argument("--fallback_batch_size1", type=int, default=3)
+    ap.add_argument("--fallback_gradient_accumulation_steps1", type=int, default=11)
+    ap.add_argument("--fallback_batch_size2", type=int, default=2)
+    ap.add_argument("--fallback_gradient_accumulation_steps2", type=int, default=16)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--output_dir", default=r".background_runs\egcaf_oia_v1_full_28")
     ap.add_argument("--require_review_pass", action="store_true")
@@ -42,18 +46,31 @@ def main() -> None:
     decisions = root / args.output_dir / "supervisor_decisions.jsonl"
     if args.require_review_pass and not preflight.exists():
         raise SystemExit(f"Missing required review pass: {preflight}")
-    cmd = [
-        sys.executable, "-m", "fate_oia.engine.train_egcaf_oia",
-        "--config", args.config,
-        "--output_dir", args.output_dir,
-        "--epochs", str(args.epochs),
-        "--batch_size", str(args.batch_size),
-        "--gradient_accumulation_steps", str(args.gradient_accumulation_steps),
-        "--device", args.device,
-        "--no_feature_cache",
-        "--test_only",
+    attempts = [
+        (args.batch_size, args.gradient_accumulation_steps, "primary"),
+        (args.fallback_batch_size1, args.fallback_gradient_accumulation_steps1, "fallback1"),
+        (args.fallback_batch_size2, args.fallback_gradient_accumulation_steps2, "fallback2"),
     ]
-    rc = stream(cmd, root, decisions)
+    rc = 1
+    for batch_size, accum, name in attempts:
+        out_dir = args.output_dir if name == "primary" else f"{args.output_dir}_{name}_b{batch_size}a{accum}"
+        cmd = [
+            sys.executable, "-m", "fate_oia.engine.train_egcaf_oia",
+            "--config", args.config,
+            "--output_dir", out_dir,
+            "--epochs", str(args.epochs),
+            "--batch_size", str(batch_size),
+            "--gradient_accumulation_steps", str(accum),
+            "--device", args.device,
+            "--no_feature_cache",
+            "--test_only",
+        ]
+        append_decision(decisions, {"event": "attempt_start", "name": name, "batch_size": batch_size, "grad_accum": accum, "output_dir": out_dir})
+        rc = stream(cmd, root, decisions)
+        if rc == 0:
+            args.output_dir = out_dir
+            break
+        append_decision(decisions, {"event": "attempt_failed", "name": name, "returncode": rc, "next_fallback": True})
     if rc != 0:
         raise SystemExit(rc)
     goal = root / args.output_dir / "GOAL_COMPLETED_EGCAF_OIA_V1.json"

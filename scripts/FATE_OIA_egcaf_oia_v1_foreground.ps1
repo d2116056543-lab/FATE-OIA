@@ -24,6 +24,10 @@ Write-Host "Config=$Config Epochs=$Epochs BatchSize=$BatchSize GradAccum=$GradAc
   --epochs $Epochs `
   --batch_size $BatchSize `
   --gradient_accumulation_steps $GradAccum `
+  --fallback_batch_size1 $FallbackBatchSize1 `
+  --fallback_gradient_accumulation_steps1 $FallbackGradAccum1 `
+  --fallback_batch_size2 $FallbackBatchSize2 `
+  --fallback_gradient_accumulation_steps2 $FallbackGradAccum2 `
   --device $Device `
   --output_dir ".background_runs\egcaf_oia_v1_full_28" `
   --require_review_pass `
