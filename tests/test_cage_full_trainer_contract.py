@@ -16,10 +16,12 @@ def test_cage_parser_accepts_direct_image_training_args():
         "--max_test_samples", "2",
         "--epochs", "1",
         "--batch_size", "1",
+        "--resume_checkpoint", "checkpoint_latest.pth",
     ])
     assert args.smoke_only is False
     assert args.max_test_samples == 2
     assert args.threshold_mode == "fixed"
+    assert args.resume_checkpoint == "checkpoint_latest.pth"
 
 
 def test_selected_vs_random_drop_uses_real_masked_forwards():

@@ -449,6 +449,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_saved_token_stats", type=int, default=64)
     parser.add_argument("--max_deletion_eval_batches", type=int, default=2)
     parser.add_argument("--deletion_mask_fill", choices=["mean", "zero"], default="mean")
+    parser.add_argument("--resume_checkpoint", default="", help="Resume CAGE model/optimizer from checkpoint_latest.pth and continue at epoch+1.")
     return parser
 
 
@@ -479,10 +480,27 @@ def main() -> None:
     ).to(device)
     criterion = make_multilabel_criterion(args)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    manifest = _manifest(args, out_dir, len(train_loader.dataset), len(test_loader.dataset), embed_dim)
-    _write_json(out_dir / "run_manifest.json", manifest)
+    start_epoch = 0
     best_joint = -math.inf
-    for epoch in range(int(args.epochs)):
+    if args.resume_checkpoint:
+        ckpt = torch.load(args.resume_checkpoint, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        if "optimizer" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        start_epoch = int(ckpt.get("epoch", -1)) + 1
+        best_joint = float(ckpt.get("joint", -math.inf))
+        best_path = out_dir / "metrics_best_test.json"
+        if best_path.exists():
+            try:
+                best_joint = max(best_joint, float(json.loads(best_path.read_text(encoding="utf-8")).get("joint", best_joint)))
+            except Exception:
+                pass
+        print(json.dumps({"event": "cage_resume", "resume_checkpoint": args.resume_checkpoint, "start_epoch": start_epoch, "best_joint": best_joint}), flush=True)
+    manifest = _manifest(args, out_dir, len(train_loader.dataset), len(test_loader.dataset), embed_dim)
+    manifest["resume_checkpoint"] = str(args.resume_checkpoint)
+    manifest["start_epoch"] = int(start_epoch)
+    _write_json(out_dir / "run_manifest.json", manifest)
+    for epoch in range(start_epoch, int(args.epochs)):
         train_stats = _run_split(args, backbone, model, train_loader, criterion, device, True, optimizer, epoch)
         test_stats = _run_split(args, backbone, model, test_loader, criterion, device, False, None, epoch)
         _save_epoch(out_dir, epoch, train_stats, test_stats, args, manifest)
