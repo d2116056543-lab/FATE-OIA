@@ -1,0 +1,23 @@
+method: DIVA-CAF-OIA V2
+data:
+  data_root: E:/sbw/BDD-OIA/data
+  raw_root: E:/sbw/BDD-OIA
+  image_height: 360
+  image_width: 640
+  patch_size: 8
+  eval_splits: [test]
+  no_feature_cache: true
+model:
+  dim: 64
+  action_dim: 4
+  reason_dim: 21
+  layer_indices: [3, 6, 9, 12]
+  delta_cap: 0.08
+  reason_cap: 0.25
+training:
+  epochs: 32
+  batch_size: 4
+  gradient_accumulation_steps: 8
+  lr: 0.0003
+  best_selection_split: test
+  foreground_only: true

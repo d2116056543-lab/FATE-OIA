@@ -1,0 +1,12 @@
+factor_groups:
+  actor_evidence: 0
+  dino_object_affinity: 1
+  bdd100k_scene_state_weak: 2
+  lane_drivable: 3
+  traffic_control: 4
+  global_context: 5
+  other: 6
+selector:
+  factor_topk: 3
+  group_topk: 2
+  lambda_exp_initial: 0.0

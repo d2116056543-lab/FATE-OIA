@@ -1,0 +1,10 @@
+scene_state_proxy:
+  train_support_only: true
+  used_in_primary_test_forward: false
+  signals:
+    - has_vehicle
+    - has_pedestrian
+    - has_traffic_control
+    - has_lane
+    - has_drivable
+    - has_obstacle
