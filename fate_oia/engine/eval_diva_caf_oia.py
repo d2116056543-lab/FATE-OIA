@@ -11,32 +11,27 @@ from fate_oia.metrics import multilabel_metrics_from_logits
 @torch.no_grad()
 def evaluate_diva_caf(model, loader: DataLoader, device: str = "cuda") -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
     model.eval()
-    action_logits = []
-    fate_logits = []
-    eva_logits = []
-    reason_logits = []
-    y_action = []
-    y_reason = []
+    stores = {k: [] for k in ["guarded", "fate", "eva", "actor", "base_reason", "factor_reason", "final_reason", "y_action", "y_reason"]}
     for batch in loader:
         images = batch["image"].to(device)
         out = model(images=images, labels=None, train_mode=False)
-        action_logits.append(out["guarded_action_logits"].detach().cpu())
-        fate_logits.append(out["z_fate_action_logits"].detach().cpu())
-        eva_logits.append(out["z_eva_action_logits"].detach().cpu())
-        reason_logits.append(out["final_reason_logits"].detach().cpu())
-        y_action.append(batch["action"].cpu())
-        y_reason.append(batch["reason"].cpu())
-    action_logits_t = torch.cat(action_logits)
-    fate_logits_t = torch.cat(fate_logits)
-    eva_logits_t = torch.cat(eva_logits)
-    reason_logits_t = torch.cat(reason_logits)
-    y_action_t = torch.cat(y_action)
-    y_reason_t = torch.cat(y_reason)
+        stores["guarded"].append(out["guarded_action_logits"].detach().cpu())
+        stores["fate"].append(out["z_fate_action_logits"].detach().cpu())
+        stores["eva"].append(out["z_eva_action_logits"].detach().cpu())
+        stores["actor"].append(out["z_actor_action_logits"].detach().cpu())
+        stores["base_reason"].append(out["base_reason_logits"].detach().cpu())
+        stores["factor_reason"].append(out["reason_factor_logits"].detach().cpu())
+        stores["final_reason"].append(out["final_reason_logits"].detach().cpu())
+        stores["y_action"].append(batch["action"].cpu())
+        stores["y_reason"].append(batch["reason"].cpu())
+    tensors = {k: torch.cat(v) for k, v in stores.items()}
     metrics: dict[str, Any] = {}
-    metrics.update(multilabel_metrics_from_logits(action_logits_t, y_action_t, prefix="Act_"))
-    metrics.update(multilabel_metrics_from_logits(fate_logits_t, y_action_t, prefix="Act_fate_"))
-    metrics.update(multilabel_metrics_from_logits(eva_logits_t, y_action_t, prefix="Act_eva_"))
-    metrics.update(multilabel_metrics_from_logits(reason_logits_t, y_reason_t, prefix="Exp_"))
+    metrics.update(multilabel_metrics_from_logits(tensors["guarded"], tensors["y_action"], prefix="Act_"))
+    metrics.update(multilabel_metrics_from_logits(tensors["fate"], tensors["y_action"], prefix="Act_fate_"))
+    metrics.update(multilabel_metrics_from_logits(tensors["eva"], tensors["y_action"], prefix="Act_eva_"))
+    metrics.update(multilabel_metrics_from_logits(tensors["actor"], tensors["y_action"], prefix="Act_actor_"))
+    metrics.update(multilabel_metrics_from_logits(tensors["base_reason"], tensors["y_reason"], prefix="Exp_base_"))
+    metrics.update(multilabel_metrics_from_logits(tensors["factor_reason"], tensors["y_reason"], prefix="Exp_factor_"))
+    metrics.update(multilabel_metrics_from_logits(tensors["final_reason"], tensors["y_reason"], prefix="Exp_"))
     metrics["joint"] = 0.5 * metrics.get("Act_mF1", 0.0) + 0.5 * metrics.get("Exp_mF1", 0.0)
-    tensors = {"action_logits": action_logits_t, "reason_logits": reason_logits_t, "labels_action": y_action_t, "labels_reason": y_reason_t}
     return metrics, tensors

@@ -2,22 +2,69 @@ method: DIVA-CAF-OIA V2
 data:
   data_root: E:/sbw/BDD-OIA/data
   raw_root: E:/sbw/BDD-OIA
+  bdd100k_root: E:/sbw/BDD100K
   image_height: 360
   image_width: 640
   patch_size: 8
   eval_splits: [test]
   no_feature_cache: true
+  direct_image_training: true
+  use_bdd100k_train_weak_proxy: true
+  use_bdd100k_gt_in_test_forward: false
 model:
-  dim: 64
+  name: diva_caf_oia_v2
+  dim: 384
   action_dim: 4
   reason_dim: 21
   layer_indices: [3, 6, 9, 12]
   delta_cap: 0.08
   reason_cap: 0.25
+backbone:
+  dino_variant: vit_small_patch8
+  pretrained_weights: ckp/reference/dino_deitsmall8_pretrain.pth
+  allow_bdd_dino_checkpoint: true
+  dino_frozen: true
+diva:
+  dense_adapter_depth: 2
+  deformable_points_per_scale: 4
+  evidence_latents: [front_center, lower_center_drivable, left_lane, right_lane, traffic_control, global_context]
+  action_set_transformer_depth: 2
+  action_set_num_heads: 4
+  visual_delta_cap: 0.08
+  visual_gate_init_bias: -2.0
+  visual_gate_margin: 0.01
+caf:
+  factor_group_topk: 3
+  factor_topk: 3
+  selector_sparse: sparsemax
+  lambda_exp_init: 0.0
+  lambda_exp_max: 0.30
+  selected_vs_random_margin: 0.02
+  use_factor_action_residual: false
+reason:
+  reason_cap: 0.25
+  tail_reason_indices: [5, 6, 9, 11, 12, 14]
+  optional_extra_tail_indices: [10, 13]
+  reason_reliability_detach: true
 training:
   epochs: 32
   batch_size: 4
   gradient_accumulation_steps: 8
+  fallback:
+    - batch_size: 3
+      gradient_accumulation_steps: 11
+    - batch_size: 2
+      gradient_accumulation_steps: 16
+  optimizer: AdamW
   lr: 0.0003
+  min_lr: 0.00001
+  warmup_epochs: 2
+  weight_decay: 0.05
+  grad_clip: 1.0
+  scheduler: cosine
   best_selection_split: test
   foreground_only: true
+diagnostics:
+  do_not_early_stop_without_user_command: true
+  log_epoch_artifacts: true
+  export_visual_samples_per_epoch: 32

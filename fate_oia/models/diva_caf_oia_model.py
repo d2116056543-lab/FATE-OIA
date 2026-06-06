@@ -57,6 +57,16 @@ class DIVACAFOIAModel(nn.Module):
         gather_idx = indices.clamp_min(0).clamp_max(max(n - 1, 0)).unsqueeze(-1).expand(b, a, k, d)
         return torch.gather(expanded, 2, gather_idx)
 
+    def _gather_meta(self, meta: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+        b, n = meta.shape[:2]
+        trailing = meta.shape[2:]
+        expanded = meta.unsqueeze(1).expand(b, self.action_dim, n, *trailing)
+        gather_idx = indices.clamp_min(0).clamp_max(max(n - 1, 0))
+        for _ in trailing:
+            gather_idx = gather_idx.unsqueeze(-1)
+        gather_idx = gather_idx.expand(b, self.action_dim, indices.shape[-1], *trailing)
+        return torch.gather(expanded, 2, gather_idx)
+
     def forward(
         self,
         images: torch.Tensor,
@@ -89,8 +99,10 @@ class DIVACAFOIAModel(nn.Module):
         factor_tokens = factor_bank["factor_tokens"]
         factor_groups = factor_bank["factor_groups"]
         action_tokens = actor["action_tokens"]
-        route = self.factor_router(action_tokens, factor_tokens, factor_groups)
+        route = self.factor_router(action_tokens, factor_tokens, factor_groups, action_uncertainty=gate_out["action_uncertainty"])
         selected_factors = self._gather_selected(factor_tokens, route["selected_factor_indices"])
+        selected_regions = self._gather_meta(factor_bank["factor_region"], route["selected_factor_indices"])
+        selected_sources = self._gather_meta(factor_bank["factor_source_id"].unsqueeze(-1).float(), route["selected_factor_indices"]).squeeze(-1)
 
         auditor = self.factor_auditor(
             z_fate=z_fate,
@@ -101,7 +113,7 @@ class DIVACAFOIAModel(nn.Module):
             y_action=y_action,
         )
         reason = self.reason_decoder(selected_factors, actor["action_evidence_tokens"], base_reason)
-        reason_gate = self.reason_reliability(reason["reason_factor_logits"], base_reason)
+        reason_gate = self.reason_reliability(reason["reason_factor_logits"], base_reason).detach() + 0.0 * base_reason
         final_reason = base_reason + reason_gate * torch.clamp(reason["reason_factor_logits"] - base_reason, -self.reason_decoder.reason_cap, self.reason_decoder.reason_cap)
 
         return {
@@ -113,19 +125,24 @@ class DIVACAFOIAModel(nn.Module):
             "base_reason_logits": base_reason,
             "reason_factor_logits": reason["reason_factor_logits"],
             "final_reason_logits": final_reason,
+            "tail_reason_indices": reason["tail_reason_indices"],
             "visual_gate": gate_out["visual_gate"],
             "gate_target": gate_out["gate_target"],
             "bounded_delta": gate_out["bounded_delta"],
             "action_evidence_tokens": actor["action_evidence_tokens"],
             "evidence_confidence": actor["evidence_confidence"],
+            "evidence_sample_points": actor.get("evidence_sample_points"),
             "action_tokens": action_tokens,
             "layer_gates": layer_gates,
             "factor_tokens": factor_tokens,
             "factor_groups": factor_groups,
+            "factor_region": factor_bank["factor_region"],
+            "factor_source_id": factor_bank["factor_source_id"],
             "factor_group_scores": route["factor_group_scores"],
             "selected_factor_indices": route["selected_factor_indices"],
             "selected_factor_weights": route["selected_factor_weights"],
             "selected_factors": selected_factors,
+            "selected_factor_meta": {"region": selected_regions, "source_id": selected_sources},
             "selected_vs_random_stats": auditor,
             "reason_to_factor_attention": reason["reason_to_factor_attention"],
             "reason_gate": reason_gate,

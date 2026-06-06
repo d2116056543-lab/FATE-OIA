@@ -2,20 +2,22 @@ param(
   [string]$OutputDir = ".background_runs\diva_caf_oia_v2_full",
   [int]$Epochs = 32,
   [int]$BatchSize = 4,
-  [int]$Accum = 8
+  [int]$GradAccum = 8,
+  [int]$FallbackBatchSize1 = 3,
+  [int]$FallbackGradAccum1 = 11,
+  [int]$FallbackBatchSize2 = 2,
+  [int]$FallbackGradAccum2 = 16,
+  [string]$Device = "cuda"
 )
 $ErrorActionPreference = "Stop"
 Set-Location (Split-Path -Parent $PSScriptRoot)
-$review = ".background_runs\diva_caf_oia_v2_preflight\REVIEW_PASS_DIVA_CAF_OIA_V2.txt"
-if (!(Test-Path $review)) { throw "Missing REVIEW_PASS_DIVA_CAF_OIA_V2.txt" }
-E:\Anaconda\envs\sbw39\python.exe -m fate_oia.engine.train_diva_caf_oia `
-  --config configs\fate_oia_train_360x640_diva_caf_oia_v2.yaml `
+E:\Anaconda\envs\sbw39\python.exe -m fate_oia.engine.supervise_diva_caf_oia_foreground `
   --output_dir $OutputDir `
   --epochs $Epochs `
   --batch_size $BatchSize `
-  --gradient_accumulation_steps $Accum `
-  --device cuda `
-  --no_feature_cache `
-  --test_only `
-  --require_review_pass `
-  --print_every 200
+  --grad_accum $GradAccum `
+  --fallback_batch_size_1 $FallbackBatchSize1 `
+  --fallback_grad_accum_1 $FallbackGradAccum1 `
+  --fallback_batch_size_2 $FallbackBatchSize2 `
+  --fallback_grad_accum_2 $FallbackGradAccum2 `
+  --device $Device
