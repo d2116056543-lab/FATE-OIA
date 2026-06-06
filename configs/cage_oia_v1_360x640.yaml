@@ -1,0 +1,33 @@
+﻿model:
+  name: cage_oia_v1
+  input_dim: 32
+  hidden_dim: 256
+  action_dim: 4
+  reason_dim: 21
+  evidence_topk: 8
+  transport_steps: 2
+  residual_cap: 2.0
+
+data:
+  image_height: 360
+  image_width: 640
+  preserve_aspect_ratio: true
+  patch_size: 8
+  eval_splits: test
+
+training:
+  loss: asl
+  batch_size: 4
+  gradient_accumulation_steps: 8
+  effective_batch_size: 32
+  lr: 0.0003
+  epochs: 32
+  best_selection_split: test
+  best_metric: joint_test_score
+  use_bdd100k_gt_in_test_forward: false
+
+audit:
+  require_label_specific_evidence: true
+  require_typed_edges: true
+  require_reason_reliability_per_label: true
+  require_selected_vs_random_schema: true
