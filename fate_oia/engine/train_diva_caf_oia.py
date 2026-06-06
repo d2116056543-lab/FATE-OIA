@@ -62,6 +62,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--test_only", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--print_every", type=int, default=200)
     parser.add_argument("--require_review_pass", action="store_true")
+    parser.add_argument("--resume_checkpoint", default=None, help="Resume model/optimizer/scheduler from checkpoint_latest.pth")
     return parser.parse_args(argv)
 
 
@@ -175,9 +176,34 @@ def main() -> None:
     scene_proxy = BDD100KSceneStateProxy(resolved["data"]["bdd100k_root"])
     best_joint = -1.0
     history: list[dict[str, Any]] = []
+    start_epoch = 0
+    if args.resume_checkpoint:
+        resume_path = Path(args.resume_checkpoint)
+        if not resume_path.exists():
+            raise FileNotFoundError(f"resume checkpoint not found: {resume_path}")
+        ckpt = torch.load(resume_path, map_location=device)
+        model.load_state_dict(ckpt["model"], strict=False)
+        if "optimizer" in ckpt:
+            opt.load_state_dict(ckpt["optimizer"])
+        if "scheduler" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler"])
+        start_epoch = int(ckpt.get("epoch", -1)) + 1
+        hist_path = output_dir / "history.json"
+        if hist_path.exists():
+            history = json.loads(hist_path.read_text(encoding="utf-8"))
+            if history:
+                best_joint = max(float(row.get("joint", -1.0)) for row in history)
+        elif "metrics" in ckpt:
+            best_joint = float(ckpt["metrics"].get("joint", -1.0))
+        write_json(output_dir / "resume_state.json", {
+            "resume_checkpoint": str(resume_path),
+            "resume_epoch": int(ckpt.get("epoch", -1)),
+            "start_epoch": start_epoch,
+            "best_joint_before_resume": best_joint,
+        })
     last_out: dict[str, Any] | None = None
     last_grad_stats: dict[str, Any] = {}
-    for epoch in range(resolved["training"]["epochs"]):
+    for epoch in range(start_epoch, resolved["training"]["epochs"]):
         model.train()
         opt.zero_grad(set_to_none=True)
         for step, batch in enumerate(train_loader, start=1):
