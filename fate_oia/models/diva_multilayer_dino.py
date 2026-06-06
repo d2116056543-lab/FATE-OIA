@@ -20,18 +20,44 @@ class DINOIntermediateExtractor(nn.Module):
             for p in self.backbone.parameters():
                 p.requires_grad_(False)
 
+    def _forward_explicit_layers(self, images: torch.Tensor) -> dict[int, torch.Tensor] | None:
+        """Return exact 1-based block taps when the local DINO implementation exposes blocks."""
+        if not hasattr(self.backbone, "prepare_tokens") or not hasattr(self.backbone, "blocks"):
+            return None
+        x = self.backbone.prepare_tokens(images)
+        wanted = {int(i) for i in self.layer_indices}
+        outputs: dict[int, torch.Tensor] = {}
+        for zero_idx, block in enumerate(self.backbone.blocks):
+            layer_id = zero_idx + 1
+            x = block(x)
+            if layer_id in wanted:
+                normed = self.backbone.norm(x) if hasattr(self.backbone, "norm") else x
+                outputs[layer_id] = normed
+        if set(outputs) != wanted:
+            missing = sorted(wanted.difference(outputs))
+            raise RuntimeError(f"DINO explicit layer taps missing layers: {missing}")
+        return outputs
+
     def forward(self, images: torch.Tensor) -> dict[str, object]:
-        raw = self.backbone.get_intermediate_layers(images, n=max(len(self.layer_indices), max(self.layer_indices)))
-        if not isinstance(raw, (list, tuple)):
-            raise TypeError("backbone.get_intermediate_layers must return list/tuple")
-        outputs = list(raw)
+        explicit = self._forward_explicit_layers(images)
+        if explicit is None:
+            raw = self.backbone.get_intermediate_layers(images, n=max(self.layer_indices))
+            if not isinstance(raw, (list, tuple)):
+                raise TypeError("backbone.get_intermediate_layers must return list/tuple")
+            outputs = list(raw)
+            if len(outputs) < max(self.layer_indices):
+                raise RuntimeError(
+                    "DINO get_intermediate_layers returned too few layers for explicit taps; "
+                    f"need {max(self.layer_indices)}, got {len(outputs)}"
+                )
+            explicit = {int(layer_idx): outputs[int(layer_idx) - 1] for layer_idx in self.layer_indices}
         h, w = self.patch_hw
         n_patch = h * w
         tokens_by_layer: dict[int, torch.Tensor] = {}
         maps_by_layer: dict[int, torch.Tensor] = {}
-        for pos, layer_idx in enumerate(self.layer_indices):
-            src_pos = min(pos, len(outputs) - 1)
-            tokens = outputs[src_pos]
+        layer_stats: dict[int, dict[str, float]] = {}
+        for layer_idx in self.layer_indices:
+            tokens = explicit[int(layer_idx)]
             if isinstance(tokens, (list, tuple)):
                 tokens = tokens[0]
             if tokens.dim() != 3:
@@ -42,7 +68,20 @@ class DINOIntermediateExtractor(nn.Module):
                 raise ValueError(f"expected {n_patch} patch tokens, got {tokens.shape[1]}")
             tokens_by_layer[int(layer_idx)] = tokens
             maps_by_layer[int(layer_idx)] = tokens.transpose(1, 2).reshape(tokens.shape[0], tokens.shape[2], h, w)
-        return {"tokens_by_layer": tokens_by_layer, "maps_by_layer": maps_by_layer, "patch_hw": self.patch_hw, "cls_token": None}
+            layer_stats[int(layer_idx)] = {
+                "mean": float(tokens.detach().mean().cpu()),
+                "std": float(tokens.detach().std().cpu()),
+            }
+        return {
+            "tokens_by_layer": tokens_by_layer,
+            "maps_by_layer": maps_by_layer,
+            "patch_hw": self.patch_hw,
+            "cls_token": None,
+            "layer_indices": self.layer_indices,
+            "layer_stats": layer_stats,
+            "extractor_type": "real_dino",
+            "load_info": getattr(self, "load_info", {}),
+        }
 
 
 class TinyPatchDINOExtractor(nn.Module):
@@ -66,11 +105,25 @@ class TinyPatchDINOExtractor(nn.Module):
             x = F.interpolate(x, size=self.patch_hw, mode="bilinear", align_corners=False)
         maps_by_layer: dict[int, torch.Tensor] = {}
         tokens_by_layer: dict[int, torch.Tensor] = {}
+        layer_stats: dict[int, dict[str, float]] = {}
         for idx, block in zip(self.layer_indices, self.blocks):
             x = self.norm(x + 0.1 * block(x))
             maps_by_layer[int(idx)] = x
             tokens_by_layer[int(idx)] = x.flatten(2).transpose(1, 2)
-        return {"tokens_by_layer": tokens_by_layer, "maps_by_layer": maps_by_layer, "patch_hw": self.patch_hw, "cls_token": None}
+            layer_stats[int(idx)] = {
+                "mean": float(tokens_by_layer[int(idx)].detach().mean().cpu()),
+                "std": float(tokens_by_layer[int(idx)].detach().std().cpu()),
+            }
+        return {
+            "tokens_by_layer": tokens_by_layer,
+            "maps_by_layer": maps_by_layer,
+            "patch_hw": self.patch_hw,
+            "cls_token": None,
+            "layer_indices": self.layer_indices,
+            "layer_stats": layer_stats,
+            "extractor_type": "tiny_patch",
+            "load_info": {},
+        }
 
 
 def _load_state_dict_flexible(model: nn.Module, checkpoint_path: str | Path, checkpoint_key: str | None = None) -> dict[str, Any]:

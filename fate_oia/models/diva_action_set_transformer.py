@@ -39,9 +39,18 @@ class ActionSetRelationTransformer(nn.Module):
 
     def forward(self, action_tokens: torch.Tensor) -> dict[str, torch.Tensor]:
         b = action_tokens.shape[0]
-        proto = self.prototype_bank().unsqueeze(0).expand(b, -1, -1)
+        proto_raw = self.prototype_bank()
+        proto = proto_raw.unsqueeze(0).expand(b, -1, -1)
         seq = torch.cat([action_tokens, proto], dim=1)
         encoded = self.encoder(seq)
         action_out = encoded[:, : self.action_dim]
         z_eva = self.action_score(action_out).squeeze(-1)
-        return {"action_tokens": action_out, "prototype_tokens": encoded[:, self.action_dim :], "z_eva": z_eva}
+        proto_scores = torch.einsum("bad,pd->bap", action_out, proto_raw) / (action_out.shape[-1] ** 0.5)
+        return {
+            "action_tokens": action_out,
+            "prototype_tokens": encoded[:, self.action_dim :],
+            "z_eva": z_eva,
+            "action_set_prototype_scores": proto_scores,
+            "prototype_score_mean": proto_scores.mean(),
+            "prototype_residual_norm": self.prototype_bank.residual.detach().norm(),
+        }

@@ -21,7 +21,9 @@ model:
   reason_cap: 0.25
 backbone:
   dino_variant: vit_small_patch8
-  pretrained_weights: ckp/reference/dino_deitsmall8_pretrain.pth
+  dino_arch: vit_small
+  pretrained_weights: E:/sbw/SNNA_repro/SNNA/ckp/reference/dino_deitsmall8_pretrain.pth
+  checkpoint_key: ""
   allow_bdd_dino_checkpoint: true
   dino_frozen: true
 diva:

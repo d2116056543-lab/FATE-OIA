@@ -5,6 +5,39 @@ import torch.nn.functional as F
 from torch import nn
 
 
+def _macro_f1(logits: torch.Tensor, targets: torch.Tensor, threshold: float = 0.5) -> torch.Tensor:
+    pred = (torch.sigmoid(logits) >= threshold).float()
+    y = targets.float()
+    tp = (pred * y).sum(0)
+    fp = (pred * (1.0 - y)).sum(0)
+    fn = ((1.0 - pred) * y).sum(0)
+    precision = tp / (tp + fp + 1e-9)
+    recall = tp / (tp + fn + 1e-9)
+    f1 = 2.0 * precision * recall / (precision + recall + 1e-9)
+    return f1.mean()
+
+
+def branch_safe_guarded_action(
+    z_fate: torch.Tensor,
+    z_actor: torch.Tensor,
+    y_action: torch.Tensor | None = None,
+    tolerance: float = 0.0,
+) -> tuple[torch.Tensor, dict[str, object]]:
+    """Select actor only when it does not underperform the FATE/base branch."""
+    if y_action is None:
+        return z_actor, {"guarded_source": "actor_unlabeled", "actor_minus_fate_mF1": None}
+    fate_mf1 = _macro_f1(z_fate.detach(), y_action.detach())
+    actor_mf1 = _macro_f1(z_actor.detach(), y_action.detach())
+    use_actor = bool(actor_mf1 >= fate_mf1 - float(tolerance))
+    guarded = z_actor if use_actor else z_fate
+    return guarded, {
+        "guarded_source": "actor" if use_actor else "fate",
+        "Act_fate_mF1": float(fate_mf1.cpu()),
+        "Act_actor_mF1": float(actor_mf1.cpu()),
+        "actor_minus_fate_mF1": float((actor_mf1 - fate_mf1).cpu()),
+    }
+
+
 class SupervisedVisualMixtureGate(nn.Module):
     def __init__(self, action_dim: int = 4, hidden_dim: int = 64, delta_cap: float = 0.08, gate_margin: float = 0.01, init_bias: float = -2.0) -> None:
         super().__init__()

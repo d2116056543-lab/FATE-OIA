@@ -13,17 +13,22 @@ class SimpleResizeToTensor:
     def __init__(self, height: int = 360, width: int = 640) -> None:
         self.height = int(height)
         self.width = int(width)
+        self.mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
+        self.std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
 
     def __call__(self, image: Image.Image):
         original_size = tuple(image.size)
         resized = image.resize((self.width, self.height), Image.BILINEAR)
         data = torch.ByteTensor(torch.ByteStorage.from_buffer(resized.tobytes()))
         tensor = data.view(self.height, self.width, 3).permute(2, 0, 1).float().div(255.0)
+        tensor = (tensor - self.mean) / self.std
         meta = {
             "original_size": original_size,
             "resized_size": (self.width, self.height),
             "pad": (0, 0, 0, 0),
             "patch_grid": (self.height // 8, self.width // 8),
+            "normalize_mean": [0.485, 0.456, 0.406],
+            "normalize_std": [0.229, 0.224, 0.225],
         }
         return tensor, meta
 

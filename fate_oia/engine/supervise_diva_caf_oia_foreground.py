@@ -25,9 +25,9 @@ def _run_stream(cmd: list[str]) -> tuple[int, list[str]]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Foreground supervisor for DIVA-CAF-OIA V2")
-    parser.add_argument("--review_pass", default=".background_runs/diva_caf_oia_v2_preflight/REVIEW_PASS_DIVA_CAF_OIA_V2.txt")
-    parser.add_argument("--output_dir", default=".background_runs/diva_caf_oia_v2_full")
+    parser = argparse.ArgumentParser(description="Foreground supervisor for DIVA-CAF-OIA V2.1")
+    parser.add_argument("--review_pass", default=".background_runs/diva_caf_oia_v2_1_preflight/REVIEW_PASS_DIVA_CAF_OIA_V2_1.txt")
+    parser.add_argument("--output_dir", default=".background_runs/diva_caf_oia_v2_1_full")
     parser.add_argument("--epochs", type=int, default=32)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--grad_accum", type=int, default=8)
