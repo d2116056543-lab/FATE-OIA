@@ -56,7 +56,11 @@ def test_reason_warmup_weights_are_epoch_gated():
     assert late["action_set"] == 0.60
     assert late["drop_add"] == 0.25
     assert "reason_sigmoid_f1" in early
-    assert early["reason_sigmoid_f1"] >= 0.05
+    assert early["reason_sigmoid_f1"] >= 0.08
+    assert early["reason_positive_boost"] == 3.0
+    assert early["reason_negative_scale"] == 0.5
+    assert late["reason_positive_boost"] == 1.0
+    assert late["reason_negative_scale"] == 1.0
 
 
 def test_evaluate_outputs_reason_threshold_and_positive_rate_diagnostics():

@@ -27,7 +27,9 @@ LOSS_WEIGHTS = {
     "cardinality": 0.15,
     "pair_compatibility": 0.10,
     "reason": 0.85,
-    "reason_sigmoid_f1": 0.05,
+    "reason_sigmoid_f1": 0.08,
+    "reason_positive_boost": 1.0,
+    "reason_negative_scale": 1.0,
     "tail_same_action_set_ranking": 0.06,
     "reason_to_action_set_alignment": 0.05,
     "text_evidence_contrast": 0.01,
@@ -58,6 +60,8 @@ def loss_weights_for_epoch(epoch: int) -> dict[str, float]:
         weights["reason"] = 1.20
         weights["action_set"] = 0.45
         weights["drop_add"] = 0.15
+        weights["reason_positive_boost"] = 3.0
+        weights["reason_negative_scale"] = 0.5
     return weights
 
 
@@ -115,7 +119,7 @@ def compute_loss(out: dict[str, Any], action: torch.Tensor, reason: torch.Tensor
         "loss_drop_add": L.drop_add_subset_margin_loss(out["action_set_logits"], action),
         "loss_cardinality": L.cardinality_loss(out["action_set_probs"], action),
         "loss_pair_compatibility": L.pair_compatibility_loss(out["pair_logits"], action),
-        "loss_reason": L.reason_reliability_asl_loss(out["reason_logits"], reason, out["reason_reliability"]),
+        "loss_reason": L.reason_reliability_asl_loss(out["reason_logits"], reason, out["reason_reliability"], positive_boost=loss_weights_for_epoch(epoch)["reason_positive_boost"], negative_scale=loss_weights_for_epoch(epoch)["reason_negative_scale"]),
         "loss_reason_sigmoid_f1": L.reason_sigmoid_f1_loss(out["reason_logits"], reason),
         "loss_tail_rank": L.tail_same_action_set_ranking_loss(out["reason_logits"], reason, action),
         "loss_reason_to_action_set_alignment": L.reason_to_action_set_alignment_loss(out["reason_to_set_logits"], reason, action),
@@ -146,6 +150,8 @@ def compute_loss(out: dict[str, Any], action: torch.Tensor, reason: torch.Tensor
     scalars["action_set_weight_active"] = float(weights["action_set"])
     scalars["drop_add_weight_active"] = float(weights["drop_add"])
     scalars["reason_sigmoid_f1_weight_active"] = float(weights["reason_sigmoid_f1"])
+    scalars["reason_positive_boost_active"] = float(weights["reason_positive_boost"])
+    scalars["reason_negative_scale_active"] = float(weights["reason_negative_scale"])
     scalars["evidence_margin_weight"] = 0.0 if epoch < 6 else 0.0
     scalars["selected_minus_random_common_gt_0p02_2epochs"] = False
     return total, scalars

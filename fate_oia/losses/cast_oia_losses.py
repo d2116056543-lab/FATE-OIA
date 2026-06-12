@@ -44,10 +44,18 @@ def pair_compatibility_loss(pair_logits, action_targets):
     return F.binary_cross_entropy_with_logits(pair_logits, torch.stack(targets, dim=-1).float())
 
 
-def reason_reliability_asl_loss(reason_logits, reason_targets, reliability):
+def reason_reliability_asl_loss(
+    reason_logits,
+    reason_targets,
+    reliability,
+    positive_boost: float = 1.0,
+    negative_scale: float = 1.0,
+):
     y = reason_targets.float()
     bce = F.binary_cross_entropy_with_logits(reason_logits, y, reduction="none")
-    weights = torch.where(y > 0.5, torch.ones_like(y), 0.4 + 0.6 * reliability.detach())
+    pos_weights = torch.ones_like(y) * float(positive_boost)
+    neg_weights = (0.4 + 0.6 * reliability.detach()) * float(negative_scale)
+    weights = torch.where(y > 0.5, pos_weights, neg_weights)
     return (bce * weights).mean()
 
 

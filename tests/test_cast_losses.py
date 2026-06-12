@@ -44,3 +44,15 @@ def test_reason_sigmoid_f1_loss_has_gradient():
     assert torch.isfinite(loss)
     assert reason_logits.grad is not None
     assert torch.isfinite(reason_logits.grad).all()
+
+
+
+def test_reason_reliability_loss_supports_warmup_positive_boost():
+    logits = torch.tensor([[-2.0, 2.0]], requires_grad=True)
+    targets = torch.tensor([[1.0, 0.0]])
+    reliability = torch.zeros_like(targets)
+    base = losses.reason_reliability_asl_loss(logits, targets, reliability)
+    boosted = losses.reason_reliability_asl_loss(
+        logits, targets, reliability, positive_boost=3.0, negative_scale=0.5
+    )
+    assert boosted > base
