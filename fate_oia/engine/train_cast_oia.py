@@ -27,6 +27,7 @@ LOSS_WEIGHTS = {
     "cardinality": 0.15,
     "pair_compatibility": 0.10,
     "reason": 0.85,
+    "reason_sigmoid_f1": 0.05,
     "tail_same_action_set_ranking": 0.06,
     "reason_to_action_set_alignment": 0.05,
     "text_evidence_contrast": 0.01,
@@ -49,6 +50,15 @@ def _deep_update(base: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any
         else:
             out[k] = v
     return out
+
+
+def loss_weights_for_epoch(epoch: int) -> dict[str, float]:
+    weights = dict(LOSS_WEIGHTS)
+    if epoch <= 3:
+        weights["reason"] = 1.20
+        weights["action_set"] = 0.45
+        weights["drop_add"] = 0.15
+    return weights
 
 
 def _write_jsonl(path: Path, rows: list[dict[str, Any]], append: bool = False) -> None:
@@ -106,6 +116,7 @@ def compute_loss(out: dict[str, Any], action: torch.Tensor, reason: torch.Tensor
         "loss_cardinality": L.cardinality_loss(out["action_set_probs"], action),
         "loss_pair_compatibility": L.pair_compatibility_loss(out["pair_logits"], action),
         "loss_reason": L.reason_reliability_asl_loss(out["reason_logits"], reason, out["reason_reliability"]),
+        "loss_reason_sigmoid_f1": L.reason_sigmoid_f1_loss(out["reason_logits"], reason),
         "loss_tail_rank": L.tail_same_action_set_ranking_loss(out["reason_logits"], reason, action),
         "loss_reason_to_action_set_alignment": L.reason_to_action_set_alignment_loss(out["reason_to_set_logits"], reason, action),
         "loss_text_evidence_contrast": L.text_evidence_contrast_loss(out["label_attention"], out["text_similarity_matrix"]),
@@ -113,22 +124,28 @@ def compute_loss(out: dict[str, Any], action: torch.Tensor, reason: torch.Tensor
         "loss_calibration": L.calibration_regularizer(out["action_logits"], action),
         "loss_evidence_compactness": L.evidence_compactness_loss(out["label_attention"]),
     }
+    weights = loss_weights_for_epoch(epoch)
     total = (
-        LOSS_WEIGHTS["action_marginal"] * losses["loss_action_marginal"]
-        + LOSS_WEIGHTS["action_set"] * losses["loss_action_set"]
-        + LOSS_WEIGHTS["drop_add"] * losses["loss_drop_add"]
-        + LOSS_WEIGHTS["cardinality"] * losses["loss_cardinality"]
-        + LOSS_WEIGHTS["pair_compatibility"] * losses["loss_pair_compatibility"]
-        + LOSS_WEIGHTS["reason"] * losses["loss_reason"]
-        + LOSS_WEIGHTS["tail_same_action_set_ranking"] * losses["loss_tail_rank"]
-        + LOSS_WEIGHTS["reason_to_action_set_alignment"] * losses["loss_reason_to_action_set_alignment"]
-        + LOSS_WEIGHTS["text_evidence_contrast"] * losses["loss_text_evidence_contrast"]
-        + LOSS_WEIGHTS["graph_sparsity"] * losses["loss_graph_sparsity"]
-        + LOSS_WEIGHTS["calibration_regularizer"] * losses["loss_calibration"]
-        + LOSS_WEIGHTS["evidence_compactness"] * losses["loss_evidence_compactness"]
+        weights["action_marginal"] * losses["loss_action_marginal"]
+        + weights["action_set"] * losses["loss_action_set"]
+        + weights["drop_add"] * losses["loss_drop_add"]
+        + weights["cardinality"] * losses["loss_cardinality"]
+        + weights["pair_compatibility"] * losses["loss_pair_compatibility"]
+        + weights["reason"] * losses["loss_reason"]
+        + weights["reason_sigmoid_f1"] * losses["loss_reason_sigmoid_f1"]
+        + weights["tail_same_action_set_ranking"] * losses["loss_tail_rank"]
+        + weights["reason_to_action_set_alignment"] * losses["loss_reason_to_action_set_alignment"]
+        + weights["text_evidence_contrast"] * losses["loss_text_evidence_contrast"]
+        + weights["graph_sparsity"] * losses["loss_graph_sparsity"]
+        + weights["calibration_regularizer"] * losses["loss_calibration"]
+        + weights["evidence_compactness"] * losses["loss_evidence_compactness"]
     )
     scalars = {k: float(v.detach().cpu()) for k, v in losses.items()}
     scalars["loss_total"] = float(total.detach().cpu())
+    scalars["reason_weight_active"] = float(weights["reason"])
+    scalars["action_set_weight_active"] = float(weights["action_set"])
+    scalars["drop_add_weight_active"] = float(weights["drop_add"])
+    scalars["reason_sigmoid_f1_weight_active"] = float(weights["reason_sigmoid_f1"])
     scalars["evidence_margin_weight"] = 0.0 if epoch < 6 else 0.0
     scalars["selected_minus_random_common_gt_0p02_2epochs"] = False
     return total, scalars
@@ -288,6 +305,10 @@ def train(args: argparse.Namespace) -> None:
                     "combo_gt_single_pred_rate_batch": aset["combo_gt_single_pred_rate"],
                     "superset_pred_rate_batch": aset["superset_pred_rate"],
                     "all_high_rate_batch": aset["all_high_rate"],
+                    "reason_gt_positive_rate_batch": float(reason.float().mean().detach().cpu()),
+                    "reason_pred_positive_rate@0.5_batch": float((torch.sigmoid(out_dict["reason_logits"].detach()) >= 0.5).float().mean().detach().cpu()),
+                    "reason_pred_positive_rate@0.3_batch": float((torch.sigmoid(out_dict["reason_logits"].detach()) >= 0.3).float().mean().detach().cpu()),
+                    "reason_pred_positive_rate@0.2_batch": float((torch.sigmoid(out_dict["reason_logits"].detach()) >= 0.2).float().mean().detach().cpu()),
                     "label_attn_support_mean": out_dict["evidence_stats"].get("support_size_mean", 0.0),
                     "graph_edge_entropy": out_dict["graph_stats"].get("graph_entropy", 0.0),
                     "gpu_peak_memory_gb": torch.cuda.max_memory_allocated() / (1024 ** 3) if torch.cuda.is_available() else 0.0,

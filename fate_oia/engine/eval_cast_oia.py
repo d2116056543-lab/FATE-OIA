@@ -10,6 +10,60 @@ from fate_oia.metrics import multilabel_metrics_from_logits
 from fate_oia.models.cast_action_set_energy import action_targets_to_subset_ids, build_subset_membership
 
 
+def _f1_from_probs(probs: torch.Tensor, labels: torch.Tensor, threshold: float) -> tuple[float, float, list[float]]:
+    pred = (probs >= threshold).float()
+    labels = labels.float()
+    tp = (pred * labels).sum(dim=0)
+    fp = (pred * (1 - labels)).sum(dim=0)
+    fn = ((1 - pred) * labels).sum(dim=0)
+    per_label = 2 * tp / (2 * tp + fp + fn + 1e-9)
+    micro_tp = tp.sum()
+    micro_fp = fp.sum()
+    micro_fn = fn.sum()
+    micro = 2 * micro_tp / (2 * micro_tp + micro_fp + micro_fn + 1e-9)
+    return float(per_label.mean().item()), float(micro.item()), [float(x) for x in per_label.detach().cpu()]
+
+
+def _reason_threshold_diagnostics(reason_logits: torch.Tensor, labels_reason: torch.Tensor) -> dict[str, Any]:
+    probs = torch.sigmoid(reason_logits.float())
+    labels = labels_reason.float()
+    fixed_mf1, fixed_of1, _ = _f1_from_probs(probs, labels, 0.5)
+    best_global = {"mF1": fixed_mf1, "oF1": fixed_of1, "threshold": 0.5}
+    for idx in range(1, 100):
+        threshold = idx / 100.0
+        mf1, of1, _ = _f1_from_probs(probs, labels, threshold)
+        if mf1 > best_global["mF1"]:
+            best_global = {"mF1": mf1, "oF1": of1, "threshold": threshold}
+    per_label_f1 = []
+    per_label_threshold = []
+    for label_idx in range(labels.shape[1]):
+        p = probs[:, label_idx:label_idx + 1]
+        y = labels[:, label_idx:label_idx + 1]
+        best_f1 = 0.0
+        best_t = 0.5
+        for idx in range(1, 100):
+            threshold = idx / 100.0
+            mf1, _, _ = _f1_from_probs(p, y, threshold)
+            if mf1 > best_f1:
+                best_f1 = mf1
+                best_t = threshold
+        per_label_f1.append(best_f1)
+        per_label_threshold.append(best_t)
+    return {
+        "Exp_mF1_fixed_0.5": fixed_mf1,
+        "Exp_oF1_fixed_0.5": fixed_of1,
+        "Exp_mF1_global_threshold_best": best_global["mF1"],
+        "Exp_oF1_global_threshold_best": best_global["oF1"],
+        "Exp_global_threshold_best": best_global["threshold"],
+        "Exp_mF1_per_label_threshold_best": float(sum(per_label_f1) / max(1, len(per_label_f1))),
+        "Exp_per_label_thresholds_best": per_label_threshold,
+        "reason_gt_positive_rate": float(labels.mean().item()),
+        "reason_pred_positive_rate@0.5": float((probs >= 0.5).float().mean().item()),
+        "reason_pred_positive_rate@0.3": float((probs >= 0.3).float().mean().item()),
+        "reason_pred_positive_rate@0.2": float((probs >= 0.2).float().mean().item()),
+    }
+
+
 def compute_action_set_metrics(action_set_probs: torch.Tensor, action_targets: torch.Tensor) -> dict[str, Any]:
     subset_ids = action_targets_to_subset_ids(action_targets)
     top1 = action_set_probs.argmax(-1)
@@ -41,6 +95,7 @@ def compute_action_set_metrics(action_set_probs: torch.Tensor, action_targets: t
 def evaluate_cast_outputs(outputs: dict[str, torch.Tensor], labels_action: torch.Tensor, labels_reason: torch.Tensor) -> dict[str, Any]:
     action_metrics = multilabel_metrics_from_logits(outputs["action_logits"], labels_action, 0.5)
     reason_metrics = multilabel_metrics_from_logits(outputs["reason_logits"], labels_reason, 0.5)
+    reason_diag = _reason_threshold_diagnostics(outputs["reason_logits"], labels_reason)
     aset = compute_action_set_metrics(outputs["action_set_probs"], labels_action)
     evidence_common = 0.0
     act = action_metrics["mF1"]
@@ -52,6 +107,7 @@ def evaluate_cast_outputs(outputs: dict[str, torch.Tensor], labels_action: torch
         "Exp_mF1": exp,
         "Exp_oF1": reason_metrics["oF1"],
         "Exp_mAP": reason_metrics["mAP"],
+        **reason_diag,
         "per_action_F1": action_metrics["per_label_f1"],
         "per_reason_F1": reason_metrics["per_label_f1"],
         "per_reason_AP": reason_metrics["per_label_ap"],

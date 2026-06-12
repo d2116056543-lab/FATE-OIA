@@ -19,3 +19,12 @@ def test_cast_model_forward_with_synthetic_tokens():
     assert out["reason_logits"].shape == (2, 21)
     assert out["action_set_logits"].shape == (2, 16)
     assert out["label_attention"].shape[-1] == 16
+
+
+
+def test_reason_head_bias_is_not_strong_negative():
+    from fate_oia.models.cast_reason_reliability import CastReasonReliability
+
+    head = CastReasonReliability(dim=32, reason_dim=21)
+    assert torch.all(head.reason_head.bias >= -1.0)
+    assert torch.all(head.reason_head.bias <= 0.0)

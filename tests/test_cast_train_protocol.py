@@ -2,6 +2,7 @@ import inspect
 from pathlib import Path
 
 import yaml
+import torch
 
 import fate_oia.engine.supervise_cast_oia_foreground as supervisor
 import fate_oia.engine.train_cast_oia as train_cast
@@ -42,3 +43,39 @@ def test_supervisor_requires_review_pass_bound_to_current_head():
     assert "cast_oia_v1_preflight_postcommit" in src
     assert "git rev-parse HEAD" in src
     assert "REVIEW_PASS_CAST_OIA_V1.txt" in src
+
+
+
+def test_reason_warmup_weights_are_epoch_gated():
+    early = train_cast.loss_weights_for_epoch(0)
+    late = train_cast.loss_weights_for_epoch(4)
+    assert early["reason"] == 1.20
+    assert early["action_set"] == 0.45
+    assert early["drop_add"] == 0.15
+    assert late["reason"] == 0.85
+    assert late["action_set"] == 0.60
+    assert late["drop_add"] == 0.25
+    assert "reason_sigmoid_f1" in early
+    assert early["reason_sigmoid_f1"] >= 0.05
+
+
+def test_evaluate_outputs_reason_threshold_and_positive_rate_diagnostics():
+    outputs = {
+        "action_logits": torch.randn(6, 4),
+        "reason_logits": torch.randn(6, 21),
+        "action_set_probs": torch.softmax(torch.randn(6, 16), dim=-1),
+    }
+    labels_action = torch.randint(0, 2, (6, 4)).float()
+    labels_reason = torch.randint(0, 2, (6, 21)).float()
+    metrics = train_cast.evaluate_cast_outputs(outputs, labels_action, labels_reason)
+    for key in [
+        "Exp_mF1_fixed_0.5",
+        "Exp_mF1_global_threshold_best",
+        "Exp_mF1_per_label_threshold_best",
+        "Exp_global_threshold_best",
+        "reason_gt_positive_rate",
+        "reason_pred_positive_rate@0.5",
+        "reason_pred_positive_rate@0.3",
+        "reason_pred_positive_rate@0.2",
+    ]:
+        assert key in metrics

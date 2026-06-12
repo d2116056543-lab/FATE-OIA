@@ -33,3 +33,14 @@ def test_required_loss_functions_are_callable():
     total.backward()
     assert torch.isfinite(total)
     assert action_logits.grad is not None
+
+
+
+def test_reason_sigmoid_f1_loss_has_gradient():
+    reason_logits = torch.tensor([[-2.0, 0.5, 1.0], [0.2, -0.5, 0.0]], requires_grad=True)
+    reason_targets = torch.tensor([[1, 0, 1], [0, 1, 0]], dtype=torch.float32)
+    loss = losses.reason_sigmoid_f1_loss(reason_logits, reason_targets)
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert reason_logits.grad is not None
+    assert torch.isfinite(reason_logits.grad).all()

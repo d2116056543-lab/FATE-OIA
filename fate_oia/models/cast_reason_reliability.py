@@ -9,6 +9,7 @@ class CastReasonReliability(nn.Module):
         super().__init__()
         self.reason_dim = int(reason_dim)
         self.reason_head = nn.Linear(dim, 1)
+        nn.init.zeros_(self.reason_head.bias)
         self.reliability_head = nn.Sequential(nn.Linear(dim + 3, dim), nn.GELU(), nn.Linear(dim, 1))
 
     def forward(self, reason_nodes, reason_evidence, graph_support, evidence_confidence, logit_margin):

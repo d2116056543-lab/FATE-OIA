@@ -51,6 +51,17 @@ def reason_reliability_asl_loss(reason_logits, reason_targets, reliability):
     return (bce * weights).mean()
 
 
+def reason_sigmoid_f1_loss(reason_logits, reason_targets, eps: float = 1e-7):
+    """Differentiable sigmoid-F1 loss for fixed-threshold recall warmup."""
+    y = reason_targets.float()
+    p = torch.sigmoid(reason_logits)
+    tp = (p * y).sum(dim=0)
+    fp = (p * (1 - y)).sum(dim=0)
+    fn = ((1 - p) * y).sum(dim=0)
+    soft_f1 = (2 * tp + eps) / (2 * tp + fp + fn + eps)
+    return 1.0 - soft_f1.mean()
+
+
 def tail_same_action_set_ranking_loss(reason_logits, reason_targets, action_targets, margin: float = 0.1):
     pos = reason_targets > 0.5
     neg = ~pos
