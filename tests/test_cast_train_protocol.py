@@ -83,17 +83,27 @@ def test_resume_filters_only_legacy_frozen_dino_vproj_keys():
 
 def test_reason_warmup_weights_are_epoch_gated():
     early = train_cast.loss_weights_for_epoch(0)
-    late = train_cast.loss_weights_for_epoch(4)
+    mid = train_cast.loss_weights_for_epoch(4)
+    light = train_cast.loss_weights_for_epoch(11)
+    late = train_cast.loss_weights_for_epoch(21)
     assert early["reason"] == 1.20
     assert early["action_set"] == 0.45
     assert early["drop_add"] == 0.15
-    assert late["reason"] == 0.85
-    assert late["action_set"] == 0.60
-    assert late["drop_add"] == 0.25
     assert "reason_sigmoid_f1" in early
     assert early["reason_sigmoid_f1"] >= 0.08
     assert early["reason_positive_boost"] == 3.0
     assert early["reason_negative_scale"] == 0.5
+    assert mid["reason"] == 1.05
+    assert mid["action_set"] == 0.50
+    assert mid["drop_add"] == 0.20
+    assert mid["reason_positive_boost"] == 2.0
+    assert mid["reason_negative_scale"] == 0.65
+    assert light["reason"] == 0.95
+    assert light["reason_positive_boost"] == 1.5
+    assert light["reason_negative_scale"] == 0.8
+    assert late["reason"] == 0.85
+    assert late["action_set"] == 0.60
+    assert late["drop_add"] == 0.25
     assert late["reason_positive_boost"] == 1.0
     assert late["reason_negative_scale"] == 1.0
 

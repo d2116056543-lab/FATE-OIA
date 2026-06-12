@@ -62,6 +62,18 @@ def loss_weights_for_epoch(epoch: int) -> dict[str, float]:
         weights["drop_add"] = 0.15
         weights["reason_positive_boost"] = 3.0
         weights["reason_negative_scale"] = 0.5
+    elif epoch <= 10:
+        weights["reason"] = 1.05
+        weights["action_set"] = 0.50
+        weights["drop_add"] = 0.20
+        weights["reason_positive_boost"] = 2.0
+        weights["reason_negative_scale"] = 0.65
+    elif epoch <= 20:
+        weights["reason"] = 0.95
+        weights["action_set"] = 0.55
+        weights["drop_add"] = 0.22
+        weights["reason_positive_boost"] = 1.5
+        weights["reason_negative_scale"] = 0.8
     return weights
 
 
