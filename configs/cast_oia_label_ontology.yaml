@@ -1,0 +1,49 @@
+actions:
+  0: forward
+  1: stop
+  2: left
+  3: right
+reasons:
+  0: traffic light is red
+  1: traffic light is green
+  2: traffic sign
+  3: front vehicle
+  4: pedestrian
+  5: rider or bike
+  6: parked vehicle
+  7: obstacle
+  8: lane change or turn left
+  9: lane change or turn right
+  10: clear road
+  11: crosswalk
+  12: solid lane line
+  13: road curb
+  14: drivable area
+  15: vehicle ahead slows
+  16: oncoming traffic
+  17: intersection
+  18: weather or visibility
+  19: uncertain scene
+  20: other driving reason
+groups:
+  action_forward:
+    labels: ["action:forward"]
+    group: action_motion
+  action_stop:
+    labels: ["action:stop"]
+    group: action_stop
+  action_left:
+    labels: ["action:left"]
+    group: action_lateral
+  action_right:
+    labels: ["action:right"]
+    group: action_lateral
+  traffic_control:
+    labels: ["reason:traffic light is red", "reason:traffic light is green", "reason:traffic sign"]
+    group: upper_control_region
+  vulnerable_road_user:
+    labels: ["reason:pedestrian", "reason:rider or bike", "reason:crosswalk"]
+    group: front_center
+  lane_drivable:
+    labels: ["reason:lane change or turn left", "reason:lane change or turn right", "reason:solid lane line", "reason:road curb", "reason:drivable area"]
+    group: ego_corridor

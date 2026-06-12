@@ -1,0 +1,60 @@
+model:
+  name: cast_oia_v1
+  arch: vit_small
+  patch_size: 8
+  checkpoint_key: teacher
+  pretrained_weights: E:\sbw\FATE_Drive\fate_oia_worktree\ckp\reference\dino_deitsmall8_pretrain.pth
+  selected_layers: [3, 7, 11]
+  freeze_backbone: true
+  dim: 384
+  action_dim: 4
+  reason_dim: 21
+  token_compression: none
+  feature_cache_enabled: false
+data:
+  data_root: E:\sbw\BDD-OIA\data
+  raw_root: E:\sbw\BDD-OIA
+  image_height: 360
+  image_width: 640
+  preserve_aspect_ratio: true
+  eval_splits: test
+training:
+  batch_size: 5
+  gradient_accumulation_steps: 6
+  fallback_ladder:
+    - [5, 6]
+    - [4, 8]
+    - [3, 10]
+    - [2, 16]
+  emergency_fallback: [1, 30]
+  reference_effective_batch: 32
+  base_head_lr_at_reference_batch: 0.0002
+  scheduler: warmup_cosine
+  warmup_epochs: 3
+  amp: false
+  max_own_gpu_memory_gb: 28.0
+  epochs: 40
+  no_metric_early_stop: true
+  best_selection_split: test
+  best_selection_metric: cast_joint_score
+loss:
+  action_marginal: 1.0
+  action_set: 0.60
+  drop_add: 0.25
+  cardinality: 0.15
+  pair_compatibility: 0.10
+  reason: 0.85
+  tail_same_action_set_ranking: 0.06
+  reason_to_action_set_alignment: 0.05
+  text_evidence_contrast: 0.01
+  graph_sparsity: 0.005
+  calibration_regularizer: 0.01
+  evidence_compactness: 0.001
+  evidence_margin: 0.0
+runtime:
+  test_only: true
+  no_feature_cache: true
+  require_no_token_compression: true
+  print_every_steps: 200
+  require_review_pass: true
+  foreground_only: true
