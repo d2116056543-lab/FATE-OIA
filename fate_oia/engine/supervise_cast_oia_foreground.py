@@ -18,9 +18,19 @@ def main() -> None:
     ap.add_argument("--require_review_pass", action="store_true")
     ap.add_argument("--output_dir", default=".background_runs/cast_oia_v1_full")
     args = ap.parse_args()
-    review = Path(".background_runs/cast_oia_v1_preflight/REVIEW_PASS_CAST_OIA_V1.txt")
-    if args.require_review_pass and not review.exists():
-        raise SystemExit(f"missing required review pass: {review}")
+    if args.require_review_pass:
+        # Keep this literal command visible for audit: git rev-parse HEAD
+        current_head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+        review_candidates = [
+            Path(".background_runs/cast_oia_v1_preflight_postcommit/REVIEW_PASS_CAST_OIA_V1.txt"),
+            Path(".background_runs/cast_oia_v1_preflight/REVIEW_PASS_CAST_OIA_V1.txt"),
+        ]
+        review = next((p for p in review_candidates if p.exists()), None)
+        if review is None:
+            raise SystemExit("missing required review pass: REVIEW_PASS_CAST_OIA_V1.txt")
+        review_text = review.read_text(encoding="utf-8", errors="ignore")
+        if current_head not in review_text:
+            raise SystemExit(f"review pass {review} is not bound to current HEAD {current_head}")
     candidates = [(args.batch_size, args.grad_accum)] + [x for x in FALLBACK_LADDER if x != (args.batch_size, args.grad_accum)] + [EMERGENCY_FALLBACK]
     last = None
     for batch, accum in candidates:

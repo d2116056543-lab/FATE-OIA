@@ -35,3 +35,10 @@ def test_train_protocol_uses_direct_image_test_only_no_cache():
     assert "feature_cache_enabled" in src
     assert "token_compression" in src
     assert "checkpoint_best_test.pth" in src
+
+
+def test_supervisor_requires_review_pass_bound_to_current_head():
+    src = inspect.getsource(supervisor)
+    assert "cast_oia_v1_preflight_postcommit" in src
+    assert "git rev-parse HEAD" in src
+    assert "REVIEW_PASS_CAST_OIA_V1.txt" in src
