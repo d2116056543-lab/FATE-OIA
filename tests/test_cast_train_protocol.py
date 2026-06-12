@@ -64,6 +64,22 @@ def test_supervisor_and_launcher_forward_resume_checkpoint():
     assert "--resume_checkpoint" in launcher_src
 
 
+def test_resume_filters_only_legacy_frozen_dino_vproj_keys():
+    state = {
+        "head.weight": torch.ones(1),
+        "dino.backbone.blocks.0.attn.vproj.weight": torch.ones(1),
+        "dino.backbone.blocks.0.attn.vproj.bias": torch.zeros(1),
+    }
+    filtered, removed = train_cast._strip_legacy_dino_vproj_keys(state)
+    assert "head.weight" in filtered
+    assert "dino.backbone.blocks.0.attn.vproj.weight" not in filtered
+    assert "dino.backbone.blocks.0.attn.vproj.bias" not in filtered
+    assert removed == [
+        "dino.backbone.blocks.0.attn.vproj.weight",
+        "dino.backbone.blocks.0.attn.vproj.bias",
+    ]
+
+
 
 def test_reason_warmup_weights_are_epoch_gated():
     early = train_cast.loss_weights_for_epoch(0)

@@ -263,6 +263,17 @@ def _load_best_scores_from_metrics(metrics_path: Path) -> tuple[float, float, fl
     return best_cast, best_standard, best_exp
 
 
+def _strip_legacy_dino_vproj_keys(state_dict: dict[str, torch.Tensor]) -> tuple[dict[str, torch.Tensor], list[str]]:
+    removed = [
+        key for key in state_dict
+        if key.startswith("dino.backbone.blocks.") and ".attn.vproj." in key
+    ]
+    if not removed:
+        return state_dict, []
+    filtered = {key: value for key, value in state_dict.items() if key not in removed}
+    return filtered, removed
+
+
 def _load_resume_state(
     resume_checkpoint: str | None,
     model: torch.nn.Module,
@@ -276,7 +287,14 @@ def _load_resume_state(
     if not resume_path.exists():
         raise FileNotFoundError(f"resume checkpoint does not exist: {resume_path}")
     ckpt = torch.load(resume_path, map_location=device)
-    model.load_state_dict(ckpt["model"])
+    state_dict, removed_legacy_keys = _strip_legacy_dino_vproj_keys(ckpt["model"])
+    if removed_legacy_keys:
+        print(json.dumps({
+            "event": "cast_resume_filtered_legacy_keys",
+            "count": len(removed_legacy_keys),
+            "pattern": "dino.backbone.blocks.*.attn.vproj.*",
+        }), flush=True)
+    model.load_state_dict(state_dict)
     if isinstance(ckpt, dict) and "optimizer" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer"])
     resume_epoch = int(ckpt.get("epoch", -1))
