@@ -17,6 +17,7 @@ def main() -> None:
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--require_review_pass", action="store_true")
     ap.add_argument("--output_dir", default=".background_runs/cast_oia_v1_full")
+    ap.add_argument("--resume_checkpoint", default=None)
     args = ap.parse_args()
     if args.require_review_pass:
         # Keep this literal command visible for audit: git rev-parse HEAD
@@ -46,6 +47,8 @@ def main() -> None:
             "--no_feature_cache",
             "--require_no_token_compression",
         ]
+        if args.resume_checkpoint:
+            cmd += ["--resume_checkpoint", args.resume_checkpoint]
         print("CAST_FOREGROUND_COMMAND " + " ".join(cmd), flush=True)
         proc = subprocess.Popen(cmd)
         proc.wait()

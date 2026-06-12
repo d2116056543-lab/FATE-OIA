@@ -45,6 +45,25 @@ def test_supervisor_requires_review_pass_bound_to_current_head():
     assert "REVIEW_PASS_CAST_OIA_V1.txt" in src
 
 
+def test_train_supports_checkpoint_resume_without_resetting_best_scores():
+    src = inspect.getsource(train_cast)
+    assert "--resume_checkpoint" in src
+    assert "_load_resume_state" in src
+    assert "_load_best_scores_from_metrics" in src
+    assert "start_epoch = resume_epoch + 1" in src
+    assert "range(start_epoch" in src
+    assert "checkpoint_latest.pth" in src
+
+
+def test_supervisor_and_launcher_forward_resume_checkpoint():
+    supervisor_src = inspect.getsource(supervisor)
+    launcher_src = Path("scripts/FATE_OIA_cast_oia_v1_foreground.ps1").read_text(encoding="utf-8")
+    assert "--resume_checkpoint" in supervisor_src
+    assert "args.resume_checkpoint" in supervisor_src
+    assert "[string]$ResumeCheckpoint" in launcher_src
+    assert "--resume_checkpoint" in launcher_src
+
+
 
 def test_reason_warmup_weights_are_epoch_gated():
     early = train_cast.loss_weights_for_epoch(0)

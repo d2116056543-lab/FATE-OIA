@@ -244,6 +244,51 @@ def evaluate(model: CastOIAModel, loader: DataLoader, device: torch.device, outp
     return metrics
 
 
+def _load_best_scores_from_metrics(metrics_path: Path) -> tuple[float, float, float]:
+    best_cast = -1e9
+    best_standard = -1e9
+    best_exp = -1e9
+    if not metrics_path.exists():
+        return best_cast, best_standard, best_exp
+    for line in metrics_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        best_cast = max(best_cast, float(row.get("cast_joint_score", -1e9)))
+        best_standard = max(best_standard, float(row.get("standard_joint", -1e9)))
+        best_exp = max(best_exp, float(row.get("Exp_mF1", -1e9)))
+    return best_cast, best_standard, best_exp
+
+
+def _load_resume_state(
+    resume_checkpoint: str | None,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    output_dir: Path,
+) -> tuple[int, float, float, float]:
+    if not resume_checkpoint:
+        return 0, -1e9, -1e9, -1e9
+    resume_path = Path(resume_checkpoint)
+    if not resume_path.exists():
+        raise FileNotFoundError(f"resume checkpoint does not exist: {resume_path}")
+    ckpt = torch.load(resume_path, map_location=device)
+    model.load_state_dict(ckpt["model"])
+    if isinstance(ckpt, dict) and "optimizer" in ckpt:
+        optimizer.load_state_dict(ckpt["optimizer"])
+    resume_epoch = int(ckpt.get("epoch", -1))
+    start_epoch = resume_epoch + 1
+    best_cast, best_standard, best_exp = _load_best_scores_from_metrics(output_dir / "metrics_summary.jsonl")
+    metrics = ckpt.get("metrics", {}) if isinstance(ckpt, dict) else {}
+    best_cast = max(best_cast, float(metrics.get("cast_joint_score", -1e9)))
+    best_standard = max(best_standard, float(metrics.get("standard_joint", -1e9)))
+    best_exp = max(best_exp, float(metrics.get("Exp_mF1", -1e9)))
+    return start_epoch, best_cast, best_standard, best_exp
+
+
 def train(args: argparse.Namespace) -> None:
     cfg = _load_config(args.config)
     if cfg["data"]["eval_splits"] != "test" or args.test_only is False:
@@ -270,6 +315,7 @@ def train(args: argparse.Namespace) -> None:
         "reference_effective_batch": 32,
         "batch_size": cfg["training"]["batch_size"],
         "gradient_accumulation_steps": cfg["training"]["gradient_accumulation_steps"],
+        "resume_checkpoint": args.resume_checkpoint,
     })
     (out / "config_resolved.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
     device = torch.device(args.device if torch.cuda.is_available() and args.device == "cuda" else "cpu")
@@ -277,11 +323,13 @@ def train(args: argparse.Namespace) -> None:
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=float(cfg["training"]["base_head_lr_at_reference_batch"]))
     train_loader = build_loader(cfg, "train", int(cfg["training"]["batch_size"]), args.max_train_samples, True)
     test_loader = build_loader(cfg, "test", int(cfg["training"]["batch_size"]), args.max_test_samples, False)
-    best_cast = -1e9
-    best_standard = -1e9
-    best_exp = -1e9
+    start_epoch, best_cast, best_standard, best_exp = _load_resume_state(args.resume_checkpoint, model, opt, device, out)
+    if start_epoch < int(cfg["training"]["epochs"]):
+        stale_goal = out / "GOAL_COMPLETED_CAST_OIA_V1.json"
+        if stale_goal.exists():
+            stale_goal.unlink()
     grad_accum = int(cfg["training"]["gradient_accumulation_steps"])
-    for epoch in range(int(cfg["training"]["epochs"])):
+    for epoch in range(start_epoch, int(cfg["training"]["epochs"])):
         model.train()
         rows = []
         opt.zero_grad(set_to_none=True)
@@ -327,16 +375,17 @@ def train(args: argparse.Namespace) -> None:
         metrics = evaluate(model, test_loader, device, out, epoch)
         _write_jsonl(out / "metrics_summary.jsonl", [{"epoch": epoch, **metrics}], append=True)
         _write_jsonl(out / "loss_components.jsonl", rows, append=True)
-        torch.save({"model": model.state_dict(), "epoch": epoch, "metrics": metrics}, out / "checkpoint_latest.pth")
+        state = {"model": model.state_dict(), "optimizer": opt.state_dict(), "epoch": epoch, "metrics": metrics}
+        torch.save(state, out / "checkpoint_latest.pth")
         if metrics["cast_joint_score"] > best_cast:
             best_cast = metrics["cast_joint_score"]
-            torch.save({"model": model.state_dict(), "epoch": epoch, "metrics": metrics}, out / "checkpoint_best_test.pth")
+            torch.save(state, out / "checkpoint_best_test.pth")
         if metrics["standard_joint"] > best_standard:
             best_standard = metrics["standard_joint"]
-            torch.save({"model": model.state_dict(), "epoch": epoch, "metrics": metrics}, out / "checkpoint_best_standard_joint.pth")
+            torch.save(state, out / "checkpoint_best_standard_joint.pth")
         if metrics["Exp_mF1"] > best_exp:
             best_exp = metrics["Exp_mF1"]
-            torch.save({"model": model.state_dict(), "epoch": epoch, "metrics": metrics}, out / "checkpoint_best_exp_mf1.pth")
+            torch.save(state, out / "checkpoint_best_exp_mf1.pth")
         print(json.dumps({"event": "cast_epoch", "epoch": epoch, **metrics}, ensure_ascii=False), flush=True)
     write_json(out / "GOAL_COMPLETED_CAST_OIA_V1.json", {"completed": True, "epochs": int(cfg["training"]["epochs"]), "best_cast_joint": best_cast})
 
@@ -351,6 +400,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--max_train_samples", type=int, default=None)
     ap.add_argument("--max_test_samples", type=int, default=None)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--resume_checkpoint", default=None)
     ap.add_argument("--test_only", action="store_true")
     ap.add_argument("--no_feature_cache", action="store_true")
     ap.add_argument("--require_no_token_compression", action="store_true")
