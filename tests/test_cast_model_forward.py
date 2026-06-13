@@ -10,15 +10,30 @@ def test_cast_model_forward_with_synthetic_tokens():
     expected = {
         "action_logits", "reason_logits", "action_set_logits", "action_set_probs",
         "action_marginal_probs", "atomic_action_logits", "pair_logits",
+        "base_action_logits", "cast_action_logits", "action_fusion_gate",
         "cardinality_logits", "label_attention", "label_evidence",
         "label_layer_weights", "graph_edge_weights", "reason_to_set_logits",
         "reason_reliability", "evidence_stats", "graph_stats", "action_set_stats",
     }
     assert expected.issubset(out.keys())
     assert out["action_logits"].shape == (2, 4)
+    assert out["base_action_logits"].shape == (2, 4)
+    assert out["cast_action_logits"].shape == (2, 4)
+    assert out["action_fusion_gate"].shape == (2, 4)
+    assert torch.all(out["action_fusion_gate"] >= 0.0)
+    assert torch.all(out["action_fusion_gate"] <= 1.0)
     assert out["reason_logits"].shape == (2, 21)
     assert out["action_set_logits"].shape == (2, 16)
     assert out["label_attention"].shape[-1] == 16
+
+
+def test_cast_final_action_is_guarded_base_action_fusion():
+    model = CastOIAModel(dim=32, use_dino=False, grid_hw=(4, 4))
+    images = torch.randn(2, 3, 32, 32)
+    out = model(images)
+    expected = out["base_action_logits"] + out["action_fusion_gate"] * out["bounded_action_delta"]
+    assert torch.allclose(out["action_logits"], expected, atol=1e-6)
+    assert torch.max(torch.abs(out["bounded_action_delta"])) <= 2.0 + 1e-6
 
 
 

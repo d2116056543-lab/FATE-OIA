@@ -38,6 +38,17 @@ def test_train_protocol_uses_direct_image_test_only_no_cache():
     assert "checkpoint_best_test.pth" in src
 
 
+def test_train_protocol_supervises_and_logs_action_anchor_branches():
+    src = inspect.getsource(train_cast)
+    assert "loss_action_base" in src
+    assert "loss_action_cast" in src
+    assert "base_action_logits" in src
+    assert "cast_action_logits" in src
+    assert "action_fusion_gate" in src
+    assert "logits_action_base_test.pt" in src
+    assert "logits_action_cast_test.pt" in src
+
+
 def test_supervisor_requires_review_pass_bound_to_current_head():
     src = inspect.getsource(supervisor)
     assert "cast_oia_v1_preflight_postcommit" in src

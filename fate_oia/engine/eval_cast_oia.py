@@ -94,6 +94,16 @@ def compute_action_set_metrics(action_set_probs: torch.Tensor, action_targets: t
 
 def evaluate_cast_outputs(outputs: dict[str, torch.Tensor], labels_action: torch.Tensor, labels_reason: torch.Tensor) -> dict[str, Any]:
     action_metrics = multilabel_metrics_from_logits(outputs["action_logits"], labels_action, 0.5)
+    base_action_metrics = (
+        multilabel_metrics_from_logits(outputs["base_action_logits"], labels_action, 0.5)
+        if "base_action_logits" in outputs
+        else None
+    )
+    cast_action_metrics = (
+        multilabel_metrics_from_logits(outputs["cast_action_logits"], labels_action, 0.5)
+        if "cast_action_logits" in outputs
+        else None
+    )
     reason_metrics = multilabel_metrics_from_logits(outputs["reason_logits"], labels_reason, 0.5)
     reason_diag = _reason_threshold_diagnostics(outputs["reason_logits"], labels_reason)
     aset = compute_action_set_metrics(outputs["action_set_probs"], labels_action)
@@ -101,7 +111,7 @@ def evaluate_cast_outputs(outputs: dict[str, torch.Tensor], labels_action: torch
     act = action_metrics["mF1"]
     exp = reason_metrics["mF1"]
     cast_joint = 0.40 * act + 0.35 * exp + 0.10 * aset["subset_top1_acc"] + 0.10 * aset["cardinality_acc"] + 0.05 * evidence_common
-    return {
+    result = {
         "Act_mF1": act,
         "Act_oF1": action_metrics["oF1"],
         "Exp_mF1": exp,
@@ -116,6 +126,19 @@ def evaluate_cast_outputs(outputs: dict[str, torch.Tensor], labels_action: torch
         "cast_joint_score": cast_joint,
         "standard_joint": 0.5 * act + 0.5 * exp,
     }
+    if base_action_metrics is not None:
+        result.update({
+            "Act_mF1_base": base_action_metrics["mF1"],
+            "Act_oF1_base": base_action_metrics["oF1"],
+            "per_action_F1_base": base_action_metrics["per_label_f1"],
+        })
+    if cast_action_metrics is not None:
+        result.update({
+            "Act_mF1_cast": cast_action_metrics["mF1"],
+            "Act_oF1_cast": cast_action_metrics["oF1"],
+            "per_action_F1_cast": cast_action_metrics["per_label_f1"],
+        })
+    return result
 
 
 def write_json(path: Path, data: Any) -> None:

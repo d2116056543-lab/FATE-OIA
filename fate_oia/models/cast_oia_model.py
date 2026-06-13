@@ -59,8 +59,11 @@ class CastOIAModel(nn.Module):
         self.set_node_seed = nn.Parameter(torch.zeros(16, dim))
         self.graph = CastEvidenceGraph(dim=dim, num_labels=action_dim + reason_dim, num_sets=16, topk_edges=16)
         self.action_set = CastActionSetEnergy(dim=dim, action_dim=action_dim)
+        self.base_action_head = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, 1))
+        self.action_fusion_gate = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, 1))
         self.reason = CastReasonReliability(dim=dim, reason_dim=reason_dim)
         nn.init.normal_(self.set_node_seed, std=0.02)
+        nn.init.constant_(self.action_fusion_gate[-1].bias, -4.0)
 
     def _extract_field(self, images: torch.Tensor) -> dict[str, Any]:
         if self.use_dino:
@@ -91,12 +94,17 @@ class CastOIAModel(nn.Module):
         text_similarity = q["text_similarity_matrix"].to(images.device, images.dtype)
         ev = self.label_evidence(label_queries, patch_tokens, ego_features)
         label_nodes = label_queries.view(1, -1, self.dim).expand(images.shape[0], -1, -1) + ev["label_evidence"]
+        base_action_logits = self.base_action_head(label_nodes[:, : self.action_dim]).squeeze(-1)
         set_nodes = self.set_node_seed.view(1, 16, self.dim).expand(images.shape[0], -1, -1)
         graph = self.graph(label_nodes, ev["label_evidence"], ev["label_attention"], set_nodes, text_similarity)
         updated_labels = graph["updated_label_nodes"]
         updated_sets = graph["updated_set_nodes"]
         graph_context = updated_sets.mean(1)
         aset = self.action_set(updated_labels[:, : self.action_dim], graph_context, updated_sets)
+        cast_action_logits = aset["action_logits"]
+        action_fusion_gate = torch.sigmoid(self.action_fusion_gate(updated_labels[:, : self.action_dim]).squeeze(-1))
+        bounded_action_delta = 2.0 * torch.tanh((cast_action_logits - base_action_logits) / 2.0)
+        action_logits = base_action_logits + action_fusion_gate * bounded_action_delta
         reason_nodes = updated_labels[:, self.action_dim :]
         graph_support = torch.sigmoid(graph["reason_to_set_logits"]).mean(-1)
         evidence_conf = ev["label_attention"][:, self.action_dim :].amax(-1)
@@ -106,7 +114,11 @@ class CastOIAModel(nn.Module):
         evidence_stats["original_tokens"] = int(field["original_tokens"])
         evidence_stats["grid_hw"] = list(field["grid_hw"])
         return {
-            "action_logits": aset["action_logits"],
+            "action_logits": action_logits,
+            "base_action_logits": base_action_logits,
+            "cast_action_logits": cast_action_logits,
+            "action_fusion_gate": action_fusion_gate,
+            "bounded_action_delta": bounded_action_delta,
             "reason_logits": reason["reason_logits"],
             "action_set_logits": aset["action_set_logits"],
             "action_set_probs": aset["action_set_probs"],
