@@ -94,6 +94,11 @@ def compute_action_set_metrics(action_set_probs: torch.Tensor, action_targets: t
 
 def evaluate_cast_outputs(outputs: dict[str, torch.Tensor], labels_action: torch.Tensor, labels_reason: torch.Tensor) -> dict[str, Any]:
     action_metrics = multilabel_metrics_from_logits(outputs["action_logits"], labels_action, 0.5)
+    main_action_metrics = (
+        multilabel_metrics_from_logits(outputs["main_action_logits"], labels_action, 0.5)
+        if "main_action_logits" in outputs
+        else None
+    )
     base_action_metrics = (
         multilabel_metrics_from_logits(outputs["base_action_logits"], labels_action, 0.5)
         if "base_action_logits" in outputs
@@ -126,6 +131,12 @@ def evaluate_cast_outputs(outputs: dict[str, torch.Tensor], labels_action: torch
         "cast_joint_score": cast_joint,
         "standard_joint": 0.5 * act + 0.5 * exp,
     }
+    if main_action_metrics is not None:
+        result.update({
+            "Act_mF1_main": main_action_metrics["mF1"],
+            "Act_oF1_main": main_action_metrics["oF1"],
+            "per_action_F1_main": main_action_metrics["per_label_f1"],
+        })
     if base_action_metrics is not None:
         result.update({
             "Act_mF1_base": base_action_metrics["mF1"],

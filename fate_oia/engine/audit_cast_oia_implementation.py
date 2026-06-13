@@ -107,6 +107,7 @@ def run_audit(repo_root: Path, config: Path, output_dir: Path, write_review_pass
         out = model(torch.randn(2, 3, 32, 32))
         forward_ok = (
             tuple(out["action_logits"].shape) == (2, 4)
+            and tuple(out["main_action_logits"].shape) == (2, 4)
             and tuple(out["base_action_logits"].shape) == (2, 4)
             and tuple(out["cast_action_logits"].shape) == (2, 4)
             and tuple(out["action_fusion_gate"].shape) == (2, 4)
