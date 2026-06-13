@@ -22,7 +22,8 @@ from fate_oia.transforms import AspectRatioLetterboxTransform
 
 LOSS_WEIGHTS = {
     "action_marginal": 1.00,
-    "action_base": 1.00,
+    "action_main": 1.00,
+    "action_base": 0.00,
     "action_cast": 0.35,
     "action_set": 0.60,
     "drop_add": 0.25,
@@ -129,6 +130,7 @@ def build_model(cfg: dict[str, Any], device: torch.device) -> CastOIAModel:
 def compute_loss(out: dict[str, Any], action: torch.Tensor, reason: torch.Tensor, epoch: int) -> tuple[torch.Tensor, dict[str, float]]:
     losses = {
         "loss_action_marginal": L.action_multi_label_asl_loss(out["action_logits"], action),
+        "loss_action_main": L.action_multi_label_asl_loss(out["main_action_logits"], action),
         "loss_action_base": L.action_multi_label_asl_loss(out["base_action_logits"], action),
         "loss_action_cast": L.action_multi_label_asl_loss(out["cast_action_logits"], action),
         "loss_action_set": L.action_set_ce_loss(out["action_set_logits"], action),
@@ -147,6 +149,7 @@ def compute_loss(out: dict[str, Any], action: torch.Tensor, reason: torch.Tensor
     weights = loss_weights_for_epoch(epoch)
     total = (
         weights["action_marginal"] * losses["loss_action_marginal"]
+        + weights["action_main"] * losses["loss_action_main"]
         + weights["action_base"] * losses["loss_action_base"]
         + weights["action_cast"] * losses["loss_action_cast"]
         + weights["action_set"] * losses["loss_action_set"]
@@ -182,6 +185,7 @@ def evaluate(model: CastOIAModel, loader: DataLoader, device: torch.device, outp
     model.eval()
     outs: dict[str, list[torch.Tensor]] = {
         "action_logits": [],
+        "main_action_logits": [],
         "base_action_logits": [],
         "cast_action_logits": [],
         "action_fusion_gate": [],
@@ -246,6 +250,7 @@ def evaluate(model: CastOIAModel, loader: DataLoader, device: torch.device, outp
     epoch_dir = output_dir / f"epoch_{epoch:03d}"
     epoch_dir.mkdir(parents=True, exist_ok=True)
     torch.save(cat["action_logits"], epoch_dir / "logits_action_test.pt")
+    torch.save(cat["main_action_logits"], epoch_dir / "logits_action_main_test.pt")
     torch.save(cat["base_action_logits"], epoch_dir / "logits_action_base_test.pt")
     torch.save(cat["cast_action_logits"], epoch_dir / "logits_action_cast_test.pt")
     torch.save(cat["action_fusion_gate"], epoch_dir / "action_fusion_gate_test.pt")
@@ -399,6 +404,7 @@ def train(args: argparse.Namespace) -> None:
                     "lr": opt.param_groups[0]["lr"],
                     **scalars,
                     "action_fusion_gate_mean": float(out_dict["action_fusion_gate"].detach().mean().cpu()),
+                    "action_main_prob_mean": float(torch.sigmoid(out_dict["main_action_logits"].detach()).mean().cpu()),
                     "action_base_prob_mean": float(torch.sigmoid(out_dict["base_action_logits"].detach()).mean().cpu()),
                     "action_cast_prob_mean": float(torch.sigmoid(out_dict["cast_action_logits"].detach()).mean().cpu()),
                     "pred_cardinality_mean": float((out_dict["action_set_probs"].detach() @ subset_cardinality).mean().detach().cpu()),

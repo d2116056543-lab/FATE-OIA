@@ -41,11 +41,12 @@ def test_train_protocol_uses_direct_image_test_only_no_cache():
 def test_train_protocol_supervises_and_logs_action_anchor_branches():
     src = inspect.getsource(train_cast)
     assert "loss_action_base" in src
+    assert "loss_action_main" in src
     assert "loss_action_cast" in src
-    assert "base_action_logits" in src
+    assert "main_action_logits" in src
     assert "cast_action_logits" in src
     assert "action_fusion_gate" in src
-    assert "logits_action_base_test.pt" in src
+    assert "logits_action_main_test.pt" in src
     assert "logits_action_cast_test.pt" in src
 
 

@@ -14,6 +14,7 @@ from fate_oia.models.cast_evidence_graph import CastEvidenceGraph
 from fate_oia.models.cast_label_evidence import CastLabelEvidence
 from fate_oia.models.cast_reason_reliability import CastReasonReliability
 from fate_oia.models.cast_text_encoder import CastLabelQueryBuilder, build_label_texts
+from fate_oia.models.label_query_head import LabelQueryHead
 
 
 class CastOIAModel(nn.Module):
@@ -59,7 +60,9 @@ class CastOIAModel(nn.Module):
         self.set_node_seed = nn.Parameter(torch.zeros(16, dim))
         self.graph = CastEvidenceGraph(dim=dim, num_labels=action_dim + reason_dim, num_sets=16, topk_edges=16)
         self.action_set = CastActionSetEnergy(dim=dim, action_dim=action_dim)
-        self.base_action_head = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, 1))
+        # Main strong-baseline action anchor: the original FATE-OIA label-query
+        # head over dense DINO tokens. CAST may only add a bounded residual.
+        self.main_label_head = LabelQueryHead(dim, action_dim + reason_dim)
         self.action_fusion_gate = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, 1))
         self.reason = CastReasonReliability(dim=dim, reason_dim=reason_dim)
         nn.init.normal_(self.set_node_seed, std=0.02)
@@ -70,16 +73,20 @@ class CastOIAModel(nn.Module):
             with torch.no_grad():
                 field = self.dino(images)
             patches = self.input_proj(field["patch_tokens_by_layer"])
+            cls_tokens = self.input_proj(field["cls_tokens_by_layer"])
             return {
                 "patch_tokens_by_layer": patches,
+                "cls_tokens_by_layer": cls_tokens,
                 "grid_hw": field["grid_hw"],
                 "original_tokens": field["original_tokens"],
             }
         patches = self.synthetic_patch(images).flatten(2).transpose(1, 2)
         h, w = images.shape[-2] // 8, images.shape[-1] // 8
         self.ego.grid_hw = (h, w)
+        cls = patches.mean(dim=1)
         return {
             "patch_tokens_by_layer": torch.stack([patches, patches * 0.7, patches * 1.3], dim=1),
+            "cls_tokens_by_layer": torch.stack([cls, cls * 0.7, cls * 1.3], dim=1),
             "grid_hw": (h, w),
             "original_tokens": patches.shape[1] + 1,
         }
@@ -87,6 +94,10 @@ class CastOIAModel(nn.Module):
     def forward(self, images: torch.Tensor) -> dict[str, Any]:
         field = self._extract_field(images)
         patch_tokens = field["patch_tokens_by_layer"]
+        main_dense_tokens = torch.cat([field["cls_tokens_by_layer"][:, -1:].contiguous(), patch_tokens[:, -1]], dim=1)
+        main_out = self.main_label_head(main_dense_tokens)
+        main_label_logits = main_out["logits"]
+        main_action_logits = main_label_logits[:, : self.action_dim]
         self.ego.grid_hw = tuple(field["grid_hw"])
         patch_tokens, ego_features = self.ego(patch_tokens)
         q = self.query_builder(self.label_texts)
@@ -94,7 +105,7 @@ class CastOIAModel(nn.Module):
         text_similarity = q["text_similarity_matrix"].to(images.device, images.dtype)
         ev = self.label_evidence(label_queries, patch_tokens, ego_features)
         label_nodes = label_queries.view(1, -1, self.dim).expand(images.shape[0], -1, -1) + ev["label_evidence"]
-        base_action_logits = self.base_action_head(label_nodes[:, : self.action_dim]).squeeze(-1)
+        base_action_logits = main_action_logits
         set_nodes = self.set_node_seed.view(1, 16, self.dim).expand(images.shape[0], -1, -1)
         graph = self.graph(label_nodes, ev["label_evidence"], ev["label_attention"], set_nodes, text_similarity)
         updated_labels = graph["updated_label_nodes"]
@@ -103,8 +114,8 @@ class CastOIAModel(nn.Module):
         aset = self.action_set(updated_labels[:, : self.action_dim], graph_context, updated_sets)
         cast_action_logits = aset["action_logits"]
         action_fusion_gate = torch.sigmoid(self.action_fusion_gate(updated_labels[:, : self.action_dim]).squeeze(-1))
-        bounded_action_delta = 2.0 * torch.tanh((cast_action_logits - base_action_logits) / 2.0)
-        action_logits = base_action_logits + action_fusion_gate * bounded_action_delta
+        bounded_action_delta = 2.0 * torch.tanh((cast_action_logits - main_action_logits) / 2.0)
+        action_logits = main_action_logits + action_fusion_gate * bounded_action_delta
         reason_nodes = updated_labels[:, self.action_dim :]
         graph_support = torch.sigmoid(graph["reason_to_set_logits"]).mean(-1)
         evidence_conf = ev["label_attention"][:, self.action_dim :].amax(-1)
@@ -115,6 +126,9 @@ class CastOIAModel(nn.Module):
         evidence_stats["grid_hw"] = list(field["grid_hw"])
         return {
             "action_logits": action_logits,
+            "main_action_logits": main_action_logits,
+            "main_label_logits": main_label_logits,
+            "main_label_attention": main_out["attention"],
             "base_action_logits": base_action_logits,
             "cast_action_logits": cast_action_logits,
             "action_fusion_gate": action_fusion_gate,
