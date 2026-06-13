@@ -47,9 +47,19 @@ class EaglePUModel(nn.Module):
         self.proto_gate_head = nn.Linear(dim, reason_dim)
         self.graph_gate_head = nn.Linear(dim, reason_dim)
 
-    def forward(self, images: torch.Tensor, epoch: int = 0) -> dict[str, torch.Tensor | dict | tuple[int, int] | int]:
+    def forward(
+        self,
+        images: torch.Tensor,
+        epoch: int = 0,
+        patch_delete_mask: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor | dict | tuple[int, int] | int]:
         field = self.dino(images)
         patch = self.input_proj(field["patch_tokens_by_layer"])
+        if patch_delete_mask is not None:
+            mask = patch_delete_mask.to(device=patch.device, dtype=patch.dtype)
+            if mask.ndim != 2 or mask.shape[-1] != patch.shape[2]:
+                raise ValueError(f"patch_delete_mask must be [B,{patch.shape[2]}], got {tuple(mask.shape)}")
+            patch = patch * (1.0 - mask[:, None, :, None])
         cls = self.input_proj(field["cls_tokens_by_layer"])
         # Freeze DINO features but keep downstream modules trainable.
         ego_tokens, ego_stats = self.ego(patch[:, 0])
@@ -68,7 +78,9 @@ class EaglePUModel(nn.Module):
         state_summary = state["state_tokens"].mean(1)
         proto_gate = torch.sigmoid(self.proto_gate_head(state_summary))
         graph_gate = torch.sigmoid(self.graph_gate_head(state_summary))
-        reason_logits_final_raw = trunk["reason_logits_direct"] + proto_gate * proto["prototype_reason_delta"] + graph_gate * graph["reason_graph_delta"]
+        reason_logits_direct_plus_prototype = trunk["reason_logits_direct"] + proto_gate * proto["prototype_reason_delta"]
+        reason_logits_direct_plus_graph = trunk["reason_logits_direct"] + graph_gate * graph["reason_graph_delta"]
+        reason_logits_final_raw = reason_logits_direct_plus_prototype + graph_gate * graph["reason_graph_delta"]
         action_logits_final_raw = trunk["action_logits_direct"]
         raw_all = torch.cat([action_logits_final_raw, reason_logits_final_raw], dim=-1)
         calibrated_all, calib_temperature, calib_bias = self.calibration(raw_all)
@@ -87,6 +99,8 @@ class EaglePUModel(nn.Module):
             "cls_tokens_by_layer_projected": cls,
             "proto_gate": proto_gate,
             "graph_gate": graph_gate,
+            "reason_logits_direct_plus_prototype": reason_logits_direct_plus_prototype,
+            "reason_logits_direct_plus_graph": reason_logits_direct_plus_graph,
             "action_logits_final_raw": action_logits_final_raw,
             "reason_logits_final_raw": reason_logits_final_raw,
             "action_logits_final_calibrated": calibrated_all[:, : self.action_dim],

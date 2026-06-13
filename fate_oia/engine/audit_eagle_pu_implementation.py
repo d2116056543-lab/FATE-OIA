@@ -43,19 +43,53 @@ def run_static_audit(repo: Path, config_path: Path) -> dict[str, Any]:
                     continue
                 hits.append(str(p.relative_to(repo)))
         forbidden_results[pat] = hits
-    functional = {name: {"pass": True, "evidence": "static contract present"} for name in FUNCTIONAL_CHECKS}
-    for file, needles in {
+    functional = {name: {"pass": False, "evidence": ""} for name in FUNCTIONAL_CHECKS}
+    check_map = {
         "fate_oia/models/eagle_pu_dino_field.py": ["selected_layers", "requires_grad = False", "patch_tokens_by_layer", "original_tokens"],
         "fate_oia/models/eagle_pu_ego_encoding.py": ["front_center", "left_corridor", "right_corridor", "upper_control_region"],
-        "fate_oia/models/eagle_pu_model.py": ["action_logits_final_raw = trunk[\"action_logits_direct\"]", "state_group_logits", "state_layer_weights", "reason_reliability"],
+        "fate_oia/models/eagle_pu_model.py": ["action_logits_final_raw", "state_group_logits", "state_layer_weights", "reason_reliability", "patch_delete_mask"],
         "fate_oia/losses/eagle_pu_losses.py": ["positive_unlabeled_reason_loss", "reason_soft_f1_loss", "evidence_margin_loss", "LOSS_WEIGHTS"],
-        "fate_oia/engine/train_eagle_pu_oia.py": ["--test_only", "--no_feature_cache", "--require_no_token_compression", "checkpoint_best_test_final_raw.pth"],
-    }.items():
+        "fate_oia/engine/train_eagle_pu_oia.py": ["--test_only", "--no_feature_cache", "--require_no_token_compression", "checkpoint_best_test_final_raw.pth", "run_selected_vs_random_evidence_audit", "evaluate_branch_metric_views"],
+        "fate_oia/engine/eagle_pu_artifacts.py": ["write_json", "append_jsonl", "save_tensor"],
+        "fate_oia/engine/export_eagle_pu_visuals.py": ["evidence_state_attention.png", "prototype_transport.json", "state_graph_edges.json"],
+    }
+    for file, needles in check_map.items():
         src = _read(repo / file) if (repo / file).exists() else ""
         for needle in needles:
             if needle not in src:
                 missing.append(f"{file}:{needle}")
-    return {"pass": not missing and not any(forbidden_results.values()), "checked_files": REQUIRED_FILES, "forbidden_pattern_results": forbidden_results, "functional_checks": functional, "missing_items": missing, "warnings": warnings}
+    functional_sources = {
+        "Dataset and targets": ("fate_oia/engine/train_eagle_pu_oia.py", ["WeakStateTargetBuilder", "state_targets"]),
+        "DINO field": ("fate_oia/models/eagle_pu_dino_field.py", ["selected_layers", "original_tokens"]),
+        "Ego encoding": ("fate_oia/models/eagle_pu_ego_encoding.py", ["front_center", "right_corridor"]),
+        "Ontology": ("configs/eagle_pu_reason_ontology.yaml", ["positive_states", "negative_states", "compatible_actions", "spatial_prior"]),
+        "State bank": ("fate_oia/models/eagle_pu_state_bank.py", ["state_group_logits", "state_layer_weights"]),
+        "Label decision trunk": ("fate_oia/models/eagle_pu_label_trunk.py", ["clamp(0.10, 0.90)", "action_logits_direct"]),
+        "Positive-unlabeled reason loss": ("fate_oia/losses/eagle_pu_losses.py", ["positive_unlabeled_reason_loss", "pos_loss", "neg_w = 0.4 + 0.6 * reliability"]),
+        "Prototype transport": ("fate_oia/models/eagle_pu_proto_transport.py", ["num_prototypes", "0.12"]),
+        "State-grounded graph": ("fate_oia/models/eagle_pu_state_graph.py", ["reason_graph_delta", "use_action_delta"]),
+        "Action-set auxiliary": ("fate_oia/models/eagle_pu_action_set_aux.py", ["subset_membership", "action_set_logits"]),
+        "Calibration": ("fate_oia/models/eagle_pu_calibration.py", ["0.5", "3.0", "-2.0", "2.0"]),
+        "Full model forward": ("fate_oia/models/eagle_pu_model.py", ["reason_logits_direct_plus_prototype", "reason_logits_direct_plus_graph", "action_logits_final_raw"]),
+        "Training protocol": ("fate_oia/engine/train_eagle_pu_oia.py", ["best_selection_split", "test_only", "branch_metrics"]),
+        "Foreground supervisor": ("fate_oia/engine/supervise_eagle_pu_foreground.py", ["ladder", "is_oom", "subprocess.Popen"]),
+    }
+    for name, (file, needles) in functional_sources.items():
+        src = _read(repo / file) if (repo / file).exists() else ""
+        ok = all(needle in src for needle in needles)
+        if name == "Ontology":
+            ok = ok and "reason_0" not in src and "placeholder" not in src.lower()
+        functional[name] = {"pass": ok, "evidence": f"{file}:{','.join(needles)}"}
+        if not ok:
+            missing.append(f"functional:{name}")
+    artifact_schema = {
+        "required_epoch_files": [
+            "run_manifest.json", "config_resolved.yaml", "implementation_fingerprint.json",
+            "branch_metrics.jsonl", "evidence_faithfulness_audit.jsonl", "state_bank_stats.jsonl",
+        ],
+        "hard_checks": ["state targets not None", "selected-vs-random audit", "separate branch metrics"],
+    }
+    return {"pass": not missing and not any(forbidden_results.values()), "checked_files": REQUIRED_FILES, "forbidden_pattern_results": forbidden_results, "functional_checks": functional, "artifact_schema": artifact_schema, "missing_items": missing, "warnings": warnings}
 
 def run_dynamic_forward(repo: Path, device: str) -> dict[str, Any]:
     dev = torch.device(device if torch.cuda.is_available() and device != "cpu" else "cpu")
