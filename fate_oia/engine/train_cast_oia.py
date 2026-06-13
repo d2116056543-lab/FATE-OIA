@@ -23,6 +23,7 @@ from fate_oia.transforms import AspectRatioLetterboxTransform
 LOSS_WEIGHTS = {
     "action_marginal": 1.00,
     "action_main": 1.00,
+    "reason_main": 1.00,
     "action_base": 0.00,
     "action_cast": 0.35,
     "action_set": 0.60,
@@ -60,15 +61,24 @@ def _deep_update(base: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any
 def loss_weights_for_epoch(epoch: int) -> dict[str, float]:
     weights = dict(LOSS_WEIGHTS)
     if epoch <= 3:
+        # Match the strong-baseline action path first. CAST action-set and
+        # residual fusion are enabled only after the main action anchor is alive.
         weights["reason"] = 1.20
-        weights["action_set"] = 0.45
-        weights["drop_add"] = 0.15
+        weights["action_marginal"] = 0.0
+        weights["action_main"] = 1.0
+        weights["action_cast"] = 0.0
+        weights["action_set"] = 0.0
+        weights["drop_add"] = 0.0
+        weights["pair_compatibility"] = 0.0
+        weights["calibration_regularizer"] = 0.0
         weights["reason_positive_boost"] = 3.0
         weights["reason_negative_scale"] = 0.5
     elif epoch <= 10:
         weights["reason"] = 1.05
-        weights["action_set"] = 0.50
-        weights["drop_add"] = 0.20
+        weights["action_marginal"] = 1.0
+        weights["action_cast"] = 0.20
+        weights["action_set"] = 0.30
+        weights["drop_add"] = 0.10
         weights["reason_positive_boost"] = 2.0
         weights["reason_negative_scale"] = 0.65
     elif epoch <= 20:
@@ -131,6 +141,7 @@ def compute_loss(out: dict[str, Any], action: torch.Tensor, reason: torch.Tensor
     losses = {
         "loss_action_marginal": L.action_multi_label_asl_loss(out["action_logits"], action),
         "loss_action_main": L.action_multi_label_asl_loss(out["main_action_logits"], action),
+        "loss_reason_main": L.reason_reliability_asl_loss(out["main_reason_logits"], reason, torch.ones_like(out["main_reason_logits"])),
         "loss_action_base": L.action_multi_label_asl_loss(out["base_action_logits"], action),
         "loss_action_cast": L.action_multi_label_asl_loss(out["cast_action_logits"], action),
         "loss_action_set": L.action_set_ce_loss(out["action_set_logits"], action),
@@ -150,6 +161,7 @@ def compute_loss(out: dict[str, Any], action: torch.Tensor, reason: torch.Tensor
     total = (
         weights["action_marginal"] * losses["loss_action_marginal"]
         + weights["action_main"] * losses["loss_action_main"]
+        + weights["reason_main"] * losses["loss_reason_main"]
         + weights["action_base"] * losses["loss_action_base"]
         + weights["action_cast"] * losses["loss_action_cast"]
         + weights["action_set"] * losses["loss_action_set"]
@@ -186,6 +198,7 @@ def evaluate(model: CastOIAModel, loader: DataLoader, device: torch.device, outp
     outs: dict[str, list[torch.Tensor]] = {
         "action_logits": [],
         "main_action_logits": [],
+        "main_reason_logits": [],
         "base_action_logits": [],
         "cast_action_logits": [],
         "action_fusion_gate": [],
@@ -251,6 +264,7 @@ def evaluate(model: CastOIAModel, loader: DataLoader, device: torch.device, outp
     epoch_dir.mkdir(parents=True, exist_ok=True)
     torch.save(cat["action_logits"], epoch_dir / "logits_action_test.pt")
     torch.save(cat["main_action_logits"], epoch_dir / "logits_action_main_test.pt")
+    torch.save(cat["main_reason_logits"], epoch_dir / "logits_reason_main_test.pt")
     torch.save(cat["base_action_logits"], epoch_dir / "logits_action_base_test.pt")
     torch.save(cat["cast_action_logits"], epoch_dir / "logits_action_cast_test.pt")
     torch.save(cat["action_fusion_gate"], epoch_dir / "action_fusion_gate_test.pt")

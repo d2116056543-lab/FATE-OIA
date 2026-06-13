@@ -42,8 +42,10 @@ def test_train_protocol_supervises_and_logs_action_anchor_branches():
     src = inspect.getsource(train_cast)
     assert "loss_action_base" in src
     assert "loss_action_main" in src
+    assert "loss_reason_main" in src
     assert "loss_action_cast" in src
     assert "main_action_logits" in src
+    assert "main_reason_logits" in src
     assert "cast_action_logits" in src
     assert "action_fusion_gate" in src
     assert "logits_action_main_test.pt" in src
@@ -99,15 +101,22 @@ def test_reason_warmup_weights_are_epoch_gated():
     light = train_cast.loss_weights_for_epoch(11)
     late = train_cast.loss_weights_for_epoch(21)
     assert early["reason"] == 1.20
-    assert early["action_set"] == 0.45
-    assert early["drop_add"] == 0.15
+    assert early["action_marginal"] == 0.0
+    assert early["action_main"] == 1.0
+    assert early["action_cast"] == 0.0
+    assert early["action_set"] == 0.0
+    assert early["drop_add"] == 0.0
+    assert early["pair_compatibility"] == 0.0
+    assert early["calibration_regularizer"] == 0.0
     assert "reason_sigmoid_f1" in early
     assert early["reason_sigmoid_f1"] >= 0.08
     assert early["reason_positive_boost"] == 3.0
     assert early["reason_negative_scale"] == 0.5
     assert mid["reason"] == 1.05
-    assert mid["action_set"] == 0.50
-    assert mid["drop_add"] == 0.20
+    assert mid["action_marginal"] == 1.0
+    assert mid["action_cast"] == 0.20
+    assert mid["action_set"] == 0.30
+    assert mid["drop_add"] == 0.10
     assert mid["reason_positive_boost"] == 2.0
     assert mid["reason_negative_scale"] == 0.65
     assert light["reason"] == 0.95

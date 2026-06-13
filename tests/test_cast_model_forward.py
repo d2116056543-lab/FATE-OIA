@@ -10,7 +10,8 @@ def test_cast_model_forward_with_synthetic_tokens():
     expected = {
         "action_logits", "reason_logits", "action_set_logits", "action_set_probs",
         "action_marginal_probs", "atomic_action_logits", "pair_logits",
-        "main_action_logits", "main_label_logits", "main_label_attention",
+        "main_action_logits", "main_reason_logits", "main_action_visual_logits",
+        "main_action_reason_logits", "main_label_logits", "main_label_attention",
         "base_action_logits", "cast_action_logits", "action_fusion_gate",
         "cardinality_logits", "label_attention", "label_evidence",
         "label_layer_weights", "graph_edge_weights", "reason_to_set_logits",
@@ -20,6 +21,9 @@ def test_cast_model_forward_with_synthetic_tokens():
     assert out["action_logits"].shape == (2, 4)
     assert out["main_action_logits"].shape == (2, 4)
     assert out["main_label_logits"].shape == (2, 25)
+    assert out["main_reason_logits"].shape == (2, 21)
+    assert out["main_action_visual_logits"].shape == (2, 4)
+    assert out["main_action_reason_logits"].shape == (2, 4)
     assert out["base_action_logits"].shape == (2, 4)
     assert out["cast_action_logits"].shape == (2, 4)
     assert out["action_fusion_gate"].shape == (2, 4)
@@ -39,7 +43,8 @@ def test_cast_final_action_is_guarded_main_action_fusion():
     assert torch.allclose(out["action_logits"], expected, atol=1e-6)
     assert torch.allclose(out["base_action_logits"], out["main_action_logits"], atol=1e-6)
     assert torch.max(torch.abs(out["bounded_action_delta"])) <= 2.0 + 1e-6
-    assert hasattr(model, "main_label_head")
+    assert hasattr(model, "main_oia_head")
+    assert not hasattr(model, "main_label_head")
     assert not hasattr(model, "base_action_head")
 
 

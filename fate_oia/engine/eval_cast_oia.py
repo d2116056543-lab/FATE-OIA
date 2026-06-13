@@ -109,6 +109,11 @@ def evaluate_cast_outputs(outputs: dict[str, torch.Tensor], labels_action: torch
         if "cast_action_logits" in outputs
         else None
     )
+    main_reason_metrics = (
+        multilabel_metrics_from_logits(outputs["main_reason_logits"], labels_reason, 0.5)
+        if "main_reason_logits" in outputs
+        else None
+    )
     reason_metrics = multilabel_metrics_from_logits(outputs["reason_logits"], labels_reason, 0.5)
     reason_diag = _reason_threshold_diagnostics(outputs["reason_logits"], labels_reason)
     aset = compute_action_set_metrics(outputs["action_set_probs"], labels_action)
@@ -142,6 +147,12 @@ def evaluate_cast_outputs(outputs: dict[str, torch.Tensor], labels_action: torch
             "Act_mF1_base": base_action_metrics["mF1"],
             "Act_oF1_base": base_action_metrics["oF1"],
             "per_action_F1_base": base_action_metrics["per_label_f1"],
+        })
+    if main_reason_metrics is not None:
+        result.update({
+            "Exp_mF1_main": main_reason_metrics["mF1"],
+            "Exp_oF1_main": main_reason_metrics["oF1"],
+            "Exp_mAP_main": main_reason_metrics["mAP"],
         })
     if cast_action_metrics is not None:
         result.update({

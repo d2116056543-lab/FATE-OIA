@@ -14,7 +14,7 @@ from fate_oia.models.cast_evidence_graph import CastEvidenceGraph
 from fate_oia.models.cast_label_evidence import CastLabelEvidence
 from fate_oia.models.cast_reason_reliability import CastReasonReliability
 from fate_oia.models.cast_text_encoder import CastLabelQueryBuilder, build_label_texts
-from fate_oia.models.label_query_head import LabelQueryHead
+from fate_oia.models.fate_oia_model import FATEOIAFeatureModel
 
 
 class CastOIAModel(nn.Module):
@@ -60,9 +60,10 @@ class CastOIAModel(nn.Module):
         self.set_node_seed = nn.Parameter(torch.zeros(16, dim))
         self.graph = CastEvidenceGraph(dim=dim, num_labels=action_dim + reason_dim, num_sets=16, topk_edges=16)
         self.action_set = CastActionSetEnergy(dim=dim, action_dim=action_dim)
-        # Main strong-baseline action anchor: the original FATE-OIA label-query
-        # head over dense DINO tokens. CAST may only add a bounded residual.
-        self.main_label_head = LabelQueryHead(dim, action_dim + reason_dim)
+        # Main strong-baseline anchor: full FATE-OIA label-query +
+        # reason-to-action + fusion path over dense DINO tokens. CAST may only
+        # add a bounded residual to this action-fused output.
+        self.main_oia_head = FATEOIAFeatureModel(dim=dim, action_dim=action_dim, reason_dim=reason_dim, use_label_query=True)
         self.action_fusion_gate = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, 1))
         self.reason = CastReasonReliability(dim=dim, reason_dim=reason_dim)
         nn.init.normal_(self.set_node_seed, std=0.02)
@@ -95,9 +96,10 @@ class CastOIAModel(nn.Module):
         field = self._extract_field(images)
         patch_tokens = field["patch_tokens_by_layer"]
         main_dense_tokens = torch.cat([field["cls_tokens_by_layer"][:, -1:].contiguous(), patch_tokens[:, -1]], dim=1)
-        main_out = self.main_label_head(main_dense_tokens)
+        main_out = self.main_oia_head(main_dense_tokens)
         main_label_logits = main_out["logits"]
-        main_action_logits = main_label_logits[:, : self.action_dim]
+        main_action_logits = main_out["action_logits"]
+        main_reason_logits = main_out["reason_logits"]
         self.ego.grid_hw = tuple(field["grid_hw"])
         patch_tokens, ego_features = self.ego(patch_tokens)
         q = self.query_builder(self.label_texts)
@@ -127,6 +129,10 @@ class CastOIAModel(nn.Module):
         return {
             "action_logits": action_logits,
             "main_action_logits": main_action_logits,
+            "main_reason_logits": main_reason_logits,
+            "main_action_visual_logits": main_out["action_visual_logits"],
+            "main_action_reason_logits": main_out["action_reason_logits"],
+            "main_fusion_gate": main_out["fusion_gate"],
             "main_label_logits": main_label_logits,
             "main_label_attention": main_out["attention"],
             "base_action_logits": base_action_logits,

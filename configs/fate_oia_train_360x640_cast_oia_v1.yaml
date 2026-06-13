@@ -28,7 +28,7 @@ training:
     - [2, 16]
   emergency_fallback: [1, 30]
   reference_effective_batch: 32
-  base_head_lr_at_reference_batch: 0.0002
+  base_head_lr_at_reference_batch: 0.0003
   scheduler: warmup_cosine
   warmup_epochs: 3
   amp: false
