@@ -1,0 +1,28 @@
+actions:
+  0: {name: forward, aliases: [go straight, move forward], group: action}
+  1: {name: stop, aliases: [brake, halt], group: action}
+  2: {name: left, aliases: [turn left, move left], group: action}
+  3: {name: right, aliases: [turn right, move right], group: action}
+groups: [traffic_control, front_object, lateral_lane, drivable_corridor, road_geometry, global_context]
+reasons:
+  0: {name: "Traffic light is green", aliases: [green light], group: traffic_control, positive_states: [traffic_green], negative_states: [traffic_red], compatible_actions: [forward], hard_negatives: [traffic_red], spatial_prior: upper}
+  1: {name: "Follow traffic", aliases: [traffic flow], group: global_context, positive_states: [global_context], negative_states: [], compatible_actions: [forward], hard_negatives: [], spatial_prior: global}
+  2: {name: "Road is clear", aliases: [clear road], group: drivable_corridor, positive_states: [clear_road], negative_states: [obstacle], compatible_actions: [forward], hard_negatives: [front_vehicle], spatial_prior: front}
+  3: {name: "Traffic light", aliases: [signal light], group: traffic_control, positive_states: [traffic_control], negative_states: [], compatible_actions: [stop, forward], hard_negatives: [], spatial_prior: upper}
+  4: {name: "Traffic sign", aliases: [road sign], group: traffic_control, positive_states: [stop_sign], negative_states: [], compatible_actions: [stop, forward], hard_negatives: [], spatial_prior: upper}
+  5: {name: "Obstacle car", aliases: [front car, vehicle ahead], group: front_object, positive_states: [front_vehicle], negative_states: [clear_road], compatible_actions: [stop, left, right], hard_negatives: [clear_road], spatial_prior: front}
+  6: {name: "Obstacle person", aliases: [pedestrian], group: front_object, positive_states: [pedestrian], negative_states: [clear_road], compatible_actions: [stop, left, right], hard_negatives: [clear_road], spatial_prior: front}
+  7: {name: "Obstacle rider", aliases: [rider, cyclist], group: front_object, positive_states: [rider], negative_states: [clear_road], compatible_actions: [stop, left, right], hard_negatives: [clear_road], spatial_prior: front}
+  8: {name: "Obstacle others", aliases: [other obstacle], group: front_object, positive_states: [obstacle], negative_states: [clear_road], compatible_actions: [stop, left, right], hard_negatives: [clear_road], spatial_prior: front}
+  9: {name: "No lane on the left", aliases: [left lane absent], group: lateral_lane, positive_states: [left_lane], negative_states: [right_lane], compatible_actions: [forward, right, stop], hard_negatives: [left_turn], spatial_prior: left}
+  10: {name: "Obstacles on the left lane", aliases: [left lane blocked], group: lateral_lane, positive_states: [left_blocked], negative_states: [clear_road], compatible_actions: [forward, right, stop], hard_negatives: [left_lane], spatial_prior: left}
+  11: {name: "Solid line on the left", aliases: [left solid line], group: road_geometry, positive_states: [solid_left], negative_states: [], compatible_actions: [forward, right, stop], hard_negatives: [left_turn], spatial_prior: left}
+  12: {name: "On the left turn lane", aliases: [left turn lane], group: road_geometry, positive_states: [left_turn], negative_states: [], compatible_actions: [left, forward], hard_negatives: [right_turn], spatial_prior: left}
+  13: {name: "Traffic light allows left", aliases: [left green arrow], group: traffic_control, positive_states: [traffic_green], negative_states: [traffic_red], compatible_actions: [left], hard_negatives: [traffic_red], spatial_prior: upper}
+  14: {name: "Front car turning left", aliases: [vehicle turning left], group: front_object, positive_states: [front_vehicle], negative_states: [clear_road], compatible_actions: [stop, forward, right], hard_negatives: [clear_road], spatial_prior: front}
+  15: {name: "No lane on the right", aliases: [right lane absent], group: lateral_lane, positive_states: [right_lane], negative_states: [left_lane], compatible_actions: [forward, left, stop], hard_negatives: [right_turn], spatial_prior: right}
+  16: {name: "Obstacles on the right lane", aliases: [right lane blocked], group: lateral_lane, positive_states: [right_blocked], negative_states: [clear_road], compatible_actions: [forward, left, stop], hard_negatives: [right_lane], spatial_prior: right}
+  17: {name: "Solid line on the right", aliases: [right solid line], group: road_geometry, positive_states: [solid_right], negative_states: [], compatible_actions: [forward, left, stop], hard_negatives: [right_turn], spatial_prior: right}
+  18: {name: "On the right turn lane", aliases: [right turn lane], group: road_geometry, positive_states: [right_turn], negative_states: [], compatible_actions: [right, forward], hard_negatives: [left_turn], spatial_prior: right}
+  19: {name: "Traffic light allows right", aliases: [right green arrow], group: traffic_control, positive_states: [traffic_green], negative_states: [traffic_red], compatible_actions: [right], hard_negatives: [traffic_red], spatial_prior: upper}
+  20: {name: "Front car turning right", aliases: [vehicle turning right], group: front_object, positive_states: [front_vehicle], negative_states: [clear_road], compatible_actions: [stop, forward, left], hard_negatives: [clear_road], spatial_prior: front}

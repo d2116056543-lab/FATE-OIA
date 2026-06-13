@@ -1,0 +1,66 @@
+﻿data:
+  data_root: E:/sbw/BDD-OIA/data
+  raw_root: E:/sbw/BDD-OIA
+  action_dim: 4
+  reason_dim: 21
+  image_height: 360
+  image_width: 640
+  patch_size: 8
+  preserve_aspect_ratio: true
+  pretrained_weights: E:/sbw/FATE_Drive/fate_oia_worktree/ckp/reference/dino_deitsmall8_pretrain.pth
+  checkpoint_key: teacher
+training:
+  epochs: 24
+  batch_size: 6
+  gradient_accumulation_steps: 5
+  fallback_ladder: [[6,5], [5,6], [4,8], [3,11], [2,16]]
+  emergency_fallback: [1,30]
+  reference_effective_batch: 32
+  effective_batch_launch: 30
+  lr_trunk: 0.0002
+  lr_state_bank: 0.0002
+  lr_prototype: 0.0002
+  lr_graph: 0.0002
+  lr_calibration: 0.0005
+  scheduler: warmup_cosine
+  warmup_epochs: 2
+  min_lr: 0.00001
+  weight_decay: 0.05
+  grad_clip: 1.0
+  amp: false
+  max_own_gpu_memory_gb: 28.0
+  eval_splits: test
+  best_selection_split: test
+  no_metric_early_stop: true
+runtime:
+  test_only: true
+  no_feature_cache: true
+  require_no_token_compression: true
+  foreground_only: true
+model:
+  dim: 384
+  dino_dim: 384
+  selected_layers: [3,7,11]
+  token_compression: none
+  feature_cache_enabled: false
+  use_action_graph_delta: false
+  ontology_path: configs/eagle_pu_reason_ontology.yaml
+evidence:
+  evidence_margin_start_epoch: 8
+  evidence_margin_gate: selected_minus_random_common_positive_two_epochs
+loss_weights:
+  action_direct: 1.00
+  reason_direct: 1.00
+  reason_soft_f1: 0.06
+  pu_reason: 0.15
+  state_weak_bag: 0.05
+  text_state_contrast: 0.03
+  prototype_transport: 0.05
+  state_label_graph: 0.02
+  action_set_ce: 0.05
+  action_set_drop_add: 0.03
+  cardinality: 0.02
+  tail_same_action_rank: 0.04
+  calibration: 0.02
+  evidence_margin_max: 0.002
+
