@@ -172,6 +172,26 @@ def main() -> None:
     Path(out_dir / "config_resolved.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
     write_json(out_dir / "implementation_fingerprint.json", {"model": "EAGLE-PU V1", "final_action": "action_logits_final_raw == action_logits_direct", "no_cache": True, "no_val": True})
     best = {"final_raw": -1e9, "calibrated": -1e9, "exp_mf1": -1e9, "exp_map": -1e9, "action_mf1": -1e9}
+    steps_per_epoch = max(1, math.ceil(len(train_loader) / max(accum, 1)))
+    total_updates = max(1, epochs * steps_per_epoch)
+    warmup_updates = max(1, int(cfg["training"].get("warmup_epochs", 2)) * steps_per_epoch)
+    min_lr = float(cfg["training"].get("min_lr", 1e-5))
+    base_lrs = [float(g["lr"]) for g in opt.param_groups]
+    update_idx = 0
+
+    def apply_warmup_cosine(update: int) -> None:
+        if cfg["training"].get("scheduler") != "warmup_cosine":
+            return
+        if update < warmup_updates:
+            scale = float(update + 1) / float(warmup_updates)
+            for g, base in zip(opt.param_groups, base_lrs):
+                g["lr"] = max(min_lr, base * scale)
+        else:
+            progress = min(1.0, float(update - warmup_updates) / float(max(1, total_updates - warmup_updates)))
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            for g, base in zip(opt.param_groups, base_lrs):
+                g["lr"] = min_lr + (base - min_lr) * cosine
+
     for epoch in range(epochs):
         model.train(); opt.zero_grad(set_to_none=True); loss_rows=[]; total_steps=len(train_loader)
         for step, batch in enumerate(train_loader, start=1):
@@ -179,11 +199,12 @@ def main() -> None:
             out = model(img, epoch=epoch)
             loss, row = compute_losses(out, action, reason, cfg, epoch)
             (loss / accum).backward()
-            row.update({"epoch": epoch, "step": step, "effective_batch": batch_size * accum, "lr_trunk": cfg["training"]["lr_trunk"], "lr_state_bank": cfg["training"]["lr_state_bank"], "lr_prototype": cfg["training"]["lr_prototype"], "lr_graph": cfg["training"]["lr_graph"], "lr_calibration": cfg["training"]["lr_calibration"]})
+            row.update({"epoch": epoch, "step": step, "effective_batch": batch_size * accum, "lr_trunk": opt.param_groups[0]["lr"], "lr_state_bank": opt.param_groups[1]["lr"], "lr_prototype": opt.param_groups[2]["lr"], "lr_graph": opt.param_groups[3]["lr"], "lr_calibration": opt.param_groups[4]["lr"]})
             if step % accum == 0 or step == total_steps:
+                apply_warmup_cosine(update_idx)
                 grad_norm = torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], float(cfg["training"].get("grad_clip", 1.0)))
                 row["grad_norm"] = float(grad_norm.detach().cpu()) if torch.is_tensor(grad_norm) else float(grad_norm)
-                opt.step(); opt.zero_grad(set_to_none=True)
+                opt.step(); opt.zero_grad(set_to_none=True); update_idx += 1
             loss_rows.append(row)
             if step % args.log_every == 0 or step == 1:
                 gpu = torch.cuda.max_memory_allocated() / (1024**3) if torch.cuda.is_available() else 0.0
