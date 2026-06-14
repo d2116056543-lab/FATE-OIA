@@ -91,12 +91,9 @@ def reason_predicate_matrices(grammar: ACPRReasonGrammar, predicate_names: list[
 def get_pair_weights(epoch: int, active_pair_rate: float) -> tuple[float, float]:
     if epoch < 3:
         return 0.0, 0.0
-    if epoch < 6:
-        return 0.05, 0.01
-    if epoch < 11:
-        return 0.10, 0.02
-    if active_pair_rate >= 0.05:
-        return 0.15, 0.04
+    # Hard-pair logits are reason-specific and can produce very large raw
+    # hinges. Keep the auxiliary objective conservative; pair strength is
+    # controlled by the miner and capped hinge rather than epoch-based jumps.
     return 0.05, 0.01
 
 

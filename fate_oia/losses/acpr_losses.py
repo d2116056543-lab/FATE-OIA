@@ -58,6 +58,7 @@ def matched_pair_logit_loss(
     pair_reason_idx: torch.Tensor | None = None,
     pair_weights: torch.Tensor | None = None,
     margin: float = 0.25,
+    max_hinge: float | None = 4.0,
     use_active_mask: bool = True,
     return_stats: bool = False,
 ):
@@ -111,13 +112,16 @@ def matched_pair_logit_loss(
     if is_memory_t.any():
         z_neg[is_memory_t] = neg_logits_detached.to(reason_logits.device, reason_logits.dtype)[valid][is_memory_t].detach()  # type: ignore[union-attr]
     w = torch.ones_like(z_pos) if weights is None else weights.to(z_pos.device, z_pos.dtype)
-    hinge = F.relu(margin - z_pos + z_neg)
+    raw_hinge_live = margin - z_pos + z_neg
+    hinge = F.relu(raw_hinge_live)
+    if max_hinge is not None and max_hinge > 0:
+        hinge = hinge.clamp(max=float(max_hinge))
     if use_active_mask:
         hinge = hinge * active.float()
         w = w * active.float()
     loss = (w * hinge).sum() / w.sum().clamp_min(1.0)
     if return_stats:
-        raw_hinge = margin - z_pos.detach() + z_neg.detach()
+        raw_hinge = raw_hinge_live.detach()
         stats = {
             "hinge_mean": float(raw_hinge.mean().detach().cpu()) if raw_hinge.numel() else 0.0,
             "hinge_positive_rate": float((raw_hinge > 0).float().mean().detach().cpu()) if raw_hinge.numel() else 0.0,

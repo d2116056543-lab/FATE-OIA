@@ -45,3 +45,17 @@ def test_memory_negative_embedding_uses_reason_specific_detached_embedding():
     touched = embeddings.grad.abs().sum(dim=-1) > 0
     assert bool(touched[0, 3])
     assert int(touched.sum()) == 1
+
+
+def test_logit_pair_loss_caps_extreme_hinge_but_reports_raw_stats():
+    logits = torch.tensor([[0.0], [100.0]], requires_grad=True)
+    pairs = {
+        "pair_pos_indices": torch.tensor([0]),
+        "pair_neg_indices": torch.tensor([1]),
+        "pair_reason_ids": torch.tensor([0]),
+        "pair_weights": torch.tensor([1.0]),
+        "pair_active_mask": torch.tensor([True]),
+    }
+    loss, stats = matched_pair_logit_loss(logits, pairs, margin=0.25, max_hinge=4.0, return_stats=True)
+    assert torch.allclose(loss.detach(), torch.tensor(4.0))
+    assert stats["hinge_mean"] > 100.0
