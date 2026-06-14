@@ -8,16 +8,31 @@ import time
 from pathlib import Path
 
 
-def run_stream(cmd: list[str]) -> int:
+def append_log(log_path: Path | None, text: str) -> None:
+    if log_path is None:
+        return
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(text)
+        if not text.endswith("\n"):
+            f.write("\n")
+
+
+def run_stream(cmd: list[str], log_path: Path | None = None) -> int:
+    append_log(log_path, json.dumps({"event": "acpr_supervisor_command", "cmd": cmd}, ensure_ascii=False))
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     assert proc.stdout is not None
     last = time.time()
     for line in proc.stdout:
         print(line, end="", flush=True)
+        append_log(log_path, line.rstrip("\n"))
         last = time.time()
     code = proc.wait()
     if time.time() - last > 1800:
-        print(json.dumps({"event": "acpr_supervisor_stall_checked", "seconds_since_output": time.time() - last}), flush=True)
+        stall = json.dumps({"event": "acpr_supervisor_stall_checked", "seconds_since_output": time.time() - last}, ensure_ascii=False)
+        print(stall, flush=True)
+        append_log(log_path, stall)
+    append_log(log_path, json.dumps({"event": "acpr_supervisor_command_exit", "returncode": code}, ensure_ascii=False))
     return code
 
 
@@ -33,31 +48,52 @@ def main() -> None:
     args = ap.parse_args()
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
+    supervisor_log = out / "supervisor.log"
+    append_log(
+        supervisor_log,
+        json.dumps(
+            {
+                "event": "acpr_supervisor_start",
+                "output_dir": str(out),
+                "epochs": args.epochs,
+                "batch_size": args.batch_size,
+                "gradient_accumulation_steps": args.gradient_accumulation_steps,
+                "device": args.device,
+            },
+            ensure_ascii=False,
+        ),
+    )
     preflight = out / "supervisor_preflight"
     audit_cmd = [sys.executable, "-m", "fate_oia.engine.audit_acpr_oia_implementation", "--config", args.config, "--output_dir", str(preflight), "--device", args.device, "--write_review_pass"]
-    if run_stream(audit_cmd) != 0:
+    if run_stream(audit_cmd, supervisor_log) != 0:
         raise SystemExit("ACPR audit failed; full training blocked")
     pass_file = preflight / "REVIEW_PASS_ACPR_OIA_V1.txt"
     if args.require_review_pass and not pass_file.exists():
         raise SystemExit("Missing REVIEW_PASS_ACPR_OIA_V1.txt")
     smoke_cmd = [sys.executable, "-u", "-m", "fate_oia.engine.train_acpr_oia", "--config", args.config, "--output_dir", str(out / "smoke"), "--epochs", "1", "--batch_size", "1", "--gradient_accumulation_steps", "2", "--max_train_samples", "4", "--max_test_samples", "4", "--device", args.device, "--test_only", "--no_feature_cache", "--require_no_token_compression"]
-    if run_stream(smoke_cmd) != 0:
+    if run_stream(smoke_cmd, supervisor_log) != 0:
         raise SystemExit("ACPR smoke failed; full training blocked")
-    fallback_ladder = [(args.batch_size, args.gradient_accumulation_steps), (5, 6), (4, 8), (3, 11)]
+    fallback_ladder = [(args.batch_size, args.gradient_accumulation_steps), (5, 6), (4, 8), (3, 11), (2, 16)]
     last_error = None
     for batch, accum in fallback_ladder:
         train_cmd = [sys.executable, "-u", "-m", "fate_oia.engine.train_acpr_oia", "--config", args.config, "--output_dir", str(out), "--epochs", str(args.epochs), "--batch_size", str(batch), "--gradient_accumulation_steps", str(accum), "--device", args.device, "--test_only", "--no_feature_cache", "--require_no_token_compression"]
-        print(json.dumps({"event": "acpr_supervisor_launch", "batch_size": batch, "grad_accum": accum, "fallback_ladder": fallback_ladder}), flush=True)
-        code = run_stream(train_cmd)
+        launch = json.dumps({"event": "acpr_supervisor_launch", "batch_size": batch, "grad_accum": accum, "fallback_ladder": fallback_ladder}, ensure_ascii=False)
+        print(launch, flush=True)
+        append_log(supervisor_log, launch)
+        code = run_stream(train_cmd, supervisor_log)
         if code == 0:
             goal = out / "GOAL_COMPLETED_ACPR_OIA_V1.json"
             if goal.exists():
-                print(json.dumps({"event": "acpr_supervisor_completed", "goal": str(goal)}), flush=True)
+                done = json.dumps({"event": "acpr_supervisor_completed", "goal": str(goal)}, ensure_ascii=False)
+                print(done, flush=True)
+                append_log(supervisor_log, done)
                 return
             last_error = "train exited 0 but goal file missing"
             break
         last_error = f"train exited {code}"
-        print(json.dumps({"event": "acpr_supervisor_retry_after_failure", "error": last_error}), flush=True)
+        retry = json.dumps({"event": "acpr_supervisor_retry_after_failure", "error": last_error}, ensure_ascii=False)
+        print(retry, flush=True)
+        append_log(supervisor_log, retry)
     raise SystemExit(last_error or "ACPR training failed")
 
 
