@@ -125,6 +125,7 @@ pair_mining:
   max_pairs_per_batch: 256
   max_pairs_per_reason: 8
   max_tail_pairs_per_reason: 12
+  max_memory_scan: 2048
   margin: 0.25
   semi_hard_band: 0.15
   action_sim_min: 0.35

@@ -147,6 +147,7 @@ class ACPRPairMemory(nn.Module):
         max_pairs: int | None = None,
         max_pairs_per_reason: int = 8,
         max_tail_pairs_per_reason: int = 12,
+        max_memory_scan: int = 2048,
         margin: float = 0.25,
         thresholds: PairMiningThresholds | None = None,
     ) -> dict[str, torch.Tensor | int | list[float] | list[int] | list[str]]:
@@ -170,6 +171,7 @@ class ACPRPairMemory(nn.Module):
             max_pairs=max_pairs,
             max_pairs_per_reason=max_pairs_per_reason,
             max_tail_pairs_per_reason=max_tail_pairs_per_reason,
+            max_memory_scan=max_memory_scan,
             margin=margin,
             thresholds=thresholds,
         )
@@ -189,6 +191,7 @@ class ACPRPairMemory(nn.Module):
         max_pairs: int | None = None,
         max_pairs_per_reason: int = 8,
         max_tail_pairs_per_reason: int = 12,
+        max_memory_scan: int = 2048,
         margin: float = 0.25,
         thresholds: PairMiningThresholds | None = None,
     ) -> dict[str, torch.Tensor | int | list[float] | list[int] | list[str]]:
@@ -231,7 +234,7 @@ class ACPRPairMemory(nn.Module):
 
         tail = set(int(x) for x in (tail_indices or []))
         files = file_names or [str(i) for i in range(b)]
-        candidates: list[dict[str, float | int | bool]] = []
+        candidate_chunks: list[dict[str, torch.Tensor]] = []
         no_candidate_count = 0
         gate_filtered_count = 0
 
@@ -250,103 +253,182 @@ class ACPRPairMemory(nn.Module):
                 thresholds.contradiction_min,
             )
 
+        def same_file_mask(pos_idx: torch.Tensor, candidate_files: list[str]) -> torch.Tensor:
+            rows = []
+            pos_cpu = pos_idx.detach().cpu().tolist()
+            for pi in pos_cpu:
+                rows.append([candidate_files[j] == files[int(pi)] for j in range(len(candidate_files))])
+            if not rows:
+                return torch.zeros(pos_idx.numel(), len(candidate_files), dtype=torch.bool, device=device)
+            return torch.tensor(rows, dtype=torch.bool, device=device)
+
+        def build_candidates(
+            r: int,
+            pos_idx: torch.Tensor,
+            neg_idx: torch.Tensor,
+            a_scores: torch.Tensor,
+            v_scores: torch.Tensor,
+            p_scores: torch.Tensor,
+            c_scores: torch.Tensor,
+            z_neg: torch.Tensor,
+            candidate_files: list[str],
+            *,
+            is_memory: bool,
+        ) -> dict[str, torch.Tensor] | None:
+            if pos_idx.numel() == 0 or neg_idx.numel() == 0:
+                return None
+            same = same_file_mask(pos_idx, candidate_files)
+            z_pos = reason_logits_current[pos_idx, r].detach().unsqueeze(1)
+            hinge = float(margin) - z_pos + z_neg.detach().unsqueeze(0)
+            eligible = ~same
+            if not eligible.any():
+                return None
+            a_min, v_min, p_min, c_min = thresholds_for(r)
+            gate_pass = (
+                eligible
+                & (a_scores >= a_min)
+                & (v_scores >= v_min)
+                & (p_scores >= p_min)
+                & (c_scores >= c_min)
+            )
+            hard = gate_pass & (hinge > 0.0)
+            semi = gate_pass & (hinge >= -thresholds.semi_hard_band) & (hinge <= 0.0)
+            easy = gate_pass & (hinge < -thresholds.semi_hard_band)
+            select_mask = hard | semi
+            if not select_mask.any() and r in tail and easy.any():
+                select_mask = easy
+            if not select_mask.any() and r in tail:
+                rejected = eligible & ~gate_pass
+                if rejected.any():
+                    select_mask = rejected
+            if not select_mask.any():
+                return {
+                    "empty": torch.tensor([1], dtype=torch.long, device=device),
+                    "filtered": (eligible & ~gate_pass).sum().view(1),
+                }
+
+            score = hinge.masked_fill(~select_mask, -torch.inf).flatten()
+            per_reason_limit = max_tail_pairs_per_reason if r in tail else max_pairs_per_reason
+            k = min(int(per_reason_limit), int(torch.isfinite(score).sum().item()))
+            if k <= 0:
+                return None
+            flat_idx = torch.topk(score, k=k, largest=True).indices
+            n = int(neg_idx.numel())
+            pos_local = torch.div(flat_idx, n, rounding_mode="floor")
+            neg_local = flat_idx.remainder(n)
+            pos_t = pos_idx[pos_local]
+            raw_neg_t = neg_idx[neg_local]
+            rid_t = torch.full((k,), int(r), dtype=torch.long, device=device)
+            is_mem_t = torch.full((k,), bool(is_memory), dtype=torch.bool, device=device)
+            neg_t = torch.full((k,), -1, dtype=torch.long, device=device) if is_memory else raw_neg_t.long()
+            mem_t = raw_neg_t.long() if is_memory else torch.full((k,), -1, dtype=torch.long, device=device)
+            return {
+                "pos": pos_t.long(),
+                "neg": neg_t.long(),
+                "mem": mem_t.long(),
+                "rid": rid_t,
+                "is_memory": is_mem_t,
+                "a": a_scores[pos_local, neg_local].float(),
+                "v": v_scores[pos_local, neg_local].float(),
+                "p": p_scores[pos_local, neg_local].float(),
+                "c": c_scores[pos_local, neg_local].clamp(0, 1).float(),
+                "hinge": hinge[pos_local, neg_local].float(),
+                "filtered": (eligible & ~gate_pass).sum().view(1),
+            }
+
         for r in range(reason_dim):
             pos_idx = torch.where(reason[:, r] > 0.5)[0]
             if pos_idx.numel() == 0:
                 continue
-            per_reason_limit = max_tail_pairs_per_reason if r in tail else max_pairs_per_reason
-            reason_candidates: list[dict[str, float | int | bool]] = []
-            rejected_candidates: list[dict[str, float | int | bool]] = []
-            a_min, v_min, p_min, c_min = thresholds_for(r)
-            for pi in pos_idx.tolist():
-                # In-batch candidates.
-                neg_idx = torch.where(reason[:, r] <= 0.5)[0]
-                for ni in neg_idx.tolist():
-                    if ni == pi or files[ni] == files[pi]:
-                        continue
-                    a = float(action_sim_batch[pi, ni].detach().cpu())
-                    v = float(visual_sim_batch[pi, ni].detach().cpu())
-                    p = float(predicate_sim_batch[pi, ni].detach().cpu())
-                    c = float(contradiction_scores[ni, r].detach().clamp(0, 1).cpu())
-                    z_pos = float(reason_logits_current[pi, r].detach().cpu())
-                    z_neg = float(reason_logits_current[ni, r].detach().cpu())
-                    hinge = float(margin - z_pos + z_neg)
-                    candidate = {"pos": pi, "neg": ni, "mem": -1, "rid": r, "is_memory": False, "a": a, "v": v, "p": p, "c": c, "hinge": hinge}
-                    if a < a_min or v < v_min or p < p_min or c < c_min:
-                        gate_filtered_count += 1
-                        if r in tail:
-                            rejected_candidates.append(candidate)
-                        continue
-                    reason_candidates.append(candidate)
-                # Memory candidates.
-                if has_mem and mem_reason is not None and mem_logits is not None:
-                    mem_neg_idx = torch.where(mem_reason[:, r] <= 0.5)[0]
-                    for mi in mem_neg_idx.tolist():
-                        if mi < len(mem_files) and mem_files[mi] == files[pi]:
-                            continue
-                        a = float(action_sim_mem[pi, mi].detach().cpu())  # type: ignore[index]
-                        v = float(visual_sim_mem[pi, mi].detach().cpu())  # type: ignore[index]
-                        p = float(predicate_sim_mem[pi, mi].detach().cpu())  # type: ignore[index]
-                        c = float(mem_contra[mi, r].detach().clamp(0, 1).cpu())  # type: ignore[index]
-                        z_pos = float(reason_logits_current[pi, r].detach().cpu())
-                        z_neg = float(mem_logits[mi, r].detach().cpu())  # type: ignore[index]
-                        hinge = float(margin - z_pos + z_neg)
-                        candidate = {"pos": pi, "neg": -1, "mem": mi, "rid": r, "is_memory": True, "a": a, "v": v, "p": p, "c": c, "hinge": hinge}
-                        if a < a_min or v < v_min or p < p_min or c < c_min:
-                            gate_filtered_count += 1
-                            if r in tail:
-                                rejected_candidates.append(candidate)
-                            continue
-                        reason_candidates.append(candidate)
-            if not reason_candidates:
-                if r in tail and rejected_candidates:
-                    reason_candidates = sorted(rejected_candidates, key=lambda x: float(x["hinge"]), reverse=True)[:per_reason_limit]
-                else:
-                    no_candidate_count += int(pos_idx.numel())
-                    continue
-            hard = [x for x in reason_candidates if float(x["hinge"]) > 0.0]
-            semi = [x for x in reason_candidates if -thresholds.semi_hard_band <= float(x["hinge"]) <= 0.0]
-            easy = [x for x in reason_candidates if float(x["hinge"]) < -thresholds.semi_hard_band]
-            selected = sorted(hard, key=lambda x: float(x["hinge"]), reverse=True)
-            selected += sorted(semi, key=lambda x: float(x["hinge"]), reverse=True)
-            if not selected and r in tail and easy:
-                selected = sorted(easy, key=lambda x: float(x["hinge"]), reverse=True)[:per_reason_limit]
-            else:
-                selected = selected[:per_reason_limit]
-            candidates.extend(selected)
-            if len(candidates) >= max_pairs:
+            chunks_before = len(candidate_chunks)
+            # In-batch candidates are tiny but still selected through the same tensor path.
+            neg_idx = torch.where(reason[:, r] <= 0.5)[0]
+            if neg_idx.numel():
+                batch_chunk = build_candidates(
+                    r,
+                    pos_idx,
+                    neg_idx,
+                    action_sim_batch[pos_idx][:, neg_idx],
+                    visual_sim_batch[pos_idx][:, neg_idx],
+                    predicate_sim_batch[pos_idx][:, neg_idx],
+                    contradiction_scores[neg_idx, r].detach().clamp(0, 1).unsqueeze(0).expand(pos_idx.numel(), neg_idx.numel()),
+                    reason_logits_current[neg_idx, r],
+                    [files[int(i)] for i in neg_idx.detach().cpu().tolist()],
+                    is_memory=False,
+                )
+                if batch_chunk is not None:
+                    gate_filtered_count += int(batch_chunk.get("filtered", torch.zeros(1, device=device)).sum().item())
+                    if "pos" in batch_chunk:
+                        candidate_chunks.append(batch_chunk)
+            if has_mem and mem_reason is not None and mem_logits is not None:
+                mem_neg_idx = torch.where(mem_reason[:, r] <= 0.5)[0]
+                if mem_neg_idx.numel():
+                    # Recent detached negatives are enough for hard-pair mining and avoid
+                    # scanning an ever-growing queue in Python.
+                    scan = max(1, int(max_memory_scan))
+                    if mem_neg_idx.numel() > scan:
+                        mem_neg_idx = mem_neg_idx[-scan:]
+                    mem_chunk = build_candidates(
+                        r,
+                        pos_idx,
+                        mem_neg_idx,
+                        action_sim_mem[pos_idx][:, mem_neg_idx],  # type: ignore[index]
+                        visual_sim_mem[pos_idx][:, mem_neg_idx],  # type: ignore[index]
+                        predicate_sim_mem[pos_idx][:, mem_neg_idx],  # type: ignore[index]
+                        mem_contra[mem_neg_idx, r].detach().clamp(0, 1).unsqueeze(0).expand(pos_idx.numel(), mem_neg_idx.numel()),  # type: ignore[index]
+                        mem_logits[mem_neg_idx, r],  # type: ignore[index]
+                        [mem_files[int(i)] for i in mem_neg_idx.detach().cpu().tolist()],
+                        is_memory=True,
+                    )
+                    if mem_chunk is not None:
+                        gate_filtered_count += int(mem_chunk.get("filtered", torch.zeros(1, device=device)).sum().item())
+                        if "pos" in mem_chunk:
+                            candidate_chunks.append(mem_chunk)
+            if len(candidate_chunks) == chunks_before:
+                no_candidate_count += int(pos_idx.numel())
+            if sum(int(x["pos"].numel()) for x in candidate_chunks if "pos" in x) >= max_pairs:
                 break
 
-        if not candidates:
+        if not candidate_chunks:
             empty = self._empty(device, reason_dim, embed_dim)
             empty["pair_no_candidate_count"] = no_candidate_count
             empty["pair_gate_filtered_count"] = gate_filtered_count
             empty["file_names"] = files
             return empty
 
-        candidates = sorted(candidates, key=lambda x: (float(x["hinge"]) > 0.0, float(x["hinge"])), reverse=True)[:max_pairs]
-        pos_t = torch.tensor([int(c["pos"]) for c in candidates], dtype=torch.long, device=device)
-        neg_t = torch.tensor([int(c["neg"]) for c in candidates], dtype=torch.long, device=device)
-        mem_t = torch.tensor([int(c["mem"]) for c in candidates], dtype=torch.long, device=device)
-        rid_t = torch.tensor([int(c["rid"]) for c in candidates], dtype=torch.long, device=device)
-        is_mem = torch.tensor([bool(c["is_memory"]) for c in candidates], dtype=torch.bool, device=device)
-        action_t = torch.tensor([float(c["a"]) for c in candidates], dtype=torch.float32, device=device)
-        visual_t = torch.tensor([float(c["v"]) for c in candidates], dtype=torch.float32, device=device)
-        pred_t = torch.tensor([float(c["p"]) for c in candidates], dtype=torch.float32, device=device)
-        contra_t = torch.tensor([float(c["c"]) for c in candidates], dtype=torch.float32, device=device)
-        hinge_t = torch.tensor([float(c["hinge"]) for c in candidates], dtype=torch.float32, device=device)
+        pos_t = torch.cat([x["pos"] for x in candidate_chunks if "pos" in x]).long()
+        neg_t = torch.cat([x["neg"] for x in candidate_chunks if "pos" in x]).long()
+        mem_t = torch.cat([x["mem"] for x in candidate_chunks if "pos" in x]).long()
+        rid_t = torch.cat([x["rid"] for x in candidate_chunks if "pos" in x]).long()
+        is_mem = torch.cat([x["is_memory"] for x in candidate_chunks if "pos" in x]).bool()
+        action_t = torch.cat([x["a"] for x in candidate_chunks if "pos" in x]).float()
+        visual_t = torch.cat([x["v"] for x in candidate_chunks if "pos" in x]).float()
+        pred_t = torch.cat([x["p"] for x in candidate_chunks if "pos" in x]).float()
+        contra_t = torch.cat([x["c"] for x in candidate_chunks if "pos" in x]).float()
+        hinge_t = torch.cat([x["hinge"] for x in candidate_chunks if "pos" in x]).float()
+        if hinge_t.numel() > max_pairs:
+            order_score = hinge_t + (hinge_t > 0).float() * 1000.0
+            order = torch.topk(order_score, k=max_pairs, largest=True).indices
+            pos_t, neg_t, mem_t, rid_t, is_mem = pos_t[order], neg_t[order], mem_t[order], rid_t[order], is_mem[order]
+            action_t, visual_t, pred_t, contra_t, hinge_t = action_t[order], visual_t[order], pred_t[order], contra_t[order], hinge_t[order]
+
         hard_mask = hinge_t > 0.0
         semi_mask = (hinge_t >= -thresholds.semi_hard_band) & (hinge_t <= 0.0)
         easy_mask = hinge_t < -thresholds.semi_hard_band
-        fallback_easy_mask = easy_mask & torch.tensor([int(c["rid"]) in tail for c in candidates], dtype=torch.bool, device=device)
+        tail_rids = torch.tensor(sorted(tail), dtype=torch.long, device=device) if tail else torch.empty(0, dtype=torch.long, device=device)
+        fallback_easy_mask = easy_mask & ((rid_t[..., None] == tail_rids).any(dim=-1) if tail_rids.numel() else torch.zeros_like(easy_mask))
         active_mask = hard_mask | semi_mask | fallback_easy_mask
         base = torch.where(hard_mask, torch.ones_like(hinge_t), torch.where(semi_mask, torch.full_like(hinge_t, 0.5), torch.full_like(hinge_t, thresholds.fallback_easy_pair_weight)))
-        tail_factor = torch.tensor([self.tail_multiplier if int(c["rid"]) in tail else 1.0 for c in candidates], dtype=torch.float32, device=device)
+        tail_factor = torch.where(
+            (rid_t[..., None] == tail_rids).any(dim=-1) if tail_rids.numel() else torch.zeros_like(active_mask),
+            torch.full_like(hinge_t, self.tail_multiplier),
+            torch.ones_like(hinge_t),
+        )
         weights = base * (0.5 + contra_t) * tail_factor
         weights = weights * active_mask.float()
 
-        neg_logits = torch.zeros(len(candidates), dtype=torch.float32, device=device)
-        neg_embeddings = torch.zeros(len(candidates), embed_dim, dtype=reason_embeddings_current.dtype, device=device)
+        neg_logits = torch.zeros(hinge_t.numel(), dtype=torch.float32, device=device)
+        neg_embeddings = torch.zeros(hinge_t.numel(), embed_dim, dtype=reason_embeddings_current.dtype, device=device)
         if has_mem and mem_logits is not None and mem_reason_emb is not None:
             mem_rows = torch.where(is_mem)[0]
             if mem_rows.numel():
@@ -401,7 +483,7 @@ class ACPRPairMemory(nn.Module):
             "pair_active_mask": active_mask,
             "positive_pairs": torch.stack([pos_t, pos_t], dim=1),
             "contrast_pairs": torch.stack([pos_t, neg_t.clamp_min(0)], dim=1),
-            "pair_count": int(len(candidates)),
+            "pair_count": int(hinge_t.numel()),
             "active_pair_count": int(active_mask.sum().item()),
             "hard_pair_count": int(hard_mask.sum().item()),
             "semi_hard_pair_count": int(semi_mask.sum().item()),

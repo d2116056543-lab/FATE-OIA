@@ -62,6 +62,44 @@ def test_tail_reason_multiplier_increases_weight():
     assert weights[rids == 12].mean() > weights[rids == 5].mean()
 
 
+def test_memory_negative_mining_uses_detached_logits_and_scan_cap():
+    m = ACPRPairMemory(memory_size=64)
+    global_embed, predicate, action, reason, contradiction, logits, reason_emb = _batch()
+    memory_reason = torch.zeros_like(reason)
+    memory_logits = torch.zeros_like(logits)
+    memory_reason_emb = torch.randn_like(reason_emb)
+    memory_logits[:, 5] = 1.25
+    m.enqueue(
+        ["m0", "m1", "m2", "m3"],
+        global_embed,
+        predicate,
+        action,
+        memory_reason,
+        contradiction_scores=contradiction,
+        reason_logits_detached=memory_logits,
+        reason_embeddings_detached=memory_reason_emb,
+    )
+    pairs = m.mine(
+        ["a", "b", "c", "d"],
+        global_embed,
+        predicate,
+        action,
+        reason,
+        contradiction,
+        tail_indices=[12],
+        reason_logits_current=logits,
+        reason_embeddings_current=reason_emb,
+        max_memory_scan=2,
+        thresholds=PairMiningThresholds(action_sim_min=-1, visual_sim_min=-1, predicate_sim_min=-1, contradiction_min=0, tail_contradiction_min=0),
+    )
+    assert pairs["pair_memory_count"] > 0
+    assert pairs["hard_pair_count"] > 0
+    assert pairs["pair_neg_is_memory"].any()
+    assert pairs["pair_neg_logits_detached"].numel() == pairs["pair_count"]
+    loss = matched_pair_logit_loss(logits.clone().requires_grad_(True), pairs)
+    assert float(loss.detach()) > 0
+
+
 def test_easy_pair_can_have_zero_active_loss():
     m = ACPRPairMemory()
     global_embed, predicate, action, reason, contradiction, _, reason_emb = _batch()

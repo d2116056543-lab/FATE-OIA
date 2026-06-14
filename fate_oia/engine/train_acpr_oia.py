@@ -318,6 +318,7 @@ def main() -> None:
                 max_pairs=int(pair_cfg.get("max_pairs_per_batch", 256)),
                 max_pairs_per_reason=int(pair_cfg.get("max_pairs_per_reason", 8)),
                 max_tail_pairs_per_reason=int(pair_cfg.get("max_tail_pairs_per_reason", 12)),
+                max_memory_scan=int(pair_cfg.get("max_memory_scan", 2048)),
                 margin=float(pair_cfg.get("margin", 0.25)),
                 thresholds=pair_thresholds,
             )
