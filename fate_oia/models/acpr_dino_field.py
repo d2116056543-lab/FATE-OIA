@@ -44,7 +44,14 @@ class ACPRDinoFieldExtractor(nn.Module):
             cls = patch.mean(1, keepdim=True)
             patches = torch.stack([patch for _ in self.selected_layers], dim=1)
             cls_layers = torch.stack([cls.squeeze(1) for _ in self.selected_layers], dim=1)
-        return {"patch_tokens_by_layer": patches, "cls_tokens_by_layer": cls_layers, "grid_hw": self.grid_hw, "original_tokens": self.original_tokens}
+        return {
+            "patch_tokens_by_layer": patches,
+            "cls_tokens_by_layer": cls_layers,
+            "patch_tokens_last": patches[:, -1],
+            "cls_token_last": cls_layers[:, -1],
+            "grid_hw": self.grid_hw,
+            "original_tokens": self.original_tokens,
+        }
 
     def forward(self, images: torch.Tensor) -> dict[str, torch.Tensor | tuple[int, int] | int]:
         if images.shape[-2:] != (360, 640):
@@ -67,4 +74,13 @@ class ACPRDinoFieldExtractor(nn.Module):
             patch = torch.stack([o[:, 1:] for o in outputs], dim=1)
         if patch.shape[2] != 3600:
             raise RuntimeError(f"Expected 3600 patch tokens, got {patch.shape[2]}")
-        return {"patch_tokens_by_layer": patch.detach(), "cls_tokens_by_layer": cls.detach(), "grid_hw": self.grid_hw, "original_tokens": self.original_tokens}
+        patch = patch.detach()
+        cls = cls.detach()
+        return {
+            "patch_tokens_by_layer": patch,
+            "cls_tokens_by_layer": cls,
+            "patch_tokens_last": patch[:, -1],
+            "cls_token_last": cls[:, -1],
+            "grid_hw": self.grid_hw,
+            "original_tokens": self.original_tokens,
+        }

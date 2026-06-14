@@ -30,10 +30,19 @@ class ACPRPredicateReasoner(nn.Module):
         mlp_score = self.mlp(torch.cat([reason_nodes, aux], dim=-1)).squeeze(-1).tanh()
         gate = torch.sigmoid(self.gate).clamp(max=0.20).view(1, -1)
         delta = (gate * (grammar_score + 0.25 * mlp_score)).clamp(-0.20, 0.20)
+        stats = {
+            "required_support_mean": float(pos_score.detach().mean().cpu()),
+            "contradiction_mean": float(contradiction.detach().mean().cpu()),
+            "delta_abs_mean": float(delta.detach().abs().mean().cpu()),
+            "gate_mean": float(gate.detach().mean().cpu()),
+        }
         return {
             "predicate_reason_delta": delta,
+            "required_support_score": pos_score,
+            "contradiction_score": contradiction,
             "predicate_reason_gate": gate.expand_as(delta),
             "predicate_reason_positive_score_by_label": pos_score,
             "predicate_reason_contradiction_score_by_label": contradiction,
             "predicate_reason_delta_by_label": delta,
+            "predicate_reason_stats": stats,
         }

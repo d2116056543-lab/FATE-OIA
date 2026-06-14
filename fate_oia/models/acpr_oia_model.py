@@ -49,8 +49,9 @@ class ACPROIAModel(nn.Module):
         action_logits_raw = trunk["action_logits_direct"]
         reason_logits_raw = trunk["reason_logits_visual"] + reason_delta["predicate_reason_delta"]
         raw_logits = torch.cat([action_logits_raw, reason_logits_raw], dim=-1)
-        calibrated = self.calibration(raw_logits)
+        calibrated = self.calibration(action_logits_raw, reason_logits_raw)
         action_set = self.action_combo_aux(trunk["label_nodes"], action_logits_raw)
+        cardinality_logits = action_set["cardinality_logits"]
         pair_embedding = self.pair_memory(trunk["label_nodes"])
         out = {
             **field,
@@ -64,15 +65,25 @@ class ACPROIAModel(nn.Module):
             "reason_logits_raw": reason_logits_raw,
             "action_logits_final_raw": action_logits_raw,
             "reason_logits_final_raw": reason_logits_raw,
+            "action_logits_calibrated": calibrated["action_logits_calibrated"],
+            "reason_logits_calibrated": calibrated["reason_logits_calibrated"],
             "logits_final_raw": raw_logits,
             "logits_final_calibrated": calibrated["calibrated_logits"],
-            "action_logits_final_calibrated": calibrated["calibrated_logits"][:, : self.action_dim],
-            "reason_logits_final_calibrated": calibrated["calibrated_logits"][:, self.action_dim :],
+            "action_logits_final_calibrated": calibrated["action_logits_calibrated"],
+            "reason_logits_final_calibrated": calibrated["reason_logits_calibrated"],
             "temperature": calibrated["temperature"],
             "calibration_bias": calibrated["calibration_bias"],
+            "cardinality_logits": cardinality_logits,
+            "bias_action": calibrated["bias_action"],
+            "bias_reason": calibrated["bias_reason"],
+            "temperature_action": calibrated["temperature_action"],
+            "temperature_reason": calibrated["temperature_reason"],
             "ego_stats": ego_stats,
             "branch_logits": {
                 "direct": raw_logits,
+                "direct_plus_predicate": raw_logits,
+                "raw": raw_logits,
+                "calibrated": calibrated["calibrated_logits"],
                 "final_raw": raw_logits,
                 "final_calibrated": calibrated["calibrated_logits"],
                 "action_visual": trunk["action_visual_logits"],

@@ -12,6 +12,37 @@ eval_splits: test
 best_selection_split: test
 token_compression: none
 feature_cache_enabled: false
+experiment:
+  name: acpr_oia_v1_direct_image
+  direct_image: true
+  feature_cache_enabled: false
+  token_compression: none
+  test_only_evaluation: true
+  best_selection_split: test
+  best_selection_metric: final_raw_joint
+  no_metric_early_stop: true
+  save_all_branch_metrics: true
+data:
+  data_root: E:\sbw\BDD-OIA\data
+  raw_root: E:\sbw\BDD-OIA
+  bdd100k_root: E:\sbw\BDD100K
+  image_height: 360
+  image_width: 640
+  patch_size: 8
+  action_dim: 4
+  reason_dim: 21
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+backbone:
+  arch: vit_small
+  patch_size: 8
+  pretrained_weights: ckp/reference/dino_deitsmall8_pretrain.pth
+  checkpoint_key: teacher
+  freeze_backbone: true
+  selected_layers: [3, 7, 11]
+  no_grad_backbone: true
 training:
   epochs: 28
   batch_size: 6
@@ -30,14 +61,70 @@ training:
   grad_clip: 1.0
   amp: false
   no_metric_early_stop: true
+optim:
+  optimizer: AdamW
+  epochs: 28
+  primary_batch_size: 6
+  primary_gradient_accumulation_steps: 5
+  fallback_1_batch_size: 5
+  fallback_1_gradient_accumulation_steps: 6
+  fallback_2_batch_size: 4
+  fallback_2_gradient_accumulation_steps: 8
+  fallback_3_batch_size: 3
+  fallback_3_gradient_accumulation_steps: 11
+  reference_effective_batch: 32
+  lr_trunk: 0.0002
+  lr_predicate: 0.0002
+  lr_reason_predicate: 0.0002
+  lr_pair_projection: 0.0002
+  lr_calibration: 0.0005
+  weight_decay: 0.05
+  scheduler: warmup_cosine
+  warmup_epochs: 2
+  min_lr: 0.00001
+  grad_clip: 1.0
+  amp: false
 runtime:
   test_only: true
   no_feature_cache: true
   require_no_token_compression: true
   foreground_only: true
+  target_own_gpu_memory_gb: 27.0
+  target_total_gpu_memory_gb_with_other_processes: 30.0
+  print_every: 200
+  eval_every_epoch: true
+  save_every_epoch: true
 model:
   selected_layers: [3, 7, 11]
   use_mock_dino: false
+  dim: 384
+  action_dim: 4
+  reason_dim: 21
+  num_predicates: 32
+  label_self_attn_layers: 1
+  label_self_attn_heads: 4
+  use_reason_to_action: true
+  use_scene_predicates: true
+  use_predicate_reason: true
+  use_partial_label_reason: true
+  use_matched_pair_learning: true
+  use_action_combo_aux: true
+  use_train_time_calibration: true
+  final_action_source: direct_sigmoid
+  predicate_affects_action: false
+  action_set_affects_final_action: false
+  graph_delta_to_logits: false
+  max_predicate_reason_delta: 0.20
+pair_mining:
+  memory_size: 8192
+  min_action_similarity: 0.5
+  min_visual_similarity: 0.2
+  min_predicate_similarity: 0.2
+  min_contradiction_common: 0.30
+  min_contradiction_tail: 0.20
+  max_pairs_per_batch: 256
+  max_pairs_per_reason: 16
+  tail_reason_indices: [12, 9, 5, 14, 6, 11, 10, 13]
 loss_weights:
   action_direct: 1.0
   reason_partial: 1.0

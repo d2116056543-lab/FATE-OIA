@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import torch
 import yaml
 
 
@@ -41,7 +42,10 @@ class ACPRReasonGrammar:
 
     @property
     def tail_indices(self) -> list[int]:
-        return [i for i in range(21) if bool(self.reasons[i].get("tail", False))]
+        # Fixed by the ACPR plan: these are the reason labels that should receive
+        # tail-aware pair/ranking diagnostics. Do not infer this from YAML flags,
+        # because broader display group tails include labels outside the planned set.
+        return [12, 9, 5, 14, 6, 11, 10, 13]
 
     def predicate_names(self) -> list[str]:
         names: list[str] = []
@@ -63,6 +67,14 @@ class ACPRReasonGrammar:
                     neg[r][index[name]] = 1.0
         return pos, neg
 
+    def positive_matrix(self, predicate_names: list[str]) -> torch.Tensor:
+        pos, _ = self.reason_predicate_matrix(predicate_names)
+        return torch.tensor(pos, dtype=torch.float32)
+
+    def contradiction_matrix(self, predicate_names: list[str]) -> torch.Tensor:
+        _, neg = self.reason_predicate_matrix(predicate_names)
+        return torch.tensor(neg, dtype=torch.float32)
+
     def reason_action_compatibility(self) -> list[list[float]]:
         action_idx = {self.actions[i]["name"]: i for i in range(4)}
         mat = [[0.0 for _ in range(4)] for _ in range(21)]
@@ -70,4 +82,16 @@ class ACPRReasonGrammar:
             for name in self.reasons[r].get("compatible_actions", []):
                 if name in action_idx:
                     mat[r][action_idx[name]] = 1.0
+        return mat
+
+    def compatible_action_matrix(self) -> torch.Tensor:
+        return torch.tensor(self.reason_action_compatibility(), dtype=torch.float32)
+
+    def hard_negative_matrix(self) -> torch.Tensor:
+        mat = torch.zeros(21, 21, dtype=torch.float32)
+        for r in range(21):
+            for neg in self.reasons[r].get("hard_negative_reasons", []):
+                idx = int(neg)
+                if 0 <= idx < 21:
+                    mat[r, idx] = 1.0
         return mat

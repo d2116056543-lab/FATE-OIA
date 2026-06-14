@@ -12,8 +12,13 @@ import yaml
 
 
 REQUIRED = [
+    "fate_oia/models/acpr_dino_field.py",
+    "fate_oia/models/acpr_ego_regions.py",
+    "fate_oia/models/acpr_scene_predicate_head.py",
     "fate_oia/models/acpr_predicate_targets.py",
     "fate_oia/models/acpr_pair_memory.py",
+    "fate_oia/models/acpr_action_combo_aux.py",
+    "fate_oia/models/acpr_calibration.py",
     "fate_oia/losses/acpr_losses.py",
     "fate_oia/models/acpr_label_trunk.py",
     "fate_oia/models/acpr_predicate_reason.py",
@@ -36,7 +41,7 @@ def main() -> None:
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--write_review_pass", action="store_true")
     args = ap.parse_args()
-    out = Path(args.output_dir); out.mkdir(parents=True, exist_ok=True)
+    out_dir = Path(args.output_dir); out_dir.mkdir(parents=True, exist_ok=True)
     missing: list[str] = []
     checks: dict[str, bool] = {}
     for rel in REQUIRED:
@@ -58,6 +63,39 @@ def main() -> None:
     checks["label_trunk_uses_predicate_tokens"] = "predicate_cross_attn" in text and "predicate_tokens" in text and "label_self_attn" in text
     checks["predicate_reason_grammar_conditioned"] = all(s in text for s in ["positive_mask", "contradictory_mask", "predicate_reason_contradiction_score_by_label"])
     checks["supervisor_full_gate"] = all(s in Path("fate_oia/engine/supervise_acpr_oia_foreground.py").read_text(encoding="utf-8") for s in ["audit_acpr_oia_implementation", "max_train_samples", "fallback_ladder", "GOAL_COMPLETED_ACPR_OIA_V1.json"])
+    checks["dino_field_last_tokens"] = all(s in Path("fate_oia/models/acpr_dino_field.py").read_text(encoding="utf-8") for s in ["patch_tokens_last", "cls_token_last", "original_tokens"])
+    checks["pair_memory_enqueue"] = all(s in Path("fate_oia/models/acpr_pair_memory.py").read_text(encoding="utf-8") for s in ["def enqueue", "def mine", "pair_neg_memory_indices"])
+    checks["combo_cardinality_outputs"] = all(s in Path("fate_oia/models/acpr_action_combo_aux.py").read_text(encoding="utf-8") for s in ["cardinality_logits", "combo_stats"])
+    checks["calibration_split_outputs"] = all(s in Path("fate_oia/models/acpr_calibration.py").read_text(encoding="utf-8") for s in ["action_logits_calibrated", "reason_logits_calibrated", "bias_action", "temperature_reason"])
+    checks["model_contract_outputs"] = all(s in Path("fate_oia/models/acpr_oia_model.py").read_text(encoding="utf-8") for s in ["direct_plus_predicate", "action_logits_raw", "reason_logits_raw", "cardinality_logits"])
+    checks["train_artifact_schema"] = all(s in Path("fate_oia/engine/train_acpr_oia.py").read_text(encoding="utf-8") for s in [
+        "implementation_fingerprint.json",
+        "logits_action_raw_test.pt",
+        "logits_reason_raw_test.pt",
+        "predicate_logits_test.pt",
+        "pair_cases_test.jsonl",
+        "pair_mining_stats.jsonl",
+        "pair_margin_per_reason.json",
+        "checkpoint_best_test_tail_mf1.pth",
+    ])
+    checks["eval_diagnostics_schema"] = all(s in Path("fate_oia/engine/eval_acpr_oia.py").read_text(encoding="utf-8") for s in ["action_composition", "tail_reason", "predicate_group", "pair_margin"])
+    checks["visual_export_counterfactual_schema"] = all(s in Path("fate_oia/engine/export_acpr_visuals.py").read_text(encoding="utf-8") for s in ["matched_negative", "predicate_delta", "reason_margin", "report.html"])
+    forbidden = ["frozen_run_c", "FrozenRunC", "run_c_logits", "cached_logits", "tail_residual_adapter", "Start-Process", "Start-Job", "nohup"]
+    checks["forbidden_patterns_absent"] = not any(pat in text for pat in forbidden)
+    from fate_oia.models.acpr_oia_model import ACPROIAModel
+    model = ACPROIAModel(use_mock_dino=True)
+    forward_out = model(torch.randn(2, 3, 360, 640))
+    checks["full_model_forward_contract"] = all(k in forward_out for k in [
+        "patch_tokens_last",
+        "cls_token_last",
+        "action_logits_raw",
+        "reason_logits_raw",
+        "action_logits_calibrated",
+        "reason_logits_calibrated",
+        "contradiction_score",
+        "required_support_score",
+        "cardinality_logits",
+    ]) and forward_out["action_logits_raw"].shape == (2, 4) and forward_out["reason_logits_raw"].shape == (2, 21)
     from fate_oia.models.acpr_predicate_targets import WeakPredicateTargetBuilder
     from fate_oia.losses.acpr_losses import matched_pair_logit_loss
     builder = WeakPredicateTargetBuilder("configs/acpr_scene_predicates.yaml")
@@ -85,9 +123,9 @@ def main() -> None:
         "missing_items": missing + [k for k, v in checks.items() if not v],
         "warnings": [],
     }
-    (out / "implementation_audit_ACPR_OIA_V1.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    (out_dir / "implementation_audit_ACPR_OIA_V1.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     if pass_all and args.write_review_pass:
-        (out / "REVIEW_PASS_ACPR_OIA_V1.txt").write_text("REVIEW_PASS_ACPR_OIA_V1\n" + result["git_head"] + "\n", encoding="utf-8")
+        (out_dir / "REVIEW_PASS_ACPR_OIA_V1.txt").write_text("REVIEW_PASS_ACPR_OIA_V1\n" + result["git_head"] + "\n", encoding="utf-8")
     if not pass_all:
         raise SystemExit(json.dumps(result, indent=2))
 
