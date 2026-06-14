@@ -16,6 +16,9 @@ class ACPRLabelTrunk(nn.Module):
         self.key_proj = nn.Linear(dim, dim)
         self.value_proj = nn.Linear(dim, dim)
         self.query_proj = nn.Linear(dim, dim)
+        self.label_self_attn = nn.MultiheadAttention(dim, num_heads=4, batch_first=True)
+        self.predicate_cross_attn = nn.MultiheadAttention(dim, num_heads=4, batch_first=True)
+        self.predicate_gate = nn.Parameter(torch.full((reason_dim,), -2.944))
         self.logit_head = nn.Linear(dim, 1)
         self.reason_to_action = nn.Linear(reason_dim, action_dim)
         self.action_visual = nn.Linear(dim, action_dim)
@@ -30,6 +33,12 @@ class ACPRLabelTrunk(nn.Module):
         score = (q * k).sum(-1) / (d ** 0.5)
         attn = entmax15_bisect(score, dim=-1)
         label_nodes = torch.einsum("bln,bnd->bld", attn, v)
+        label_nodes = label_nodes + self.label_self_attn(label_nodes, label_nodes, label_nodes, need_weights=False)[0]
+        if predicate_tokens is not None:
+            reason_nodes = label_nodes[:, self.action_dim :]
+            pred_delta = self.predicate_cross_attn(reason_nodes, predicate_tokens, predicate_tokens, need_weights=False)[0]
+            gate = torch.sigmoid(self.predicate_gate).clamp(max=0.20).view(1, self.reason_dim, 1)
+            label_nodes = torch.cat([label_nodes[:, : self.action_dim], reason_nodes + gate * pred_delta], dim=1)
         label_logits = self.logit_head(label_nodes).squeeze(-1)
         reason_logits_visual = label_logits[:, self.action_dim:]
         action_visual_logits = self.action_visual(label_nodes[:, : self.action_dim].mean(1))
@@ -44,5 +53,6 @@ class ACPRLabelTrunk(nn.Module):
             "action_reason_logits": action_reason_logits,
             "reason_logits_visual": reason_logits_visual,
             "action_fusion_gate": gate,
+            "predicate_conditioning_strength": torch.sigmoid(self.predicate_gate).detach(),
             "action_logits_direct": action_logits_direct,
         }

@@ -22,6 +22,7 @@ class ACPROIAModel(nn.Module):
         selected_layers: tuple[int, ...] = (3, 7, 11),
         pretrained_weights: str = "ckp/reference/dino_deitsmall8_pretrain.pth",
         scene_config: str = "configs/acpr_scene_predicates.yaml",
+        grammar_path: str = "configs/acpr_reason_predicate_grammar.yaml",
         use_mock_dino: bool = False,
     ) -> None:
         super().__init__()
@@ -31,7 +32,7 @@ class ACPROIAModel(nn.Module):
         self.ego = ACPREgoRegionEncoder(grid_hw=(45, 80), dim=dim)
         self.predicate_head = ACPRScenePredicateHead(scene_config=scene_config, dim=dim, num_layers=len(selected_layers))
         self.trunk = ACPRLabelTrunk(dim=dim, action_dim=action_dim, reason_dim=reason_dim)
-        self.predicate_reason = ACPRPredicateReasoner(dim=dim, reason_dim=reason_dim, num_predicates=self.predicate_head.num_predicates)
+        self.predicate_reason = ACPRPredicateReasoner(dim=dim, reason_dim=reason_dim, num_predicates=self.predicate_head.num_predicates, predicate_names=self.predicate_head.names, grammar_path=grammar_path)
         self.pair_memory = ACPRPairMemory(dim=dim)
         self.action_combo_aux = ACPRActionComboAux(dim=dim, action_dim=action_dim)
         self.calibration = ACPRCalibrationHead(num_labels=action_dim + reason_dim)
@@ -57,6 +58,7 @@ class ACPROIAModel(nn.Module):
             **predicates,
             **reason_delta,
             **action_set,
+            "global_embedding": field["cls_tokens_by_layer"].mean(1),
             "pair_embedding": pair_embedding,
             "action_logits_raw": action_logits_raw,
             "reason_logits_raw": reason_logits_raw,
