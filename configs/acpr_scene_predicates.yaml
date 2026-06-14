@@ -1,0 +1,33 @@
+predicates:
+  - {id: 0, name: traffic_light_red, group: traffic_control, region: upper_traffic_region, bdd100k_sources: [traffic light], enabled: true}
+  - {id: 1, name: traffic_light_green, group: traffic_control, region: upper_traffic_region, bdd100k_sources: [traffic light], enabled: true}
+  - {id: 2, name: stop_sign_present, group: traffic_control, region: upper_traffic_region, bdd100k_sources: [traffic sign], enabled: true}
+  - {id: 3, name: front_vehicle_close, group: front_object, region: front_center, bdd100k_sources: [car, truck, bus], enabled: true}
+  - {id: 4, name: front_vehicle_far, group: front_object, region: front_center, bdd100k_sources: [car, truck, bus], enabled: true}
+  - {id: 5, name: pedestrian_front, group: front_object, region: front_center, bdd100k_sources: [pedestrian], enabled: true}
+  - {id: 6, name: cyclist_front, group: front_object, region: front_center, bdd100k_sources: [rider, bike, bicycle, motorcycle], enabled: true}
+  - {id: 7, name: obstacle_front, group: front_object, region: front_center, bdd100k_sources: [obstacle, train], enabled: true}
+  - {id: 8, name: lane_left_available, group: lane, region: left_corridor, bdd100k_sources: [lane], enabled: true}
+  - {id: 9, name: lane_right_available, group: lane, region: right_corridor, bdd100k_sources: [lane], enabled: true}
+  - {id: 10, name: left_turn_region, group: lane, region: left_corridor, bdd100k_sources: [lane], enabled: true}
+  - {id: 11, name: right_turn_region, group: lane, region: right_corridor, bdd100k_sources: [lane], enabled: true}
+  - {id: 12, name: drivable_center, group: drivable, region: bottom_drivable_region, bdd100k_sources: [drivable], enabled: true}
+  - {id: 13, name: drivable_left, group: drivable, region: left_corridor, bdd100k_sources: [drivable], enabled: true}
+  - {id: 14, name: drivable_right, group: drivable, region: right_corridor, bdd100k_sources: [drivable], enabled: true}
+  - {id: 15, name: road_clear, group: road, region: front_center, bdd100k_sources: [road], enabled: true}
+  - {id: 16, name: road_crowded, group: road, region: front_center, bdd100k_sources: [car, pedestrian, rider], enabled: true}
+  - {id: 17, name: parked_vehicle_left, group: object, region: left_corridor, bdd100k_sources: [car, truck, bus], enabled: true}
+  - {id: 18, name: parked_vehicle_right, group: object, region: right_corridor, bdd100k_sources: [car, truck, bus], enabled: true}
+  - {id: 19, name: vehicle_left, group: object, region: left_corridor, bdd100k_sources: [car, truck, bus], enabled: true}
+  - {id: 20, name: vehicle_right, group: object, region: right_corridor, bdd100k_sources: [car, truck, bus], enabled: true}
+  - {id: 21, name: traffic_light_visible, group: traffic_control, region: upper_traffic_region, bdd100k_sources: [traffic light], enabled: true}
+  - {id: 22, name: traffic_sign_visible, group: traffic_control, region: upper_traffic_region, bdd100k_sources: [traffic sign], enabled: true}
+  - {id: 23, name: crosswalk_region, group: road, region: front_center, bdd100k_sources: [crosswalk], enabled: true}
+  - {id: 24, name: intersection_region, group: road, region: front_center, bdd100k_sources: [intersection], enabled: true}
+  - {id: 25, name: merging_left_context, group: lane, region: left_corridor, bdd100k_sources: [lane], enabled: true}
+  - {id: 26, name: merging_right_context, group: lane, region: right_corridor, bdd100k_sources: [lane], enabled: true}
+  - {id: 27, name: ego_lane_centered, group: road, region: bottom_drivable_region, bdd100k_sources: [road], enabled: true}
+  - {id: 28, name: low_front_visibility, group: global, region: front_center, bdd100k_sources: [weather, sky], enabled: true}
+  - {id: 29, name: open_left_gap, group: lane, region: left_corridor, bdd100k_sources: [drivable], enabled: true}
+  - {id: 30, name: open_right_gap, group: lane, region: right_corridor, bdd100k_sources: [drivable], enabled: true}
+  - {id: 31, name: global_scene_context, group: global, region: front_center, bdd100k_sources: [global], enabled: true}

@@ -1,0 +1,59 @@
+data_root: E:\sbw\BDD-OIA\data
+raw_root: E:\sbw\BDD-OIA
+bdd100k_root: E:\sbw\BDD100K
+pretrained_weights: ckp\reference\dino_deitsmall8_pretrain.pth
+checkpoint_key: teacher
+image_height: 360
+image_width: 640
+patch_size: 8
+action_dim: 4
+reason_dim: 21
+eval_splits: test
+best_selection_split: test
+token_compression: none
+feature_cache_enabled: false
+training:
+  epochs: 28
+  batch_size: 6
+  gradient_accumulation_steps: 5
+  fallback_ladder: [[6,5], [5,6], [4,8], [3,11]]
+  reference_effective_batch: 32
+  lr_trunk: 0.0002
+  lr_predicate: 0.0002
+  lr_reason_predicate: 0.0002
+  lr_pair_projection: 0.0002
+  lr_calibration: 0.0005
+  scheduler: warmup_cosine
+  warmup_epochs: 2
+  min_lr: 0.00001
+  weight_decay: 0.05
+  grad_clip: 1.0
+  amp: false
+  no_metric_early_stop: true
+runtime:
+  test_only: true
+  no_feature_cache: true
+  require_no_token_compression: true
+  foreground_only: true
+model:
+  selected_layers: [3, 7, 11]
+  use_mock_dino: false
+loss_weights:
+  action_direct: 1.0
+  reason_partial: 1.0
+  reason_soft_f1: 0.08
+  predicate_weak: 0.12
+  predicate_reason_align: 0.05
+  matched_pair_logit: 0.20
+  matched_pair_embed: 0.08
+  tail_pair_multiplier: 2.0
+  action_combo_ce: 0.015
+  action_combo_drop_add: 0.010
+  cardinality: 0.005
+  calibration: 0.05
+  predicate_attention_compactness: 0.001
+predicate:
+  scene_config: configs\acpr_scene_predicates.yaml
+grammar:
+  path: configs\acpr_reason_predicate_grammar.yaml
+  tail_indices: [12, 9, 5, 14, 6, 11, 10, 13]
