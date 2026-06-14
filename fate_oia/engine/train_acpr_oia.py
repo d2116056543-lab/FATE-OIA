@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader, Subset
 
 from fate_oia.datasets.bdd_oia_multitask import BDDOIAMultiTaskDataset
 from fate_oia.models.acpr_oia_model import ACPROIAModel
+from fate_oia.models.acpr_pair_memory import PairMiningThresholds
 from fate_oia.models.acpr_predicate_targets import WeakPredicateTargetBuilder
 from fate_oia.models.acpr_reason_grammar import ACPRReasonGrammar
 from fate_oia.transforms import AspectRatioLetterboxTransform
@@ -66,6 +67,7 @@ def optimizer_for(model: ACPROIAModel, cfg: dict) -> torch.optim.Optimizer:
         {"params": list(model.predicate_head.parameters()), "lr": float(tr.get("lr_predicate", 2e-4)), "name": "predicate"},
         {"params": list(model.predicate_reason.parameters()), "lr": float(tr.get("lr_reason_predicate", 2e-4)), "name": "reason_predicate"},
         {"params": list(model.pair_memory.parameters()), "lr": float(tr.get("lr_pair_projection", 2e-4)), "name": "pair_projection"},
+        {"params": list(model.reason_pair_proj.parameters()), "lr": float(tr.get("lr_pair_projection", 2e-4)), "name": "reason_pair_projection"},
         {"params": list(model.action_combo_aux.parameters()), "lr": float(tr.get("lr_trunk", 2e-4)), "name": "combo"},
         {"params": list(model.calibration.parameters()), "lr": float(tr.get("lr_calibration", 5e-4)), "name": "calibration"},
     ]
@@ -86,18 +88,53 @@ def reason_predicate_matrices(grammar: ACPRReasonGrammar, predicate_names: list[
     return torch.tensor(pos, dtype=torch.float32, device=device), torch.tensor(neg, dtype=torch.float32, device=device)
 
 
+def get_pair_weights(epoch: int, active_pair_rate: float) -> tuple[float, float]:
+    if epoch < 3:
+        return 0.0, 0.0
+    if epoch < 6:
+        return 0.05, 0.01
+    if epoch < 11:
+        return 0.10, 0.02
+    if active_pair_rate >= 0.05:
+        return 0.15, 0.04
+    return 0.05, 0.01
+
+
+def pair_artifact_payload(pairs: dict, reason_names: list[str] | None = None) -> dict[str, Any]:
+    summary = pair_summary(pairs)
+    reason_dim = len(pairs.get("pair_count_per_reason", [])) if isinstance(pairs.get("pair_count_per_reason"), list) else 21
+    per_reason = []
+    for rid in range(reason_dim):
+        name = reason_names[rid] if reason_names and rid < len(reason_names) else f"reason_{rid}"
+        per_reason.append({
+            "reason_id": rid,
+            "reason_name": name,
+            "pair_count": int((pairs.get("pair_count_per_reason") or [0] * reason_dim)[rid]),
+            "active_pair_count": int((pairs.get("active_pair_count_per_reason") or [0] * reason_dim)[rid]),
+            "hard_pair_count": int((pairs.get("hard_pair_count_per_reason") or [0] * reason_dim)[rid]),
+            "semi_hard_count": int((pairs.get("semi_hard_pair_count_per_reason") or [0] * reason_dim)[rid]),
+            "easy_count": int((pairs.get("easy_pair_count_per_reason") or [0] * reason_dim)[rid]),
+            "margin_mean": float((pairs.get("margin_mean_per_reason") or [0.0] * reason_dim)[rid]),
+            "active_margin_mean": float((pairs.get("active_margin_mean_per_reason") or [0.0] * reason_dim)[rid]),
+        })
+    return {"available": True, **summary, "per_reason": per_reason}
+
+
 def compute_losses(out: dict, batch: dict, predicate_batch: dict, pairs: dict, grammar_matrices: tuple[torch.Tensor, torch.Tensor], weights: dict) -> tuple[torch.Tensor, dict[str, float]]:
     action = batch["action"]
     reason = batch["reason"]
-    labels = torch.cat([action, reason], dim=-1)
+    pair_logit, pair_logit_stats = L.matched_pair_logit_loss(out["reason_logits_final_raw"], pairs, return_stats=True)
+    pair_embed, pair_embed_stats = L.matched_pair_embedding_loss(out["reason_embeddings_for_pair"], pairs, return_stats=True)
     terms = {
         "action_direct": L.action_asl_loss(out["action_logits_final_raw"], action),
+        "action_visual_aux": L.action_asl_loss(out["action_visual_logits"], action),
+        "action_reason_aux": L.action_asl_loss(out["action_reason_logits"], action),
         "reason_partial": L.partial_label_reason_loss(out["reason_logits_final_raw"], reason, out.get("predicate_reason_contradiction_score_by_label")),
         "reason_soft_f1": L.reason_soft_f1_loss(out["reason_logits_final_raw"], reason),
         "predicate_weak": L.predicate_weak_bce_mil_loss(out["predicate_logits"], predicate_batch["predicate_targets"], predicate_batch["predicate_mask"], predicate_batch.get("predicate_reliability")),
         "predicate_reason_align": L.predicate_reason_alignment_loss(out["predicate_probs"], reason, grammar_matrices[0], grammar_matrices[1]),
-        "matched_pair_logit": L.matched_pair_logit_loss(out["reason_logits_final_raw"], pairs),
-        "matched_pair_embed": L.matched_pair_embedding_loss(out["pair_embedding"], pairs),
+        "matched_pair_logit": pair_logit,
+        "matched_pair_embed": pair_embed,
         "action_combo_ce": L.action_combo_ce_loss(out["action_set_logits"], action),
         "action_combo_drop_add": L.action_combo_drop_add_loss(out["action_set_logits"], action),
         "cardinality": L.cardinality_loss(out["cardinality_logits"], action),
@@ -105,7 +142,10 @@ def compute_losses(out: dict, batch: dict, predicate_batch: dict, pairs: dict, g
         "predicate_attention_compactness": L.predicate_attention_compactness_loss(out["predicate_attention"]),
     }
     total = sum(terms[k] * float(weights.get(k, 0.0)) for k in terms)
-    return total, {f"loss_{k}": float(v.detach().cpu()) for k, v in terms.items()}
+    parts = {f"loss_{k}": float(v.detach().cpu()) for k, v in terms.items()}
+    parts.update({f"pair_logit_{k}": v for k, v in pair_logit_stats.items()})
+    parts.update({f"pair_embed_{k}": v for k, v in pair_embed_stats.items()})
+    return total, parts
 
 
 @torch.no_grad()
@@ -237,6 +277,19 @@ def main() -> None:
     target_builder = WeakPredicateTargetBuilder(cfg.get("predicate", {}).get("scene_config", "configs/acpr_scene_predicates.yaml"), cfg.get("bdd100k_root"))
     matrices = reason_predicate_matrices(grammar, model.predicate_head.names, device)
     weights = cfg.get("loss_weights", {})
+    pair_cfg = cfg.get("pair_mining", {})
+    pair_thresholds = PairMiningThresholds(
+        action_sim_min=float(pair_cfg.get("action_sim_min", pair_cfg.get("min_action_similarity", 0.35))),
+        visual_sim_min=float(pair_cfg.get("visual_sim_min", pair_cfg.get("min_visual_similarity", 0.05))),
+        predicate_sim_min=float(pair_cfg.get("predicate_sim_min", pair_cfg.get("min_predicate_similarity", 0.05))),
+        contradiction_min=float(pair_cfg.get("contradiction_min", pair_cfg.get("min_contradiction_common", 0.15))),
+        tail_action_sim_min=float(pair_cfg.get("tail_action_sim_min", 0.20)),
+        tail_visual_sim_min=float(pair_cfg.get("tail_visual_sim_min", -0.05)),
+        tail_predicate_sim_min=float(pair_cfg.get("tail_predicate_sim_min", -0.05)),
+        tail_contradiction_min=float(pair_cfg.get("tail_contradiction_min", pair_cfg.get("min_contradiction_tail", 0.05))),
+        semi_hard_band=float(pair_cfg.get("semi_hard_band", 0.15)),
+        fallback_easy_pair_weight=float(pair_cfg.get("fallback_easy_pair_weight", 0.15)),
+    )
     best_raw = -1.0
     best_cal = -1.0
     best_exp = -1.0
@@ -259,9 +312,22 @@ def main() -> None:
                 batch["reason"],
                 out["contradiction_score"].detach(),
                 grammar.tail_indices,
+                reason_logits_current=out["reason_logits_final_raw"].detach(),
+                reason_embeddings_current=out["reason_embeddings_for_pair"].detach(),
+                epoch=epoch,
+                max_pairs=int(pair_cfg.get("max_pairs_per_batch", 256)),
+                max_pairs_per_reason=int(pair_cfg.get("max_pairs_per_reason", 8)),
+                max_tail_pairs_per_reason=int(pair_cfg.get("max_tail_pairs_per_reason", 12)),
+                margin=float(pair_cfg.get("margin", 0.25)),
+                thresholds=pair_thresholds,
             )
-            model.pair_memory.enqueue(batch["file_name"], out["global_embedding"], out["predicate_probs"], batch["action"], batch["reason"])
-            loss, parts = compute_losses(out, batch, pred_batch, pairs, matrices, weights)
+            pair_count = int(pairs.get("pair_count", 0))
+            active_pair_rate = float(pairs.get("active_pair_count", 0)) / max(float(pair_count), 1.0)
+            pair_logit_weight, pair_embed_weight = get_pair_weights(epoch, active_pair_rate)
+            batch_weights = dict(weights)
+            batch_weights["matched_pair_logit"] = pair_logit_weight
+            batch_weights["matched_pair_embed"] = pair_embed_weight
+            loss, parts = compute_losses(out, batch, pred_batch, pairs, matrices, batch_weights)
             (loss / accum).backward()
             if step % accum == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), float(tr.get("grad_clip", 1.0)))
@@ -278,12 +344,25 @@ def main() -> None:
                     "loss_total": float(loss.detach().cpu()),
                     **parts,
                     **pair_summary(pairs),
+                    "matched_pair_weight_logit": pair_logit_weight,
+                    "matched_pair_weight_embed": pair_embed_weight,
+                    "active_pair_rate": active_pair_rate,
                     "reason_positive_rate": float(batch["reason"].mean().detach().cpu()),
                     "predicate_positive_rate": float(pred_batch["predicate_targets"].mean().detach().cpu()),
                     "gpu_peak_memory_gb": float(torch.cuda.max_memory_allocated() / (1024**3)) if torch.cuda.is_available() else 0.0,
                 }
                 print(json.dumps(payload), flush=True)
                 append_jsonl(out_dir / "loss_components.jsonl", payload)
+            model.pair_memory.enqueue(
+                batch["file_name"],
+                out["global_embedding"],
+                out["predicate_probs"],
+                batch["action"],
+                batch["reason"],
+                out["contradiction_score"].detach(),
+                out["reason_logits_final_raw"].detach(),
+                out["reason_embeddings_for_pair"].detach(),
+            )
         sched.step()
         metrics = evaluate(model, test_loader, device, epoch, out_dir)
         row = {"event": "acpr_epoch", "epoch": epoch, **metrics}
@@ -301,25 +380,63 @@ def main() -> None:
         append_jsonl(epoch_dir / "predicate_metrics.jsonl", {"available": True, "predicate_positive_rate": float(pred_batch["predicate_targets"].mean().detach().cpu()), "predicate_mask_rate": float(pred_batch["predicate_mask"].mean().detach().cpu())})
         append_jsonl(epoch_dir / "predicate_coverage.jsonl", {"available": True, **pred_batch.get("predicate_coverage", {})})
         append_jsonl(epoch_dir / "predicate_reason_alignment.jsonl", {"available": True, "positive_score_mean": float(out.get("predicate_reason_positive_score_by_label").mean().detach().cpu()), "contradiction_score_mean": float(out.get("predicate_reason_contradiction_score_by_label").mean().detach().cpu())})
+        pair_epoch_payload = pair_artifact_payload(pairs)
         append_jsonl(epoch_dir / "pair_mining_stats.jsonl", {"available": True, **pair_summary(pairs)})
         append_jsonl(epoch_dir / "pair_stats.jsonl", {"available": True, **pair_summary(pairs)})
-        write_json(epoch_dir / "pair_margin_per_reason.json", {"available": True, "pair_count": int(pairs.get("pair_count", 0)), "pair_contradiction_mean": pair_summary(pairs).get("pair_contradiction_mean", 0.0)})
-        append_jsonl(epoch_dir / "pair_margins.jsonl", {"available": True, "pair_count": int(pairs.get("pair_count", 0)), "pair_contradiction_mean": pair_summary(pairs).get("pair_contradiction_mean", 0.0)})
-        append_jsonl(epoch_dir / "tail_reason_metrics.jsonl", {"available": True, "tail_indices": grammar.tail_indices, "tail_pair_count": int(pairs.get("tail_pair_count", 0))})
+        write_json(epoch_dir / "pair_margin_per_reason.json", pair_epoch_payload)
+        append_jsonl(epoch_dir / "pair_margins.jsonl", pair_epoch_payload)
+        append_jsonl(epoch_dir / "tail_reason_metrics.jsonl", {
+            "available": True,
+            "tail_indices": grammar.tail_indices,
+            "tail_pair_count": int(pairs.get("tail_pair_count", 0)),
+            "tail_active_pair_count": int(pairs.get("tail_active_pair_count", 0)),
+            "tail_margin_mean": float(sum(float((pairs.get("margin_mean_per_reason") or [0.0] * 21)[i]) for i in grammar.tail_indices) / max(len(grammar.tail_indices), 1)),
+        })
         combo_loss_tmp, combo_stats_tmp = L.action_combo_drop_add_loss(out["action_set_logits"], batch["action"], return_stats=True)
         append_jsonl(epoch_dir / "action_combo_metrics.jsonl", {"available": True, **combo_stats_tmp})
         append_jsonl(epoch_dir / "calibration_diagnostics.jsonl", {"available": True, "temperature_mean": float(out["temperature"].mean().detach().cpu()), "bias_mean": float(out["calibration_bias"].mean().detach().cpu())})
         append_jsonl(epoch_dir / "reason_activation_stats.jsonl", {"available": True, "reason_logit_mean": float(out["reason_logits_final_raw"].mean().detach().cpu()), "reason_delta_mean": float(out["predicate_reason_delta_by_label"].mean().detach().cpu())})
         append_jsonl(epoch_dir / "per_label_action_metrics.jsonl", {"available": True, "metrics": metrics["metrics_raw_fixed"].get("per_action_F1", [])})
         append_jsonl(epoch_dir / "per_label_reason_metrics.jsonl", {"available": True, "metrics": metrics["metrics_raw_fixed"].get("per_reason_F1", [])})
-        pair_case = {
-            "available": int(pairs.get("pair_count", 0)) > 0,
-            "pair_pos_indices": json_safe(pairs.get("pair_pos_indices", [])),
-            "pair_neg_indices": json_safe(pairs.get("pair_neg_indices", [])),
-            "pair_reason_ids": json_safe(pairs.get("pair_reason_ids", [])),
-            **pair_summary(pairs),
-        }
-        append_jsonl(epoch_dir / "matched_counterfactual_cases.jsonl", pair_case)
+        pos_idx = pairs.get("pair_pos_indices")
+        neg_idx = pairs.get("pair_neg_indices")
+        mem_idx = pairs.get("pair_neg_memory_indices")
+        rid_idx = pairs.get("pair_reason_ids")
+        hinge_vals = pairs.get("pair_hinge_raw")
+        weight_vals = pairs.get("pair_weights")
+        active_mask = pairs.get("pair_active_mask")
+        is_mem = pairs.get("pair_neg_is_memory")
+        if torch.is_tensor(pos_idx) and torch.is_tensor(rid_idx) and pos_idx.numel():
+            order = torch.arange(pos_idx.numel(), device=pos_idx.device)
+            if torch.is_tensor(active_mask) and active_mask.numel() == pos_idx.numel():
+                active_order = torch.where(active_mask.bool())[0]
+                order = active_order if active_order.numel() else order
+            for oi in order[:50].tolist():
+                pi = int(pos_idx[oi].detach().cpu())
+                ni = int(neg_idx[oi].detach().cpu()) if torch.is_tensor(neg_idx) else -1
+                mi = int(mem_idx[oi].detach().cpu()) if torch.is_tensor(mem_idx) else -1
+                rr = int(rid_idx[oi].detach().cpu())
+                append_jsonl(epoch_dir / "matched_counterfactual_cases.jsonl", {
+                    "available": True,
+                    "file_pos": batch["file_name"][pi] if pi < len(batch["file_name"]) else str(pi),
+                    "file_neg_or_memory": (batch["file_name"][ni] if ni >= 0 and ni < len(batch["file_name"]) else f"memory:{mi}"),
+                    "reason_id": rr,
+                    "reason_name": f"reason_{rr}",
+                    "action_pos": json_safe(batch["action"][pi].detach().cpu()) if pi < batch["action"].shape[0] else [],
+                    "action_neg": json_safe(batch["action"][ni].detach().cpu()) if ni >= 0 and ni < batch["action"].shape[0] else [],
+                    "z_pos": float(out["reason_logits_final_raw"][pi, rr].detach().cpu()) if pi < out["reason_logits_final_raw"].shape[0] else 0.0,
+                    "z_neg": float((pairs.get("pair_neg_logits_detached")[oi] if torch.is_tensor(pairs.get("pair_neg_logits_detached")) else torch.tensor(0.0)).detach().cpu()),
+                    "hinge_raw": float(hinge_vals[oi].detach().cpu()) if torch.is_tensor(hinge_vals) else 0.0,
+                    "pair_weight": float(weight_vals[oi].detach().cpu()) if torch.is_tensor(weight_vals) else 0.0,
+                    "is_memory": bool(is_mem[oi].detach().cpu()) if torch.is_tensor(is_mem) else False,
+                    "action_sim": float(pairs["pair_action_sim"][oi].detach().cpu()) if torch.is_tensor(pairs.get("pair_action_sim")) else 0.0,
+                    "visual_sim": float(pairs["pair_visual_sim"][oi].detach().cpu()) if torch.is_tensor(pairs.get("pair_visual_sim")) else 0.0,
+                    "predicate_sim": float(pairs["pair_predicate_sim"][oi].detach().cpu()) if torch.is_tensor(pairs.get("pair_predicate_sim")) else 0.0,
+                    "contradiction": float(pairs["pair_contradiction"][oi].detach().cpu()) if torch.is_tensor(pairs.get("pair_contradiction")) else 0.0,
+                })
+        else:
+            append_jsonl(epoch_dir / "matched_counterfactual_cases.jsonl", {"available": False, **pair_summary(pairs)})
+        pair_case = {"available": int(pairs.get("pair_count", 0)) > 0, **pair_summary(pairs)}
         append_jsonl(epoch_dir / "pair_cases_test.jsonl", pair_case)
         append_jsonl(epoch_dir / "failure_cases.jsonl", {"available": True, "file_count": len(metrics)})
         append_jsonl(epoch_dir / "gpu_memory.jsonl", {"peak_gb": float(torch.cuda.max_memory_allocated() / (1024**3)) if torch.cuda.is_available() else 0.0})

@@ -56,18 +56,21 @@ def main() -> None:
     checks["grammar_matches_external_names"] = all(str(grammar["reasons"][i]["name"]) == str(display["names"][i]) for i in range(21))
     checks["grammar_has_predicate_fields"] = all(all(k in grammar["reasons"][i] for k in ["positive_predicates", "contradictory_predicates", "compatible_actions", "hard_negative_reasons", "spatial_region"]) for i in range(21))
     text = "\n".join(Path(r).read_text(encoding="utf-8") for r in REQUIRED if Path(r).exists())
+    checks["action_visual_head_per_action_token"] = all(s in Path("fate_oia/models/acpr_label_trunk.py").read_text(encoding="utf-8") for s in ["action_visual_head(action_nodes).squeeze(-1)", "action_token_norm_mean"]) and "action_visual(label_nodes[:, : self.action_dim].mean(1))" not in Path("fate_oia/models/acpr_label_trunk.py").read_text(encoding="utf-8")
     checks["pair_mining_reason_specific"] = all(s in text for s in ["pair_reason_ids", "pair_pos_indices", "pair_neg_indices", "pair_contradiction", "global_embedding", "predicate_probs"])
-    checks["pair_loss_reason_specific"] = "reason_logits[pos.long(), rid.long()]" in text and "margin - z_pos + z_neg" in text
+    checks["hardpair_active_schema"] = all(s in Path("fate_oia/models/acpr_pair_memory.py").read_text(encoding="utf-8") for s in ["pair_active_mask", "pair_hard_mask", "pair_semi_hard_mask", "pair_easy_mask", "pair_neg_logits_detached", "pair_neg_embedding_detached"])
+    checks["pair_loss_reason_specific"] = "reason_logits[pos, rid]" in text and "margin - z_pos + z_neg" in text
+    checks["memory_pair_loss_detached"] = all(s in Path("fate_oia/losses/acpr_losses.py").read_text(encoding="utf-8") for s in ["pair_neg_is_memory", "pair_neg_logits_detached", "pair_neg_embedding_detached", "detach()"])
     checks["pu_loss_uses_contradiction"] = "0.2 + (1.0 - neg_min_weight) * contradiction_scores" in text or "neg_min_weight + (1.0 - neg_min_weight) * contradiction_scores" in text
     checks["predicate_target_geometry"] = all(s in text for s in ["box2d", "poly2d", "drivable_available", "left_corridor", "right_corridor", "predicate_reliability"])
     checks["label_trunk_uses_predicate_tokens"] = "predicate_cross_attn" in text and "predicate_tokens" in text and "label_self_attn" in text
     checks["predicate_reason_grammar_conditioned"] = all(s in text for s in ["positive_mask", "contradictory_mask", "predicate_reason_contradiction_score_by_label"])
     checks["supervisor_full_gate"] = all(s in Path("fate_oia/engine/supervise_acpr_oia_foreground.py").read_text(encoding="utf-8") for s in ["audit_acpr_oia_implementation", "max_train_samples", "fallback_ladder", "GOAL_COMPLETED_ACPR_OIA_V1.json"])
     checks["dino_field_last_tokens"] = all(s in Path("fate_oia/models/acpr_dino_field.py").read_text(encoding="utf-8") for s in ["patch_tokens_last", "cls_token_last", "original_tokens"])
-    checks["pair_memory_enqueue"] = all(s in Path("fate_oia/models/acpr_pair_memory.py").read_text(encoding="utf-8") for s in ["def enqueue", "def mine", "pair_neg_memory_indices"])
+    checks["pair_memory_enqueue"] = all(s in Path("fate_oia/models/acpr_pair_memory.py").read_text(encoding="utf-8") for s in ["def enqueue", "def mine", "pair_neg_memory_indices", "reason_logits_detached", "reason_embeddings_detached"])
     checks["combo_cardinality_outputs"] = all(s in Path("fate_oia/models/acpr_action_combo_aux.py").read_text(encoding="utf-8") for s in ["cardinality_logits", "combo_stats"])
     checks["calibration_split_outputs"] = all(s in Path("fate_oia/models/acpr_calibration.py").read_text(encoding="utf-8") for s in ["action_logits_calibrated", "reason_logits_calibrated", "bias_action", "temperature_reason"])
-    checks["model_contract_outputs"] = all(s in Path("fate_oia/models/acpr_oia_model.py").read_text(encoding="utf-8") for s in ["direct_plus_predicate", "action_logits_raw", "reason_logits_raw", "cardinality_logits"])
+    checks["model_contract_outputs"] = all(s in Path("fate_oia/models/acpr_oia_model.py").read_text(encoding="utf-8") for s in ["direct_plus_predicate", "action_logits_raw", "reason_logits_raw", "cardinality_logits", "reason_embeddings_for_pair"])
     checks["train_artifact_schema"] = all(s in Path("fate_oia/engine/train_acpr_oia.py").read_text(encoding="utf-8") for s in [
         "implementation_fingerprint.json",
         "logits_action_raw_test.pt",
@@ -76,6 +79,7 @@ def main() -> None:
         "pair_cases_test.jsonl",
         "pair_mining_stats.jsonl",
         "pair_margin_per_reason.json",
+        "matched_counterfactual_cases.jsonl",
         "checkpoint_best_test_tail_mf1.pth",
     ])
     checks["eval_diagnostics_schema"] = all(s in Path("fate_oia/engine/eval_acpr_oia.py").read_text(encoding="utf-8") for s in ["action_composition", "tail_reason", "predicate_group", "pair_margin"])
@@ -95,6 +99,8 @@ def main() -> None:
         "contradiction_score",
         "required_support_score",
         "cardinality_logits",
+        "reason_embeddings_for_pair",
+        "action_token_norm_mean",
     ]) and forward_out["action_logits_raw"].shape == (2, 4) and forward_out["reason_logits_raw"].shape == (2, 21)
     from fate_oia.models.acpr_predicate_targets import WeakPredicateTargetBuilder
     from fate_oia.losses.acpr_losses import matched_pair_logit_loss
@@ -109,11 +115,24 @@ def main() -> None:
     pred = builder.build_from_records(synthetic)
     checks["predicate_synthetic_nonzero"] = bool(pred["predicate_targets"].sum().item() > 0 and pred["predicate_coverage"]["object_box_count"] > 0 and pred["predicate_coverage"]["lane_poly_count"] > 0 and pred["predicate_coverage"]["drivable_count"] > 0)
     logits = torch.zeros(3, 21, requires_grad=True)
-    pairs = {"pair_pos_indices": torch.tensor([0]), "pair_neg_indices": torch.tensor([1]), "pair_reason_ids": torch.tensor([5]), "pair_weights": torch.tensor([1.0])}
+    pairs = {"pair_pos_indices": torch.tensor([0]), "pair_neg_indices": torch.tensor([1]), "pair_reason_ids": torch.tensor([5]), "pair_weights": torch.tensor([1.0]), "pair_active_mask": torch.tensor([True]), "pair_neg_is_memory": torch.tensor([False])}
     loss = matched_pair_logit_loss(logits, pairs)
     loss.backward()
     grad = logits.grad
     checks["pair_loss_only_reason_r"] = bool(grad[:, 5].abs().sum() > 0 and grad[:, [i for i in range(21) if i != 5]].abs().sum() == 0)
+    mem_logits = torch.zeros(2, 21, requires_grad=True)
+    mem_pairs = {
+        "pair_pos_indices": torch.tensor([0]),
+        "pair_neg_indices": torch.tensor([-1]),
+        "pair_neg_memory_indices": torch.tensor([7]),
+        "pair_reason_ids": torch.tensor([3]),
+        "pair_weights": torch.tensor([1.0]),
+        "pair_active_mask": torch.tensor([True]),
+        "pair_neg_is_memory": torch.tensor([True]),
+        "pair_neg_logits_detached": torch.tensor([1.0]),
+    }
+    mem_loss = matched_pair_logit_loss(mem_logits, mem_pairs)
+    checks["memory_pair_loss_no_batch_index"] = bool(torch.isfinite(mem_loss) and float(mem_loss.detach()) > 0)
     pass_all = not missing and all(checks.values())
     result = {
         "pass": pass_all,

@@ -117,26 +117,52 @@ model:
   max_predicate_reason_delta: 0.20
 pair_mining:
   memory_size: 8192
-  min_action_similarity: 0.5
-  min_visual_similarity: 0.2
-  min_predicate_similarity: 0.2
-  min_contradiction_common: 0.30
-  min_contradiction_tail: 0.20
+  min_action_similarity: 0.35
+  min_visual_similarity: 0.05
+  min_predicate_similarity: 0.05
+  min_contradiction_common: 0.15
+  min_contradiction_tail: 0.05
   max_pairs_per_batch: 256
-  max_pairs_per_reason: 16
+  max_pairs_per_reason: 8
+  max_tail_pairs_per_reason: 12
+  margin: 0.25
+  semi_hard_band: 0.15
+  action_sim_min: 0.35
+  visual_sim_min: 0.05
+  predicate_sim_min: 0.05
+  contradiction_min: 0.15
+  tail_action_sim_min: 0.20
+  tail_visual_sim_min: -0.05
+  tail_predicate_sim_min: -0.05
+  tail_contradiction_min: 0.05
+  fallback_easy_pair_weight: 0.15
   tail_reason_indices: [12, 9, 5, 14, 6, 11, 10, 13]
 loss_weights:
   action_direct: 1.0
+  action_visual_aux: 0.05
+  action_reason_aux: 0.05
   reason_partial: 1.0
   reason_soft_f1: 0.08
   predicate_weak: 0.12
   predicate_reason_align: 0.05
-  matched_pair_logit: 0.20
-  matched_pair_embed: 0.08
+  matched_pair_logit: 0.0
+  matched_pair_embed: 0.0
+  matched_pair_logit_weight_schedule:
+    before_epoch_3: 0.0
+    epoch_3_to_5: 0.05
+    epoch_6_to_10: 0.10
+    epoch_11_plus_active: 0.15
+    epoch_11_plus_inactive: 0.05
+  matched_pair_embed_weight_schedule:
+    before_epoch_3: 0.0
+    epoch_3_to_5: 0.01
+    epoch_6_to_10: 0.02
+    epoch_11_plus_active: 0.04
+    epoch_11_plus_inactive: 0.01
   tail_pair_multiplier: 2.0
-  action_combo_ce: 0.015
-  action_combo_drop_add: 0.010
-  cardinality: 0.005
+  action_combo_ce: 0.03
+  action_combo_drop_add: 0.03
+  cardinality: 0.02
   calibration: 0.05
   predicate_attention_compactness: 0.001
 predicate:

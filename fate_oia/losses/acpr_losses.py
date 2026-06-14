@@ -58,29 +58,74 @@ def matched_pair_logit_loss(
     pair_reason_idx: torch.Tensor | None = None,
     pair_weights: torch.Tensor | None = None,
     margin: float = 0.25,
-) -> torch.Tensor:
+    use_active_mask: bool = True,
+    return_stats: bool = False,
+):
     if isinstance(pair_pos_idx, dict):
         pairs = pair_pos_idx
         pos = pairs.get("pair_pos_indices")
         neg = pairs.get("pair_neg_indices")
         rid = pairs.get("pair_reason_ids")
         weights = pairs.get("pair_weights")
+        is_memory = pairs.get("pair_neg_is_memory")
+        neg_logits_detached = pairs.get("pair_neg_logits_detached")
+        active = pairs.get("pair_active_mask")
     else:
         pos, neg, rid, weights = pair_pos_idx, pair_neg_idx, pair_reason_idx, pair_weights
+        is_memory = None
+        neg_logits_detached = None
+        active = None
     if pos is None or neg is None or rid is None or pos.numel() == 0:
-        return reason_logits.sum() * 0.0
-    valid = (pos.long() >= 0) & (pos.long() < reason_logits.shape[0]) & (neg.long() >= 0) & (neg.long() < reason_logits.shape[0]) & (rid.long() >= 0) & (rid.long() < reason_logits.shape[1])
+        zero = reason_logits.sum() * 0.0
+        if return_stats:
+            return zero, {"hinge_mean": 0.0, "hinge_positive_rate": 0.0, "active_pair_rate": 0.0, "zero_loss_rate": 1.0}
+        return zero
+    pos = pos.long().to(reason_logits.device)
+    neg = neg.long().to(reason_logits.device)
+    rid = rid.long().to(reason_logits.device)
+    is_memory_t = torch.zeros_like(pos, dtype=torch.bool) if is_memory is None else is_memory.to(reason_logits.device).bool()
+    valid = (pos >= 0) & (pos < reason_logits.shape[0]) & (rid >= 0) & (rid < reason_logits.shape[1])
+    valid = valid & (is_memory_t | ((neg >= 0) & (neg < reason_logits.shape[0])))
+    if neg_logits_detached is None and is_memory_t.any():
+        valid = valid & (~is_memory_t)
     if not valid.any():
-        return reason_logits.sum() * 0.0
+        zero = reason_logits.sum() * 0.0
+        if return_stats:
+            return zero, {"hinge_mean": 0.0, "hinge_positive_rate": 0.0, "active_pair_rate": 0.0, "zero_loss_rate": 1.0}
+        return zero
     pos = pos[valid]
     neg = neg[valid]
     rid = rid[valid]
+    is_memory_t = is_memory_t[valid]
     if weights is not None:
-        weights = weights[valid]
-    z_pos = reason_logits[pos.long(), rid.long()]
-    z_neg = reason_logits[neg.long(), rid.long()]
+        weights = weights.to(reason_logits.device)[valid]
+    if active is not None:
+        active = active.to(reason_logits.device).bool()[valid]
+    else:
+        active = torch.ones_like(pos, dtype=torch.bool)
+    z_pos = reason_logits[pos, rid]
+    z_neg = torch.empty_like(z_pos)
+    in_batch = ~is_memory_t
+    if in_batch.any():
+        z_neg[in_batch] = reason_logits[neg[in_batch], rid[in_batch]]
+    if is_memory_t.any():
+        z_neg[is_memory_t] = neg_logits_detached.to(reason_logits.device, reason_logits.dtype)[valid][is_memory_t].detach()  # type: ignore[union-attr]
     w = torch.ones_like(z_pos) if weights is None else weights.to(z_pos.device, z_pos.dtype)
-    return (w * F.relu(margin - z_pos + z_neg)).sum() / w.sum().clamp_min(1.0)
+    hinge = F.relu(margin - z_pos + z_neg)
+    if use_active_mask:
+        hinge = hinge * active.float()
+        w = w * active.float()
+    loss = (w * hinge).sum() / w.sum().clamp_min(1.0)
+    if return_stats:
+        raw_hinge = margin - z_pos.detach() + z_neg.detach()
+        stats = {
+            "hinge_mean": float(raw_hinge.mean().detach().cpu()) if raw_hinge.numel() else 0.0,
+            "hinge_positive_rate": float((raw_hinge > 0).float().mean().detach().cpu()) if raw_hinge.numel() else 0.0,
+            "active_pair_rate": float(active.float().mean().detach().cpu()) if active.numel() else 0.0,
+            "zero_loss_rate": float((hinge.detach() <= 0).float().mean().detach().cpu()) if hinge.numel() else 1.0,
+        }
+        return loss, stats
+    return loss
 
 
 def matched_pair_embedding_loss(
@@ -89,27 +134,84 @@ def matched_pair_embedding_loss(
     pair_neg_idx: torch.Tensor | None = None,
     pair_reason_idx: torch.Tensor | None = None,
     pair_weights: torch.Tensor | None = None,
-) -> torch.Tensor:
+    embed_margin: float = 0.2,
+    use_active_mask: bool = True,
+    return_stats: bool = False,
+):
     if isinstance(pair_pos_idx, dict):
         pairs = pair_pos_idx
         pos = pairs.get("pair_pos_indices")
         neg = pairs.get("pair_neg_indices")
+        rid = pairs.get("pair_reason_ids")
         weights = pairs.get("pair_weights")
+        is_memory = pairs.get("pair_neg_is_memory")
+        neg_embedding_detached = pairs.get("pair_neg_embedding_detached")
+        active = pairs.get("pair_active_mask")
     else:
-        pos, neg, weights = pair_pos_idx, pair_neg_idx, pair_weights
-    if pos is None or neg is None or pos.numel() == 0:
-        return reason_embeddings.sum() * 0.0
-    valid = (pos.long() >= 0) & (pos.long() < reason_embeddings.shape[0]) & (neg.long() >= 0) & (neg.long() < reason_embeddings.shape[0])
+        pos, neg, rid, weights = pair_pos_idx, pair_neg_idx, pair_reason_idx, pair_weights
+        is_memory = None
+        neg_embedding_detached = None
+        active = None
+    if pos is None or neg is None or rid is None or pos.numel() == 0:
+        zero = reason_embeddings.sum() * 0.0
+        if return_stats:
+            return zero, {"embed_cosine_mean": 0.0, "active_pair_rate": 0.0}
+        return zero
+    pos = pos.long().to(reason_embeddings.device)
+    neg = neg.long().to(reason_embeddings.device)
+    rid = rid.long().to(reason_embeddings.device)
+    if reason_embeddings.dim() == 2:
+        e_all = reason_embeddings
+        valid = (pos >= 0) & (pos < e_all.shape[0]) & (neg >= 0) & (neg < e_all.shape[0])
+        rid_valid = torch.ones_like(valid, dtype=torch.bool)
+        is_memory_t = torch.zeros_like(pos, dtype=torch.bool)
+    else:
+        e_all = reason_embeddings
+        is_memory_t = torch.zeros_like(pos, dtype=torch.bool) if is_memory is None else is_memory.to(reason_embeddings.device).bool()
+        valid = (pos >= 0) & (pos < e_all.shape[0]) & (rid >= 0) & (rid < e_all.shape[1])
+        valid = valid & (is_memory_t | ((neg >= 0) & (neg < e_all.shape[0])))
+        rid_valid = valid
+        if neg_embedding_detached is None and is_memory_t.any():
+            valid = valid & (~is_memory_t)
     if not valid.any():
-        return reason_embeddings.sum() * 0.0
+        zero = reason_embeddings.sum() * 0.0
+        if return_stats:
+            return zero, {"embed_cosine_mean": 0.0, "active_pair_rate": 0.0}
+        return zero
     pos = pos[valid]
     neg = neg[valid]
+    rid = rid[valid]
+    is_memory_t = is_memory_t[valid] if reason_embeddings.dim() == 3 else torch.zeros_like(pos, dtype=torch.bool)
     if weights is not None:
-        weights = weights[valid]
-    sim_pos = (reason_embeddings[pos.long()] * reason_embeddings[pos.long()]).sum(-1)
-    sim_neg = (reason_embeddings[pos.long()] * reason_embeddings[neg.long()]).sum(-1)
-    w = torch.ones_like(sim_pos) if weights is None else weights.to(sim_pos.device, sim_pos.dtype)
-    return (w * F.relu(0.2 - sim_pos + sim_neg)).sum() / w.sum().clamp_min(1.0)
+        weights = weights.to(reason_embeddings.device)[valid]
+    if active is not None:
+        active = active.to(reason_embeddings.device).bool()[valid]
+    else:
+        active = torch.ones_like(pos, dtype=torch.bool)
+    if reason_embeddings.dim() == 3 and rid_valid.any():
+        e_pos = reason_embeddings[pos, rid]
+        e_neg = torch.empty_like(e_pos)
+        in_batch = ~is_memory_t
+        if in_batch.any():
+            e_neg[in_batch] = reason_embeddings[neg[in_batch], rid[in_batch]]
+        if is_memory_t.any():
+            e_neg[is_memory_t] = neg_embedding_detached.to(reason_embeddings.device, reason_embeddings.dtype)[valid][is_memory_t].detach()  # type: ignore[union-attr]
+    else:
+        e_pos = reason_embeddings[pos]
+        e_neg = reason_embeddings[neg]
+    sim_neg = F.cosine_similarity(e_pos, e_neg, dim=-1)
+    w = torch.ones_like(sim_neg) if weights is None else weights.to(sim_neg.device, sim_neg.dtype)
+    loss_vec = F.relu(embed_margin + sim_neg)
+    if use_active_mask:
+        loss_vec = loss_vec * active.float()
+        w = w * active.float()
+    loss = (w * loss_vec).sum() / w.sum().clamp_min(1.0)
+    if return_stats:
+        return loss, {
+            "embed_cosine_mean": float(sim_neg.mean().detach().cpu()) if sim_neg.numel() else 0.0,
+            "active_pair_rate": float(active.float().mean().detach().cpu()) if active.numel() else 0.0,
+        }
+    return loss
 
 
 def action_combo_ce_loss(action_set_logits: torch.Tensor, action_target: torch.Tensor) -> torch.Tensor:
@@ -144,11 +246,14 @@ def action_combo_drop_add_loss(action_set_logits: torch.Tensor, action_target: t
     if not return_stats:
         return loss
     pred = action_set_logits.argmax(-1)
+    pred_membership = membership[pred.long()]
+    gt = action_target.float()
     stats = {
         "drop_margin_mean": float(torch.cat(drop_losses).mean().detach().cpu()) if drop_losses else 0.0,
         "add_margin_mean": float(torch.cat(add_losses).mean().detach().cpu()) if add_losses else 0.0,
         "combo_gt_single_pred_rate": float(((action_target.sum(-1) > 1) & (torch.tensor([bin(int(x)).count("1") for x in pred.detach().cpu()], device=action_target.device) <= 1)).float().mean().detach().cpu()),
-        "superset_pred_rate": float((((pred.view(-1, 1) & subset_id.view(-1, 1)) == subset_id.view(-1, 1)).float().mean()).detach().cpu()),
+        "superset_pred_rate": float((((pred_membership >= gt).all(dim=1)) & (pred_membership.sum(dim=1) > gt.sum(dim=1))).float().mean().detach().cpu()),
+        "all_high_rate": float((pred_membership.sum(dim=1) >= 4).float().mean().detach().cpu()),
     }
     return loss, stats
 

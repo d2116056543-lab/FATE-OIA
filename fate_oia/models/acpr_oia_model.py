@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from .acpr_action_combo_aux import ACPRActionComboAux
@@ -34,6 +35,7 @@ class ACPROIAModel(nn.Module):
         self.trunk = ACPRLabelTrunk(dim=dim, action_dim=action_dim, reason_dim=reason_dim)
         self.predicate_reason = ACPRPredicateReasoner(dim=dim, reason_dim=reason_dim, num_predicates=self.predicate_head.num_predicates, predicate_names=self.predicate_head.names, grammar_path=grammar_path)
         self.pair_memory = ACPRPairMemory(dim=dim)
+        self.reason_pair_proj = nn.Linear(dim, dim)
         self.action_combo_aux = ACPRActionComboAux(dim=dim, action_dim=action_dim)
         self.calibration = ACPRCalibrationHead(num_labels=action_dim + reason_dim)
 
@@ -52,6 +54,7 @@ class ACPROIAModel(nn.Module):
         calibrated = self.calibration(action_logits_raw, reason_logits_raw)
         action_set = self.action_combo_aux(trunk["label_nodes"], action_logits_raw)
         cardinality_logits = action_set["cardinality_logits"]
+        reason_embeddings_for_pair = F.normalize(self.reason_pair_proj(trunk["label_nodes"][:, self.action_dim :]), dim=-1)
         pair_embedding = self.pair_memory(trunk["label_nodes"])
         out = {
             **field,
@@ -61,6 +64,7 @@ class ACPROIAModel(nn.Module):
             **action_set,
             "global_embedding": field["cls_tokens_by_layer"].mean(1),
             "pair_embedding": pair_embedding,
+            "reason_embeddings_for_pair": reason_embeddings_for_pair,
             "action_logits_raw": action_logits_raw,
             "reason_logits_raw": reason_logits_raw,
             "action_logits_final_raw": action_logits_raw,

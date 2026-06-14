@@ -21,7 +21,13 @@ class ACPRLabelTrunk(nn.Module):
         self.predicate_gate = nn.Parameter(torch.full((reason_dim,), -2.944))
         self.logit_head = nn.Linear(dim, 1)
         self.reason_to_action = nn.Linear(reason_dim, action_dim)
-        self.action_visual = nn.Linear(dim, action_dim)
+        hidden = max(dim // 2, 1)
+        self.action_visual_head = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, 1),
+        )
         self.fusion_gate = nn.Linear(dim * 2, action_dim)
 
     def forward(self, patch_tokens_by_layer: torch.Tensor, predicate_tokens: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
@@ -41,7 +47,8 @@ class ACPRLabelTrunk(nn.Module):
             label_nodes = torch.cat([label_nodes[:, : self.action_dim], reason_nodes + gate * pred_delta], dim=1)
         label_logits = self.logit_head(label_nodes).squeeze(-1)
         reason_logits_visual = label_logits[:, self.action_dim:]
-        action_visual_logits = self.action_visual(label_nodes[:, : self.action_dim].mean(1))
+        action_nodes = label_nodes[:, : self.action_dim]
+        action_visual_logits = self.action_visual_head(action_nodes).squeeze(-1)
         action_reason_logits = self.reason_to_action(reason_logits_visual)
         gate_in = torch.cat([label_nodes[:, : self.action_dim].mean(1), label_nodes[:, self.action_dim:].mean(1)], dim=-1)
         gate = torch.sigmoid(self.fusion_gate(gate_in)).clamp(0.10, 0.90)
@@ -53,6 +60,7 @@ class ACPRLabelTrunk(nn.Module):
             "action_reason_logits": action_reason_logits,
             "reason_logits_visual": reason_logits_visual,
             "action_fusion_gate": gate,
+            "action_token_norm_mean": action_nodes.norm(dim=-1).mean(),
             "predicate_conditioning_strength": torch.sigmoid(self.predicate_gate).detach(),
             "action_logits_direct": action_logits_direct,
         }
