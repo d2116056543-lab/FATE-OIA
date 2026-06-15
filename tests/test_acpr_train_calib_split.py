@@ -1,24 +1,33 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
 from fate_oia.utils.acpr_train_calib_split import make_train_calib_indices
 
 
-class _Dataset:
-    def __init__(self, n=100):
-        self.items = [{"file_name": f"sample_{i:04d}.jpg"} for i in range(n)]
-
-    def __len__(self):
-        return len(self.items)
-
-    def __getitem__(self, idx):
-        return self.items[idx]
+@dataclass
+class _Sample:
+    file_name: str
 
 
-def test_make_train_calib_indices_is_deterministic_and_disjoint():
-    ds = _Dataset(100)
-    main_a, calib_a = make_train_calib_indices(ds, calib_fraction=0.1, seed=20260615)
-    main_b, calib_b = make_train_calib_indices(ds, calib_fraction=0.1, seed=20260615)
+class _DatasetWithSamples:
+    def __init__(self) -> None:
+        self.samples = [_Sample(f"sample_{idx:03d}.jpg") for idx in range(10)]
+        self.getitem_calls = 0
 
-    assert main_a == main_b
-    assert calib_a == calib_b
-    assert len(calib_a) == 10
-    assert set(main_a).isdisjoint(calib_a)
-    assert sorted(main_a + calib_a) == list(range(100))
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> dict:
+        self.getitem_calls += 1
+        raise AssertionError("make_train_calib_indices should not load image items when samples metadata exists")
+
+
+def test_make_train_calib_indices_uses_samples_without_getitem() -> None:
+    dataset = _DatasetWithSamples()
+    main, calib = make_train_calib_indices(dataset, calib_fraction=0.2, seed=123)
+
+    assert len(calib) == 2
+    assert len(main) == 8
+    assert sorted(main + calib) == list(range(10))
+    assert dataset.getitem_calls == 0

@@ -15,6 +15,12 @@ def _item_key(dataset: Any, idx: int, key: str) -> str:
         item = base.items[mapped_idx]
         if isinstance(item, dict) and key in item:
             return str(item[key])
+    if hasattr(base, "samples"):
+        sample = base.samples[mapped_idx]
+        if hasattr(sample, key):
+            return str(getattr(sample, key))
+        if isinstance(sample, dict) and key in sample:
+            return str(sample[key])
     try:
         item = dataset[idx]
         if isinstance(item, dict) and key in item:
