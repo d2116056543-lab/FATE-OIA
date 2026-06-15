@@ -467,3 +467,41 @@ Required fields:
 - review_pass_path
 - missing_items
 - warnings
+
+## ACPR-CalAlign V1.2 addendum
+
+When the active config is `configs/fate_oia_train_360x640_acpr_calalign_v1_2.yaml` or `threshold.enabled=true`, the audit must additionally reject the implementation unless all of these are true:
+
+1. `ACPRThresholdHead` exists and exposes group shrinkage plus label deltas through `theta_group`, `theta_delta`, `label_group_ids`, and `label_delta_scale`.
+2. Deploy logits are exactly `deploy_logits = base_logits - theta`; primary raw/fixed metrics use the `deploy_fixed` branch.
+3. `base_fixed` metrics and tensors are still saved separately and are not overwritten by deploy metrics.
+4. Teacher thresholds are collected only from a deterministic `train_calib` split of the train split.
+5. Test per-label threshold search is named oracle/diagnostic only and is never assigned to `threshold_head`, `theta_teacher`, or checkpoint parameters.
+6. Threshold losses include soft-F1, predicted positive rate, action cardinality, teacher, and prior terms.
+7. Threshold losses use detached base logits by default so they do not damage ACPR ranking unless explicitly configured otherwise.
+8. The old ACPR config with `threshold.enabled=false` still forwards and trains without requiring CalAlign.
+9. Action-set outputs remain auxiliary only and never become final action logits.
+10. No feature cache, token compression, RunC residual, expert, MoE, selector, or graph-delta path is introduced by CalAlign.
+
+Required CalAlign files:
+
+- `fate_oia/models/acpr_threshold_head.py`
+- `fate_oia/losses/acpr_threshold_losses.py`
+- `fate_oia/utils/acpr_train_calib_split.py`
+- `fate_oia/utils/acpr_threshold_search.py`
+- `fate_oia/engine/fit_acpr_threshold_head.py`
+- `configs/fate_oia_train_360x640_acpr_calalign_v1_2.yaml`
+- `scripts/FATE_OIA_acpr_calalign_v1_2_foreground.ps1`
+
+Required CalAlign artifacts per run:
+
+- `threshold_initialization.json`
+- `threshold_teacher_epoch_*.json`
+- `threshold_stats.jsonl`
+- `calibration_diagnostics.jsonl`
+- `logits_action_base_test.pt`
+- `logits_reason_base_test.pt`
+- `logits_action_deploy_test.pt`
+- `logits_reason_deploy_test.pt`
+- `checkpoint_best_test_deploy_raw.pth`
+- `checkpoint_best_test_base_fixed.pth`

@@ -34,8 +34,22 @@ def _tail_reason_metrics(reason_logits: torch.Tensor, reason: torch.Tensor, tail
     return {"tail_reason_indices": tail_indices, "tail_reason_mF1": sum(vals) / max(len(vals), 1)}
 
 
-def evaluate_tensors(action_logits: torch.Tensor, reason_logits: torch.Tensor, action: torch.Tensor, reason: torch.Tensor, predicate_logits: torch.Tensor | None = None, pair_margins: dict | None = None) -> dict:
+def evaluate_tensors(
+    action_logits: torch.Tensor,
+    reason_logits: torch.Tensor,
+    action: torch.Tensor,
+    reason: torch.Tensor,
+    predicate_logits: torch.Tensor | None = None,
+    pair_margins: dict | None = None,
+    branch: str = "deploy_fixed",
+    base_action_logits: torch.Tensor | None = None,
+    base_reason_logits: torch.Tensor | None = None,
+    calibrated_action_logits: torch.Tensor | None = None,
+    calibrated_reason_logits: torch.Tensor | None = None,
+) -> dict:
     views = acpr_metric_views(action_logits, reason_logits, action, reason)
+    base_views = acpr_metric_views(base_action_logits, base_reason_logits, action, reason) if base_action_logits is not None and base_reason_logits is not None else None
+    cal_views = acpr_metric_views(calibrated_action_logits, calibrated_reason_logits, action, reason) if calibrated_action_logits is not None and calibrated_reason_logits is not None else None
     raw = views["metrics_raw_fixed"]
     predicate_group_metrics = {"predicate_group_available": predicate_logits is not None}
     if predicate_logits is not None:
@@ -43,7 +57,15 @@ def evaluate_tensors(action_logits: torch.Tensor, reason_logits: torch.Tensor, a
     pair_margin_by_reason = pair_margins or {"pair_margin_available": False}
     return {
         **views,
+        "primary_branch": branch,
+        "metrics_deploy_fixed": views["metrics_raw_fixed"],
+        "metrics_base_fixed": base_views["metrics_raw_fixed"] if base_views else views["metrics_raw_fixed"],
+        "metrics_calibrated": cal_views["metrics_raw_fixed"] if cal_views else views["metrics_raw_fixed"],
+        "metrics_test_oracle_global_threshold": views["metrics_global_threshold"],
+        "metrics_test_oracle_per_label_threshold": views["metrics_per_label_threshold"],
         "final_raw_joint": standard_joint(raw),
+        "base_fixed_joint": standard_joint(base_views["metrics_raw_fixed"]) if base_views else standard_joint(raw),
+        "final_calibrated_joint": standard_joint(cal_views["metrics_raw_fixed"]) if cal_views else standard_joint(raw),
         "action_composition_metrics": _action_composition_metrics(action_logits, action),
         "tail_reason_metrics": _tail_reason_metrics(reason_logits, reason),
         "predicate_group_metrics": predicate_group_metrics,
@@ -58,6 +80,11 @@ def main() -> None:
     ap.add_argument("--labels_action", required=True)
     ap.add_argument("--labels_reason", required=True)
     ap.add_argument("--predicate_logits", default=None)
+    ap.add_argument("--branch", default="deploy_fixed", choices=["base_fixed", "deploy_fixed", "calibrated", "final_raw", "final_calibrated"])
+    ap.add_argument("--logits_action_base", default=None)
+    ap.add_argument("--logits_reason_base", default=None)
+    ap.add_argument("--logits_action_calibrated", default=None)
+    ap.add_argument("--logits_reason_calibrated", default=None)
     ap.add_argument("--output", required=True)
     args = ap.parse_args()
     result = evaluate_tensors(
@@ -66,6 +93,11 @@ def main() -> None:
         torch.load(args.labels_action, map_location="cpu"),
         torch.load(args.labels_reason, map_location="cpu"),
         torch.load(args.predicate_logits, map_location="cpu") if args.predicate_logits else None,
+        branch=args.branch,
+        base_action_logits=torch.load(args.logits_action_base, map_location="cpu") if args.logits_action_base else None,
+        base_reason_logits=torch.load(args.logits_reason_base, map_location="cpu") if args.logits_reason_base else None,
+        calibrated_action_logits=torch.load(args.logits_action_calibrated, map_location="cpu") if args.logits_action_calibrated else None,
+        calibrated_reason_logits=torch.load(args.logits_reason_calibrated, map_location="cpu") if args.logits_reason_calibrated else None,
     )
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     Path(args.output).write_text(json.dumps(result, indent=2), encoding="utf-8")

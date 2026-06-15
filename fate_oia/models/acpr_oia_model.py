@@ -12,6 +12,7 @@ from .acpr_label_trunk import ACPRLabelTrunk
 from .acpr_pair_memory import ACPRPairMemory
 from .acpr_predicate_reason import ACPRPredicateReasoner
 from .acpr_scene_predicate_head import ACPRScenePredicateHead
+from .acpr_threshold_head import ACPRThresholdHead
 
 
 class ACPROIAModel(nn.Module):
@@ -25,10 +26,13 @@ class ACPROIAModel(nn.Module):
         scene_config: str = "configs/acpr_scene_predicates.yaml",
         grammar_path: str = "configs/acpr_reason_predicate_grammar.yaml",
         use_mock_dino: bool = False,
+        threshold_enabled: bool = False,
+        threshold_kwargs: dict | None = None,
     ) -> None:
         super().__init__()
         self.action_dim = action_dim
         self.reason_dim = reason_dim
+        self.threshold_enabled = bool(threshold_enabled)
         self.dino = ACPRDinoFieldExtractor(selected_layers=selected_layers, pretrained_weights=pretrained_weights, use_mock_dino=use_mock_dino)
         self.ego = ACPREgoRegionEncoder(grid_hw=(45, 80), dim=dim)
         self.predicate_head = ACPRScenePredicateHead(scene_config=scene_config, dim=dim, num_layers=len(selected_layers))
@@ -38,6 +42,7 @@ class ACPROIAModel(nn.Module):
         self.reason_pair_proj = nn.Linear(dim, dim)
         self.action_combo_aux = ACPRActionComboAux(dim=dim, action_dim=action_dim)
         self.calibration = ACPRCalibrationHead(num_labels=action_dim + reason_dim)
+        self.threshold_head = ACPRThresholdHead(action_dim=action_dim, reason_dim=reason_dim, **(threshold_kwargs or {}))
 
     def forward(self, images: torch.Tensor, epoch: int = 0) -> dict[str, torch.Tensor | dict | tuple[int, int] | int]:
         field = self.dino(images)
@@ -48,11 +53,30 @@ class ACPROIAModel(nn.Module):
         predicates = self.predicate_head(patch, region_masks=region_masks)
         trunk = self.trunk(patch, predicate_tokens=predicates["predicate_tokens"])
         reason_delta = self.predicate_reason(trunk["label_nodes"][:, self.action_dim :], predicates["predicate_probs"], predicates["predicate_tokens"])
-        action_logits_raw = trunk["action_logits_direct"]
-        reason_logits_raw = trunk["reason_logits_visual"] + reason_delta["predicate_reason_delta"]
-        raw_logits = torch.cat([action_logits_raw, reason_logits_raw], dim=-1)
-        calibrated = self.calibration(action_logits_raw, reason_logits_raw)
-        action_set = self.action_combo_aux(trunk["label_nodes"], action_logits_raw)
+        action_logits_base = trunk["action_logits_direct"]
+        reason_logits_base = trunk["reason_logits_visual"] + reason_delta["predicate_reason_delta"]
+        logits_base = torch.cat([action_logits_base, reason_logits_base], dim=-1)
+        thresholded = self.threshold_head(action_logits_base, reason_logits_base)
+        legacy_calibrated = self.calibration(action_logits_base, reason_logits_base)
+        if self.threshold_enabled:
+            action_logits_final_raw = thresholded["action_logits_deploy"]
+            reason_logits_final_raw = thresholded["reason_logits_deploy"]
+            logits_final_raw = thresholded["logits_deploy"]
+            action_logits_final_calibrated = thresholded["action_logits_calibrated"]
+            reason_logits_final_calibrated = thresholded["reason_logits_calibrated"]
+            logits_final_calibrated = thresholded["logits_calibrated"]
+            temperature = thresholded["temperature"]
+            calibration_bias = torch.zeros_like(temperature)
+        else:
+            action_logits_final_raw = action_logits_base
+            reason_logits_final_raw = reason_logits_base
+            logits_final_raw = logits_base
+            action_logits_final_calibrated = legacy_calibrated["action_logits_calibrated"]
+            reason_logits_final_calibrated = legacy_calibrated["reason_logits_calibrated"]
+            logits_final_calibrated = legacy_calibrated["calibrated_logits"]
+            temperature = legacy_calibrated["temperature"]
+            calibration_bias = legacy_calibrated["calibration_bias"]
+        action_set = self.action_combo_aux(trunk["label_nodes"], action_logits_base)
         cardinality_logits = action_set["cardinality_logits"]
         reason_embeddings_for_pair = F.normalize(self.reason_pair_proj(trunk["label_nodes"][:, self.action_dim :]), dim=-1)
         pair_embedding = self.pair_memory(trunk["label_nodes"])
@@ -65,31 +89,45 @@ class ACPROIAModel(nn.Module):
             "global_embedding": field["cls_tokens_by_layer"].mean(1),
             "pair_embedding": pair_embedding,
             "reason_embeddings_for_pair": reason_embeddings_for_pair,
-            "action_logits_raw": action_logits_raw,
-            "reason_logits_raw": reason_logits_raw,
-            "action_logits_final_raw": action_logits_raw,
-            "reason_logits_final_raw": reason_logits_raw,
-            "action_logits_calibrated": calibrated["action_logits_calibrated"],
-            "reason_logits_calibrated": calibrated["reason_logits_calibrated"],
-            "logits_final_raw": raw_logits,
-            "logits_final_calibrated": calibrated["calibrated_logits"],
-            "action_logits_final_calibrated": calibrated["action_logits_calibrated"],
-            "reason_logits_final_calibrated": calibrated["reason_logits_calibrated"],
-            "temperature": calibrated["temperature"],
-            "calibration_bias": calibrated["calibration_bias"],
+            # Backward-compatible raw aliases are base logits. CalAlign's
+            # action/reason_logits_final_raw are deploy logits when enabled.
+            "action_logits_raw": action_logits_base,
+            "reason_logits_raw": reason_logits_base,
+            "action_logits_base": action_logits_base,
+            "reason_logits_base": reason_logits_base,
+            "logits_base_fixed": logits_base,
+            "action_logits_deploy": thresholded["action_logits_deploy"],
+            "reason_logits_deploy": thresholded["reason_logits_deploy"],
+            "logits_deploy": thresholded["logits_deploy"],
+            "threshold_logit": thresholded["threshold_logit"],
+            "threshold_prob": thresholded["threshold_prob"],
+            "action_threshold_prob": thresholded["action_threshold_prob"],
+            "reason_threshold_prob": thresholded["reason_threshold_prob"],
+            "action_logits_final_raw": action_logits_final_raw,
+            "reason_logits_final_raw": reason_logits_final_raw,
+            "action_logits_calibrated": action_logits_final_calibrated,
+            "reason_logits_calibrated": reason_logits_final_calibrated,
+            "logits_final_raw": logits_final_raw,
+            "logits_final_calibrated": logits_final_calibrated,
+            "action_logits_final_calibrated": action_logits_final_calibrated,
+            "reason_logits_final_calibrated": reason_logits_final_calibrated,
+            "temperature": temperature,
+            "calibration_bias": calibration_bias,
             "cardinality_logits": cardinality_logits,
-            "bias_action": calibrated["bias_action"],
-            "bias_reason": calibrated["bias_reason"],
-            "temperature_action": calibrated["temperature_action"],
-            "temperature_reason": calibrated["temperature_reason"],
+            "bias_action": calibration_bias[: self.action_dim],
+            "bias_reason": calibration_bias[self.action_dim :],
+            "temperature_action": temperature[: self.action_dim],
+            "temperature_reason": temperature[self.action_dim :],
             "ego_stats": ego_stats,
             "branch_logits": {
-                "direct": raw_logits,
-                "direct_plus_predicate": raw_logits,
-                "raw": raw_logits,
-                "calibrated": calibrated["calibrated_logits"],
-                "final_raw": raw_logits,
-                "final_calibrated": calibrated["calibrated_logits"],
+                "direct": logits_base,
+                "direct_plus_predicate": logits_base,
+                "base_fixed": logits_base,
+                "deploy_fixed": logits_final_raw,
+                "raw": logits_final_raw,
+                "calibrated": logits_final_calibrated,
+                "final_raw": logits_final_raw,
+                "final_calibrated": logits_final_calibrated,
                 "action_visual": trunk["action_visual_logits"],
                 "action_reason": trunk["action_reason_logits"],
             },

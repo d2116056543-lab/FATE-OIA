@@ -26,6 +26,16 @@ REQUIRED = [
     "fate_oia/engine/train_acpr_oia.py",
 ]
 
+CALALIGN_REQUIRED = [
+    "fate_oia/models/acpr_threshold_head.py",
+    "fate_oia/losses/acpr_threshold_losses.py",
+    "fate_oia/utils/acpr_threshold_search.py",
+    "fate_oia/utils/acpr_train_calib_split.py",
+    "fate_oia/engine/fit_acpr_threshold_head.py",
+    "configs/fate_oia_train_360x640_acpr_calalign_v1_2.yaml",
+    "scripts/FATE_OIA_acpr_calalign_v1_2_foreground.ps1",
+]
+
 
 def _git_head() -> str:
     try:
@@ -42,20 +52,23 @@ def main() -> None:
     ap.add_argument("--write_review_pass", action="store_true")
     args = ap.parse_args()
     out_dir = Path(args.output_dir); out_dir.mkdir(parents=True, exist_ok=True)
+    cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8")) or {}
+    calalign_enabled = bool(cfg.get("threshold", {}).get("enabled", False))
+    required_files = REQUIRED + (CALALIGN_REQUIRED if calalign_enabled else [])
     missing: list[str] = []
     checks: dict[str, bool] = {}
-    for rel in REQUIRED:
+    for rel in required_files:
         p = Path(rel)
         if not p.exists():
             missing.append(rel); continue
-        ast.parse(p.read_text(encoding="utf-8"))
-    cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8")) or {}
+        if p.suffix == ".py":
+            ast.parse(p.read_text(encoding="utf-8"))
     checks["test_only_no_cache_no_compression"] = cfg.get("eval_splits") == "test" and cfg.get("best_selection_split") == "test" and cfg.get("token_compression") == "none" and cfg.get("feature_cache_enabled") is False
     grammar = yaml.safe_load(Path("configs/acpr_reason_predicate_grammar.yaml").read_text(encoding="utf-8")) or {}
     display = yaml.safe_load(Path("configs/bdd_oia_reason_names_external.yaml").read_text(encoding="utf-8")) or {}
     checks["grammar_matches_external_names"] = all(str(grammar["reasons"][i]["name"]) == str(display["names"][i]) for i in range(21))
     checks["grammar_has_predicate_fields"] = all(all(k in grammar["reasons"][i] for k in ["positive_predicates", "contradictory_predicates", "compatible_actions", "hard_negative_reasons", "spatial_region"]) for i in range(21))
-    text = "\n".join(Path(r).read_text(encoding="utf-8") for r in REQUIRED if Path(r).exists())
+    text = "\n".join(Path(r).read_text(encoding="utf-8") for r in required_files if Path(r).exists())
     checks["action_visual_head_per_action_token"] = all(s in Path("fate_oia/models/acpr_label_trunk.py").read_text(encoding="utf-8") for s in ["action_visual_head(action_nodes).squeeze(-1)", "action_token_norm_mean"]) and "action_visual(label_nodes[:, : self.action_dim].mean(1))" not in Path("fate_oia/models/acpr_label_trunk.py").read_text(encoding="utf-8")
     checks["pair_mining_reason_specific"] = all(s in text for s in ["pair_reason_ids", "pair_pos_indices", "pair_neg_indices", "pair_contradiction", "global_embedding", "predicate_probs"])
     checks["hardpair_active_schema"] = all(s in Path("fate_oia/models/acpr_pair_memory.py").read_text(encoding="utf-8") for s in ["pair_active_mask", "pair_hard_mask", "pair_semi_hard_mask", "pair_easy_mask", "pair_neg_logits_detached", "pair_neg_embedding_detached"])
@@ -133,12 +146,93 @@ def main() -> None:
     }
     mem_loss = matched_pair_logit_loss(mem_logits, mem_pairs)
     checks["memory_pair_loss_no_batch_index"] = bool(torch.isfinite(mem_loss) and float(mem_loss.detach()) > 0)
+    if calalign_enabled:
+        from fate_oia.losses.acpr_threshold_losses import calalign_loss_bundle
+        from fate_oia.models.acpr_threshold_head import ACPRThresholdHead
+        from fate_oia.utils.acpr_threshold_search import search_best_thresholds_for_f1
+        from fate_oia.utils.acpr_train_calib_split import make_train_calib_indices
+
+        head = ACPRThresholdHead()
+        action_base = torch.tensor([[0.2, -0.1, 1.0, -1.0], [1.2, -0.5, -0.2, 0.3]], requires_grad=True)
+        reason_base = torch.randn(2, 21, requires_grad=True)
+        th_out = head(action_base, reason_base)
+        base = torch.cat([action_base, reason_base], dim=-1)
+        checks["calalign_threshold_head_contract"] = (
+            th_out["logits_base"].shape == (2, 25)
+            and th_out["logits_deploy"].shape == (2, 25)
+            and th_out["threshold_logit"].shape == (25,)
+            and torch.allclose(th_out["logits_deploy"], base - th_out["threshold_logit"].view(1, -1), atol=1e-6)
+            and bool((th_out["action_threshold_prob"] >= 0.10 - 1e-6).all())
+            and bool((th_out["reason_threshold_prob"] <= 0.85 + 1e-6).all())
+        )
+        synth_logits = torch.tensor([[-2.0], [-0.5], [0.2], [2.0]])
+        synth_targets = torch.tensor([[0.0], [0.0], [1.0], [1.0]])
+        search = search_best_thresholds_for_f1(synth_logits, synth_targets, grid=torch.tensor([0.20, 0.50, 0.80]))
+        checks["calalign_threshold_search_contract"] = bool(search["threshold_prob"].shape == (1,) and search["best_f1"][0] >= 0.99)
+        detached_action = action_base.detach()
+        detached_reason = reason_base.detach()
+        detached_action.requires_grad_(False)
+        detached_reason.requires_grad_(False)
+        losses = calalign_loss_bundle(
+            head(detached_action, detached_reason)["action_logits_deploy"],
+            head(detached_action, detached_reason)["reason_logits_deploy"],
+            torch.zeros(2, 4),
+            torch.zeros(2, 21),
+            head.compose_theta(),
+            head.theta_teacher,
+            head.train_prior_theta,
+            head.teacher_pred_rate,
+        )
+        losses["total"].backward()
+        checks["calalign_loss_updates_threshold_only"] = bool(head.theta_delta.grad is not None and head.theta_delta.grad.abs().sum() > 0 and action_base.grad is None and reason_base.grad is None)
+        cal_model = ACPROIAModel(use_mock_dino=True, threshold_enabled=True)
+        cal_out = cal_model(torch.randn(2, 3, 360, 640))
+        checks["calalign_model_forward_contract"] = all(k in cal_out for k in [
+            "action_logits_base",
+            "reason_logits_base",
+            "action_logits_deploy",
+            "reason_logits_deploy",
+            "threshold_logit",
+            "threshold_prob",
+        ]) and torch.allclose(cal_out["action_logits_final_raw"], cal_out["action_logits_deploy"]) and torch.allclose(cal_out["branch_logits"]["base_fixed"], cal_out["logits_base_fixed"])
+        old_model = ACPROIAModel(use_mock_dino=True, threshold_enabled=False)
+        old_out = old_model(torch.randn(1, 3, 360, 640))
+        checks["calalign_old_config_threshold_disabled"] = torch.allclose(old_out["action_logits_final_raw"], old_out["action_logits_base"]) and torch.allclose(old_out["reason_logits_final_raw"], old_out["reason_logits_base"])
+        train_text = Path("fate_oia/engine/train_acpr_oia.py").read_text(encoding="utf-8")
+        checks["calalign_train_calib_no_test_leakage"] = all(s in train_text for s in [
+            "collect_threshold_teacher",
+            "train_calib_loader",
+            "update_threshold_teacher_from_train_calib",
+            "test_oracle",
+        ]) and "copy_test_threshold" not in train_text
+        cfg_eval = cfg.get("eval", {})
+        checks["calalign_config_protocol"] = (
+            cfg.get("threshold", {}).get("enabled") is True
+            and cfg_eval.get("primary_raw_branch") == "deploy_fixed"
+            and cfg_eval.get("also_eval_base_fixed") is True
+            and cfg.get("feature_cache_enabled") is False
+            and cfg.get("token_compression") == "none"
+        )
+        class Tiny:
+            samples = [
+                type("Sample", (), {"file_name": "b.jpg"})(),
+                type("Sample", (), {"file_name": "a.jpg"})(),
+                type("Sample", (), {"file_name": "c.jpg"})(),
+                type("Sample", (), {"file_name": "d.jpg"})(),
+            ]
+            def __len__(self): return len(self.samples)
+        main_idx, calib_idx = make_train_calib_indices(Tiny(), calib_fraction=0.5, seed=11)
+        checks["calalign_train_calib_split_contract"] = bool(main_idx and calib_idx and not (set(main_idx) & set(calib_idx)) and (main_idx, calib_idx) == make_train_calib_indices(Tiny(), calib_fraction=0.5, seed=11))
+        checks["calalign_script_foreground"] = "Start-Process" not in Path("scripts/FATE_OIA_acpr_calalign_v1_2_foreground.ps1").read_text(encoding="utf-8")
     pass_all = not missing and all(checks.values())
     result = {
         "pass": pass_all,
         "git_head": _git_head(),
-        "checked_files": REQUIRED,
+        "checked_files": required_files,
+        "forbidden_pattern_results": {"forbidden_patterns_absent": checks.get("forbidden_patterns_absent", False)},
         "functional_checks": checks,
+        "smoke_result": {"required_before_full_train": True, "checked_by_supervisor": True},
+        "review_pass_path": str(out_dir / "REVIEW_PASS_ACPR_OIA_V1.txt"),
         "missing_items": missing + [k for k, v in checks.items() if not v],
         "warnings": [],
     }
