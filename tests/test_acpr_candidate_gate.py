@@ -39,3 +39,31 @@ def test_candidate_gate_selects_improving_candidate_and_rejects_exploding_rate()
     assert gate.selected_candidate_id[0].item() == 0
     assert gate.selected_gate[0].item() == 1.0
 
+
+def test_candidate_gate_can_disable_reason_or_predicate_candidates():
+    gate = ACPRActionCandidateGate(
+        ["visual", "reason", "blend", "predicate", "blend_predicate"],
+        gate_ema=1.0,
+        min_delta_f1=0.002,
+        allow_reason_candidate=False,
+        allow_predicate_candidate=False,
+    )
+    fallback = {
+        "Act_mF1": 0.70,
+        "per_action_F1": [0.5, 0.5, 0.5, 0.5],
+        "predicted_positive_rate_per_action": [0.2, 0.2, 0.2, 0.2],
+        "all_high_rate": 0.0,
+    }
+    strong = {
+        "Act_mF1": 0.90,
+        "per_action_F1": [0.9, 0.9, 0.9, 0.9],
+        "predicted_positive_rate_per_action": [0.2, 0.2, 0.2, 0.2],
+        "all_high_rate": 0.0,
+    }
+    metrics = {"fallback": fallback, "visual": fallback, "reason": strong, "blend": strong, "predicate": strong, "blend_predicate": strong}
+
+    result = gate.update_from_train_calib(metrics, fallback)
+
+    assert result["selected_gates_nonzero"] is False
+    assert "reason_candidate_disabled" in result["rejected_forward"]["reason"]
+    assert "predicate_candidate_disabled" in result["rejected_forward"]["predicate"]

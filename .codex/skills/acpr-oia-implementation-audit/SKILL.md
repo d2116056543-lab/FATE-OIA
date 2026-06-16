@@ -505,3 +505,34 @@ Required CalAlign artifacts per run:
 - `logits_reason_deploy_test.pt`
 - `checkpoint_best_test_deploy_raw.pth`
 - `checkpoint_best_test_base_fixed.pth`
+
+## ACPR-ActAlign V1.3.1 Candidate-Probe addendum
+
+When the active config is `configs/fate_oia_train_360x640_acpr_actalign_v1_3_candidate_probe.yaml` or `actalign.stage_mode=candidate_probe`, the audit must additionally reject the implementation unless all of these are true:
+
+1. `ACPRActionCandidates` exists and outputs `fallback`, `visual`, `reason`, `blend`, `predicate`, `blend_predicate`, and `utility_final` action logits.
+2. Gate zero is an exact invariant: `action_logits_utility == action_logits_fallback` and final reason logits are unchanged.
+3. Stage A trains only candidate heads and predicate micro-delta; trunk, DINO, reason, predicate head, threshold head, and calibration stay frozen.
+4. Gate update uses `train_calib` only; test metrics must never update gate, thresholds, or selected candidate state.
+5. `candidate_probe.candidate_weight=0.5`, `candidate_probe.nonreg_weight=0.5`, `candidate_probe.gate_ema=0.20`, and `training.lr_action_candidate=0.0005`.
+6. `allow_reason_candidate` and `allow_predicate_candidate` are explicit config and gate parameters.
+7. Stage A PASS requires all hard gates: nonzero selected gate, per-action delta >= 0.002, gated train_calib Act_mF1 gain >= 0.001, train_calib Exp drop <= 0.005, all_high increase <= 0.02, test Act drop <= 0.005, and test Exp drop <= 0.010.
+8. Stage B must be blocked unless a `STAGE_A_CANDIDATE_PROBE_PASS.json` artifact is loaded with `--load_candidate_gate`.
+9. Clean full train must remain blocked until Stage A and Stage B both have explicit PASS artifacts.
+10. Candidate artifacts must include `action_candidate_train_calib.jsonl`, `action_candidate_metrics.jsonl`, `action_candidate_gate.jsonl`, `candidate_selected_state.json`, and tensor logits for each candidate branch.
+11. Evaluation must expose candidate action metrics through `--evaluate_action_candidates`, `--candidate_gate_json`, and `--output_action_candidate_metrics`.
+12. Audit must write `implementation_audit_ACPR_ACTALIGN_V1_3_1.json` and `REVIEW_PASS_ACPR_ACTALIGN_V1_3_1.txt` for this config.
+
+Required candidate-probe files:
+
+- `fate_oia/models/acpr_action_candidates.py`
+- `fate_oia/losses/acpr_candidate_losses.py`
+- `fate_oia/utils/acpr_candidate_gate.py`
+- `fate_oia/utils/acpr_candidate_metrics.py`
+- `fate_oia/engine/fit_acpr_action_candidates.py`
+- `configs/fate_oia_train_360x640_acpr_actalign_v1_3_candidate_probe.yaml`
+- `tests/test_acpr_action_candidates.py`
+- `tests/test_acpr_candidate_losses.py`
+- `tests/test_acpr_candidate_gate.py`
+- `tests/test_acpr_actalign_candidate_forward.py`
+- `tests/test_acpr_actalign_stageA_protocol.py`

@@ -231,7 +231,7 @@ def main() -> None:
         cfg_eval = cfg.get("eval", {})
         checks["calalign_config_protocol"] = (
             cfg.get("threshold", {}).get("enabled") is True
-            and cfg_eval.get("primary_raw_branch") in {"deploy_fixed", "actalign_utility_deploy_fixed", "candidate_probe_guarded_fallback"}
+            and cfg_eval.get("primary_raw_branch") in {"deploy_fixed", "actalign_utility_deploy_fixed", "candidate_probe_guarded_fallback", "fallback_until_gate_selected"}
             and cfg_eval.get("also_eval_base_fixed") is True
             and cfg.get("feature_cache_enabled") is False
             and cfg.get("token_compression") == "none"
@@ -299,9 +299,23 @@ def main() -> None:
             cand_text = Path("fate_oia/models/acpr_action_candidates.py").read_text(encoding="utf-8")
             cand_loss_text = Path("fate_oia/losses/acpr_candidate_losses.py").read_text(encoding="utf-8")
             cand_gate_text = Path("fate_oia/utils/acpr_candidate_gate.py").read_text(encoding="utf-8")
+            eval_text = Path("fate_oia/engine/eval_acpr_oia.py").read_text(encoding="utf-8")
+            cand_cfg = cfg.get("candidate_probe", {})
             checks["candidate_files_contract"] = all(t in cand_text for t in ["ACPRActionCandidates", "blend_gamma_raw", "selected_candidate_id", "set_selected_candidates", "utility_final"])
             checks["candidate_loss_contract"] = all(t in cand_loss_text for t in ["all_candidate_probe_loss", "action_candidate_nonregression_loss", "candidate_action_asl_loss"])
-            checks["candidate_gate_train_calib_contract"] = all(t in cand_gate_text for t in ["update_from_train_calib", "selected_candidate_", "pred_rate_explosion", "all_high_increase", "delta_f1_"])
+            checks["candidate_config_exact"] = (
+                abs(float(cfg.get("training", {}).get("lr_action_candidate", -1.0)) - 0.0005) < 1e-12
+                and abs(float(cand_cfg.get("candidate_weight", -1.0)) - 0.5) < 1e-12
+                and abs(float(cand_cfg.get("nonreg_weight", -1.0)) - 0.5) < 1e-12
+                and abs(float(cand_cfg.get("gate_ema", -1.0)) - 0.20) < 1e-12
+                and bool(cand_cfg.get("allow_reason_candidate", False)) is True
+                and bool(cand_cfg.get("allow_predicate_candidate", False)) is True
+                and cfg.get("model", {}).get("final_action_source") == "fallback_until_gate_selected"
+                and cfg.get("eval", {}).get("primary_raw_branch") == "fallback_until_gate_selected"
+                and abs(float(cfg.get("stageA", {}).get("action_primary_score_action_weight", -1.0)) - 0.85) < 1e-12
+                and abs(float(cfg.get("stageA", {}).get("action_primary_score_exp_weight", -1.0)) - 0.15) < 1e-12
+            )
+            checks["candidate_gate_train_calib_contract"] = all(t in cand_gate_text for t in ["update_from_train_calib", "selected_candidate_", "pred_rate_explosion", "all_high_increase", "delta_f1_", "allow_reason_candidate", "allow_predicate_candidate"])
             candidate_model = ACPROIAModel(use_mock_dino=True, threshold_enabled=True, actalign_enabled=True, actalign_kwargs={"mode": "candidate_probe"})
             candidate_out = candidate_model(torch.randn(2, 3, 360, 640))
             required_candidates = {"fallback", "visual", "reason", "blend", "predicate", "blend_predicate"}
@@ -309,6 +323,9 @@ def main() -> None:
                 "action_candidate_logits" in candidate_out
                 and required_candidates.issubset(set(candidate_out["action_candidate_logits"].keys()))
                 and torch.allclose(candidate_out["action_logits_utility"], candidate_out["action_logits_fallback"], atol=1e-6)
+                and "action_utility_stats" in candidate_out
+                and "pred_delta_max_abs" in candidate_out
+                and "pred_delta_per_action_mean" in candidate_out
             )
             candidate_loss = candidate_out["action_candidate_logits"]["blend"].sum() + candidate_out["action_candidate_logits"]["predicate"].sum()
             candidate_loss.backward()
@@ -319,9 +336,20 @@ def main() -> None:
                 cfg.get("stageA", {}).get("train_candidate_heads_only") is True
                 and cfg.get("stageB", {}).get("enabled") is False
                 and cfg.get("stageB", {}).get("require_stageA_pass") is True
-                and all(t in train_text for t in ["STAGE_A_CANDIDATE_PROBE_PASS.json", "STAGE_A_CANDIDATE_PROBE_FAIL.json", "collect_action_candidates_train_calib"])
+                and all(t in train_text for t in [
+                    "STAGE_A_CANDIDATE_PROBE_PASS.json",
+                    "STAGE_A_CANDIDATE_PROBE_FAIL.json",
+                    "collect_action_candidates_train_calib",
+                    "action_candidate_train_calib.jsonl",
+                    "gated_train_calib_delta_act_mf1",
+                    "test_act_nonregression",
+                    "test_exp_nonregression",
+                    "--load_candidate_gate",
+                    "Clean full train is blocked",
+                ])
                 and "candidate_probe" in Path("fate_oia/engine/fit_acpr_action_candidates.py").read_text(encoding="utf-8")
             )
+            checks["candidate_eval_entry"] = all(t in eval_text for t in ["--evaluate_action_candidates", "--candidate_gate_json", "--output_action_candidate_metrics", "metrics_action_candidates_fixed"])
     pass_all = not missing and all(checks.values())
     pass_name = "REVIEW_PASS_ACPR_ACTALIGN_V1_3_1.txt" if candidate_probe else ("REVIEW_PASS_ACPR_ACTALIGN_V1_3.txt" if actalign_enabled else "REVIEW_PASS_ACPR_OIA_V1.txt")
     pass_label = "REVIEW_PASS_ACPR_ACTALIGN_V1_3_1" if candidate_probe else ("REVIEW_PASS_ACPR_ACTALIGN_V1_3" if actalign_enabled else "REVIEW_PASS_ACPR_OIA_V1")
@@ -337,6 +365,8 @@ def main() -> None:
         "warnings": [],
     }
     (out_dir / "implementation_audit_ACPR_OIA_V1.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    if candidate_probe:
+        (out_dir / "implementation_audit_ACPR_ACTALIGN_V1_3_1.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     if pass_all and args.write_review_pass:
         (out_dir / pass_name).write_text(pass_label + "\n" + result["git_head"] + "\n", encoding="utf-8")
     if not pass_all:

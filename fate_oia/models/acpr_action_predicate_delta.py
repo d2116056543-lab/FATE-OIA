@@ -53,4 +53,6 @@ class ACPRActionPredicateDelta(nn.Module):
             "predicate_action_delta_raw": raw,
             "predicate_action_delta": delta,
             "predicate_action_delta_abs_mean": delta.abs().mean(),
+            "predicate_action_delta_max_abs": delta.abs().max(),
+            "predicate_action_delta_per_action_mean": delta.mean(0),
         }

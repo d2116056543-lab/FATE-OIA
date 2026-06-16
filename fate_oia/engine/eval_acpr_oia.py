@@ -46,6 +46,7 @@ def evaluate_tensors(
     base_reason_logits: torch.Tensor | None = None,
     calibrated_action_logits: torch.Tensor | None = None,
     calibrated_reason_logits: torch.Tensor | None = None,
+    action_candidate_logits: dict[str, torch.Tensor] | None = None,
 ) -> dict:
     views = acpr_metric_views(action_logits, reason_logits, action, reason)
     base_views = acpr_metric_views(base_action_logits, base_reason_logits, action, reason) if base_action_logits is not None and base_reason_logits is not None else None
@@ -55,6 +56,9 @@ def evaluate_tensors(
     if predicate_logits is not None:
         predicate_group_metrics["predicate_group_positive_rate"] = float((torch.sigmoid(predicate_logits) >= 0.5).float().mean())
     pair_margin_by_reason = pair_margins or {"pair_margin_available": False}
+    candidate_metrics = {}
+    for name, cand_action in (action_candidate_logits or {}).items():
+        candidate_metrics[name] = acpr_metric_views(cand_action, reason_logits, action, reason)["metrics_raw_fixed"]
     return {
         **views,
         "primary_branch": branch,
@@ -70,6 +74,7 @@ def evaluate_tensors(
         "tail_reason_metrics": _tail_reason_metrics(reason_logits, reason),
         "predicate_group_metrics": predicate_group_metrics,
         "pair_margin_by_reason": pair_margin_by_reason,
+        "metrics_action_candidates_fixed": candidate_metrics,
     }
 
 
@@ -85,8 +90,18 @@ def main() -> None:
     ap.add_argument("--logits_reason_base", default=None)
     ap.add_argument("--logits_action_calibrated", default=None)
     ap.add_argument("--logits_reason_calibrated", default=None)
+    ap.add_argument("--logits_action_candidate", action="append", default=[], help="Candidate action logits as name=path.")
+    ap.add_argument("--evaluate_action_candidates", action="store_true")
+    ap.add_argument("--candidate_gate_json", default=None)
+    ap.add_argument("--output_action_candidate_metrics", default=None)
     ap.add_argument("--output", required=True)
     args = ap.parse_args()
+    candidates = {}
+    for item in args.logits_action_candidate:
+        if "=" not in item:
+            raise ValueError("--logits_action_candidate must be name=path")
+        name, path = item.split("=", 1)
+        candidates[name] = torch.load(path, map_location="cpu")
     result = evaluate_tensors(
         torch.load(args.logits_action, map_location="cpu"),
         torch.load(args.logits_reason, map_location="cpu"),
@@ -98,9 +113,15 @@ def main() -> None:
         base_reason_logits=torch.load(args.logits_reason_base, map_location="cpu") if args.logits_reason_base else None,
         calibrated_action_logits=torch.load(args.logits_action_calibrated, map_location="cpu") if args.logits_action_calibrated else None,
         calibrated_reason_logits=torch.load(args.logits_reason_calibrated, map_location="cpu") if args.logits_reason_calibrated else None,
+        action_candidate_logits=candidates if args.evaluate_action_candidates or candidates else None,
     )
+    if args.candidate_gate_json:
+        result["candidate_gate_json"] = json.loads(Path(args.candidate_gate_json).read_text(encoding="utf-8"))
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     Path(args.output).write_text(json.dumps(result, indent=2), encoding="utf-8")
+    if args.output_action_candidate_metrics:
+        Path(args.output_action_candidate_metrics).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.output_action_candidate_metrics).write_text(json.dumps(result.get("metrics_action_candidates_fixed", {}), indent=2), encoding="utf-8")
 
 
 if __name__ == "__main__":

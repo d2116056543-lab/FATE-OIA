@@ -46,7 +46,7 @@ training:
   lr_calibration: 0.0
   lr_threshold: 0.0
   lr_action_utility: 0.0002
-  lr_action_candidate: 0.0002
+  lr_action_candidate: 0.0005
   scheduler: warmup_cosine
   warmup_epochs: 1
   min_lr: 1.0e-05
@@ -70,7 +70,7 @@ model:
   dim: 384
   action_dim: 4
   reason_dim: 21
-  final_action_source: candidate_probe_guarded_fallback
+  final_action_source: fallback_until_gate_selected
   action_set_affects_final_action: false
   graph_delta_to_logits: false
   actalign_enabled: true
@@ -101,7 +101,7 @@ threshold:
   grid_step: 0.01
 
 eval:
-  primary_raw_branch: candidate_probe_guarded_fallback
+  primary_raw_branch: fallback_until_gate_selected
   also_eval_base_fixed: true
   also_eval_calibrated: true
   also_eval_global_threshold_diag: true
@@ -119,6 +119,8 @@ actalign:
   enabled: true
   stage_mode: candidate_probe
   mode: candidate_probe
+  final_action_source: fallback_until_gate_selected
+  train_calib_gate: true
   max_r2a_delta: 0.2
   max_pred_delta: 0.05
   initial_r2a_gate: 0.0
@@ -129,10 +131,15 @@ actalign:
 
 candidate_probe:
   candidate_names: [visual, reason, blend, predicate, blend_predicate]
-  candidate_weight: 1.0
-  nonreg_weight: 0.25
+  candidate_weight: 0.5
+  nonreg_weight: 0.5
   min_delta_f1: 0.002
-  gate_ema: 1.0
+  train_calib_act_gain_min: 0.001
+  test_act_drop_max: 0.005
+  test_exp_drop_max: 0.010
+  gate_ema: 0.20
+  allow_reason_candidate: true
+  allow_predicate_candidate: true
   max_exp_drop: 0.005
   gate_max_all_high_increase: 0.02
   gate_max_action_pred_rate_increase_abs: 0.08
@@ -141,6 +148,8 @@ candidate_probe:
 
 stageA:
   enabled: true
+  action_primary_score_action_weight: 0.85
+  action_primary_score_exp_weight: 0.15
   train_candidate_heads_only: true
   freeze_trunk: true
   freeze_dino: true

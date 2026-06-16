@@ -128,6 +128,8 @@ class ACPROIAModel(nn.Module):
                     "pred_gate": candidate_out["selected_gate"],
                     "r2a_delta_abs_mean": (candidate_out["reason"] - action_logits_fallback).abs().mean(),
                     "pred_delta_abs_mean": candidate_out["predicate_delta_clipped"].abs().mean(),
+                    "pred_delta_max_abs": candidate_out["predicate_delta_clipped"].abs().max(),
+                    "pred_delta_per_action_mean": candidate_out["predicate_delta_clipped"].mean(0),
                 }
             else:
                 utility = self.action_utility(
@@ -144,6 +146,8 @@ class ACPROIAModel(nn.Module):
                 "predicate_action_delta_raw": zero_delta,
                 "predicate_action_delta": zero_delta,
                 "predicate_action_delta_abs_mean": zero_delta.abs().mean(),
+                "predicate_action_delta_max_abs": zero_delta.abs().max(),
+                "predicate_action_delta_per_action_mean": zero_delta.mean(0),
             }
             utility = self.action_utility(
                 action_logits_fallback=action_logits_fallback,
@@ -200,7 +204,21 @@ class ACPROIAModel(nn.Module):
             "pred_gate": utility["pred_gate"],
             "r2a_delta_abs_mean": utility["r2a_delta_abs_mean"],
             "pred_delta_abs_mean": utility["pred_delta_abs_mean"],
+            "pred_delta_max_abs": utility.get("pred_delta_max_abs", pred_delta.get("predicate_action_delta_max_abs")),
+            "pred_delta_per_action_mean": utility.get("pred_delta_per_action_mean", pred_delta.get("predicate_action_delta_per_action_mean")),
             "action_utility_enabled": torch.tensor(float(self.actalign_enabled), device=images.device),
+            "action_utility_stats": {
+                "mode": self.actalign_mode,
+                "r2a_gate": utility["r2a_gate"],
+                "pred_gate": utility["pred_gate"],
+                "r2a_delta_abs_mean": utility["r2a_delta_abs_mean"],
+                "pred_delta_abs_mean": utility["pred_delta_abs_mean"],
+                "pred_delta_max_abs": utility.get("pred_delta_max_abs", pred_delta.get("predicate_action_delta_max_abs")),
+                "pred_delta_per_action_mean": utility.get("pred_delta_per_action_mean", pred_delta.get("predicate_action_delta_per_action_mean")),
+                "candidate_selected_id": candidate_out["selected_candidate_id"],
+                "candidate_selected_gate": candidate_out["selected_gate"],
+                "candidate_blend_gamma": candidate_out["blend_gamma"],
+            },
             "action_candidate_logits": {k: candidate_out[k] for k in ["fallback", "visual", "reason", "blend", "predicate", "blend_predicate"]},
             "action_candidate_names": candidate_out["candidate_names"],
             "action_candidate_selected_id": candidate_out["selected_candidate_id"],

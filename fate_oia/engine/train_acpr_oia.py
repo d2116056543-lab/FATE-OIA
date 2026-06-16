@@ -252,6 +252,30 @@ def collect_action_candidates_train_calib(
     return {name: torch.cat(parts) for name, parts in rows.items()}, torch.cat(label_rows)
 
 
+def apply_candidate_gate_logits(
+    candidate_logits: dict[str, torch.Tensor],
+    selected_candidate_id: torch.Tensor,
+    selected_gate: torch.Tensor,
+    candidate_names: list[str],
+) -> torch.Tensor:
+    """Apply the train_calib-selected per-action candidate gate.
+
+    Gate zero is an exact fallback invariant. Candidate ids are indices into
+    candidate_names, not including the fallback entry.
+    """
+
+    out = candidate_logits["fallback"].clone()
+    ids = selected_candidate_id.detach().cpu().long().view(-1)
+    gates = selected_gate.detach().cpu().float().view(-1)
+    for action_idx, cand_id in enumerate(ids.tolist()):
+        gate = float(gates[action_idx].item())
+        if cand_id < 0 or gate <= 0.0:
+            continue
+        name = candidate_names[cand_id]
+        out[:, action_idx] = (1.0 - gate) * out[:, action_idx] + gate * candidate_logits[name][:, action_idx]
+    return out
+
+
 @torch.no_grad()
 def collect_threshold_teacher(
     model: ACPROIAModel,
@@ -432,7 +456,15 @@ def compute_losses(out: dict, batch: dict, predicate_batch: dict, pairs: dict, g
 
 
 @torch.no_grad()
-def evaluate(model: ACPROIAModel, loader: DataLoader, device: torch.device, epoch: int, out_dir: Path) -> dict:
+def evaluate(
+    model: ACPROIAModel,
+    loader: DataLoader,
+    device: torch.device,
+    epoch: int,
+    out_dir: Path,
+    action_primary_action_weight: float = 0.80,
+    action_primary_exp_weight: float = 0.20,
+) -> dict:
     model.eval()
     action_base = []
     reason_base = []
@@ -491,7 +523,11 @@ def evaluate(model: ACPROIAModel, loader: DataLoader, device: torch.device, epoc
     for cname, parts in candidate_rows.items():
         candidate_logits = torch.cat(parts)
         candidate_test_metrics[cname] = acpr_metric_views(candidate_logits, rl, ya, yr)["metrics_raw_fixed"]
-    action_primary_score = 0.80 * float(views["metrics_raw_fixed"].get("Act_mF1", 0.0)) + 0.20 * float(views["metrics_raw_fixed"].get("Exp_mF1", 0.0))
+    action_primary_score = _action_primary_score(
+        views["metrics_raw_fixed"],
+        action_weight=action_primary_action_weight,
+        exp_weight=action_primary_exp_weight,
+    )
     metrics = {
         "primary_branch": "deploy_fixed" if getattr(model, "threshold_enabled", False) else "base_fixed",
         "metrics_base_fixed": base_views["metrics_raw_fixed"],
@@ -514,6 +550,12 @@ def evaluate(model: ACPROIAModel, loader: DataLoader, device: torch.device, epoc
         "final_calibrated_joint": standard_joint(cal_views["metrics_raw_fixed"]),
         "base_fixed_joint": standard_joint(base_views["metrics_raw_fixed"]),
     }
+    for cname, cmetrics in candidate_test_metrics.items():
+        prefix = f"candidate_test_{cname}"
+        metrics[f"{prefix}_Act_mF1"] = float(cmetrics.get("Act_mF1", 0.0))
+        metrics[f"{prefix}_Act_oF1"] = float(cmetrics.get("Act_oF1", 0.0))
+        metrics[f"{prefix}_all_high_rate"] = float(cmetrics.get("all_high_rate", 0.0))
+        metrics[f"{prefix}_superset_pred_rate"] = float(cmetrics.get("superset_pred_rate", 0.0))
     epoch_dir = out_dir / f"epoch_{epoch:03d}"
     save_tensor(epoch_dir / "logits_action_raw_test.pt", al)
     save_tensor(epoch_dir / "logits_reason_raw_test.pt", rl)
@@ -546,16 +588,34 @@ def evaluate(model: ACPROIAModel, loader: DataLoader, device: torch.device, epoc
     return metrics
 
 
-def _action_primary_score(metrics_view: dict) -> float:
-    return 0.80 * float(metrics_view.get("Act_mF1", 0.0)) + 0.20 * float(metrics_view.get("Exp_mF1", 0.0))
+def _action_primary_score(metrics_view: dict, action_weight: float = 0.80, exp_weight: float = 0.20) -> float:
+    return float(action_weight) * float(metrics_view.get("Act_mF1", 0.0)) + float(exp_weight) * float(metrics_view.get("Exp_mF1", 0.0))
 
 
-def evaluate_shadow_model(model: ACPROIAModel, helper: Any, kind: str, loader: DataLoader, device: torch.device, epoch: int, out_dir: Path) -> tuple[dict | None, dict[str, torch.Tensor] | None]:
+def evaluate_shadow_model(
+    model: ACPROIAModel,
+    helper: Any,
+    kind: str,
+    loader: DataLoader,
+    device: torch.device,
+    epoch: int,
+    out_dir: Path,
+    action_primary_action_weight: float = 0.80,
+    action_primary_exp_weight: float = 0.20,
+) -> tuple[dict | None, dict[str, torch.Tensor] | None]:
     if helper is None or not getattr(helper, "available", False):
         return None, None
     context = helper.average_parameters if hasattr(helper, "average_parameters") else helper.averaged_parameters
     with context(model):
-        metrics = evaluate(model, loader, device, epoch, out_dir / f"{kind}_eval")
+        metrics = evaluate(
+            model,
+            loader,
+            device,
+            epoch,
+            out_dir / f"{kind}_eval",
+            action_primary_action_weight=action_primary_action_weight,
+            action_primary_exp_weight=action_primary_exp_weight,
+        )
         state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
     return metrics, state
 
@@ -634,7 +694,8 @@ def main() -> None:
     ap.add_argument("--resume_checkpoint", "--resume", dest="resume_checkpoint", default=None, help="Resume ACPR model weights from a previous checkpoint.")
     ap.add_argument("--stop_after_epochs", type=int, default=None, help="Run only N epochs after start_epoch while preserving --epochs for LR scheduling.")
     ap.add_argument("--freeze_trunk_for_action_utility_sanity", action="store_true", help="Freeze all modules except action utility and threshold head for sanity fine-tuning.")
-    ap.add_argument("--stage_mode", default=None, choices=["candidate_probe", "candidate_finetune"], help="ACPR-ActAlign V1.3.1 stage mode.")
+    ap.add_argument("--stage_mode", default=None, choices=["candidate_probe", "candidate_finetune", "full_clean"], help="ACPR-ActAlign V1.3.1 stage mode.")
+    ap.add_argument("--load_candidate_gate", default=None, help="Load a validated Stage A candidate gate JSON before candidate finetune.")
     args = ap.parse_args()
     cfg = load_config(args.config)
     if cfg.get("best_selection_split") != "test" or cfg.get("eval_splits") != "test":
@@ -646,6 +707,11 @@ def main() -> None:
     if stage_mode:
         cfg.setdefault("actalign", {})["stage_mode"] = stage_mode
         cfg.setdefault("actalign", {})["mode"] = stage_mode
+    if stage_mode in {"candidate_finetune", "full_clean"}:
+        if stage_mode == "candidate_finetune" and not args.load_candidate_gate:
+            raise RuntimeError("Stage B candidate_finetune requires --load_candidate_gate from a Stage A PASS run.")
+        if stage_mode == "full_clean":
+            raise RuntimeError("Clean full train is blocked until Stage A and Stage B both produce explicit PASS artifacts.")
     epochs = int(args.epochs or tr.get("epochs", 28))
     batch_size = int(args.batch_size or tr.get("batch_size", 6))
     accum = int(args.gradient_accumulation_steps or tr.get("gradient_accumulation_steps", 5))
@@ -653,6 +719,9 @@ def main() -> None:
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     Path(out_dir / "config_resolved.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
+    stage_a_cfg = cfg.get("stageA", {})
+    action_primary_action_weight = float(stage_a_cfg.get("action_primary_score_action_weight", 0.80))
+    action_primary_exp_weight = float(stage_a_cfg.get("action_primary_score_exp_weight", 0.20))
     write_json(out_dir / "run_manifest.json", {
         "git_head": os.popen("git rev-parse HEAD").read().strip(),
         "command_line": " ".join(sys.argv),
@@ -671,6 +740,9 @@ def main() -> None:
         "loss_weights": cfg.get("loss_weights", {}),
         "resume_checkpoint": args.resume_checkpoint,
         "stage_mode": stage_mode,
+        "load_candidate_gate": args.load_candidate_gate,
+        "action_primary_score_action_weight": action_primary_action_weight,
+        "action_primary_score_exp_weight": action_primary_exp_weight,
     })
     write_json(out_dir / "implementation_fingerprint.json", {
         "git_head": os.popen("git rev-parse HEAD").read().strip(),
@@ -791,11 +863,26 @@ def main() -> None:
             list(model.action_candidates.candidate_names),
             min_delta_f1=float(cand_cfg.get("min_delta_f1", 0.002)),
             max_exp_drop=float(cand_cfg.get("max_exp_drop", 0.005)),
-            gate_ema=float(cand_cfg.get("gate_ema", 1.0 if stage_mode == "candidate_probe" else 0.2)),
+            gate_ema=float(cand_cfg.get("gate_ema", 0.20)),
             gate_max_all_high_increase=float(cand_cfg.get("gate_max_all_high_increase", 0.02)),
             gate_max_action_pred_rate_increase_abs=float(cand_cfg.get("gate_max_action_pred_rate_increase_abs", 0.08)),
             gate_max_action_pred_rate_increase_rel=float(cand_cfg.get("gate_max_action_pred_rate_increase_rel", 1.5)),
+            allow_reason_candidate=bool(cand_cfg.get("allow_reason_candidate", True)),
+            allow_predicate_candidate=bool(cand_cfg.get("allow_predicate_candidate", True)),
         )
+        if stage_mode == "candidate_finetune":
+            gate_path = Path(args.load_candidate_gate)
+            gate_payload = json.loads(gate_path.read_text(encoding="utf-8"))
+            if not bool(gate_payload.get("pass", False)):
+                raise RuntimeError(f"Candidate gate file is not a Stage A PASS artifact: {gate_path}")
+            selected = gate_payload.get("candidate_selected_state") or {}
+            ids = torch.tensor(selected.get("selected_candidate_id", []), dtype=torch.long)
+            gates = torch.tensor(selected.get("selected_gate", []), dtype=torch.float32)
+            if ids.numel() != 4 or gates.numel() != 4 or not bool((gates > 0).any().item()):
+                raise RuntimeError(f"Candidate gate file has no active selected gate: {gate_path}")
+            candidate_gate.selected_candidate_id.copy_(ids)
+            candidate_gate.selected_gate.copy_(gates)
+            model.action_candidates.set_selected_candidates(ids.to(device), gates.to(device))
     gg_cfg = cfg.get("gradient_guard", {})
     grad_guard = ACPRActionGradientGuard(
         mode=gg_cfg.get("mode", "log_only"),
@@ -840,6 +927,10 @@ def main() -> None:
     if args.stop_after_epochs is not None:
         end_epoch = min(epochs, start_epoch + max(0, int(args.stop_after_epochs)))
     candidate_gate_stats = {"available": False, "source": "train_calib_only", "reason": "epoch_loop_not_run"}
+    last_candidate_train_calib_gated: dict | None = None
+    last_candidate_train_calib_fallback: dict | None = None
+    last_candidate_train_calib_all_high_increase: float | None = None
+    last_metrics: dict | None = None
     for epoch in range(start_epoch, end_epoch):
         set_epoch_lrs(opt, epoch, epochs, warmup_epochs, min_lr)
         model.train()
@@ -879,8 +970,8 @@ def main() -> None:
                     out["action_logits_fallback"].detach(),
                     batch["action"],
                     out.get("action_candidate_names", ["visual", "reason", "blend", "predicate", "blend_predicate"]),
-                    candidate_weight=float(cfg.get("candidate_probe", {}).get("candidate_weight", 1.0)),
-                    nonreg_weight=float(cfg.get("candidate_probe", {}).get("nonreg_weight", 0.25)),
+                candidate_weight=float(cfg.get("candidate_probe", {}).get("candidate_weight", 0.5)),
+                nonreg_weight=float(cfg.get("candidate_probe", {}).get("nonreg_weight", 0.5)),
                 )
                 loss = cand_loss
                 parts.update(cand_parts)
@@ -973,27 +1064,98 @@ def main() -> None:
             cand_logits, cand_targets = collect_action_candidates_train_calib(model, train_calib_loader, device, epoch)
             candidate_metrics = compute_candidate_metrics(cand_logits, cand_targets)
             candidate_comparison = compare_candidates_to_fallback(candidate_metrics)
-            candidate_gate_stats = candidate_gate.update_from_train_calib(candidate_metrics, candidate_metrics["fallback"])
+            candidate_gate_stats = candidate_gate.update_from_train_calib(
+                candidate_metrics,
+                candidate_metrics["fallback"],
+                exp_metrics_optional={"exp_drop": 0.0},
+            )
             model.action_candidates.set_selected_candidates(candidate_gate.selected_candidate_id.to(device), candidate_gate.selected_gate.to(device))
             candidate_selected = model.action_candidates.selected_summary()
+            gated_logits = apply_candidate_gate_logits(
+                cand_logits,
+                candidate_gate.selected_candidate_id,
+                candidate_gate.selected_gate,
+                list(model.action_candidates.candidate_names),
+            )
+            gated_metrics = compute_candidate_metrics({"utility_final_gated": gated_logits}, cand_targets)["utility_final_gated"]
+            fallback_metrics = candidate_metrics["fallback"]
+            gated_delta = float(gated_metrics.get("Act_mF1", 0.0)) - float(fallback_metrics.get("Act_mF1", 0.0))
+            all_high_increase = float(gated_metrics.get("all_high_rate", 0.0)) - float(fallback_metrics.get("all_high_rate", 0.0))
+            last_candidate_train_calib_gated = gated_metrics
+            last_candidate_train_calib_fallback = fallback_metrics
+            last_candidate_train_calib_all_high_increase = all_high_increase
             train_calib_action_primary = max(
                 float(train_calib_action_primary if train_calib_action_primary is not None else 0.0),
-                max(float(m.get("Act_mF1", 0.0)) for m in candidate_metrics.values()),
+                _action_primary_score(
+                    {"Act_mF1": gated_metrics.get("Act_mF1", 0.0), "Exp_mF1": 0.0},
+                    action_primary_action_weight,
+                    0.0,
+                ),
             )
-            append_jsonl(out_dir / "action_candidate_metrics.jsonl", {"epoch": epoch, "split": "train_calib", **json_safe(candidate_metrics), "comparison": json_safe(candidate_comparison)})
+            train_calib_payload = {
+                "epoch": epoch,
+                "split": "train_calib",
+                "fallback": json_safe(fallback_metrics),
+                "utility_final_gated": json_safe(gated_metrics),
+                "gated_delta_act_mf1": gated_delta,
+                "gated_all_high_increase": all_high_increase,
+                "candidates": json_safe(candidate_metrics),
+                "comparison": json_safe(candidate_comparison),
+                "gate_stats": json_safe(candidate_gate_stats),
+                "candidate_selected_state": json_safe(candidate_selected),
+            }
+            append_jsonl(out_dir / "action_candidate_train_calib.jsonl", train_calib_payload)
+            append_jsonl(out_dir / "action_candidate_metrics.jsonl", train_calib_payload)
             append_jsonl(out_dir / "action_candidate_gate.jsonl", {"epoch": epoch, **json_safe(candidate_gate_stats), **json_safe(candidate_selected)})
-            write_json(out_dir / "candidate_selected_state.json", {"epoch": epoch, **json_safe(candidate_selected), "gate_stats": json_safe(candidate_gate_stats)})
+            write_json(out_dir / "candidate_selected_state.json", {"epoch": epoch, **json_safe(candidate_selected), "gate_stats": json_safe(candidate_gate_stats), "train_calib": json_safe(train_calib_payload)})
         cooldown_state = update_cooldown_state(cooldown_state, train_calib_action_primary, cfg, opt, weights, epoch)
-        metrics = evaluate(model, test_loader, device, epoch, out_dir)
-        ema_metrics, ema_model_state = evaluate_shadow_model(model, ema_helper, "ema", test_loader, device, epoch, out_dir)
+        metrics = evaluate(
+            model,
+            test_loader,
+            device,
+            epoch,
+            out_dir,
+            action_primary_action_weight=action_primary_action_weight,
+            action_primary_exp_weight=action_primary_exp_weight,
+        )
+        last_metrics = metrics
+        if candidate_gate is not None:
+            metrics["candidate_selected_candidate_id"] = [int(x) for x in candidate_gate.selected_candidate_id.detach().cpu().tolist()]
+            metrics["candidate_selected_gate"] = [float(x) for x in candidate_gate.selected_gate.detach().cpu().tolist()]
+            metrics["candidate_selected_gates_nonzero"] = bool((candidate_gate.selected_gate > 0).any().item())
+            metrics["candidate_train_calib_gated_Act_mF1"] = float((last_candidate_train_calib_gated or {}).get("Act_mF1", 0.0))
+            metrics["candidate_train_calib_fallback_Act_mF1"] = float((last_candidate_train_calib_fallback or {}).get("Act_mF1", 0.0))
+            metrics["candidate_train_calib_gated_delta_Act_mF1"] = metrics["candidate_train_calib_gated_Act_mF1"] - metrics["candidate_train_calib_fallback_Act_mF1"]
+            metrics["candidate_train_calib_all_high_increase"] = float(last_candidate_train_calib_all_high_increase or 0.0)
+        ema_metrics, ema_model_state = evaluate_shadow_model(
+            model,
+            ema_helper,
+            "ema",
+            test_loader,
+            device,
+            epoch,
+            out_dir,
+            action_primary_action_weight=action_primary_action_weight,
+            action_primary_exp_weight=action_primary_exp_weight,
+        )
         if swa_helper is not None:
             swa_helper.consider(model, float(train_calib_action_primary if train_calib_action_primary is not None else metrics.get("action_primary_score", 0.0)), epoch)
-        swa_metrics, _swa_model_state = evaluate_shadow_model(model, swa_helper, "swa", test_loader, device, epoch, out_dir)
+        swa_metrics, _swa_model_state = evaluate_shadow_model(
+            model,
+            swa_helper,
+            "swa",
+            test_loader,
+            device,
+            epoch,
+            out_dir,
+            action_primary_action_weight=action_primary_action_weight,
+            action_primary_exp_weight=action_primary_exp_weight,
+        )
         if ema_metrics is not None:
             metrics["metrics_ema"] = ema_metrics["metrics_raw_fixed"]
             metrics["Act_mF1_ema"] = float(ema_metrics["metrics_raw_fixed"].get("Act_mF1", 0.0))
             metrics["Exp_mF1_ema"] = float(ema_metrics["metrics_raw_fixed"].get("Exp_mF1", 0.0))
-            metrics["action_primary_score_ema"] = _action_primary_score(ema_metrics["metrics_raw_fixed"])
+            metrics["action_primary_score_ema"] = _action_primary_score(ema_metrics["metrics_raw_fixed"], action_primary_action_weight, action_primary_exp_weight)
         else:
             metrics["metrics_ema"] = None
             metrics["Act_mF1_ema"] = None
@@ -1003,7 +1165,7 @@ def main() -> None:
             metrics["metrics_swa"] = swa_metrics["metrics_raw_fixed"]
             metrics["Act_mF1_swa"] = float(swa_metrics["metrics_raw_fixed"].get("Act_mF1", 0.0))
             metrics["Exp_mF1_swa"] = float(swa_metrics["metrics_raw_fixed"].get("Exp_mF1", 0.0))
-            metrics["action_primary_score_swa"] = _action_primary_score(swa_metrics["metrics_raw_fixed"])
+            metrics["action_primary_score_swa"] = _action_primary_score(swa_metrics["metrics_raw_fixed"], action_primary_action_weight, action_primary_exp_weight)
         else:
             metrics["metrics_swa"] = None
             metrics["Act_mF1_swa"] = None
@@ -1186,16 +1348,48 @@ def main() -> None:
         for key, value in (candidate_gate_stats or {}).items():
             if key.startswith("delta_f1_"):
                 max_delta = max(max_delta, float(value))
+        cand_cfg = cfg.get("candidate_probe", {})
+        train_gain = 0.0
+        train_exp_drop = 0.0
+        all_high_increase = 0.0
+        if last_candidate_train_calib_gated is not None and last_candidate_train_calib_fallback is not None:
+            train_gain = float(last_candidate_train_calib_gated.get("Act_mF1", 0.0)) - float(last_candidate_train_calib_fallback.get("Act_mF1", 0.0))
+            all_high_increase = float(last_candidate_train_calib_gated.get("all_high_rate", 0.0)) - float(last_candidate_train_calib_fallback.get("all_high_rate", 0.0))
+        test_act_drop = 0.0
+        test_exp_drop = 0.0
+        if last_metrics is not None:
+            test_act_drop = float(last_metrics.get("Act_mF1_fallback", 0.0)) - float(last_metrics["metrics_raw_fixed"].get("Act_mF1", 0.0))
+            test_exp_drop = float(last_metrics.get("Exp_mF1_fallback", 0.0)) - float(last_metrics["metrics_raw_fixed"].get("Exp_mF1", 0.0))
+        pass_checks = {
+            "selected_nonzero": bool(selected_nonzero),
+            "max_per_action_delta_f1": bool(max_delta >= float(cand_cfg.get("min_delta_f1", 0.002))),
+            "gated_train_calib_act_gain": bool(train_gain >= float(cand_cfg.get("train_calib_act_gain_min", 0.001))),
+            "train_calib_exp_drop": bool(train_exp_drop <= float(cand_cfg.get("max_exp_drop", 0.005))),
+            "all_high_control": bool(all_high_increase <= float(cand_cfg.get("gate_max_all_high_increase", 0.02))),
+            "test_act_nonregression": bool(test_act_drop <= float(cand_cfg.get("test_act_drop_max", 0.005))),
+            "test_exp_nonregression": bool(test_exp_drop <= float(cand_cfg.get("test_exp_drop_max", 0.010))),
+        }
+        stage_a_pass = all(pass_checks.values())
         stage_a_payload = {
             "stage": "A_candidate_probe",
-            "pass": bool(selected_nonzero and max_delta >= float(cfg.get("candidate_probe", {}).get("min_delta_f1", 0.002))),
+            "pass": bool(stage_a_pass),
+            "pass_checks": pass_checks,
             "selected_nonzero": selected_nonzero,
             "max_train_calib_delta_f1": max_delta,
+            "gated_train_calib_delta_act_mf1": train_gain,
+            "train_calib_exp_drop": train_exp_drop,
+            "gated_train_calib_all_high_increase": all_high_increase,
+            "test_act_drop_vs_fallback": test_act_drop,
+            "test_exp_drop_vs_fallback": test_exp_drop,
             "candidate_gate_stats": json_safe(candidate_gate_stats),
             "candidate_selected_state": model.action_candidates.selected_summary() if hasattr(model, "action_candidates") else None,
+            "candidate_train_calib_fallback": json_safe(last_candidate_train_calib_fallback or {}),
+            "candidate_train_calib_gated": json_safe(last_candidate_train_calib_gated or {}),
+            "latest_test_metrics_raw_fixed": json_safe((last_metrics or {}).get("metrics_raw_fixed", {})),
+            "latest_test_metrics_fallback": json_safe((last_metrics or {}).get("metrics_fallback_fixed", {})),
             "best_action_primary_score": best_action_primary,
             "best_final_raw_joint": best_raw,
-            "reason": "candidate positive train_calib gain validated" if selected_nonzero and max_delta >= float(cfg.get("candidate_probe", {}).get("min_delta_f1", 0.002)) else "no train_calib-positive candidate action utility; Stage B must remain blocked",
+            "reason": "candidate positive train_calib gain validated with non-regression constraints" if stage_a_pass else "candidate utility failed at least one Stage A gate; Stage B must remain blocked",
         }
         if stage_a_payload["pass"]:
             write_json(out_dir / "STAGE_A_CANDIDATE_PROBE_PASS.json", stage_a_payload)

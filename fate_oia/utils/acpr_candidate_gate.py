@@ -14,6 +14,8 @@ class ACPRActionCandidateGate:
         gate_max_all_high_increase: float = 0.02,
         gate_max_action_pred_rate_increase_abs: float = 0.08,
         gate_max_action_pred_rate_increase_rel: float = 1.5,
+        allow_reason_candidate: bool = True,
+        allow_predicate_candidate: bool = True,
     ) -> None:
         self.candidate_names = list(candidate_names)
         self.action_names = list(action_names)
@@ -23,6 +25,8 @@ class ACPRActionCandidateGate:
         self.gate_max_all_high_increase = float(gate_max_all_high_increase)
         self.gate_max_action_pred_rate_increase_abs = float(gate_max_action_pred_rate_increase_abs)
         self.gate_max_action_pred_rate_increase_rel = float(gate_max_action_pred_rate_increase_rel)
+        self.allow_reason_candidate = bool(allow_reason_candidate)
+        self.allow_predicate_candidate = bool(allow_predicate_candidate)
         self.selected_candidate_id = torch.full((len(self.action_names),), -1, dtype=torch.long)
         self.selected_gate = torch.zeros(len(self.action_names), dtype=torch.float32)
 
@@ -46,6 +50,8 @@ class ACPRActionCandidateGate:
         diagnostics = {
             "source": "train_calib_only",
             "candidate_names": self.candidate_names,
+            "allow_reason_candidate": self.allow_reason_candidate,
+            "allow_predicate_candidate": self.allow_predicate_candidate,
             "selected_candidate_id": [],
             "selected_gate": [],
         }
@@ -59,6 +65,12 @@ class ACPRActionCandidateGate:
             best_f1 = float(fallback["per_action_F1"][a])
             rejected = {}
             for idx, name in enumerate(self.candidate_names):
+                if (not self.allow_reason_candidate) and name in {"reason", "blend"}:
+                    rejected[name] = ["reason_candidate_disabled"]
+                    continue
+                if (not self.allow_predicate_candidate) and name in {"predicate", "blend_predicate"}:
+                    rejected[name] = ["predicate_candidate_disabled"]
+                    continue
                 m = candidate_metrics[name]
                 cand_f1 = float(m["per_action_F1"][a])
                 cand_rate = float(m["predicted_positive_rate_per_action"][a])
