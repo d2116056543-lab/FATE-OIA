@@ -463,6 +463,7 @@ def main() -> None:
     ap.add_argument("--no_feature_cache", action="store_true")
     ap.add_argument("--require_no_token_compression", action="store_true")
     ap.add_argument("--resume_checkpoint", default=None, help="Resume ACPR model weights from a previous checkpoint.")
+    ap.add_argument("--stop_after_epochs", type=int, default=None, help="Run only N epochs after start_epoch while preserving --epochs for LR scheduling.")
     args = ap.parse_args()
     cfg = load_config(args.config)
     if cfg.get("best_selection_split") != "test" or cfg.get("eval_splits") != "test":
@@ -540,6 +541,7 @@ def main() -> None:
             "resume_checkpoint": str(resume_path),
             "checkpoint_epoch": int(resume_ckpt.get("epoch", -1)),
             "start_epoch": start_epoch,
+            "stop_after_epochs": args.stop_after_epochs,
             "optimizer_state_restored": bool("optimizer" in resume_ckpt),
             "scheduler_state_restored": False,
             "resume_mode": "model_weights_plus_absolute_epoch_lr",
@@ -593,7 +595,10 @@ def main() -> None:
     best_act = -1.0
     best_tail = -1.0
     global_step = 0
-    for epoch in range(start_epoch, epochs):
+    end_epoch = epochs
+    if args.stop_after_epochs is not None:
+        end_epoch = min(epochs, start_epoch + max(0, int(args.stop_after_epochs)))
+    for epoch in range(start_epoch, end_epoch):
         set_epoch_lrs(opt, epoch, epochs, warmup_epochs, min_lr)
         model.train()
         opt.zero_grad(set_to_none=True)
