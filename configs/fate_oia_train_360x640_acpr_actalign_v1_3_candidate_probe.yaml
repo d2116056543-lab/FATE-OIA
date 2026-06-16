@@ -48,7 +48,7 @@ training:
   lr_action_utility: 0.0002
   lr_action_candidate: 0.0005
   scheduler: warmup_cosine
-  warmup_epochs: 1
+  warmup_epochs: 2
   min_lr: 1.0e-05
   weight_decay: 0.05
   grad_clip: 1.0

@@ -332,6 +332,11 @@ def main() -> None:
             blend_grad = candidate_model.action_candidates.blend_gamma_raw.grad
             pred_grad = candidate_model.action_predicate_delta.mlp[-1].weight.grad
             checks["candidate_gradients_active"] = bool(blend_grad is not None and blend_grad.abs().sum() > 0 and pred_grad is not None and pred_grad.abs().sum() > 0)
+            checks["candidate_probe_disables_gradient_guard"] = all(t in train_text for t in [
+                'grad_guard_enabled = bool(gg_cfg.get("enabled", False)) and stage_mode != "candidate_probe"',
+                'grad_guard_mode = str(gg_cfg.get("mode", "log_only")) if grad_guard_enabled else "disabled"',
+                'shared_named_params = [] if not grad_guard_enabled else',
+            ])
             checks["candidate_stage_protocol"] = (
                 cfg.get("stageA", {}).get("train_candidate_heads_only") is True
                 and cfg.get("stageB", {}).get("enabled") is False
@@ -346,7 +351,9 @@ def main() -> None:
                     "test_exp_nonregression",
                     "--load_candidate_gate",
                     "Clean full train is blocked",
+                    'stage_mode != "candidate_probe"',
                 ])
+                and checks["candidate_probe_disables_gradient_guard"]
                 and "candidate_probe" in Path("fate_oia/engine/fit_acpr_action_candidates.py").read_text(encoding="utf-8")
             )
             checks["candidate_eval_entry"] = all(t in eval_text for t in ["--evaluate_action_candidates", "--candidate_gate_json", "--output_action_candidate_metrics", "metrics_action_candidates_fixed"])

@@ -884,15 +884,17 @@ def main() -> None:
             candidate_gate.selected_gate.copy_(gates)
             model.action_candidates.set_selected_candidates(ids.to(device), gates.to(device))
     gg_cfg = cfg.get("gradient_guard", {})
+    grad_guard_enabled = bool(gg_cfg.get("enabled", False)) and stage_mode != "candidate_probe"
+    grad_guard_mode = str(gg_cfg.get("mode", "log_only")) if grad_guard_enabled else "disabled"
     grad_guard = ACPRActionGradientGuard(
-        mode=gg_cfg.get("mode", "log_only"),
+        mode=grad_guard_mode,
         project_after_epoch=int(gg_cfg.get("project_after_epoch", 3)),
         every_n_steps=int(gg_cfg.get("every_n_steps", 8)),
     )
     shared_patterns = [str(x) for x in gg_cfg.get("shared_param_patterns", [])]
     if not shared_patterns:
         shared_patterns = ["trunk", "predicate_reason", "reason_pair_proj", "threshold_head", "action_predicate_delta"]
-    shared_named_params = [
+    shared_named_params = [] if not grad_guard_enabled else [
         (name, param)
         for name, param in model.named_parameters()
         if param.requires_grad and any(pattern in name for pattern in shared_patterns)
@@ -994,9 +996,15 @@ def main() -> None:
             current_global_step = global_step + 1
             will_step_optimizer = step % accum == 0
             action_guard_grads = None
-            if will_step_optimizer and shared_named_params and grad_guard.should_run(epoch, current_global_step):
+            if (
+                stage_mode != "candidate_probe"
+                and will_step_optimizer
+                and shared_named_params
+                and grad_guard.should_run(epoch, current_global_step)
+            ):
                 action_anchor_loss = L.action_asl_loss(out["action_logits_final_raw"], batch["action"]) / accum
-                action_guard_grads = grad_guard.capture_action_grads(action_anchor_loss, [p for _, p in shared_named_params])
+                if action_anchor_loss.requires_grad:
+                    action_guard_grads = grad_guard.capture_action_grads(action_anchor_loss, [p for _, p in shared_named_params])
             (loss / accum).backward()
             if step % accum == 0:
                 if action_guard_grads is not None:
