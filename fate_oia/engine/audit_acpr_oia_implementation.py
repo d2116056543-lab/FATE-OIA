@@ -36,6 +36,18 @@ CALALIGN_REQUIRED = [
     "scripts/FATE_OIA_acpr_calalign_v1_2_foreground.ps1",
 ]
 
+ACTALIGN_REQUIRED = [
+    "fate_oia/models/acpr_action_utility.py",
+    "fate_oia/models/acpr_action_predicate_delta.py",
+    "fate_oia/losses/acpr_action_utility_losses.py",
+    "fate_oia/utils/acpr_action_pareto_gate.py",
+    "fate_oia/utils/acpr_action_gradient_guard.py",
+    "fate_oia/utils/acpr_model_ema.py",
+    "fate_oia/utils/acpr_swa_lite.py",
+    "configs/fate_oia_train_360x640_acpr_actalign_v1_3.yaml",
+    "scripts/FATE_OIA_acpr_actalign_v1_3_foreground.ps1",
+]
+
 
 def _git_head() -> str:
     try:
@@ -54,7 +66,8 @@ def main() -> None:
     out_dir = Path(args.output_dir); out_dir.mkdir(parents=True, exist_ok=True)
     cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8")) or {}
     calalign_enabled = bool(cfg.get("threshold", {}).get("enabled", False))
-    required_files = REQUIRED + (CALALIGN_REQUIRED if calalign_enabled else [])
+    actalign_enabled = bool(cfg.get("actalign", {}).get("enabled", False) or cfg.get("model", {}).get("actalign_enabled", False))
+    required_files = REQUIRED + (CALALIGN_REQUIRED if calalign_enabled else []) + (ACTALIGN_REQUIRED if actalign_enabled else [])
     missing: list[str] = []
     checks: dict[str, bool] = {}
     for rel in required_files:
@@ -208,7 +221,7 @@ def main() -> None:
         cfg_eval = cfg.get("eval", {})
         checks["calalign_config_protocol"] = (
             cfg.get("threshold", {}).get("enabled") is True
-            and cfg_eval.get("primary_raw_branch") == "deploy_fixed"
+            and cfg_eval.get("primary_raw_branch") in {"deploy_fixed", "actalign_utility_deploy_fixed"}
             and cfg_eval.get("also_eval_base_fixed") is True
             and cfg.get("feature_cache_enabled") is False
             and cfg.get("token_compression") == "none"
@@ -224,6 +237,48 @@ def main() -> None:
         main_idx, calib_idx = make_train_calib_indices(Tiny(), calib_fraction=0.5, seed=11)
         checks["calalign_train_calib_split_contract"] = bool(main_idx and calib_idx and not (set(main_idx) & set(calib_idx)) and (main_idx, calib_idx) == make_train_calib_indices(Tiny(), calib_fraction=0.5, seed=11))
         checks["calalign_script_foreground"] = "Start-Process" not in Path("scripts/FATE_OIA_acpr_calalign_v1_2_foreground.ps1").read_text(encoding="utf-8")
+    if actalign_enabled:
+        act_cfg = cfg.get("actalign", {})
+        model_text = Path("fate_oia/models/acpr_oia_model.py").read_text(encoding="utf-8")
+        train_text = Path("fate_oia/engine/train_acpr_oia.py").read_text(encoding="utf-8")
+        utility_text = Path("fate_oia/models/acpr_action_utility.py").read_text(encoding="utf-8")
+        pred_text = Path("fate_oia/models/acpr_action_predicate_delta.py").read_text(encoding="utf-8")
+        checks["actalign_forbidden_arch_absent"] = not any(x in model_text + train_text for x in ["MoE", "specialist", "selector_primary", "graph_delta_to_logits=True", "action_set_probs @"])
+        checks["actalign_config_protocol"] = (
+            cfg.get("model", {}).get("action_set_affects_final_action") is False
+            and cfg.get("model", {}).get("graph_delta_to_logits") is False
+            and cfg.get("runtime", {}).get("no_feature_cache") is True
+            and cfg.get("runtime", {}).get("require_no_token_compression") is True
+            and cfg.get("runtime", {}).get("test_only") is True
+            and float(act_cfg.get("max_pred_delta", 9.0)) <= 0.05
+            and float(act_cfg.get("max_r2a_delta", 9.0)) <= 0.20
+            and float(act_cfg.get("initial_r2a_gate", 1.0)) == 0.0
+            and float(act_cfg.get("initial_pred_gate", 1.0)) == 0.0
+        )
+        checks["actalign_utility_formula"] = all(t in utility_text for t in ["action_reason_logits - action_visual_logits", "action_logits_fallback + r2a_gate * r2a_delta + pred_gate * pred_delta", 'register_buffer("r2a_gate"', 'register_buffer("pred_gate"'])
+        checks["actalign_predicate_delta_contract"] = all(t in pred_text for t in ["action_nodes", "predicate_probs", "detach_inputs", "nn.init.zeros_", "torch.tanh(raw) * self.max_delta"])
+        torch.manual_seed(123)
+        disabled = ACPROIAModel(use_mock_dino=True, threshold_enabled=True, actalign_enabled=False)
+        torch.manual_seed(123)
+        enabled = ACPROIAModel(use_mock_dino=True, threshold_enabled=True, actalign_enabled=True, actalign_kwargs={"initial_r2a_gate": 0.0, "initial_pred_gate": 0.0})
+        x = torch.randn(2, 3, 360, 640)
+        out_d = disabled(x)
+        out_e = enabled(x)
+        checks["actalign_zero_gate_exact_action"] = bool(torch.allclose(out_d["action_logits_final_raw"], out_e["action_logits_final_raw"], atol=1e-6))
+        checks["actalign_reason_unchanged_by_utility"] = bool(torch.allclose(out_d["reason_logits_final_raw"], out_e["reason_logits_final_raw"], atol=1e-6))
+        enabled.action_utility.set_gates(r2a_gate=torch.tensor([1.0, 0.0, 0.0, 0.0]), pred_gate=torch.zeros(4))
+        out_one = enabled(x)
+        diff = (out_one["action_logits_final_raw"] - out_e["action_logits_final_raw"]).abs()
+        checks["actalign_single_gate_only_selected_action"] = bool(diff[:, 0].max() > 0 and diff[:, 1:].max() < 1e-6)
+        checks["actalign_delta_bounds"] = bool(out_one["action_r2a_delta"].abs().max() <= 0.20001 and out_one["action_predicate_delta"].abs().max() <= 0.05001)
+        from fate_oia.utils.acpr_action_pareto_gate import ActionParetoGate
+        gate = ActionParetoGate(action_dim=4, gate_ema=1.0, min_support=1)
+        labels = torch.zeros(4, 4); labels[:2, 0] = 1
+        base_logits = torch.zeros(4, 4)
+        r2a_logits = base_logits.clone(); r2a_logits[:2, 0] = 4; r2a_logits[2:, 0] = -4
+        gate_stats = gate.update(base_logits, r2a_logits, base_logits, labels)
+        checks["actalign_gate_train_calib_only"] = gate_stats.get("source") == "train_calib_only" and gate.r2a_gate[0].item() == 1.0
+        checks["actalign_artifact_writers"] = all(t in train_text for t in ["action_utility_metrics.jsonl", "action_utility_gates.jsonl", "gradient_guard_stats.jsonl", "cooldown_stats.jsonl", "ema_swa_metrics.jsonl", "checkpoint_best_test_action_primary.pth"])
     pass_all = not missing and all(checks.values())
     result = {
         "pass": pass_all,
@@ -232,16 +287,19 @@ def main() -> None:
         "forbidden_pattern_results": {"forbidden_patterns_absent": checks.get("forbidden_patterns_absent", False)},
         "functional_checks": checks,
         "smoke_result": {"required_before_full_train": True, "checked_by_supervisor": True},
-        "review_pass_path": str(out_dir / "REVIEW_PASS_ACPR_OIA_V1.txt"),
+        "review_pass_path": str(out_dir / ("REVIEW_PASS_ACPR_ACTALIGN_V1_3.txt" if actalign_enabled else "REVIEW_PASS_ACPR_OIA_V1.txt")),
         "missing_items": missing + [k for k, v in checks.items() if not v],
         "warnings": [],
     }
     (out_dir / "implementation_audit_ACPR_OIA_V1.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     if pass_all and args.write_review_pass:
-        (out_dir / "REVIEW_PASS_ACPR_OIA_V1.txt").write_text("REVIEW_PASS_ACPR_OIA_V1\n" + result["git_head"] + "\n", encoding="utf-8")
+        pass_name = "REVIEW_PASS_ACPR_ACTALIGN_V1_3.txt" if actalign_enabled else "REVIEW_PASS_ACPR_OIA_V1.txt"
+        pass_label = "REVIEW_PASS_ACPR_ACTALIGN_V1_3" if actalign_enabled else "REVIEW_PASS_ACPR_OIA_V1"
+        (out_dir / pass_name).write_text(pass_label + "\n" + result["git_head"] + "\n", encoding="utf-8")
     if not pass_all:
         raise SystemExit(json.dumps(result, indent=2))
 
 
 if __name__ == "__main__":
     main()
+

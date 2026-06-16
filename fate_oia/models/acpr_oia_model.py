@@ -5,6 +5,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from .acpr_action_combo_aux import ACPRActionComboAux
+from .acpr_action_predicate_delta import ACPRActionPredicateDelta
+from .acpr_action_utility import ACPRActionUtility
 from .acpr_calibration import ACPRCalibrationHead
 from .acpr_dino_field import ACPRDinoFieldExtractor
 from .acpr_ego_regions import ACPREgoRegionEncoder
@@ -28,11 +30,15 @@ class ACPROIAModel(nn.Module):
         use_mock_dino: bool = False,
         threshold_enabled: bool = False,
         threshold_kwargs: dict | None = None,
+        actalign_enabled: bool = False,
+        actalign_kwargs: dict | None = None,
     ) -> None:
         super().__init__()
         self.action_dim = action_dim
         self.reason_dim = reason_dim
         self.threshold_enabled = bool(threshold_enabled)
+        self.actalign_enabled = bool(actalign_enabled)
+        actalign_kwargs = actalign_kwargs or {}
         self.dino = ACPRDinoFieldExtractor(selected_layers=selected_layers, pretrained_weights=pretrained_weights, use_mock_dino=use_mock_dino)
         self.ego = ACPREgoRegionEncoder(grid_hw=(45, 80), dim=dim)
         self.predicate_head = ACPRScenePredicateHead(scene_config=scene_config, dim=dim, num_layers=len(selected_layers))
@@ -43,6 +49,21 @@ class ACPROIAModel(nn.Module):
         self.action_combo_aux = ACPRActionComboAux(dim=dim, action_dim=action_dim)
         self.calibration = ACPRCalibrationHead(num_labels=action_dim + reason_dim)
         self.threshold_head = ACPRThresholdHead(action_dim=action_dim, reason_dim=reason_dim, **(threshold_kwargs or {}))
+        self.action_predicate_delta = ACPRActionPredicateDelta(
+            dim=dim,
+            num_predicates=self.predicate_head.num_predicates,
+            action_dim=action_dim,
+            hidden_dim=int(actalign_kwargs.get("predicate_delta_hidden", 192)),
+            max_delta=float(actalign_kwargs.get("max_pred_delta", 0.05)),
+            detach_inputs=bool(actalign_kwargs.get("detach_predicate_delta_inputs", True)),
+        )
+        self.action_utility = ACPRActionUtility(
+            action_dim=action_dim,
+            max_r2a_delta=float(actalign_kwargs.get("max_r2a_delta", 0.20)),
+            max_pred_delta=float(actalign_kwargs.get("max_pred_delta", 0.05)),
+            initial_r2a_gate=float(actalign_kwargs.get("initial_r2a_gate", 0.0)),
+            initial_pred_gate=float(actalign_kwargs.get("initial_pred_gate", 0.0)),
+        )
 
     def forward(self, images: torch.Tensor, epoch: int = 0) -> dict[str, torch.Tensor | dict | tuple[int, int] | int]:
         field = self.dino(images)
@@ -76,6 +97,36 @@ class ACPROIAModel(nn.Module):
             logits_final_calibrated = legacy_calibrated["calibrated_logits"]
             temperature = legacy_calibrated["temperature"]
             calibration_bias = legacy_calibrated["calibration_bias"]
+        action_logits_fallback = action_logits_final_raw
+        if self.actalign_enabled:
+            pred_delta = self.action_predicate_delta(
+                action_nodes=trunk["label_nodes"][:, : self.action_dim],
+                predicate_probs=predicates["predicate_probs"],
+            )
+            utility = self.action_utility(
+                action_logits_fallback=action_logits_fallback,
+                action_visual_logits=trunk["action_visual_logits"],
+                action_reason_logits=trunk["action_reason_logits"],
+                predicate_action_delta=pred_delta["predicate_action_delta"],
+            )
+            action_logits_final_raw = utility["action_logits_utility"]
+            logits_final_raw = torch.cat([action_logits_final_raw, reason_logits_final_raw], dim=-1)
+        else:
+            zero_delta = torch.zeros_like(action_logits_fallback)
+            pred_delta = {
+                "predicate_action_delta_raw": zero_delta,
+                "predicate_action_delta": zero_delta,
+                "predicate_action_delta_abs_mean": zero_delta.abs().mean(),
+            }
+            utility = self.action_utility(
+                action_logits_fallback=action_logits_fallback,
+                action_visual_logits=trunk["action_visual_logits"],
+                action_reason_logits=trunk["action_reason_logits"],
+                predicate_action_delta=zero_delta,
+                override_r2a_gate=torch.zeros_like(self.action_utility.r2a_gate),
+                override_pred_gate=torch.zeros_like(self.action_utility.pred_gate),
+            )
+
         action_set = self.action_combo_aux(trunk["label_nodes"], action_logits_base)
         cardinality_logits = action_set["cardinality_logits"]
         reason_embeddings_for_pair = F.normalize(self.reason_pair_proj(trunk["label_nodes"][:, self.action_dim :]), dim=-1)
@@ -103,6 +154,17 @@ class ACPROIAModel(nn.Module):
             "threshold_prob": thresholded["threshold_prob"],
             "action_threshold_prob": thresholded["action_threshold_prob"],
             "reason_threshold_prob": thresholded["reason_threshold_prob"],
+            "action_logits_fallback": action_logits_fallback,
+            "action_logits_utility": utility["action_logits_utility"],
+            "action_logits_actalign": action_logits_final_raw,
+            "action_r2a_delta": utility["action_r2a_delta"],
+            "action_predicate_delta": utility["action_predicate_delta"],
+            "predicate_action_delta_raw": pred_delta["predicate_action_delta_raw"],
+            "r2a_gate": utility["r2a_gate"],
+            "pred_gate": utility["pred_gate"],
+            "r2a_delta_abs_mean": utility["r2a_delta_abs_mean"],
+            "pred_delta_abs_mean": utility["pred_delta_abs_mean"],
+            "action_utility_enabled": torch.tensor(float(self.actalign_enabled), device=images.device),
             "action_logits_final_raw": action_logits_final_raw,
             "reason_logits_final_raw": reason_logits_final_raw,
             "action_logits_calibrated": action_logits_final_calibrated,
@@ -123,6 +185,8 @@ class ACPROIAModel(nn.Module):
                 "direct": logits_base,
                 "direct_plus_predicate": logits_base,
                 "base_fixed": logits_base,
+                "fallback": torch.cat([action_logits_fallback, reason_logits_final_raw], dim=-1),
+                "utility": torch.cat([action_logits_final_raw, reason_logits_final_raw], dim=-1),
                 "deploy_fixed": logits_final_raw,
                 "raw": logits_final_raw,
                 "calibrated": logits_final_calibrated,

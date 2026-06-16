@@ -21,11 +21,16 @@ from fate_oia.models.acpr_reason_grammar import ACPRReasonGrammar
 from fate_oia.transforms import AspectRatioLetterboxTransform
 from fate_oia.losses import acpr_losses as L
 from fate_oia.losses import acpr_threshold_losses as TL
+from fate_oia.losses import acpr_action_utility_losses as UL
 from fate_oia.utils.acpr_artifacts import append_jsonl, json_safe, save_tensor, write_json
 from fate_oia.utils.acpr_pair_mining import pair_summary
 from fate_oia.utils.acpr_threshold_search import search_best_thresholds_for_f1
 from fate_oia.utils.acpr_thresholds import acpr_metric_views, standard_joint
 from fate_oia.utils.acpr_train_calib_split import make_train_calib_indices
+from fate_oia.utils.acpr_action_pareto_gate import ActionParetoGate
+from fate_oia.utils.acpr_action_gradient_guard import ACPRActionGradientGuard
+from fate_oia.utils.acpr_model_ema import ModelEMA
+from fate_oia.utils.acpr_swa_lite import SWALite
 
 
 def load_config(path: str) -> dict[str, Any]:
@@ -77,6 +82,8 @@ def build_model(cfg: dict, device: torch.device) -> ACPROIAModel:
             "tail_reason_indices": cfg.get("grammar", {}).get("tail_indices", [12, 9, 5, 14, 6, 11, 10, 13]),
             "use_group_shrinkage": bool(threshold_cfg.get("use_group_shrinkage", True)),
         },
+        actalign_enabled=bool(model_cfg.get("actalign_enabled", False) or cfg.get("actalign", {}).get("enabled", False)),
+        actalign_kwargs=cfg.get("actalign", {}),
     )
     return model.to(device)
 
@@ -93,10 +100,16 @@ def optimizer_for(model: ACPROIAModel, cfg: dict) -> torch.optim.Optimizer:
         {"params": list(model.action_combo_aux.parameters()), "lr": float(tr.get("lr_trunk", 2e-4)), "name": "combo"},
         {"params": list(model.calibration.parameters()), "lr": float(tr.get("lr_calibration", 5e-4)), "name": "calibration"},
     ]
+    if hasattr(model, "action_predicate_delta"):
+        groups.append({
+            "params": list(model.action_predicate_delta.parameters()),
+            "lr": float(tr.get("lr_action_utility", 2e-4)),
+            "name": "action_utility",
+        })
     if bool(threshold_cfg.get("enabled", False)):
         groups.append({
             "params": list(model.threshold_head.parameters()),
-            "lr": float(threshold_cfg.get("lr_threshold", 7e-4)),
+            "lr": float(threshold_cfg.get("lr_threshold", tr.get("lr_threshold", 7e-4))),
             "weight_decay": float(threshold_cfg.get("weight_decay_threshold", 0.0)),
             "name": "threshold",
         })
@@ -186,6 +199,20 @@ def collect_base_logits(model: ACPROIAModel, loader: DataLoader, device: torch.d
         action_labels.append(batch["action"].detach().cpu())
         reason_labels.append(batch["reason"].detach().cpu())
     return torch.cat(action_logits), torch.cat(reason_logits), torch.cat(action_labels), torch.cat(reason_labels)
+
+
+@torch.no_grad()
+def collect_action_utility_train_calib(model: ACPROIAModel, loader: DataLoader, device: torch.device, epoch: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    model.eval()
+    fallback_rows, r2a_rows, pred_rows, label_rows = [], [], [], []
+    for batch in loader:
+        batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
+        out = model(batch["image"], epoch=epoch)
+        fallback_rows.append(out["action_logits_fallback"].detach().cpu())
+        r2a_rows.append((out["action_logits_fallback"] + out["action_r2a_delta"]).detach().cpu())
+        pred_rows.append((out["action_logits_fallback"] + out["action_predicate_delta"]).detach().cpu())
+        label_rows.append(batch["action"].detach().cpu())
+    return torch.cat(fallback_rows), torch.cat(r2a_rows), torch.cat(pred_rows), torch.cat(label_rows)
 
 
 @torch.no_grad()
@@ -341,9 +368,13 @@ def compute_losses(out: dict, batch: dict, predicate_batch: dict, pairs: dict, g
     pair_logit, pair_logit_stats = L.matched_pair_logit_loss(out["reason_logits_base"], pairs, return_stats=True)
     pair_embed, pair_embed_stats = L.matched_pair_embedding_loss(out["reason_embeddings_for_pair"], pairs, return_stats=True)
     terms = {
+        "action_deploy": L.action_asl_loss(out["action_logits_final_raw"], action),
         "action_direct": L.action_asl_loss(out["action_logits_base"], action),
         "action_visual_aux": L.action_asl_loss(out["action_visual_logits"], action),
         "action_reason_aux": L.action_asl_loss(out["action_reason_logits"], action),
+        "action_utility": UL.action_utility_nonregression_loss(out["action_logits_utility"], out["action_logits_fallback"], action),
+        "action_delta_regularizer": UL.action_delta_regularizer(out["action_r2a_delta"], out["action_predicate_delta"]),
+        "action_gate_sparsity": UL.action_gate_sparsity_loss(out["r2a_gate"], out["pred_gate"]),
         "reason_partial": L.partial_label_reason_loss(out["reason_logits_base"], reason, out.get("predicate_reason_contradiction_score_by_label")),
         "reason_soft_f1": L.reason_soft_f1_loss(out["reason_logits_base"], reason),
         "predicate_weak": L.predicate_weak_bce_mil_loss(out["predicate_logits"], predicate_batch["predicate_targets"], predicate_batch["predicate_mask"], predicate_batch.get("predicate_reliability")),
@@ -370,6 +401,8 @@ def evaluate(model: ACPROIAModel, loader: DataLoader, device: torch.device, epoc
     reason_base = []
     action_logits = []
     reason_logits = []
+    action_fallback = []
+    action_utility = []
     action_cal = []
     reason_cal = []
     action_labels = []
@@ -387,6 +420,8 @@ def evaluate(model: ACPROIAModel, loader: DataLoader, device: torch.device, epoc
         reason_base.append(out["reason_logits_base"].cpu())
         action_logits.append(out["action_logits_final_raw"].cpu())
         reason_logits.append(out["reason_logits_final_raw"].cpu())
+        action_fallback.append(out["action_logits_fallback"].cpu())
+        action_utility.append(out["action_logits_utility"].cpu())
         action_cal.append(out["action_logits_final_calibrated"].cpu())
         reason_cal.append(out["reason_logits_final_calibrated"].cpu())
         action_labels.append(batch["action"].cpu())
@@ -401,6 +436,8 @@ def evaluate(model: ACPROIAModel, loader: DataLoader, device: torch.device, epoc
     rb = torch.cat(reason_base)
     al = torch.cat(action_logits)
     rl = torch.cat(reason_logits)
+    afb = torch.cat(action_fallback)
+    aut = torch.cat(action_utility)
     ac = torch.cat(action_cal)
     rc = torch.cat(reason_cal)
     ya = torch.cat(action_labels)
@@ -408,6 +445,9 @@ def evaluate(model: ACPROIAModel, loader: DataLoader, device: torch.device, epoc
     base_views = acpr_metric_views(ab, rb, ya, yr)
     views = acpr_metric_views(al, rl, ya, yr)
     cal_views = acpr_metric_views(ac, rc, ya, yr)
+    fallback_views = acpr_metric_views(afb, rl, ya, yr)
+    utility_views = acpr_metric_views(aut, rl, ya, yr)
+    action_primary_score = 0.80 * float(views["metrics_raw_fixed"].get("Act_mF1", 0.0)) + 0.20 * float(views["metrics_raw_fixed"].get("Exp_mF1", 0.0))
     metrics = {
         "primary_branch": "deploy_fixed" if getattr(model, "threshold_enabled", False) else "base_fixed",
         "metrics_base_fixed": base_views["metrics_raw_fixed"],
@@ -416,6 +456,15 @@ def evaluate(model: ACPROIAModel, loader: DataLoader, device: torch.device, epoc
         "metrics_test_oracle_global_threshold": views["metrics_global_threshold"],
         "metrics_test_oracle_per_label_threshold": views["metrics_per_label_threshold"],
         "metrics_calibrated": cal_views["metrics_raw_fixed"],
+        "metrics_fallback_fixed": fallback_views["metrics_raw_fixed"],
+        "metrics_utility_fixed": utility_views["metrics_raw_fixed"],
+        "action_primary_score": action_primary_score,
+        "Act_mF1_fallback": float(fallback_views["metrics_raw_fixed"].get("Act_mF1", 0.0)),
+        "Act_mF1_utility": float(utility_views["metrics_raw_fixed"].get("Act_mF1", 0.0)),
+        "Exp_mF1_fallback": float(fallback_views["metrics_raw_fixed"].get("Exp_mF1", 0.0)),
+        "Exp_mF1_utility": float(utility_views["metrics_raw_fixed"].get("Exp_mF1", 0.0)),
+        "r2a_gate_mean": float(getattr(model, "action_utility").r2a_gate.mean().detach().cpu()) if hasattr(model, "action_utility") else 0.0,
+        "pred_gate_mean": float(getattr(model, "action_utility").pred_gate.mean().detach().cpu()) if hasattr(model, "action_utility") else 0.0,
         "final_raw_joint": standard_joint(views["metrics_raw_fixed"]),
         "final_calibrated_joint": standard_joint(cal_views["metrics_raw_fixed"]),
         "base_fixed_joint": standard_joint(base_views["metrics_raw_fixed"]),
@@ -423,6 +472,8 @@ def evaluate(model: ACPROIAModel, loader: DataLoader, device: torch.device, epoc
     epoch_dir = out_dir / f"epoch_{epoch:03d}"
     save_tensor(epoch_dir / "logits_action_raw_test.pt", al)
     save_tensor(epoch_dir / "logits_reason_raw_test.pt", rl)
+    save_tensor(epoch_dir / "logits_action_fallback_test.pt", afb)
+    save_tensor(epoch_dir / "logits_action_utility_test.pt", aut)
     save_tensor(epoch_dir / "logits_action_base_test.pt", ab)
     save_tensor(epoch_dir / "logits_reason_base_test.pt", rb)
     save_tensor(epoch_dir / "logits_action_base_fixed_test.pt", ab)
@@ -462,8 +513,9 @@ def main() -> None:
     ap.add_argument("--test_only", action="store_true")
     ap.add_argument("--no_feature_cache", action="store_true")
     ap.add_argument("--require_no_token_compression", action="store_true")
-    ap.add_argument("--resume_checkpoint", default=None, help="Resume ACPR model weights from a previous checkpoint.")
+    ap.add_argument("--resume_checkpoint", "--resume", dest="resume_checkpoint", default=None, help="Resume ACPR model weights from a previous checkpoint.")
     ap.add_argument("--stop_after_epochs", type=int, default=None, help="Run only N epochs after start_epoch while preserving --epochs for LR scheduling.")
+    ap.add_argument("--freeze_trunk_for_action_utility_sanity", action="store_true", help="Freeze all modules except action utility and threshold head for sanity fine-tuning.")
     args = ap.parse_args()
     cfg = load_config(args.config)
     if cfg.get("best_selection_split") != "test" or cfg.get("eval_splits") != "test":
@@ -498,8 +550,8 @@ def main() -> None:
     })
     write_json(out_dir / "implementation_fingerprint.json", {
         "git_head": os.popen("git rev-parse HEAD").read().strip(),
-        "model": "ACPR-OIA V1 direct-image predicate contrast learning",
-        "final_action_source": "action_logits_direct",
+        "model": "ACPR-ActAlign V1.3 action-utility guarded reasoning",
+        "final_action_source": cfg.get("model", {}).get("final_action_source", "actalign_utility_deploy_fixed"),
         "feature_cache_enabled": False,
         "token_compression": "none",
         "eval_splits": "test",
@@ -561,6 +613,11 @@ def main() -> None:
             "reason_pos_rate": reason_rate.tolist(),
             "initial_threshold_prob": model.threshold_head.forward(torch.zeros(1, 4, device=device), torch.zeros(1, 21, device=device))["threshold_prob"].detach().cpu().tolist(),
         })
+    if args.freeze_trunk_for_action_utility_sanity:
+        for name, param in model.named_parameters():
+            keep = name.startswith("action_predicate_delta") or name.startswith("threshold_head")
+            param.requires_grad = bool(keep)
+        write_json(out_dir / "sanity_freeze_info.json", {"freeze_trunk_for_action_utility_sanity": True, "trainable_param_names": [n for n, p in model.named_parameters() if p.requires_grad]})
     opt = optimizer_for(model, cfg)
     warmup_epochs = int(tr.get("warmup_epochs", 2))
     min_lr = float(tr.get("min_lr", 1e-5))
@@ -575,6 +632,20 @@ def main() -> None:
     matrices = reason_predicate_matrices(grammar, model.predicate_head.names, device)
     weights = cfg.get("loss_weights", {})
     pair_cfg = cfg.get("pair_mining", {})
+    act_gate_cfg = cfg.get("action_pareto_gate", {})
+    action_gate = ActionParetoGate(
+        action_dim=4,
+        gate_ema=float(act_gate_cfg.get("gate_ema", 0.20)),
+        action_margin=float(act_gate_cfg.get("action_margin", 0.002)),
+        min_support=int(act_gate_cfg.get("min_support", 5)),
+    ) if bool(act_gate_cfg.get("enabled", False)) and hasattr(model, "action_utility") else None
+    grad_guard = ACPRActionGradientGuard(mode=cfg.get("gradient_guard", {}).get("mode", "log_only"))
+    ema_helper = ModelEMA(model, decay=float(cfg.get("ema", {}).get("decay", 0.995)), start_epoch=int(cfg.get("ema", {}).get("start_epoch", 3))) if bool(cfg.get("ema", {}).get("enabled", False)) else None
+    swa_helper = SWALite(top_k=int(cfg.get("swa_lite", {}).get("top_k", 5)), start_epoch=int(cfg.get("swa_lite", {}).get("start_epoch", 5))) if bool(cfg.get("swa_lite", {}).get("enabled", False)) else None
+    cooldown_state = {"active": False, "epoch": None, "patience_counter": 0, "best_train_calib_action_primary_score": -1.0}
+    best_action_primary = -1.0
+    best_action_primary_ema = -1.0
+    best_train_calib_action_primary = -1.0
     pair_thresholds = PairMiningThresholds(
         action_sim_min=float(pair_cfg.get("action_sim_min", pair_cfg.get("min_action_similarity", 0.35))),
         visual_sim_min=float(pair_cfg.get("visual_sim_min", pair_cfg.get("min_visual_similarity", 0.05))),
@@ -638,6 +709,8 @@ def main() -> None:
             if step % accum == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), float(tr.get("grad_clip", 1.0)))
                 opt.step()
+                if ema_helper is not None:
+                    ema_helper.update(model, epoch)
                 opt.zero_grad(set_to_none=True)
             global_step += 1
             if global_step % 200 == 0 or step == 1:
@@ -655,6 +728,10 @@ def main() -> None:
                     "active_pair_rate": active_pair_rate,
                     "reason_positive_rate": float(batch["reason"].mean().detach().cpu()),
                     "predicate_positive_rate": float(pred_batch["predicate_targets"].mean().detach().cpu()),
+                    "r2a_gate_mean": float(out["r2a_gate"].mean().detach().cpu()) if torch.is_tensor(out.get("r2a_gate")) else 0.0,
+                    "pred_gate_mean": float(out["pred_gate"].mean().detach().cpu()) if torch.is_tensor(out.get("pred_gate")) else 0.0,
+                    "r2a_delta_abs_mean": float(out["r2a_delta_abs_mean"].detach().cpu()) if torch.is_tensor(out.get("r2a_delta_abs_mean")) else 0.0,
+                    "pred_delta_abs_mean": float(out["pred_delta_abs_mean"].detach().cpu()) if torch.is_tensor(out.get("pred_delta_abs_mean")) else 0.0,
                     "gpu_peak_memory_gb": float(torch.cuda.max_memory_allocated() / (1024**3)) if torch.cuda.is_available() else 0.0,
                 }
                 print(json.dumps(payload), flush=True)
@@ -672,6 +749,17 @@ def main() -> None:
         if bool(threshold_cfg.get("enabled", False)) and train_calib_loader is not None and epoch >= int(threshold_cfg.get("teacher_update_start_epoch", 2)):
             if (epoch - int(threshold_cfg.get("teacher_update_start_epoch", 2))) % int(threshold_cfg.get("teacher_update_every", 1)) == 0:
                 update_threshold_teacher_from_train_calib(model, train_calib_loader, device, epoch, cfg, out_dir)
+        gate_stats = {"available": False, "source": "train_calib_only"}
+        train_calib_action_primary = None
+        if action_gate is not None and train_calib_loader is not None:
+            fb_logits, r2a_logits, pred_logits, action_targets = collect_action_utility_train_calib(model, train_calib_loader, device, epoch)
+            gate_stats = action_gate.update(fb_logits, r2a_logits, pred_logits, action_targets)
+            model.action_utility.set_gates(action_gate.r2a_gate.to(device), action_gate.pred_gate.to(device))
+            fb_views = acpr_metric_views(fb_logits, fb_logits.new_zeros((fb_logits.shape[0], 21)), action_targets, fb_logits.new_zeros((fb_logits.shape[0], 21)))
+            r2a_views = acpr_metric_views(r2a_logits, r2a_logits.new_zeros((r2a_logits.shape[0], 21)), action_targets, r2a_logits.new_zeros((r2a_logits.shape[0], 21)))
+            pred_views = acpr_metric_views(pred_logits, pred_logits.new_zeros((pred_logits.shape[0], 21)), action_targets, pred_logits.new_zeros((pred_logits.shape[0], 21)))
+            train_calib_action_primary = max(float(r2a_views["metrics_raw_fixed"].get("Act_mF1", 0.0)), float(pred_views["metrics_raw_fixed"].get("Act_mF1", 0.0)))
+            append_jsonl(out_dir / "action_utility_gates.jsonl", {"epoch": epoch, **json_safe(gate_stats), "train_calib_action_primary_score": train_calib_action_primary})
         metrics = evaluate(model, test_loader, device, epoch, out_dir)
         row = {"event": "acpr_epoch", "epoch": epoch, **metrics}
         print(json.dumps(json_safe(row)), flush=True)
@@ -681,6 +769,8 @@ def main() -> None:
             "direct": metrics.get("metrics_base_fixed", metrics["metrics_raw_fixed"]),
             "direct_plus_predicate": metrics.get("metrics_base_fixed", metrics["metrics_raw_fixed"]),
             "base_fixed": metrics.get("metrics_base_fixed", metrics["metrics_raw_fixed"]),
+            "fallback": metrics.get("metrics_fallback_fixed", metrics["metrics_raw_fixed"]),
+            "utility": metrics.get("metrics_utility_fixed", metrics["metrics_raw_fixed"]),
             "deploy_fixed": metrics["metrics_raw_fixed"],
             "raw": metrics["metrics_raw_fixed"],
             "calibrated": metrics["metrics_calibrated"],
@@ -713,6 +803,25 @@ def main() -> None:
             "deploy_fixed_joint": metrics.get("final_raw_joint"),
             "primary_branch": metrics.get("primary_branch"),
         })
+        append_jsonl(epoch_dir / "action_utility_metrics.jsonl", {
+            "epoch": epoch,
+            "split": "test",
+            "Act_mF1_fallback": metrics.get("Act_mF1_fallback"),
+            "Act_mF1_utility": metrics.get("Act_mF1_utility"),
+            "Act_mF1_ema": None,
+            "Act_mF1_swa": None,
+            "Exp_mF1_fallback": metrics.get("Exp_mF1_fallback"),
+            "Exp_mF1_utility": metrics.get("Exp_mF1_utility"),
+            "Exp_mF1_ema": None,
+            "action_primary_score_utility": metrics.get("action_primary_score"),
+            "action_primary_score_ema": None,
+            "all_high_rate": metrics["metrics_raw_fixed"].get("all_high_rate"),
+            "superset_rate": metrics["metrics_raw_fixed"].get("superset_pred_rate"),
+        })
+        append_jsonl(epoch_dir / "action_utility_gates.jsonl", {"epoch": epoch, **json_safe(gate_stats), "r2a_gate": json_safe(model.action_utility.r2a_gate.detach().cpu()) if hasattr(model, "action_utility") else [], "pred_gate": json_safe(model.action_utility.pred_gate.detach().cpu()) if hasattr(model, "action_utility") else []})
+        append_jsonl(epoch_dir / "gradient_guard_stats.jsonl", grad_guard.stats(epoch=epoch, step=global_step))
+        append_jsonl(epoch_dir / "cooldown_stats.jsonl", {"epoch": epoch, **cooldown_state})
+        append_jsonl(epoch_dir / "ema_swa_metrics.jsonl", {"epoch": epoch, "ema_available": ema_helper is not None and ema_helper.available, "swa_available": swa_helper is not None and swa_helper.available, "deploy_fixed_online": metrics["metrics_raw_fixed"], "deploy_fixed_ema": None, "deploy_fixed_swa": None, "action_primary_score_online": metrics.get("action_primary_score"), "action_primary_score_ema": None, "action_primary_score_swa": None})
         append_jsonl(epoch_dir / "threshold_stats.jsonl", {
             "available": bool(threshold_cfg.get("enabled", False)),
             "threshold_prob": json_safe(out.get("threshold_prob", torch.empty(0)).detach().cpu()) if torch.is_tensor(out.get("threshold_prob")) else [],
@@ -771,6 +880,11 @@ def main() -> None:
             "epoch": epoch,
             "metrics": metrics,
             "base_lrs": [group.get("base_lr", group["lr"]) for group in opt.param_groups],
+            "action_pareto_gate": action_gate.state_dict() if action_gate is not None else None,
+            "ema": ema_helper.state_dict() if ema_helper is not None else None,
+            "swa_lite": swa_helper.state_dict() if swa_helper is not None else None,
+            "cooldown_state": cooldown_state,
+            "train_calib_action_primary_score": train_calib_action_primary,
         }
         torch.save(ckpt, out_dir / "checkpoint_latest.pth")
         raw = float(metrics["final_raw_joint"])
@@ -778,10 +892,15 @@ def main() -> None:
         cal = float(metrics["final_calibrated_joint"])
         exp = float(metrics["metrics_raw_fixed"].get("Exp_mF1", 0.0))
         mp = float(metrics["metrics_raw_fixed"].get("Exp_mAP", 0.0))
+        action_primary = float(metrics.get("action_primary_score", 0.0))
         act = float(metrics["metrics_raw_fixed"].get("Act_mF1", 0.0))
         per_reason = metrics["metrics_raw_fixed"].get("per_reason_F1", [])
         tail_vals = [float(per_reason[i]) for i in grammar.tail_indices if isinstance(per_reason, list) and i < len(per_reason)]
         tail_mf1 = sum(tail_vals) / max(len(tail_vals), 1)
+        if action_primary >= best_action_primary:
+            best_action_primary = action_primary; torch.save(ckpt, out_dir / "checkpoint_best_test_action_primary.pth")
+        if train_calib_action_primary is not None and float(train_calib_action_primary) >= best_train_calib_action_primary:
+            best_train_calib_action_primary = float(train_calib_action_primary); torch.save(ckpt, out_dir / "checkpoint_best_train_calib_action_primary.pth")
         if raw >= best_raw:
             best_raw = raw
             torch.save(ckpt, out_dir / "checkpoint_best_test_final_raw.pth")
@@ -798,7 +917,7 @@ def main() -> None:
             best_act = act; torch.save(ckpt, out_dir / "checkpoint_best_test_action_mf1.pth")
         if tail_mf1 >= best_tail:
             best_tail = tail_mf1; torch.save(ckpt, out_dir / "checkpoint_best_test_tail_mf1.pth")
-    write_json(out_dir / "GOAL_COMPLETED_ACPR_OIA_V1.json", {"complete": True, "epochs": epochs, "best_final_raw_joint": best_raw})
+    write_json(out_dir / "GOAL_COMPLETED_ACPR_ACTALIGN_V1_3.json", {"complete": True, "epochs": epochs, "best_final_raw_joint": best_raw, "best_action_primary_score": best_action_primary})
 
 
 if __name__ == "__main__":
