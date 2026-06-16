@@ -112,6 +112,26 @@ def scheduler_for(optimizer: torch.optim.Optimizer, total_epochs: int, warmup_ep
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=fn)
 
 
+def lr_multiplier_for_epoch(epoch: int, total_epochs: int, warmup_epochs: int, min_lr: float) -> float:
+    """Absolute-epoch warmup/cosine multiplier for checkpoint continuation.
+
+    Early ACPR-CalAlign checkpoints saved only model/epoch/metrics. When we
+    continue from those checkpoints, this prevents the LR from restarting at
+    warmup/base LR after loading model weights.
+    """
+    if epoch < warmup_epochs:
+        return max((epoch + 1) / max(warmup_epochs, 1), min_lr)
+    progress = (epoch - warmup_epochs) / max(total_epochs - warmup_epochs, 1)
+    return min_lr + (1 - min_lr) * 0.5 * (1 + math.cos(math.pi * progress))
+
+
+def set_epoch_lrs(optimizer: torch.optim.Optimizer, epoch: int, total_epochs: int, warmup_epochs: int, min_lr: float) -> None:
+    mult = lr_multiplier_for_epoch(epoch, total_epochs, warmup_epochs, min_lr)
+    for group in optimizer.param_groups:
+        base_lr = group.setdefault("base_lr", group["lr"])
+        group["lr"] = base_lr * mult
+
+
 def reason_predicate_matrices(grammar: ACPRReasonGrammar, predicate_names: list[str], device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
     pos, neg = grammar.reason_predicate_matrix(predicate_names)
     return torch.tensor(pos, dtype=torch.float32, device=device), torch.tensor(neg, dtype=torch.float32, device=device)
@@ -442,6 +462,7 @@ def main() -> None:
     ap.add_argument("--test_only", action="store_true")
     ap.add_argument("--no_feature_cache", action="store_true")
     ap.add_argument("--require_no_token_compression", action="store_true")
+    ap.add_argument("--resume_checkpoint", default=None, help="Resume ACPR model weights from a previous checkpoint.")
     args = ap.parse_args()
     cfg = load_config(args.config)
     if cfg.get("best_selection_split") != "test" or cfg.get("eval_splits") != "test":
@@ -472,6 +493,7 @@ def main() -> None:
         "effective_batch": batch_size * accum,
         "reference_effective_batch": tr.get("reference_effective_batch", 32),
         "loss_weights": cfg.get("loss_weights", {}),
+        "resume_checkpoint": args.resume_checkpoint,
     })
     write_json(out_dir / "implementation_fingerprint.json", {
         "git_head": os.popen("git rev-parse HEAD").read().strip(),
@@ -506,7 +528,25 @@ def main() -> None:
         train_loader = make_loader(cfg, "train", batch_size, args.max_train_samples, True, args.num_workers)
     test_loader = make_loader(cfg, "test", batch_size, args.max_test_samples, False, args.num_workers)
     model = build_model(cfg, device)
-    if bool(threshold_cfg.get("enabled", False)):
+    resume_ckpt = None
+    start_epoch = 0
+    if args.resume_checkpoint:
+        resume_path = Path(args.resume_checkpoint)
+        resume_ckpt = torch.load(resume_path, map_location=device)
+        state = resume_ckpt.get("model", resume_ckpt)
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        start_epoch = int(resume_ckpt.get("epoch", -1)) + 1
+        write_json(out_dir / "resume_info.json", {
+            "resume_checkpoint": str(resume_path),
+            "checkpoint_epoch": int(resume_ckpt.get("epoch", -1)),
+            "start_epoch": start_epoch,
+            "optimizer_state_restored": bool("optimizer" in resume_ckpt),
+            "scheduler_state_restored": False,
+            "resume_mode": "model_weights_plus_absolute_epoch_lr",
+            "missing_keys": list(missing),
+            "unexpected_keys": list(unexpected),
+        })
+    if bool(threshold_cfg.get("enabled", False)) and not args.resume_checkpoint:
         init_ds = train_dataset if train_calib_indices is None else Subset(train_dataset, train_calib_indices)
         action_rate, reason_rate = dataset_label_rates(init_ds)
         model.threshold_head.initialize_from_label_stats(action_rate.to(device), reason_rate.to(device), cfg.get("grammar", {}).get("tail_indices"))
@@ -520,7 +560,14 @@ def main() -> None:
             "initial_threshold_prob": model.threshold_head.forward(torch.zeros(1, 4, device=device), torch.zeros(1, 21, device=device))["threshold_prob"].detach().cpu().tolist(),
         })
     opt = optimizer_for(model, cfg)
-    sched = scheduler_for(opt, epochs, int(tr.get("warmup_epochs", 2)), float(tr.get("min_lr", 1e-5)))
+    warmup_epochs = int(tr.get("warmup_epochs", 2))
+    min_lr = float(tr.get("min_lr", 1e-5))
+    for group in opt.param_groups:
+        group.setdefault("base_lr", group["lr"])
+    if resume_ckpt is not None and "optimizer" in resume_ckpt:
+        opt.load_state_dict(resume_ckpt["optimizer"])
+        for group in opt.param_groups:
+            group.setdefault("base_lr", group["lr"])
     grammar = ACPRReasonGrammar(cfg.get("grammar", {}).get("path", "configs/acpr_reason_predicate_grammar.yaml"))
     target_builder = WeakPredicateTargetBuilder(cfg.get("predicate", {}).get("scene_config", "configs/acpr_scene_predicates.yaml"), cfg.get("bdd100k_root"))
     matrices = reason_predicate_matrices(grammar, model.predicate_head.names, device)
@@ -546,7 +593,8 @@ def main() -> None:
     best_act = -1.0
     best_tail = -1.0
     global_step = 0
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
+        set_epoch_lrs(opt, epoch, epochs, warmup_epochs, min_lr)
         model.train()
         opt.zero_grad(set_to_none=True)
         for step, batch in enumerate(train_loader, start=1):
@@ -619,7 +667,6 @@ def main() -> None:
         if bool(threshold_cfg.get("enabled", False)) and train_calib_loader is not None and epoch >= int(threshold_cfg.get("teacher_update_start_epoch", 2)):
             if (epoch - int(threshold_cfg.get("teacher_update_start_epoch", 2))) % int(threshold_cfg.get("teacher_update_every", 1)) == 0:
                 update_threshold_teacher_from_train_calib(model, train_calib_loader, device, epoch, cfg, out_dir)
-        sched.step()
         metrics = evaluate(model, test_loader, device, epoch, out_dir)
         row = {"event": "acpr_epoch", "epoch": epoch, **metrics}
         print(json.dumps(json_safe(row)), flush=True)
@@ -713,7 +760,13 @@ def main() -> None:
         append_jsonl(epoch_dir / "pair_cases_test.jsonl", pair_case)
         append_jsonl(epoch_dir / "failure_cases.jsonl", {"available": True, "file_count": len(metrics)})
         append_jsonl(epoch_dir / "gpu_memory.jsonl", {"peak_gb": float(torch.cuda.max_memory_allocated() / (1024**3)) if torch.cuda.is_available() else 0.0})
-        ckpt = {"model": model.state_dict(), "epoch": epoch, "metrics": metrics}
+        ckpt = {
+            "model": model.state_dict(),
+            "optimizer": opt.state_dict(),
+            "epoch": epoch,
+            "metrics": metrics,
+            "base_lrs": [group.get("base_lr", group["lr"]) for group in opt.param_groups],
+        }
         torch.save(ckpt, out_dir / "checkpoint_latest.pth")
         raw = float(metrics["final_raw_joint"])
         base = float(metrics.get("base_fixed_joint", raw))
