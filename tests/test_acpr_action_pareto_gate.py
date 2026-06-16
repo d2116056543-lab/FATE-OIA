@@ -13,6 +13,8 @@ def test_action_pareto_gate_opens_only_improved_supported_label():
     stats = g.update(base, r2a, pred, labels)
     assert g.r2a_gate.tolist() == [0.0, 0.0, 1.0, 0.0]
     assert stats["source"] == "train_calib_only"
+    assert "F1_base_per_action" in stats
+    assert "r2a_loss_improvement" not in stats
 
 
 def test_action_pareto_gate_low_support_stays_closed():
@@ -22,3 +24,16 @@ def test_action_pareto_gate_low_support_stays_closed():
     cand = base.clone(); cand[0, 1] = 5
     g.update(base, cand, cand, labels)
     assert g.r2a_gate[1].item() == 0.0
+
+
+def test_action_pareto_gate_hurt_closes_existing_gate():
+    g = ActionParetoGate(action_dim=4, gate_ema=1.0, action_margin=0.001, min_support=2)
+    g.r2a_gate[0] = 1.0
+    labels = torch.zeros(6, 4)
+    labels[:3, 0] = 1
+    base = torch.zeros(6, 4)
+    base[:3, 0] = 4
+    base[3:, 0] = -4
+    hurt = -base
+    g.update(base, hurt, base, labels)
+    assert g.r2a_gate[0].item() == 0.0

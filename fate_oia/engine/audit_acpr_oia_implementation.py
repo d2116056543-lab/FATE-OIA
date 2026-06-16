@@ -243,6 +243,8 @@ def main() -> None:
         train_text = Path("fate_oia/engine/train_acpr_oia.py").read_text(encoding="utf-8")
         utility_text = Path("fate_oia/models/acpr_action_utility.py").read_text(encoding="utf-8")
         pred_text = Path("fate_oia/models/acpr_action_predicate_delta.py").read_text(encoding="utf-8")
+        gate_text = Path("fate_oia/utils/acpr_action_pareto_gate.py").read_text(encoding="utf-8")
+        guard_text = Path("fate_oia/utils/acpr_action_gradient_guard.py").read_text(encoding="utf-8")
         checks["actalign_forbidden_arch_absent"] = not any(x in model_text + train_text for x in ["MoE", "specialist", "selector_primary", "graph_delta_to_logits=True", "action_set_probs @"])
         checks["actalign_config_protocol"] = (
             cfg.get("model", {}).get("action_set_affects_final_action") is False
@@ -279,6 +281,10 @@ def main() -> None:
         gate_stats = gate.update(base_logits, r2a_logits, base_logits, labels)
         checks["actalign_gate_train_calib_only"] = gate_stats.get("source") == "train_calib_only" and gate.r2a_gate[0].item() == 1.0
         checks["actalign_artifact_writers"] = all(t in train_text for t in ["action_utility_metrics.jsonl", "action_utility_gates.jsonl", "gradient_guard_stats.jsonl", "cooldown_stats.jsonl", "ema_swa_metrics.jsonl", "checkpoint_best_test_action_primary.pth"])
+        checks["actalign_gate_uses_f1_not_bce"] = all(t in gate_text for t in ["_binary_f1_per_label", "F1_base_per_action", "F1_r2a_candidate_per_action", "delta_r2a_per_action"]) and "binary_cross_entropy" not in gate_text
+        checks["actalign_gradient_guard_projects_in_trainer"] = all(t in guard_text for t in ["capture_action_grads", "project_model_grads", "param.grad.copy_"]) and all(t in train_text for t in ["grad_guard.capture_action_grads", "grad_guard.project_model_grads"])
+        checks["actalign_ema_swa_real_eval"] = all(t in train_text for t in ["evaluate_shadow_model", "average_parameters", "averaged_parameters", "swa_helper.consider", "metrics_ema", "metrics_swa", "checkpoint_best_test_action_primary_ema.pth"]) and '"deploy_fixed_ema": None' not in train_text
+        checks["actalign_cooldown_changes_lr_and_weights"] = all(t in train_text for t in ["update_cooldown_state", "cooldown_multiplier", "weights[\"action_deploy\"]", "lr_multiplier_threshold", "action_visual_aux_bonus"])
     pass_all = not missing and all(checks.values())
     result = {
         "pass": pass_all,

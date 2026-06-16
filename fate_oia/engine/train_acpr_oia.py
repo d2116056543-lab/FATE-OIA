@@ -142,7 +142,8 @@ def set_epoch_lrs(optimizer: torch.optim.Optimizer, epoch: int, total_epochs: in
     mult = lr_multiplier_for_epoch(epoch, total_epochs, warmup_epochs, min_lr)
     for group in optimizer.param_groups:
         base_lr = group.setdefault("base_lr", group["lr"])
-        group["lr"] = base_lr * mult
+        cooldown_mult = float(group.get("cooldown_multiplier", 1.0))
+        group["lr"] = base_lr * mult * cooldown_mult
 
 
 def reason_predicate_matrices(grammar: ACPRReasonGrammar, predicate_names: list[str], device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
@@ -499,6 +500,77 @@ def evaluate(model: ACPROIAModel, loader: DataLoader, device: torch.device, epoc
     return metrics
 
 
+def _action_primary_score(metrics_view: dict) -> float:
+    return 0.80 * float(metrics_view.get("Act_mF1", 0.0)) + 0.20 * float(metrics_view.get("Exp_mF1", 0.0))
+
+
+def evaluate_shadow_model(model: ACPROIAModel, helper: Any, kind: str, loader: DataLoader, device: torch.device, epoch: int, out_dir: Path) -> tuple[dict | None, dict[str, torch.Tensor] | None]:
+    if helper is None or not getattr(helper, "available", False):
+        return None, None
+    context = helper.average_parameters if hasattr(helper, "average_parameters") else helper.averaged_parameters
+    with context(model):
+        metrics = evaluate(model, loader, device, epoch, out_dir / f"{kind}_eval")
+        state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    return metrics, state
+
+
+def update_cooldown_state(cooldown_state: dict, score: float | None, cfg: dict, optimizer: torch.optim.Optimizer, weights: dict, epoch: int) -> dict:
+    cd = cfg.get("cooldown", {})
+    if not bool(cd.get("enabled", False)) or score is None:
+        cooldown_state.setdefault("lr_multipliers", {})
+        cooldown_state.setdefault("loss_weight_multipliers", {})
+        return cooldown_state
+    score = float(score)
+    if score > float(cooldown_state.get("best_train_calib_action_primary_score", -1.0)) + 1e-8:
+        cooldown_state["best_train_calib_action_primary_score"] = score
+        cooldown_state["patience_counter"] = 0
+    else:
+        cooldown_state["patience_counter"] = int(cooldown_state.get("patience_counter", 0)) + 1
+    patience = int(cd.get("patience", 2))
+    if cooldown_state.get("active", False) or cooldown_state["patience_counter"] < patience:
+        cooldown_state.setdefault("lr_multipliers", {})
+        cooldown_state.setdefault("loss_weight_multipliers", {})
+        return cooldown_state
+
+    lr_mults = {
+        "trunk": float(cd.get("lr_multiplier_trunk", 0.25)),
+        "predicate": float(cd.get("lr_multiplier_predicate", 0.25)),
+        "reason_predicate": float(cd.get("lr_multiplier_predicate", 0.25)),
+        "pair_projection": float(cd.get("lr_multiplier_pair", 0.25)),
+        "reason_pair_projection": float(cd.get("lr_multiplier_pair", 0.25)),
+        "action_utility": float(cd.get("lr_multiplier_predicate", 0.25)),
+        "threshold": float(cd.get("lr_multiplier_threshold", 0.50)),
+    }
+    for group in optimizer.param_groups:
+        name = str(group.get("name", ""))
+        group["cooldown_multiplier"] = float(lr_mults.get(name, group.get("cooldown_multiplier", 1.0)))
+
+    loss_mults = {
+        "matched_pair_logit": float(cd.get("pair_weight_multiplier", 0.50)),
+        "matched_pair_embed": float(cd.get("pair_weight_multiplier", 0.50)),
+        "predicate_reason_align": float(cd.get("predicate_reason_align_multiplier", 0.50)),
+        "reason_soft_f1": float(cd.get("reason_soft_f1_multiplier", 0.50)),
+    }
+    for key, mult in loss_mults.items():
+        if key in weights:
+            weights[key] = float(weights[key]) * mult
+    weights["action_deploy"] = float(weights.get("action_deploy", 1.20)) + float(cd.get("action_deploy_bonus", 0.20))
+    weights["action_visual_aux"] = float(weights.get("action_visual_aux", 0.15)) + float(cd.get("action_visual_aux_bonus", 0.05))
+    weights["action_reason_aux"] = float(weights.get("action_reason_aux", 0.08)) + float(cd.get("action_reason_aux_bonus", 0.03))
+
+    cooldown_state.update({
+        "active": True,
+        "epoch": epoch,
+        "trigger_metric": score,
+        "lr_multipliers": lr_mults,
+        "loss_weight_multipliers": loss_mults,
+        "action_deploy_bonus": float(cd.get("action_deploy_bonus", 0.20)),
+        "action_visual_aux_bonus": float(cd.get("action_visual_aux_bonus", 0.05)),
+        "action_reason_aux_bonus": float(cd.get("action_reason_aux_bonus", 0.03)),
+    })
+    return cooldown_state
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
@@ -641,7 +713,20 @@ def main() -> None:
         action_margin=float(act_gate_cfg.get("action_margin", 0.002)),
         min_support=int(act_gate_cfg.get("min_support", 5)),
     ) if bool(act_gate_cfg.get("enabled", False)) and hasattr(model, "action_utility") else None
-    grad_guard = ACPRActionGradientGuard(mode=cfg.get("gradient_guard", {}).get("mode", "log_only"))
+    gg_cfg = cfg.get("gradient_guard", {})
+    grad_guard = ACPRActionGradientGuard(
+        mode=gg_cfg.get("mode", "log_only"),
+        project_after_epoch=int(gg_cfg.get("project_after_epoch", 3)),
+        every_n_steps=int(gg_cfg.get("every_n_steps", 8)),
+    )
+    shared_patterns = [str(x) for x in gg_cfg.get("shared_param_patterns", [])]
+    if not shared_patterns:
+        shared_patterns = ["trunk", "predicate_reason", "reason_pair_proj", "threshold_head", "action_predicate_delta"]
+    shared_named_params = [
+        (name, param)
+        for name, param in model.named_parameters()
+        if param.requires_grad and any(pattern in name for pattern in shared_patterns)
+    ]
     ema_helper = ModelEMA(model, decay=float(cfg.get("ema", {}).get("decay", 0.995)), start_epoch=int(cfg.get("ema", {}).get("start_epoch", 3))) if bool(cfg.get("ema", {}).get("enabled", False)) else None
     swa_helper = SWALite(top_k=int(cfg.get("swa_lite", {}).get("top_k", 5)), start_epoch=int(cfg.get("swa_lite", {}).get("start_epoch", 5))) if bool(cfg.get("swa_lite", {}).get("enabled", False)) else None
     cooldown_state = {"active": False, "epoch": None, "patience_counter": 0, "best_train_calib_action_primary_score": -1.0}
@@ -707,8 +792,16 @@ def main() -> None:
             threshold_loss, threshold_parts = compute_threshold_losses(model, out, batch, cfg, epoch)
             loss = loss + threshold_loss
             parts.update(threshold_parts)
+            current_global_step = global_step + 1
+            will_step_optimizer = step % accum == 0
+            action_guard_grads = None
+            if will_step_optimizer and shared_named_params and grad_guard.should_run(epoch, current_global_step):
+                action_anchor_loss = L.action_asl_loss(out["action_logits_final_raw"], batch["action"]) / accum
+                action_guard_grads = grad_guard.capture_action_grads(action_anchor_loss, [p for _, p in shared_named_params])
             (loss / accum).backward()
             if step % accum == 0:
+                if action_guard_grads is not None:
+                    grad_guard.project_model_grads(shared_named_params, action_guard_grads, epoch=epoch, step=current_global_step)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), float(tr.get("grad_clip", 1.0)))
                 opt.step()
                 if ema_helper is not None:
@@ -735,6 +828,7 @@ def main() -> None:
                     "r2a_delta_abs_mean": float(out["r2a_delta_abs_mean"].detach().cpu()) if torch.is_tensor(out.get("r2a_delta_abs_mean")) else 0.0,
                     "pred_delta_abs_mean": float(out["pred_delta_abs_mean"].detach().cpu()) if torch.is_tensor(out.get("pred_delta_abs_mean")) else 0.0,
                     "gpu_peak_memory_gb": float(torch.cuda.max_memory_allocated() / (1024**3)) if torch.cuda.is_available() else 0.0,
+                    **{f"grad_guard_{k}": v for k, v in grad_guard.stats(epoch=epoch, step=current_global_step).items() if isinstance(v, (int, float, bool, str))},
                 }
                 print(json.dumps(payload), flush=True)
                 append_jsonl(out_dir / "loss_components.jsonl", payload)
@@ -762,7 +856,32 @@ def main() -> None:
             pred_views = acpr_metric_views(pred_logits, pred_logits.new_zeros((pred_logits.shape[0], 21)), action_targets, pred_logits.new_zeros((pred_logits.shape[0], 21)))
             train_calib_action_primary = max(float(r2a_views["metrics_raw_fixed"].get("Act_mF1", 0.0)), float(pred_views["metrics_raw_fixed"].get("Act_mF1", 0.0)))
             append_jsonl(out_dir / "action_utility_gates.jsonl", {"epoch": epoch, **json_safe(gate_stats), "train_calib_action_primary_score": train_calib_action_primary})
+        cooldown_state = update_cooldown_state(cooldown_state, train_calib_action_primary, cfg, opt, weights, epoch)
         metrics = evaluate(model, test_loader, device, epoch, out_dir)
+        ema_metrics, ema_model_state = evaluate_shadow_model(model, ema_helper, "ema", test_loader, device, epoch, out_dir)
+        if swa_helper is not None:
+            swa_helper.consider(model, float(train_calib_action_primary if train_calib_action_primary is not None else metrics.get("action_primary_score", 0.0)), epoch)
+        swa_metrics, _swa_model_state = evaluate_shadow_model(model, swa_helper, "swa", test_loader, device, epoch, out_dir)
+        if ema_metrics is not None:
+            metrics["metrics_ema"] = ema_metrics["metrics_raw_fixed"]
+            metrics["Act_mF1_ema"] = float(ema_metrics["metrics_raw_fixed"].get("Act_mF1", 0.0))
+            metrics["Exp_mF1_ema"] = float(ema_metrics["metrics_raw_fixed"].get("Exp_mF1", 0.0))
+            metrics["action_primary_score_ema"] = _action_primary_score(ema_metrics["metrics_raw_fixed"])
+        else:
+            metrics["metrics_ema"] = None
+            metrics["Act_mF1_ema"] = None
+            metrics["Exp_mF1_ema"] = None
+            metrics["action_primary_score_ema"] = None
+        if swa_metrics is not None:
+            metrics["metrics_swa"] = swa_metrics["metrics_raw_fixed"]
+            metrics["Act_mF1_swa"] = float(swa_metrics["metrics_raw_fixed"].get("Act_mF1", 0.0))
+            metrics["Exp_mF1_swa"] = float(swa_metrics["metrics_raw_fixed"].get("Exp_mF1", 0.0))
+            metrics["action_primary_score_swa"] = _action_primary_score(swa_metrics["metrics_raw_fixed"])
+        else:
+            metrics["metrics_swa"] = None
+            metrics["Act_mF1_swa"] = None
+            metrics["Exp_mF1_swa"] = None
+            metrics["action_primary_score_swa"] = None
         row = {"event": "acpr_epoch", "epoch": epoch, **metrics}
         print(json.dumps(json_safe(row)), flush=True)
         append_jsonl(out_dir / "metrics_summary.jsonl", json_safe(row))
@@ -810,20 +929,21 @@ def main() -> None:
             "split": "test",
             "Act_mF1_fallback": metrics.get("Act_mF1_fallback"),
             "Act_mF1_utility": metrics.get("Act_mF1_utility"),
-            "Act_mF1_ema": None,
-            "Act_mF1_swa": None,
+            "Act_mF1_ema": metrics.get("Act_mF1_ema"),
+            "Act_mF1_swa": metrics.get("Act_mF1_swa"),
             "Exp_mF1_fallback": metrics.get("Exp_mF1_fallback"),
             "Exp_mF1_utility": metrics.get("Exp_mF1_utility"),
-            "Exp_mF1_ema": None,
+            "Exp_mF1_ema": metrics.get("Exp_mF1_ema"),
             "action_primary_score_utility": metrics.get("action_primary_score"),
-            "action_primary_score_ema": None,
+            "action_primary_score_ema": metrics.get("action_primary_score_ema"),
+            "action_primary_score_swa": metrics.get("action_primary_score_swa"),
             "all_high_rate": metrics["metrics_raw_fixed"].get("all_high_rate"),
             "superset_rate": metrics["metrics_raw_fixed"].get("superset_pred_rate"),
         })
         append_jsonl(epoch_dir / "action_utility_gates.jsonl", {"epoch": epoch, **json_safe(gate_stats), "r2a_gate": json_safe(model.action_utility.r2a_gate.detach().cpu()) if hasattr(model, "action_utility") else [], "pred_gate": json_safe(model.action_utility.pred_gate.detach().cpu()) if hasattr(model, "action_utility") else []})
         append_jsonl(epoch_dir / "gradient_guard_stats.jsonl", grad_guard.stats(epoch=epoch, step=global_step))
         append_jsonl(epoch_dir / "cooldown_stats.jsonl", {"epoch": epoch, **cooldown_state})
-        append_jsonl(epoch_dir / "ema_swa_metrics.jsonl", {"epoch": epoch, "ema_available": ema_helper is not None and ema_helper.available, "swa_available": swa_helper is not None and swa_helper.available, "deploy_fixed_online": metrics["metrics_raw_fixed"], "deploy_fixed_ema": None, "deploy_fixed_swa": None, "action_primary_score_online": metrics.get("action_primary_score"), "action_primary_score_ema": None, "action_primary_score_swa": None})
+        append_jsonl(epoch_dir / "ema_swa_metrics.jsonl", {"epoch": epoch, "ema_available": ema_helper is not None and ema_helper.available, "swa_available": swa_helper is not None and swa_helper.available, "deploy_fixed_online": metrics["metrics_raw_fixed"], "deploy_fixed_ema": metrics.get("metrics_ema"), "deploy_fixed_swa": metrics.get("metrics_swa"), "action_primary_score_online": metrics.get("action_primary_score"), "action_primary_score_ema": metrics.get("action_primary_score_ema"), "action_primary_score_swa": metrics.get("action_primary_score_swa")})
         append_jsonl(epoch_dir / "threshold_stats.jsonl", {
             "available": bool(threshold_cfg.get("enabled", False)),
             "threshold_prob": json_safe(out.get("threshold_prob", torch.empty(0)).detach().cpu()) if torch.is_tensor(out.get("threshold_prob")) else [],
@@ -901,6 +1021,13 @@ def main() -> None:
         tail_mf1 = sum(tail_vals) / max(len(tail_vals), 1)
         if action_primary >= best_action_primary:
             best_action_primary = action_primary; torch.save(ckpt, out_dir / "checkpoint_best_test_action_primary.pth")
+        ema_action_primary = metrics.get("action_primary_score_ema")
+        if ema_model_state is not None and ema_action_primary is not None and float(ema_action_primary) >= best_action_primary_ema:
+            best_action_primary_ema = float(ema_action_primary)
+            ema_ckpt = dict(ckpt)
+            ema_ckpt["model"] = ema_model_state
+            ema_ckpt["metrics"] = {"online": metrics, "ema": metrics.get("metrics_ema"), "action_primary_score_ema": best_action_primary_ema}
+            torch.save(ema_ckpt, out_dir / "checkpoint_best_test_action_primary_ema.pth")
         if train_calib_action_primary is not None and float(train_calib_action_primary) >= best_train_calib_action_primary:
             best_train_calib_action_primary = float(train_calib_action_primary); torch.save(ckpt, out_dir / "checkpoint_best_train_calib_action_primary.pth")
         if raw >= best_raw:
