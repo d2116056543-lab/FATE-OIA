@@ -614,10 +614,12 @@ def main() -> None:
             "initial_threshold_prob": model.threshold_head.forward(torch.zeros(1, 4, device=device), torch.zeros(1, 21, device=device))["threshold_prob"].detach().cpu().tolist(),
         })
     if args.freeze_trunk_for_action_utility_sanity:
+        tr["lr_action_utility"] = float(tr.get("lr_action_utility_sanity", 5e-5))
+        threshold_cfg["lr_threshold"] = float(threshold_cfg.get("lr_threshold_sanity", 1e-4))
         for name, param in model.named_parameters():
             keep = name.startswith("action_predicate_delta") or name.startswith("threshold_head")
             param.requires_grad = bool(keep)
-        write_json(out_dir / "sanity_freeze_info.json", {"freeze_trunk_for_action_utility_sanity": True, "trainable_param_names": [n for n, p in model.named_parameters() if p.requires_grad]})
+        write_json(out_dir / "sanity_freeze_info.json", {"freeze_trunk_for_action_utility_sanity": True, "lr_action_utility": tr["lr_action_utility"], "lr_threshold": threshold_cfg["lr_threshold"], "trainable_param_names": [n for n, p in model.named_parameters() if p.requires_grad]})
     opt = optimizer_for(model, cfg)
     warmup_epochs = int(tr.get("warmup_epochs", 2))
     min_lr = float(tr.get("min_lr", 1e-5))
