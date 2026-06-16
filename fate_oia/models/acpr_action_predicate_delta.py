@@ -33,7 +33,11 @@ class ACPRActionPredicateDelta(nn.Module):
             nn.Dropout(0.05),
             nn.Linear(int(hidden_dim), 1),
         )
-        nn.init.zeros_(self.mlp[-1].weight)
+        # V1.3 failed because a zero-initialized predicate branch produced an
+        # exactly-zero candidate and never beat the fallback during gate search.
+        # Keep the initial delta tiny, but non-zero, so candidate-probe training
+        # has a real gradient path before any gate is opened.
+        nn.init.normal_(self.mlp[-1].weight, mean=0.0, std=1e-4)
         nn.init.zeros_(self.mlp[-1].bias)
 
     def forward(self, action_nodes: torch.Tensor, predicate_probs: torch.Tensor) -> dict[str, torch.Tensor]:

@@ -48,6 +48,15 @@ ACTALIGN_REQUIRED = [
     "scripts/FATE_OIA_acpr_actalign_v1_3_foreground.ps1",
 ]
 
+ACTALIGN_CANDIDATE_REQUIRED = [
+    "fate_oia/models/acpr_action_candidates.py",
+    "fate_oia/losses/acpr_candidate_losses.py",
+    "fate_oia/utils/acpr_candidate_gate.py",
+    "fate_oia/utils/acpr_candidate_metrics.py",
+    "fate_oia/engine/fit_acpr_action_candidates.py",
+    "configs/fate_oia_train_360x640_acpr_actalign_v1_3_candidate_probe.yaml",
+]
+
 
 def _git_head() -> str:
     try:
@@ -67,7 +76,8 @@ def main() -> None:
     cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8")) or {}
     calalign_enabled = bool(cfg.get("threshold", {}).get("enabled", False))
     actalign_enabled = bool(cfg.get("actalign", {}).get("enabled", False) or cfg.get("model", {}).get("actalign_enabled", False))
-    required_files = REQUIRED + (CALALIGN_REQUIRED if calalign_enabled else []) + (ACTALIGN_REQUIRED if actalign_enabled else [])
+    candidate_probe = str(cfg.get("actalign", {}).get("stage_mode", cfg.get("actalign", {}).get("mode", ""))) == "candidate_probe"
+    required_files = REQUIRED + (CALALIGN_REQUIRED if calalign_enabled else []) + (ACTALIGN_REQUIRED if actalign_enabled else []) + (ACTALIGN_CANDIDATE_REQUIRED if candidate_probe else [])
     missing: list[str] = []
     checks: dict[str, bool] = {}
     for rel in required_files:
@@ -221,7 +231,7 @@ def main() -> None:
         cfg_eval = cfg.get("eval", {})
         checks["calalign_config_protocol"] = (
             cfg.get("threshold", {}).get("enabled") is True
-            and cfg_eval.get("primary_raw_branch") in {"deploy_fixed", "actalign_utility_deploy_fixed"}
+            and cfg_eval.get("primary_raw_branch") in {"deploy_fixed", "actalign_utility_deploy_fixed", "candidate_probe_guarded_fallback"}
             and cfg_eval.get("also_eval_base_fixed") is True
             and cfg.get("feature_cache_enabled") is False
             and cfg.get("token_compression") == "none"
@@ -285,7 +295,36 @@ def main() -> None:
         checks["actalign_gradient_guard_projects_in_trainer"] = all(t in guard_text for t in ["capture_action_grads", "project_model_grads", "param.grad.copy_"]) and all(t in train_text for t in ["grad_guard.capture_action_grads", "grad_guard.project_model_grads"])
         checks["actalign_ema_swa_real_eval"] = all(t in train_text for t in ["evaluate_shadow_model", "average_parameters", "averaged_parameters", "swa_helper.consider", "metrics_ema", "metrics_swa", "checkpoint_best_test_action_primary_ema.pth"]) and '"deploy_fixed_ema": None' not in train_text
         checks["actalign_cooldown_changes_lr_and_weights"] = all(t in train_text for t in ["update_cooldown_state", "cooldown_multiplier", "weights[\"action_deploy\"]", "lr_multiplier_threshold", "action_visual_aux_bonus"])
+        if candidate_probe:
+            cand_text = Path("fate_oia/models/acpr_action_candidates.py").read_text(encoding="utf-8")
+            cand_loss_text = Path("fate_oia/losses/acpr_candidate_losses.py").read_text(encoding="utf-8")
+            cand_gate_text = Path("fate_oia/utils/acpr_candidate_gate.py").read_text(encoding="utf-8")
+            checks["candidate_files_contract"] = all(t in cand_text for t in ["ACPRActionCandidates", "blend_gamma_raw", "selected_candidate_id", "set_selected_candidates", "utility_final"])
+            checks["candidate_loss_contract"] = all(t in cand_loss_text for t in ["all_candidate_probe_loss", "action_candidate_nonregression_loss", "candidate_action_asl_loss"])
+            checks["candidate_gate_train_calib_contract"] = all(t in cand_gate_text for t in ["update_from_train_calib", "selected_candidate_", "pred_rate_explosion", "all_high_increase", "delta_f1_"])
+            candidate_model = ACPROIAModel(use_mock_dino=True, threshold_enabled=True, actalign_enabled=True, actalign_kwargs={"mode": "candidate_probe"})
+            candidate_out = candidate_model(torch.randn(2, 3, 360, 640))
+            required_candidates = {"fallback", "visual", "reason", "blend", "predicate", "blend_predicate"}
+            checks["candidate_forward_contract"] = (
+                "action_candidate_logits" in candidate_out
+                and required_candidates.issubset(set(candidate_out["action_candidate_logits"].keys()))
+                and torch.allclose(candidate_out["action_logits_utility"], candidate_out["action_logits_fallback"], atol=1e-6)
+            )
+            candidate_loss = candidate_out["action_candidate_logits"]["blend"].sum() + candidate_out["action_candidate_logits"]["predicate"].sum()
+            candidate_loss.backward()
+            blend_grad = candidate_model.action_candidates.blend_gamma_raw.grad
+            pred_grad = candidate_model.action_predicate_delta.mlp[-1].weight.grad
+            checks["candidate_gradients_active"] = bool(blend_grad is not None and blend_grad.abs().sum() > 0 and pred_grad is not None and pred_grad.abs().sum() > 0)
+            checks["candidate_stage_protocol"] = (
+                cfg.get("stageA", {}).get("train_candidate_heads_only") is True
+                and cfg.get("stageB", {}).get("enabled") is False
+                and cfg.get("stageB", {}).get("require_stageA_pass") is True
+                and all(t in train_text for t in ["STAGE_A_CANDIDATE_PROBE_PASS.json", "STAGE_A_CANDIDATE_PROBE_FAIL.json", "collect_action_candidates_train_calib"])
+                and "candidate_probe" in Path("fate_oia/engine/fit_acpr_action_candidates.py").read_text(encoding="utf-8")
+            )
     pass_all = not missing and all(checks.values())
+    pass_name = "REVIEW_PASS_ACPR_ACTALIGN_V1_3_1.txt" if candidate_probe else ("REVIEW_PASS_ACPR_ACTALIGN_V1_3.txt" if actalign_enabled else "REVIEW_PASS_ACPR_OIA_V1.txt")
+    pass_label = "REVIEW_PASS_ACPR_ACTALIGN_V1_3_1" if candidate_probe else ("REVIEW_PASS_ACPR_ACTALIGN_V1_3" if actalign_enabled else "REVIEW_PASS_ACPR_OIA_V1")
     result = {
         "pass": pass_all,
         "git_head": _git_head(),
@@ -293,14 +332,12 @@ def main() -> None:
         "forbidden_pattern_results": {"forbidden_patterns_absent": checks.get("forbidden_patterns_absent", False)},
         "functional_checks": checks,
         "smoke_result": {"required_before_full_train": True, "checked_by_supervisor": True},
-        "review_pass_path": str(out_dir / ("REVIEW_PASS_ACPR_ACTALIGN_V1_3.txt" if actalign_enabled else "REVIEW_PASS_ACPR_OIA_V1.txt")),
+        "review_pass_path": str(out_dir / pass_name),
         "missing_items": missing + [k for k, v in checks.items() if not v],
         "warnings": [],
     }
     (out_dir / "implementation_audit_ACPR_OIA_V1.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     if pass_all and args.write_review_pass:
-        pass_name = "REVIEW_PASS_ACPR_ACTALIGN_V1_3.txt" if actalign_enabled else "REVIEW_PASS_ACPR_OIA_V1.txt"
-        pass_label = "REVIEW_PASS_ACPR_ACTALIGN_V1_3" if actalign_enabled else "REVIEW_PASS_ACPR_OIA_V1"
         (out_dir / pass_name).write_text(pass_label + "\n" + result["git_head"] + "\n", encoding="utf-8")
     if not pass_all:
         raise SystemExit(json.dumps(result, indent=2))

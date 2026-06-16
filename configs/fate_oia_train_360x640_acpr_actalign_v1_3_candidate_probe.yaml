@@ -1,0 +1,200 @@
+data_root: E:\sbw\BDD-OIA\data
+raw_root: E:\sbw\BDD-OIA
+bdd100k_root: E:\sbw\BDD100K
+pretrained_weights: ckp\reference\dino_deitsmall8_pretrain.pth
+checkpoint_key: teacher
+image_height: 360
+image_width: 640
+patch_size: 8
+action_dim: 4
+reason_dim: 21
+eval_splits: test
+best_selection_split: test
+token_compression: none
+feature_cache_enabled: false
+
+experiment:
+  name: acpr_actalign_v1_3_1_candidate_probe
+  direct_image: true
+  feature_cache_enabled: false
+  token_compression: none
+  test_only_evaluation: true
+  best_selection_split: test
+  no_metric_early_stop: true
+
+data:
+  data_root: E:\sbw\BDD-OIA\data
+  raw_root: E:\sbw\BDD-OIA
+  bdd100k_root: E:\sbw\BDD100K
+  image_height: 360
+  image_width: 640
+  patch_size: 8
+  action_dim: 4
+  reason_dim: 21
+  num_workers: 4
+
+training:
+  epochs: 5
+  batch_size: 6
+  gradient_accumulation_steps: 5
+  fallback_ladder: [[6, 5], [5, 6], [4, 8], [3, 11], [2, 16]]
+  reference_effective_batch: 32
+  lr_trunk: 0.0
+  lr_predicate: 0.0
+  lr_reason_predicate: 0.0
+  lr_pair_projection: 0.0
+  lr_calibration: 0.0
+  lr_threshold: 0.0
+  lr_action_utility: 0.0002
+  lr_action_candidate: 0.0002
+  scheduler: warmup_cosine
+  warmup_epochs: 1
+  min_lr: 1.0e-05
+  weight_decay: 0.05
+  grad_clip: 1.0
+  amp: false
+  no_metric_early_stop: true
+
+runtime:
+  test_only: true
+  no_feature_cache: true
+  require_no_token_compression: true
+  foreground_only: true
+  print_every: 200
+  eval_every_epoch: true
+  save_every_epoch: true
+
+model:
+  selected_layers: [3, 7, 11]
+  use_mock_dino: false
+  dim: 384
+  action_dim: 4
+  reason_dim: 21
+  final_action_source: candidate_probe_guarded_fallback
+  action_set_affects_final_action: false
+  graph_delta_to_logits: false
+  actalign_enabled: true
+  token_compression: none
+  feature_cache_enabled: false
+
+threshold:
+  enabled: true
+  train_calib_fraction: 0.1
+  train_trunk_on_all_train: true
+  split_seed: 20260615
+  init_from_train_frequency: true
+  use_group_shrinkage: true
+  lr_threshold: 0.0
+  weight_decay_threshold: 0.0
+  start_epoch: 999
+  teacher_update_start_epoch: 999
+  teacher_update_every: 1
+  teacher_ema: 0.0
+  copy_teacher_to_params: false
+  base_detach: true
+  action_threshold_min: 0.1
+  action_threshold_max: 0.9
+  reason_threshold_min: 0.02
+  reason_threshold_max: 0.85
+  tail_reason_threshold_min: 0.01
+  tail_reason_threshold_max: 0.65
+  grid_step: 0.01
+
+eval:
+  primary_raw_branch: candidate_probe_guarded_fallback
+  also_eval_base_fixed: true
+  also_eval_calibrated: true
+  also_eval_global_threshold_diag: true
+  also_eval_test_oracle_per_label_diag: true
+  also_eval_train_calib_teacher_diag: false
+
+predicate:
+  scene_config: configs\acpr_scene_predicates.yaml
+
+grammar:
+  path: configs\acpr_reason_predicate_grammar.yaml
+  tail_indices: [12, 9, 5, 14, 6, 11, 10, 13]
+
+actalign:
+  enabled: true
+  stage_mode: candidate_probe
+  mode: candidate_probe
+  max_r2a_delta: 0.2
+  max_pred_delta: 0.05
+  initial_r2a_gate: 0.0
+  initial_pred_gate: 0.0
+  detach_predicate_delta_inputs: false
+  predicate_delta_hidden: 192
+  initial_blend_gamma: 0.5
+
+candidate_probe:
+  candidate_names: [visual, reason, blend, predicate, blend_predicate]
+  candidate_weight: 1.0
+  nonreg_weight: 0.25
+  min_delta_f1: 0.002
+  gate_ema: 1.0
+  max_exp_drop: 0.005
+  gate_max_all_high_increase: 0.02
+  gate_max_action_pred_rate_increase_abs: 0.08
+  gate_max_action_pred_rate_increase_rel: 1.5
+  write_pass_fail: true
+
+stageA:
+  enabled: true
+  train_candidate_heads_only: true
+  freeze_trunk: true
+  freeze_dino: true
+  freeze_predicate: true
+  freeze_reason: true
+  freeze_threshold_head: true
+  resume_relative_epoch: true
+
+stageB:
+  enabled: false
+  require_stageA_pass: true
+  pass_file: STAGE_A_CANDIDATE_PROBE_PASS.json
+
+action_pareto_gate:
+  enabled: false
+
+gradient_guard:
+  enabled: false
+  mode: log_only
+  shared_param_patterns: [action_candidates, action_predicate_delta]
+
+pair_mining:
+  memory_size: 8192
+  max_pairs_per_batch: 32
+  max_pairs_per_reason: 2
+  max_tail_pairs_per_reason: 2
+  max_memory_scan: 256
+  margin: 0.25
+
+loss_weights:
+  action_deploy: 0.0
+  action_direct: 0.0
+  action_visual_aux: 0.0
+  action_reason_aux: 0.0
+  action_utility: 0.0
+  action_delta_regularizer: 0.0
+  action_gate_sparsity: 0.0
+  reason_partial: 0.0
+  reason_soft_f1: 0.0
+  predicate_weak: 0.0
+  predicate_reason_align: 0.0
+  matched_pair_logit: 0.0
+  matched_pair_embed: 0.0
+  action_combo_ce: 0.0
+  action_combo_drop_add: 0.0
+  cardinality: 0.0
+  calibration: 0.0
+  predicate_attention_compactness: 0.0
+
+ema:
+  enabled: false
+swa_lite:
+  enabled: false
+cooldown:
+  enabled: false
+
+best_selection_metric: action_primary_score
