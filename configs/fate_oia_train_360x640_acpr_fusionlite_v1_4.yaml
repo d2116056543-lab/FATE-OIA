@@ -40,13 +40,26 @@ backbone:
   pretrained_weights: ckp/reference/dino_deitsmall8_pretrain.pth
   checkpoint_key: teacher
   freeze_backbone: true
-  selected_layers: [3, 7, 11]
+  selected_layers:
+  - 3
+  - 7
+  - 11
   no_grad_backbone: true
 training:
   epochs: 16
   batch_size: 6
   gradient_accumulation_steps: 5
-  fallback_ladder: [[6,5], [5,6], [4,8], [3,11], [2,16]]
+  fallback_ladder:
+  - - 6
+    - 5
+  - - 5
+    - 6
+  - - 4
+    - 8
+  - - 3
+    - 11
+  - - 2
+    - 16
   reference_effective_batch: 32
   lr_trunk: 0.0002
   lr_predicate: 0.0002
@@ -56,7 +69,7 @@ training:
   lr_fusionlite: 0.0002
   scheduler: warmup_cosine
   warmup_epochs: 2
-  min_lr: 0.00001
+  min_lr: 1.0e-05
   weight_decay: 0.05
   grad_clip: 1.0
   amp: false
@@ -84,7 +97,7 @@ optim:
   weight_decay: 0.05
   scheduler: warmup_cosine
   warmup_epochs: 2
-  min_lr: 0.00001
+  min_lr: 1.0e-05
   grad_clip: 1.0
   amp: false
 runtime:
@@ -100,12 +113,15 @@ runtime:
 model:
   use_fusionlite: true
   fusionlite_max_delta: 0.15
-  fusionlite_gate_min: 0.10
-  fusionlite_gate_max: 0.90
+  fusionlite_gate_min: 0.1
+  fusionlite_gate_max: 0.9
   fusionlite_use_predicate_context: true
   fusionlite_grammar_path: configs\acpr_reason_predicate_grammar.yaml
   fusionlite_scene_config: configs\acpr_scene_predicates.yaml
-  selected_layers: [3, 7, 11]
+  selected_layers:
+  - 3
+  - 7
+  - 11
   use_mock_dino: false
   dim: 384
   action_dim: 4
@@ -121,13 +137,14 @@ model:
   use_action_combo_aux: true
   use_train_time_calibration: true
   final_action_source: fusionlite_direct_sigmoid_deploy_fixed
-  predicate_affects_action: false  # Predicate only conditions gate, not logits directly.
+  predicate_affects_action: false
   action_set_affects_final_action: false
   graph_delta_to_logits: false
-  max_predicate_reason_delta: 0.20
+  max_predicate_reason_delta: 0.2
+  threshold_enabled: true
 threshold:
   enabled: true
-  train_calib_fraction: 0.10
+  train_calib_fraction: 0.1
   train_trunk_on_all_train: true
   split_seed: 20260615
   init_from_train_frequency: true
@@ -138,12 +155,12 @@ threshold:
   warmup_epochs: 2
   teacher_update_start_epoch: 2
   teacher_update_every: 1
-  teacher_ema: 0.20
+  teacher_ema: 0.2
   copy_teacher_to_params: false
   base_detach: true
   base_grad_ratio_after_epoch: 0.0
-  soft_f1_tau_start: 0.50
-  soft_f1_tau_final: 0.20
+  soft_f1_tau_start: 0.5
+  soft_f1_tau_final: 0.2
   soft_f1_action_weight: 0.03
   soft_f1_reason_weight: 0.08
   teacher_weight: 0.05
@@ -152,8 +169,8 @@ threshold:
   action_cardinality_weight: 0.02
   range_weight: 0.0
   fp_guard_weight: 0.0
-  action_threshold_min: 0.10
-  action_threshold_max: 0.90
+  action_threshold_min: 0.1
+  action_threshold_max: 0.9
   reason_threshold_min: 0.02
   reason_threshold_max: 0.85
   tail_reason_threshold_min: 0.01
@@ -183,19 +200,27 @@ pair_mining:
   visual_sim_min: 0.05
   predicate_sim_min: 0.05
   contradiction_min: 0.15
-  tail_action_sim_min: 0.20
+  tail_action_sim_min: 0.2
   tail_visual_sim_min: -0.05
   tail_predicate_sim_min: -0.05
   tail_contradiction_min: 0.05
   fallback_easy_pair_weight: 0.15
-  tail_reason_indices: [12, 9, 5, 14, 6, 11, 10, 13]
+  tail_reason_indices:
+  - 12
+  - 9
+  - 5
+  - 14
+  - 6
+  - 11
+  - 10
+  - 13
 loss_weights:
-  action_direct: 1.20
+  action_direct: 1.2
   action_visual_aux: 0.12
   action_reason_aux: 0.08
   reason_partial: 0.75
   reason_soft_f1: 0.04
-  predicate_weak: 0.10
+  predicate_weak: 0.1
   predicate_reason_align: 0.03
   matched_pair_logit: 0.03
   matched_pair_embed: 0.005
@@ -217,13 +242,20 @@ predicate:
   scene_config: configs\acpr_scene_predicates.yaml
 grammar:
   path: configs\acpr_reason_predicate_grammar.yaml
-  tail_indices: [12, 9, 5, 14, 6, 11, 10, 13]
-
+  tail_indices:
+  - 12
+  - 9
+  - 5
+  - 14
+  - 6
+  - 11
+  - 10
+  - 13
 fusionlite:
   enabled: true
   max_delta: 0.15
-  gate_min: 0.10
-  gate_max: 0.90
+  gate_min: 0.1
+  gate_max: 0.9
   use_reason_context: true
   use_predicate_context: true
   zero_init_delta: true
@@ -234,8 +266,27 @@ fusionlite:
   cooldown_lr_mult_trunk: 0.25
   cooldown_lr_mult_predicate: 0.25
   cooldown_lr_mult_fusionlite: 0.25
-  cooldown_lr_mult_threshold: 0.50
+  cooldown_lr_mult_threshold: 0.5
 ema:
   enabled: true
   start_epoch: 3
   decay: 0.995
+loss:
+  action_deploy_weight: 1.2
+  action_visual_aux_weight: 0.12
+  action_reason_aux_weight: 0.08
+  reason_partial_weight: 0.75
+  reason_soft_f1_weight: 0.04
+  matched_pair_logit_weight: 0.03
+  matched_pair_embed_weight: 0.005
+  predicate_weak_weight: 0.1
+  predicate_reason_align_weight: 0.03
+  fusionlite_delta_l2_weight: 0.001
+  r2a_forbidden_prior_weight: 0.005
+  action_combo_ce_weight: 0.03
+  action_combo_drop_add_weight: 0.03
+  cardinality_weight: 0.02
+audit:
+  export_fusionlite_metrics: true
+  export_gate_delta_table: true
+  export_online_and_ema_metrics: true

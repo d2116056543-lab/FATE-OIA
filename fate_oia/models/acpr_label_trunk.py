@@ -7,11 +7,20 @@ from .acpr_sparse_ops import entmax15_bisect
 
 
 class ACPRLabelTrunk(nn.Module):
-    def __init__(self, dim: int = 384, action_dim: int = 4, reason_dim: int = 21) -> None:
+    def __init__(
+        self,
+        dim: int = 384,
+        action_dim: int = 4,
+        reason_dim: int = 21,
+        use_fusionlite: bool = False,
+        fusionlite_gate: object | None = None,
+    ) -> None:
         super().__init__()
         self.action_dim = action_dim
         self.reason_dim = reason_dim
         self.num_labels = action_dim + reason_dim
+        self.use_fusionlite = bool(use_fusionlite)
+        self.fusionlite_gate = fusionlite_gate
         self.label_queries = nn.Parameter(torch.randn(self.num_labels, dim) * 0.02)
         self.key_proj = nn.Linear(dim, dim)
         self.value_proj = nn.Linear(dim, dim)

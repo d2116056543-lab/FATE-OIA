@@ -71,6 +71,11 @@ def load_action_semantic_maps(
 
     action_to_id = {name: i for i, name in enumerate(action_names)}
     pred_to_id = {name: i for i, name in enumerate(predicate_names)}
+    region_to_pred_ids: dict[str, list[int]] = {}
+    for pid, pred in enumerate(predicate_rows):
+        region = str(pred.get("region", ""))
+        if region:
+            region_to_pred_ids.setdefault(region, []).append(pid)
     action_reason = torch.zeros(action_dim, reason_dim, dtype=torch.float32)
     action_pred = torch.zeros(action_dim, len(predicate_names), dtype=torch.float32)
     forbidden = torch.zeros(action_dim, reason_dim, dtype=torch.float32)
@@ -81,6 +86,7 @@ def load_action_semantic_maps(
         neutral = set(str(x) for x in reason.get("neutral_actions", []))
         positives = [str(x) for x in reason.get("positive_predicates", [])]
         contradictory = [str(x) for x in reason.get("contradictory_predicates", [])]
+        spatial_region = str(reason.get("spatial_region", ""))
         for aname in compatible:
             if aname in action_to_id:
                 action_reason[action_to_id[aname], rid] = 1.0
@@ -90,6 +96,10 @@ def load_action_semantic_maps(
                 for pname in contradictory:
                     if pname in pred_to_id:
                         action_pred[action_to_id[aname], pred_to_id[pname]] -= 0.25
+                # Use the grammar spatial_region as a weak action-specific
+                # predicate prior; this conditions the gate context only.
+                for pid in region_to_pred_ids.get(spatial_region, []):
+                    action_pred[action_to_id[aname], pid] += 0.25
         for aid, aname in enumerate(action_names):
             if aname in incompatible or (compatible and aname not in compatible and aname not in neutral):
                 forbidden[aid, rid] = 1.0

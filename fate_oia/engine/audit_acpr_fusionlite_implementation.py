@@ -73,7 +73,9 @@ def main() -> None:
         and cfg.get("eval_splits") == "test"
         and cfg.get("best_selection_split") == "test"
     )
-    checks["fusionlite_config_enabled"] = cfg.get("model", {}).get("use_fusionlite") is True and cfg.get("fusionlite", {}).get("zero_init_delta") is True
+    checks["fusionlite_config_enabled"] = cfg.get("model", {}).get("use_fusionlite") is True and cfg.get("model", {}).get("threshold_enabled") is True and cfg.get("fusionlite", {}).get("zero_init_delta") is True
+    checks["loss_section_present"] = all(k in cfg.get("loss", {}) for k in ["action_deploy_weight", "fusionlite_delta_l2_weight", "r2a_forbidden_prior_weight"])
+    checks["audit_section_present"] = cfg.get("audit", {}).get("export_online_and_ema_metrics") is True and cfg.get("audit", {}).get("export_gate_delta_table") is True
     checks["files_have_core_flow"] = all(
         s in text
         for s in ["ACPRFusionLiteGate", "load_action_semantic_maps", "action_logits_direct_legacy", "fusionlite_delta_gate", "deploy = base - theta"]
@@ -82,6 +84,7 @@ def main() -> None:
 
     maps = load_action_semantic_maps("configs/acpr_reason_predicate_grammar.yaml", "configs/acpr_scene_predicates.yaml")
     checks["semantic_masks_shape"] = maps.action_reason_mask.shape == (4, 21) and maps.action_predicate_mask.shape[0] == 4 and maps.forbidden_r2a_mask.shape == (4, 21)
+    checks["semantic_uses_spatial_region"] = "spatial_region" in Path("fate_oia/utils/acpr_action_semantic_maps.py").read_text(encoding="utf-8") and "region_to_pred_ids" in Path("fate_oia/utils/acpr_action_semantic_maps.py").read_text(encoding="utf-8")
     from fate_oia.models.acpr_fusionlite_gate import ACPRFusionLiteGate
 
     gate = ACPRFusionLiteGate(dim=8, num_predicates=max(int(maps.action_predicate_mask.shape[1]), 1))
@@ -97,6 +100,7 @@ def main() -> None:
     x = torch.randn(2, 3, 360, 640)
     out = model(x)
     checks["model_forward_shapes"] = out["action_logits_base"].shape == (2, 4) and out["reason_logits_base"].shape == (2, 21) and out["action_fusion_gate"].shape == (2, 4)
+    checks["dino_frozen"] = all(not p.requires_grad for p in model.dino.parameters())
     checks["zero_init_compat"] = bool(
         torch.allclose(out["action_logits_base"], out["action_logits_direct_legacy"], atol=1e-6)
         and torch.allclose(out["action_logits_fusionlite"], out["action_logits_direct_legacy"], atol=1e-6)
@@ -105,6 +109,10 @@ def main() -> None:
     model2 = ACPROIAModel(use_mock_dino=True, threshold_enabled=False, use_fusionlite=False)
     out2 = model2(x)
     checks["old_config_still_runs"] = out2["action_logits_base"].shape == (2, 4) and "fusionlite_delta_gate" in out2
+    train_text = Path("fate_oia/engine/train_acpr_oia.py").read_text(encoding="utf-8")
+    checks["ema_actual_created"] = "ema_helper = ModelEMA" in train_text and "apply_to(model)" in train_text and "restore(model, backup)" in train_text
+    checks["cooldown_actual"] = "train_calib_action_primary_scores" in train_text and "action_primary_cooldown_should_trigger" in train_text and "fusionlite_cooldown_events.jsonl" in train_text
+    checks["fusionlite_artifacts_complete"] = all(s in train_text for s in ["fusionlite_metrics.jsonl", "fusionlite_gate_stats.jsonl", "fusionlite_per_action_table.json", "deploy_fixed_ema", "old_gate_mean", "new_gate_mean", "visual_F1", "reason_F1", "legacy_F1", "fusionlite_F1"])
     checks["reason_unchanged_by_fusionlite_contract"] = "reason_logits_base = trunk[\"reason_logits_visual\"] + reason_delta" in Path("fate_oia/models/acpr_oia_model.py").read_text(encoding="utf-8")
     pass_all = not missing and all(checks.values())
     result = {
