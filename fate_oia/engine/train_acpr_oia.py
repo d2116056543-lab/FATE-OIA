@@ -16,13 +16,17 @@ from torch.utils.data import DataLoader, Subset
 from fate_oia.datasets.bdd_oia_multitask import BDDOIAMultiTaskDataset
 from fate_oia.models.acpr_oia_model import ACPROIAModel
 from fate_oia.models.acpr_pair_memory import PairMiningThresholds
+from fate_oia.models.acpr_predicate_patch_targets import ACPRPredicatePatchTargetBuilder
 from fate_oia.models.acpr_predicate_targets import WeakPredicateTargetBuilder
 from fate_oia.models.acpr_reason_grammar import ACPRReasonGrammar
 from fate_oia.transforms import AspectRatioLetterboxTransform
 from fate_oia.losses import acpr_losses as L
+from fate_oia.losses import acpr_pmt_losses as PMTL
 from fate_oia.losses import acpr_threshold_losses as TL
 from fate_oia.utils.acpr_artifacts import append_jsonl, json_safe, save_tensor, write_json
 from fate_oia.utils.acpr_pair_mining import pair_summary
+from fate_oia.utils.acpr_pmt_artifacts import write_pmt_epoch_artifacts
+from fate_oia.utils.acpr_pmt_phase_schedule import pmt_phase_for_epoch
 from fate_oia.utils.acpr_threshold_search import search_best_thresholds_for_f1
 from fate_oia.utils.acpr_thresholds import acpr_metric_views, standard_joint
 from fate_oia.utils.acpr_train_calib_split import make_train_calib_indices
@@ -77,6 +81,7 @@ def build_model(cfg: dict, device: torch.device) -> ACPROIAModel:
             "tail_reason_indices": cfg.get("grammar", {}).get("tail_indices", [12, 9, 5, 14, 6, 11, 10, 13]),
             "use_group_shrinkage": bool(threshold_cfg.get("use_group_shrinkage", True)),
         },
+        pmt_kwargs=cfg.get("pmt", {}),
     )
     return model.to(device)
 
@@ -93,6 +98,12 @@ def optimizer_for(model: ACPROIAModel, cfg: dict) -> torch.optim.Optimizer:
         {"params": list(model.action_combo_aux.parameters()), "lr": float(tr.get("lr_trunk", 2e-4)), "name": "combo"},
         {"params": list(model.calibration.parameters()), "lr": float(tr.get("lr_calibration", 5e-4)), "name": "calibration"},
     ]
+    if hasattr(model, "triadic_mediator"):
+        groups.append({
+            "params": list(model.triadic_mediator.parameters()),
+            "lr": float(tr.get("lr_triadic", tr.get("lr_trunk", 2e-4))),
+            "name": "triadic_mediator",
+        })
     if bool(threshold_cfg.get("enabled", False)):
         groups.append({
             "params": list(model.threshold_head.parameters()),
@@ -280,7 +291,7 @@ def compute_threshold_losses(
     base_detach = bool(th.get("base_detach", True))
     action_base = out["action_logits_base"].detach() if base_detach else out["action_logits_base"]
     reason_base = out["reason_logits_base"].detach() if base_detach else out["reason_logits_base"]
-    thresholded = model.threshold_head(action_base, reason_base)
+    thresholded = model._threshold_forward(action_base, reason_base, out["predicate_probs"])
     tau_start = float(th.get("soft_f1_tau_start", 0.50))
     tau_final = float(th.get("soft_f1_tau_final", 0.20))
     tau = tau_start + (tau_final - tau_start) * ramp
@@ -335,11 +346,59 @@ def pair_artifact_payload(pairs: dict, reason_names: list[str] | None = None) ->
     return {"available": True, **summary, "per_reason": per_reason}
 
 
-def compute_losses(out: dict, batch: dict, predicate_batch: dict, pairs: dict, grammar_matrices: tuple[torch.Tensor, torch.Tensor], weights: dict) -> tuple[torch.Tensor, dict[str, float]]:
+def compute_losses(
+    out: dict,
+    batch: dict,
+    predicate_batch: dict,
+    patch_batch: dict,
+    pairs: dict,
+    grammar_matrices: tuple[torch.Tensor, torch.Tensor],
+    weights: dict,
+    phase: dict,
+) -> tuple[torch.Tensor, dict[str, float]]:
     action = batch["action"]
     reason = batch["reason"]
     pair_logit, pair_logit_stats = L.matched_pair_logit_loss(out["reason_logits_base"], pairs, return_stats=True)
     pair_embed, pair_embed_stats = L.matched_pair_embedding_loss(out["reason_embeddings_for_pair"], pairs, return_stats=True)
+    predicate_pair_stats = {"predicate_filtered_pair_count": 0, "weak_predicate_pair_count": 0}
+    if torch.is_tensor(pairs.get("pair_predicate_sim")) and pairs["pair_predicate_sim"].numel():
+        predicate_diff = (1.0 - pairs["pair_predicate_sim"].detach()).clamp(0.0, 1.0)
+        pair_weights, predicate_pair_stats = PMTL.predicate_pair_weights(
+            predicate_diff,
+            threshold=float(phase.get("predicate_pair_diff_threshold", 0.05)),
+        )
+        pair_logit = pair_logit * pair_weights.mean().clamp(0.25, 1.0)
+    main_prediction_loss = (
+        L.action_asl_loss(out["action_logits_base"], action)
+        + L.partial_label_reason_loss(out["reason_logits_base"], reason, out.get("predicate_reason_contradiction_score_by_label"))
+    )
+    pair_logit_capped, pair_cap_stats = PMTL.capped_pair_loss(
+        pair_logit,
+        main_prediction_loss,
+        cap_ratio=float(phase.get("pair_cap_ratio", 0.10)),
+    )
+    patch_loss, patch_stats = PMTL.predicate_patch_alignment_loss(
+        out["predicate_attention"],
+        patch_batch["predicate_patch_targets"],
+        patch_batch["predicate_patch_mask"],
+        patch_batch["predicate_patch_reliability"],
+        predicate_probs=out["predicate_probs"],
+        entropy_weight=float(weights.get("predicate_patch_entropy_weight", 0.005)),
+    )
+    triadic_loss, triadic_stats = PMTL.triadic_consistency_loss(
+        out["triadic_reason_support"],
+        action,
+        reason,
+        out.get("predicate_reason_contradiction_score_by_label"),
+    )
+    pu_loss, pu_stats = PMTL.predicate_conditioned_pu_reason_loss(
+        out["reason_logits_base"],
+        reason,
+        out.get("predicate_reason_contradiction_score_by_label"),
+        neg_min=float(weights.get("pmt_pu_neg_min", 0.4)),
+    )
+    threshold_delta = out.get("threshold_delta")
+    threshold_delta_l2 = threshold_delta.pow(2).mean() if torch.is_tensor(threshold_delta) else out["logits_final_raw"].sum() * 0.0
     terms = {
         "action_direct": L.action_asl_loss(out["action_logits_base"], action),
         "action_visual_aux": L.action_asl_loss(out["action_visual_logits"], action),
@@ -348,8 +407,12 @@ def compute_losses(out: dict, batch: dict, predicate_batch: dict, pairs: dict, g
         "reason_soft_f1": L.reason_soft_f1_loss(out["reason_logits_base"], reason),
         "predicate_weak": L.predicate_weak_bce_mil_loss(out["predicate_logits"], predicate_batch["predicate_targets"], predicate_batch["predicate_mask"], predicate_batch.get("predicate_reliability")),
         "predicate_reason_align": L.predicate_reason_alignment_loss(out["predicate_probs"], reason, grammar_matrices[0], grammar_matrices[1]),
-        "matched_pair_logit": pair_logit,
+        "matched_pair_logit": pair_logit_capped,
         "matched_pair_embed": pair_embed,
+        "predicate_patch_alignment": patch_loss,
+        "triadic_consistency": triadic_loss,
+        "predicate_conditioned_pu": pu_loss,
+        "threshold_delta_l2": threshold_delta_l2,
         "action_combo_ce": L.action_combo_ce_loss(out["action_set_logits"], action),
         "action_combo_drop_add": L.action_combo_drop_add_loss(out["action_set_logits"], action),
         "cardinality": L.cardinality_loss(out["cardinality_logits"], action),
@@ -360,6 +423,12 @@ def compute_losses(out: dict, batch: dict, predicate_batch: dict, pairs: dict, g
     parts = {f"loss_{k}": float(v.detach().cpu()) for k, v in terms.items()}
     parts.update({f"pair_logit_{k}": v for k, v in pair_logit_stats.items()})
     parts.update({f"pair_embed_{k}": v for k, v in pair_embed_stats.items()})
+    parts.update({f"predicate_patch_{k}": v for k, v in patch_stats.items()})
+    parts.update({f"triadic_{k}": v for k, v in triadic_stats.items()})
+    parts.update({f"pmt_pu_{k}": v for k, v in pu_stats.items()})
+    parts.update(predicate_pair_stats)
+    parts.update(pair_cap_stats)
+    parts.update({f"pmt_phase_{k}": v for k, v in phase.items() if isinstance(v, (int, float, bool, str))})
     return total, parts
 
 
@@ -572,6 +641,11 @@ def main() -> None:
             group.setdefault("base_lr", group["lr"])
     grammar = ACPRReasonGrammar(cfg.get("grammar", {}).get("path", "configs/acpr_reason_predicate_grammar.yaml"))
     target_builder = WeakPredicateTargetBuilder(cfg.get("predicate", {}).get("scene_config", "configs/acpr_scene_predicates.yaml"), cfg.get("bdd100k_root"))
+    patch_target_builder = ACPRPredicatePatchTargetBuilder(
+        cfg.get("predicate", {}).get("scene_config", "configs/acpr_scene_predicates.yaml"),
+        bdd100k_root=cfg.get("bdd100k_root"),
+        grid_hw=(45, 80),
+    )
     matrices = reason_predicate_matrices(grammar, model.predicate_head.names, device)
     weights = cfg.get("loss_weights", {})
     pair_cfg = cfg.get("pair_mining", {})
@@ -605,7 +679,9 @@ def main() -> None:
         for step, batch in enumerate(train_loader, start=1):
             batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
             pred_batch = target_builder.build(batch["file_name"], device=device)
-            out = model(batch["image"], epoch=epoch)
+            patch_batch = patch_target_builder.build(batch["file_name"], device=device)
+            phase = pmt_phase_for_epoch(epoch, cfg.get("pmt", {}))
+            out = model(batch["image"], epoch=epoch, predicate_patch_targets=patch_batch["predicate_patch_targets"])
             pairs = model.pair_memory.mine(
                 batch["file_name"],
                 out["global_embedding"].detach(),
@@ -630,7 +706,7 @@ def main() -> None:
             batch_weights = dict(weights)
             batch_weights["matched_pair_logit"] = pair_logit_weight
             batch_weights["matched_pair_embed"] = pair_embed_weight
-            loss, parts = compute_losses(out, batch, pred_batch, pairs, matrices, batch_weights)
+            loss, parts = compute_losses(out, batch, pred_batch, patch_batch, pairs, matrices, batch_weights, phase)
             threshold_loss, threshold_parts = compute_threshold_losses(model, out, batch, cfg, epoch)
             loss = loss + threshold_loss
             parts.update(threshold_parts)
@@ -680,6 +756,8 @@ def main() -> None:
         append_jsonl(epoch_dir / "branch_metrics.jsonl", {
             "direct": metrics.get("metrics_base_fixed", metrics["metrics_raw_fixed"]),
             "direct_plus_predicate": metrics.get("metrics_base_fixed", metrics["metrics_raw_fixed"]),
+            "direct_plus_triadic": metrics.get("metrics_base_fixed", metrics["metrics_raw_fixed"]),
+            "pmt_deploy_fixed": metrics["metrics_raw_fixed"],
             "base_fixed": metrics.get("metrics_base_fixed", metrics["metrics_raw_fixed"]),
             "deploy_fixed": metrics["metrics_raw_fixed"],
             "raw": metrics["metrics_raw_fixed"],
@@ -690,6 +768,38 @@ def main() -> None:
         append_jsonl(epoch_dir / "predicate_metrics.jsonl", {"available": True, "predicate_positive_rate": float(pred_batch["predicate_targets"].mean().detach().cpu()), "predicate_mask_rate": float(pred_batch["predicate_mask"].mean().detach().cpu())})
         append_jsonl(epoch_dir / "predicate_coverage.jsonl", {"available": True, **pred_batch.get("predicate_coverage", {})})
         append_jsonl(epoch_dir / "predicate_reason_alignment.jsonl", {"available": True, "positive_score_mean": float(out.get("predicate_reason_positive_score_by_label").mean().detach().cpu()), "contradiction_score_mean": float(out.get("predicate_reason_contradiction_score_by_label").mean().detach().cpu())})
+        write_pmt_epoch_artifacts(epoch_dir, epoch, {
+            "pmt_phase_schedule": {"available": True, **pmt_phase_for_epoch(epoch, cfg.get("pmt", {}))},
+            "predicate_patch_alignment": {
+                "available": True,
+                "mask_rate": float(patch_batch["predicate_patch_mask"].float().mean().detach().cpu()),
+                "attention_mass_on_target": float(out["predicate_attention_mass_on_target"].mean().detach().cpu()),
+                "visual_confidence_mean": float(out["predicate_visual_confidence"].mean().detach().cpu()),
+            },
+            "predicate_coverage": {"available": True, **patch_batch.get("predicate_patch_coverage", {})},
+            "predicate_reason_alignment": {
+                "available": True,
+                "positive_score_mean": float(out.get("predicate_reason_positive_score_by_label").mean().detach().cpu()),
+                "contradiction_score_mean": float(out.get("predicate_reason_contradiction_score_by_label").mean().detach().cpu()),
+            },
+            "triadic_mediator_stats": {
+                "available": True,
+                "delta_abs_mean": float(out["triadic_action_delta"].detach().abs().mean().cpu()),
+                "support_mean": float(out["triadic_reason_support"].detach().mean().cpu()),
+            },
+            "triadic_chain_topk": {
+                "available": True,
+                "top_chain_indices": json_safe(out["triadic_top_chain_indices"].detach().cpu()),
+            },
+            "threshold_diagnostics": {
+                "available": True,
+                "threshold_delta_abs_mean": float(out.get("threshold_delta", torch.zeros_like(out["logits_base_fixed"])).detach().abs().mean().cpu()),
+                "threshold_prob": json_safe(out.get("threshold_prob", torch.empty(0)).detach().cpu()) if torch.is_tensor(out.get("threshold_prob")) else [],
+            },
+            "pmt_hardpair_stats": {"available": True, **pair_summary(pairs)},
+            "pmt_pu_stats": {"available": True, "pu_stats_source": "loss_components.jsonl"},
+            "loss_group_components": {"available": True, "source": "loss_components.jsonl"},
+        })
         pair_epoch_payload = pair_artifact_payload(pairs)
         append_jsonl(epoch_dir / "pair_mining_stats.jsonl", {"available": True, **pair_summary(pairs)})
         append_jsonl(epoch_dir / "pair_stats.jsonl", {"available": True, **pair_summary(pairs)})

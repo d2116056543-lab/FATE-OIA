@@ -1,0 +1,21 @@
+actions:
+  forward:
+    id: 0
+    compatible_reasons: [0, 1, 2, 3, 4, 7, 15, 16, 17, 18, 19, 20]
+    support_predicates: [front_vehicle, drivable_front, lane_clear, road_clear, green_light, speed_limit]
+    contradict_predicates: [red_light, stop_sign, pedestrian_front, front_obstacle]
+  stop:
+    id: 1
+    compatible_reasons: [0, 1, 2, 3, 4, 7, 8, 15, 18]
+    support_predicates: [red_light, stop_sign, pedestrian_front, front_vehicle, front_obstacle]
+    contradict_predicates: [green_light, road_clear, drivable_front]
+  left:
+    id: 2
+    compatible_reasons: [2, 3, 4, 5, 6, 9, 10, 12, 14]
+    support_predicates: [left_lane_marking, left_free_space, lane_left, left_vehicle]
+    contradict_predicates: [left_obstacle, left_blocked]
+  right:
+    id: 3
+    compatible_reasons: [2, 3, 4, 5, 6, 9, 11, 13, 14]
+    support_predicates: [right_lane_marking, right_free_space, lane_right, right_vehicle]
+    contradict_predicates: [right_obstacle, right_blocked]

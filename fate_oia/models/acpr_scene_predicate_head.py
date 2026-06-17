@@ -29,7 +29,12 @@ class ACPRScenePredicateHead(nn.Module):
     def names(self) -> list[str]:
         return [str(p["name"]) for p in self.predicates]
 
-    def forward(self, patch_tokens_by_layer: torch.Tensor, region_masks: dict[str, torch.Tensor] | None = None) -> dict[str, torch.Tensor | dict]:
+    def forward(
+        self,
+        patch_tokens_by_layer: torch.Tensor,
+        region_masks: dict[str, torch.Tensor] | None = None,
+        predicate_patch_targets: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor | dict]:
         b, s, n, d = patch_tokens_by_layer.shape
         weights = torch.softmax(self.layer_logits, dim=-1)
         tokens = torch.einsum("ls,bsnd->blnd", weights, patch_tokens_by_layer)
@@ -48,14 +53,31 @@ class ACPRScenePredicateHead(nn.Module):
         predicate_tokens = torch.einsum("bln,blnd->bld", attn, v)
         logits = self.logit_head(predicate_tokens).squeeze(-1)
         probs = torch.sigmoid(logits)
-        support = (attn > 1e-4).float().sum(-1).mean().detach()
-        entropy = (-(attn.clamp_min(1e-9).log() * attn).sum(-1)).mean().detach()
-        stats = {"predicate_support_size": float(support.cpu()), "predicate_attention_entropy": float(entropy.cpu())}
+        entropy_by_predicate = -(attn.clamp_min(1e-9).log() * attn).sum(-1)
+        support_by_predicate = (attn > 1e-4).float().sum(-1)
+        support = support_by_predicate.mean().detach()
+        entropy = entropy_by_predicate.mean().detach()
+        if predicate_patch_targets is not None:
+            target = predicate_patch_targets.to(attn.device, attn.dtype).clamp(0.0, 1.0)
+            target_mass = (attn * target).sum(-1)
+        else:
+            target_mass = attn.new_zeros(attn.shape[:2])
+        max_entropy = torch.log(torch.tensor(float(max(n, 2)), device=attn.device, dtype=attn.dtype))
+        visual_confidence = probs * (1.0 - entropy_by_predicate / max_entropy).clamp(0.0, 1.0)
+        stats = {
+            "predicate_support_size": float(support.cpu()),
+            "predicate_attention_entropy": float(entropy.cpu()),
+            "predicate_attention_mass_on_target": float(target_mass.mean().detach().cpu()),
+            "predicate_visual_confidence": float(visual_confidence.mean().detach().cpu()),
+        }
         return {
             "predicate_tokens": predicate_tokens,
             "predicate_logits": logits,
             "predicate_probs": probs,
             "predicate_attention": attn,
             "predicate_layer_weights": weights,
+            "predicate_attention_mass_on_target": target_mass,
+            "predicate_attention_entropy_by_predicate": entropy_by_predicate,
+            "predicate_visual_confidence": visual_confidence,
             "predicate_stats": stats,
         }
