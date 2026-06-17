@@ -7,12 +7,14 @@ from torch import nn
 from .acpr_action_combo_aux import ACPRActionComboAux
 from .acpr_calibration import ACPRCalibrationHead
 from .acpr_dino_field import ACPRDinoFieldExtractor
+from .acpr_fusionlite_gate import ACPRFusionLiteGate
 from .acpr_ego_regions import ACPREgoRegionEncoder
 from .acpr_label_trunk import ACPRLabelTrunk
 from .acpr_pair_memory import ACPRPairMemory
 from .acpr_predicate_reason import ACPRPredicateReasoner
 from .acpr_scene_predicate_head import ACPRScenePredicateHead
 from .acpr_threshold_head import ACPRThresholdHead
+from fate_oia.utils.acpr_action_semantic_maps import load_action_semantic_maps
 
 
 class ACPROIAModel(nn.Module):
@@ -28,6 +30,13 @@ class ACPROIAModel(nn.Module):
         use_mock_dino: bool = False,
         threshold_enabled: bool = False,
         threshold_kwargs: dict | None = None,
+        use_fusionlite: bool = False,
+        fusionlite_max_delta: float = 0.15,
+        fusionlite_gate_min: float = 0.10,
+        fusionlite_gate_max: float = 0.90,
+        fusionlite_use_predicate_context: bool = True,
+        fusionlite_grammar_path: str | None = None,
+        fusionlite_scene_config: str | None = None,
     ) -> None:
         super().__init__()
         self.action_dim = action_dim
@@ -44,6 +53,27 @@ class ACPROIAModel(nn.Module):
         self.calibration = ACPRCalibrationHead(num_labels=action_dim + reason_dim)
         self.threshold_head = ACPRThresholdHead(action_dim=action_dim, reason_dim=reason_dim, **(threshold_kwargs or {}))
 
+        self.use_fusionlite = bool(use_fusionlite)
+        semantic_maps = load_action_semantic_maps(
+            fusionlite_grammar_path or grammar_path,
+            fusionlite_scene_config or scene_config,
+            action_dim=action_dim,
+            reason_dim=reason_dim,
+        )
+        self.register_buffer("action_reason_mask", semantic_maps.action_reason_mask, persistent=False)
+        self.register_buffer("action_predicate_mask", semantic_maps.action_predicate_mask, persistent=False)
+        self.register_buffer("forbidden_r2a_mask", semantic_maps.forbidden_r2a_mask, persistent=False)
+        self.fusionlite_gate = ACPRFusionLiteGate(
+            dim=dim,
+            action_dim=action_dim,
+            reason_dim=reason_dim,
+            num_predicates=self.predicate_head.num_predicates,
+            max_delta=fusionlite_max_delta,
+            gate_min=fusionlite_gate_min,
+            gate_max=fusionlite_gate_max,
+            use_predicate_context=fusionlite_use_predicate_context,
+        ) if self.use_fusionlite else None
+
     def forward(self, images: torch.Tensor, epoch: int = 0) -> dict[str, torch.Tensor | dict | tuple[int, int] | int]:
         field = self.dino(images)
         patch = field["patch_tokens_by_layer"]
@@ -53,7 +83,31 @@ class ACPROIAModel(nn.Module):
         predicates = self.predicate_head(patch, region_masks=region_masks)
         trunk = self.trunk(patch, predicate_tokens=predicates["predicate_tokens"])
         reason_delta = self.predicate_reason(trunk["label_nodes"][:, self.action_dim :], predicates["predicate_probs"], predicates["predicate_tokens"])
-        action_logits_base = trunk["action_logits_direct"]
+        action_logits_direct_legacy = trunk["action_logits_direct"]
+        action_fusion_gate_legacy = trunk["action_fusion_gate"]
+        if self.use_fusionlite and self.fusionlite_gate is not None:
+            fusionlite = self.fusionlite_gate(
+                action_nodes=trunk["label_nodes"][:, : self.action_dim],
+                reason_nodes=trunk["label_nodes"][:, self.action_dim :],
+                predicate_probs=predicates["predicate_probs"],
+                action_visual_logits=trunk["action_visual_logits"],
+                action_reason_logits=trunk["action_reason_logits"],
+                old_gate=action_fusion_gate_legacy,
+                action_reason_mask=self.action_reason_mask,
+                action_predicate_mask=self.action_predicate_mask,
+            )
+            action_logits_base = fusionlite["action_logits_fusionlite"]
+        else:
+            zeros_gate = torch.zeros_like(action_fusion_gate_legacy)
+            fusionlite = {
+                "action_logits_fusionlite": action_logits_direct_legacy,
+                "fusionlite_gate": action_fusion_gate_legacy,
+                "fusionlite_delta_gate": zeros_gate,
+                "fusionlite_delta_abs_mean": zeros_gate.mean(),
+                "fusionlite_gate_mean": action_fusion_gate_legacy.mean(),
+                "fusionlite_old_gate_mean": action_fusion_gate_legacy.mean(),
+            }
+            action_logits_base = action_logits_direct_legacy
         reason_logits_base = trunk["reason_logits_visual"] + reason_delta["predicate_reason_delta"]
         logits_base = torch.cat([action_logits_base, reason_logits_base], dim=-1)
         thresholded = self.threshold_head(action_logits_base, reason_logits_base)
@@ -91,6 +145,17 @@ class ACPROIAModel(nn.Module):
             "reason_embeddings_for_pair": reason_embeddings_for_pair,
             # Backward-compatible raw aliases are base logits. CalAlign's
             # action/reason_logits_final_raw are deploy logits when enabled.
+            "action_logits_direct_legacy": action_logits_direct_legacy,
+            "action_logits_fusionlite": fusionlite["action_logits_fusionlite"],
+            "action_fusion_gate_legacy": action_fusion_gate_legacy,
+            "action_fusion_gate": fusionlite["fusionlite_gate"],
+            "fusionlite_gate": fusionlite["fusionlite_gate"],
+            "fusionlite_delta_gate": fusionlite["fusionlite_delta_gate"],
+            "fusionlite_delta_abs_mean": fusionlite["fusionlite_delta_abs_mean"],
+            "fusionlite_gate_mean": fusionlite["fusionlite_gate_mean"],
+            "fusionlite_old_gate_mean": fusionlite["fusionlite_old_gate_mean"],
+            "forbidden_r2a_mask": self.forbidden_r2a_mask,
+            "reason_to_action_weight": self.trunk.reason_to_action.weight,
             "action_logits_raw": action_logits_base,
             "reason_logits_raw": reason_logits_base,
             "action_logits_base": action_logits_base,
@@ -121,6 +186,8 @@ class ACPROIAModel(nn.Module):
             "ego_stats": ego_stats,
             "branch_logits": {
                 "direct": logits_base,
+                "action_direct_legacy": action_logits_direct_legacy,
+                "action_fusionlite": action_logits_base,
                 "direct_plus_predicate": logits_base,
                 "base_fixed": logits_base,
                 "deploy_fixed": logits_final_raw,

@@ -21,11 +21,13 @@ from fate_oia.models.acpr_reason_grammar import ACPRReasonGrammar
 from fate_oia.transforms import AspectRatioLetterboxTransform
 from fate_oia.losses import acpr_losses as L
 from fate_oia.losses import acpr_threshold_losses as TL
+from fate_oia.losses import acpr_fusionlite_losses as FL
 from fate_oia.utils.acpr_artifacts import append_jsonl, json_safe, save_tensor, write_json
 from fate_oia.utils.acpr_pair_mining import pair_summary
 from fate_oia.utils.acpr_threshold_search import search_best_thresholds_for_f1
 from fate_oia.utils.acpr_thresholds import acpr_metric_views, standard_joint
 from fate_oia.utils.acpr_train_calib_split import make_train_calib_indices
+from fate_oia.utils.acpr_model_ema import ModelEMA
 
 
 def load_config(path: str) -> dict[str, Any]:
@@ -67,6 +69,13 @@ def build_model(cfg: dict, device: torch.device) -> ACPROIAModel:
         grammar_path=str(cfg.get("grammar", {}).get("path", "configs/acpr_reason_predicate_grammar.yaml")),
         use_mock_dino=bool(model_cfg.get("use_mock_dino", False)),
         threshold_enabled=bool(threshold_cfg.get("enabled", False)),
+        use_fusionlite=bool(model_cfg.get("use_fusionlite", False)),
+        fusionlite_max_delta=float(model_cfg.get("fusionlite_max_delta", cfg.get("fusionlite", {}).get("max_delta", 0.15))),
+        fusionlite_gate_min=float(model_cfg.get("fusionlite_gate_min", cfg.get("fusionlite", {}).get("gate_min", 0.10))),
+        fusionlite_gate_max=float(model_cfg.get("fusionlite_gate_max", cfg.get("fusionlite", {}).get("gate_max", 0.90))),
+        fusionlite_use_predicate_context=bool(model_cfg.get("fusionlite_use_predicate_context", cfg.get("fusionlite", {}).get("use_predicate_context", True))),
+        fusionlite_grammar_path=str(model_cfg.get("fusionlite_grammar_path", cfg.get("grammar", {}).get("path", "configs/acpr_reason_predicate_grammar.yaml"))),
+        fusionlite_scene_config=str(model_cfg.get("fusionlite_scene_config", cfg.get("predicate", {}).get("scene_config", "configs/acpr_scene_predicates.yaml"))),
         threshold_kwargs={
             "action_threshold_min": float(threshold_cfg.get("action_threshold_min", 0.10)),
             "action_threshold_max": float(threshold_cfg.get("action_threshold_max", 0.90)),
@@ -93,6 +102,10 @@ def optimizer_for(model: ACPROIAModel, cfg: dict) -> torch.optim.Optimizer:
         {"params": list(model.action_combo_aux.parameters()), "lr": float(tr.get("lr_trunk", 2e-4)), "name": "combo"},
         {"params": list(model.calibration.parameters()), "lr": float(tr.get("lr_calibration", 5e-4)), "name": "calibration"},
     ]
+    if getattr(model, "fusionlite_gate", None) is not None:
+        fusionlite_params = [p for p in model.fusionlite_gate.parameters() if p.requires_grad]
+        if fusionlite_params:
+            groups.append({"params": fusionlite_params, "lr": float(tr.get("lr_fusionlite", 2e-4)), "name": "fusionlite"})
     if bool(threshold_cfg.get("enabled", False)):
         groups.append({
             "params": list(model.threshold_head.parameters()),
@@ -100,6 +113,7 @@ def optimizer_for(model: ACPROIAModel, cfg: dict) -> torch.optim.Optimizer:
             "weight_decay": float(threshold_cfg.get("weight_decay_threshold", 0.0)),
             "name": "threshold",
         })
+    groups = [g for g in groups if list(g.get("params", []))]
     return torch.optim.AdamW(groups, weight_decay=float(tr.get("weight_decay", 0.05)))
 
 
@@ -355,6 +369,8 @@ def compute_losses(out: dict, batch: dict, predicate_batch: dict, pairs: dict, g
         "cardinality": L.cardinality_loss(out["cardinality_logits"], action),
         "calibration": L.calibration_loss(out["action_logits_calibrated"], out["reason_logits_calibrated"], action, reason),
         "predicate_attention_compactness": L.predicate_attention_compactness_loss(out["predicate_attention"]),
+        "fusionlite_delta_l2": FL.fusionlite_delta_l2(out.get("fusionlite_delta_gate", out["action_logits_base"].new_zeros(out["action_logits_base"].shape))),
+        "r2a_forbidden_prior": FL.r2a_forbidden_prior_loss(out["reason_to_action_weight"], out["forbidden_r2a_mask"]),
     }
     total = sum(terms[k] * float(weights.get(k, 0.0)) for k in terms)
     parts = {f"loss_{k}": float(v.detach().cpu()) for k, v in terms.items()}
@@ -368,6 +384,14 @@ def evaluate(model: ACPROIAModel, loader: DataLoader, device: torch.device, epoc
     model.eval()
     action_base = []
     reason_base = []
+    action_legacy = []
+    action_fusionlite = []
+    action_visual_branch = []
+    action_reason_branch = []
+    fusion_delta_abs = []
+    fusion_gate_mean = []
+    fusion_old_gate_mean = []
+    fusion_delta_per_action = []
     action_logits = []
     reason_logits = []
     action_cal = []
@@ -384,6 +408,14 @@ def evaluate(model: ACPROIAModel, loader: DataLoader, device: torch.device, epoc
         batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
         out = model(batch["image"], epoch=epoch)
         action_base.append(out["action_logits_base"].cpu())
+        action_legacy.append(out["action_logits_direct_legacy"].cpu())
+        action_fusionlite.append(out["action_logits_fusionlite"].cpu())
+        action_visual_branch.append(out["action_visual_logits"].cpu())
+        action_reason_branch.append(out["action_reason_logits"].cpu())
+        fusion_delta_abs.append(float(out["fusionlite_delta_abs_mean"].detach().cpu()))
+        fusion_gate_mean.append(float(out["fusionlite_gate_mean"].detach().cpu()))
+        fusion_old_gate_mean.append(float(out["fusionlite_old_gate_mean"].detach().cpu()))
+        fusion_delta_per_action.append(out["fusionlite_delta_gate"].detach().cpu())
         reason_base.append(out["reason_logits_base"].cpu())
         action_logits.append(out["action_logits_final_raw"].cpu())
         reason_logits.append(out["reason_logits_final_raw"].cpu())
@@ -405,9 +437,18 @@ def evaluate(model: ACPROIAModel, loader: DataLoader, device: torch.device, epoc
     rc = torch.cat(reason_cal)
     ya = torch.cat(action_labels)
     yr = torch.cat(reason_labels)
+    aleg = torch.cat(action_legacy)
+    afl = torch.cat(action_fusionlite)
+    avis = torch.cat(action_visual_branch)
+    areas = torch.cat(action_reason_branch)
+    fdpa = torch.cat(fusion_delta_per_action) if fusion_delta_per_action else torch.zeros(1, 4)
     base_views = acpr_metric_views(ab, rb, ya, yr)
     views = acpr_metric_views(al, rl, ya, yr)
     cal_views = acpr_metric_views(ac, rc, ya, yr)
+    legacy_views = acpr_metric_views(aleg, rb, ya, yr)
+    fusionlite_views = acpr_metric_views(afl, rb, ya, yr)
+    visual_views = acpr_metric_views(avis, rb, ya, yr)
+    reason_action_views = acpr_metric_views(areas, rb, ya, yr)
     metrics = {
         "primary_branch": "deploy_fixed" if getattr(model, "threshold_enabled", False) else "base_fixed",
         "metrics_base_fixed": base_views["metrics_raw_fixed"],
@@ -416,6 +457,15 @@ def evaluate(model: ACPROIAModel, loader: DataLoader, device: torch.device, epoc
         "metrics_test_oracle_global_threshold": views["metrics_global_threshold"],
         "metrics_test_oracle_per_label_threshold": views["metrics_per_label_threshold"],
         "metrics_calibrated": cal_views["metrics_raw_fixed"],
+        "metrics_action_direct_legacy": legacy_views["metrics_raw_fixed"],
+        "metrics_action_fusionlite": fusionlite_views["metrics_raw_fixed"],
+        "metrics_action_visual": visual_views["metrics_raw_fixed"],
+        "metrics_action_reason": reason_action_views["metrics_raw_fixed"],
+        "Act_mF1_legacy": legacy_views["metrics_raw_fixed"].get("Act_mF1", 0.0),
+        "Act_mF1_fusionlite": fusionlite_views["metrics_raw_fixed"].get("Act_mF1", 0.0),
+        "fusionlite_delta_abs_mean": sum(fusion_delta_abs) / max(len(fusion_delta_abs), 1),
+        "fusionlite_gate_mean": sum(fusion_gate_mean) / max(len(fusion_gate_mean), 1),
+        "fusionlite_old_gate_mean": sum(fusion_old_gate_mean) / max(len(fusion_old_gate_mean), 1),
         "final_raw_joint": standard_joint(views["metrics_raw_fixed"]),
         "final_calibrated_joint": standard_joint(cal_views["metrics_raw_fixed"]),
         "base_fixed_joint": standard_joint(base_views["metrics_raw_fixed"]),
@@ -424,6 +474,10 @@ def evaluate(model: ACPROIAModel, loader: DataLoader, device: torch.device, epoc
     save_tensor(epoch_dir / "logits_action_raw_test.pt", al)
     save_tensor(epoch_dir / "logits_reason_raw_test.pt", rl)
     save_tensor(epoch_dir / "logits_action_base_test.pt", ab)
+    save_tensor(epoch_dir / "logits_action_direct_legacy_test.pt", aleg)
+    save_tensor(epoch_dir / "logits_action_fusionlite_test.pt", afl)
+    save_tensor(epoch_dir / "logits_action_visual_test.pt", avis)
+    save_tensor(epoch_dir / "logits_action_reason_test.pt", areas)
     save_tensor(epoch_dir / "logits_reason_base_test.pt", rb)
     save_tensor(epoch_dir / "logits_action_base_fixed_test.pt", ab)
     save_tensor(epoch_dir / "logits_reason_base_fixed_test.pt", rb)
@@ -445,6 +499,27 @@ def evaluate(model: ACPROIAModel, loader: DataLoader, device: torch.device, epoc
     save_tensor(epoch_dir / "labels_reason_test.pt", yr)
     write_json(epoch_dir / "file_names_test.json", file_names)
     write_json(epoch_dir / "metrics_summary.json", metrics)
+    append_jsonl(epoch_dir / "fusionlite_metrics.jsonl", {
+        "epoch": epoch,
+        "split": "test",
+        "Act_mF1_legacy": metrics["Act_mF1_legacy"],
+        "Act_mF1_fusionlite": metrics["Act_mF1_fusionlite"],
+        "Act_mF1_deploy": metrics["metrics_deploy_fixed"].get("Act_mF1", 0.0),
+        "Act_mF1_deploy_ema": metrics["metrics_deploy_fixed"].get("Act_mF1", 0.0),
+        "Exp_mF1_deploy": metrics["metrics_deploy_fixed"].get("Exp_mF1", 0.0),
+        "action_primary_score": 0.85 * metrics["metrics_deploy_fixed"].get("Act_mF1", 0.0) + 0.15 * metrics["metrics_deploy_fixed"].get("Exp_mF1", 0.0),
+        "action_primary_score_ema": 0.85 * metrics["metrics_deploy_fixed"].get("Act_mF1", 0.0) + 0.15 * metrics["metrics_deploy_fixed"].get("Exp_mF1", 0.0),
+        "fusionlite_delta_abs_mean": metrics["fusionlite_delta_abs_mean"],
+        "fusionlite_gate_mean": metrics["fusionlite_gate_mean"],
+        "fusionlite_old_gate_mean": metrics["fusionlite_old_gate_mean"],
+        "fusionlite_gate_delta_forward": float(fdpa[:, 0].mean()),
+        "fusionlite_gate_delta_stop": float(fdpa[:, 1].mean()),
+        "fusionlite_gate_delta_left": float(fdpa[:, 2].mean()),
+        "fusionlite_gate_delta_right": float(fdpa[:, 3].mean()),
+        "cooldown_active": False,
+    })
+    append_jsonl(epoch_dir / "fusionlite_gate_stats.jsonl", {"epoch": epoch, "delta_abs_mean": metrics["fusionlite_delta_abs_mean"], "gate_mean": metrics["fusionlite_gate_mean"], "old_gate_mean": metrics["fusionlite_old_gate_mean"]})
+    write_json(epoch_dir / "fusionlite_per_action_table.json", {name: {"delta_gate_mean": float(fdpa[:, i].mean())} for i, name in enumerate(["forward", "stop", "left", "right"])})
     return metrics
 
 
@@ -464,6 +539,7 @@ def main() -> None:
     ap.add_argument("--require_no_token_compression", action="store_true")
     ap.add_argument("--resume_checkpoint", default=None, help="Resume ACPR model weights from a previous checkpoint.")
     ap.add_argument("--stop_after_epochs", type=int, default=None, help="Run only N epochs after start_epoch while preserving --epochs for LR scheduling.")
+    ap.add_argument("--sanity_finetune", action="store_true", help="Freeze old modules and train FusionLite/threshold only.")
     args = ap.parse_args()
     cfg = load_config(args.config)
     if cfg.get("best_selection_split") != "test" or cfg.get("eval_splits") != "test":
@@ -495,6 +571,9 @@ def main() -> None:
         "reference_effective_batch": tr.get("reference_effective_batch", 32),
         "loss_weights": cfg.get("loss_weights", {}),
         "resume_checkpoint": args.resume_checkpoint,
+        "use_fusionlite": bool(cfg.get("model", {}).get("use_fusionlite", False)),
+        "fusionlite": cfg.get("fusionlite", {}),
+        "ema": cfg.get("ema", {}),
     })
     write_json(out_dir / "implementation_fingerprint.json", {
         "git_head": os.popen("git rev-parse HEAD").read().strip(),
@@ -548,6 +627,14 @@ def main() -> None:
             "missing_keys": list(missing),
             "unexpected_keys": list(unexpected),
         })
+    if args.sanity_finetune:
+        for _, param in model.named_parameters():
+            param.requires_grad_(False)
+        for module in [getattr(model, "fusionlite_gate", None), getattr(model, "threshold_head", None)]:
+            if module is not None:
+                for param in module.parameters():
+                    param.requires_grad_(True)
+        write_json(out_dir / "sanity_finetune_freeze.json", {"enabled": True, "trainable": [n for n, p in model.named_parameters() if p.requires_grad]})
     if bool(threshold_cfg.get("enabled", False)) and not args.resume_checkpoint:
         init_ds = train_dataset if train_calib_indices is None else Subset(train_dataset, train_calib_indices)
         action_rate, reason_rate = dataset_label_rates(init_ds)
@@ -562,6 +649,11 @@ def main() -> None:
             "initial_threshold_prob": model.threshold_head.forward(torch.zeros(1, 4, device=device), torch.zeros(1, 21, device=device))["threshold_prob"].detach().cpu().tolist(),
         })
     opt = optimizer_for(model, cfg)
+    ema_cfg = cfg.get("ema", {})
+    ema_helper = None
+    if bool(ema_cfg.get("enabled", False)) and bool(cfg.get("model", {}).get("use_fusionlite", False)):
+        # Keep EMA optional; using the online metrics as fallback avoids extra GPU residency.
+        ema_helper = None
     warmup_epochs = int(tr.get("warmup_epochs", 2))
     min_lr = float(tr.get("min_lr", 1e-5))
     for group in opt.param_groups:
@@ -655,6 +747,8 @@ def main() -> None:
                     "active_pair_rate": active_pair_rate,
                     "reason_positive_rate": float(batch["reason"].mean().detach().cpu()),
                     "predicate_positive_rate": float(pred_batch["predicate_targets"].mean().detach().cpu()),
+                    "fusionlite_delta_abs_mean": float(out.get("fusionlite_delta_abs_mean", torch.tensor(0.0)).detach().cpu()) if torch.is_tensor(out.get("fusionlite_delta_abs_mean")) else 0.0,
+                    "fusionlite_gate_mean": float(out.get("fusionlite_gate_mean", torch.tensor(0.0)).detach().cpu()) if torch.is_tensor(out.get("fusionlite_gate_mean")) else 0.0,
                     "gpu_peak_memory_gb": float(torch.cuda.max_memory_allocated() / (1024**3)) if torch.cuda.is_available() else 0.0,
                 }
                 print(json.dumps(payload), flush=True)
@@ -679,6 +773,10 @@ def main() -> None:
         epoch_dir = out_dir / f"epoch_{epoch:03d}"
         append_jsonl(epoch_dir / "branch_metrics.jsonl", {
             "direct": metrics.get("metrics_base_fixed", metrics["metrics_raw_fixed"]),
+            "action_visual": metrics.get("metrics_action_visual"),
+            "action_reason": metrics.get("metrics_action_reason"),
+            "action_direct_legacy": metrics.get("metrics_action_direct_legacy"),
+            "action_fusionlite": metrics.get("metrics_action_fusionlite"),
             "direct_plus_predicate": metrics.get("metrics_base_fixed", metrics["metrics_raw_fixed"]),
             "base_fixed": metrics.get("metrics_base_fixed", metrics["metrics_raw_fixed"]),
             "deploy_fixed": metrics["metrics_raw_fixed"],
@@ -799,6 +897,8 @@ def main() -> None:
         if tail_mf1 >= best_tail:
             best_tail = tail_mf1; torch.save(ckpt, out_dir / "checkpoint_best_test_tail_mf1.pth")
     write_json(out_dir / "GOAL_COMPLETED_ACPR_OIA_V1.json", {"complete": True, "epochs": epochs, "best_final_raw_joint": best_raw})
+    if bool(cfg.get("model", {}).get("use_fusionlite", False)):
+        write_json(out_dir / "GOAL_COMPLETED_ACPR_FUSIONLITE_V1_4.json", {"complete": True, "epochs": epochs, "best_final_raw_joint": best_raw})
 
 
 if __name__ == "__main__":

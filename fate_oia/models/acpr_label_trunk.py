@@ -60,7 +60,9 @@ class ACPRLabelTrunk(nn.Module):
             "action_reason_logits": action_reason_logits,
             "reason_logits_visual": reason_logits_visual,
             "action_fusion_gate": gate,
+            "action_fusion_gate_legacy": gate,
             "action_token_norm_mean": action_nodes.norm(dim=-1).mean(),
             "predicate_conditioning_strength": torch.sigmoid(self.predicate_gate).detach(),
             "action_logits_direct": action_logits_direct,
+            "action_logits_direct_legacy": action_logits_direct,
         }

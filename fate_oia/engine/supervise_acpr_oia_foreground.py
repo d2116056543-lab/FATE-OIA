@@ -45,6 +45,8 @@ def main() -> None:
     ap.add_argument("--gradient_accumulation_steps", type=int, default=5)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--require_review_pass", action="store_true")
+    ap.add_argument("--resume_checkpoint", default="")
+    ap.add_argument("--sanity_finetune", action="store_true")
     args = ap.parse_args()
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -64,10 +66,11 @@ def main() -> None:
         ),
     )
     preflight = out / "supervisor_preflight"
-    audit_cmd = [sys.executable, "-m", "fate_oia.engine.audit_acpr_oia_implementation", "--config", args.config, "--output_dir", str(preflight), "--device", args.device, "--write_review_pass"]
+    audit_module = "fate_oia.engine.audit_acpr_fusionlite_implementation" if "fusionlite" in args.config.lower() else "fate_oia.engine.audit_acpr_oia_implementation"
+    audit_cmd = [sys.executable, "-m", audit_module, "--config", args.config, "--output_dir", str(preflight), "--device", args.device, "--write_review_pass"]
     if run_stream(audit_cmd, supervisor_log) != 0:
         raise SystemExit("ACPR audit failed; full training blocked")
-    pass_file = preflight / "REVIEW_PASS_ACPR_OIA_V1.txt"
+    pass_file = preflight / ("REVIEW_PASS_ACPR_FUSIONLITE_V1_4.txt" if "fusionlite" in args.config.lower() else "REVIEW_PASS_ACPR_OIA_V1.txt")
     if args.require_review_pass and not pass_file.exists():
         raise SystemExit("Missing REVIEW_PASS_ACPR_OIA_V1.txt")
     smoke_cmd = [sys.executable, "-u", "-m", "fate_oia.engine.train_acpr_oia", "--config", args.config, "--output_dir", str(out / "smoke"), "--epochs", "1", "--batch_size", "1", "--gradient_accumulation_steps", "2", "--max_train_samples", "4", "--max_test_samples", "4", "--device", args.device, "--test_only", "--no_feature_cache", "--require_no_token_compression"]
@@ -77,13 +80,18 @@ def main() -> None:
     last_error = None
     for batch, accum in fallback_ladder:
         train_cmd = [sys.executable, "-u", "-m", "fate_oia.engine.train_acpr_oia", "--config", args.config, "--output_dir", str(out), "--epochs", str(args.epochs), "--batch_size", str(batch), "--gradient_accumulation_steps", str(accum), "--device", args.device, "--test_only", "--no_feature_cache", "--require_no_token_compression"]
+        if args.resume_checkpoint:
+            train_cmd.extend(["--resume_checkpoint", args.resume_checkpoint])
+        if args.sanity_finetune:
+            train_cmd.append("--sanity_finetune")
         launch = json.dumps({"event": "acpr_supervisor_launch", "batch_size": batch, "grad_accum": accum, "fallback_ladder": fallback_ladder}, ensure_ascii=False)
         print(launch, flush=True)
         append_log(supervisor_log, launch)
         code = run_stream(train_cmd, supervisor_log)
         if code == 0:
             goal = out / "GOAL_COMPLETED_ACPR_OIA_V1.json"
-            if goal.exists():
+            fusion_goal = out / "GOAL_COMPLETED_ACPR_FUSIONLITE_V1_4.json"
+            if goal.exists() or fusion_goal.exists():
                 done = json.dumps({"event": "acpr_supervisor_completed", "goal": str(goal)}, ensure_ascii=False)
                 print(done, flush=True)
                 append_log(supervisor_log, done)
