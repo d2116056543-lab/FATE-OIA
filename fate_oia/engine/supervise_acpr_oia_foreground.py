@@ -46,6 +46,7 @@ def main() -> None:
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--require_review_pass", action="store_true")
     ap.add_argument("--resume_checkpoint", default="")
+    ap.add_argument("--stop_after_epochs", type=int, default=None)
     ap.add_argument("--sanity_finetune", action="store_true")
     args = ap.parse_args()
     out = Path(args.output_dir)
@@ -82,6 +83,8 @@ def main() -> None:
         train_cmd = [sys.executable, "-u", "-m", "fate_oia.engine.train_acpr_oia", "--config", args.config, "--output_dir", str(out), "--epochs", str(args.epochs), "--batch_size", str(batch), "--gradient_accumulation_steps", str(accum), "--device", args.device, "--test_only", "--no_feature_cache", "--require_no_token_compression"]
         if args.resume_checkpoint:
             train_cmd.extend(["--resume_checkpoint", args.resume_checkpoint])
+        if args.stop_after_epochs is not None:
+            train_cmd.extend(["--stop_after_epochs", str(args.stop_after_epochs)])
         if args.sanity_finetune:
             train_cmd.append("--sanity_finetune")
         launch = json.dumps({"event": "acpr_supervisor_launch", "batch_size": batch, "grad_accum": accum, "fallback_ladder": fallback_ladder}, ensure_ascii=False)

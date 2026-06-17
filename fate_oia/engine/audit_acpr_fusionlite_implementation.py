@@ -113,6 +113,9 @@ def main() -> None:
     checks["ema_actual_created"] = "ema_helper = ModelEMA" in train_text and "apply_to(model)" in train_text and "restore(model, backup)" in train_text
     checks["cooldown_actual"] = "train_calib_action_primary_scores" in train_text and "action_primary_cooldown_should_trigger" in train_text and "fusionlite_cooldown_events.jsonl" in train_text
     checks["fusionlite_artifacts_complete"] = all(s in train_text for s in ["fusionlite_metrics.jsonl", "fusionlite_gate_stats.jsonl", "fusionlite_per_action_table.json", "deploy_fixed_ema", "old_gate_mean", "new_gate_mean", "visual_F1", "reason_F1", "legacy_F1", "fusionlite_F1"])
+    supervisor_text = Path("fate_oia/engine/supervise_acpr_oia_foreground.py").read_text(encoding="utf-8")
+    script_text = Path("scripts/FATE_OIA_acpr_fusionlite_v1_4_foreground.ps1").read_text(encoding="utf-8")
+    checks["supervisor_stop_after_epochs"] = "--stop_after_epochs" in supervisor_text and "StopAfterEpochs" in script_text
     checks["reason_unchanged_by_fusionlite_contract"] = "reason_logits_base = trunk[\"reason_logits_visual\"] + reason_delta" in Path("fate_oia/models/acpr_oia_model.py").read_text(encoding="utf-8")
     pass_all = not missing and all(checks.values())
     result = {

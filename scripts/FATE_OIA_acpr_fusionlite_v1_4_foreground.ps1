@@ -5,6 +5,7 @@ param(
   [string]$Device = "cuda",
   [switch]$RequireReviewPass,
   [string]$Resume = "",
+  [int]$StopAfterEpochs = 0,
   [switch]$SanityFineTune
 )
 $ErrorActionPreference = "Stop"
@@ -20,5 +21,6 @@ $argsList = @(
 )
 if ($RequireReviewPass) { $argsList += "--require_review_pass" }
 if ($Resume -ne "") { $argsList += @("--resume_checkpoint", $Resume) }
+if ($StopAfterEpochs -gt 0) { $argsList += @("--stop_after_epochs", "$StopAfterEpochs") }
 if ($SanityFineTune) { $argsList += "--sanity_finetune" }
 & E:\Anaconda\envs\sbw39\python.exe @argsList
