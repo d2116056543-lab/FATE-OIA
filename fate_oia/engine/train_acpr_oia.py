@@ -136,11 +136,18 @@ def lr_multiplier_for_epoch(epoch: int, total_epochs: int, warmup_epochs: int, m
     return min_lr + (1 - min_lr) * 0.5 * (1 + math.cos(math.pi * progress))
 
 
-def set_epoch_lrs(optimizer: torch.optim.Optimizer, epoch: int, total_epochs: int, warmup_epochs: int, min_lr: float) -> None:
+def set_epoch_lrs(optimizer: torch.optim.Optimizer, epoch: int, total_epochs: int, warmup_epochs: int, min_lr: float, phase: dict | None = None) -> None:
     mult = lr_multiplier_for_epoch(epoch, total_epochs, warmup_epochs, min_lr)
+    phase = phase or {}
     for group in optimizer.param_groups:
         base_lr = group.setdefault("base_lr", group["lr"])
-        group["lr"] = base_lr * mult
+        extra = 1.0
+        name = str(group.get("name", ""))
+        if name == "triadic_mediator":
+            extra = float(phase.get("triadic_lr_multiplier", 1.0))
+        elif name == "threshold":
+            extra = float(phase.get("threshold_delta_lr_multiplier", 1.0))
+        group["lr"] = base_lr * mult * extra
 
 
 def reason_predicate_matrices(grammar: ACPRReasonGrammar, predicate_names: list[str], device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
@@ -419,8 +426,17 @@ def compute_losses(
         "calibration": L.calibration_loss(out["action_logits_calibrated"], out["reason_logits_calibrated"], action, reason),
         "predicate_attention_compactness": L.predicate_attention_compactness_loss(out["predicate_attention"]),
     }
-    total = sum(terms[k] * float(weights.get(k, 0.0)) for k in terms)
+    term_weights = dict(weights)
+    if not bool(phase.get("triadic_enabled", True)):
+        term_weights["triadic_consistency"] = 0.0
+    if not bool(phase.get("threshold_delta_enabled", True)):
+        term_weights["threshold_delta_l2"] = 0.0
+    total = sum(terms[k] * float(term_weights.get(k, 0.0)) for k in terms)
     parts = {f"loss_{k}": float(v.detach().cpu()) for k, v in terms.items()}
+    parts.update({f"weight_{k}": float(term_weights.get(k, 0.0)) for k in terms})
+    parts["main_prediction_loss"] = float(main_prediction_loss.detach().cpu())
+    parts["predicate_mediator_loss"] = float((patch_loss * float(term_weights.get("predicate_patch_alignment", 0.0)) + triadic_loss * float(term_weights.get("triadic_consistency", 0.0)) + pu_loss * float(term_weights.get("predicate_conditioned_pu", 0.0)) + pair_logit_capped * float(term_weights.get("matched_pair_logit", 0.0)) + pair_embed * float(term_weights.get("matched_pair_embed", 0.0))).detach().cpu())
+    parts["calalign_loss"] = float((threshold_delta_l2 * float(term_weights.get("threshold_delta_l2", 0.0)) + terms["calibration"] * float(term_weights.get("calibration", 0.0))).detach().cpu())
     parts.update({f"pair_logit_{k}": v for k, v in pair_logit_stats.items()})
     parts.update({f"pair_embed_{k}": v for k, v in pair_embed_stats.items()})
     parts.update({f"predicate_patch_{k}": v for k, v in patch_stats.items()})
@@ -673,14 +689,15 @@ def main() -> None:
     if args.stop_after_epochs is not None:
         end_epoch = min(epochs, start_epoch + max(0, int(args.stop_after_epochs)))
     for epoch in range(start_epoch, end_epoch):
-        set_epoch_lrs(opt, epoch, epochs, warmup_epochs, min_lr)
+        epoch_phase = pmt_phase_for_epoch(epoch, cfg.get("pmt", {}))
+        set_epoch_lrs(opt, epoch, epochs, warmup_epochs, min_lr, epoch_phase)
         model.train()
         opt.zero_grad(set_to_none=True)
         for step, batch in enumerate(train_loader, start=1):
             batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
             pred_batch = target_builder.build(batch["file_name"], device=device)
             patch_batch = patch_target_builder.build(batch["file_name"], device=device)
-            phase = pmt_phase_for_epoch(epoch, cfg.get("pmt", {}))
+            phase = epoch_phase
             out = model(batch["image"], epoch=epoch, predicate_patch_targets=patch_batch["predicate_patch_targets"])
             pairs = model.pair_memory.mine(
                 batch["file_name"],
@@ -710,6 +727,7 @@ def main() -> None:
             threshold_loss, threshold_parts = compute_threshold_losses(model, out, batch, cfg, epoch)
             loss = loss + threshold_loss
             parts.update(threshold_parts)
+            last_parts = dict(parts)
             (loss / accum).backward()
             if step % accum == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), float(tr.get("grad_clip", 1.0)))
@@ -796,9 +814,9 @@ def main() -> None:
                 "threshold_delta_abs_mean": float(out.get("threshold_delta", torch.zeros_like(out["logits_base_fixed"])).detach().abs().mean().cpu()),
                 "threshold_prob": json_safe(out.get("threshold_prob", torch.empty(0)).detach().cpu()) if torch.is_tensor(out.get("threshold_prob")) else [],
             },
-            "pmt_hardpair_stats": {"available": True, **pair_summary(pairs)},
-            "pmt_pu_stats": {"available": True, "pu_stats_source": "loss_components.jsonl"},
-            "loss_group_components": {"available": True, "source": "loss_components.jsonl"},
+            "pmt_hardpair_stats": {"available": True, **pair_summary(pairs), "predicate_filtered_pair_count": float(last_parts.get("predicate_filtered_pair_count", 0.0)) if "last_parts" in locals() else 0.0, "weak_predicate_pair_count": float(last_parts.get("weak_predicate_pair_count", 0.0)) if "last_parts" in locals() else 0.0},
+            "pmt_pu_stats": {"available": True, "positive_weight_mean": float(last_parts.get("pmt_pu_positive_weight_mean", 0.0)) if "last_parts" in locals() else 0.0, "negative_weight_mean": float(last_parts.get("pmt_pu_negative_weight_mean", 0.0)) if "last_parts" in locals() else 0.0, "pu_neg_weight_mean": float(last_parts.get("pmt_pu_pu_neg_weight_mean", 0.0)) if "last_parts" in locals() else 0.0},
+            "loss_group_components": {"available": True, "main_prediction_loss": float(last_parts.get("main_prediction_loss", 0.0)) if "last_parts" in locals() else 0.0, "predicate_mediator_loss": float(last_parts.get("predicate_mediator_loss", 0.0)) if "last_parts" in locals() else 0.0, "calalign_loss": float(last_parts.get("calalign_loss", 0.0)) if "last_parts" in locals() else 0.0},
         })
         pair_epoch_payload = pair_artifact_payload(pairs)
         append_jsonl(epoch_dir / "pair_mining_stats.jsonl", {"available": True, **pair_summary(pairs)})
@@ -908,7 +926,7 @@ def main() -> None:
             best_act = act; torch.save(ckpt, out_dir / "checkpoint_best_test_action_mf1.pth")
         if tail_mf1 >= best_tail:
             best_tail = tail_mf1; torch.save(ckpt, out_dir / "checkpoint_best_test_tail_mf1.pth")
-    write_json(out_dir / "GOAL_COMPLETED_ACPR_OIA_V1.json", {"complete": True, "epochs": epochs, "best_final_raw_joint": best_raw})
+    write_json(out_dir / "GOAL_COMPLETED_ACPR_PMT_S_V1.json", {"complete": True, "epochs": epochs, "best_final_raw_joint": best_raw})
 
 
 if __name__ == "__main__":
