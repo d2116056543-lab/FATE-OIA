@@ -22,6 +22,9 @@ from fate_oia.transforms import AspectRatioLetterboxTransform
 from fate_oia.losses import acpr_losses as L
 from fate_oia.losses import acpr_threshold_losses as TL
 from fate_oia.utils.acpr_artifacts import append_jsonl, json_safe, save_tensor, write_json
+from fate_oia.utils.acpr_pair_budget import apply_pair_budget
+from fate_oia.utils.acpr_seca_artifacts import seca_metrics_payload
+from fate_oia.utils.acpr_seca_training_control import ACPRSECATrainingControl, apply_lr_cooldown, update_warmup_cosine_multiplier
 from fate_oia.utils.acpr_pair_mining import pair_summary
 from fate_oia.utils.acpr_threshold_search import search_best_thresholds_for_f1
 from fate_oia.utils.acpr_thresholds import acpr_metric_views, standard_joint
@@ -54,7 +57,10 @@ def make_loader(cfg: dict, split: str, batch_size: int, max_samples: int | None,
         ds = Subset(ds, indices)
     if max_samples:
         ds = Subset(ds, list(range(min(max_samples, len(ds)))))
-    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, collate_fn=collate, pin_memory=torch.cuda.is_available())
+    loader_kwargs = {"batch_size": batch_size, "shuffle": shuffle, "num_workers": num_workers, "collate_fn": collate, "pin_memory": torch.cuda.is_available()}
+    if num_workers > 0:
+        loader_kwargs.update({"persistent_workers": bool(cfg.get("data", {}).get("persistent_workers", True)), "prefetch_factor": int(cfg.get("data", {}).get("prefetch_factor", 2))})
+    return DataLoader(ds, **loader_kwargs)
 
 
 def build_model(cfg: dict, device: torch.device) -> ACPROIAModel:
@@ -67,6 +73,10 @@ def build_model(cfg: dict, device: torch.device) -> ACPROIAModel:
         grammar_path=str(cfg.get("grammar", {}).get("path", "configs/acpr_reason_predicate_grammar.yaml")),
         use_mock_dino=bool(model_cfg.get("use_mock_dino", False)),
         threshold_enabled=bool(threshold_cfg.get("enabled", False)),
+        seca_enabled=bool(model_cfg.get("seca", {}).get("enabled", model_cfg.get("seca_enabled", False))),
+        seca_num_heads=int(model_cfg.get("seca", {}).get("num_heads", model_cfg.get("seca_num_heads", 4))),
+        seca_max_residual_scale=float(model_cfg.get("seca", {}).get("max_residual_scale", model_cfg.get("seca_max_residual_scale", 0.20))),
+        seca_evidence_grad_scale=float(model_cfg.get("seca", {}).get("evidence_grad_scale", model_cfg.get("seca_evidence_grad_scale", 0.25))),
         threshold_kwargs={
             "action_threshold_min": float(threshold_cfg.get("action_threshold_min", 0.10)),
             "action_threshold_max": float(threshold_cfg.get("action_threshold_max", 0.90)),
@@ -81,11 +91,18 @@ def build_model(cfg: dict, device: torch.device) -> ACPROIAModel:
     return model.to(device)
 
 
+
 def optimizer_for(model: ACPROIAModel, cfg: dict) -> torch.optim.Optimizer:
     tr = cfg.get("training", {})
     threshold_cfg = cfg.get("threshold", {})
+    seca = getattr(model.trunk, "seca", None)
+    seca_ids = {id(p) for p in seca.parameters()} if seca is not None else set()
+    seca_gate_ids = {id(getattr(seca, "residual_gate_raw"))} if seca is not None else set()
+    trunk_params = [p for p in model.trunk.parameters() if id(p) not in seca_ids]
+    seca_gate = [p for p in (seca.parameters() if seca is not None else []) if id(p) in seca_gate_ids]
+    seca_body = [p for p in (seca.parameters() if seca is not None else []) if id(p) not in seca_gate_ids]
     groups = [
-        {"params": list(model.trunk.parameters()), "lr": float(tr.get("lr_trunk", 2e-4)), "name": "trunk"},
+        {"params": trunk_params, "lr": float(tr.get("lr_trunk", 2e-4)), "name": "trunk_without_seca"},
         {"params": list(model.predicate_head.parameters()), "lr": float(tr.get("lr_predicate", 2e-4)), "name": "predicate"},
         {"params": list(model.predicate_reason.parameters()), "lr": float(tr.get("lr_reason_predicate", 2e-4)), "name": "reason_predicate"},
         {"params": list(model.pair_memory.parameters()), "lr": float(tr.get("lr_pair_projection", 2e-4)), "name": "pair_projection"},
@@ -93,6 +110,10 @@ def optimizer_for(model: ACPROIAModel, cfg: dict) -> torch.optim.Optimizer:
         {"params": list(model.action_combo_aux.parameters()), "lr": float(tr.get("lr_trunk", 2e-4)), "name": "combo"},
         {"params": list(model.calibration.parameters()), "lr": float(tr.get("lr_calibration", 5e-4)), "name": "calibration"},
     ]
+    if seca_body:
+        groups.append({"params": seca_body, "lr": float(tr.get("lr_seca", 3e-4)), "weight_decay": float(tr.get("weight_decay_seca", 0.01)), "name": "seca_projections_and_null"})
+    if seca_gate:
+        groups.append({"params": seca_gate, "lr": float(tr.get("lr_seca_gate", 1e-3)), "weight_decay": 0.0, "name": "seca_gate"})
     if bool(threshold_cfg.get("enabled", False)):
         groups.append({
             "params": list(model.threshold_head.parameters()),
@@ -100,7 +121,20 @@ def optimizer_for(model: ACPROIAModel, cfg: dict) -> torch.optim.Optimizer:
             "weight_decay": float(threshold_cfg.get("weight_decay_threshold", 0.0)),
             "name": "threshold",
         })
-    return torch.optim.AdamW(groups, weight_decay=float(tr.get("weight_decay", 0.05)))
+    seen: set[int] = set()
+    clean_groups = []
+    for group in groups:
+        params = [p for p in group["params"] if p.requires_grad]
+        for p in params:
+            if id(p) in seen:
+                raise RuntimeError(f"Duplicate optimizer parameter in group {group.get('name')}")
+            seen.add(id(p))
+        if params:
+            g = dict(group)
+            g["params"] = params
+            clean_groups.append(g)
+    return torch.optim.AdamW(clean_groups, weight_decay=float(tr.get("weight_decay", 0.05)))
+
 
 
 def scheduler_for(optimizer: torch.optim.Optimizer, total_epochs: int, warmup_epochs: int, min_lr: float):
@@ -335,6 +369,7 @@ def pair_artifact_payload(pairs: dict, reason_names: list[str] | None = None) ->
     return {"available": True, **summary, "per_reason": per_reason}
 
 
+
 def compute_losses(out: dict, batch: dict, predicate_batch: dict, pairs: dict, grammar_matrices: tuple[torch.Tensor, torch.Tensor], weights: dict) -> tuple[torch.Tensor, dict[str, float]]:
     action = batch["action"]
     reason = batch["reason"]
@@ -348,24 +383,36 @@ def compute_losses(out: dict, batch: dict, predicate_batch: dict, pairs: dict, g
         "reason_soft_f1": L.reason_soft_f1_loss(out["reason_logits_base"], reason),
         "predicate_weak": L.predicate_weak_bce_mil_loss(out["predicate_logits"], predicate_batch["predicate_targets"], predicate_batch["predicate_mask"], predicate_batch.get("predicate_reliability")),
         "predicate_reason_align": L.predicate_reason_alignment_loss(out["predicate_probs"], reason, grammar_matrices[0], grammar_matrices[1]),
-        "matched_pair_logit": pair_logit,
-        "matched_pair_embed": pair_embed,
         "action_combo_ce": L.action_combo_ce_loss(out["action_set_logits"], action),
         "action_combo_drop_add": L.action_combo_drop_add_loss(out["action_set_logits"], action),
         "cardinality": L.cardinality_loss(out["cardinality_logits"], action),
         "calibration": L.calibration_loss(out["action_logits_calibrated"], out["reason_logits_calibrated"], action, reason),
         "predicate_attention_compactness": L.predicate_attention_compactness_loss(out["predicate_attention"]),
     }
-    total = sum(terms[k] * float(weights.get(k, 0.0)) for k in terms)
+    main_for_budget = terms["action_direct"] * float(weights.get("action_direct", 0.0)) + terms["reason_partial"] * float(weights.get("reason_partial", 0.0))
+    pair_used, budget_stats = apply_pair_budget(
+        pair_logit,
+        pair_embed,
+        pair_logit_weight=float(weights.get("matched_pair_logit", 0.0)),
+        pair_embed_weight=float(weights.get("matched_pair_embed", 0.0)),
+        main_loss=main_for_budget,
+        pair_budget_ratio=float(weights.get("pair_budget_ratio", 0.25)),
+    )
+    total = sum(terms[k] * float(weights.get(k, 0.0)) for k in terms) + pair_used
     parts = {f"loss_{k}": float(v.detach().cpu()) for k, v in terms.items()}
+    parts["loss_matched_pair_logit"] = float(pair_logit.detach().cpu())
+    parts["loss_matched_pair_embed"] = float(pair_embed.detach().cpu())
+    parts.update(budget_stats)
     parts.update({f"pair_logit_{k}": v for k, v in pair_logit_stats.items()})
     parts.update({f"pair_embed_{k}": v for k, v in pair_embed_stats.items()})
     return total, parts
 
 
+
 @torch.no_grad()
 def evaluate(model: ACPROIAModel, loader: DataLoader, device: torch.device, epoch: int, out_dir: Path) -> dict:
     model.eval()
+    action_legacy_base = []
     action_base = []
     reason_base = []
     action_logits = []
@@ -378,11 +425,20 @@ def evaluate(model: ACPROIAModel, loader: DataLoader, device: torch.device, epoc
     action_set_probs = []
     predicate_logits = []
     predicate_probs = []
+    seca_attentions = []
+    reason_predicate_attentions = []
+    predicate_patch_cases = []
+    seca_nulls = []
+    seca_active_counts = []
+    seca_entropies = []
+    seca_diversities = []
+    seca_context_norms = []
+    seca_residual_scale = None
     file_names: list[str] = []
-    pred_stats = []
     for batch in loader:
         batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
         out = model(batch["image"], epoch=epoch)
+        action_legacy_base.append(out.get("action_logits_legacy_base", out["action_logits_base"]).cpu())
         action_base.append(out["action_logits_base"].cpu())
         reason_base.append(out["reason_logits_base"].cpu())
         action_logits.append(out["action_logits_final_raw"].cpu())
@@ -396,7 +452,30 @@ def evaluate(model: ACPROIAModel, loader: DataLoader, device: torch.device, epoc
         predicate_logits.append(out["predicate_logits"].cpu())
         predicate_probs.append(out["predicate_probs"].cpu())
         file_names.extend(batch["file_name"])
-        pred_stats.append(out["predicate_stats"])
+        if torch.is_tensor(out.get("seca_action_reason_attention")):
+            seca_attentions.append(out["seca_action_reason_attention"].detach().cpu().to(torch.float16))
+        if torch.is_tensor(out.get("reason_predicate_attention")):
+            rpa = out["reason_predicate_attention"].detach().cpu()
+            if rpa.dim() == 4:
+                rpa = rpa.mean(dim=1)
+            reason_predicate_attentions.append(rpa.to(torch.float16))
+        if torch.is_tensor(out.get("predicate_attention")) and sum(x.shape[0] for x in predicate_patch_cases) < 64:
+            remain = 64 - sum(x.shape[0] for x in predicate_patch_cases)
+            predicate_patch_cases.append(out["predicate_attention"][:remain].detach().cpu().to(torch.float16))
+        if torch.is_tensor(out.get("seca_null_attention")):
+            seca_nulls.append(out["seca_null_attention"].detach().cpu())
+        if torch.is_tensor(out.get("seca_active_reason_count")):
+            seca_active_counts.append(out["seca_active_reason_count"].detach().flatten().cpu())
+        if torch.is_tensor(out.get("seca_attention_entropy")):
+            seca_entropies.append(out["seca_attention_entropy"].detach().flatten().cpu())
+        if torch.is_tensor(out.get("seca_action_attention_diversity")):
+            seca_diversities.append(out["seca_action_attention_diversity"].detach().flatten().cpu())
+        if torch.is_tensor(out.get("seca_evidence_context_norm")):
+            seca_context_norms.append(out["seca_evidence_context_norm"].detach().flatten().cpu())
+        if torch.is_tensor(out.get("seca_residual_scale")):
+            seca_residual_scale = out["seca_residual_scale"].detach().cpu()
+
+    alg = torch.cat(action_legacy_base)
     ab = torch.cat(action_base)
     rb = torch.cat(reason_base)
     al = torch.cat(action_logits)
@@ -405,11 +484,13 @@ def evaluate(model: ACPROIAModel, loader: DataLoader, device: torch.device, epoc
     rc = torch.cat(reason_cal)
     ya = torch.cat(action_labels)
     yr = torch.cat(reason_labels)
+    legacy_views = acpr_metric_views(alg, rb, ya, yr)
     base_views = acpr_metric_views(ab, rb, ya, yr)
     views = acpr_metric_views(al, rl, ya, yr)
     cal_views = acpr_metric_views(ac, rc, ya, yr)
     metrics = {
         "primary_branch": "deploy_fixed" if getattr(model, "threshold_enabled", False) else "base_fixed",
+        "metrics_legacy_base_fixed": legacy_views["metrics_raw_fixed"],
         "metrics_base_fixed": base_views["metrics_raw_fixed"],
         **views,
         "metrics_deploy_fixed": views["metrics_raw_fixed"],
@@ -421,6 +502,8 @@ def evaluate(model: ACPROIAModel, loader: DataLoader, device: torch.device, epoc
         "base_fixed_joint": standard_joint(base_views["metrics_raw_fixed"]),
     }
     epoch_dir = out_dir / f"epoch_{epoch:03d}"
+    save_tensor(epoch_dir / "logits_action_legacy_base_test.pt", alg)
+    save_tensor(epoch_dir / "logits_action_seca_base_test.pt", ab)
     save_tensor(epoch_dir / "logits_action_raw_test.pt", al)
     save_tensor(epoch_dir / "logits_reason_raw_test.pt", rl)
     save_tensor(epoch_dir / "logits_action_base_test.pt", ab)
@@ -445,6 +528,82 @@ def evaluate(model: ACPROIAModel, loader: DataLoader, device: torch.device, epoc
     save_tensor(epoch_dir / "labels_reason_test.pt", yr)
     write_json(epoch_dir / "file_names_test.json", file_names)
     write_json(epoch_dir / "metrics_summary.json", metrics)
+
+    seca_all = torch.cat(seca_attentions) if seca_attentions else torch.empty(0, 4, 22, dtype=torch.float16)
+    reason_pred_all = torch.cat(reason_predicate_attentions) if reason_predicate_attentions else torch.empty(0, 21, 32, dtype=torch.float16)
+    pred_cases = torch.cat(predicate_patch_cases)[:64] if predicate_patch_cases else torch.empty(0, 32, 3600, dtype=torch.float16)
+    save_tensor(epoch_dir / "seca_action_reason_attention_test.pt", seca_all)
+    save_tensor(epoch_dir / "reason_predicate_attention_test.pt", reason_pred_all)
+    save_tensor(epoch_dir / "predicate_patch_attention_cases.pt", pred_cases)
+
+    aggregate_out = {
+        "seca_enabled": bool(seca_attentions),
+        "seca_residual_scale": seca_residual_scale if seca_residual_scale is not None else torch.empty(0),
+        "seca_null_attention": torch.cat(seca_nulls) if seca_nulls else torch.empty(0),
+        "seca_active_reason_count": torch.cat(seca_active_counts) if seca_active_counts else torch.empty(0),
+        "seca_attention_entropy": torch.cat(seca_entropies) if seca_entropies else torch.empty(0),
+        "seca_action_attention_diversity": torch.cat(seca_diversities) if seca_diversities else torch.empty(0),
+        "seca_evidence_context_norm": torch.cat(seca_context_norms) if seca_context_norms else torch.empty(0),
+    }
+    seca_payload = seca_metrics_payload(aggregate_out, metrics)
+    write_json(epoch_dir / "seca_metrics.json", seca_payload)
+
+    chain_path = epoch_dir / "seca_evidence_chains.jsonl"
+    if chain_path.exists():
+        chain_path.unlink()
+    probs = torch.sigmoid(al)
+    reason_probs = torch.sigmoid(rl)
+    exact = ((probs >= 0.5) == ya.bool()).all(dim=1)
+    high_conf = probs.max(dim=1).values
+    null_mean = seca_all.float()[..., 21].mean(dim=1) if seca_all.numel() else torch.zeros(len(file_names))
+    categories: list[tuple[str, torch.Tensor]] = [
+        ("correct_high_conf", torch.where(exact & (high_conf >= 0.70))[0]),
+        ("wrong_high_conf", torch.where((~exact) & (high_conf >= 0.70))[0]),
+        ("combo", torch.where(ya.sum(dim=1) >= 2)[0]),
+        ("tail_reason", torch.where(yr[:, [12, 9, 5, 14, 6, 11, 10, 13]].sum(dim=1) > 0)[0] if yr.shape[1] > 14 else torch.empty(0, dtype=torch.long)),
+        ("null_heavy", torch.where(null_mean >= 0.50)[0]),
+        ("non_null_heavy", torch.where(null_mean < 0.50)[0]),
+    ]
+    written = set()
+    for category, idxs in categories:
+        for idx in idxs[:4].tolist():
+            key = (category, int(idx))
+            if key in written or idx >= len(file_names):
+                continue
+            written.add(key)
+            top_action = int(probs[idx].argmax().item())
+            top_reason = int(reason_probs[idx].argmax().item())
+            attention = seca_all[idx, top_action].float().tolist() if idx < seca_all.shape[0] else []
+            append_jsonl(chain_path, {
+                "available": True,
+                "category": category,
+                "file_name": file_names[idx],
+                "top_action": top_action,
+                "top_reason": top_reason,
+                "gt_action": json_safe(ya[idx]),
+                "gt_reason": json_safe(yr[idx]),
+                "action_prob": json_safe(probs[idx]),
+                "reason_prob_top": float(reason_probs[idx, top_reason]),
+                "seca_action_reason_attention_22": attention,
+                "null_attention": float(null_mean[idx]) if idx < null_mean.numel() else 0.0,
+            })
+    if not written:
+        append_jsonl(chain_path, {"available": False, "reason": "no eligible SECA evidence cases"})
+    rows = [
+        "<tr><th>category</th><th>file</th><th>top_action</th><th>top_reason</th><th>null_attention</th></tr>"
+    ]
+    for line in chain_path.read_text(encoding="utf-8").splitlines()[:80]:
+        try:
+            item = json.loads(line)
+        except Exception:
+            continue
+        rows.append(
+            f"<tr><td>{item.get('category','')}</td><td>{item.get('file_name','')}</td><td>{item.get('top_action','')}</td><td>{item.get('top_reason','')}</td><td>{item.get('null_attention','')}</td></tr>"
+        )
+    (epoch_dir / "seca_evidence_report.html").write_text(
+        "<html><body><h1>ACPR-SECA evidence report</h1><table>" + "\n".join(rows) + "</table></body></html>",
+        encoding="utf-8",
+    )
     return metrics
 
 
@@ -564,12 +723,24 @@ def main() -> None:
     opt = optimizer_for(model, cfg)
     warmup_epochs = int(tr.get("warmup_epochs", 2))
     min_lr = float(tr.get("min_lr", 1e-5))
+    min_lr_ratio = float(tr.get("min_lr_ratio", min_lr / max(float(tr.get("lr_trunk", 2e-4)), 1e-12)))
     for group in opt.param_groups:
         group.setdefault("base_lr", group["lr"])
     if resume_ckpt is not None and "optimizer" in resume_ckpt:
         opt.load_state_dict(resume_ckpt["optimizer"])
         for group in opt.param_groups:
             group.setdefault("base_lr", group["lr"])
+    updates_per_epoch = max(math.ceil(len(train_loader) / max(accum, 1)), 1)
+    total_updates = max(updates_per_epoch * max(epochs, 1), 1)
+    warmup_updates = max(updates_per_epoch * max(warmup_epochs, 1), 1)
+    seca_control_cfg = cfg.get("seca_training_control", {})
+    seca_control = ACPRSECATrainingControl(
+        cooldown_start_epoch=int(seca_control_cfg.get("cooldown_start_epoch", 6)),
+        patience=int(seca_control_cfg.get("patience", 2)),
+        non_threshold_lr_mult=float(seca_control_cfg.get("non_threshold_lr_mult", 0.20)),
+        threshold_lr_mult=float(seca_control_cfg.get("threshold_lr_mult", 0.50)),
+    )
+    seca_control_state = {"cooldown_active": False, "non_threshold_lr_mult": 1.0, "threshold_lr_mult": 1.0, "bad_epochs": 0}
     grammar = ACPRReasonGrammar(cfg.get("grammar", {}).get("path", "configs/acpr_reason_predicate_grammar.yaml"))
     target_builder = WeakPredicateTargetBuilder(cfg.get("predicate", {}).get("scene_config", "configs/acpr_scene_predicates.yaml"), cfg.get("bdd100k_root"))
     matrices = reason_predicate_matrices(grammar, model.predicate_head.names, device)
@@ -599,7 +770,7 @@ def main() -> None:
     if args.stop_after_epochs is not None:
         end_epoch = min(epochs, start_epoch + max(0, int(args.stop_after_epochs)))
     for epoch in range(start_epoch, end_epoch):
-        set_epoch_lrs(opt, epoch, epochs, warmup_epochs, min_lr)
+        # SECA uses update-based warmup/cosine; per-step LR is set immediately before optimizer.step().
         model.train()
         opt.zero_grad(set_to_none=True)
         for step, batch in enumerate(train_loader, start=1):
@@ -636,6 +807,9 @@ def main() -> None:
             parts.update(threshold_parts)
             (loss / accum).backward()
             if step % accum == 0:
+                update_idx = epoch * updates_per_epoch + ((step - 1) // max(accum, 1))
+                lr_mult = update_warmup_cosine_multiplier(update_idx, total_updates, warmup_updates, min_lr_ratio=min_lr_ratio)
+                apply_lr_cooldown(opt, seca_control_state, lr_multiplier=lr_mult)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), float(tr.get("grad_clip", 1.0)))
                 opt.step()
                 opt.zero_grad(set_to_none=True)
@@ -648,6 +822,10 @@ def main() -> None:
                     "total_steps": len(train_loader),
                     "lr": opt.param_groups[0]["lr"],
                     "loss_total": float(loss.detach().cpu()),
+                    "seca_residual_scale": json_safe(out.get("seca_residual_scale", torch.empty(0)).detach().cpu()) if torch.is_tensor(out.get("seca_residual_scale")) else [],
+                    "seca_null_attention_mean": float(out.get("seca_null_attention", torch.zeros(1, device=device)).detach().float().mean().cpu()) if torch.is_tensor(out.get("seca_null_attention")) else 0.0,
+                    "seca_active_reason_count": float(out.get("seca_active_reason_count", torch.tensor(0.0, device=device)).detach().cpu()) if torch.is_tensor(out.get("seca_active_reason_count")) else 0.0,
+                    "seca_attention_entropy": float(out.get("seca_attention_entropy", torch.tensor(0.0, device=device)).detach().cpu()) if torch.is_tensor(out.get("seca_attention_entropy")) else 0.0,
                     **parts,
                     **pair_summary(pairs),
                     "matched_pair_weight_logit": pair_logit_weight,
@@ -671,13 +849,18 @@ def main() -> None:
             )
         if bool(threshold_cfg.get("enabled", False)) and train_calib_loader is not None and epoch >= int(threshold_cfg.get("teacher_update_start_epoch", 2)):
             if (epoch - int(threshold_cfg.get("teacher_update_start_epoch", 2))) % int(threshold_cfg.get("teacher_update_every", 1)) == 0:
-                update_threshold_teacher_from_train_calib(model, train_calib_loader, device, epoch, cfg, out_dir)
+                teacher_payload = update_threshold_teacher_from_train_calib(model, train_calib_loader, device, epoch, cfg, out_dir)
+                teacher_metric = float(sum(teacher_payload.get("best_f1", [])) / max(len(teacher_payload.get("best_f1", [])), 1))
+                seca_control_state = seca_control.update(epoch, teacher_metric)
+                append_jsonl(out_dir / "seca_training_control.jsonl", {"epoch": epoch, "source": "train_calib_teacher_best_f1", **seca_control_state})
         metrics = evaluate(model, test_loader, device, epoch, out_dir)
         row = {"event": "acpr_epoch", "epoch": epoch, **metrics}
         print(json.dumps(json_safe(row)), flush=True)
         append_jsonl(out_dir / "metrics_summary.jsonl", json_safe(row))
         epoch_dir = out_dir / f"epoch_{epoch:03d}"
         append_jsonl(epoch_dir / "branch_metrics.jsonl", {
+            "legacy_base_fixed": metrics.get("metrics_legacy_base_fixed", metrics["metrics_raw_fixed"]),
+            "seca_base_fixed": metrics.get("metrics_base_fixed", metrics["metrics_raw_fixed"]),
             "direct": metrics.get("metrics_base_fixed", metrics["metrics_raw_fixed"]),
             "direct_plus_predicate": metrics.get("metrics_base_fixed", metrics["metrics_raw_fixed"]),
             "base_fixed": metrics.get("metrics_base_fixed", metrics["metrics_raw_fixed"]),
@@ -687,6 +870,7 @@ def main() -> None:
             "final_raw": metrics["metrics_raw_fixed"],
             "final_calibrated": metrics["metrics_calibrated"],
         })
+        # Full-test SECA attention tensors, metrics, evidence chains, and HTML report are written inside evaluate().
         append_jsonl(epoch_dir / "predicate_metrics.jsonl", {"available": True, "predicate_positive_rate": float(pred_batch["predicate_targets"].mean().detach().cpu()), "predicate_mask_rate": float(pred_batch["predicate_mask"].mean().detach().cpu())})
         append_jsonl(epoch_dir / "predicate_coverage.jsonl", {"available": True, **pred_batch.get("predicate_coverage", {})})
         append_jsonl(epoch_dir / "predicate_reason_alignment.jsonl", {"available": True, "positive_score_mean": float(out.get("predicate_reason_positive_score_by_label").mean().detach().cpu()), "contradiction_score_mean": float(out.get("predicate_reason_contradiction_score_by_label").mean().detach().cpu())})
@@ -798,8 +982,9 @@ def main() -> None:
             best_act = act; torch.save(ckpt, out_dir / "checkpoint_best_test_action_mf1.pth")
         if tail_mf1 >= best_tail:
             best_tail = tail_mf1; torch.save(ckpt, out_dir / "checkpoint_best_test_tail_mf1.pth")
-    write_json(out_dir / "GOAL_COMPLETED_ACPR_OIA_V1.json", {"complete": True, "epochs": epochs, "best_final_raw_joint": best_raw})
+    write_json(out_dir / "GOAL_COMPLETED_ACPR_SECA_V1.json", {"complete": True, "epochs": epochs, "best_final_raw_joint": best_raw, "model": "ACPR-SECA V1"})
 
 
 if __name__ == "__main__":
     main()
+

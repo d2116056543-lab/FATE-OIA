@@ -28,6 +28,10 @@ class ACPROIAModel(nn.Module):
         use_mock_dino: bool = False,
         threshold_enabled: bool = False,
         threshold_kwargs: dict | None = None,
+        seca_enabled: bool = False,
+        seca_num_heads: int = 4,
+        seca_max_residual_scale: float = 0.20,
+        seca_evidence_grad_scale: float = 0.25,
     ) -> None:
         super().__init__()
         self.action_dim = action_dim
@@ -36,7 +40,7 @@ class ACPROIAModel(nn.Module):
         self.dino = ACPRDinoFieldExtractor(selected_layers=selected_layers, pretrained_weights=pretrained_weights, use_mock_dino=use_mock_dino)
         self.ego = ACPREgoRegionEncoder(grid_hw=(45, 80), dim=dim)
         self.predicate_head = ACPRScenePredicateHead(scene_config=scene_config, dim=dim, num_layers=len(selected_layers))
-        self.trunk = ACPRLabelTrunk(dim=dim, action_dim=action_dim, reason_dim=reason_dim)
+        self.trunk = ACPRLabelTrunk(dim=dim, action_dim=action_dim, reason_dim=reason_dim, seca_enabled=seca_enabled, seca_num_heads=seca_num_heads, seca_max_residual_scale=seca_max_residual_scale, seca_evidence_grad_scale=seca_evidence_grad_scale)
         self.predicate_reason = ACPRPredicateReasoner(dim=dim, reason_dim=reason_dim, num_predicates=self.predicate_head.num_predicates, predicate_names=self.predicate_head.names, grammar_path=grammar_path)
         self.pair_memory = ACPRPairMemory(dim=dim)
         self.reason_pair_proj = nn.Linear(dim, dim)
@@ -53,8 +57,10 @@ class ACPROIAModel(nn.Module):
         predicates = self.predicate_head(patch, region_masks=region_masks)
         trunk = self.trunk(patch, predicate_tokens=predicates["predicate_tokens"])
         reason_delta = self.predicate_reason(trunk["label_nodes"][:, self.action_dim :], predicates["predicate_probs"], predicates["predicate_tokens"])
+        action_logits_legacy_base = trunk["action_logits_direct_legacy"]
         action_logits_base = trunk["action_logits_direct"]
         reason_logits_base = trunk["reason_logits_visual"] + reason_delta["predicate_reason_delta"]
+        logits_legacy_base = torch.cat([action_logits_legacy_base, reason_logits_base], dim=-1)
         logits_base = torch.cat([action_logits_base, reason_logits_base], dim=-1)
         thresholded = self.threshold_head(action_logits_base, reason_logits_base)
         legacy_calibrated = self.calibration(action_logits_base, reason_logits_base)
@@ -95,6 +101,8 @@ class ACPROIAModel(nn.Module):
             "reason_logits_raw": reason_logits_base,
             "action_logits_base": action_logits_base,
             "reason_logits_base": reason_logits_base,
+            "action_logits_legacy_base": action_logits_legacy_base,
+            "logits_legacy_base_fixed": logits_legacy_base,
             "logits_base_fixed": logits_base,
             "action_logits_deploy": thresholded["action_logits_deploy"],
             "reason_logits_deploy": thresholded["reason_logits_deploy"],
@@ -120,6 +128,8 @@ class ACPROIAModel(nn.Module):
             "temperature_reason": temperature[self.action_dim :],
             "ego_stats": ego_stats,
             "branch_logits": {
+                "legacy_base_fixed": logits_legacy_base,
+                "seca_base_fixed": logits_base,
                 "direct": logits_base,
                 "direct_plus_predicate": logits_base,
                 "base_fixed": logits_base,
