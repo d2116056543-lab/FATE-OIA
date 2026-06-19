@@ -34,18 +34,36 @@ class ACPRPredicateReasoner(nn.Module):
         preclip_delta = raw_grammar_delta + raw_mlp_delta
         delta = preclip_delta.clamp(-0.20, 0.20)
         clamp_scale = torch.where(preclip_delta.abs() > 1.0e-8, delta / preclip_delta.clamp(min=-1.0e12, max=1.0e12), torch.ones_like(delta))
+        pos_mask = self.positive_mask.to(predicate_probs.device, predicate_probs.dtype)
+        neg_mask = self.contradictory_mask.to(predicate_probs.device, predicate_probs.dtype)
+        pos_count_full = pos_mask.sum(-1).clamp_min(1.0).view(1, -1, 1)
+        neg_count_full = neg_mask.sum(-1).clamp_min(1.0).view(1, -1, 1)
+        positive_basis = predicate_probs.unsqueeze(1) * pos_mask.unsqueeze(0) / pos_count_full
+        negative_basis = -predicate_probs.unsqueeze(1) * neg_mask.unsqueeze(0) / neg_count_full
+        basis = positive_basis + negative_basis
+        grammar_target = raw_grammar_delta * clamp_scale
+        basis_sum = basis.sum(-1)
+        basis_scale = torch.where(basis_sum.abs() > 1.0e-8, grammar_target / basis_sum.clamp(min=-1.0e12, max=1.0e12), torch.zeros_like(grammar_target))
+        predicate_reason_positive_contrib_by_predicate = positive_basis * basis_scale.unsqueeze(-1)
+        predicate_reason_negative_contrib_by_predicate = negative_basis * basis_scale.unsqueeze(-1)
+        predicate_reason_contrib_by_predicate = predicate_reason_positive_contrib_by_predicate + predicate_reason_negative_contrib_by_predicate
+        predicate_reason_mlp_residual_delta = raw_mlp_delta * clamp_scale
         stats = {
             "required_support_mean": float(pos_score.detach().mean().cpu()),
             "contradiction_mean": float(contradiction.detach().mean().cpu()),
             "delta_abs_mean": float(delta.detach().abs().mean().cpu()),
             "gate_mean": float(gate.detach().mean().cpu()),
+            "predicate_contrib_abs_mean": float(predicate_reason_contrib_by_predicate.detach().abs().mean().cpu()),
         }
         return {
             "predicate_reason_delta": delta,
             "predicate_reason_delta_preclip": preclip_delta,
             "predicate_reason_delta_clamp_scale": clamp_scale,
-            "predicate_reason_grammar_delta": raw_grammar_delta * clamp_scale,
-            "predicate_reason_mlp_residual_delta": raw_mlp_delta * clamp_scale,
+            "predicate_reason_grammar_delta": grammar_target,
+            "predicate_reason_mlp_residual_delta": predicate_reason_mlp_residual_delta,
+            "predicate_reason_contrib_by_predicate": predicate_reason_contrib_by_predicate,
+            "predicate_reason_positive_contrib_by_predicate": predicate_reason_positive_contrib_by_predicate,
+            "predicate_reason_negative_contrib_by_predicate": predicate_reason_negative_contrib_by_predicate,
             "required_support_score": pos_score,
             "contradiction_score": contradiction,
             "predicate_reason_gate": gate.expand_as(delta),

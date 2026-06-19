@@ -41,3 +41,61 @@ class PACEGradientCoordinator:
 
     def should_apply(self, epoch: int) -> bool:
         return self.enabled and int(epoch) >= self.start_epoch
+
+
+
+def _flatten_optional_grads(grads: list[torch.Tensor | None], params: list[torch.nn.Parameter]) -> torch.Tensor:
+    chunks: list[torch.Tensor] = []
+    for grad, param in zip(grads, params):
+        if grad is None:
+            chunks.append(torch.zeros_like(param).reshape(-1))
+        else:
+            chunks.append(grad.reshape(-1))
+    if not chunks:
+        return torch.empty(0)
+    return torch.cat(chunks)
+
+
+def _unflatten_like(flat: torch.Tensor, params: list[torch.nn.Parameter]) -> list[torch.Tensor]:
+    pieces: list[torch.Tensor] = []
+    offset = 0
+    for param in params:
+        n = param.numel()
+        pieces.append(flat[offset : offset + n].view_as(param))
+        offset += n
+    return pieces
+
+
+def build_gradient_delta(
+    action_group_loss: torch.Tensor,
+    exp_group_loss: torch.Tensor,
+    shared_params,
+    max_common_scale: float = 2.0,
+    epsilon: float = 1.0e-12,
+) -> tuple[list[tuple[torch.nn.Parameter, torch.Tensor]], dict[str, float]]:
+    """Return additive gradient deltas without overwriting accumulated grads.
+
+    The trainer first computes these deltas on the predicate evidence core, then
+    runs normal ``loss.backward()`` and adds ``delta / grad_accum`` into the same
+    parameters. This preserves gradient accumulation instead of replacing
+    already-accumulated shared gradients.
+    """
+    params = [p for p in list(shared_params) if p.requires_grad]
+    if not params:
+        return [], {"gradient_coordination_active": 0.0, "gradient_delta_norm": 0.0}
+    g_action = torch.autograd.grad(action_group_loss, params, retain_graph=True, allow_unused=True)
+    g_exp = torch.autograd.grad(exp_group_loss, params, retain_graph=True, allow_unused=True)
+    flat_action = _flatten_optional_grads(list(g_action), params)
+    flat_exp = _flatten_optional_grads(list(g_exp), params)
+    common, stats = common_descent_gradient(flat_action, flat_exp, max_common_scale=max_common_scale, epsilon=epsilon)
+    baseline = flat_action + flat_exp
+    # Add a bounded correction on top of normal accumulated gradients. A half-step
+    # avoids the degenerate full-cancellation case while still moving conflict
+    # gradients toward the common descent direction.
+    delta_flat = 0.5 * (common - baseline)
+    deltas = [(p, d.detach()) for p, d in zip(params, _unflatten_like(delta_flat, params))]
+    stats = dict(stats)
+    stats["gradient_coordination_active"] = 1.0
+    stats["gradient_delta_norm"] = float(delta_flat.norm().detach().cpu())
+    stats["gradient_shared_param_count"] = float(len(params))
+    return deltas, stats

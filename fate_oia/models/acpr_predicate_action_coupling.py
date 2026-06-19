@@ -8,7 +8,7 @@ class ACPRPredicateActionCoupling(nn.Module):
     """Route predicate-conditioned reason evidence into the action reason branch.
 
     This module is deliberately bounded and transparent. It does not create an
-    expert/router path and it never uses action-set marginals. The only action
+    mixture/router path and it never uses action-set marginals. The only action
     correction is the existing reason-to-action projection applied to the same
     predicate-conditioned reason delta used by the explanation logits.
     """

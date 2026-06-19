@@ -46,7 +46,7 @@ training:
   epochs: 16
   batch_size: 5
   gradient_accumulation_steps: 6
-  fallback_ladder: [[6,5], [5,6], [4,8], [3,11], [2,16]]
+  fallback_ladder: [[5,6], [4,8], [3,10], [2,15]]
   reference_effective_batch: 32
   lr_trunk: 0.0002
   lr_predicate: 0.0002
@@ -215,9 +215,11 @@ pace:
   max_action_delta: 0.20
   contribution_artifacts: true
   gradient_coordination:
-    enabled: false
+    enabled: true
     scope: predicate_evidence_core_only
     preserves_accumulation: true
+    start_epoch: 3
+    max_common_scale: 2.0
   teacher_lock:
     enabled: true
     source: train_calib

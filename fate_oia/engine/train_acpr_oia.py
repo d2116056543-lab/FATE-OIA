@@ -23,6 +23,9 @@ from fate_oia.losses import acpr_losses as L
 from fate_oia.losses import acpr_threshold_losses as TL
 from fate_oia.utils.acpr_artifacts import append_jsonl, json_safe, save_tensor, write_json
 from fate_oia.utils.acpr_pair_mining import pair_summary
+from fate_oia.utils.acpr_pace_gradient_coordinator import PACEGradientCoordinator, build_gradient_delta
+from fate_oia.utils.acpr_pace_training_control import PACETrainingControl
+from fate_oia.utils.acpr_teacher_lock import TeacherLockState
 from fate_oia.utils.acpr_threshold_search import search_best_thresholds_for_f1
 from fate_oia.utils.acpr_thresholds import acpr_metric_views, standard_joint
 from fate_oia.utils.acpr_pair_budget import apply_pair_budget
@@ -341,7 +344,7 @@ def pair_artifact_payload(pairs: dict, reason_names: list[str] | None = None) ->
     return {"available": True, **summary, "per_reason": per_reason}
 
 
-def compute_losses(out: dict, batch: dict, predicate_batch: dict, pairs: dict, grammar_matrices: tuple[torch.Tensor, torch.Tensor], weights: dict) -> tuple[torch.Tensor, dict[str, float]]:
+def compute_losses(out: dict, batch: dict, predicate_batch: dict, pairs: dict, grammar_matrices: tuple[torch.Tensor, torch.Tensor], weights: dict) -> tuple[torch.Tensor, dict[str, float], dict[str, torch.Tensor]]:
     action = batch["action"]
     reason = batch["reason"]
     contradiction = out.get("predicate_reason_contradiction_score_by_label")
@@ -392,7 +395,8 @@ def compute_losses(out: dict, batch: dict, predicate_batch: dict, pairs: dict, g
     parts.update(budget_stats)
     parts.update({f"pair_logit_{k}": v for k, v in pair_logit_stats.items()})
     parts.update({f"pair_embed_{k}": v for k, v in pair_embed_stats.items()})
-    return total, parts
+    groups = {"action_group": action_group, "exp_group": exp_group, "pair_used": pair_used}
+    return total, parts, groups
 
 
 @torch.no_grad()
@@ -400,6 +404,8 @@ def evaluate(model: ACPROIAModel, loader: DataLoader, device: torch.device, epoc
     model.eval()
     action_base = []
     reason_base = []
+    action_legacy_base = []
+    reason_visual = []
     action_logits = []
     reason_logits = []
     action_cal = []
@@ -418,6 +424,8 @@ def evaluate(model: ACPROIAModel, loader: DataLoader, device: torch.device, epoc
         out = model(batch["image"], epoch=epoch)
         action_base.append(out["action_logits_base"].cpu())
         reason_base.append(out["reason_logits_base"].cpu())
+        action_legacy_base.append(out.get("action_logits_legacy_base", out["action_logits_base"]).cpu())
+        reason_visual.append(out.get("reason_logits_visual", out["reason_logits_base"]).cpu())
         action_logits.append(out["action_logits_final_raw"].cpu())
         reason_logits.append(out["reason_logits_final_raw"].cpu())
         action_cal.append(out["action_logits_final_calibrated"].cpu())
@@ -434,6 +442,8 @@ def evaluate(model: ACPROIAModel, loader: DataLoader, device: torch.device, epoc
         pred_stats.append(out["predicate_stats"])
     ab = torch.cat(action_base)
     rb = torch.cat(reason_base)
+    alg = torch.cat(action_legacy_base)
+    rv = torch.cat(reason_visual)
     al = torch.cat(action_logits)
     rl = torch.cat(reason_logits)
     ac = torch.cat(action_cal)
@@ -441,11 +451,14 @@ def evaluate(model: ACPROIAModel, loader: DataLoader, device: torch.device, epoc
     ya = torch.cat(action_labels)
     yr = torch.cat(reason_labels)
     base_views = acpr_metric_views(ab, rb, ya, yr)
+    legacy_views = acpr_metric_views(alg, rv, ya, yr)
     views = acpr_metric_views(al, rl, ya, yr)
     cal_views = acpr_metric_views(ac, rc, ya, yr)
     metrics = {
         "primary_branch": "deploy_fixed" if getattr(model, "threshold_enabled", False) else "base_fixed",
         "metrics_base_fixed": base_views["metrics_raw_fixed"],
+        "metrics_pace_base_fixed": base_views["metrics_raw_fixed"],
+        "metrics_legacy_base_fixed": legacy_views["metrics_raw_fixed"],
         **views,
         "metrics_deploy_fixed": views["metrics_raw_fixed"],
         "metrics_test_oracle_global_threshold": views["metrics_global_threshold"],
@@ -460,6 +473,10 @@ def evaluate(model: ACPROIAModel, loader: DataLoader, device: torch.device, epoc
     save_tensor(epoch_dir / "logits_reason_raw_test.pt", rl)
     save_tensor(epoch_dir / "logits_action_base_test.pt", ab)
     save_tensor(epoch_dir / "logits_reason_base_test.pt", rb)
+    save_tensor(epoch_dir / "logits_action_legacy_base_test.pt", alg)
+    save_tensor(epoch_dir / "logits_reason_visual_test.pt", rv)
+    save_tensor(epoch_dir / "logits_action_pace_base_test.pt", ab)
+    save_tensor(epoch_dir / "logits_reason_shared_test.pt", rb)
     save_tensor(epoch_dir / "logits_action_base_fixed_test.pt", ab)
     save_tensor(epoch_dir / "logits_reason_base_fixed_test.pt", rb)
     save_tensor(epoch_dir / "logits_action_deploy_test.pt", al)
@@ -602,6 +619,14 @@ def main() -> None:
             "initial_threshold_prob": model.threshold_head.forward(torch.zeros(1, 4, device=device), torch.zeros(1, 21, device=device))["threshold_prob"].detach().cpu().tolist(),
         })
     opt = optimizer_for(model, cfg)
+    pace_cfg = cfg.get("pace", {})
+    coord_cfg = pace_cfg.get("gradient_coordination", {})
+    grad_coord = PACEGradientCoordinator(enabled=bool(coord_cfg.get("enabled", False)), start_epoch=int(coord_cfg.get("start_epoch", 3)), max_common_scale=float(coord_cfg.get("max_common_scale", 2.0)))
+    control_cfg = pace_cfg.get("training_control", {})
+    pace_control = PACETrainingControl(min_epoch=int(control_cfg.get("cooldown_after_epoch", 8)), patience=int(control_cfg.get("patience", 2)), min_delta=float(control_cfg.get("min_delta", 1e-4)), non_threshold_lr_multiplier=float(control_cfg.get("non_threshold_lr_multiplier", 0.20)), threshold_lr_multiplier=float(control_cfg.get("threshold_lr_multiplier", 0.50)))
+    teacher_lock = TeacherLockState()
+    last_gradient_summary = {"gradient_coordination_active": 0.0}
+    last_teacher_state = teacher_lock.to_dict()
     warmup_epochs = int(tr.get("warmup_epochs", 2))
     min_lr = float(tr.get("min_lr", 1e-5))
     for group in opt.param_groups:
@@ -670,11 +695,23 @@ def main() -> None:
             batch_weights = dict(weights)
             batch_weights["matched_pair_logit"] = pair_logit_weight
             batch_weights["matched_pair_embed"] = pair_embed_weight
-            loss, parts = compute_losses(out, batch, pred_batch, pairs, matrices, batch_weights)
+            loss, parts, loss_groups = compute_losses(out, batch, pred_batch, pairs, matrices, batch_weights)
             threshold_loss, threshold_parts = compute_threshold_losses(model, out, batch, cfg, epoch)
             loss = loss + threshold_loss
             parts.update(threshold_parts)
+            coord_deltas = []
+            coord_stats = {"gradient_coordination_active": 0.0}
+            if grad_coord.should_apply(epoch):
+                shared_params = list(model.predicate_head.parameters()) + list(model.predicate_reason.parameters())
+                coord_deltas, coord_stats = build_gradient_delta(loss_groups["action_group"], loss_groups["exp_group"], shared_params, max_common_scale=grad_coord.max_common_scale)
+            parts.update({f"pace_{k}": v for k, v in coord_stats.items()})
+            last_gradient_summary = dict(coord_stats)
             (loss / accum).backward()
+            for param, delta in coord_deltas:
+                if param.grad is None:
+                    param.grad = delta.to(param.device, param.dtype) / accum
+                else:
+                    param.grad.add_(delta.to(param.device, param.dtype), alpha=1.0 / accum)
             if step % accum == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), float(tr.get("grad_clip", 1.0)))
                 opt.step()
@@ -711,16 +748,31 @@ def main() -> None:
             )
         if bool(threshold_cfg.get("enabled", False)) and train_calib_loader is not None and epoch >= int(threshold_cfg.get("teacher_update_start_epoch", 2)):
             if (epoch - int(threshold_cfg.get("teacher_update_start_epoch", 2))) % int(threshold_cfg.get("teacher_update_every", 1)) == 0:
-                update_threshold_teacher_from_train_calib(model, train_calib_loader, device, epoch, cfg, out_dir)
+                teacher_payload = update_threshold_teacher_from_train_calib(model, train_calib_loader, device, epoch, cfg, out_dir)
+                best_f1 = teacher_payload.get("best_f1", [])
+                action_teacher = float(sum(best_f1[:4]) / max(len(best_f1[:4]), 1)) if isinstance(best_f1, list) else 0.0
+                exp_teacher = float(sum(best_f1[4:]) / max(len(best_f1[4:]), 1)) if isinstance(best_f1, list) else 0.0
+                joint_teacher = 0.5 * action_teacher + 0.5 * exp_teacher
+                accepted = teacher_lock.update(epoch, joint_teacher, action_teacher, exp_teacher)
+                control_state = pace_control.update(epoch, joint_teacher)
+                if control_state.get("cooldown_apply"):
+                    for group in opt.param_groups:
+                        mult = pace_control.threshold_lr_multiplier if group.get("name") == "threshold" else pace_control.non_threshold_lr_multiplier
+                        group["base_lr"] = group.get("base_lr", group["lr"]) * mult
+                        group["lr"] = group["lr"] * mult
+                last_teacher_state = {**teacher_lock.to_dict(), **control_state, "teacher_lock_accepted": accepted, "train_calib_action": action_teacher, "train_calib_exp": exp_teacher, "train_calib_joint": joint_teacher, "test_feedback_allowed": False}
+                write_json(out_dir / "pace_teacher_state.json", last_teacher_state)
         metrics = evaluate(model, test_loader, device, epoch, out_dir)
         row = {"event": "acpr_epoch", "epoch": epoch, **metrics}
         print(json.dumps(json_safe(row)), flush=True)
         append_jsonl(out_dir / "metrics_summary.jsonl", json_safe(row))
         epoch_dir = out_dir / f"epoch_{epoch:03d}"
         append_jsonl(epoch_dir / "branch_metrics.jsonl", {
-            "direct": metrics.get("metrics_base_fixed", metrics["metrics_raw_fixed"]),
-            "direct_plus_predicate": metrics.get("metrics_base_fixed", metrics["metrics_raw_fixed"]),
-            "base_fixed": metrics.get("metrics_base_fixed", metrics["metrics_raw_fixed"]),
+            "direct": metrics.get("metrics_legacy_base_fixed", metrics["metrics_raw_fixed"]),
+            "direct_plus_predicate": metrics.get("metrics_pace_base_fixed", metrics["metrics_raw_fixed"]),
+            "base_fixed": metrics.get("metrics_pace_base_fixed", metrics["metrics_raw_fixed"]),
+            "legacy_base_fixed": metrics.get("metrics_legacy_base_fixed", metrics["metrics_raw_fixed"]),
+            "pace_base_fixed": metrics.get("metrics_pace_base_fixed", metrics["metrics_raw_fixed"]),
             "deploy_fixed": metrics["metrics_raw_fixed"],
             "raw": metrics["metrics_raw_fixed"],
             "calibrated": metrics["metrics_calibrated"],
@@ -730,6 +782,11 @@ def main() -> None:
         append_jsonl(epoch_dir / "predicate_metrics.jsonl", {"available": True, "predicate_positive_rate": float(pred_batch["predicate_targets"].mean().detach().cpu()), "predicate_mask_rate": float(pred_batch["predicate_mask"].mean().detach().cpu())})
         append_jsonl(epoch_dir / "predicate_coverage.jsonl", {"available": True, **pred_batch.get("predicate_coverage", {})})
         append_jsonl(epoch_dir / "predicate_reason_alignment.jsonl", {"available": True, "positive_score_mean": float(out.get("predicate_reason_positive_score_by_label").mean().detach().cpu()), "contradiction_score_mean": float(out.get("predicate_reason_contradiction_score_by_label").mean().detach().cpu())})
+        write_json(epoch_dir / "pace_gradient_summary.json", json_safe(last_gradient_summary))
+        write_json(epoch_dir / "pace_teacher_state.json", json_safe(last_teacher_state))
+        write_json(epoch_dir / "pace_pu_semantics.json", {"reason_zero_semantics": "positive-unlabeled", "negative_labels_are_not_hard_negatives": True, "predicate_reason_alignment": "PU masked by grammar reliability"})
+        append_jsonl(epoch_dir / "pace_evidence_chains.jsonl", {"available": True, "chain": "action -> predicate-conditioned reason -> predicate -> DINO patch", "contrib_artifact": "pace_action_reason_predicate_contrib_test.pt"})
+        (epoch_dir / "pace_evidence_report.html").write_text("<html><body><h1>ACPR-PACE evidence chain</h1><p>See pace_evidence_chains.jsonl and pace_action_reason_predicate_contrib_test.pt.</p></body></html>", encoding="utf-8")
         pair_epoch_payload = pair_artifact_payload(pairs)
         append_jsonl(epoch_dir / "pair_mining_stats.jsonl", {"available": True, **pair_summary(pairs)})
         append_jsonl(epoch_dir / "pair_stats.jsonl", {"available": True, **pair_summary(pairs)})
@@ -826,8 +883,9 @@ def main() -> None:
             best_raw = raw
             torch.save(ckpt, out_dir / "checkpoint_best_test_final_raw.pth")
             torch.save(ckpt, out_dir / "checkpoint_best_test_deploy_raw.pth")
+            torch.save(ckpt, out_dir / "checkpoint_best_test_deploy_joint.pth")
         if base >= best_base:
-            best_base = base; torch.save(ckpt, out_dir / "checkpoint_best_test_base_fixed.pth")
+            best_base = base; torch.save(ckpt, out_dir / "checkpoint_best_test_base_fixed.pth"); torch.save(ckpt, out_dir / "checkpoint_best_test_base_joint.pth")
         if cal >= best_cal:
             best_cal = cal; torch.save(ckpt, out_dir / "checkpoint_best_test_final_calibrated.pth")
         if exp >= best_exp:
