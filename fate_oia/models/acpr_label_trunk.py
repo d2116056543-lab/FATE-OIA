@@ -30,6 +30,12 @@ class ACPRLabelTrunk(nn.Module):
         )
         self.fusion_gate = nn.Linear(dim * 2, action_dim)
 
+    def project_reason_logits_to_action(self, reason_logits: torch.Tensor) -> torch.Tensor:
+        return self.reason_to_action(reason_logits)
+
+    def fuse_action_logits(self, action_visual_logits: torch.Tensor, action_reason_logits: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        return gate * action_visual_logits + (1.0 - gate) * action_reason_logits
+
     def forward(self, patch_tokens_by_layer: torch.Tensor, predicate_tokens: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
         patch = patch_tokens_by_layer.mean(1)
         b, n, d = patch.shape
@@ -52,15 +58,17 @@ class ACPRLabelTrunk(nn.Module):
         action_reason_logits = self.reason_to_action(reason_logits_visual)
         gate_in = torch.cat([label_nodes[:, : self.action_dim].mean(1), label_nodes[:, self.action_dim:].mean(1)], dim=-1)
         gate = torch.sigmoid(self.fusion_gate(gate_in)).clamp(0.10, 0.90)
-        action_logits_direct = gate * action_visual_logits + (1.0 - gate) * action_reason_logits
+        action_logits_direct = self.fuse_action_logits(action_visual_logits, action_reason_logits, gate)
         return {
             "label_nodes": label_nodes,
             "label_attention": attn,
             "action_visual_logits": action_visual_logits,
             "action_reason_logits": action_reason_logits,
+            "action_reason_logits_visual": action_reason_logits,
             "reason_logits_visual": reason_logits_visual,
             "action_fusion_gate": gate,
             "action_token_norm_mean": action_nodes.norm(dim=-1).mean(),
             "predicate_conditioning_strength": torch.sigmoid(self.predicate_gate).detach(),
             "action_logits_direct": action_logits_direct,
+            "action_logits_direct_legacy": action_logits_direct,
         }

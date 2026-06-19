@@ -83,27 +83,26 @@ class WeakPredicateTargetBuilder:
                     counts["lane_poly"] += 1
             if cat in {"traffic light"}:
                 names.update(["traffic_light_visible"])
-                names.add("traffic_light_green")
                 if region == "upper_traffic_region":
                     reliability["traffic_light_visible"] = 0.80
             if cat in {"traffic sign"}:
-                names.update(["traffic_sign_visible", "stop_sign_present"])
+                names.update(["traffic_sign_visible"])
             if cat in {"car", "truck", "bus"}:
                 if region == "left_corridor":
-                    names.update(["vehicle_left", "parked_vehicle_left"])
+                    names.update(["vehicle_left"])
                 elif region == "right_corridor":
-                    names.update(["vehicle_right", "parked_vehicle_right"])
+                    names.update(["vehicle_right"])
                 else:
-                    names.update(["front_vehicle_close", "front_vehicle_far", "road_crowded"])
+                    names.update(["front_vehicle_close", "road_crowded"])
             if cat in {"person", "pedestrian"}:
                 names.update(["pedestrian_front", "road_crowded"])
             if cat in {"rider", "bike", "bicycle", "motorcycle"}:
                 names.add("cyclist_front")
             if "lane" in cat or poly:
                 if region == "left_corridor":
-                    names.update(["lane_left_available", "left_lane_boundary", "left_solid_boundary", "left_turn_region", "merging_left_context"])
+                    names.update(["lane_left_available", "left_lane_boundary"])
                 elif region == "right_corridor":
-                    names.update(["lane_right_available", "right_lane_boundary", "right_solid_boundary", "right_turn_region", "merging_right_context"])
+                    names.update(["lane_right_available", "right_lane_boundary"])
             if cat in {"crosswalk"}:
                 names.add("crosswalk_region")
             if cat in {"intersection"}:
@@ -111,7 +110,7 @@ class WeakPredicateTargetBuilder:
             if cat in {"obstacle", "train"}:
                 names.add("obstacle_front")
         if drivable_available:
-            names.update(["drivable_center", "drivable_left", "drivable_right", "open_left_gap", "open_right_gap", "ego_lane_centered"])
+            names.update(["drivable_center"])
         if not {"front_vehicle_close", "pedestrian_front", "obstacle_front"} & names:
             names.add("road_clear")
         names.add("global_scene_context")

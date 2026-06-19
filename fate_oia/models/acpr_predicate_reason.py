@@ -29,7 +29,11 @@ class ACPRPredicateReasoner(nn.Module):
         aux = torch.stack([pos_score, neg_score, grammar_score], dim=-1)
         mlp_score = self.mlp(torch.cat([reason_nodes, aux], dim=-1)).squeeze(-1).tanh()
         gate = torch.sigmoid(self.gate).clamp(max=0.20).view(1, -1)
-        delta = (gate * (grammar_score + 0.25 * mlp_score)).clamp(-0.20, 0.20)
+        raw_grammar_delta = gate * grammar_score
+        raw_mlp_delta = gate * 0.25 * mlp_score
+        preclip_delta = raw_grammar_delta + raw_mlp_delta
+        delta = preclip_delta.clamp(-0.20, 0.20)
+        clamp_scale = torch.where(preclip_delta.abs() > 1.0e-8, delta / preclip_delta.clamp(min=-1.0e12, max=1.0e12), torch.ones_like(delta))
         stats = {
             "required_support_mean": float(pos_score.detach().mean().cpu()),
             "contradiction_mean": float(contradiction.detach().mean().cpu()),
@@ -38,6 +42,10 @@ class ACPRPredicateReasoner(nn.Module):
         }
         return {
             "predicate_reason_delta": delta,
+            "predicate_reason_delta_preclip": preclip_delta,
+            "predicate_reason_delta_clamp_scale": clamp_scale,
+            "predicate_reason_grammar_delta": raw_grammar_delta * clamp_scale,
+            "predicate_reason_mlp_residual_delta": raw_mlp_delta * clamp_scale,
             "required_support_score": pos_score,
             "contradiction_score": contradiction,
             "predicate_reason_gate": gate.expand_as(delta),

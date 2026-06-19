@@ -285,3 +285,37 @@ def calibration_regularizer_only_small(temperature: torch.Tensor, bias: torch.Te
 def predicate_attention_compactness_loss(attention: torch.Tensor) -> torch.Tensor:
     entropy = -(attention.clamp_min(1e-9).log() * attention).sum(-1)
     return entropy.mean()
+
+
+
+def pu_reason_soft_f1_loss(logits: torch.Tensor, target: torch.Tensor, contradiction_scores: torch.Tensor | None = None, neg_min_weight: float = 0.2) -> torch.Tensor:
+    probs = torch.sigmoid(logits)
+    target = target.float()
+    if contradiction_scores is None:
+        contradiction_scores = torch.zeros_like(target)
+    neg_weight = neg_min_weight + (1.0 - neg_min_weight) * contradiction_scores.detach().clamp(0, 1)
+    tp = (probs * target).sum(0)
+    fp = (probs * (1.0 - target) * neg_weight).sum(0)
+    fn = ((1.0 - probs) * target).sum(0)
+    f1 = (2 * tp + 1e-6) / (2 * tp + fp + fn + 1e-6)
+    return 1.0 - f1.mean()
+
+
+def pu_predicate_reason_alignment_loss(
+    predicate_probs: torch.Tensor,
+    reason_targets: torch.Tensor,
+    grammar_positive_matrix: torch.Tensor,
+    grammar_contradiction_matrix: torch.Tensor,
+    contradiction_scores: torch.Tensor | None = None,
+    neg_min_weight: float = 0.2,
+) -> torch.Tensor:
+    pos_support = predicate_probs @ grammar_positive_matrix.t().to(predicate_probs.device, predicate_probs.dtype)
+    neg_support = predicate_probs @ grammar_contradiction_matrix.t().to(predicate_probs.device, predicate_probs.dtype)
+    support_score = (pos_support - neg_support).clamp(-1, 1)
+    target = reason_targets.float()
+    if contradiction_scores is None:
+        contradiction_scores = torch.zeros_like(target)
+    pos_loss = torch.nn.functional.softplus(-support_score) * target
+    neg_weight = (neg_min_weight + (1.0 - neg_min_weight) * contradiction_scores.detach().clamp(0, 1)) * (1.0 - target)
+    neg_loss = torch.nn.functional.softplus(support_score) * neg_weight
+    return (pos_loss + neg_loss).sum() / (target.sum() + neg_weight.sum()).clamp_min(1.0)

@@ -25,6 +25,8 @@ from fate_oia.utils.acpr_artifacts import append_jsonl, json_safe, save_tensor, 
 from fate_oia.utils.acpr_pair_mining import pair_summary
 from fate_oia.utils.acpr_threshold_search import search_best_thresholds_for_f1
 from fate_oia.utils.acpr_thresholds import acpr_metric_views, standard_joint
+from fate_oia.utils.acpr_pair_budget import apply_pair_budget
+from fate_oia.utils.acpr_pace_artifacts import save_compact_contrib
 from fate_oia.utils.acpr_train_calib_split import make_train_calib_indices
 
 
@@ -60,6 +62,7 @@ def make_loader(cfg: dict, split: str, batch_size: int, max_samples: int | None,
 def build_model(cfg: dict, device: torch.device) -> ACPROIAModel:
     model_cfg = cfg.get("model", {})
     threshold_cfg = cfg.get("threshold", {})
+    pace_cfg = cfg.get("pace", {})
     model = ACPROIAModel(
         selected_layers=tuple(model_cfg.get("selected_layers", [3, 7, 11])),
         pretrained_weights=str(cfg.get("pretrained_weights", "ckp/reference/dino_deitsmall8_pretrain.pth")),
@@ -67,6 +70,9 @@ def build_model(cfg: dict, device: torch.device) -> ACPROIAModel:
         grammar_path=str(cfg.get("grammar", {}).get("path", "configs/acpr_reason_predicate_grammar.yaml")),
         use_mock_dino=bool(model_cfg.get("use_mock_dino", False)),
         threshold_enabled=bool(threshold_cfg.get("enabled", False)),
+        pace_enabled=bool(pace_cfg.get("enabled", False)),
+        pace_coupling_strength=float(pace_cfg.get("coupling_strength", 1.0)),
+        pace_max_action_delta=float(pace_cfg.get("max_action_delta", 0.20)),
         threshold_kwargs={
             "action_threshold_min": float(threshold_cfg.get("action_threshold_min", 0.10)),
             "action_threshold_max": float(threshold_cfg.get("action_threshold_max", 0.90)),
@@ -338,16 +344,17 @@ def pair_artifact_payload(pairs: dict, reason_names: list[str] | None = None) ->
 def compute_losses(out: dict, batch: dict, predicate_batch: dict, pairs: dict, grammar_matrices: tuple[torch.Tensor, torch.Tensor], weights: dict) -> tuple[torch.Tensor, dict[str, float]]:
     action = batch["action"]
     reason = batch["reason"]
+    contradiction = out.get("predicate_reason_contradiction_score_by_label")
     pair_logit, pair_logit_stats = L.matched_pair_logit_loss(out["reason_logits_base"], pairs, return_stats=True)
     pair_embed, pair_embed_stats = L.matched_pair_embedding_loss(out["reason_embeddings_for_pair"], pairs, return_stats=True)
     terms = {
         "action_direct": L.action_asl_loss(out["action_logits_base"], action),
         "action_visual_aux": L.action_asl_loss(out["action_visual_logits"], action),
-        "action_reason_aux": L.action_asl_loss(out["action_reason_logits"], action),
-        "reason_partial": L.partial_label_reason_loss(out["reason_logits_base"], reason, out.get("predicate_reason_contradiction_score_by_label")),
-        "reason_soft_f1": L.reason_soft_f1_loss(out["reason_logits_base"], reason),
+        "action_reason_aux": L.action_asl_loss(out.get("action_reason_logits_pace", out["action_reason_logits"]), action),
+        "reason_partial": L.partial_label_reason_loss(out["reason_logits_base"], reason, contradiction),
+        "reason_soft_f1": L.pu_reason_soft_f1_loss(out["reason_logits_base"], reason, contradiction),
         "predicate_weak": L.predicate_weak_bce_mil_loss(out["predicate_logits"], predicate_batch["predicate_targets"], predicate_batch["predicate_mask"], predicate_batch.get("predicate_reliability")),
-        "predicate_reason_align": L.predicate_reason_alignment_loss(out["predicate_probs"], reason, grammar_matrices[0], grammar_matrices[1]),
+        "predicate_reason_align": L.pu_predicate_reason_alignment_loss(out["predicate_probs"], reason, grammar_matrices[0], grammar_matrices[1], contradiction),
         "matched_pair_logit": pair_logit,
         "matched_pair_embed": pair_embed,
         "action_combo_ce": L.action_combo_ce_loss(out["action_set_logits"], action),
@@ -356,8 +363,33 @@ def compute_losses(out: dict, batch: dict, predicate_batch: dict, pairs: dict, g
         "calibration": L.calibration_loss(out["action_logits_calibrated"], out["reason_logits_calibrated"], action, reason),
         "predicate_attention_compactness": L.predicate_attention_compactness_loss(out["predicate_attention"]),
     }
-    total = sum(terms[k] * float(weights.get(k, 0.0)) for k in terms)
+    action_group = (
+        terms["action_direct"] * float(weights.get("action_direct", 0.0))
+        + terms["action_visual_aux"] * float(weights.get("action_visual_aux", 0.0))
+        + terms["action_reason_aux"] * float(weights.get("action_reason_aux", 0.0))
+        + terms["action_combo_ce"] * float(weights.get("action_combo_ce", 0.0))
+        + terms["action_combo_drop_add"] * float(weights.get("action_combo_drop_add", 0.0))
+        + terms["cardinality"] * float(weights.get("cardinality", 0.0))
+    )
+    exp_group = (
+        terms["reason_partial"] * float(weights.get("reason_partial", 0.0))
+        + terms["reason_soft_f1"] * float(weights.get("reason_soft_f1", 0.0))
+        + terms["predicate_weak"] * float(weights.get("predicate_weak", 0.0))
+        + terms["predicate_reason_align"] * float(weights.get("predicate_reason_align", 0.0))
+        + terms["predicate_attention_compactness"] * float(weights.get("predicate_attention_compactness", 0.0))
+    )
+    pair_raw_weighted = (
+        terms["matched_pair_logit"] * float(weights.get("matched_pair_logit", 0.0))
+        + terms["matched_pair_embed"] * float(weights.get("matched_pair_embed", 0.0))
+    )
+    pair_used, budget_stats = apply_pair_budget(pair_raw_weighted, action_group, exp_group, ratio=float(weights.get("matched_pair_budget_ratio", 0.25)))
+    total = action_group + exp_group + pair_used + terms["calibration"] * float(weights.get("calibration", 0.0))
     parts = {f"loss_{k}": float(v.detach().cpu()) for k, v in terms.items()}
+    parts["loss_action_group"] = float(action_group.detach().cpu())
+    parts["loss_exp_group"] = float(exp_group.detach().cpu())
+    parts["loss_pair_raw_weighted"] = float(pair_raw_weighted.detach().cpu())
+    parts["loss_pair_budgeted"] = float(pair_used.detach().cpu())
+    parts.update(budget_stats)
     parts.update({f"pair_logit_{k}": v for k, v in pair_logit_stats.items()})
     parts.update({f"pair_embed_{k}": v for k, v in pair_embed_stats.items()})
     return total, parts
@@ -378,6 +410,7 @@ def evaluate(model: ACPROIAModel, loader: DataLoader, device: torch.device, epoc
     action_set_probs = []
     predicate_logits = []
     predicate_probs = []
+    pace_contrib = []
     file_names: list[str] = []
     pred_stats = []
     for batch in loader:
@@ -395,6 +428,8 @@ def evaluate(model: ACPROIAModel, loader: DataLoader, device: torch.device, epoc
         action_set_probs.append(out["action_set_probs"].cpu())
         predicate_logits.append(out["predicate_logits"].cpu())
         predicate_probs.append(out["predicate_probs"].cpu())
+        if torch.is_tensor(out.get("predicate_reason_action_contrib_final")):
+            pace_contrib.append(out["predicate_reason_action_contrib_final"].cpu())
         file_names.extend(batch["file_name"])
         pred_stats.append(out["predicate_stats"])
     ab = torch.cat(action_base)
@@ -444,6 +479,11 @@ def evaluate(model: ACPROIAModel, loader: DataLoader, device: torch.device, epoc
     save_tensor(epoch_dir / "labels_action_test.pt", ya)
     save_tensor(epoch_dir / "labels_reason_test.pt", yr)
     write_json(epoch_dir / "file_names_test.json", file_names)
+    if pace_contrib:
+        save_compact_contrib(epoch_dir / "pace_action_reason_predicate_contrib_test.pt", torch.cat(pace_contrib), max_cases=256)
+        write_json(epoch_dir / "pace_contribution_manifest.json", {"available": True, "shape": list(torch.cat(pace_contrib).shape), "sum_equals_action_delta": True})
+    else:
+        write_json(epoch_dir / "pace_contribution_manifest.json", {"available": False})
     write_json(epoch_dir / "metrics_summary.json", metrics)
     return metrics
 
