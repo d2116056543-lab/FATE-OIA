@@ -672,24 +672,44 @@ def main() -> None:
             batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
             pred_batch = target_builder.build(batch["file_name"], device=device)
             out = model(batch["image"], epoch=epoch)
-            pairs = model.pair_memory.mine(
-                batch["file_name"],
-                out["global_embedding"].detach(),
-                out["predicate_probs"].detach(),
-                batch["action"],
-                batch["reason"],
-                out["contradiction_score"].detach(),
-                grammar.tail_indices,
-                reason_logits_current=out["reason_logits_base"].detach(),
-                reason_embeddings_current=out["reason_embeddings_for_pair"].detach(),
-                epoch=epoch,
-                max_pairs=int(pair_cfg.get("max_pairs_per_batch", 256)),
-                max_pairs_per_reason=int(pair_cfg.get("max_pairs_per_reason", 8)),
-                max_tail_pairs_per_reason=int(pair_cfg.get("max_tail_pairs_per_reason", 12)),
-                max_memory_scan=int(pair_cfg.get("max_memory_scan", 2048)),
-                margin=float(pair_cfg.get("margin", 0.25)),
-                thresholds=pair_thresholds,
+            log_every_steps = max(1, int(args.log_every_steps))
+            current_global_step = global_step + 1
+            scheduled_pair_logit_weight, scheduled_pair_embed_weight = get_pair_weights(epoch, 1.0)
+            pair_weights_active = (scheduled_pair_logit_weight > 0.0) or (scheduled_pair_embed_weight > 0.0)
+            should_mine_pairs = (
+                pair_weights_active
+                or step == 1
+                or step == len(train_loader)
+                or current_global_step % log_every_steps == 0
             )
+            if should_mine_pairs:
+                pairs = model.pair_memory.mine(
+                    batch["file_name"],
+                    out["global_embedding"].detach(),
+                    out["predicate_probs"].detach(),
+                    batch["action"],
+                    batch["reason"],
+                    out["contradiction_score"].detach(),
+                    grammar.tail_indices,
+                    reason_logits_current=out["reason_logits_base"].detach(),
+                    reason_embeddings_current=out["reason_embeddings_for_pair"].detach(),
+                    epoch=epoch,
+                    max_pairs=int(pair_cfg.get("max_pairs_per_batch", 256)),
+                    max_pairs_per_reason=int(pair_cfg.get("max_pairs_per_reason", 8)),
+                    max_tail_pairs_per_reason=int(pair_cfg.get("max_tail_pairs_per_reason", 12)),
+                    max_memory_scan=int(pair_cfg.get("max_memory_scan", 2048)),
+                    margin=float(pair_cfg.get("margin", 0.25)),
+                    thresholds=pair_thresholds,
+                )
+            else:
+                pairs = model.pair_memory._empty(
+                    device,
+                    int(batch["reason"].shape[1]),
+                    int(out["reason_embeddings_for_pair"].shape[-1]),
+                )
+                mem_files = getattr(model.pair_memory, "_memory", {}).get("file_names", []) if getattr(model.pair_memory, "_memory", None) else []
+                pairs["pair_memory_count"] = len(mem_files)
+                pairs["file_names"] = batch["file_name"]
             pair_count = int(pairs.get("pair_count", 0))
             active_pair_rate = float(pairs.get("active_pair_count", 0)) / max(float(pair_count), 1.0)
             pair_logit_weight, pair_embed_weight = get_pair_weights(epoch, active_pair_rate)
@@ -718,7 +738,6 @@ def main() -> None:
                 opt.step()
                 opt.zero_grad(set_to_none=True)
             global_step += 1
-            log_every_steps = max(1, int(args.log_every_steps))
             if global_step % log_every_steps == 0 or step == 1:
                 payload = {
                     "event": "acpr_batch",
