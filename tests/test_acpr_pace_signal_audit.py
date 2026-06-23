@@ -21,10 +21,12 @@ def test_signal_audit_writes_required_pass_files(tmp_path):
         "--strengths",
         "0.0",
         "0.5",
+        "--unit_test_fast_path",
     ]
     subprocess.check_call(cmd)
     payload = json.loads((out / "signal_audit_ACPR_PACE_V1.json").read_text(encoding="utf-8"))
     assert payload["pass"] is True
     assert (out / "PACE_SIGNAL_PASS.json").exists()
     assert (out / "pace_selected_strength.json").exists()
-    assert payload["selected_strength"] in [0.0, 0.5]
+    assert payload["selected_strength"] == 0.5
+    assert payload["unit_test_fast_path"] is True
