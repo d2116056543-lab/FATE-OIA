@@ -17,7 +17,8 @@ $argsList = @(
   "--batch_size",$BatchSize,
   "--gradient_accumulation_steps",$GradAccum,
   "--num_workers",$NumWorkers,
-  "--device",$Device
+  "--device",$Device,
+  "--reference_checkpoint",$ReferenceCheckpoint
 )
 if ($RequireReviewPass) { $argsList += "--require_review_pass" }
 E:\Anaconda\envs\sbw39\python.exe @argsList
