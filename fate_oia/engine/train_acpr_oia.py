@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import json
@@ -515,6 +515,7 @@ def main() -> None:
     ap.add_argument("--max_train_samples", type=int, default=None)
     ap.add_argument("--max_test_samples", type=int, default=None)
     ap.add_argument("--num_workers", type=int, default=0)
+    ap.add_argument("--log_every_steps", type=int, default=200, help="Write batch diagnostics every N global steps.")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--test_only", action="store_true")
     ap.add_argument("--no_feature_cache", action="store_true")
@@ -717,7 +718,8 @@ def main() -> None:
                 opt.step()
                 opt.zero_grad(set_to_none=True)
             global_step += 1
-            if global_step % 200 == 0 or step == 1:
+            log_every_steps = max(1, int(args.log_every_steps))
+            if global_step % log_every_steps == 0 or step == 1:
                 payload = {
                     "event": "acpr_batch",
                     "epoch": epoch,
@@ -901,3 +903,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
