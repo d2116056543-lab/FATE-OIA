@@ -6,6 +6,7 @@ import math
 import os
 import socket
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -144,6 +145,17 @@ def set_epoch_lrs(optimizer: torch.optim.Optimizer, epoch: int, total_epochs: in
 def reason_predicate_matrices(grammar: ACPRReasonGrammar, predicate_names: list[str], device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
     pos, neg = grammar.reason_predicate_matrix(predicate_names)
     return torch.tensor(pos, dtype=torch.float32, device=device), torch.tensor(neg, dtype=torch.float32, device=device)
+
+
+def phase_heartbeat(out_dir: Path, epoch: int, step: int, phase: str) -> None:
+    if step <= 40 or step % 100 == 0:
+        append_jsonl(out_dir / "train_phase_heartbeat.jsonl", {
+            "time": time.time(),
+            "pid": os.getpid(),
+            "epoch": int(epoch),
+            "step": int(step),
+            "phase": str(phase),
+        })
 
 
 def get_pair_weights(epoch: int, active_pair_rate: float) -> tuple[float, float]:
@@ -670,19 +682,26 @@ def main() -> None:
         opt.zero_grad(set_to_none=True)
         for step, batch in enumerate(train_loader, start=1):
             batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
+            phase_heartbeat(out_dir, epoch, step, "batch_loaded")
             pred_batch = target_builder.build(batch["file_name"], device=device)
+            phase_heartbeat(out_dir, epoch, step, "predicate_done")
             out = model(batch["image"], epoch=epoch)
+            phase_heartbeat(out_dir, epoch, step, "forward_done")
             log_every_steps = max(1, int(args.log_every_steps))
             current_global_step = global_step + 1
             scheduled_pair_logit_weight, scheduled_pair_embed_weight = get_pair_weights(epoch, 1.0)
             pair_weights_active = (scheduled_pair_logit_weight > 0.0) or (scheduled_pair_embed_weight > 0.0)
-            should_mine_pairs = (
-                pair_weights_active
-                or step == 1
+            # Pair mining is expensive and only affects optimization when the
+            # scheduled pair weights are active. Keep memory enqueue running
+            # every step, but do not run log-only mining during zero-weight
+            # warmup epochs; otherwise training can stall at diagnostic steps.
+            should_mine_pairs = pair_weights_active and (
+                step == 1
                 or step == len(train_loader)
                 or current_global_step % log_every_steps == 0
             )
             if should_mine_pairs:
+                phase_heartbeat(out_dir, epoch, step, "pair_mine_start")
                 pairs = model.pair_memory.mine(
                     batch["file_name"],
                     out["global_embedding"].detach(),
@@ -701,6 +720,7 @@ def main() -> None:
                     margin=float(pair_cfg.get("margin", 0.25)),
                     thresholds=pair_thresholds,
                 )
+                phase_heartbeat(out_dir, epoch, step, "pair_mine_done")
             else:
                 pairs = model.pair_memory._empty(
                     device,
@@ -717,7 +737,9 @@ def main() -> None:
             batch_weights["matched_pair_logit"] = pair_logit_weight
             batch_weights["matched_pair_embed"] = pair_embed_weight
             loss, parts, loss_groups = compute_losses(out, batch, pred_batch, pairs, matrices, batch_weights)
+            phase_heartbeat(out_dir, epoch, step, "loss_done")
             threshold_loss, threshold_parts = compute_threshold_losses(model, out, batch, cfg, epoch)
+            phase_heartbeat(out_dir, epoch, step, "threshold_loss_done")
             loss = loss + threshold_loss
             parts.update(threshold_parts)
             coord_deltas = []
@@ -728,6 +750,7 @@ def main() -> None:
             parts.update({f"pace_{k}": v for k, v in coord_stats.items()})
             last_gradient_summary = dict(coord_stats)
             (loss / accum).backward()
+            phase_heartbeat(out_dir, epoch, step, "backward_done")
             for param, delta in coord_deltas:
                 if param.grad is None:
                     param.grad = delta.to(param.device, param.dtype) / accum
@@ -736,6 +759,7 @@ def main() -> None:
             if step % accum == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), float(tr.get("grad_clip", 1.0)))
                 opt.step()
+                phase_heartbeat(out_dir, epoch, step, "optimizer_step_done")
                 opt.zero_grad(set_to_none=True)
             global_step += 1
             if global_step % log_every_steps == 0 or step == 1:
@@ -757,6 +781,8 @@ def main() -> None:
                 }
                 print(json.dumps(payload), flush=True)
                 append_jsonl(out_dir / "loss_components.jsonl", payload)
+                phase_heartbeat(out_dir, epoch, step, "batch_log_done")
+            phase_heartbeat(out_dir, epoch, step, "enqueue_start")
             model.pair_memory.enqueue(
                 batch["file_name"],
                 out["global_embedding"],
@@ -767,6 +793,7 @@ def main() -> None:
                 out["reason_logits_base"].detach(),
                 out["reason_embeddings_for_pair"].detach(),
             )
+            phase_heartbeat(out_dir, epoch, step, "enqueue_done")
         if bool(threshold_cfg.get("enabled", False)) and train_calib_loader is not None and epoch >= int(threshold_cfg.get("teacher_update_start_epoch", 2)):
             if (epoch - int(threshold_cfg.get("teacher_update_start_epoch", 2))) % int(threshold_cfg.get("teacher_update_every", 1)) == 0:
                 teacher_payload = update_threshold_teacher_from_train_calib(model, train_calib_loader, device, epoch, cfg, out_dir)
