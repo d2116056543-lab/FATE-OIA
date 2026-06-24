@@ -33,7 +33,7 @@ data:
   num_workers: 4
   pin_memory: true
   persistent_workers: true
-  prefetch_factor: 2
+  prefetch_factor: 4
 backbone:
   arch: vit_small
   patch_size: 8
@@ -98,6 +98,7 @@ runtime:
   save_every_epoch: true
 model:
   selected_layers: [3, 7, 11]
+  pair_memory_device: cuda
   use_mock_dino: false
   dim: 384
   action_dim: 4

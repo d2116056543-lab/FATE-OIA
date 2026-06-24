@@ -60,13 +60,24 @@ def make_loader(cfg: dict, split: str, batch_size: int, max_samples: int | None,
         ds = Subset(ds, indices)
     if max_samples:
         ds = Subset(ds, list(range(min(max_samples, len(ds)))))
-    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, collate_fn=collate, pin_memory=torch.cuda.is_available())
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "shuffle": shuffle,
+        "num_workers": num_workers,
+        "collate_fn": collate,
+        "pin_memory": torch.cuda.is_available(),
+    }
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = bool(cfg.get("data", {}).get("persistent_workers", True))
+        loader_kwargs["prefetch_factor"] = int(cfg.get("data", {}).get("prefetch_factor", 4))
+    return DataLoader(ds, **loader_kwargs)
 
 
 def build_model(cfg: dict, device: torch.device) -> ACPROIAModel:
     model_cfg = cfg.get("model", {})
     threshold_cfg = cfg.get("threshold", {})
     pace_cfg = cfg.get("pace", {})
+    pair_cfg = cfg.get("pair_mining", {})
     model = ACPROIAModel(
         selected_layers=tuple(model_cfg.get("selected_layers", [3, 7, 11])),
         pretrained_weights=str(cfg.get("pretrained_weights", "ckp/reference/dino_deitsmall8_pretrain.pth")),
@@ -77,6 +88,9 @@ def build_model(cfg: dict, device: torch.device) -> ACPROIAModel:
         pace_enabled=bool(pace_cfg.get("enabled", False)),
         pace_coupling_strength=float(pace_cfg.get("coupling_strength", 1.0)),
         pace_max_action_delta=float(pace_cfg.get("max_action_delta", 0.20)),
+        pair_memory_device=str(model_cfg.get("pair_memory_device", "cpu")),
+        pair_memory_size=int(pair_cfg.get("memory_size", 8192)),
+        pair_tail_multiplier=float(cfg.get("loss_weights", {}).get("tail_pair_multiplier", 2.0)),
         threshold_kwargs={
             "action_threshold_min": float(threshold_cfg.get("action_threshold_min", 0.10)),
             "action_threshold_max": float(threshold_cfg.get("action_threshold_max", 0.90)),
@@ -559,6 +573,10 @@ def main() -> None:
         "best_selection_split": "test",
         "feature_cache_enabled": False,
         "token_compression": "none",
+        "num_workers": int(args.num_workers),
+        "persistent_workers": bool(cfg.get("data", {}).get("persistent_workers", True)) if int(args.num_workers) > 0 else False,
+        "prefetch_factor": int(cfg.get("data", {}).get("prefetch_factor", 4)) if int(args.num_workers) > 0 else None,
+        "pair_memory_device": str(cfg.get("model", {}).get("pair_memory_device", "cpu")),
         "batch_size": batch_size,
         "gradient_accumulation_steps": accum,
         "effective_batch": batch_size * accum,
