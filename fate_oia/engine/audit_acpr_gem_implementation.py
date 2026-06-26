@@ -103,6 +103,7 @@ def required_audit_keys() -> list[str]:
         "pu_checks",
         "predicate_target_checks",
         "pair_budget_checks",
+        "pair_memory_runtime_checks",
         "teacher_lock_checks",
         "gate_results",
         "memory_results",
@@ -169,15 +170,25 @@ def run_audit(config: str, output_dir: str, device: str, write_review_pass: bool
         "best_test": cfg.get("best_selection_split") == "test",
         "gem_enabled": cfg.get("gem", {}).get("enabled") is True,
         "oracle_mode_false": cfg.get("gem", {}).get("oracle_mode") is False,
+        "num_workers_positive": int(cfg.get("data", {}).get("num_workers", 0)) > 0,
+        "persistent_workers": cfg.get("data", {}).get("persistent_workers") is True,
+        "prefetch_factor_positive": int(cfg.get("data", {}).get("prefetch_factor", 0)) > 0,
+        "pin_memory": cfg.get("data", {}).get("pin_memory") is True,
     }
+    pair_memory_src = _read("fate_oia/models/acpr_pair_memory.py")
+    train_src = _read("fate_oia/engine/train_acpr_oia.py")
     source_checks = {
         "evidence_memory_has_queries": "evidence_queries" in _read("fate_oia/models/acpr_grounded_evidence_memory.py"),
         "evidence_memory_entmax_or_topk": "entmax15_bisect" in _read("fate_oia/models/acpr_grounded_evidence_memory.py") and "topk" in _read("fate_oia/models/acpr_grounded_evidence_memory.py"),
         "trunk_consumes_evidence": "evidence_tokens" in _read("fate_oia/models/acpr_label_trunk.py") and "action_evidence_attention" in _read("fate_oia/models/acpr_label_trunk.py"),
         "predicate_consumes_evidence": "predicate_evidence_attention" in _read("fate_oia/models/acpr_scene_predicate_head.py"),
         "pu_losses_active": "target_sign" not in _read("fate_oia/losses/acpr_losses.py") and "pu_reason_soft_f1_loss" in _read("fate_oia/losses/acpr_losses.py"),
-        "teacher_lock_before_update": "TeacherBestLock" in _read("fate_oia/engine/train_acpr_oia.py") and "maybe_accept" in _read("fate_oia/engine/train_acpr_oia.py"),
-        "pair_budget_main_ref": "apply_pair_budget" in _read("fate_oia/engine/train_acpr_oia.py"),
+        "teacher_lock_before_update": "TeacherBestLock" in train_src and "maybe_accept" in train_src,
+        "pair_budget_main_ref": "apply_pair_budget" in train_src,
+        "pair_memory_ring_buffer": "fixed-capacity ring buffer" in pair_memory_src and "_write_idx" in pair_memory_src and "_memory_tensors" in pair_memory_src,
+        "pair_memory_enqueue_no_cat": "torch.cat" not in pair_memory_src[pair_memory_src.index("def enqueue") : pair_memory_src.index("@staticmethod")],
+        "pair_memory_device_config": "memory_device" in pair_memory_src and "pair_memory_kwargs" in _read("fate_oia/models/acpr_oia_model.py") and "pair_mining" in train_src,
+        "train_loader_uses_config_workers": "args.num_workers if args.num_workers is not None else data_cfg.get" in train_src,
     }
     dyn = _dynamic_forward(cfg, torch.device("cpu"))
     ast_errors = _ast_ok(REQUIRED_FILES)
@@ -217,6 +228,16 @@ def run_audit(config: str, output_dir: str, device: str, write_review_pass: bool
         "pu_checks": {"pu_soft_f1": source_checks["pu_losses_active"]},
         "predicate_target_checks": {"cleanup_source_present": "traffic_light_green" in _read("fate_oia/models/acpr_predicate_targets.py")},
         "pair_budget_checks": {"budgeted": source_checks["pair_budget_main_ref"]},
+        "pair_memory_runtime_checks": {
+            "ring_buffer": source_checks["pair_memory_ring_buffer"],
+            "enqueue_no_torch_cat": source_checks["pair_memory_enqueue_no_cat"],
+            "memory_device_config": source_checks["pair_memory_device_config"],
+            "train_loader_uses_config_workers": source_checks["train_loader_uses_config_workers"],
+            "num_workers_positive": config_checks["num_workers_positive"],
+            "persistent_workers": config_checks["persistent_workers"],
+            "prefetch_factor_positive": config_checks["prefetch_factor_positive"],
+            "pin_memory": config_checks["pin_memory"],
+        },
         "teacher_lock_checks": {"best_lock": source_checks["teacher_lock_before_update"]},
         "gate_results": {},
         "memory_results": {},

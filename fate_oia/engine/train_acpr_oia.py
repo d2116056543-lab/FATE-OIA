@@ -93,6 +93,7 @@ def build_model(cfg: dict, device: torch.device) -> ACPROIAModel:
         },
         gem_enabled=bool(cfg.get("gem", {}).get("enabled", False)),
         gem_kwargs=cfg.get("gem", {}),
+        pair_memory_kwargs=cfg.get("pair_mining", {}),
     )
     return model.to(device)
 
@@ -533,7 +534,7 @@ def main() -> None:
     ap.add_argument("--gradient_accumulation_steps", type=int, default=None)
     ap.add_argument("--max_train_samples", type=int, default=None)
     ap.add_argument("--max_test_samples", type=int, default=None)
-    ap.add_argument("--num_workers", type=int, default=0)
+    ap.add_argument("--num_workers", type=int, default=None)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--test_only", action="store_true")
     ap.add_argument("--no_feature_cache", action="store_true")
@@ -550,6 +551,8 @@ def main() -> None:
     epochs = int(args.epochs or tr.get("epochs", 28))
     batch_size = int(args.batch_size or tr.get("batch_size", 6))
     accum = int(args.gradient_accumulation_steps or tr.get("gradient_accumulation_steps", 5))
+    data_cfg = cfg.get("data", {})
+    num_workers = int(args.num_workers if args.num_workers is not None else data_cfg.get("num_workers", 0))
     device = torch.device(args.device if torch.cuda.is_available() and args.device == "cuda" else "cpu")
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -567,6 +570,10 @@ def main() -> None:
         "token_compression": "none",
         "batch_size": batch_size,
         "gradient_accumulation_steps": accum,
+        "num_workers": num_workers,
+        "pin_memory": bool(data_cfg.get("pin_memory", torch.cuda.is_available())),
+        "persistent_workers": bool(data_cfg.get("persistent_workers", True)) if num_workers > 0 else False,
+        "prefetch_factor": int(data_cfg.get("prefetch_factor", 4)) if num_workers > 0 else None,
         "effective_batch": batch_size * accum,
         "reference_effective_batch": tr.get("reference_effective_batch", 32),
         "loss_weights": cfg.get("loss_weights", {}),
@@ -599,11 +606,11 @@ def main() -> None:
             if not train_calib_indices:
                 train_calib_indices = list(range(min(1, len(train_dataset))))
         train_loader_indices = None if bool(threshold_cfg.get("train_trunk_on_all_train", True)) else train_main_indices
-        train_loader = make_loader(cfg, "train", batch_size, args.max_train_samples if train_loader_indices is None else None, True, args.num_workers, indices=train_loader_indices)
-        train_calib_loader = make_loader(cfg, "train", batch_size, None, False, args.num_workers, indices=train_calib_indices)
+        train_loader = make_loader(cfg, "train", batch_size, args.max_train_samples if train_loader_indices is None else None, True, num_workers, indices=train_loader_indices)
+        train_calib_loader = make_loader(cfg, "train", batch_size, None, False, num_workers, indices=train_calib_indices)
     else:
-        train_loader = make_loader(cfg, "train", batch_size, args.max_train_samples, True, args.num_workers)
-    test_loader = make_loader(cfg, "test", batch_size, args.max_test_samples, False, args.num_workers)
+        train_loader = make_loader(cfg, "train", batch_size, args.max_train_samples, True, num_workers)
+    test_loader = make_loader(cfg, "test", batch_size, args.max_test_samples, False, num_workers)
     model = build_model(cfg, device)
     resume_ckpt = None
     start_epoch = 0

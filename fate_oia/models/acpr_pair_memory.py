@@ -22,12 +22,106 @@ class PairMiningThresholds:
 
 
 class ACPRPairMemory(nn.Module):
-    def __init__(self, dim: int = 384, memory_size: int = 8192, tail_multiplier: float = 2.0) -> None:
+    def __init__(
+        self,
+        dim: int = 384,
+        memory_size: int = 8192,
+        tail_multiplier: float = 2.0,
+        memory_device: str = "cpu",
+    ) -> None:
         super().__init__()
         self.memory_size = int(memory_size)
         self.tail_multiplier = float(tail_multiplier)
+        self.memory_device = str(memory_device)
         self.proj = nn.Linear(dim, dim)
-        self._memory: dict[str, torch.Tensor | list[str]] = {}
+        self._memory_tensors: dict[str, torch.Tensor] = {}
+        self._file_names: list[str] = ["" for _ in range(self.memory_size)]
+        self._write_idx = 0
+        self._count = 0
+        self._reason_dim = 0
+        self._embed_dim = int(dim)
+
+    @property
+    def memory_count(self) -> int:
+        return int(self._count)
+
+    def _storage_device(self, reference: torch.Tensor) -> torch.device:
+        requested = self.memory_device.lower()
+        if requested in {"same", "input", "auto"}:
+            return reference.device
+        if requested.startswith("cuda"):
+            if reference.is_cuda:
+                return reference.device
+            if torch.cuda.is_available():
+                return torch.device(requested)
+            return torch.device("cpu")
+        return torch.device("cpu")
+
+    def _ensure_memory(
+        self,
+        *,
+        global_embed: torch.Tensor,
+        predicate_probs: torch.Tensor,
+        action_targets: torch.Tensor,
+        reason_targets: torch.Tensor,
+        reason_embeddings_detached: torch.Tensor,
+    ) -> None:
+        storage_device = self._storage_device(global_embed)
+        reason_dim = int(reason_targets.shape[1])
+        embed_dim = int(global_embed.shape[-1])
+        predicate_dim = int(predicate_probs.shape[-1])
+        action_dim = int(action_targets.shape[-1])
+        need_alloc = (
+            not self._memory_tensors
+            or self._memory_tensors["global_embed"].device != storage_device
+            or self._memory_tensors["global_embed"].shape[1] != embed_dim
+            or self._memory_tensors["predicate_probs"].shape[1] != predicate_dim
+            or self._memory_tensors["action_targets"].shape[1] != action_dim
+            or self._memory_tensors["reason_targets"].shape[1] != reason_dim
+        )
+        if not need_alloc:
+            return
+        self._reason_dim = reason_dim
+        self._embed_dim = embed_dim
+        self._write_idx = 0
+        self._count = 0
+        self._file_names = ["" for _ in range(self.memory_size)]
+        self._memory_tensors = {
+            "global_embed": torch.empty(self.memory_size, embed_dim, device=storage_device, dtype=global_embed.dtype),
+            "predicate_probs": torch.empty(self.memory_size, predicate_dim, device=storage_device, dtype=predicate_probs.dtype),
+            "action_targets": torch.empty(self.memory_size, action_dim, device=storage_device, dtype=action_targets.dtype),
+            "reason_targets": torch.empty(self.memory_size, reason_dim, device=storage_device, dtype=reason_targets.dtype),
+            "contradiction_scores": torch.empty(self.memory_size, reason_dim, device=storage_device, dtype=reason_targets.dtype),
+            "reason_logits_detached": torch.empty(self.memory_size, reason_dim, device=storage_device, dtype=reason_targets.dtype),
+            "reason_embeddings_detached": torch.empty(
+                self.memory_size,
+                reason_dim,
+                int(reason_embeddings_detached.shape[-1]),
+                device=storage_device,
+                dtype=reason_embeddings_detached.dtype,
+            ),
+        }
+
+    def _ordered_indices(self, device: torch.device | None = None) -> torch.Tensor:
+        if self._count <= 0:
+            return torch.empty(0, dtype=torch.long, device=device or torch.device("cpu"))
+        storage_device = next(iter(self._memory_tensors.values())).device
+        idx_device = device or storage_device
+        start = (self._write_idx - self._count) % self.memory_size
+        return (torch.arange(self._count, device=idx_device, dtype=torch.long) + start) % self.memory_size
+
+    def memory_view(self, device: torch.device | None = None) -> dict[str, torch.Tensor | list[str]]:
+        if self._count <= 0 or not self._memory_tensors:
+            return {}
+        tensor_device = next(iter(self._memory_tensors.values())).device
+        indices_on_storage = self._ordered_indices(tensor_device)
+        out: dict[str, torch.Tensor | list[str]] = {}
+        for key, tensor in self._memory_tensors.items():
+            value = tensor.index_select(0, indices_on_storage)
+            out[key] = value if device is None or value.device == device else value.to(device, non_blocking=True)
+        indices_cpu = indices_on_storage.detach().cpu().tolist()
+        out["file_names"] = [self._file_names[int(i)] for i in indices_cpu]
+        return out
 
     def forward(self, label_nodes: torch.Tensor) -> torch.Tensor:
         return F.normalize(self.proj(label_nodes.mean(1)), dim=-1)
@@ -54,36 +148,32 @@ class ACPRPairMemory(nn.Module):
         if reason_embeddings_detached is None:
             d = int(global_embed.shape[-1])
             reason_embeddings_detached = torch.zeros(b, reason_dim, d, device=device, dtype=global_embed.dtype)
-
+        # fixed-capacity ring buffer: keep historical negatives on the requested
+        # memory device and overwrite in-place instead of rebuilding history.
+        self._ensure_memory(
+            global_embed=global_embed,
+            predicate_probs=predicate_probs,
+            action_targets=action_targets,
+            reason_targets=reason_targets,
+            reason_embeddings_detached=reason_embeddings_detached,
+        )
+        storage_device = next(iter(self._memory_tensors.values())).device
         payload = {
-            "file_names": list(file_names),
-            "global_embed": F.normalize(global_embed.detach().cpu(), dim=-1),
-            "predicate_probs": predicate_probs.detach().cpu(),
-            "action_targets": action_targets.detach().cpu(),
-            "reason_targets": reason_targets.detach().cpu(),
-            "contradiction_scores": contradiction_scores.detach().cpu(),
-            "reason_logits_detached": reason_logits_detached.detach().cpu(),
-            "reason_embeddings_detached": F.normalize(reason_embeddings_detached.detach().cpu(), dim=-1),
+            "global_embed": F.normalize(global_embed.detach(), dim=-1).to(storage_device, non_blocking=True),
+            "predicate_probs": predicate_probs.detach().to(storage_device, non_blocking=True),
+            "action_targets": action_targets.detach().to(storage_device, non_blocking=True),
+            "reason_targets": reason_targets.detach().to(storage_device, non_blocking=True),
+            "contradiction_scores": contradiction_scores.detach().to(storage_device, non_blocking=True),
+            "reason_logits_detached": reason_logits_detached.detach().to(storage_device, non_blocking=True),
+            "reason_embeddings_detached": F.normalize(reason_embeddings_detached.detach(), dim=-1).to(storage_device, non_blocking=True),
         }
-        if not self._memory:
-            self._memory = payload
-            return
-        keep = max(0, int(self.memory_size) - len(file_names))
-        merged: dict[str, torch.Tensor | list[str]] = {}
-        merged["file_names"] = (self._memory.get("file_names", [])[-keep:] if keep else []) + payload["file_names"]  # type: ignore[operator]
-        for key in [
-            "global_embed",
-            "predicate_probs",
-            "action_targets",
-            "reason_targets",
-            "contradiction_scores",
-            "reason_logits_detached",
-            "reason_embeddings_detached",
-        ]:
-            old = self._memory[key]
-            old = old[-keep:] if keep else old[:0]  # type: ignore[index]
-            merged[key] = torch.cat([old, payload[key]], dim=0)  # type: ignore[arg-type]
-        self._memory = merged
+        for row in range(b):
+            slot = self._write_idx
+            for key, value in payload.items():
+                self._memory_tensors[key][slot].copy_(value[row], non_blocking=True)
+            self._file_names[slot] = file_names[row]
+            self._write_idx = (self._write_idx + 1) % self.memory_size
+            self._count = min(self._count + 1, self.memory_size)
 
     @staticmethod
     def _empty(device: torch.device, reason_dim: int = 21, embed_dim: int = 384) -> dict[str, torch.Tensor | int | list[float] | list[int] | list[str]]:
@@ -213,7 +303,7 @@ class ACPRPairMemory(nn.Module):
         visual_sim_batch = emb @ emb.t()
         predicate_sim_batch = pred @ pred.t()
 
-        mem = self._memory
+        mem = self.memory_view(device)
         has_mem = bool(mem)
         if has_mem:
             mem_embed = mem["global_embed"].to(device)  # type: ignore[union-attr]
