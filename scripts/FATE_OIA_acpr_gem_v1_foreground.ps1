@@ -1,6 +1,6 @@
 param(
   [int]$Epochs = 16,
-  [int]$NumWorkers = 6,
+  [int]$NumWorkers = 4,
   [string]$Device = "cuda",
   [string]$ReferenceCheckpoint = "",
   [switch]$RequireReviewPass
