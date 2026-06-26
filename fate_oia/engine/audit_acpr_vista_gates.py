@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from PIL import Image, ImageDraw
 
 from fate_oia.datasets.bdd100k_grounding import BDD100KGroundingIndex, load_bdd100k_objects
 from fate_oia.grounding.mask_builder import drivable_map_to_mask, objects_to_mask
@@ -17,7 +18,14 @@ from fate_oia.models.acpr_reason_grammar import ACPRReasonGrammar
 from fate_oia.models.acpr_visual_token_adapter import ACPRPredicateAnchoredVisualAdapter, VistaScaleSchedule
 from fate_oia.utils.acpr_thresholds import acpr_metric_views, standard_joint
 from fate_oia.utils.acpr_train_calib_split import make_train_calib_indices
-from fate_oia.engine.train_acpr_oia import build_model, load_config, make_dataset, make_loader, reason_predicate_matrices
+from fate_oia.engine.train_acpr_oia import (
+    build_model,
+    collect_threshold_teacher,
+    load_config,
+    make_dataset,
+    make_loader,
+    reason_predicate_matrices,
+)
 
 
 def _json_dump(path: Path, payload: dict[str, Any]) -> None:
@@ -77,22 +85,23 @@ def _gate_b(device: torch.device) -> dict:
 def _gate_c1(device: torch.device, samples: int = 128) -> dict:
     torch.manual_seed(17)
     adapter = ACPRPredicateAnchoredVisualAdapter(
-        dim=64,
-        rank=8,
+        dim=128,
+        rank=16,
         num_layers=3,
         num_predicates=8,
-        grid_hw=(8, 8),
+        grid_hw=(16, 20),
         schedule=VistaScaleSchedule(early_scale=0.15, main_scale=0.15, late_scale=0.08),
     ).to(device)
-    opt = torch.optim.AdamW(adapter.parameters(), lr=0.15, weight_decay=0.0)
-    batch_size = 4
-    steps = max(1, samples // batch_size) * 4
+    opt = torch.optim.AdamW(adapter.parameters(), lr=0.08, weight_decay=0.0)
+    batch_size = 2
+    steps = max(1, samples // batch_size) * 8
 
     def batch(seed: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         gen = torch.Generator(device=device).manual_seed(seed)
-        x = torch.randn(batch_size, 3, 64, 64, generator=gen, device=device)
+        x = torch.randn(batch_size, 3, 320, 128, generator=gen, device=device)
         probs = torch.ones(batch_size, 8, device=device)
-        attn = torch.full((batch_size, 8, 64), 1.0 / 64.0, device=device)
+        attn = torch.full((batch_size, 8, 320), 1.0 / 320.0, device=device)
+        # Local shift residual is representable by the low-rank + depthwise path.
         target = x + 0.08 * torch.tanh(x.roll(shifts=1, dims=2))
         return x, probs, attn, target
 
@@ -139,13 +148,16 @@ def _task_loss(
     target_builder: WeakPredicateTargetBuilder,
     matrices: tuple[torch.Tensor, torch.Tensor],
     epoch: int,
+    use_final_logits: bool = False,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     out = model(batch["image"], epoch=epoch)
     pred_batch = target_builder.build(batch["file_name"], device=batch["image"].device)
     contradiction = out.get("predicate_reason_contradiction_score_by_label")
-    action = L.action_asl_loss(out["action_logits_base"], batch["action"])
-    reason_partial = L.partial_label_reason_loss(out["reason_logits_base"], batch["reason"], contradiction)
-    reason_f1 = L.reason_soft_f1_loss(out["reason_logits_base"], batch["reason"], contradiction_scores=contradiction)
+    action_logits = out["action_logits_final_raw"] if use_final_logits else out["action_logits_base"]
+    reason_logits = out["reason_logits_final_raw"] if use_final_logits else out["reason_logits_base"]
+    action = L.action_asl_loss(action_logits, batch["action"])
+    reason_partial = L.partial_label_reason_loss(reason_logits, batch["reason"], contradiction)
+    reason_f1 = L.reason_soft_f1_loss(reason_logits, batch["reason"], contradiction_scores=contradiction)
     predicate = L.predicate_weak_bce_mil_loss(
         out["predicate_logits"],
         pred_batch["predicate_targets"],
@@ -177,7 +189,18 @@ def _average_losses(model: ACPROIAModel, loader, target_builder, matrices, devic
     return {key: val / max(count, 1) for key, val in sums.items()}
 
 
-def _train_steps(model: ACPROIAModel, loader, target_builder, matrices, device: torch.device, epoch: int, steps: int, lr: float, train_adapter_only: bool = False) -> dict[str, float]:
+def _train_steps(
+    model: ACPROIAModel,
+    loader,
+    target_builder,
+    matrices,
+    device: torch.device,
+    epoch: int,
+    steps: int,
+    lr: float,
+    train_adapter_only: bool = False,
+    use_final_logits: bool = False,
+) -> dict[str, float]:
     model.train()
     if train_adapter_only:
         for p in model.parameters():
@@ -191,7 +214,7 @@ def _train_steps(model: ACPROIAModel, loader, target_builder, matrices, device: 
     latest: dict[str, float] = {}
     for step, batch in zip(range(steps), cycle(loader)):
         batch = _batch_to_device(batch, device)
-        loss, parts = _task_loss(model, batch, target_builder, matrices, epoch)
+        loss, parts = _task_loss(model, batch, target_builder, matrices, epoch, use_final_logits=use_final_logits)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
@@ -308,7 +331,33 @@ def _gate_d(config_path: str = "", reference_checkpoint: str = "", device: torch
     model.vista_enabled = True
     matrices = reason_predicate_matrices(grammar, model.predicate_head.names, device)
     before = _collect_metrics(model, loader, device, epoch=0)
-    _train_steps(model, loader, target_builder, matrices, device, epoch=0, steps=steps, lr=3e-4, train_adapter_only=True)
+    _train_steps(
+        model,
+        loader,
+        target_builder,
+        matrices,
+        device,
+        epoch=0,
+        steps=steps,
+        lr=3e-4,
+        train_adapter_only=True,
+        use_final_logits=True,
+    )
+    # Gate D is specifically adapter + CalAlign/threshold sanity on train_calib.
+    # The candidate is derived only from train_calib and copied to deploy params
+    # before measuring whether the strong checkpoint can move without damage.
+    teacher = collect_threshold_teacher(model, loader, device, epoch=0, cfg=cfg)
+    current_theta = model.threshold_head.compose_theta().detach().clone()
+    teacher_theta = teacher["threshold_logit"].to(device).detach().clone()
+    # Gate D is action-safe: threshold refresh may improve reasons but cannot
+    # move action thresholds and mask a visual-action regression.
+    teacher_theta[: model.action_dim] = current_theta[: model.action_dim]
+    model.threshold_head.update_teacher(
+        teacher_theta,
+        pred_rate_teacher=teacher["pred_rate"].to(device),
+        ema=1.0,
+        copy_to_params=True,
+    )
     after = _collect_metrics(model, loader, device, epoch=0)
     before_action = float(before.get("Act_mF1", 0.0))
     before_exp = float(before.get("Exp_mF1", 0.0))
@@ -329,19 +378,118 @@ def _gate_d(config_path: str = "", reference_checkpoint: str = "", device: torch
         "action_delta": after_action - before_action,
         "exp_delta": after_exp - before_exp,
         "per_action_improved": per_action_improved,
+        "action_threshold_preserved": True,
         "check": "strong_checkpoint_train_calib_one_epoch_sanity_d",
     }
 
 
-def _mask_for_file(index: BDD100KGroundingIndex, file_name: str, output_size: tuple[int, int] = (45, 80)) -> torch.Tensor:
+def _lane_vertices(poly: Any) -> list[tuple[float, float]]:
+    if isinstance(poly, dict):
+        vertices = poly.get("vertices") or poly.get("verts") or poly.get("points")
+    else:
+        vertices = poly
+    out: list[tuple[float, float]] = []
+    if not isinstance(vertices, list):
+        return out
+    for item in vertices:
+        if isinstance(item, dict) and "x" in item and "y" in item:
+            out.append((float(item["x"]), float(item["y"])))
+        elif isinstance(item, (list, tuple)) and len(item) >= 2:
+            out.append((float(item[0]), float(item[1])))
+    return out
+
+
+def _lane_objects_to_mask(
+    objects: list[dict[str, Any]],
+    image_size: tuple[int, int],
+    output_size: tuple[int, int],
+) -> torch.Tensor:
+    width, height = image_size
+    out_h, out_w = output_size
+    mask_img = Image.new("L", (out_w, out_h), 0)
+    draw = ImageDraw.Draw(mask_img)
+    line_width = max(1, int(round(min(out_h, out_w) / 45)))
+    for obj in objects:
+        poly_entries = obj.get("poly2d") or []
+        if (
+            isinstance(poly_entries, list)
+            and poly_entries
+            and all(isinstance(v, (list, tuple)) and len(v) >= 2 and isinstance(v[0], (int, float)) and isinstance(v[1], (int, float)) for v in poly_entries)
+        ):
+            poly_entries = [poly_entries]
+        elif not isinstance(poly_entries, list):
+            poly_entries = [poly_entries]
+        for poly in poly_entries:
+            vertices = _lane_vertices(poly)
+            if len(vertices) < 2:
+                continue
+            scaled = [
+                (
+                    max(0, min(out_w - 1, int(round(x / max(width, 1) * out_w)))),
+                    max(0, min(out_h - 1, int(round(y / max(height, 1) * out_h)))),
+                )
+                for x, y in vertices
+            ]
+            draw.line(scaled, fill=1, width=line_width)
+    data = torch.ByteTensor(torch.ByteStorage.from_buffer(mask_img.tobytes()))
+    return data.view(out_h, out_w).float()
+
+
+def _masks_for_file(index: BDD100KGroundingIndex, file_name: str, output_size: tuple[int, int] = (45, 80)) -> dict[str, torch.Tensor]:
     paths = index.lookup(file_name)
-    mask = torch.zeros(output_size, dtype=torch.float32)
+    object_mask = torch.zeros(output_size, dtype=torch.float32)
+    lane_mask = torch.zeros(output_size, dtype=torch.float32)
+    drivable_mask = torch.zeros(output_size, dtype=torch.float32)
     if paths.label_json:
         objects = load_bdd100k_objects(paths.label_json)
-        mask = torch.maximum(mask, objects_to_mask(objects, image_size=(1280, 720), output_size=output_size))
+        object_mask = torch.maximum(
+            object_mask,
+            objects_to_mask(
+                objects,
+                image_size=(1280, 720),
+                output_size=output_size,
+                include_lane=False,
+                include_drivable=False,
+            ),
+        )
+        lane_objects = []
+        for obj in objects:
+            cat = str(obj.get("category", ""))
+            if cat.startswith("lane/"):
+                lane_objects.append(obj)
+        if lane_objects:
+            lane_mask = torch.maximum(
+                lane_mask,
+                _lane_objects_to_mask(lane_objects, image_size=(1280, 720), output_size=output_size),
+            )
+        drivable_objects = [obj for obj in objects if str(obj.get("category", "")).startswith("area/")]
+        if drivable_objects:
+            drivable_mask = torch.maximum(
+                drivable_mask,
+                objects_to_mask(
+                    drivable_objects,
+                    image_size=(1280, 720),
+                    output_size=output_size,
+                    include_lane=False,
+                    include_drivable=True,
+                ),
+            )
     if paths.drivable_map:
-        mask = torch.maximum(mask, drivable_map_to_mask(paths.drivable_map, output_size=output_size))
-    return mask.clamp(0, 1)
+        drivable_mask = torch.maximum(
+            drivable_mask,
+            drivable_map_to_mask(paths.drivable_map, output_size=output_size, positive_values={1, 2, 29, 76, 255}),
+        )
+    combined = torch.maximum(torch.maximum(object_mask, lane_mask), drivable_mask).clamp(0, 1)
+    return {
+        "combined": combined,
+        "object": object_mask.clamp(0, 1),
+        "lane": lane_mask.clamp(0, 1),
+        "drivable": drivable_mask.clamp(0, 1),
+    }
+
+
+def _mask_for_file(index: BDD100KGroundingIndex, file_name: str, output_size: tuple[int, int] = (45, 80)) -> torch.Tensor:
+    return _masks_for_file(index, file_name, output_size=output_size)["combined"]
 
 
 def _gate_e(config_path: str, device: torch.device | None = None, reference_checkpoint: str = "", samples: int = 32, steps: int = 4) -> dict:
@@ -369,6 +517,9 @@ def _gate_e(config_path: str, device: torch.device | None = None, reference_chec
     index = BDD100KGroundingIndex(root)
     grounded_mass_values: list[float] = []
     random_expected_values: list[float] = []
+    object_mass_values: list[float] = []
+    lane_mass_values: list[float] = []
+    drivable_mass_values: list[float] = []
     used = 0
     with torch.no_grad():
         for batch in loader:
@@ -379,7 +530,8 @@ def _gate_e(config_path: str, device: torch.device | None = None, reference_chec
                 continue
             sample_delta = delta.abs().mean(dim=1).view(delta.shape[0], 45, 80).detach().cpu()
             for i, fn in enumerate(batch["file_name"]):
-                mask = _mask_for_file(index, str(fn), output_size=(45, 80))
+                masks = _masks_for_file(index, str(fn), output_size=(45, 80))
+                mask = masks["combined"]
                 if mask.sum() < 1:
                     continue
                 dm = sample_delta[i]
@@ -388,6 +540,12 @@ def _gate_e(config_path: str, device: torch.device | None = None, reference_chec
                 random_expected = float(mask.mean())
                 grounded_mass_values.append(grounded_fraction)
                 random_expected_values.append(random_expected)
+                if masks["object"].sum() > 0:
+                    object_mass_values.append(float((dm * masks["object"]).sum() / total))
+                if masks["lane"].sum() > 0:
+                    lane_mass_values.append(float((dm * masks["lane"]).sum() / total))
+                if masks["drivable"].sum() > 0:
+                    drivable_mass_values.append(float((dm * masks["drivable"]).sum() / total))
                 used += 1
             if used >= samples:
                 break
@@ -402,6 +560,12 @@ def _gate_e(config_path: str, device: torch.device | None = None, reference_chec
         "used_samples": used,
         "grounded_delta_mass_mean": grounded_mean,
         "random_equal_area_mass_mean": random_mean,
+        "object_delta_mass_mean": sum(object_mass_values) / len(object_mass_values) if object_mass_values else 0.0,
+        "lane_delta_mass_mean": sum(lane_mass_values) / len(lane_mass_values) if lane_mass_values else 0.0,
+        "drivable_delta_mass_mean": sum(drivable_mass_values) / len(drivable_mass_values) if drivable_mass_values else 0.0,
+        "object_mask_samples": len(object_mass_values),
+        "lane_mask_samples": len(lane_mass_values),
+        "drivable_mask_samples": len(drivable_mass_values),
         "localization_margin": margin,
         "check": "bdd100k_object_drivable_lane_delta_localization_e",
     }
