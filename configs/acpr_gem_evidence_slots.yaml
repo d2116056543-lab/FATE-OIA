@@ -1,0 +1,201 @@
+slots:
+  - id: 0
+    name: front_object
+    group: object
+    grounding_sources: [object_box]
+    region_prior: front_center
+    use_object_boxes: true
+    use_lane_polylines: false
+    use_drivable_masks: false
+    oracle_allowed: true
+    reliability: 0.9
+  - id: 1
+    name: left_object
+    group: object
+    grounding_sources: [object_box]
+    region_prior: left_corridor
+    use_object_boxes: true
+    use_lane_polylines: false
+    use_drivable_masks: false
+    oracle_allowed: true
+    reliability: 0.85
+  - id: 2
+    name: right_object
+    group: object
+    grounding_sources: [object_box]
+    region_prior: right_corridor
+    use_object_boxes: true
+    use_lane_polylines: false
+    use_drivable_masks: false
+    oracle_allowed: true
+    reliability: 0.85
+  - id: 3
+    name: pedestrian_or_rider
+    group: object
+    grounding_sources: [object_box]
+    region_prior: front_center
+    use_object_boxes: true
+    use_lane_polylines: false
+    use_drivable_masks: false
+    oracle_allowed: true
+    reliability: 0.9
+  - id: 4
+    name: traffic_control
+    group: traffic
+    grounding_sources: [object_box]
+    region_prior: upper_traffic_region
+    use_object_boxes: true
+    use_lane_polylines: false
+    use_drivable_masks: false
+    oracle_allowed: true
+    reliability: 0.9
+  - id: 5
+    name: front_obstacle
+    group: object
+    grounding_sources: [object_box]
+    region_prior: front_center
+    use_object_boxes: true
+    use_lane_polylines: false
+    use_drivable_masks: false
+    oracle_allowed: true
+    reliability: 0.8
+  - id: 6
+    name: crosswalk_or_intersection
+    group: traffic
+    grounding_sources: [object_box, lane_polyline]
+    region_prior: front_center
+    use_object_boxes: true
+    use_lane_polylines: true
+    use_drivable_masks: false
+    oracle_allowed: true
+    reliability: 0.75
+  - id: 7
+    name: object_global
+    group: object
+    grounding_sources: [object_box]
+    region_prior: global
+    use_object_boxes: true
+    use_lane_polylines: false
+    use_drivable_masks: false
+    oracle_allowed: true
+    reliability: 0.7
+  - id: 8
+    name: front_lane_boundary
+    group: lane
+    grounding_sources: [lane_polyline]
+    region_prior: front_center
+    use_object_boxes: false
+    use_lane_polylines: true
+    use_drivable_masks: false
+    oracle_allowed: true
+    reliability: 0.8
+  - id: 9
+    name: left_lane_boundary
+    group: lane
+    grounding_sources: [lane_polyline]
+    region_prior: left_corridor
+    use_object_boxes: false
+    use_lane_polylines: true
+    use_drivable_masks: false
+    oracle_allowed: true
+    reliability: 0.85
+  - id: 10
+    name: right_lane_boundary
+    group: lane
+    grounding_sources: [lane_polyline]
+    region_prior: right_corridor
+    use_object_boxes: false
+    use_lane_polylines: true
+    use_drivable_masks: false
+    oracle_allowed: true
+    reliability: 0.85
+  - id: 11
+    name: center_drivable
+    group: drivable
+    grounding_sources: [drivable_mask]
+    region_prior: bottom_drivable_region
+    use_object_boxes: false
+    use_lane_polylines: false
+    use_drivable_masks: true
+    oracle_allowed: true
+    reliability: 0.9
+  - id: 12
+    name: left_drivable
+    group: drivable
+    grounding_sources: [drivable_mask]
+    region_prior: left_corridor
+    use_object_boxes: false
+    use_lane_polylines: false
+    use_drivable_masks: true
+    oracle_allowed: true
+    reliability: 0.85
+  - id: 13
+    name: right_drivable
+    group: drivable
+    grounding_sources: [drivable_mask]
+    region_prior: right_corridor
+    use_object_boxes: false
+    use_lane_polylines: false
+    use_drivable_masks: true
+    oracle_allowed: true
+    reliability: 0.85
+  - id: 14
+    name: lane_global
+    group: lane
+    grounding_sources: [lane_polyline]
+    region_prior: global
+    use_object_boxes: false
+    use_lane_polylines: true
+    use_drivable_masks: false
+    oracle_allowed: true
+    reliability: 0.7
+  - id: 15
+    name: drivable_global
+    group: drivable
+    grounding_sources: [drivable_mask]
+    region_prior: global
+    use_object_boxes: false
+    use_lane_polylines: false
+    use_drivable_masks: true
+    oracle_allowed: true
+    reliability: 0.7
+  - id: 16
+    name: lower_center_context
+    group: context
+    grounding_sources: []
+    region_prior: bottom_drivable_region
+    use_object_boxes: false
+    use_lane_polylines: false
+    use_drivable_masks: false
+    oracle_allowed: false
+    reliability: 0.45
+  - id: 17
+    name: upper_traffic_context
+    group: context
+    grounding_sources: []
+    region_prior: upper_traffic_region
+    use_object_boxes: false
+    use_lane_polylines: false
+    use_drivable_masks: false
+    oracle_allowed: false
+    reliability: 0.45
+  - id: 18
+    name: left_context
+    group: context
+    grounding_sources: []
+    region_prior: left_corridor
+    use_object_boxes: false
+    use_lane_polylines: false
+    use_drivable_masks: false
+    oracle_allowed: false
+    reliability: 0.45
+  - id: 19
+    name: right_context
+    group: context
+    grounding_sources: []
+    region_prior: right_corridor
+    use_object_boxes: false
+    use_lane_polylines: false
+    use_drivable_masks: false
+    oracle_allowed: false
+    reliability: 0.45

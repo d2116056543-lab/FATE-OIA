@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from .acpr_grounded_evidence_memory import ACPREvidenceMemoryAugmenter
 from .acpr_sparse_ops import entmax15_bisect
 
 
@@ -29,8 +30,17 @@ class ACPRLabelTrunk(nn.Module):
             nn.Linear(hidden, 1),
         )
         self.fusion_gate = nn.Linear(dim * 2, action_dim)
+        self.evidence_augmenter = ACPREvidenceMemoryAugmenter(dim=dim, max_delta=0.20, num_heads=4)
+        self.evidence_out_proj = self.evidence_augmenter.evidence_out_proj
 
-    def forward(self, patch_tokens_by_layer: torch.Tensor, predicate_tokens: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
+    def forward(
+        self,
+        patch_tokens_by_layer: torch.Tensor,
+        predicate_tokens: torch.Tensor | None = None,
+        evidence_tokens: torch.Tensor | None = None,
+        evidence_attention: torch.Tensor | None = None,
+        evidence_enabled: bool = False,
+    ) -> dict[str, torch.Tensor]:
         patch = patch_tokens_by_layer.mean(1)
         b, n, d = patch.shape
         q = self.query_proj(self.label_queries).view(1, self.num_labels, 1, d)
@@ -40,6 +50,14 @@ class ACPRLabelTrunk(nn.Module):
         attn = entmax15_bisect(score, dim=-1)
         label_nodes = torch.einsum("bln,bnd->bld", attn, v)
         label_nodes = label_nodes + self.label_self_attn(label_nodes, label_nodes, label_nodes, need_weights=False)[0]
+        label_nodes_patch = label_nodes
+        if evidence_enabled and evidence_tokens is not None:
+            label_nodes, evidence_context, label_evidence_attention = self.evidence_augmenter(label_nodes_patch, evidence_tokens)
+            label_evidence_delta = label_nodes - label_nodes_patch
+        else:
+            evidence_context = torch.zeros_like(label_nodes)
+            label_evidence_delta = torch.zeros_like(label_nodes)
+            label_evidence_attention = label_nodes.new_zeros(b, self.num_labels, 0)
         if predicate_tokens is not None:
             reason_nodes = label_nodes[:, self.action_dim :]
             pred_delta = self.predicate_cross_attn(reason_nodes, predicate_tokens, predicate_tokens, need_weights=False)[0]
@@ -55,7 +73,19 @@ class ACPRLabelTrunk(nn.Module):
         action_logits_direct = gate * action_visual_logits + (1.0 - gate) * action_reason_logits
         return {
             "label_nodes": label_nodes,
+            "label_nodes_patch": label_nodes_patch,
+            "label_nodes_evidence_context": evidence_context,
+            "label_nodes_evidence_delta": label_evidence_delta,
             "label_attention": attn,
+            "label_evidence_attention": label_evidence_attention,
+            "action_evidence_attention": label_evidence_attention[:, : self.action_dim],
+            "reason_evidence_attention": label_evidence_attention[:, self.action_dim :],
+            "label_evidence_delta_norm": label_evidence_delta.norm(dim=-1).mean(),
+            "label_evidence_gate_or_scale_stats": torch.tensor(
+                [float(label_evidence_delta.norm(dim=-1).mean().detach().cpu())],
+                device=label_nodes.device,
+                dtype=label_nodes.dtype,
+            ),
             "action_visual_logits": action_visual_logits,
             "action_reason_logits": action_reason_logits,
             "reason_logits_visual": reason_logits_visual,

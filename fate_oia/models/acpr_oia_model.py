@@ -8,6 +8,7 @@ from .acpr_action_combo_aux import ACPRActionComboAux
 from .acpr_calibration import ACPRCalibrationHead
 from .acpr_dino_field import ACPRDinoFieldExtractor
 from .acpr_ego_regions import ACPREgoRegionEncoder
+from .acpr_grounded_evidence_memory import ACPREvidenceGroundingLoss, ACPRGroundedEvidencePooler
 from .acpr_label_trunk import ACPRLabelTrunk
 from .acpr_pair_memory import ACPRPairMemory
 from .acpr_predicate_reason import ACPRPredicateReasoner
@@ -28,11 +29,14 @@ class ACPROIAModel(nn.Module):
         use_mock_dino: bool = False,
         threshold_enabled: bool = False,
         threshold_kwargs: dict | None = None,
+        gem_enabled: bool = False,
+        gem_kwargs: dict | None = None,
     ) -> None:
         super().__init__()
         self.action_dim = action_dim
         self.reason_dim = reason_dim
         self.threshold_enabled = bool(threshold_enabled)
+        self.gem_enabled = bool(gem_enabled)
         self.dino = ACPRDinoFieldExtractor(selected_layers=selected_layers, pretrained_weights=pretrained_weights, use_mock_dino=use_mock_dino)
         self.ego = ACPREgoRegionEncoder(grid_hw=(45, 80), dim=dim)
         self.predicate_head = ACPRScenePredicateHead(scene_config=scene_config, dim=dim, num_layers=len(selected_layers))
@@ -43,15 +47,55 @@ class ACPROIAModel(nn.Module):
         self.action_combo_aux = ACPRActionComboAux(dim=dim, action_dim=action_dim)
         self.calibration = ACPRCalibrationHead(num_labels=action_dim + reason_dim)
         self.threshold_head = ACPRThresholdHead(action_dim=action_dim, reason_dim=reason_dim, **(threshold_kwargs or {}))
+        gem_cfg = dict(gem_kwargs or {})
+        self.evidence_memory = ACPRGroundedEvidencePooler(
+            dim=dim,
+            slots_config=gem_cfg.get("slots_config", "configs/acpr_gem_evidence_slots.yaml"),
+            topk=int(gem_cfg.get("topk", 256)),
+        )
+        self.evidence_grounding_loss_fn = ACPREvidenceGroundingLoss(entropy_weight=float(gem_cfg.get("entropy_weight", 0.001)))
 
-    def forward(self, images: torch.Tensor, epoch: int = 0) -> dict[str, torch.Tensor | dict | tuple[int, int] | int]:
+    def forward(
+        self,
+        images: torch.Tensor,
+        epoch: int = 0,
+        gem_grounding: dict | None = None,
+        oracle_evidence: bool = False,
+    ) -> dict[str, torch.Tensor | dict | tuple[int, int] | int | list[str] | bool]:
         field = self.dino(images)
-        patch = field["patch_tokens_by_layer"]
-        patch0, ego_features, region_masks, ego_stats = self.ego(patch[:, 0])
-        patch = patch.clone()
+        patch_tokens_raw = field["patch_tokens_by_layer"]
+        patch0, ego_features, region_masks, ego_stats = self.ego(patch_tokens_raw[:, 0])
+        patch = patch_tokens_raw.clone()
         patch[:, 0] = patch0
-        predicates = self.predicate_head(patch, region_masks=region_masks)
-        trunk = self.trunk(patch, predicate_tokens=predicates["predicate_tokens"])
+        grounding_targets = None if gem_grounding is None else gem_grounding.get("grounding_targets")
+        grounding_mask = None if gem_grounding is None else gem_grounding.get("grounding_mask")
+        if self.gem_enabled:
+            evidence = self.evidence_memory(patch, grounding_targets=grounding_targets, grounding_mask=grounding_mask)
+            evidence_tokens = evidence["evidence_tokens"]
+        else:
+            b, _, n, d = patch.shape
+            m = self.evidence_memory.num_slots
+            evidence_tokens = None
+            evidence = {
+                "evidence_tokens": patch.new_zeros(b, m, d),
+                "evidence_attention": patch.new_zeros(b, m, n),
+                "evidence_scores": patch.new_zeros(b, m, n),
+                "evidence_slot_names": self.evidence_memory.slot_names,
+                "evidence_slot_groups": self.evidence_memory.slot_groups,
+                "evidence_grounding_targets": patch.new_zeros(b, m, n),
+                "evidence_grounding_mask": patch.new_zeros(b, m),
+                "evidence_available_rate": patch.new_zeros(()),
+                "evidence_stats": {},
+                "evidence_oracle_mode": False,
+            }
+        predicates = self.predicate_head(patch, region_masks=region_masks, evidence_tokens=evidence_tokens)
+        trunk = self.trunk(
+            patch,
+            predicate_tokens=predicates["predicate_tokens"],
+            evidence_tokens=evidence_tokens,
+            evidence_attention=evidence.get("evidence_attention"),
+            evidence_enabled=self.gem_enabled,
+        )
         reason_delta = self.predicate_reason(trunk["label_nodes"][:, self.action_dim :], predicates["predicate_probs"], predicates["predicate_tokens"])
         action_logits_base = trunk["action_logits_direct"]
         reason_logits_base = trunk["reason_logits_visual"] + reason_delta["predicate_reason_delta"]
@@ -82,10 +126,12 @@ class ACPROIAModel(nn.Module):
         pair_embedding = self.pair_memory(trunk["label_nodes"])
         out = {
             **field,
+            "patch_tokens_by_layer_raw": patch_tokens_raw,
             **trunk,
             **predicates,
             **reason_delta,
             **action_set,
+            **evidence,
             "global_embedding": field["cls_tokens_by_layer"].mean(1),
             "pair_embedding": pair_embedding,
             "reason_embeddings_for_pair": reason_embeddings_for_pair,
@@ -119,6 +165,10 @@ class ACPROIAModel(nn.Module):
             "temperature_action": temperature[: self.action_dim],
             "temperature_reason": temperature[self.action_dim :],
             "ego_stats": ego_stats,
+            "evidence_branch_delta_norms": {
+                "label": float(trunk["label_evidence_delta_norm"].detach().cpu()) if torch.is_tensor(trunk.get("label_evidence_delta_norm")) else 0.0,
+                "predicate": float(predicates["predicate_evidence_delta_norm"].detach().cpu()) if torch.is_tensor(predicates.get("predicate_evidence_delta_norm")) else 0.0,
+            },
             "branch_logits": {
                 "direct": logits_base,
                 "direct_plus_predicate": logits_base,
@@ -128,8 +178,20 @@ class ACPROIAModel(nn.Module):
                 "calibrated": logits_final_calibrated,
                 "final_raw": logits_final_raw,
                 "final_calibrated": logits_final_calibrated,
+                "evidence_base_fixed": logits_base,
+                "no_evidence_base_fixed": logits_base.detach(),
                 "action_visual": trunk["action_visual_logits"],
                 "action_reason": trunk["action_reason_logits"],
             },
         }
+        if grounding_targets is not None and grounding_mask is not None:
+            out["evidence_grounding_loss"] = self.evidence_grounding_loss_fn(
+                evidence["evidence_attention"],
+                grounding_targets,
+                grounding_mask,
+                evidence.get("evidence_scores"),
+            )
+        else:
+            out["evidence_grounding_loss"] = logits_base.sum() * 0.0
+        out["evidence_grounding_stats"] = evidence.get("evidence_stats", {})
         return out

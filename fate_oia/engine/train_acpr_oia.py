@@ -18,11 +18,14 @@ from fate_oia.models.acpr_oia_model import ACPROIAModel
 from fate_oia.models.acpr_pair_memory import PairMiningThresholds
 from fate_oia.models.acpr_predicate_targets import WeakPredicateTargetBuilder
 from fate_oia.models.acpr_reason_grammar import ACPRReasonGrammar
+from fate_oia.grounding.acpr_gem_grounding import ACPRGEMGroundingBuilder
 from fate_oia.transforms import AspectRatioLetterboxTransform
 from fate_oia.losses import acpr_losses as L
 from fate_oia.losses import acpr_threshold_losses as TL
 from fate_oia.utils.acpr_artifacts import append_jsonl, json_safe, save_tensor, write_json
 from fate_oia.utils.acpr_pair_mining import pair_summary
+from fate_oia.utils.acpr_pair_budget import apply_pair_budget
+from fate_oia.utils.acpr_gem_teacher_lock import TeacherBestLock
 from fate_oia.utils.acpr_threshold_search import search_best_thresholds_for_f1
 from fate_oia.utils.acpr_thresholds import acpr_metric_views, standard_joint
 from fate_oia.utils.acpr_train_calib_split import make_train_calib_indices
@@ -54,7 +57,18 @@ def make_loader(cfg: dict, split: str, batch_size: int, max_samples: int | None,
         ds = Subset(ds, indices)
     if max_samples:
         ds = Subset(ds, list(range(min(max_samples, len(ds)))))
-    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, collate_fn=collate, pin_memory=torch.cuda.is_available())
+    data_cfg = cfg.get("data", {})
+    kwargs = {
+        "batch_size": batch_size,
+        "shuffle": shuffle,
+        "num_workers": num_workers,
+        "collate_fn": collate,
+        "pin_memory": bool(data_cfg.get("pin_memory", torch.cuda.is_available())),
+    }
+    if num_workers > 0:
+        kwargs["persistent_workers"] = bool(data_cfg.get("persistent_workers", True))
+        kwargs["prefetch_factor"] = int(data_cfg.get("prefetch_factor", 4))
+    return DataLoader(ds, **kwargs)
 
 
 def build_model(cfg: dict, device: torch.device) -> ACPROIAModel:
@@ -77,6 +91,8 @@ def build_model(cfg: dict, device: torch.device) -> ACPROIAModel:
             "tail_reason_indices": cfg.get("grammar", {}).get("tail_indices", [12, 9, 5, 14, 6, 11, 10, 13]),
             "use_group_shrinkage": bool(threshold_cfg.get("use_group_shrinkage", True)),
         },
+        gem_enabled=bool(cfg.get("gem", {}).get("enabled", False)),
+        gem_kwargs=cfg.get("gem", {}),
     )
     return model.to(device)
 
@@ -84,15 +100,36 @@ def build_model(cfg: dict, device: torch.device) -> ACPROIAModel:
 def optimizer_for(model: ACPROIAModel, cfg: dict) -> torch.optim.Optimizer:
     tr = cfg.get("training", {})
     threshold_cfg = cfg.get("threshold", {})
+    evidence_params: list[torch.nn.Parameter] = []
+    evidence_projection_params: list[torch.nn.Parameter] = []
+    if bool(cfg.get("gem", {}).get("enabled", False)):
+        evidence_params = list(model.evidence_memory.parameters())
+        evidence_projection_params = list(model.trunk.evidence_augmenter.parameters()) + list(model.predicate_head.evidence_augmenter.parameters())
+    excluded = {id(p) for p in evidence_params + evidence_projection_params}
+    trunk_params = [p for p in model.trunk.parameters() if id(p) not in excluded]
+    predicate_params = [p for p in model.predicate_head.parameters() if id(p) not in excluded]
     groups = [
-        {"params": list(model.trunk.parameters()), "lr": float(tr.get("lr_trunk", 2e-4)), "name": "trunk"},
-        {"params": list(model.predicate_head.parameters()), "lr": float(tr.get("lr_predicate", 2e-4)), "name": "predicate"},
+        {"params": trunk_params, "lr": float(tr.get("lr_trunk", 2e-4)), "name": "trunk"},
+        {"params": predicate_params, "lr": float(tr.get("lr_predicate", 2e-4)), "name": "predicate"},
         {"params": list(model.predicate_reason.parameters()), "lr": float(tr.get("lr_reason_predicate", 2e-4)), "name": "reason_predicate"},
         {"params": list(model.pair_memory.parameters()), "lr": float(tr.get("lr_pair_projection", 2e-4)), "name": "pair_projection"},
         {"params": list(model.reason_pair_proj.parameters()), "lr": float(tr.get("lr_pair_projection", 2e-4)), "name": "reason_pair_projection"},
         {"params": list(model.action_combo_aux.parameters()), "lr": float(tr.get("lr_trunk", 2e-4)), "name": "combo"},
         {"params": list(model.calibration.parameters()), "lr": float(tr.get("lr_calibration", 5e-4)), "name": "calibration"},
     ]
+    if bool(cfg.get("gem", {}).get("enabled", False)):
+        groups.append({
+            "params": evidence_params,
+            "lr": float(tr.get("lr_evidence_memory", 3e-4)),
+            "weight_decay": float(tr.get("evidence_weight_decay", 0.01)),
+            "name": "evidence_memory",
+        })
+        groups.append({
+            "params": evidence_projection_params,
+            "lr": float(tr.get("lr_evidence_projection", 5e-4)),
+            "weight_decay": float(tr.get("evidence_weight_decay", 0.01)),
+            "name": "evidence_output_projection",
+        })
     if bool(threshold_cfg.get("enabled", False)):
         groups.append({
             "params": list(model.threshold_head.parameters()),
@@ -226,12 +263,37 @@ def update_threshold_teacher_from_train_calib(
 ) -> dict[str, Any]:
     teacher = collect_threshold_teacher(model, train_calib_loader, device, epoch, cfg)
     search_cfg = cfg.get("threshold", {})
-    model.threshold_head.update_teacher(
-        teacher["threshold_logit"].to(device),
-        pred_rate_teacher=teacher["pred_rate"].to(device),
-        ema=float(search_cfg.get("teacher_ema", 0.20)),
-        copy_to_params=bool(search_cfg.get("copy_teacher_to_params", False)),
-    )
+    accepted = True
+    lock_payload: dict[str, Any] = {}
+    if bool(search_cfg.get("teacher_best_lock", False)):
+        action_logits, reason_logits, action_labels, reason_labels = collect_base_logits(model, train_calib_loader, device, epoch)
+        theta = teacher["threshold_logit"]
+        deploy = torch.cat([action_logits, reason_logits], dim=-1) - theta.view(1, -1)
+        views = acpr_metric_views(deploy[:, :4], deploy[:, 4:], action_labels, reason_labels)
+        raw = views["metrics_raw_fixed"]
+        joint = standard_joint(raw)
+        if not hasattr(model, "_gem_teacher_lock"):
+            model._gem_teacher_lock = TeacherBestLock(
+                min_delta=float(search_cfg.get("teacher_best_min_delta", 1e-4)),
+                action_tolerance=float(search_cfg.get("teacher_action_tolerance", 0.001)),
+                exp_tolerance=float(search_cfg.get("teacher_exp_tolerance", 0.001)),
+            )
+        result = model._gem_teacher_lock.maybe_accept(
+            theta,
+            joint=joint,
+            action=float(raw.get("Act_mF1", 0.0)),
+            exp=float(raw.get("Exp_mF1", 0.0)),
+            epoch=epoch,
+        )
+        accepted = bool(result["accepted"])
+        lock_payload = result
+    if accepted:
+        model.threshold_head.update_teacher(
+            teacher["threshold_logit"].to(device),
+            pred_rate_teacher=teacher["pred_rate"].to(device),
+            ema=float(search_cfg.get("teacher_ema", 0.20)),
+            copy_to_params=bool(search_cfg.get("copy_teacher_to_params", False)),
+        )
     payload = {
         "epoch": epoch,
         "source": "train_calib",
@@ -241,6 +303,9 @@ def update_threshold_teacher_from_train_calib(
         "pred_rate": teacher["pred_rate"].tolist(),
         "support_pos": teacher["support_pos"].tolist(),
         "support_neg": teacher["support_neg"].tolist(),
+        "teacher_best_lock": bool(search_cfg.get("teacher_best_lock", False)),
+        "accepted": bool(accepted),
+        "best_lock": lock_payload,
     }
     write_json(out_dir / f"threshold_teacher_epoch_{epoch:03d}.json", payload)
     return payload
@@ -335,7 +400,7 @@ def pair_artifact_payload(pairs: dict, reason_names: list[str] | None = None) ->
     return {"available": True, **summary, "per_reason": per_reason}
 
 
-def compute_losses(out: dict, batch: dict, predicate_batch: dict, pairs: dict, grammar_matrices: tuple[torch.Tensor, torch.Tensor], weights: dict) -> tuple[torch.Tensor, dict[str, float]]:
+def compute_losses(out: dict, batch: dict, predicate_batch: dict, pairs: dict, grammar_matrices: tuple[torch.Tensor, torch.Tensor], weights: dict, epoch: int = 0) -> tuple[torch.Tensor, dict[str, float]]:
     action = batch["action"]
     reason = batch["reason"]
     pair_logit, pair_logit_stats = L.matched_pair_logit_loss(out["reason_logits_base"], pairs, return_stats=True)
@@ -345,9 +410,9 @@ def compute_losses(out: dict, batch: dict, predicate_batch: dict, pairs: dict, g
         "action_visual_aux": L.action_asl_loss(out["action_visual_logits"], action),
         "action_reason_aux": L.action_asl_loss(out["action_reason_logits"], action),
         "reason_partial": L.partial_label_reason_loss(out["reason_logits_base"], reason, out.get("predicate_reason_contradiction_score_by_label")),
-        "reason_soft_f1": L.reason_soft_f1_loss(out["reason_logits_base"], reason),
+        "reason_soft_f1": L.pu_reason_soft_f1_loss(out["reason_logits_base"], reason, out.get("predicate_reason_contradiction_score_by_label")),
         "predicate_weak": L.predicate_weak_bce_mil_loss(out["predicate_logits"], predicate_batch["predicate_targets"], predicate_batch["predicate_mask"], predicate_batch.get("predicate_reliability")),
-        "predicate_reason_align": L.predicate_reason_alignment_loss(out["predicate_probs"], reason, grammar_matrices[0], grammar_matrices[1]),
+        "predicate_reason_align": L.pu_predicate_reason_alignment_loss(out["predicate_probs"], reason, grammar_matrices[0], grammar_matrices[1], out.get("predicate_reason_contradiction_score_by_label")),
         "matched_pair_logit": pair_logit,
         "matched_pair_embed": pair_embed,
         "action_combo_ce": L.action_combo_ce_loss(out["action_set_logits"], action),
@@ -355,9 +420,20 @@ def compute_losses(out: dict, batch: dict, predicate_batch: dict, pairs: dict, g
         "cardinality": L.cardinality_loss(out["cardinality_logits"], action),
         "calibration": L.calibration_loss(out["action_logits_calibrated"], out["reason_logits_calibrated"], action, reason),
         "predicate_attention_compactness": L.predicate_attention_compactness_loss(out["predicate_attention"]),
+        "evidence_grounding": out.get("evidence_grounding_loss", out["action_logits_base"].sum() * 0.0),
     }
-    total = sum(terms[k] * float(weights.get(k, 0.0)) for k in terms)
+    main_total = sum(terms[k] * float(weights.get(k, 0.0)) for k in terms if k not in {"matched_pair_logit", "matched_pair_embed"})
+    pair_raw = terms["matched_pair_logit"] * float(weights.get("matched_pair_logit", 0.0)) + terms["matched_pair_embed"] * float(weights.get("matched_pair_embed", 0.0))
+    pair_used, pair_budget_stats = apply_pair_budget(
+        pair_raw,
+        terms["action_direct"] * float(weights.get("action_direct", 1.0)),
+        terms["reason_partial"] * float(weights.get("reason_partial", 1.0)),
+        epoch=epoch,
+    )
+    total = main_total + pair_used
     parts = {f"loss_{k}": float(v.detach().cpu()) for k, v in terms.items()}
+    parts["loss_matched_pair_budgeted"] = float(pair_used.detach().cpu())
+    parts.update(pair_budget_stats)
     parts.update({f"pair_logit_{k}": v for k, v in pair_logit_stats.items()})
     parts.update({f"pair_embed_{k}": v for k, v in pair_embed_stats.items()})
     return total, parts
@@ -572,6 +648,10 @@ def main() -> None:
             group.setdefault("base_lr", group["lr"])
     grammar = ACPRReasonGrammar(cfg.get("grammar", {}).get("path", "configs/acpr_reason_predicate_grammar.yaml"))
     target_builder = WeakPredicateTargetBuilder(cfg.get("predicate", {}).get("scene_config", "configs/acpr_scene_predicates.yaml"), cfg.get("bdd100k_root"))
+    gem_builder = ACPRGEMGroundingBuilder(
+        cfg.get("bdd100k_root", ""),
+        cfg.get("gem", {}).get("slots_config", "configs/acpr_gem_evidence_slots.yaml"),
+    ) if bool(cfg.get("gem", {}).get("enabled", False)) else None
     matrices = reason_predicate_matrices(grammar, model.predicate_head.names, device)
     weights = cfg.get("loss_weights", {})
     pair_cfg = cfg.get("pair_mining", {})
@@ -605,7 +685,8 @@ def main() -> None:
         for step, batch in enumerate(train_loader, start=1):
             batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
             pred_batch = target_builder.build(batch["file_name"], device=device)
-            out = model(batch["image"], epoch=epoch)
+            gem_grounding = gem_builder.build(batch["file_name"], device=device) if gem_builder is not None else None
+            out = model(batch["image"], epoch=epoch, gem_grounding=gem_grounding)
             pairs = model.pair_memory.mine(
                 batch["file_name"],
                 out["global_embedding"].detach(),
@@ -630,7 +711,7 @@ def main() -> None:
             batch_weights = dict(weights)
             batch_weights["matched_pair_logit"] = pair_logit_weight
             batch_weights["matched_pair_embed"] = pair_embed_weight
-            loss, parts = compute_losses(out, batch, pred_batch, pairs, matrices, batch_weights)
+            loss, parts = compute_losses(out, batch, pred_batch, pairs, matrices, batch_weights, epoch=epoch)
             threshold_loss, threshold_parts = compute_threshold_losses(model, out, batch, cfg, epoch)
             loss = loss + threshold_loss
             parts.update(threshold_parts)

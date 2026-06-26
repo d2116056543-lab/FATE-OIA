@@ -6,6 +6,7 @@ import torch
 import yaml
 from torch import nn
 
+from .acpr_grounded_evidence_memory import ACPREvidenceMemoryAugmenter
 from .acpr_sparse_ops import entmax15_bisect
 
 
@@ -24,12 +25,19 @@ class ACPRScenePredicateHead(nn.Module):
         self.value_proj = nn.Linear(dim, dim)
         self.logit_head = nn.Linear(dim, 1)
         self.temperature = nn.Parameter(torch.ones(self.num_predicates))
+        self.evidence_augmenter = ACPREvidenceMemoryAugmenter(dim=dim, max_delta=0.20, num_heads=4)
+        self.evidence_out_proj = self.evidence_augmenter.evidence_out_proj
 
     @property
     def names(self) -> list[str]:
         return [str(p["name"]) for p in self.predicates]
 
-    def forward(self, patch_tokens_by_layer: torch.Tensor, region_masks: dict[str, torch.Tensor] | None = None) -> dict[str, torch.Tensor | dict]:
+    def forward(
+        self,
+        patch_tokens_by_layer: torch.Tensor,
+        region_masks: dict[str, torch.Tensor] | None = None,
+        evidence_tokens: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor | dict]:
         b, s, n, d = patch_tokens_by_layer.shape
         weights = torch.softmax(self.layer_logits, dim=-1)
         tokens = torch.einsum("ls,bsnd->blnd", weights, patch_tokens_by_layer)
@@ -46,6 +54,14 @@ class ACPRScenePredicateHead(nn.Module):
         tau = self.temperature.clamp(0.2, 5.0).view(1, -1, 1)
         attn = entmax15_bisect(score / tau, dim=-1)
         predicate_tokens = torch.einsum("bln,blnd->bld", attn, v)
+        predicate_tokens_patch = predicate_tokens
+        if evidence_tokens is not None:
+            predicate_tokens, predicate_evidence_context, predicate_evidence_attention = self.evidence_augmenter(predicate_tokens_patch, evidence_tokens)
+            predicate_evidence_delta = predicate_tokens - predicate_tokens_patch
+        else:
+            predicate_evidence_context = torch.zeros_like(predicate_tokens)
+            predicate_evidence_delta = torch.zeros_like(predicate_tokens)
+            predicate_evidence_attention = predicate_tokens.new_zeros(b, self.num_predicates, 0)
         logits = self.logit_head(predicate_tokens).squeeze(-1)
         probs = torch.sigmoid(logits)
         support = (attn > 1e-4).float().sum(-1).mean().detach()
@@ -53,6 +69,10 @@ class ACPRScenePredicateHead(nn.Module):
         stats = {"predicate_support_size": float(support.cpu()), "predicate_attention_entropy": float(entropy.cpu())}
         return {
             "predicate_tokens": predicate_tokens,
+            "predicate_tokens_patch": predicate_tokens_patch,
+            "predicate_tokens_evidence_context": predicate_evidence_context,
+            "predicate_evidence_attention": predicate_evidence_attention,
+            "predicate_evidence_delta_norm": predicate_evidence_delta.norm(dim=-1).mean(),
             "predicate_logits": logits,
             "predicate_probs": probs,
             "predicate_attention": attn,
