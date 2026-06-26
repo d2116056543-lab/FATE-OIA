@@ -109,6 +109,20 @@ def audit(config: str, output_dir: str, device: str = "cpu", write_review_pass: 
         "config_no_cache": cfg.get("experiment", {}).get("feature_cache_enabled") is False,
         "config_no_compression": cfg.get("experiment", {}).get("token_compression") == "none",
         "test_best": cfg.get("experiment", {}).get("best_selection_split") == "test",
+        "dataloader_prefetch": all(
+            token in read_text(root / "fate_oia/engine/train_acpr_oia.py")
+            for token in ["persistent_workers", "prefetch_factor", "pin_memory"]
+        ),
+        "pair_memory_ring_buffer": all(
+            token in read_text(root / "fate_oia/models/acpr_pair_memory.py")
+            for token in ["_memory_cursor", "_memory_count", "index_copy_", "memory_device"]
+        )
+        and "torch.cat([old, payload[key]]" not in read_text(root / "fate_oia/models/acpr_pair_memory.py"),
+        "pair_memory_cuda_config": cfg.get("pair_mining", {}).get("pair_memory_device") == "cuda",
+        "vista_gates_not_placeholder": "placeholder" not in read_text(root / "fate_oia/engine/audit_acpr_vista_gates.py").lower(),
+        "memory_probe_real_step": "real_cuda_forward_backward" in read_text(root / "fate_oia/engine/probe_acpr_vista_memory.py")
+        and "schema probe" not in read_text(root / "fate_oia/engine/probe_acpr_vista_memory.py").lower(),
+        "num_workers_parallel": int(cfg.get("data", {}).get("num_workers", 0)) >= 4,
     }
     passed = not missing and not ast_errors and not any(forbidden_hits.values()) and all(functional_checks.values())
     out_dir = Path(output_dir)

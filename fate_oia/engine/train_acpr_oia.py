@@ -50,13 +50,34 @@ def make_dataset(cfg: dict, split: str) -> BDDOIAMultiTaskDataset:
     return BDDOIAMultiTaskDataset(cfg["data_root"], cfg["raw_root"], split=split, action_dim=4, reason_dim=21, load_image=True, transform=transform)
 
 
-def make_loader(cfg: dict, split: str, batch_size: int, max_samples: int | None, shuffle: bool, num_workers: int, indices: list[int] | None = None) -> DataLoader:
+def make_loader(
+    cfg: dict,
+    split: str,
+    batch_size: int,
+    max_samples: int | None,
+    shuffle: bool,
+    num_workers: int,
+    indices: list[int] | None = None,
+) -> DataLoader:
     ds = make_dataset(cfg, split)
     if indices is not None:
         ds = Subset(ds, indices)
     if max_samples:
         ds = Subset(ds, list(range(min(max_samples, len(ds)))))
-    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, collate_fn=collate, pin_memory=torch.cuda.is_available())
+    data_cfg = cfg.get("data", {})
+    pin_memory = bool(data_cfg.get("pin_memory", torch.cuda.is_available()))
+    persistent_workers = bool(data_cfg.get("persistent_workers", False)) and int(num_workers) > 0
+    loader_kwargs: dict[str, Any] = {
+        "batch_size": batch_size,
+        "shuffle": shuffle,
+        "num_workers": int(num_workers),
+        "collate_fn": collate,
+        "pin_memory": pin_memory,
+        "persistent_workers": persistent_workers,
+    }
+    if int(num_workers) > 0:
+        loader_kwargs["prefetch_factor"] = int(data_cfg.get("prefetch_factor", 2))
+    return DataLoader(ds, **loader_kwargs)
 
 
 def build_model(cfg: dict, device: torch.device) -> ACPROIAModel:
@@ -72,6 +93,8 @@ def build_model(cfg: dict, device: torch.device) -> ACPROIAModel:
         use_mock_dino=bool(model_cfg.get("use_mock_dino", False)),
         threshold_enabled=bool(threshold_cfg.get("enabled", False)),
         vista_enabled=bool(vista_cfg.get("enabled", False)),
+        pair_memory_size=int(cfg.get("pair_mining", {}).get("memory_size", 8192)),
+        pair_memory_device=str(cfg.get("pair_mining", {}).get("pair_memory_device", "cpu")),
         vista_kwargs={
             "rank": int(vista_cfg.get("rank", 48)),
             "gate_floor": float(vista_cfg.get("gate_floor", 0.20)),
@@ -515,7 +538,10 @@ def main() -> None:
     ap.add_argument("--gradient_accumulation_steps", type=int, default=None)
     ap.add_argument("--max_train_samples", type=int, default=None)
     ap.add_argument("--max_test_samples", type=int, default=None)
-    ap.add_argument("--num_workers", type=int, default=0)
+    ap.add_argument("--num_workers", type=int, default=None)
+    ap.add_argument("--prefetch_factor", type=int, default=None)
+    ap.add_argument("--persistent_workers", action="store_true", default=None)
+    ap.add_argument("--no_persistent_workers", action="store_true")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--test_only", action="store_true")
     ap.add_argument("--no_feature_cache", action="store_true")
@@ -532,6 +558,16 @@ def main() -> None:
     epochs = int(args.epochs or tr.get("epochs", 28))
     batch_size = int(args.batch_size or tr.get("batch_size", 6))
     accum = int(args.gradient_accumulation_steps or tr.get("gradient_accumulation_steps", 5))
+    data_cfg = cfg.setdefault("data", {})
+    num_workers = int(args.num_workers if args.num_workers is not None else data_cfg.get("num_workers", 0))
+    if args.prefetch_factor is not None:
+        data_cfg["prefetch_factor"] = int(args.prefetch_factor)
+    if args.no_persistent_workers:
+        data_cfg["persistent_workers"] = False
+    elif args.persistent_workers is True:
+        data_cfg["persistent_workers"] = True
+    if num_workers <= 0:
+        data_cfg["persistent_workers"] = False
     device = torch.device(args.device if torch.cuda.is_available() and args.device == "cuda" else "cpu")
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -549,9 +585,14 @@ def main() -> None:
         "token_compression": "none",
         "batch_size": batch_size,
         "gradient_accumulation_steps": accum,
+        "num_workers": num_workers,
+        "pin_memory": bool(data_cfg.get("pin_memory", torch.cuda.is_available())),
+        "persistent_workers": bool(data_cfg.get("persistent_workers", False)) and num_workers > 0,
+        "prefetch_factor": int(data_cfg.get("prefetch_factor", 2)) if num_workers > 0 else None,
         "effective_batch": batch_size * accum,
         "reference_effective_batch": tr.get("reference_effective_batch", 32),
         "loss_weights": cfg.get("loss_weights", {}),
+        "pair_memory_device": cfg.get("pair_mining", {}).get("pair_memory_device", "cpu"),
         "resume_checkpoint": args.resume_checkpoint,
     })
     write_json(out_dir / "implementation_fingerprint.json", {
@@ -581,11 +622,11 @@ def main() -> None:
             if not train_calib_indices:
                 train_calib_indices = list(range(min(1, len(train_dataset))))
         train_loader_indices = None if bool(threshold_cfg.get("train_trunk_on_all_train", True)) else train_main_indices
-        train_loader = make_loader(cfg, "train", batch_size, args.max_train_samples if train_loader_indices is None else None, True, args.num_workers, indices=train_loader_indices)
-        train_calib_loader = make_loader(cfg, "train", batch_size, None, False, args.num_workers, indices=train_calib_indices)
+        train_loader = make_loader(cfg, "train", batch_size, args.max_train_samples if train_loader_indices is None else None, True, num_workers, indices=train_loader_indices)
+        train_calib_loader = make_loader(cfg, "train", batch_size, None, False, num_workers, indices=train_calib_indices)
     else:
-        train_loader = make_loader(cfg, "train", batch_size, args.max_train_samples, True, args.num_workers)
-    test_loader = make_loader(cfg, "test", batch_size, args.max_test_samples, False, args.num_workers)
+        train_loader = make_loader(cfg, "train", batch_size, args.max_train_samples, True, num_workers)
+    test_loader = make_loader(cfg, "test", batch_size, args.max_test_samples, False, num_workers)
     model = build_model(cfg, device)
     resume_ckpt = None
     start_epoch = 0

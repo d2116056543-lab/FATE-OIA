@@ -9,7 +9,8 @@ from pathlib import Path
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=16)
-    parser.add_argument("--num_workers", type=int, default=6)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--prefetch_factor", type=int, default=4)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--reference_checkpoint", default="")
     parser.add_argument("--require_review_pass", action="store_true")
@@ -29,6 +30,9 @@ def main() -> None:
         str(args.epochs),
         "--num_workers",
         str(args.num_workers),
+        "--prefetch_factor",
+        str(args.prefetch_factor),
+        "--persistent_workers",
         "--device",
         args.device,
         "--test_only",
@@ -44,4 +48,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

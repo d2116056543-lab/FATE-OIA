@@ -22,15 +22,60 @@ class PairMiningThresholds:
 
 
 class ACPRPairMemory(nn.Module):
-    def __init__(self, dim: int = 384, memory_size: int = 8192, tail_multiplier: float = 2.0) -> None:
+    def __init__(
+        self,
+        dim: int = 384,
+        memory_size: int = 8192,
+        tail_multiplier: float = 2.0,
+        memory_device: str = "cpu",
+    ) -> None:
         super().__init__()
         self.memory_size = int(memory_size)
         self.tail_multiplier = float(tail_multiplier)
+        self.memory_device = str(memory_device)
         self.proj = nn.Linear(dim, dim)
         self._memory: dict[str, torch.Tensor | list[str]] = {}
+        self._memory_count = 0
+        self._memory_cursor = 0
 
     def forward(self, label_nodes: torch.Tensor) -> torch.Tensor:
         return F.normalize(self.proj(label_nodes.mean(1)), dim=-1)
+
+    @torch.no_grad()
+    def _target_memory_device(self, fallback: torch.device) -> torch.device:
+        if self.memory_device.startswith("cuda") and torch.cuda.is_available():
+            return torch.device(self.memory_device)
+        if self.memory_device == "model":
+            return fallback
+        return torch.device("cpu")
+
+    @torch.no_grad()
+    def _init_memory(self, payload: dict[str, torch.Tensor | list[str]]) -> None:
+        self._memory = {"file_names": ["" for _ in range(self.memory_size)]}
+        for key, value in payload.items():
+            if key == "file_names":
+                continue
+            assert isinstance(value, torch.Tensor)
+            shape = (self.memory_size,) + tuple(value.shape[1:])
+            self._memory[key] = torch.empty(shape, dtype=value.dtype, device=value.device)
+        self._memory_count = 0
+        self._memory_cursor = 0
+
+    @torch.no_grad()
+    def _valid_indices(self, device: torch.device) -> torch.Tensor:
+        count = int(self._memory_count)
+        if count <= 0:
+            return torch.empty(0, dtype=torch.long, device=device)
+        if count < self.memory_size:
+            return torch.arange(count, dtype=torch.long, device=device)
+        start = int(self._memory_cursor)
+        return torch.cat(
+            [
+                torch.arange(start, self.memory_size, dtype=torch.long, device=device),
+                torch.arange(0, start, dtype=torch.long, device=device),
+            ],
+            dim=0,
+        )
 
     @torch.no_grad()
     def enqueue(
@@ -55,22 +100,29 @@ class ACPRPairMemory(nn.Module):
             d = int(global_embed.shape[-1])
             reason_embeddings_detached = torch.zeros(b, reason_dim, d, device=device, dtype=global_embed.dtype)
 
+        target_device = self._target_memory_device(action_targets.device)
         payload = {
             "file_names": list(file_names),
-            "global_embed": F.normalize(global_embed.detach().cpu(), dim=-1),
-            "predicate_probs": predicate_probs.detach().cpu(),
-            "action_targets": action_targets.detach().cpu(),
-            "reason_targets": reason_targets.detach().cpu(),
-            "contradiction_scores": contradiction_scores.detach().cpu(),
-            "reason_logits_detached": reason_logits_detached.detach().cpu(),
-            "reason_embeddings_detached": F.normalize(reason_embeddings_detached.detach().cpu(), dim=-1),
+            "global_embed": F.normalize(global_embed.detach().to(target_device), dim=-1),
+            "predicate_probs": predicate_probs.detach().to(target_device),
+            "action_targets": action_targets.detach().to(target_device),
+            "reason_targets": reason_targets.detach().to(target_device),
+            "contradiction_scores": contradiction_scores.detach().to(target_device),
+            "reason_logits_detached": reason_logits_detached.detach().to(target_device),
+            "reason_embeddings_detached": F.normalize(reason_embeddings_detached.detach().to(target_device), dim=-1),
         }
         if not self._memory:
-            self._memory = payload
-            return
-        keep = max(0, int(self.memory_size) - len(file_names))
-        merged: dict[str, torch.Tensor | list[str]] = {}
-        merged["file_names"] = (self._memory.get("file_names", [])[-keep:] if keep else []) + payload["file_names"]  # type: ignore[operator]
+            self._init_memory(payload)
+        # Keep only the newest samples when a very large batch exceeds capacity.
+        if b > self.memory_size:
+            start = b - self.memory_size
+            payload["file_names"] = payload["file_names"][start:]  # type: ignore[index]
+            for key, value in list(payload.items()):
+                if key != "file_names":
+                    payload[key] = value[start:]  # type: ignore[index]
+            b = self.memory_size
+        insert = torch.arange(b, dtype=torch.long, device=target_device)
+        slots = (insert + int(self._memory_cursor)) % int(self.memory_size)
         for key in [
             "global_embed",
             "predicate_probs",
@@ -80,10 +132,15 @@ class ACPRPairMemory(nn.Module):
             "reason_logits_detached",
             "reason_embeddings_detached",
         ]:
-            old = self._memory[key]
-            old = old[-keep:] if keep else old[:0]  # type: ignore[index]
-            merged[key] = torch.cat([old, payload[key]], dim=0)  # type: ignore[arg-type]
-        self._memory = merged
+            store = self._memory[key]
+            assert isinstance(store, torch.Tensor)
+            store.index_copy_(0, slots.to(store.device), payload[key].to(store.device))  # type: ignore[union-attr]
+        names = self._memory["file_names"]
+        assert isinstance(names, list)
+        for offset, name in enumerate(payload["file_names"]):  # type: ignore[union-attr]
+            names[(self._memory_cursor + offset) % self.memory_size] = str(name)
+        self._memory_cursor = (self._memory_cursor + b) % self.memory_size
+        self._memory_count = min(self.memory_size, self._memory_count + b)
 
     @staticmethod
     def _empty(device: torch.device, reason_dim: int = 21, embed_dim: int = 384) -> dict[str, torch.Tensor | int | list[float] | list[int] | list[str]]:
@@ -214,16 +271,19 @@ class ACPRPairMemory(nn.Module):
         predicate_sim_batch = pred @ pred.t()
 
         mem = self._memory
-        has_mem = bool(mem)
+        has_mem = bool(mem) and self._memory_count > 0
         if has_mem:
-            mem_embed = mem["global_embed"].to(device)  # type: ignore[union-attr]
-            mem_pred = mem["predicate_probs"].to(device)  # type: ignore[union-attr]
-            mem_action = mem["action_targets"].to(device)  # type: ignore[union-attr]
-            mem_reason = mem["reason_targets"].to(device)  # type: ignore[union-attr]
-            mem_contra = mem["contradiction_scores"].to(device)  # type: ignore[union-attr]
-            mem_logits = mem["reason_logits_detached"].to(device)  # type: ignore[union-attr]
-            mem_reason_emb = mem["reason_embeddings_detached"].to(device)  # type: ignore[union-attr]
-            mem_files = list(mem.get("file_names", []))  # type: ignore[arg-type]
+            mem_device = mem["global_embed"].device  # type: ignore[union-attr]
+            valid_idx = self._valid_indices(mem_device)
+            mem_embed = mem["global_embed"].index_select(0, valid_idx).to(device)  # type: ignore[union-attr]
+            mem_pred = mem["predicate_probs"].index_select(0, valid_idx).to(device)  # type: ignore[union-attr]
+            mem_action = mem["action_targets"].index_select(0, valid_idx).to(device)  # type: ignore[union-attr]
+            mem_reason = mem["reason_targets"].index_select(0, valid_idx).to(device)  # type: ignore[union-attr]
+            mem_contra = mem["contradiction_scores"].index_select(0, valid_idx).to(device)  # type: ignore[union-attr]
+            mem_logits = mem["reason_logits_detached"].index_select(0, valid_idx).to(device)  # type: ignore[union-attr]
+            mem_reason_emb = mem["reason_embeddings_detached"].index_select(0, valid_idx).to(device)  # type: ignore[union-attr]
+            names = mem.get("file_names", [])
+            mem_files = [names[int(i)] for i in valid_idx.detach().cpu().tolist()]  # type: ignore[index]
             action_sim_mem = F.cosine_similarity(action[:, None, :], mem_action[None, :, :], dim=-1).clamp(-1, 1)
             visual_sim_mem = emb @ F.normalize(mem_embed, dim=-1).t()
             predicate_sim_mem = pred @ F.normalize(mem_pred, dim=-1).t()

@@ -31,6 +31,8 @@ class ACPROIAModel(nn.Module):
         threshold_kwargs: dict | None = None,
         vista_enabled: bool = False,
         vista_kwargs: dict | None = None,
+        pair_memory_size: int = 8192,
+        pair_memory_device: str = "cpu",
     ) -> None:
         super().__init__()
         self.action_dim = action_dim
@@ -42,7 +44,11 @@ class ACPROIAModel(nn.Module):
         self.predicate_head = ACPRScenePredicateHead(scene_config=scene_config, dim=dim, num_layers=len(selected_layers))
         self.trunk = ACPRLabelTrunk(dim=dim, action_dim=action_dim, reason_dim=reason_dim)
         self.predicate_reason = ACPRPredicateReasoner(dim=dim, reason_dim=reason_dim, num_predicates=self.predicate_head.num_predicates, predicate_names=self.predicate_head.names, grammar_path=grammar_path)
-        self.pair_memory = ACPRPairMemory(dim=dim)
+        self.pair_memory = ACPRPairMemory(
+            dim=dim,
+            memory_size=int(pair_memory_size),
+            memory_device=str(pair_memory_device),
+        )
         self.reason_pair_proj = nn.Linear(dim, dim)
         self.action_combo_aux = ACPRActionComboAux(dim=dim, action_dim=action_dim)
         self.calibration = ACPRCalibrationHead(num_labels=action_dim + reason_dim)

@@ -31,7 +31,7 @@ data:
   patch_size: 8
   action_dim: 4
   reason_dim: 21
-  num_workers: 6
+  num_workers: 4
   pin_memory: true
   persistent_workers: true
   prefetch_factor: 4
@@ -178,6 +178,7 @@ eval:
   also_eval_train_calib_teacher_diag: true
 pair_mining:
   memory_size: 8192
+  pair_memory_device: cuda
   min_action_similarity: 0.35
   min_visual_similarity: 0.05
   min_predicate_similarity: 0.05
