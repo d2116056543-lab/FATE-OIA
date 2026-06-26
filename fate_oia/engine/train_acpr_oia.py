@@ -22,10 +22,12 @@ from fate_oia.transforms import AspectRatioLetterboxTransform
 from fate_oia.losses import acpr_losses as L
 from fate_oia.losses import acpr_threshold_losses as TL
 from fate_oia.utils.acpr_artifacts import append_jsonl, json_safe, save_tensor, write_json
+from fate_oia.utils.acpr_pair_budget import apply_pair_budget
 from fate_oia.utils.acpr_pair_mining import pair_summary
 from fate_oia.utils.acpr_threshold_search import search_best_thresholds_for_f1
 from fate_oia.utils.acpr_thresholds import acpr_metric_views, standard_joint
 from fate_oia.utils.acpr_train_calib_split import make_train_calib_indices
+from fate_oia.utils.acpr_vista_artifacts import vista_stats_payload, write_vista_epoch_artifacts
 
 
 def load_config(path: str) -> dict[str, Any]:
@@ -60,6 +62,8 @@ def make_loader(cfg: dict, split: str, batch_size: int, max_samples: int | None,
 def build_model(cfg: dict, device: torch.device) -> ACPROIAModel:
     model_cfg = cfg.get("model", {})
     threshold_cfg = cfg.get("threshold", {})
+    vista_cfg = cfg.get("vista", {})
+    vista_schedule = vista_cfg.get("max_scale_schedule", {})
     model = ACPROIAModel(
         selected_layers=tuple(model_cfg.get("selected_layers", [3, 7, 11])),
         pretrained_weights=str(cfg.get("pretrained_weights", "ckp/reference/dino_deitsmall8_pretrain.pth")),
@@ -67,6 +71,17 @@ def build_model(cfg: dict, device: torch.device) -> ACPROIAModel:
         grammar_path=str(cfg.get("grammar", {}).get("path", "configs/acpr_reason_predicate_grammar.yaml")),
         use_mock_dino=bool(model_cfg.get("use_mock_dino", False)),
         threshold_enabled=bool(threshold_cfg.get("enabled", False)),
+        vista_enabled=bool(vista_cfg.get("enabled", False)),
+        vista_kwargs={
+            "rank": int(vista_cfg.get("rank", 48)),
+            "gate_floor": float(vista_cfg.get("gate_floor", 0.20)),
+            "detach_predicate_gate": bool(vista_cfg.get("detach_predicate_gate", True)),
+            "early_scale": float(vista_schedule.get("early_scale", 0.05)),
+            "main_scale": float(vista_schedule.get("main_scale", 0.15)),
+            "late_scale": float(vista_schedule.get("late_scale", 0.08)),
+            "main_start_epoch": int(vista_schedule.get("main_start_epoch", 3)),
+            "late_start_epoch": int(vista_schedule.get("late_start_epoch", 9)),
+        },
         threshold_kwargs={
             "action_threshold_min": float(threshold_cfg.get("action_threshold_min", 0.10)),
             "action_threshold_max": float(threshold_cfg.get("action_threshold_max", 0.90)),
@@ -84,7 +99,15 @@ def build_model(cfg: dict, device: torch.device) -> ACPROIAModel:
 def optimizer_for(model: ACPROIAModel, cfg: dict) -> torch.optim.Optimizer:
     tr = cfg.get("training", {})
     threshold_cfg = cfg.get("threshold", {})
+    adapter_gate_params = [model.visual_adapter.gate_raw] if hasattr(model, "visual_adapter") else []
+    adapter_weight_params = []
+    if hasattr(model, "visual_adapter"):
+        for name, param in model.visual_adapter.named_parameters():
+            if name != "gate_raw":
+                adapter_weight_params.append(param)
     groups = [
+        {"params": adapter_weight_params, "lr": float(tr.get("lr_visual_adapter", 3e-4)), "weight_decay": float(tr.get("adapter_weight_decay", 0.01)), "name": "visual_adapter_weights"},
+        {"params": adapter_gate_params, "lr": float(tr.get("lr_adapter_gate", 1e-3)), "weight_decay": float(tr.get("adapter_gate_weight_decay", 0.0)), "name": "visual_adapter_gates"},
         {"params": list(model.trunk.parameters()), "lr": float(tr.get("lr_trunk", 2e-4)), "name": "trunk"},
         {"params": list(model.predicate_head.parameters()), "lr": float(tr.get("lr_predicate", 2e-4)), "name": "predicate"},
         {"params": list(model.predicate_reason.parameters()), "lr": float(tr.get("lr_reason_predicate", 2e-4)), "name": "reason_predicate"},
@@ -100,7 +123,22 @@ def optimizer_for(model: ACPROIAModel, cfg: dict) -> torch.optim.Optimizer:
             "weight_decay": float(threshold_cfg.get("weight_decay_threshold", 0.0)),
             "name": "threshold",
         })
-    return torch.optim.AdamW(groups, weight_decay=float(tr.get("weight_decay", 0.05)))
+    seen: set[int] = set()
+    clean_groups = []
+    for group in groups:
+        params = [p for p in group["params"] if p.requires_grad]
+        unique = []
+        for param in params:
+            pid = id(param)
+            if pid in seen:
+                raise RuntimeError(f"Parameter appears in multiple optimizer groups: {group.get('name')}")
+            seen.add(pid)
+            unique.append(param)
+        if unique:
+            g = dict(group)
+            g["params"] = unique
+            clean_groups.append(g)
+    return torch.optim.AdamW(clean_groups, weight_decay=float(tr.get("weight_decay", 0.05)))
 
 
 def scheduler_for(optimizer: torch.optim.Optimizer, total_epochs: int, warmup_epochs: int, min_lr: float):
@@ -356,8 +394,28 @@ def compute_losses(out: dict, batch: dict, predicate_batch: dict, pairs: dict, g
         "calibration": L.calibration_loss(out["action_logits_calibrated"], out["reason_logits_calibrated"], action, reason),
         "predicate_attention_compactness": L.predicate_attention_compactness_loss(out["predicate_attention"]),
     }
-    total = sum(terms[k] * float(weights.get(k, 0.0)) for k in terms)
+    pair_raw = terms["matched_pair_logit"] * float(weights.get("matched_pair_logit", 0.0)) + terms["matched_pair_embed"] * float(weights.get("matched_pair_embed", 0.0))
+    main_total = sum(
+        terms[k] * float(weights.get(k, 0.0))
+        for k in terms
+        if k not in {"matched_pair_logit", "matched_pair_embed"}
+    )
+    if bool(weights.get("__vista_pair_budget", False)):
+        pair_used, budget_stats = apply_pair_budget(pair_raw, main_total, int(weights.get("__epoch", 0)))
+    else:
+        pair_used = pair_raw
+        budget_stats = {
+            "pair_raw_weighted": float(pair_raw.detach().cpu()),
+            "pair_used_weighted": float(pair_raw.detach().cpu()),
+            "pair_budget_cap": 0.0,
+            "pair_budget_scale": 1.0,
+            "pair_budget_active": False,
+            "pair_to_main_raw": float((pair_raw.detach() / main_total.detach().clamp_min(1e-6)).cpu()),
+            "pair_to_main_used": float((pair_raw.detach() / main_total.detach().clamp_min(1e-6)).cpu()),
+        }
+    total = main_total + pair_used
     parts = {f"loss_{k}": float(v.detach().cpu()) for k, v in terms.items()}
+    parts.update(budget_stats)
     parts.update({f"pair_logit_{k}": v for k, v in pair_logit_stats.items()})
     parts.update({f"pair_embed_{k}": v for k, v in pair_embed_stats.items()})
     return total, parts
@@ -630,6 +688,8 @@ def main() -> None:
             batch_weights = dict(weights)
             batch_weights["matched_pair_logit"] = pair_logit_weight
             batch_weights["matched_pair_embed"] = pair_embed_weight
+            batch_weights["__epoch"] = epoch
+            batch_weights["__vista_pair_budget"] = bool(cfg.get("pair_budget", {}).get("enabled", cfg.get("vista", {}).get("enabled", False)))
             loss, parts = compute_losses(out, batch, pred_batch, pairs, matrices, batch_weights)
             threshold_loss, threshold_parts = compute_threshold_losses(model, out, batch, cfg, epoch)
             loss = loss + threshold_loss
@@ -656,6 +716,7 @@ def main() -> None:
                     "reason_positive_rate": float(batch["reason"].mean().detach().cpu()),
                     "predicate_positive_rate": float(pred_batch["predicate_targets"].mean().detach().cpu()),
                     "gpu_peak_memory_gb": float(torch.cuda.max_memory_allocated() / (1024**3)) if torch.cuda.is_available() else 0.0,
+                    **vista_stats_payload(out, epoch, step),
                 }
                 print(json.dumps(payload), flush=True)
                 append_jsonl(out_dir / "loss_components.jsonl", payload)
@@ -687,6 +748,7 @@ def main() -> None:
             "final_raw": metrics["metrics_raw_fixed"],
             "final_calibrated": metrics["metrics_calibrated"],
         })
+        write_vista_epoch_artifacts(epoch_dir, out, epoch)
         append_jsonl(epoch_dir / "predicate_metrics.jsonl", {"available": True, "predicate_positive_rate": float(pred_batch["predicate_targets"].mean().detach().cpu()), "predicate_mask_rate": float(pred_batch["predicate_mask"].mean().detach().cpu())})
         append_jsonl(epoch_dir / "predicate_coverage.jsonl", {"available": True, **pred_batch.get("predicate_coverage", {})})
         append_jsonl(epoch_dir / "predicate_reason_alignment.jsonl", {"available": True, "positive_score_mean": float(out.get("predicate_reason_positive_score_by_label").mean().detach().cpu()), "contradiction_score_mean": float(out.get("predicate_reason_contradiction_score_by_label").mean().detach().cpu())})

@@ -13,6 +13,7 @@ from .acpr_pair_memory import ACPRPairMemory
 from .acpr_predicate_reason import ACPRPredicateReasoner
 from .acpr_scene_predicate_head import ACPRScenePredicateHead
 from .acpr_threshold_head import ACPRThresholdHead
+from .acpr_visual_token_adapter import ACPRPredicateAnchoredVisualAdapter, VistaScaleSchedule
 
 
 class ACPROIAModel(nn.Module):
@@ -28,11 +29,14 @@ class ACPROIAModel(nn.Module):
         use_mock_dino: bool = False,
         threshold_enabled: bool = False,
         threshold_kwargs: dict | None = None,
+        vista_enabled: bool = False,
+        vista_kwargs: dict | None = None,
     ) -> None:
         super().__init__()
         self.action_dim = action_dim
         self.reason_dim = reason_dim
         self.threshold_enabled = bool(threshold_enabled)
+        self.vista_enabled = bool(vista_enabled)
         self.dino = ACPRDinoFieldExtractor(selected_layers=selected_layers, pretrained_weights=pretrained_weights, use_mock_dino=use_mock_dino)
         self.ego = ACPREgoRegionEncoder(grid_hw=(45, 80), dim=dim)
         self.predicate_head = ACPRScenePredicateHead(scene_config=scene_config, dim=dim, num_layers=len(selected_layers))
@@ -43,10 +47,55 @@ class ACPROIAModel(nn.Module):
         self.action_combo_aux = ACPRActionComboAux(dim=dim, action_dim=action_dim)
         self.calibration = ACPRCalibrationHead(num_labels=action_dim + reason_dim)
         self.threshold_head = ACPRThresholdHead(action_dim=action_dim, reason_dim=reason_dim, **(threshold_kwargs or {}))
+        vista_cfg = dict(vista_kwargs or {})
+        self.visual_adapter = ACPRPredicateAnchoredVisualAdapter(
+            dim=dim,
+            rank=int(vista_cfg.get("rank", 48)),
+            num_layers=len(selected_layers),
+            num_predicates=self.predicate_head.num_predicates,
+            gate_floor=float(vista_cfg.get("gate_floor", 0.20)),
+            detach_predicate_gate=bool(vista_cfg.get("detach_predicate_gate", True)),
+            schedule=VistaScaleSchedule(
+                early_scale=float(vista_cfg.get("early_scale", 0.05)),
+                main_scale=float(vista_cfg.get("main_scale", 0.15)),
+                late_scale=float(vista_cfg.get("late_scale", 0.08)),
+                main_start_epoch=int(vista_cfg.get("main_start_epoch", 3)),
+                late_start_epoch=int(vista_cfg.get("late_start_epoch", 9)),
+            ),
+        )
 
     def forward(self, images: torch.Tensor, epoch: int = 0) -> dict[str, torch.Tensor | dict | tuple[int, int] | int]:
         field = self.dino(images)
-        patch = field["patch_tokens_by_layer"]
+        patch_raw = field["patch_tokens_by_layer"]
+        patch0_raw, _, raw_region_masks, raw_ego_stats = self.ego(patch_raw[:, 0])
+        patch_for_gate = patch_raw.clone()
+        patch_for_gate[:, 0] = patch0_raw
+        with torch.no_grad():
+            raw_predicates_for_gate = self.predicate_head(patch_for_gate, region_masks=raw_region_masks)
+        if self.vista_enabled:
+            patch_adapted, vista_stats = self.visual_adapter(
+                patch_raw,
+                raw_predicates_for_gate["predicate_probs"],
+                raw_predicates_for_gate["predicate_attention"],
+                epoch=epoch,
+            )
+            patch = patch_adapted
+        else:
+            patch = patch_raw
+            zero_gate = torch.zeros(patch.shape[0], patch.shape[2], device=patch.device, dtype=patch.dtype)
+            vista_stats = {
+                "vista_enabled": False,
+                "vista_alpha_per_layer": torch.zeros(patch.shape[1], device=patch.device, dtype=patch.dtype),
+                "vista_alpha_abs_mean": torch.zeros((), device=patch.device, dtype=patch.dtype),
+                "vista_adapter_delta_norm_per_layer": torch.zeros(patch.shape[1], device=patch.device, dtype=patch.dtype),
+                "vista_adapter_delta_norm_mean": torch.zeros((), device=patch.device, dtype=patch.dtype),
+                "vista_gate_map": zero_gate,
+                "vista_gate_mean": torch.zeros((), device=patch.device, dtype=patch.dtype),
+                "vista_gate_max": torch.zeros((), device=patch.device, dtype=patch.dtype),
+                "vista_gate_entropy": torch.zeros((), device=patch.device, dtype=patch.dtype),
+                "vista_delta_mass_on_high_gate": torch.zeros((), device=patch.device, dtype=patch.dtype),
+                "vista_delta_uniformity": torch.zeros((), device=patch.device, dtype=patch.dtype),
+            }
         patch0, ego_features, region_masks, ego_stats = self.ego(patch[:, 0])
         patch = patch.clone()
         patch[:, 0] = patch0
@@ -82,10 +131,24 @@ class ACPROIAModel(nn.Module):
         pair_embedding = self.pair_memory(trunk["label_nodes"])
         out = {
             **field,
+            "patch_tokens_by_layer_raw": patch_raw,
+            "patch_tokens_by_layer_adapted": patch,
             **trunk,
             **predicates,
             **reason_delta,
             **action_set,
+            **vista_stats,
+            "vista_raw_predicate_probs_for_gate": raw_predicates_for_gate["predicate_probs"],
+            "vista_raw_predicate_attention_for_gate": raw_predicates_for_gate["predicate_attention"],
+            "vista_final_predicate_probs": predicates["predicate_probs"],
+            "vista_patch_tokens_raw_stats": {
+                "mean": float(patch_raw.mean().detach().cpu()),
+                "std": float(patch_raw.std().detach().cpu()),
+            },
+            "vista_patch_tokens_adapted_stats": {
+                "mean": float(patch.mean().detach().cpu()),
+                "std": float(patch.std().detach().cpu()),
+            },
             "global_embedding": field["cls_tokens_by_layer"].mean(1),
             "pair_embedding": pair_embedding,
             "reason_embeddings_for_pair": reason_embeddings_for_pair,
@@ -119,6 +182,7 @@ class ACPROIAModel(nn.Module):
             "temperature_action": temperature[: self.action_dim],
             "temperature_reason": temperature[self.action_dim :],
             "ego_stats": ego_stats,
+            "raw_ego_stats": raw_ego_stats,
             "branch_logits": {
                 "direct": logits_base,
                 "direct_plus_predicate": logits_base,
