@@ -20,10 +20,18 @@ def partial_label_reason_loss(logits: torch.Tensor, target: torch.Tensor, contra
     return F.binary_cross_entropy_with_logits(logits, pos, weight=weights)
 
 
-def reason_soft_f1_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+def reason_soft_f1_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    contradiction_scores: torch.Tensor | None = None,
+    neg_min_weight: float = 0.2,
+) -> torch.Tensor:
     probs = torch.sigmoid(logits)
+    if contradiction_scores is None:
+        contradiction_scores = torch.zeros_like(target)
+    neg_weight = neg_min_weight + (1.0 - neg_min_weight) * contradiction_scores.detach().clamp(0, 1)
     tp = (probs * target).sum(0)
-    fp = (probs * (1 - target)).sum(0)
+    fp = (probs * (1 - target) * neg_weight).sum(0)
     fn = ((1 - probs) * target).sum(0)
     f1 = (2 * tp + 1e-6) / (2 * tp + fp + fn + 1e-6)
     return 1.0 - f1.mean()
@@ -43,12 +51,19 @@ def predicate_reason_alignment_loss(
     reason_targets: torch.Tensor,
     grammar_positive_matrix: torch.Tensor,
     grammar_contradiction_matrix: torch.Tensor,
+    contradiction_scores: torch.Tensor | None = None,
+    neg_min_weight: float = 0.2,
 ) -> torch.Tensor:
     pos_support = predicate_probs @ grammar_positive_matrix.t().to(predicate_probs.device, predicate_probs.dtype)
     neg_support = predicate_probs @ grammar_contradiction_matrix.t().to(predicate_probs.device, predicate_probs.dtype)
     support_score = (pos_support - neg_support).clamp(-1, 1)
-    target_sign = reason_targets.float() * 2.0 - 1.0
-    return F.softplus(-target_sign * support_score).mean()
+    target = reason_targets.float()
+    if contradiction_scores is None:
+        contradiction_scores = torch.zeros_like(target)
+    neg_weight = neg_min_weight + (1.0 - neg_min_weight) * contradiction_scores.detach().clamp(0, 1)
+    positive = target * F.softplus(-support_score)
+    negative = (1.0 - target) * neg_weight * F.softplus(support_score)
+    return (positive + negative).mean()
 
 
 def matched_pair_logit_loss(

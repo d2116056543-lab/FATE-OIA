@@ -40,6 +40,8 @@ def update_teacher_if_accepted(
     min_delta: float = 1e-4,
     action_tolerance: float = 1e-3,
     exp_tolerance: float = 1e-3,
+    ema: float = 0.20,
+    copy_to_params: bool = False,
 ) -> dict:
     joint = float(metrics.get("joint", metrics.get("final_raw_joint", 0.0)))
     action = float(metrics.get("Act_mF1", metrics.get("action_mf1", 0.0)))
@@ -49,6 +51,8 @@ def update_teacher_if_accepted(
         threshold_head.update_teacher(
             candidate["threshold_logit"].to(next(threshold_head.parameters()).device),
             pred_rate_teacher=candidate["pred_rate"].to(next(threshold_head.parameters()).device),
+            ema=ema,
+            copy_to_params=copy_to_params,
         )
         state.best_joint = joint
         state.best_action = action
@@ -65,4 +69,3 @@ def update_teacher_if_accepted(
         "teacher_best_action": float(state.best_action),
         "teacher_best_exp": float(state.best_exp),
     }
-

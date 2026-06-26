@@ -104,7 +104,32 @@ def audit(config: str, output_dir: str, device: str = "cpu", write_review_pass: 
     functional_checks = {
         "adapter_file": "ACPRPredicateAnchoredVisualAdapter" in read_text(root / "fate_oia/models/acpr_visual_token_adapter.py"),
         "local_geometry": "Conv2d" in read_text(root / "fate_oia/models/acpr_visual_token_adapter.py") and "groups=rank" in read_text(root / "fate_oia/models/acpr_visual_token_adapter.py"),
-        "rezero": torch.allclose(model.visual_adapter.gate_raw.detach(), torch.zeros_like(model.visual_adapter.gate_raw.detach())),
+        "zero_up_adapter": all(
+            torch.allclose(block.up.weight.detach(), torch.zeros_like(block.up.weight.detach()))
+            and torch.allclose(block.up.bias.detach(), torch.zeros_like(block.up.bias.detach()))
+            for block in model.visual_adapter.blocks
+        ),
+        "nonzero_scale_startup": "base_fraction" in read_text(root / "fate_oia/models/acpr_visual_token_adapter.py")
+        and "learned_fraction" in read_text(root / "fate_oia/models/acpr_visual_token_adapter.py"),
+        "predicate_gate_annealing": "anchor_mix_start_epoch" in read_text(root / "fate_oia/models/acpr_visual_token_adapter.py")
+        and "early_global_gate" in read_text(root / "fate_oia/models/acpr_visual_token_adapter.py"),
+        "predicate_importance_prior": "predicate_importance_prior" in read_text(root / "fate_oia/models/acpr_visual_token_adapter.py"),
+        "pu_consistent_reason_losses": "contradiction_scores" in read_text(root / "fate_oia/losses/acpr_losses.py")
+        and "target_sign" not in read_text(root / "fate_oia/losses/acpr_losses.py"),
+        "weak_predicate_cleanup": all(
+            token not in read_text(root / "fate_oia/models/acpr_predicate_targets.py")
+            for token in [
+                'names.add("traffic_light_green")',
+                '"traffic_sign_visible", "stop_sign_present"',
+                '"parked_vehicle_left"',
+                '"open_left_gap"',
+                'names.add("road_clear")',
+            ]
+        ),
+        "teacher_lock_before_update": "update_teacher_if_accepted" in read_text(root / "fate_oia/engine/train_acpr_oia.py")
+        and "candidate_evaluated_before_update" in read_text(root / "fate_oia/engine/train_acpr_oia.py"),
+        "pair_budget_main_reference": "pair_budget_main_reference" in read_text(root / "fate_oia/engine/train_acpr_oia.py")
+        and "predicate_weak" not in read_text(root / "fate_oia/engine/train_acpr_oia.py").split("def pair_budget_main_reference", 1)[1].split("def compute_losses", 1)[0],
         "model_forward": all(shape_checks.values()),
         "config_no_cache": cfg.get("experiment", {}).get("feature_cache_enabled") is False,
         "config_no_compression": cfg.get("experiment", {}).get("token_compression") == "none",
@@ -119,7 +144,10 @@ def audit(config: str, output_dir: str, device: str = "cpu", write_review_pass: 
         )
         and "torch.cat([old, payload[key]]" not in read_text(root / "fate_oia/models/acpr_pair_memory.py"),
         "pair_memory_cuda_config": cfg.get("pair_mining", {}).get("pair_memory_device") == "cuda",
-        "vista_gates_not_placeholder": "placeholder" not in read_text(root / "fate_oia/engine/audit_acpr_vista_gates.py").lower(),
+        "vista_gates_not_placeholder": "placeholder" not in read_text(root / "fate_oia/engine/audit_acpr_vista_gates.py").lower()
+        and "_gate_c2" in read_text(root / "fate_oia/engine/audit_acpr_vista_gates.py")
+        and "_gate_d" in read_text(root / "fate_oia/engine/audit_acpr_vista_gates.py")
+        and "_gate_e" in read_text(root / "fate_oia/engine/audit_acpr_vista_gates.py"),
         "memory_probe_real_step": "real_cuda_forward_backward" in read_text(root / "fate_oia/engine/probe_acpr_vista_memory.py")
         and "schema probe" not in read_text(root / "fate_oia/engine/probe_acpr_vista_memory.py").lower(),
         "num_workers_parallel": int(cfg.get("data", {}).get("num_workers", 0)) >= 4,

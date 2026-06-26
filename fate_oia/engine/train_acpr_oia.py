@@ -26,6 +26,7 @@ from fate_oia.utils.acpr_pair_budget import apply_pair_budget
 from fate_oia.utils.acpr_pair_mining import pair_summary
 from fate_oia.utils.acpr_threshold_search import search_best_thresholds_for_f1
 from fate_oia.utils.acpr_thresholds import acpr_metric_views, standard_joint
+from fate_oia.utils.acpr_teacher_lock import ACPRTeacherLockState, update_teacher_if_accepted
 from fate_oia.utils.acpr_train_calib_split import make_train_calib_indices
 from fate_oia.utils.acpr_vista_artifacts import vista_stats_payload, write_vista_epoch_artifacts
 
@@ -85,6 +86,7 @@ def build_model(cfg: dict, device: torch.device) -> ACPROIAModel:
     threshold_cfg = cfg.get("threshold", {})
     vista_cfg = cfg.get("vista", {})
     vista_schedule = vista_cfg.get("max_scale_schedule", {})
+    vista_gate_cfg = vista_cfg.get("predicate_gate", {})
     model = ACPROIAModel(
         selected_layers=tuple(model_cfg.get("selected_layers", [3, 7, 11])),
         pretrained_weights=str(cfg.get("pretrained_weights", "ckp/reference/dino_deitsmall8_pretrain.pth")),
@@ -99,6 +101,14 @@ def build_model(cfg: dict, device: torch.device) -> ACPROIAModel:
             "rank": int(vista_cfg.get("rank", 48)),
             "gate_floor": float(vista_cfg.get("gate_floor", 0.20)),
             "detach_predicate_gate": bool(vista_cfg.get("detach_predicate_gate", True)),
+            "base_fraction": float(vista_cfg.get("base_fraction", 0.20)),
+            "learned_fraction": float(vista_cfg.get("learned_fraction", 0.10)),
+            "reliable_predicate_weight": float(vista_gate_cfg.get("reliable_predicate_weight", 1.0)),
+            "global_predicate_weight": float(vista_gate_cfg.get("global_predicate_weight", 0.3)),
+            "unreliable_predicate_weight": float(vista_gate_cfg.get("unreliable_predicate_weight", 0.0)),
+            "anchor_mix_start_epoch": int(vista_gate_cfg.get("anchor_mix_start_epoch", 2)),
+            "anchor_mix_end_epoch": int(vista_gate_cfg.get("anchor_mix_end_epoch", 5)),
+            "early_global_gate": bool(vista_gate_cfg.get("early_global_gate", True)),
             "early_scale": float(vista_schedule.get("early_scale", 0.05)),
             "main_scale": float(vista_schedule.get("main_scale", 0.15)),
             "late_scale": float(vista_schedule.get("late_scale", 0.08)),
@@ -284,18 +294,31 @@ def update_threshold_teacher_from_train_calib(
     epoch: int,
     cfg: dict,
     out_dir: Path,
+    teacher_lock_state: ACPRTeacherLockState,
 ) -> dict[str, Any]:
     teacher = collect_threshold_teacher(model, train_calib_loader, device, epoch, cfg)
     search_cfg = cfg.get("threshold", {})
-    model.threshold_head.update_teacher(
-        teacher["threshold_logit"].to(device),
-        pred_rate_teacher=teacher["pred_rate"].to(device),
+    best_f1 = teacher["best_f1"]
+    candidate_action = float(best_f1[: model.action_dim].mean().detach().cpu())
+    candidate_exp = float(best_f1[model.action_dim :].mean().detach().cpu())
+    candidate_joint = 0.5 * candidate_action + 0.5 * candidate_exp
+    lock_payload = update_teacher_if_accepted(
+        model.threshold_head,
+        teacher_lock_state,
+        epoch,
+        teacher,
+        {"joint": candidate_joint, "Act_mF1": candidate_action, "Exp_mF1": candidate_exp},
+        min_delta=float(search_cfg.get("teacher_best_min_delta", 1e-4)),
+        action_tolerance=float(search_cfg.get("teacher_action_tolerance", 1e-3)),
+        exp_tolerance=float(search_cfg.get("teacher_exp_tolerance", 1e-3)),
         ema=float(search_cfg.get("teacher_ema", 0.20)),
         copy_to_params=bool(search_cfg.get("copy_teacher_to_params", False)),
     )
     payload = {
         "epoch": epoch,
         "source": "train_calib",
+        "teacher_lock_source": "candidate_evaluated_before_update",
+        **lock_payload,
         "threshold_prob": teacher["threshold_prob"].tolist(),
         "threshold_logit": teacher["threshold_logit"].tolist(),
         "best_f1": teacher["best_f1"].tolist(),
@@ -396,9 +419,26 @@ def pair_artifact_payload(pairs: dict, reason_names: list[str] | None = None) ->
     return {"available": True, **summary, "per_reason": per_reason}
 
 
+def pair_budget_main_reference(terms: dict[str, torch.Tensor], weights: dict) -> torch.Tensor:
+    """Reference loss for HardPair cap: action + reason primary objectives only."""
+    keys = ("action_direct", "reason_partial", "action_visual_aux", "action_reason_aux")
+    total = None
+    for key in keys:
+        if key not in terms:
+            continue
+        value = terms[key] * float(weights.get(key, 0.0))
+        total = value if total is None else total + value
+    if total is None:
+        first = next(iter(terms.values()))
+        total = first.sum() * 0.0
+    return total
+
+
 def compute_losses(out: dict, batch: dict, predicate_batch: dict, pairs: dict, grammar_matrices: tuple[torch.Tensor, torch.Tensor], weights: dict) -> tuple[torch.Tensor, dict[str, float]]:
     action = batch["action"]
     reason = batch["reason"]
+    contradiction = out.get("predicate_reason_contradiction_score_by_label")
+    neg_min = float(weights.get("__pu_neg_min_weight", 0.20))
     pair_logit, pair_logit_stats = L.matched_pair_logit_loss(out["reason_logits_base"], pairs, return_stats=True)
     pair_embed, pair_embed_stats = L.matched_pair_embedding_loss(out["reason_embeddings_for_pair"], pairs, return_stats=True)
     terms = {
@@ -406,9 +446,9 @@ def compute_losses(out: dict, batch: dict, predicate_batch: dict, pairs: dict, g
         "action_visual_aux": L.action_asl_loss(out["action_visual_logits"], action),
         "action_reason_aux": L.action_asl_loss(out["action_reason_logits"], action),
         "reason_partial": L.partial_label_reason_loss(out["reason_logits_base"], reason, out.get("predicate_reason_contradiction_score_by_label")),
-        "reason_soft_f1": L.reason_soft_f1_loss(out["reason_logits_base"], reason),
+        "reason_soft_f1": L.reason_soft_f1_loss(out["reason_logits_base"], reason, contradiction_scores=contradiction, neg_min_weight=neg_min),
         "predicate_weak": L.predicate_weak_bce_mil_loss(out["predicate_logits"], predicate_batch["predicate_targets"], predicate_batch["predicate_mask"], predicate_batch.get("predicate_reliability")),
-        "predicate_reason_align": L.predicate_reason_alignment_loss(out["predicate_probs"], reason, grammar_matrices[0], grammar_matrices[1]),
+        "predicate_reason_align": L.predicate_reason_alignment_loss(out["predicate_probs"], reason, grammar_matrices[0], grammar_matrices[1], contradiction_scores=contradiction, neg_min_weight=neg_min),
         "matched_pair_logit": pair_logit,
         "matched_pair_embed": pair_embed,
         "action_combo_ce": L.action_combo_ce_loss(out["action_set_logits"], action),
@@ -424,7 +464,9 @@ def compute_losses(out: dict, batch: dict, predicate_batch: dict, pairs: dict, g
         if k not in {"matched_pair_logit", "matched_pair_embed"}
     )
     if bool(weights.get("__vista_pair_budget", False)):
-        pair_used, budget_stats = apply_pair_budget(pair_raw, main_total, int(weights.get("__epoch", 0)))
+        pair_ref = pair_budget_main_reference(terms, weights)
+        pair_used, budget_stats = apply_pair_budget(pair_raw, pair_ref, int(weights.get("__epoch", 0)))
+        budget_stats["pair_budget_reference_loss"] = float(pair_ref.detach().cpu())
     else:
         pair_used = pair_raw
         budget_stats = {
@@ -435,6 +477,7 @@ def compute_losses(out: dict, batch: dict, predicate_batch: dict, pairs: dict, g
             "pair_budget_active": False,
             "pair_to_main_raw": float((pair_raw.detach() / main_total.detach().clamp_min(1e-6)).cpu()),
             "pair_to_main_used": float((pair_raw.detach() / main_total.detach().clamp_min(1e-6)).cpu()),
+            "pair_budget_reference_loss": float(main_total.detach().cpu()),
         }
     total = main_total + pair_used
     parts = {f"loss_{k}": float(v.detach().cpu()) for k, v in terms.items()}
@@ -693,6 +736,7 @@ def main() -> None:
     best_map = -1.0
     best_act = -1.0
     best_tail = -1.0
+    teacher_lock_state = ACPRTeacherLockState()
     global_step = 0
     end_epoch = epochs
     if args.stop_after_epochs is not None:
@@ -731,6 +775,7 @@ def main() -> None:
             batch_weights["matched_pair_embed"] = pair_embed_weight
             batch_weights["__epoch"] = epoch
             batch_weights["__vista_pair_budget"] = bool(cfg.get("pair_budget", {}).get("enabled", cfg.get("vista", {}).get("enabled", False)))
+            batch_weights["__pu_neg_min_weight"] = float(cfg.get("pu_consistency", {}).get("neg_min_weight", 0.20))
             loss, parts = compute_losses(out, batch, pred_batch, pairs, matrices, batch_weights)
             threshold_loss, threshold_parts = compute_threshold_losses(model, out, batch, cfg, epoch)
             loss = loss + threshold_loss
@@ -773,7 +818,7 @@ def main() -> None:
             )
         if bool(threshold_cfg.get("enabled", False)) and train_calib_loader is not None and epoch >= int(threshold_cfg.get("teacher_update_start_epoch", 2)):
             if (epoch - int(threshold_cfg.get("teacher_update_start_epoch", 2))) % int(threshold_cfg.get("teacher_update_every", 1)) == 0:
-                update_threshold_teacher_from_train_calib(model, train_calib_loader, device, epoch, cfg, out_dir)
+                update_threshold_teacher_from_train_calib(model, train_calib_loader, device, epoch, cfg, out_dir, teacher_lock_state)
         metrics = evaluate(model, test_loader, device, epoch, out_dir)
         row = {"event": "acpr_epoch", "epoch": epoch, **metrics}
         print(json.dumps(json_safe(row)), flush=True)

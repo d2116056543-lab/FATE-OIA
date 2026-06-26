@@ -10,6 +10,9 @@ def test_gate_b_non_dead_gradient_mock_dino():
     out = model(torch.randn(1, 3, 360, 640), epoch=0)
     loss = out["action_logits_base"].mean() + out["reason_logits_base"].mean() + out["predicate_logits"].mean()
     loss.backward()
-    assert model.visual_adapter.gate_raw.grad is not None
-    assert model.visual_adapter.gate_raw.grad.abs().sum() > 0
-
+    up_grad = sum(
+        float(block.up.weight.grad.abs().sum())
+        for block in model.visual_adapter.blocks
+        if block.up.weight.grad is not None
+    )
+    assert up_grad > 0

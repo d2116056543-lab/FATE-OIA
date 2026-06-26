@@ -105,6 +105,8 @@ vista:
   gate_floor: 0.20
   detach_predicate_gate: true
   initial_gate_raw: 0.0
+  base_fraction: 0.20
+  learned_fraction: 0.10
   max_scale_schedule:
     early_scale: 0.05
     main_start_epoch: 3
@@ -118,6 +120,9 @@ vista:
     reliable_predicate_weight: 1.0
     global_predicate_weight: 0.3
     unreliable_predicate_weight: 0.0
+    anchor_mix_start_epoch: 2
+    anchor_mix_end_epoch: 5
+    early_global_gate: true
   gradient_coordination:
     enabled: true
     scope: visual_adapter_only

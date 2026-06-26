@@ -61,6 +61,15 @@ class ACPROIAModel(nn.Module):
             num_predicates=self.predicate_head.num_predicates,
             gate_floor=float(vista_cfg.get("gate_floor", 0.20)),
             detach_predicate_gate=bool(vista_cfg.get("detach_predicate_gate", True)),
+            predicate_names=self.predicate_head.names,
+            reliable_predicate_weight=float(vista_cfg.get("reliable_predicate_weight", 1.0)),
+            global_predicate_weight=float(vista_cfg.get("global_predicate_weight", 0.3)),
+            unreliable_predicate_weight=float(vista_cfg.get("unreliable_predicate_weight", 0.0)),
+            anchor_mix_start_epoch=int(vista_cfg.get("anchor_mix_start_epoch", 2)),
+            anchor_mix_end_epoch=int(vista_cfg.get("anchor_mix_end_epoch", 5)),
+            early_global_gate=bool(vista_cfg.get("early_global_gate", True)),
+            base_fraction=float(vista_cfg.get("base_fraction", 0.20)),
+            learned_fraction=float(vista_cfg.get("learned_fraction", 0.10)),
             schedule=VistaScaleSchedule(
                 early_scale=float(vista_cfg.get("early_scale", 0.05)),
                 main_scale=float(vista_cfg.get("main_scale", 0.15)),
@@ -101,6 +110,10 @@ class ACPROIAModel(nn.Module):
                 "vista_gate_entropy": torch.zeros((), device=patch.device, dtype=patch.dtype),
                 "vista_delta_mass_on_high_gate": torch.zeros((), device=patch.device, dtype=patch.dtype),
                 "vista_delta_uniformity": torch.zeros((), device=patch.device, dtype=patch.dtype),
+                "vista_anchor_mix": 0.0,
+                "vista_predicate_importance_prior": torch.zeros(self.predicate_head.num_predicates),
+                "vista_predicate_importance": torch.zeros(self.predicate_head.num_predicates),
+                "vista_predicate_names": list(self.predicate_head.names),
             }
         patch0, ego_features, region_masks, ego_stats = self.ego(patch[:, 0])
         patch = patch.clone()
