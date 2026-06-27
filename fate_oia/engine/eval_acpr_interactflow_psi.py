@@ -13,12 +13,25 @@ from fate_oia.acpr_interactflow.psi_damo_dataset import PSIDAMO11902Dataset, psi
 from fate_oia.acpr_interactflow.psi_metrics import compute_psi_action_metrics, compute_psi_exp29_metrics
 
 
+def _mean_dict(rows: list[dict]) -> dict:
+    if not rows:
+        return {}
+    keys = sorted({k for row in rows for k in row if isinstance(row.get(k), (int, float, bool))})
+    out: dict[str, float] = {}
+    for key in keys:
+        values = [float(row[key]) for row in rows if isinstance(row.get(key), (int, float, bool))]
+        if values:
+            out[key] = sum(values) / len(values)
+    return out
+
+
 @torch.no_grad()
 def evaluate(model: ACPRInteractFlowPPModel, loader: DataLoader, device: torch.device, output_dir: str | Path | None = None, epoch: int = 0) -> dict:
     model.eval()
     action_logits, exp_logits, exp_logits_calibrated, action_labels, action_soft, exp_labels, exp_mask = [], [], [], [], [], [], []
     global_logits, flow_delta_logits, calibration_delta, visual_logits, motion_logits, predicate_logits = [], [], [], [], [], []
     gated_state_contrib, benefit_gate, ledger_gate = [], [], []
+    innovation_rows: list[dict] = []
     file_names: list[str] = []
     progress_path = Path(output_dir) / "eval_progress.jsonl" if output_dir is not None else None
     total_batches = len(loader) if hasattr(loader, "__len__") else None
@@ -37,6 +50,42 @@ def evaluate(model: ACPRInteractFlowPPModel, loader: DataLoader, device: torch.d
         gated_state_contrib.append(out.ledger.gated_state_contributions.detach().cpu())
         benefit_gate.append(out.ledger.benefit_gate.detach().cpu())
         ledger_gate.append(out.ledger.gate.detach().cpu())
+        exp_prob_raw = torch.sigmoid(out.exp29_logits)
+        exp_prob_cal = torch.sigmoid(out.aux.get("exp29_logits_calibrated", out.exp29_logits))
+        state_group_logits = out.aux.get("state_group_logits")
+        state_layer_weights = out.aux.get("state_layer_weights")
+        innovation_rows.append(
+            {
+                "epoch": epoch,
+                "batch": batch_idx,
+                "predicate_positive_rate": float(out.predicates.temporal_stats.get("predicate_positive_rate", 0.0)),
+                "predicate_confidence_mean": float(out.predicates.predicate_confidence.detach().mean().cpu()),
+                "predicate_confidence_max": float(out.predicates.predicate_confidence.detach().max().cpu()),
+                "predicate_attention_entropy": float(out.predicates.temporal_stats.get("attention_entropy", 0.0)),
+                "predicate_transfer_gate_mean": float(out.predicates.transfer_gate.detach().mean().cpu()),
+                "predicate_corridor_mass_mean": float(out.predicates.predicate_corridor_mass.detach().mean().cpu()),
+                "predicate_centroid_x_mean": float(out.predicates.predicate_centroids[..., 0].detach().mean().cpu()),
+                "predicate_centroid_y_mean": float(out.predicates.predicate_centroids[..., 1].detach().mean().cpu()),
+                "state_group_logits_mean": float(state_group_logits.detach().mean().cpu()) if state_group_logits is not None else 0.0,
+                "state_group_logits_std": float(state_group_logits.detach().std().cpu()) if state_group_logits is not None else 0.0,
+                "state_layer_weights_max": float(state_layer_weights.detach().max().cpu()) if state_layer_weights is not None else 0.0,
+                "flow_edge_abs_mean": float(out.flow.flow_edges.detach().abs().mean().cpu()),
+                "flow_edge_abs_max": float(out.flow.flow_edges.detach().abs().max().cpu()),
+                "factor_attention_entropy": float(out.flow.stats.get("factor_attention_entropy", 0.0)),
+                "lag_argmax_mean": float(out.flow.stats.get("lag_argmax_mean", 0.0)),
+                "ledger_gate_mean": float(out.ledger.gate.detach().mean().cpu()),
+                "ledger_benefit_gate_mean": float(out.ledger.benefit_gate.detach().mean().cpu()),
+                "ledger_flow_delta_abs_mean": float(out.ledger.flow_delta_logits.detach().abs().mean().cpu()),
+                "ledger_calibration_delta_abs_mean": float(out.ledger.calibration_delta.detach().abs().mean().cpu()),
+                "ledger_identity_error": float(out.ledger.identity_error.detach().cpu()),
+                "exp29_raw_prob_mean": float(exp_prob_raw.detach().mean().cpu()),
+                "exp29_raw_prob_max": float(exp_prob_raw.detach().max().cpu()),
+                "exp29_calibrated_prob_mean": float(exp_prob_cal.detach().mean().cpu()),
+                "exp29_calibrated_prob_max": float(exp_prob_cal.detach().max().cpu()),
+                "exp29_raw_pred_positive_rate_0p5": float((exp_prob_raw >= 0.5).float().mean().detach().cpu()),
+                "exp29_calibrated_pred_positive_rate_0p5": float((exp_prob_cal >= 0.5).float().mean().detach().cpu()),
+            }
+        )
         action_labels.append(batch.action_majority.detach().cpu())
         action_soft.append(batch.action_soft.detach().cpu())
         exp_labels.append(batch.exp29.detach().cpu())
@@ -65,14 +114,25 @@ def evaluate(model: ACPRInteractFlowPPModel, loader: DataLoader, device: torch.d
     exp_calibrated = compute_psi_exp29_metrics(ecal, ey, em)
     exp = exp_calibrated
     joint = 0.60 * action["Act_mAcc"] + 0.25 * action["Act_stopF1"] + 0.15 * exp["Exp_mF1"]
+    innovation = _mean_dict(innovation_rows)
     metrics = {
         "epoch": epoch,
         "joint": joint,
+        "Act_mAcc": action["Act_mAcc"],
+        "Act_oAcc": action["Act_oAcc"],
+        "Exp_mF1": exp["Exp_mF1"],
+        "Exp_oF1": exp["Exp_oF1"],
+        "Exp_mAP": exp["Exp_mAP"],
+        "ExpRaw_mF1": exp_raw["Exp_mF1"],
+        "ExpRaw_oF1": exp_raw["Exp_oF1"],
+        "ExpCal_mF1": exp_calibrated["Exp_mF1"],
+        "ExpCal_oF1": exp_calibrated["Exp_oF1"],
         "action": action,
         "exp29": exp,
         "exp29_raw_fixed": exp_raw,
         "exp29_calibrated_fixed": exp_calibrated,
         "exp29_primary": "calibrated_fixed",
+        "innovation": innovation,
     }
     if output_dir is not None:
         save_epoch_tensors(
@@ -96,6 +156,8 @@ def evaluate(model: ACPRInteractFlowPPModel, loader: DataLoader, device: torch.d
                 "ledger_gate": torch.cat(ledger_gate),
             },
         )
+        append_jsonl(Path(output_dir) / "innovation_intermediate_metrics.jsonl", {"epoch": epoch, **innovation})
+        write_json(Path(output_dir) / "innovation_intermediate_latest.json", {"epoch": epoch, **innovation})
         write_json(Path(output_dir) / "metrics_latest.json", metrics)
     return metrics
 

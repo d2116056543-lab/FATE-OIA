@@ -176,6 +176,20 @@ def _write_epoch_artifacts(
     write_json(epoch_dir / "exp29_metrics.json", metrics["exp29"])
     write_json(epoch_dir / "exp29_raw_fixed_metrics.json", metrics.get("exp29_raw_fixed", {}))
     write_json(epoch_dir / "exp29_calibrated_fixed_metrics.json", metrics.get("exp29_calibrated_fixed", {}))
+    write_json(epoch_dir / "core_metrics.json", {
+        "epoch": epoch,
+        "joint": metrics.get("joint"),
+        "Act_mAcc": metrics.get("Act_mAcc"),
+        "Act_oAcc": metrics.get("Act_oAcc"),
+        "Exp_mF1": metrics.get("Exp_mF1"),
+        "Exp_oF1": metrics.get("Exp_oF1"),
+        "Exp_mAP": metrics.get("Exp_mAP"),
+        "ExpRaw_mF1": metrics.get("ExpRaw_mF1"),
+        "ExpRaw_oF1": metrics.get("ExpRaw_oF1"),
+        "ExpCal_mF1": metrics.get("ExpCal_mF1"),
+        "ExpCal_oF1": metrics.get("ExpCal_oF1"),
+    })
+    write_json(epoch_dir / "innovation_intermediate_metrics.json", metrics.get("innovation", {}))
     write_json(epoch_dir / "joint_metrics.json", {"epoch": epoch, "joint": metrics["joint"], "formula": "0.60*Act_mAcc + 0.25*Stop_F1 + 0.15*Exp_mF1"})
     _write_jsonl_rows(epoch_dir / "loss_components.jsonl", loss_rows)
     write_json(epoch_dir / "gradient_norms.json", {"epoch": epoch, "optimizer_steps": grad_rows})
@@ -397,6 +411,19 @@ def main() -> None:
             except Exception as exc:
                 influence = {"epoch": epoch, "available": False, "error": repr(exc)}
         append_jsonl(out_dir / "metrics_summary.jsonl", metrics)
+        append_jsonl(out_dir / "core_metrics_summary.jsonl", {
+            "epoch": epoch,
+            "joint": metrics.get("joint"),
+            "Act_mAcc": metrics.get("Act_mAcc"),
+            "Act_oAcc": metrics.get("Act_oAcc"),
+            "Exp_mF1": metrics.get("Exp_mF1"),
+            "Exp_oF1": metrics.get("Exp_oF1"),
+            "Exp_mAP": metrics.get("Exp_mAP"),
+            "ExpRaw_mF1": metrics.get("ExpRaw_mF1"),
+            "ExpRaw_oF1": metrics.get("ExpRaw_oF1"),
+            "ExpCal_mF1": metrics.get("ExpCal_mF1"),
+            "ExpCal_oF1": metrics.get("ExpCal_oF1"),
+        })
         append_jsonl(out_dir / "state_bank_stats.jsonl", {"epoch": epoch, **output.aux.get("state_stats", {})})
         append_jsonl(out_dir / "interaction_flow_stats.jsonl", {"epoch": epoch, **output.flow.stats})
         append_jsonl(out_dir / "predicate_stats.jsonl", {"epoch": epoch, **output.predicates.temporal_stats})
@@ -445,10 +472,16 @@ def main() -> None:
             _atomic_torch_save(ckpt, out_dir / "checkpoint_best_exp.pth")
         print(
             f"interactflow_epoch epoch={epoch} joint={metrics['joint']:.4f} "
-            f"Act_mAcc={metrics['action']['Act_mAcc']:.4f} StopF1={metrics['action']['Act_stopF1']:.4f} "
-            f"Exp_mF1={metrics['exp29']['Exp_mF1']:.4f} "
+            f"Act_mAcc={metrics.get('Act_mAcc', 0.0):.4f} "
+            f"Act_oAcc={metrics.get('Act_oAcc', 0.0):.4f} "
+            f"StopF1={metrics['action']['Act_stopF1']:.4f} "
+            f"Exp_mF1={metrics.get('Exp_mF1', 0.0):.4f} "
+            f"Exp_oF1={metrics.get('Exp_oF1', 0.0):.4f} "
             f"ExpRaw_mF1={metrics.get('exp29_raw_fixed', {}).get('Exp_mF1', 0.0):.4f} "
             f"ExpCal_mF1={metrics.get('exp29_calibrated_fixed', {}).get('Exp_mF1', 0.0):.4f} "
+            f"predPosCal={metrics.get('innovation', {}).get('exp29_calibrated_pred_positive_rate_0p5', 0.0):.4f} "
+            f"flowDelta={metrics.get('innovation', {}).get('ledger_flow_delta_abs_mean', 0.0):.4f} "
+            f"lagMean={metrics.get('innovation', {}).get('lag_argmax_mean', 0.0):.2f} "
             f"elapsed={time.time()-start:.1f}s",
             flush=True,
         )
