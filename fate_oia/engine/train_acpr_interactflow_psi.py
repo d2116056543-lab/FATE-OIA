@@ -39,6 +39,7 @@ def _build_model(cfg: dict) -> ACPRInteractFlowPPModel:
         grammar_path=cfg["model"]["interaction_flow"]["grammar_yaml"],
         exp29_names_path=cfg["paths"].get("psi_label_embedding_json"),
         action_dim=int(cfg["data"]["action_dim"]),
+        dino_chunk_size=int(cfg["model"]["visual_encoder"].get("dino_chunk_size", 2)),
         use_mock_dino=False,
     )
 

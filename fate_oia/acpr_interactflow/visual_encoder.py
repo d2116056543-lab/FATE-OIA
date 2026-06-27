@@ -21,6 +21,7 @@ class InteractVisualEncoder(nn.Module):
         selected_layers: tuple[int, ...] = (3, 7, 11),
         use_mock_dino: bool = False,
         dim: int = 384,
+        dino_chunk_size: int = 2,
     ) -> None:
         super().__init__()
         self.anchor_frames = tuple(anchor_frames)
@@ -31,6 +32,7 @@ class InteractVisualEncoder(nn.Module):
             mock_dim=dim,
         )
         self.dim = self.dino.dim
+        self.dino_chunk_size = max(1, int(dino_chunk_size))
         self.fast_motion_cnn = nn.Sequential(
             nn.Conv2d(3, 32, kernel_size=5, stride=4, padding=2),
             nn.GELU(),
@@ -54,9 +56,16 @@ class InteractVisualEncoder(nn.Module):
         flat = anchors.reshape(b * len(self.anchor_frames), c, h, w)
         if flat.shape[-2:] != (360, 640):
             flat = F.interpolate(flat, size=(360, 640), mode="bilinear", align_corners=False)
-        dino = self.dino(flat)
-        patches = dino["patch_tokens_by_layer"].reshape(b, len(self.anchor_frames), len(self.dino.selected_layers), 3600, self.dim)
-        cls = dino["cls_tokens_by_layer"].reshape(b, len(self.anchor_frames), len(self.dino.selected_layers), self.dim)
+        patch_chunks = []
+        cls_chunks = []
+        for chunk in flat.split(self.dino_chunk_size, dim=0):
+            dino = self.dino(chunk)
+            patch_chunks.append(dino["patch_tokens_by_layer"])
+            cls_chunks.append(dino["cls_tokens_by_layer"])
+        patch_all = torch.cat(patch_chunks, dim=0)
+        cls_all = torch.cat(cls_chunks, dim=0)
+        patches = patch_all.reshape(b, len(self.anchor_frames), len(self.dino.selected_layers), 3600, self.dim)
+        cls = cls_all.reshape(b, len(self.anchor_frames), len(self.dino.selected_layers), self.dim)
         first_last = torch.cat([patches[:, 0].mean(1), patches[:, -1].mean(1)], dim=-1)
         motion_tokens = self.temporal_proj(first_last)
         anchor_tokens = patches.mean(2).mean(2)
@@ -67,6 +76,7 @@ class InteractVisualEncoder(nn.Module):
             "dino_grid_h": 45,
             "dino_grid_w": 80,
             "formal_target_frame_used": False,
+            "dino_chunk_size": self.dino_chunk_size,
         }
         return InteractVisualOutput(
             anchor_tokens=anchor_tokens,

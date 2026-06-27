@@ -18,10 +18,12 @@ def main() -> None:
     parser.add_argument("--config", default="configs/acpr_interactflow_pp_v1_psi_damo_11902.yaml")
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--measured_batches", type=int, default=100)
+    parser.add_argument("--warmup_batches", type=int)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
     cfg = load_interactflow_config(args.config)
+    warmup_batches = int(args.warmup_batches if args.warmup_batches is not None else cfg.get("profile", {}).get("warmup_batches", 0))
     device = torch.device(args.device if args.device == "cuda" and torch.cuda.is_available() else "cpu")
     ds = PSIDAMO11902Dataset(
         cfg["paths"]["psi_package_root"],
@@ -29,7 +31,7 @@ def main() -> None:
         frames_root=cfg["paths"].get("psi2_root_reference_only"),
         image_size=(int(cfg["data"]["image_height"]), int(cfg["data"]["image_width"])),
         action_dim=int(cfg["data"]["action_dim"]),
-        max_samples=max(args.batch_size * args.measured_batches, args.batch_size),
+        max_samples=max(args.batch_size * (args.measured_batches + warmup_batches + 1), args.batch_size),
     )
     data_cfg = cfg["data"]
     workers = int(data_cfg.get("num_workers", 0))
@@ -49,16 +51,18 @@ def main() -> None:
         predicate_config="configs/acpr_interactflow_predicates.yaml",
         grammar_path=cfg["model"]["interaction_flow"]["grammar_yaml"],
         action_dim=int(cfg["data"]["action_dim"]),
+        dino_chunk_size=int(cfg["model"]["visual_encoder"].get("dino_chunk_size", 2)),
         use_mock_dino=False,
     ).to(device).eval()
     start = time.time()
     load_time = 0.0
     forward_time = 0.0
     count = 0
+    warmup_count = 0
     next_start = time.time()
     with torch.no_grad():
         for batch in loader:
-            load_time += time.time() - next_start
+            current_load_gap = time.time() - next_start
             frames = batch.input_frames.to(device, non_blocking=True)
             if device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats()
@@ -67,7 +71,13 @@ def main() -> None:
             _ = model(frames)
             if device.type == "cuda":
                 torch.cuda.synchronize()
-            forward_time += time.time() - fwd_start
+            current_forward = time.time() - fwd_start
+            if warmup_count < warmup_batches:
+                warmup_count += 1
+                next_start = time.time()
+                continue
+            load_time += current_load_gap
+            forward_time += current_forward
             count += 1
             if count >= args.measured_batches:
                 break
@@ -75,6 +85,8 @@ def main() -> None:
     peak = torch.cuda.max_memory_reserved() / (1024 ** 3) if device.type == "cuda" else 0.0
     report = {
         "measured_batches": args.measured_batches,
+        "warmup_batches": warmup_batches,
+        "completed_warmup_batches": warmup_count,
         "profile_kind": "real_dataset_forward_profile",
         "completed_batches": count,
         "batch_size": args.batch_size,

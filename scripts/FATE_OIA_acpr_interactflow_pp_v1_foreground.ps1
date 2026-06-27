@@ -1,7 +1,7 @@
 param(
   [int]$Epochs = 30,
-  [int]$BatchSize = 1,
-  [int]$GradAccum = 64,
+  [int]$BatchSize = 4,
+  [int]$GradAccum = 16,
   [string]$Device = "cuda",
   [switch]$RequireReviewPass
 )

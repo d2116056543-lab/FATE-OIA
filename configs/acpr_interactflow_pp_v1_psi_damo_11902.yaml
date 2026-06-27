@@ -66,6 +66,7 @@ model:
     optional_full15_dino_mode: true
     default_full15_dino_mode: false
     selected_layers: [3, 7, 11]
+    dino_chunk_size: 2
     freeze_dino_backbone: true
     adapter_type: lora
     adapter_rank: 4

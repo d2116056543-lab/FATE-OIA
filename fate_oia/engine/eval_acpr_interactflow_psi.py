@@ -105,6 +105,7 @@ def main() -> None:
         grammar_path=cfg["model"]["interaction_flow"]["grammar_yaml"],
         exp29_names_path=cfg["paths"].get("psi_label_embedding_json"),
         action_dim=int(cfg["data"]["action_dim"]),
+        dino_chunk_size=int(cfg["model"]["visual_encoder"].get("dino_chunk_size", 2)),
     ).to(device)
     if args.checkpoint:
         ckpt = torch.load(args.checkpoint, map_location="cpu")

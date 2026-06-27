@@ -26,9 +26,15 @@ class ACPRInteractFlowPPModel(nn.Module):
         dim: int = 384,
         action_dim: int = 4,
         use_mock_dino: bool = False,
+        dino_chunk_size: int = 2,
     ) -> None:
         super().__init__()
-        self.visual = InteractVisualEncoder(pretrained_weights=pretrained_weights, use_mock_dino=use_mock_dino, dim=dim)
+        self.visual = InteractVisualEncoder(
+            pretrained_weights=pretrained_weights,
+            use_mock_dino=use_mock_dino,
+            dim=dim,
+            dino_chunk_size=dino_chunk_size,
+        )
         self.motion = MotionPathEncoder(dim=dim)
         self.predicates = DynamicPredicateField(predicate_config=predicate_config, dim=dim)
         self.state_bank = ObjectiveEnvironmentStateBank(grammar_path=grammar_path, dim=dim, num_predicates=48)

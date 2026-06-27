@@ -22,6 +22,7 @@ def main() -> None:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--skip_real_dino_smoke", action="store_true")
     parser.add_argument("--profile_batches", type=int, default=5)
+    parser.add_argument("--profile_batch_size", type=int, default=4)
     parser.add_argument("--mechanism_samples", type=int, default=128)
     args = parser.parse_args()
     root = Path.cwd()
@@ -82,7 +83,7 @@ def main() -> None:
             "--measured_batches",
             str(args.profile_batches),
             "--batch_size",
-            "1",
+            str(args.profile_batch_size),
             "--device",
             args.device,
         ],

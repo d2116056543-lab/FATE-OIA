@@ -116,11 +116,13 @@ def run_audit(config: str, output_dir: str, device: str = "cpu", write_review_pa
             predicate_config="configs/acpr_interactflow_predicates.yaml",
             grammar_path=cfg["model"]["interaction_flow"]["grammar_yaml"],
             action_dim=int(cfg["data"]["action_dim"]),
+            dino_chunk_size=int(cfg["model"]["visual_encoder"].get("dino_chunk_size", 2)),
             use_mock_dino=True,
         ).to(dev)
         frames = torch.randn(2, 15, 3, int(cfg["data"]["image_height"]), int(cfg["data"]["image_width"]), device=dev)
         output = model(frames, epoch=0)
         functional["model_forward"] = output.action_logits.shape == (2, int(cfg["data"]["action_dim"])) and output.exp29_logits.shape == (2, 29)
+        functional["dino_anchor_chunking"] = output.visual.stats.get("dino_chunk_size") == int(cfg["model"]["visual_encoder"].get("dino_chunk_size", 2))
         functional["predicate_field"] = output.predicates.predicate_logits.shape == (2, 48)
         functional["predicate_trajectory"] = (
             output.predicates.predicate_logits_trajectory.shape == (2, 15, 48)
