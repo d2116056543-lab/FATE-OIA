@@ -24,6 +24,7 @@ paths:
 
   oia_acpr_checkpoint: E:/sbw/FATE_Drive/fate_oia_acpr_calalign_v1_2_worktree/.background_runs/acpr_calalign_v1_2_resume_e15_17_sched28_20260616_125105/checkpoint_best_test_final_calibrated.pth
   oia_predicate_yaml: configs/acpr_scene_predicates.yaml
+  text_encoder_model: E:/sbw/hf_cache/transformers/models--bert-base-uncased/snapshots/86b5e0934494bd15c9632b12f734a8a67f723594
   dino_weights: ckp/reference/dino_deitsmall8_pretrain.pth
 
   output_root: E:/sbw/FATE_Drive/active_runs
@@ -81,6 +82,8 @@ model:
     temporal_module: gru_plus_tcn
     lagged_proxy_for_non_anchor_frames: true
     output_evidence_kind: true
+    require_oia_transfer_source: true
+    require_transformer_text: true
 
   nnpu:
     enabled: true

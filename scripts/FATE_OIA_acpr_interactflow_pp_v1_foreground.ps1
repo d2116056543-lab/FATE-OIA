@@ -14,6 +14,25 @@ $ReviewPass = Join-Path $Root ".background_runs\acpr_interactflow_pp_v1_prefligh
 if ($RequireReviewPass -and -not (Test-Path $ReviewPass)) {
   throw "Missing REVIEW_PASS_ACPR_INTERACTFLOW_PP_V1.txt"
 }
+if ($RequireReviewPass) {
+  $LocalHead = (git rev-parse HEAD).Trim()
+  $Review = Get-Content -LiteralPath $ReviewPass -Raw | ConvertFrom-Json
+  if ($Review.git_head -ne $LocalHead) {
+    throw "Stale REVIEW_PASS: review git_head=$($Review.git_head), local HEAD=$LocalHead"
+  }
+  $Dirty = git status --porcelain
+  if ($Dirty) {
+    throw "Worktree is dirty; commit code-only changes and rerun preflight before full train."
+  }
+  $RemoteLine = git ls-remote github refs/heads/acpr_interactflow_pp_v1
+  if (-not $RemoteLine) {
+    throw "Cannot verify GitHub branch refs/heads/acpr_interactflow_pp_v1"
+  }
+  $RemoteHead = ($RemoteLine -split "\s+")[0]
+  if ($RemoteHead -ne $LocalHead) {
+    throw "GitHub branch HEAD mismatch: remote=$RemoteHead local=$LocalHead"
+  }
+}
 
 $Out = Join-Path $Root ".background_runs\acpr_interactflow_pp_v1_full"
 New-Item -ItemType Directory -Force -Path $Out | Out-Null

@@ -23,6 +23,7 @@ def _run(cmd: list[str], cwd: Path) -> dict:
 
 def _run_real_intervention_probe(config: str, output_dir: Path, device_name: str) -> dict:
     cfg = load_interactflow_config(config)
+    pred_cfg = cfg["model"].get("predicates", {})
     device = torch.device(device_name if device_name == "cuda" and torch.cuda.is_available() else "cpu")
     data = cfg["data"]
     paths = cfg["paths"]
@@ -43,6 +44,10 @@ def _run_real_intervention_probe(config: str, output_dir: Path, device_name: str
         predicate_config="configs/acpr_interactflow_predicates.yaml",
         grammar_path=cfg["model"]["interaction_flow"]["grammar_yaml"],
         exp29_names_path=cfg["paths"].get("psi_label_embedding_json"),
+        oia_acpr_checkpoint=cfg["paths"].get("oia_acpr_checkpoint"),
+        text_encoder_model=cfg["paths"].get("text_encoder_model"),
+        require_oia_transfer_source=bool(pred_cfg.get("require_oia_transfer_source", False)),
+        require_transformer_text=bool(pred_cfg.get("require_transformer_text", False)),
         action_dim=int(cfg["data"]["action_dim"]),
         dino_chunk_size=int(cfg["model"]["visual_encoder"].get("dino_chunk_size", 2)),
         use_mock_dino=False,
@@ -209,21 +214,48 @@ def main() -> None:
         ],
         root,
     )
+    atlas = _run(
+        [
+            sys.executable,
+            "-m",
+            "fate_oia.engine.build_acpr_interactflow_atlas",
+            "--input_dir",
+            str(visual_dir),
+            "--output",
+            str(visual_dir / "atlas.html"),
+            "--metrics",
+            str(mechanism_dir / "metrics_latest.json"),
+            "--intervention",
+            str(out / "intervention_audit.json"),
+        ],
+        root,
+    )
     skill_path = root / ".codex" / "skills" / "acpr-interactflowpp-implementation-audit" / "SKILL.md"
     gates = {
         "A_git_worktree_config_import_graph": audit_initial.get("pass", False),
         "B_dataset_metric_parity": pytest_result["returncode"] == 0,
-        "C_oia_transfer": audit_initial["functional_checks"].get("predicate_field", False),
+        "C_oia_transfer": (
+            audit_initial["functional_checks"].get("predicate_field", False)
+            and audit_initial["functional_checks"].get("oia_32_checkpoint_transfer", False)
+            and audit_initial["functional_checks"].get("text_transfer_uses_frozen_transformer", False)
+            and audit_initial["functional_checks"].get("predicate_transfer_source_report", False)
+            and audit_initial["functional_checks"].get("predicate_transfer_text_report", False)
+        ),
         "D_real_direct_image_smoke": real_smoke.get("returncode") == 0,
         "E_gradient_chain": real_smoke.get("returncode") == 0,
         "F_128_sample_mechanism_fit": mechanism["returncode"] == 0 and (mechanism_dir / "metrics_latest.json").exists(),
         "G_temporal_lag_necessity": intervention_report["temporal_lag_pass"],
         "H_intervention": intervention_report["pass"],
-        "I_visualization": visual["returncode"] == 0 and (visual_dir / "visual_export_manifest.json").exists(),
+        "I_visualization": (
+            visual["returncode"] == 0
+            and atlas["returncode"] == 0
+            and (visual_dir / "visual_export_manifest.json").exists()
+            and (visual_dir / "atlas.json").exists()
+        ),
         "J_throughput_memory": profile["returncode"] == 0,
         "K_independent_review_pass": skill_path.exists() and audit_initial.get("pass", False),
     }
-    write_json(out / "preflight_gates_summary.json", {"gates": gates, "compile": compile_result, "pytest": pytest_result, "profile": profile, "mechanism": mechanism, "intervention": intervention_report, "visual": visual})
+    write_json(out / "preflight_gates_summary.json", {"gates": gates, "compile": compile_result, "pytest": pytest_result, "profile": profile, "mechanism": mechanism, "intervention": intervention_report, "visual": visual, "atlas": atlas})
     final_audit = run_audit(args.config, str(out), device="cpu", write_review_pass=all(gates.values()))
     write_json(out / "preflight_summary.json", {"compile": compile_result, "pytest": pytest_result, "initial_audit": audit_initial, "real_smoke": real_smoke, "profile": profile, "gates": gates, "final_audit": final_audit})
     if not all([compile_result["returncode"] == 0, pytest_result["returncode"] == 0, final_audit["pass"]]):

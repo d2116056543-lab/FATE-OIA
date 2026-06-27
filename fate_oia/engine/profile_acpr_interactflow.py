@@ -46,10 +46,16 @@ def main() -> None:
         loader_kwargs["persistent_workers"] = bool(data_cfg.get("persistent_workers", False))
         loader_kwargs["prefetch_factor"] = int(data_cfg.get("prefetch_factor", 2))
     loader = DataLoader(ds, **loader_kwargs)
+    pred_cfg = cfg["model"].get("predicates", {})
     model = ACPRInteractFlowPPModel(
         pretrained_weights=cfg["paths"]["dino_weights"],
         predicate_config="configs/acpr_interactflow_predicates.yaml",
         grammar_path=cfg["model"]["interaction_flow"]["grammar_yaml"],
+        exp29_names_path=cfg["paths"].get("psi_label_embedding_json"),
+        oia_acpr_checkpoint=cfg["paths"].get("oia_acpr_checkpoint"),
+        text_encoder_model=cfg["paths"].get("text_encoder_model"),
+        require_oia_transfer_source=bool(pred_cfg.get("require_oia_transfer_source", False)),
+        require_transformer_text=bool(pred_cfg.get("require_transformer_text", False)),
         action_dim=int(cfg["data"]["action_dim"]),
         dino_chunk_size=int(cfg["model"]["visual_encoder"].get("dino_chunk_size", 2)),
         use_mock_dino=False,

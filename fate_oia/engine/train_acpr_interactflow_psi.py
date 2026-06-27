@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -11,6 +12,7 @@ from torch.utils.data import DataLoader
 
 from fate_oia.acpr_interactflow.artifacts import append_jsonl, write_json
 from fate_oia.acpr_interactflow.config import load_interactflow_config
+from fate_oia.acpr_interactflow.interventions import evaluate_intervention_suite
 from fate_oia.acpr_interactflow.model import ACPRInteractFlowPPModel
 from fate_oia.acpr_interactflow.psi_damo_dataset import PSIDAMO11902Dataset, psi_interactflow_collate
 from fate_oia.engine.eval_acpr_interactflow_psi import evaluate
@@ -34,11 +36,16 @@ def _loader(ds, batch_size: int, cfg: dict, shuffle: bool) -> DataLoader:
 
 
 def _build_model(cfg: dict) -> ACPRInteractFlowPPModel:
+    pred_cfg = cfg["model"].get("predicates", {})
     return ACPRInteractFlowPPModel(
         pretrained_weights=cfg["paths"]["dino_weights"],
         predicate_config="configs/acpr_interactflow_predicates.yaml",
         grammar_path=cfg["model"]["interaction_flow"]["grammar_yaml"],
         exp29_names_path=cfg["paths"].get("psi_label_embedding_json"),
+        oia_acpr_checkpoint=cfg["paths"].get("oia_acpr_checkpoint"),
+        text_encoder_model=cfg["paths"].get("text_encoder_model"),
+        require_oia_transfer_source=bool(pred_cfg.get("require_oia_transfer_source", False)),
+        require_transformer_text=bool(pred_cfg.get("require_transformer_text", False)),
         action_dim=int(cfg["data"]["action_dim"]),
         dino_chunk_size=int(cfg["model"]["visual_encoder"].get("dino_chunk_size", 2)),
         use_mock_dino=False,
@@ -96,6 +103,109 @@ def _atomic_torch_save(payload: dict, path: Path) -> None:
             tmp_path.unlink()
 
 
+def _write_jsonl_rows(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    import json
+
+    with path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def _write_epoch_prediction_artifacts(run_dir: Path, epoch_dir: Path) -> None:
+    import json
+
+    logits_action_path = run_dir / "logits_action_test.pt"
+    logits_exp_path = run_dir / "logits_exp29_test.pt"
+    labels_action_path = run_dir / "labels_action_test.pt"
+    labels_exp_path = run_dir / "labels_exp29_test.pt"
+    files_path = run_dir / "file_names_test.json"
+    if not all(p.exists() for p in [logits_action_path, logits_exp_path, labels_action_path, labels_exp_path, files_path]):
+        return
+    action_logits = torch.load(logits_action_path, map_location="cpu")
+    exp_logits = torch.load(logits_exp_path, map_location="cpu")
+    action_labels = torch.load(labels_action_path, map_location="cpu")
+    exp_labels = torch.load(labels_exp_path, map_location="cpu")
+    files = json.loads(files_path.read_text(encoding="utf-8"))
+    action_probs = torch.softmax(action_logits, dim=-1)
+    exp_probs = torch.sigmoid(exp_logits)
+    action_rows = []
+    exp_rows = []
+    for i, file_name in enumerate(files):
+        action_rows.append(
+            {
+                "epoch": epoch_dir.name,
+                "sample_id": file_name,
+                "pred_action": int(action_probs[i].argmax()),
+                "gt_action": int(action_labels[i]),
+                "action_probs": action_probs[i].tolist(),
+            }
+        )
+        top_exp = torch.topk(exp_probs[i], k=min(5, exp_probs.shape[1])).indices.tolist()
+        exp_rows.append(
+            {
+                "epoch": epoch_dir.name,
+                "sample_id": file_name,
+                "top_exp29": [int(x) for x in top_exp],
+                "exp29_probs_top5": [float(exp_probs[i, x]) for x in top_exp],
+                "positive_exp29_indices": [int(x) for x in torch.nonzero(exp_labels[i] > 0.5, as_tuple=False).flatten().tolist()],
+            }
+        )
+    _write_jsonl_rows(epoch_dir / "predictions_action.jsonl", action_rows)
+    _write_jsonl_rows(epoch_dir / "predictions_exp29.jsonl", exp_rows)
+
+
+def _write_epoch_artifacts(
+    run_dir: Path,
+    epoch: int,
+    metrics: dict,
+    output,
+    model: ACPRInteractFlowPPModel,
+    loss_rows: list[dict],
+    grad_rows: list[dict],
+    influence: dict,
+) -> None:
+    epoch_dir = run_dir / f"epoch_{epoch:03d}"
+    epoch_dir.mkdir(parents=True, exist_ok=True)
+    write_json(epoch_dir / "action_metrics.json", metrics["action"])
+    write_json(epoch_dir / "exp29_metrics.json", metrics["exp29"])
+    write_json(epoch_dir / "joint_metrics.json", {"epoch": epoch, "joint": metrics["joint"], "formula": "0.60*Act_mAcc + 0.25*Stop_F1 + 0.15*Exp_mF1"})
+    _write_jsonl_rows(epoch_dir / "loss_components.jsonl", loss_rows)
+    write_json(epoch_dir / "gradient_norms.json", {"epoch": epoch, "optimizer_steps": grad_rows})
+    write_json(epoch_dir / "predicate_stats.json", {"epoch": epoch, **output.predicates.temporal_stats})
+    write_json(epoch_dir / "nnpu_calibration.json", {
+        "epoch": epoch,
+        "action_temperature": torch.exp(model.calalign.action_temp.clamp(-1.0, 1.0)).detach().cpu().tolist(),
+        "action_bias": model.calalign.action_bias.clamp(-2, 2).detach().cpu().tolist(),
+        "exp29_temperature": torch.exp(model.calalign.exp_temp.clamp(-1.0, 1.0)).detach().cpu().tolist(),
+        "exp29_bias": model.calalign.exp_bias.clamp(-2, 2).detach().cpu().tolist(),
+    })
+    write_json(epoch_dir / "interaction_state_stats.json", {"epoch": epoch, **output.aux.get("state_stats", {})})
+    write_json(epoch_dir / "response_lag_stats.json", {"epoch": epoch, **output.flow.stats})
+    write_json(epoch_dir / "decision_ledger_stats.json", {
+        "epoch": epoch,
+        "identity_error": float(output.ledger.identity_error.detach().cpu()),
+        "gate_mean": float(output.ledger.gate.detach().mean().cpu()),
+        "benefit_gate_mean": float(output.ledger.benefit_gate.detach().mean().cpu()),
+    })
+    write_json(epoch_dir / "lightweight_interaction_influence.json", influence)
+    _write_epoch_prediction_artifacts(run_dir, epoch_dir)
+    fixed_rows = []
+    for i in range(min(8, output.action_logits.shape[0])):
+        fixed_rows.append(
+            {
+                "epoch": epoch,
+                "index": i,
+                "action_logits": output.action_logits[i].detach().cpu().tolist(),
+                "global_logits": output.ledger.global_logits[i].detach().cpu().tolist(),
+                "flow_delta_logits": output.ledger.flow_delta_logits[i].detach().cpu().tolist(),
+                "calibration_delta": output.ledger.calibration_delta[i].detach().cpu().tolist(),
+                "identity_error": float(output.ledger.identity_error.detach().cpu()),
+            }
+        )
+    _write_jsonl_rows(epoch_dir / "fixed_case_intermediate_outputs.jsonl", fixed_rows)
+
+
 def _build_warmup_cosine_scheduler(opt: torch.optim.Optimizer, cfg: dict, total_updates: int):
     opt_cfg = cfg["optimization"]
     warmup_updates = max(1, int(float(opt_cfg.get("warmup_ratio", 0.05)) * total_updates))
@@ -108,6 +218,13 @@ def _build_warmup_cosine_scheduler(opt: torch.optim.Optimizer, cfg: dict, total_
         return min_lr_ratio + 0.5 * (1.0 - min_lr_ratio) * (1.0 + math.cos(math.pi * progress))
 
     return torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lr_lambda), warmup_updates
+
+
+def _git_head() -> str:
+    try:
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    except Exception:
+        return "unknown"
 
 
 def main() -> None:
@@ -179,8 +296,16 @@ def main() -> None:
         "warmup_ratio": cfg["optimization"].get("warmup_ratio", 0.05),
         "warmup_updates": warmup_updates,
         "optimizer_groups": [{"name": g.get("name"), "lr": g.get("lr"), "weight_decay": g.get("weight_decay")} for g in opt.param_groups],
+        "oia_transfer_source_loaded": bool(model.predicates.transfer.report().get("source_loaded", False)),
+        "oia_transfer_text_embedding_source": model.predicates.transfer.report().get("text_embedding_source"),
     }
     write_json(out_dir / "run_manifest.json", manifest)
+    write_json(out_dir / "oia_transfer_report.json", model.predicates.transfer.report())
+    write_json(out_dir / "optimizer_groups.json", manifest["optimizer_groups"])
+    write_json(out_dir / "git_provenance.json", {"git_head": _git_head(), "config": args.config})
+    config_path = Path(args.config)
+    if config_path.exists():
+        (out_dir / "config_resolved.yaml").write_text(config_path.read_text(encoding="utf-8"), encoding="utf-8")
     best_joint = -1.0
     best_action = -1.0
     best_exp = -1.0
@@ -189,8 +314,12 @@ def main() -> None:
         model.train()
         opt.zero_grad(set_to_none=True)
         start = time.time()
+        epoch_loss_rows: list[dict] = []
+        epoch_grad_rows: list[dict] = []
+        last_frames_for_audit: torch.Tensor | None = None
         for step, batch in enumerate(train_loader, start=1):
             frames = batch.input_frames.to(device, non_blocking=True)
+            last_frames_for_audit = frames[:1].detach()
             batch = batch.__class__(
                 input_frames=frames,
                 action_soft=batch.action_soft.to(device, non_blocking=True),
@@ -212,12 +341,21 @@ def main() -> None:
                 output = model(frames, epoch=epoch)
                 loss, terms = compute_interactflow_losses(output, batch, weights=cfg.get("loss", {}))
             (loss / args.gradient_accumulation_steps).backward()
-            if step % args.gradient_accumulation_steps == 0:
-                torch.nn.utils.clip_grad_norm_(params, float(cfg["optimization"]["gradient_clip_norm"]))
+            if step % args.gradient_accumulation_steps == 0 or step == len(train_loader):
+                grad_norm = torch.nn.utils.clip_grad_norm_(params, float(cfg["optimization"]["gradient_clip_norm"]))
                 opt.step()
                 sched.step()
                 opt.zero_grad(set_to_none=True)
                 global_step += 1
+                epoch_grad_rows.append(
+                    {
+                        "epoch": epoch,
+                        "global_step": global_step,
+                        "batch_step": step,
+                        "grad_norm": float(grad_norm.detach().cpu() if torch.is_tensor(grad_norm) else grad_norm),
+                        "lr": opt.param_groups[0]["lr"],
+                    }
+                )
             if step == 1 or step % 200 == 0:
                 row = {
                     "epoch": epoch,
@@ -235,9 +373,19 @@ def main() -> None:
                     for k, val in term_values.items()
                     if k != "total_loss"
                 }
-                append_jsonl(out_dir / "loss_components.jsonl", {**row, **term_values, **weighted_values})
+                log_row = {**row, **term_values, **weighted_values}
+                append_jsonl(out_dir / "loss_components.jsonl", log_row)
+                epoch_loss_rows.append(log_row)
                 print("interactflow_batch " + str(row), flush=True)
         metrics = evaluate(model, test_loader, device, out_dir, epoch=epoch)
+        influence = {"epoch": epoch, "available": False}
+        if last_frames_for_audit is not None:
+            try:
+                with torch.no_grad():
+                    influence = evaluate_intervention_suite(model, last_frames_for_audit.to(device), epoch=epoch)
+                    influence["available"] = True
+            except Exception as exc:
+                influence = {"epoch": epoch, "available": False, "error": repr(exc)}
         append_jsonl(out_dir / "metrics_summary.jsonl", metrics)
         append_jsonl(out_dir / "state_bank_stats.jsonl", {"epoch": epoch, **output.aux.get("state_stats", {})})
         append_jsonl(out_dir / "interaction_flow_stats.jsonl", {"epoch": epoch, **output.flow.stats})
@@ -252,6 +400,13 @@ def main() -> None:
             "epoch": epoch,
             "calibration_bias_mean": float(model.ledger.calibration_bias.detach().mean().cpu()),
         })
+        if device.type == "cuda":
+            append_jsonl(out_dir / "gpu_memory.jsonl", {
+                "epoch": epoch,
+                "max_memory_allocated_gib": torch.cuda.max_memory_allocated() / (1024 ** 3),
+                "max_memory_reserved_gib": torch.cuda.max_memory_reserved() / (1024 ** 3),
+            })
+        _write_epoch_artifacts(out_dir, epoch, metrics, output, model, epoch_loss_rows, epoch_grad_rows, influence)
         ckpt = {"model": model.state_dict(), "epoch": epoch, "metrics": metrics, "optimizer": opt.state_dict(), "scheduler": sched.state_dict()}
         _atomic_torch_save(ckpt, out_dir / "checkpoint_latest.pth")
         if metrics["joint"] > best_joint:
@@ -274,7 +429,9 @@ def main() -> None:
             f"Exp_mF1={metrics['exp29']['Exp_mF1']:.4f} elapsed={time.time()-start:.1f}s",
             flush=True,
         )
-    write_json(out_dir / "GOAL_COMPLETED_ACPR_INTERACTFLOW_PP_V1.json", {"completed": True, "best_joint": best_joint})
+    completion = {"completed": True, "best_joint": best_joint, "best_action": best_action, "best_exp": best_exp}
+    write_json(out_dir / "run_complete.json", completion)
+    write_json(out_dir / "GOAL_COMPLETED_ACPR_INTERACTFLOW_PP_V1.json", completion)
 
 
 if __name__ == "__main__":

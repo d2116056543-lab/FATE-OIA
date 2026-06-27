@@ -8,6 +8,7 @@ import torch
 from PIL import Image, ImageDraw
 
 from fate_oia.acpr_interactflow.artifacts import write_json
+from fate_oia.explain.acpr_interactflow_renderer import render_case
 
 ACTION_NAMES = ["maintain_speed", "reduce_speed", "stop_car"]
 
@@ -98,9 +99,11 @@ def main() -> None:
                 "gated_state_contributions": state_contrib[i].tolist(),
                 "calibration_delta": calibration_delta[i].tolist(),
                 "identity_check_max_abs": float((final_logits[i] - (global_logits[i] + flow_delta[i] + calibration_delta[i])).abs().max()),
+                "tensor_lineage": "final_logits = global_logits + flow_delta_logits + calibration_delta",
             }
             write_json(case_dir / "decision_ledger.json", case)
             _draw_contribution_png(case_dir / "decision_ledger.png", final_logits[i], global_logits[i], flow_delta[i], calibration_delta[i])
+            render_case(case, case_dir)
             cases.append({"case_dir": str(case_dir), "file_name": case["file_name"], "pred_action": case["pred_action"], "gt_action": case["gt_action"]})
 
     rows = "\n".join(

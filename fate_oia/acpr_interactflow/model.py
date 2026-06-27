@@ -25,8 +25,12 @@ class ACPRInteractFlowPPModel(nn.Module):
         predicate_config: str = "configs/acpr_interactflow_predicates.yaml",
         grammar_path: str = "configs/acpr_interactflow_state_grammar.yaml",
         exp29_names_path: str | None = None,
+        oia_acpr_checkpoint: str | None = None,
+        text_encoder_model: str | None = None,
+        require_oia_transfer_source: bool = False,
+        require_transformer_text: bool = False,
         dim: int = 384,
-        action_dim: int = 4,
+        action_dim: int = 3,
         use_mock_dino: bool = False,
         dino_chunk_size: int = 2,
     ) -> None:
@@ -38,7 +42,14 @@ class ACPRInteractFlowPPModel(nn.Module):
             dino_chunk_size=dino_chunk_size,
         )
         self.motion = MotionPathEncoder(dim=dim)
-        self.predicates = DynamicPredicateField(predicate_config=predicate_config, dim=dim)
+        self.predicates = DynamicPredicateField(
+            predicate_config=predicate_config,
+            dim=dim,
+            source_checkpoint=oia_acpr_checkpoint,
+            text_encoder_model=text_encoder_model,
+            require_source_checkpoint=require_oia_transfer_source,
+            require_transformer_text=require_transformer_text,
+        )
         self.state_bank = ObjectiveEnvironmentStateBank(grammar_path=grammar_path, dim=dim, num_predicates=48)
         self.flow = InteractionFlowReasoner(grammar_path=grammar_path, dim=dim, num_predicates=48, num_actions=action_dim)
         self.ledger = DecisionLedgerHead(dim=dim, num_actions=action_dim)

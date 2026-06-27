@@ -98,12 +98,17 @@ def main() -> None:
     parser.add_argument("--max_test_samples", type=int)
     args = parser.parse_args()
     cfg = load_interactflow_config(args.config)
+    pred_cfg = cfg["model"].get("predicates", {})
     device = torch.device(args.device if torch.cuda.is_available() and args.device == "cuda" else "cpu")
     model = ACPRInteractFlowPPModel(
         pretrained_weights=cfg["paths"]["dino_weights"],
         predicate_config="configs/acpr_interactflow_predicates.yaml",
         grammar_path=cfg["model"]["interaction_flow"]["grammar_yaml"],
         exp29_names_path=cfg["paths"].get("psi_label_embedding_json"),
+        oia_acpr_checkpoint=cfg["paths"].get("oia_acpr_checkpoint"),
+        text_encoder_model=cfg["paths"].get("text_encoder_model"),
+        require_oia_transfer_source=bool(pred_cfg.get("require_oia_transfer_source", False)),
+        require_transformer_text=bool(pred_cfg.get("require_transformer_text", False)),
         action_dim=int(cfg["data"]["action_dim"]),
         dino_chunk_size=int(cfg["model"]["visual_encoder"].get("dino_chunk_size", 2)),
     ).to(device)

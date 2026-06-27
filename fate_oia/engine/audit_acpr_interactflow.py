@@ -27,7 +27,6 @@ FORBIDDEN_PATTERNS = [
     "Start-Job",
     "nohup",
     "hidden cmd",
-    "hashlib",
 ]
 
 
@@ -108,11 +107,33 @@ def run_audit(config: str, output_dir: str, device: str = "cpu", write_review_pa
     transfer_source = (root / "fate_oia" / "acpr_interactflow" / "predicate_transfer.py").read_text(encoding="utf-8", errors="ignore")
     eval_source = (root / "fate_oia" / "engine" / "eval_acpr_interactflow_psi.py").read_text(encoding="utf-8", errors="ignore")
     export_source = (root / "fate_oia" / "engine" / "export_acpr_interactflow_visuals.py").read_text(encoding="utf-8", errors="ignore")
+    supervisor_source = (root / "fate_oia" / "engine" / "supervise_acpr_interactflow_foreground.py").read_text(encoding="utf-8", errors="ignore")
+    ps1_source = (root / "scripts" / "FATE_OIA_acpr_interactflow_pp_v1_foreground.ps1").read_text(encoding="utf-8", errors="ignore")
+    atlas_source = (root / "fate_oia" / "explain" / "acpr_interactflow_atlas.py").read_text(encoding="utf-8", errors="ignore")
+    renderer_source = (root / "fate_oia" / "explain" / "acpr_interactflow_renderer.py").read_text(encoding="utf-8", errors="ignore")
     functional["formal_train_real_dino_only"] = "use_mock_dino=True" not in train_source and "--use_mock_dino" not in train_source
     functional["motion_uses_full15_fast_tokens"] = "self.motion(visual.fast_motion_tokens)" in model_source
-    functional["text_transfer_not_hash_embedding"] = "hashlib" not in transfer_source and "build_bow_text_embeddings" in transfer_source
+    functional["oia_32_checkpoint_transfer"] = (
+        "load_oia_predicate_queries" in transfer_source
+        and "predicate_head.predicate_queries" in transfer_source
+        and "source_checkpoint_sha256" in transfer_source
+        and "source_oia_queries" in transfer_source
+        and "oia_name_order_verified" in transfer_source
+    )
+    functional["text_transfer_uses_frozen_transformer"] = (
+        "build_transformer_text_embeddings" in transfer_source
+        and "AutoTokenizer.from_pretrained" in transfer_source
+        and "AutoModel.from_pretrained" in transfer_source
+        and "ontology_bow_fallback" in transfer_source
+    )
     functional["eval_saves_ledger_middle_outputs"] = "ledger_gated_state_contributions" in eval_source and "logits_action_global" in eval_source
     functional["visual_export_real_ledger"] = "decision_ledger.png" in export_source and "Missing eval tensors" in export_source
+    functional["atlas_renderer_tensor_linked"] = (
+        "summarize_intervention_audit" in atlas_source
+        and "decision_waterfall.png" in renderer_source
+        and "identity_check_max_abs" in renderer_source
+        and "ACPR-InteractFlow atlas:" not in (root / "fate_oia" / "engine" / "build_acpr_interactflow_atlas.py").read_text(encoding="utf-8", errors="ignore")
+    )
     functional["state_temporal_losses_not_zero_placeholders"] = (
         "interaction_state_semantic_loss(output.flow.state_logits" in loss_source
         and "temporal_consistency_loss(" in loss_source
@@ -134,12 +155,58 @@ def run_audit(config: str, output_dir: str, device: str = "cpu", write_review_pa
         and "checkpoint_best_exp.pth" in train_source
         and "checkpoint_best_test.pth" in train_source
     )
+    functional["required_epoch_artifact_schema"] = all(
+        token in train_source
+        for token in [
+            "action_metrics.json",
+            "exp29_metrics.json",
+            "joint_metrics.json",
+            "gradient_norms.json",
+            "predicate_stats.json",
+            "nnpu_calibration.json",
+            "interaction_state_stats.json",
+            "response_lag_stats.json",
+            "decision_ledger_stats.json",
+            "lightweight_interaction_influence.json",
+            "predictions_action.jsonl",
+            "predictions_exp29.jsonl",
+            "fixed_case_intermediate_outputs.jsonl",
+        ]
+    )
+    functional["required_run_root_artifact_schema"] = all(
+        token in train_source
+        for token in [
+            "run_manifest.json",
+            "config_resolved.yaml",
+            "git_provenance.json",
+            "oia_transfer_report.json",
+            "optimizer_groups.json",
+            "checkpoint_latest.pth",
+            "checkpoint_best_action.pth",
+            "checkpoint_best_exp.pth",
+            "checkpoint_best_joint.pth",
+            "checkpoint_best_test.pth",
+            "run_complete.json",
+        ]
+    )
+    functional["review_pass_head_remote_binding"] = (
+        "Stale REVIEW_PASS" in supervisor_source
+        and "git ls-remote" in ps1_source
+        and "Worktree is dirty" in ps1_source
+        and "GitHub branch HEAD mismatch" in ps1_source
+    )
     try:
         dev = torch.device(device if device == "cuda" and torch.cuda.is_available() else "cpu")
+        pred_cfg = cfg["model"].get("predicates", {})
         model = ACPRInteractFlowPPModel(
             pretrained_weights=cfg["paths"]["dino_weights"],
             predicate_config="configs/acpr_interactflow_predicates.yaml",
             grammar_path=cfg["model"]["interaction_flow"]["grammar_yaml"],
+            exp29_names_path=cfg["paths"].get("psi_label_embedding_json"),
+            oia_acpr_checkpoint=cfg["paths"].get("oia_acpr_checkpoint"),
+            text_encoder_model=cfg["paths"].get("text_encoder_model"),
+            require_oia_transfer_source=bool(pred_cfg.get("require_oia_transfer_source", False)),
+            require_transformer_text=bool(pred_cfg.get("require_transformer_text", False)),
             action_dim=int(cfg["data"]["action_dim"]),
             dino_chunk_size=int(cfg["model"]["visual_encoder"].get("dino_chunk_size", 2)),
             use_mock_dino=True,
@@ -164,6 +231,15 @@ def run_audit(config: str, output_dir: str, device: str = "cpu", write_review_pa
             and output.predicates.predicate_corridor_mass.shape == (2, 15, 48, 4)
         )
         functional["predicate_transfer_gate_surface"] = output.predicates.transfer_gate.shape[0] == 48
+        transfer_report = model.predicates.transfer.report()
+        functional["predicate_transfer_source_report"] = (
+            transfer_report.get("source_loaded") is True
+            and transfer_report.get("source_tensor_key") == "predicate_head.predicate_queries"
+            and transfer_report.get("source_shape") == [32, 384]
+            and transfer_report.get("oia_name_order_verified") is True
+            and len(transfer_report.get("loaded_predicate_names", [])) == 32
+        )
+        functional["predicate_transfer_text_report"] = transfer_report.get("text_embedding_source") == "transformers_frozen"
         functional["decision_identity"] = float(output.ledger.identity_error.detach().cpu()) < 1e-5
         functional["ledger_exact_contribution_chain"] = (
             output.ledger.global_logits.shape == output.action_logits.shape

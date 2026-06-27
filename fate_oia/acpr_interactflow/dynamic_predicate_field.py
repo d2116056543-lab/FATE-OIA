@@ -12,7 +12,16 @@ from .types import InteractPredicateField
 
 
 class DynamicPredicateField(nn.Module):
-    def __init__(self, predicate_config: str, dim: int = 384, num_layers: int = 3) -> None:
+    def __init__(
+        self,
+        predicate_config: str,
+        dim: int = 384,
+        num_layers: int = 3,
+        source_checkpoint: str | None = None,
+        text_encoder_model: str | None = None,
+        require_source_checkpoint: bool = False,
+        require_transformer_text: bool = False,
+    ) -> None:
         super().__init__()
         self.ontology = InteractPredicateOntology(predicate_config)
         self.oia_head = ACPRScenePredicateHead(scene_config="configs/acpr_scene_predicates.yaml", dim=dim, num_layers=num_layers)
@@ -25,7 +34,15 @@ class DynamicPredicateField(nn.Module):
             nn.Conv1d(dim, dim, kernel_size=1),
         )
         self.oia_temporal_logit = nn.Linear(dim, 1)
-        self.transfer = TextPredicateTransfer(self.ontology.names, dim=dim)
+        self.transfer = TextPredicateTransfer(
+            self.ontology.names,
+            dim=dim,
+            source_checkpoint=source_checkpoint,
+            oia_predicate_names=self.ontology.names[:32],
+            text_encoder_model=text_encoder_model,
+            require_source_checkpoint=require_source_checkpoint,
+            require_transformer_text=require_transformer_text,
+        )
 
     @staticmethod
     def _trajectory_indices(anchor_count: int, observed_frames: int, device: torch.device) -> torch.Tensor:
@@ -106,6 +123,7 @@ class DynamicPredicateField(nn.Module):
             "attention_entropy": float((-(attention.clamp_min(1e-9).log() * attention).sum(-1)).mean().detach().cpu()),
             "transfer_gate_mean": float(transfer["transfer_gate"].detach().mean().cpu()),
             "text_embedding_source": transfer.get("text_embedding_source", "unknown"),
+            "oia_source_loaded": bool(self.transfer.report().get("source_loaded", False)),
         }
         return InteractPredicateField(
             predicate_logits=logits,
