@@ -1,0 +1,28 @@
+version: acpr_interactflow_pp_v1
+state_groups:
+  traffic_control: [traffic_control_visible, red_or_stop_control]
+  front_object: [leading_vehicle_close, leading_vehicle_braking, obstacle_near_path]
+  actor_crossing: [crossing_pedestrian, cyclist_near_path]
+  lane_context: [left_lane_relevant, right_lane_relevant, lane_change_context]
+  drivable_corridor: [road_clear_forward]
+  ego_motion: [ego_moving_fast, ego_decelerating, ego_stopped]
+  road_geometry: [intersection_context, turn_intent_context]
+  global_context: []
+response_lags: [0, 1, 2, 3, 4]
+flow_factors:
+  - {name: traffic_to_stop, source: traffic_control, target_action: stop}
+  - {name: obstacle_to_stop, source: front_object, target_action: stop}
+  - {name: clear_to_forward, source: drivable_corridor, target_action: forward}
+  - {name: left_context_to_left, source: lane_context, target_action: left}
+  - {name: right_context_to_right, source: lane_context, target_action: right}
+  - {name: pedestrian_conflict_waiting, source: actor_crossing, target_action: reduce_speed}
+  - {name: pedestrian_conflict_crossing, source: actor_crossing, target_action: stop}
+  - {name: crosswalk_context_approaching, source: road_geometry, target_action: reduce_speed}
+  - {name: traffic_signal_approaching, source: traffic_control, target_action: reduce_speed}
+  - {name: traffic_signal_stop_required, source: traffic_control, target_action: stop}
+  - {name: front_vehicle_yielding, source: front_object, target_action: reduce_speed}
+  - {name: side_occlusion_caution, source: lane_context, target_action: reduce_speed}
+  - {name: intersection_constraint_entering, source: road_geometry, target_action: reduce_speed}
+  - {name: ego_decelerating_to_stop, source: ego_motion, target_action: stop}
+  - {name: ego_motion_clear_go, source: ego_motion, target_action: maintain_speed}
+  - {name: uncertain_global_context, source: global_context, target_action: reduce_speed}

@@ -1,0 +1,20 @@
+version: acpr_interactflow_pp_v1
+oia_predicate_config: configs/acpr_scene_predicates.yaml
+psi_predicates:
+  - {name: ego_moving_fast, group: motion, source: temporal}
+  - {name: ego_decelerating, group: motion, source: temporal}
+  - {name: ego_stopped, group: motion, source: temporal}
+  - {name: leading_vehicle_close, group: object, source: frame_text}
+  - {name: leading_vehicle_braking, group: object, source: temporal}
+  - {name: crossing_pedestrian, group: actor, source: frame_text}
+  - {name: cyclist_near_path, group: actor, source: frame_text}
+  - {name: traffic_control_visible, group: traffic, source: frame_text}
+  - {name: red_or_stop_control, group: traffic, source: text_rule}
+  - {name: intersection_context, group: road, source: frame_text}
+  - {name: left_lane_relevant, group: lane, source: ego_region}
+  - {name: right_lane_relevant, group: lane, source: ego_region}
+  - {name: lane_change_context, group: lane, source: temporal}
+  - {name: road_clear_forward, group: road, source: text_rule}
+  - {name: obstacle_near_path, group: object, source: frame_text}
+  - {name: turn_intent_context, group: road, source: temporal}
+

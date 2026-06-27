@@ -1,0 +1,262 @@
+config_version: acpr_interactflow_pp_v1
+experiment_name: acpr_interactflow_pp_v1_psi_damo_11902
+protocol_tag: test_selected_user_requested
+dataset_protocol: public_reconstruction_psi1_damo_abim_style_11902_not_private_exact
+
+repository:
+  source_repo: d2116056543-lab/FATE-OIA
+  source_branch: acpr_calalign_v1_2
+  source_worktree: E:/sbw/FATE_Drive/fate_oia_acpr_calalign_v1_2_worktree
+  target_worktree: E:/sbw/FATE_Drive/fate_oia_acpr_interactflow_pp_worktree
+  target_branch: acpr_interactflow_pp_v1
+  github_remote: github
+  require_source_clean_and_synced: true
+  require_target_clean_and_synced: true
+
+paths:
+  psi_package_root: E:/sbw/PSI-DriverDecision-Prediction-main/.worktrees/damo_repro/artifacts/psi_damo_compatible_11902_verified_20260626
+  psi_samples_dir: E:/sbw/PSI-DriverDecision-Prediction-main/.worktrees/damo_repro/artifacts/psi_damo_compatible_11902_verified_20260626/samples
+  psi_reason_exp29_dir: E:/sbw/PSI-DriverDecision-Prediction-main/.worktrees/damo_repro/artifacts/psi_damo_compatible_11902_verified_20260626/reason_exp29
+  psi_label_embedding_pkl: E:/sbw/PSI-DriverDecision-Prediction-main/.worktrees/damo_repro/artifacts/psi_damo_compatible_11902_verified_20260626/label_embedding/label_embedding_psi_exp29.pkl
+  psi_label_embedding_json: E:/sbw/PSI-DriverDecision-Prediction-main/.worktrees/damo_repro/artifacts/psi_damo_compatible_11902_verified_20260626/label_embedding/label_embedding_psi_exp29.json
+  psi1_root: E:/sbw/PSI-DriverDecision-Prediction-main/PSI_Dataset_1_2/PSI/PSI1.0
+  psi2_root_reference_only: E:/sbw/PSI-DriverDecision-Prediction-main/PSI_data
+
+  oia_acpr_checkpoint: E:/sbw/FATE_Drive/fate_oia_acpr_calalign_v1_2_worktree/.background_runs/acpr_calalign_v1_2_resume_e15_17_sched28_20260616_125105/checkpoint_best_test_final_calibrated.pth
+  oia_predicate_yaml: configs/acpr_scene_predicates.yaml
+  dino_weights: ckp/reference/dino_deitsmall8_pretrain.pth
+
+  output_root: E:/sbw/FATE_Drive/active_runs
+  preflight_dir: .background_runs/acpr_interactflow_pp_v1_preflight
+
+data:
+  observed_frames: 15
+  target_offset: 1
+  stride: 3
+  formal_input_uses_target_frame: false
+  action_names: [maintain_speed, reduce_speed, stop_car]
+  action_dim: 3
+  exp29_dim: 29
+  use_action_soft_target: true
+  use_paper_effective_weight: true
+  all_zero_exp29_is_unknown: true
+
+  image_height: 320
+  image_width: 576
+  patch_size: 8
+  direct_image_training: true
+  feature_cache_enabled: false
+  token_cache_enabled: false
+  logit_cache_enabled: false
+
+  num_workers: 8
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 4
+  non_blocking_transfer: true
+
+model:
+  state_dim: 384
+  predicate_dim: 384
+  motion_dim: 256
+
+  visual_encoder:
+    type: dino_anchor_plus_fast_motion
+    anchor_frames: [0, 3, 6, 9, 12, 14]
+    optional_full15_dino_mode: true
+    default_full15_dino_mode: false
+    selected_layers: [3, 7, 11]
+    freeze_dino_backbone: true
+    adapter_type: lora
+    adapter_rank: 4
+    last_layer_fusion: learned
+
+  predicates:
+    oia_base_count: 32
+    psi_specific_count: 16
+    total_count: 48
+    assignment: entmax15
+    region_priors: true
+    temporal_module: gru_plus_tcn
+    lagged_proxy_for_non_anchor_frames: true
+    output_evidence_kind: true
+
+  nnpu:
+    enabled: true
+    rules_yaml: configs/acpr_interactflow_text_rules.yaml
+    unknown_as_negative: false
+    nonnegative_risk: true
+    train_only_calibration: true
+    per_predicate_prior: true
+    per_predicate_threshold: true
+    per_predicate_temperature: true
+
+  interaction_flow:
+    regimes: [clear_to_go, caution_required, yielding_required, stop_required]
+    phases: [waiting, approaching, entering, crossing, leaving, uncertain]
+    sources: [pedestrian_conflict, crosswalk_context, traffic_signal, front_vehicle_yielding, side_occlusion, intersection_constraint]
+    corridors: [left_sidewalk_zone, center_ego_path, right_sidewalk_zone, crosswalk_zone]
+    factor_set: regime_phase_source
+    factor_count: 16
+    assignment: entmax15
+    grammar_yaml: configs/acpr_interactflow_state_grammar.yaml
+    response_lags: [0, 1, 2, 3, 4]
+
+  decision_ledger:
+    exact_additive_decomposition: true
+    benefit_gate: true
+    non_degradation_margin: 0.01
+    state_contributions_to_actions: true
+    global_branch_independent_supervision: true
+
+  exp29:
+    enabled: true
+    label_embedding_source: psi_exp29
+    masked_unknown_loss: true
+    reliability_weighted: true
+    contribution_alignment: true
+
+loss:
+  action_final_soft_kl: 1.00
+  action_global_soft_kl: 0.50
+  ledger_residual_soft_kl: 0.20
+  non_degradation_hinge: 0.10
+
+  exp29_masked_asl: 0.30
+  predicate_nnpu: 0.10
+  interaction_state_semantic: 0.05
+  response_lag_consistency: 0.03
+  contribution_alignment_js: 0.05
+  temporal_consistency: 0.02
+  gate_entropy: 0.002
+  group_sparsity: 0.002
+
+  hard_action_ce_only: false
+  all_zero_exp29_negative_bce: false
+  contribution_magnitude_residual: false
+  test_threshold_leakage: false
+
+optimization:
+  epochs: 30
+  precision: bf16
+  optimizer: adamw
+  warmup_ratio: 0.05
+  scheduler: cosine
+  min_lr_ratio: 0.10
+  gradient_clip_norm: 1.0
+  metric_based_early_stop: false
+  effective_batch_target: 64
+
+  learning_rates:
+    dino_adapter: 0.00001
+    predicate_transfer: 0.00010
+    dynamic_predicate: 0.00010
+    motion_path: 0.00010
+    interaction_flow: 0.00010
+    response_lag: 0.000075
+    decision_ledger: 0.00010
+    exp29_head: 0.00010
+    calibration_thresholds: 0.00005
+
+  weight_decay:
+    default: 0.01
+    backbone: 0.05
+    bias_norm_gate: 0.0
+
+evaluation:
+  after_every_epoch: true
+  eval_splits: [test]
+  validation_loader_forbidden_formal: true
+
+  action_metrics:
+    - Act_oAcc
+    - Act_mAcc
+    - Act_macro_F1
+    - Act_weighted_F1
+    - Maintain_recall
+    - Reduce_recall
+    - Stop_recall
+    - Maintain_F1
+    - Reduce_F1
+    - Stop_F1
+    - soft_target_KL
+    - ECE
+
+  exp29_metrics:
+    - Exp_oF1
+    - Exp_mF1
+    - Exp_mAP
+    - Exp_micro_F1
+    - Exp_macro_F1
+    - positive_mask_only_F1
+
+  best_selector:
+    primary: joint
+    joint_formula: "0.60*Act_mAcc + 0.25*Stop_F1 + 0.15*Exp_mF1"
+    tie_breakers: [Act_mAcc, Stop_F1, Exp_mF1, negative_soft_target_KL]
+
+  save_best: [action, exp, joint, test]
+
+traffic_influence:
+  lightweight_audit_samples: 256
+  every_epoch: true
+  final_full_test: true
+  interventions:
+    - global_only
+    - regime_off
+    - phase_off
+    - source_off
+    - factor_off
+    - predicate_off
+    - evidence_tube_off
+    - equal_mass_random
+    - temporal_reverse
+    - temporal_shuffle
+    - lag_disabled
+    - last_frame_only
+    - prefix_5
+    - prefix_10
+    - prefix_15
+  random_equal_mass_trials: 5
+  bootstrap_trials: 1000
+  permutation_trials: 1000
+
+profile:
+  candidates:
+    - {batch_size: 16, gradient_accumulation_steps: 2}
+    - {batch_size: 12, gradient_accumulation_steps: 3}
+    - {batch_size: 8, gradient_accumulation_steps: 4}
+    - {batch_size: 6, gradient_accumulation_steps: 5}
+    - {batch_size: 4, gradient_accumulation_steps: 8}
+    - {batch_size: 3, gradient_accumulation_steps: 11}
+    - {batch_size: 2, gradient_accumulation_steps: 16}
+  warmup_batches: 10
+  measured_batches: 100
+  preferred_peak_reserved_gib: [34.0, 42.0]
+  hard_peak_reserved_limit_gib: 44.0
+  max_projected_epoch_plus_eval_hours: 2.5
+  max_data_time_fraction: 0.25
+  selection_metric: samples_per_second
+  dummy_allocation_forbidden: true
+
+visualization:
+  fixed_cases_per_epoch: 8
+  best_checkpoint_cases: 256
+  keyframes_per_case: 15
+  canvas_png: true
+  source_json: true
+  atlas_html: true
+  manual_boxes_forbidden: true
+  fabricated_effects_forbidden: true
+
+supervisor:
+  foreground_only: true
+  heartbeat_seconds: 60
+  require_review_pass: true
+  require_clean_worktree: true
+  require_remote_sha_match: true
+  metric_based_stop: false
+  oom_fallback: true
+  resume_latest: true
+  reject_tmp_checkpoints: true
+  user_stop_sentinel: control/STOP_REQUESTED_BY_USER

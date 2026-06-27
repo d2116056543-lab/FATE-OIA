@@ -1,0 +1,33 @@
+{
+  "created_at_utc": "2026-06-26T15:55:59.137753+00:00",
+  "package": "ACPR-InteractFlow++ V1 Codex implementation package",
+  "target_repository": "d2116056543-lab/FATE-OIA",
+  "source_branch": "acpr_calalign_v1_2",
+  "source_head_when_written": "373aa49feac17372574fd7fb056c1d79c7c848fe",
+  "target_branch": "acpr_interactflow_pp_v1",
+  "target_worktree": "E:\\sbw\\FATE_Drive\\fate_oia_acpr_interactflow_pp_worktree",
+  "formal_epochs": 30,
+  "dataset_protocol": "public PSI-1.0 DAMO/ABIM/InAction-style 11902 reconstruction",
+  "files": {
+    "Codex_ACPR_InteractFlowPP_V1_Implementation_Plan.md": {
+      "bytes": 43957,
+      "sha256": "48f84a922c3c02b69572b2905f2c2ca1f3eaf9a70e1dc5236a93fd35a43e4201"
+    },
+    "acpr-interactflowpp-implementation-audit_SKILL.md": {
+      "bytes": 14300,
+      "sha256": "83092af39ad9ca888bfcfeb53a1bde5620eb146f3b335d3be2a0063d64e01d93"
+    },
+    "acpr_interactflow_pp_v1_psi_damo_11902.yaml": {
+      "bytes": 7871,
+      "sha256": "1b590322f2fe624e1449be29267a1d8379fe826aa3bb1649405f05d21e0463fd"
+    },
+    "ACPR_InteractFlowPP_V1_File_Level_Checklist.md": {
+      "bytes": 3724,
+      "sha256": "60a2ab89d02dc21bb029cc9c4f47b1fae12570e3efa412ff06f119ce372cd61f"
+    },
+    "Codex_ACPR_InteractFlowPP_V1_Bootstrap_Prompt.txt": {
+      "bytes": 3324,
+      "sha256": "f12cf67a238ac7787f16dd18fe542457c3c7333a69c63dfea090bec88b217236"
+    }
+  }
+}

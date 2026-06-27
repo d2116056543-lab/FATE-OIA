@@ -1,0 +1,16 @@
+version: acpr_interactflow_pp_v1
+actions:
+  0: {name: forward, aliases: [go, move, proceed, straight]}
+  1: {name: stop, aliases: [stop, brake, wait]}
+  2: {name: left, aliases: [left, turn left, left lane]}
+  3: {name: right, aliases: [right, turn right, right lane]}
+psi_action_names: [forward, stop, left, right]
+reason_text_fields: [reason, reasoning, explanation, explanation_text, reasoning_text, description]
+exp29_unknown_policy: all_zero_is_unknown
+predicate_rules:
+  red_or_stop_control: [red light, stop sign, stop signal, traffic light]
+  crossing_pedestrian: [pedestrian, person, crossing]
+  cyclist_near_path: [cyclist, bicycle, bike]
+  obstacle_near_path: [obstacle, parked, vehicle, car, truck]
+  road_clear_forward: [clear, empty road, no obstacle]
+
