@@ -22,8 +22,6 @@ class ACPRDinoFieldExtractor(nn.Module):
         super().__init__()
         self.selected_layers = tuple(int(x) for x in selected_layers)
         self.patch_size = patch_size
-        self.grid_hw = (45, 80)
-        self.original_tokens = 3601
         self.use_mock_dino = use_mock_dino
         self.dim = mock_dim
         if use_mock_dino:
@@ -38,9 +36,11 @@ class ACPRDinoFieldExtractor(nn.Module):
         self.backbone.eval()
 
     def _mock_forward(self, images: torch.Tensor) -> dict[str, torch.Tensor | tuple[int, int] | int]:
+        grid_hw = (images.shape[-2] // self.patch_size, images.shape[-1] // self.patch_size)
+        original_tokens = grid_hw[0] * grid_hw[1] + 1
         with torch.no_grad():
             patch = self.backbone(images).flatten(2).transpose(1, 2)
-            patch = patch[:, : self.grid_hw[0] * self.grid_hw[1]]
+            patch = patch[:, : grid_hw[0] * grid_hw[1]]
             cls = patch.mean(1, keepdim=True)
             patches = torch.stack([patch for _ in self.selected_layers], dim=1)
             cls_layers = torch.stack([cls.squeeze(1) for _ in self.selected_layers], dim=1)
@@ -49,13 +49,16 @@ class ACPRDinoFieldExtractor(nn.Module):
             "cls_tokens_by_layer": cls_layers,
             "patch_tokens_last": patches[:, -1],
             "cls_token_last": cls_layers[:, -1],
-            "grid_hw": self.grid_hw,
-            "original_tokens": self.original_tokens,
+            "grid_hw": grid_hw,
+            "original_tokens": original_tokens,
         }
 
     def forward(self, images: torch.Tensor) -> dict[str, torch.Tensor | tuple[int, int] | int]:
-        if images.shape[-2:] != (360, 640):
-            raise ValueError(f"ACPR expects 360x640 images, got {tuple(images.shape[-2:])}")
+        if images.shape[-2] % self.patch_size != 0 or images.shape[-1] % self.patch_size != 0:
+            raise ValueError(f"Image size must be divisible by patch_size={self.patch_size}, got {tuple(images.shape[-2:])}")
+        grid_hw = (images.shape[-2] // self.patch_size, images.shape[-1] // self.patch_size)
+        expected_patches = grid_hw[0] * grid_hw[1]
+        original_tokens = expected_patches + 1
         if self.use_mock_dino:
             return self._mock_forward(images)
         with torch.no_grad():
@@ -72,8 +75,8 @@ class ACPRDinoFieldExtractor(nn.Module):
                 raise RuntimeError(f"Requested layers {self.selected_layers}, collected {len(outputs)}")
             cls = torch.stack([o[:, 0] for o in outputs], dim=1)
             patch = torch.stack([o[:, 1:] for o in outputs], dim=1)
-        if patch.shape[2] != 3600:
-            raise RuntimeError(f"Expected 3600 patch tokens, got {patch.shape[2]}")
+        if patch.shape[2] != expected_patches:
+            raise RuntimeError(f"Expected {expected_patches} patch tokens, got {patch.shape[2]}")
         patch = patch.detach()
         cls = cls.detach()
         return {
@@ -81,6 +84,6 @@ class ACPRDinoFieldExtractor(nn.Module):
             "cls_tokens_by_layer": cls,
             "patch_tokens_last": patch[:, -1],
             "cls_token_last": cls[:, -1],
-            "grid_hw": self.grid_hw,
-            "original_tokens": self.original_tokens,
+            "grid_hw": grid_hw,
+            "original_tokens": original_tokens,
         }

@@ -15,6 +15,7 @@ from fate_oia.acpr_interactflow.config import load_interactflow_config
 from fate_oia.acpr_interactflow.interventions import evaluate_intervention_suite
 from fate_oia.acpr_interactflow.model import ACPRInteractFlowPPModel
 from fate_oia.acpr_interactflow.psi_damo_dataset import PSIDAMO11902Dataset, psi_interactflow_collate
+from fate_oia.acpr_interactflow.timing import REQUIRED_TIMING_SECTIONS, StepTimer
 from fate_oia.engine.eval_acpr_interactflow_psi import evaluate
 from fate_oia.losses.acpr_interactflow_losses import DEFAULT_INTERACTFLOW_LOSS_WEIGHTS, compute_interactflow_losses
 
@@ -37,6 +38,7 @@ def _loader(ds, batch_size: int, cfg: dict, shuffle: bool) -> DataLoader:
 
 def _build_model(cfg: dict) -> ACPRInteractFlowPPModel:
     pred_cfg = cfg["model"].get("predicates", {})
+    visual_cfg = cfg["model"].get("visual_encoder", {})
     return ACPRInteractFlowPPModel(
         pretrained_weights=cfg["paths"]["dino_weights"],
         predicate_config="configs/acpr_interactflow_predicates.yaml",
@@ -47,7 +49,12 @@ def _build_model(cfg: dict) -> ACPRInteractFlowPPModel:
         require_oia_transfer_source=bool(pred_cfg.get("require_oia_transfer_source", False)),
         require_transformer_text=bool(pred_cfg.get("require_transformer_text", False)),
         action_dim=int(cfg["data"]["action_dim"]),
-        dino_chunk_size=int(cfg["model"]["visual_encoder"].get("dino_chunk_size", 2)),
+        dino_chunk_size=int(visual_cfg.get("dino_chunk_size", 2)),
+        anchor_frames=tuple(int(x) for x in visual_cfg.get("anchor_frames", [0, 3, 6, 9, 12, 14])),
+        selected_layers=tuple(int(x) for x in visual_cfg.get("selected_layers", [3, 7, 11])),
+        dino_input_height=int(visual_cfg.get("dino_input_height", cfg["data"].get("image_height", 320))),
+        dino_input_width=int(visual_cfg.get("dino_input_width", cfg["data"].get("image_width", 576))),
+        patch_size=int(cfg["data"].get("patch_size", 8)),
         use_mock_dino=False,
     )
 
@@ -69,14 +76,14 @@ def _build_optimizer(model: ACPRInteractFlowPPModel, cfg: dict) -> torch.optim.O
         if params:
             groups.append({"params": params, "lr": float(lr_cfg.get(lr_key, lr_default)), "weight_decay": default_wd, "name": name})
 
-    add_group("dino_adapter", [model.visual.fast_motion_cnn, model.visual.fast_motion_proj, model.visual.temporal_proj], "dino_adapter", 1e-5)
+    add_group("dino_adapter", [model.visual.fast_motion_cnn, model.visual.fast_motion_proj, model.visual.lowres_motion_proj, model.visual.temporal_proj], "dino_adapter", 1e-5)
     add_group("predicate_transfer", [model.predicates.transfer], "predicate_transfer", 8e-5)
-    add_group("dynamic_predicate_field", [model.predicates.oia_head, model.predicates.temporal, model.predicates.tcn, model.predicates.psi_logit], "dynamic_predicate_field", 8e-5)
+    add_group("dynamic_predicate_field", [model.predicates.oia_head, model.predicates.temporal, model.predicates.tcn, model.predicates.psi_logit], "dynamic_predicate", 8e-5)
     if model.predicates.psi_queries.requires_grad and id(model.predicates.psi_queries) not in used:
-        groups.append({"params": [model.predicates.psi_queries], "lr": float(lr_cfg.get("dynamic_predicate_field", 8e-5)), "weight_decay": default_wd, "name": "psi_queries"})
+        groups.append({"params": [model.predicates.psi_queries], "lr": float(lr_cfg.get("dynamic_predicate", 8e-5)), "weight_decay": default_wd, "name": "psi_queries"})
         used.add(id(model.predicates.psi_queries))
     add_group("motion_path", [model.motion], "motion_path", 1e-4)
-    add_group("interaction_flow", [model.state_bank, model.flow.predicate_key, model.flow.factor_value, model.flow.edge_head, model.flow.state_head], "interaction_flow", 1e-4)
+    add_group("interaction_flow", [model.state_bank, model.flow.predicate_key, model.flow.factor_value, model.flow.edge_head, model.flow.factor_logit, model.flow.state_head], "interaction_flow", 1e-4)
     if model.flow.factor_queries.requires_grad and id(model.flow.factor_queries) not in used:
         groups.append({"params": [model.flow.factor_queries], "lr": float(lr_cfg.get("interaction_flow", 1e-4)), "weight_decay": default_wd, "name": "flow_factor_queries"})
         used.add(id(model.flow.factor_queries))
@@ -174,6 +181,9 @@ def _write_epoch_artifacts(
     epoch_dir.mkdir(parents=True, exist_ok=True)
     write_json(epoch_dir / "action_metrics.json", metrics["action"])
     write_json(epoch_dir / "exp29_metrics.json", metrics["exp29"])
+    write_json(epoch_dir / "exp29_raw_metrics.json", metrics.get("exp29_raw_fixed", {}))
+    write_json(epoch_dir / "exp29_calibrated_metrics.json", metrics.get("exp29_calibrated_fixed", {}))
+    write_json(epoch_dir / "exp29_diagnostic_threshold_sweep.json", metrics.get("exp29_diagnostic_threshold_sweep", {}))
     write_json(epoch_dir / "exp29_raw_fixed_metrics.json", metrics.get("exp29_raw_fixed", {}))
     write_json(epoch_dir / "exp29_calibrated_fixed_metrics.json", metrics.get("exp29_calibrated_fixed", {}))
     write_json(epoch_dir / "core_metrics.json", {
@@ -211,6 +221,20 @@ def _write_epoch_artifacts(
         "identity_error": float(output.ledger.identity_error.detach().cpu()),
         "gate_mean": float(output.ledger.gate.detach().mean().cpu()),
         "benefit_gate_mean": float(output.ledger.benefit_gate.detach().mean().cpu()),
+        "benefit_target_mean": float(output.ledger.benefit_target.detach().mean().cpu()) if output.ledger.benefit_target is not None else None,
+        "raw_state_contribution_abs_mean": float(output.ledger.raw_state_contributions.detach().abs().mean().cpu()),
+        "gated_state_contribution_abs_mean": float(output.ledger.gated_state_contributions.detach().abs().mean().cpu()),
+    })
+    write_json(epoch_dir / "exp29_ledger_alignment_stats.json", {
+        "epoch": epoch,
+        "attention_entropy": output.exp29.stats.get("exp29_attention_entropy"),
+        "contribution_mass_mean": output.exp29.stats.get("exp29_contribution_mass_mean"),
+        "cluster_reliability_mean": float(output.exp29.cluster_reliability.detach().mean().cpu()),
+    })
+    write_json(epoch_dir / "timing_epoch.json", {
+        "epoch": epoch,
+        "available": bool(loss_rows),
+        "last_logged_step": loss_rows[-1] if loss_rows else None,
     })
     write_json(epoch_dir / "lightweight_interaction_influence.json", influence)
     _write_epoch_prediction_artifacts(run_dir, epoch_dir)
@@ -258,6 +282,7 @@ def main() -> None:
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+    parser.add_argument("--dino_chunk_size", type=int)
     parser.add_argument("--max_train_samples", type=int)
     parser.add_argument("--max_test_samples", type=int)
     parser.add_argument("--device", default="cuda")
@@ -266,6 +291,8 @@ def main() -> None:
     parser.add_argument("--require_no_token_compression", action="store_true")
     args = parser.parse_args()
     cfg = load_interactflow_config(args.config)
+    if args.dino_chunk_size is not None:
+        cfg.setdefault("model", {}).setdefault("visual_encoder", {})["dino_chunk_size"] = int(args.dino_chunk_size)
     if args.no_feature_cache is False:
         raise ValueError("--no_feature_cache is required")
     if args.require_no_token_compression is False:
@@ -341,35 +368,44 @@ def main() -> None:
         epoch_loss_rows: list[dict] = []
         epoch_grad_rows: list[dict] = []
         last_frames_for_audit: torch.Tensor | None = None
+        step_timer = StepTimer()
+        last_step_end = time.perf_counter()
         for step, batch in enumerate(train_loader, start=1):
-            frames = batch.input_frames.to(device, non_blocking=True)
-            last_frames_for_audit = frames[:1].detach()
-            batch = batch.__class__(
-                input_frames=frames,
-                action_soft=batch.action_soft.to(device, non_blocking=True),
-                action_majority=batch.action_majority.to(device, non_blocking=True),
-                exp29=batch.exp29.to(device, non_blocking=True),
-                exp29_mask=batch.exp29_mask.to(device, non_blocking=True),
-                paper_effective_weight=batch.paper_effective_weight.to(device, non_blocking=True),
-                video_id=batch.video_id,
-                start_frame=batch.start_frame,
-                target_frame_index=batch.target_frame_index,
-                target_frame_path=batch.target_frame_path,
-                frame_paths=batch.frame_paths,
-                explanation_text=batch.explanation_text,
-                reasoning_text=batch.reasoning_text,
-                sample_id=batch.sample_id,
-                meta=batch.meta,
-            )
+            now = time.perf_counter()
+            step_timer.add("data_gap", now - last_step_end)
+            with step_timer.section("h2d"):
+                frames = batch.input_frames.to(device, non_blocking=True)
+                last_frames_for_audit = frames[:1].detach()
+                batch = batch.__class__(
+                    input_frames=frames,
+                    action_soft=batch.action_soft.to(device, non_blocking=True),
+                    action_majority=batch.action_majority.to(device, non_blocking=True),
+                    exp29=batch.exp29.to(device, non_blocking=True),
+                    exp29_mask=batch.exp29_mask.to(device, non_blocking=True),
+                    paper_effective_weight=batch.paper_effective_weight.to(device, non_blocking=True),
+                    video_id=batch.video_id,
+                    start_frame=batch.start_frame,
+                    target_frame_index=batch.target_frame_index,
+                    target_frame_path=batch.target_frame_path,
+                    frame_paths=batch.frame_paths,
+                    explanation_text=batch.explanation_text,
+                    reasoning_text=batch.reasoning_text,
+                    sample_id=batch.sample_id,
+                    meta=batch.meta,
+                )
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16):
-                output = model(frames, epoch=epoch)
-                loss, terms = compute_interactflow_losses(output, batch, weights=cfg.get("loss", {}))
-            (loss / args.gradient_accumulation_steps).backward()
+                with step_timer.section("visual_dino"):
+                    output = model(frames, epoch=epoch, action_soft_target=batch.action_soft)
+                with step_timer.section("loss"):
+                    loss, terms = compute_interactflow_losses(output, batch, weights=cfg.get("loss", {}))
+            with step_timer.section("backward"):
+                (loss / args.gradient_accumulation_steps).backward()
             if step % args.gradient_accumulation_steps == 0 or step == len(train_loader):
-                grad_norm = torch.nn.utils.clip_grad_norm_(params, float(cfg["optimization"]["gradient_clip_norm"]))
-                opt.step()
-                sched.step()
-                opt.zero_grad(set_to_none=True)
+                with step_timer.section("optimizer"):
+                    grad_norm = torch.nn.utils.clip_grad_norm_(params, float(cfg["optimization"]["gradient_clip_norm"]))
+                    opt.step()
+                    sched.step()
+                    opt.zero_grad(set_to_none=True)
                 global_step += 1
                 epoch_grad_rows.append(
                     {
@@ -397,10 +433,39 @@ def main() -> None:
                     for k, val in term_values.items()
                     if k != "total_loss"
                 }
-                log_row = {**row, **term_values, **weighted_values}
+                timing_row = step_timer.summary(reset=True)
+                model_timing = output.aux.get("model_timing", {})
+                for section in (
+                    "visual_dino",
+                    "visual_motion",
+                    "predicate",
+                    "interaction_flow",
+                    "response_lag",
+                    "decision_ledger",
+                    "exp29",
+                ):
+                    key = f"{section}_time"
+                    if key in model_timing:
+                        timing_row[key] = float(model_timing[key])
+                total_profiled = sum(float(timing_row.get(f"{section}_time", 0.0)) for section in REQUIRED_TIMING_SECTIONS)
+                timing_row["total_profiled_time"] = total_profiled
+                for section in REQUIRED_TIMING_SECTIONS:
+                    key = f"{section}_time"
+                    timing_row[f"{section}_fraction"] = float(timing_row.get(key, 0.0)) / max(total_profiled, 1e-9)
+                row.update(
+                    {
+                        "data_gap_time": timing_row.get("data_gap_time", 0.0),
+                        "visual_dino_time": timing_row.get("visual_dino_time", 0.0),
+                        "backward_time": timing_row.get("backward_time", 0.0),
+                        "gpu_reserved_gib": torch.cuda.memory_reserved(device) / (1024 ** 3) if device.type == "cuda" else 0.0,
+                    }
+                )
+                log_row = {**row, **term_values, **weighted_values, **timing_row}
                 append_jsonl(out_dir / "loss_components.jsonl", log_row)
+                append_jsonl(out_dir / "timing_train_steps.jsonl", {"epoch": epoch, "step": step, **timing_row})
                 epoch_loss_rows.append(log_row)
                 print("interactflow_batch " + str(row), flush=True)
+            last_step_end = time.perf_counter()
         metrics = evaluate(model, test_loader, device, out_dir, epoch=epoch)
         influence = {"epoch": epoch, "available": False}
         if last_frames_for_audit is not None:

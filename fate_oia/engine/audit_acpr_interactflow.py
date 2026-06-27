@@ -201,6 +201,7 @@ def run_audit(config: str, output_dir: str, device: str = "cpu", write_review_pa
     try:
         dev = torch.device(device if device == "cuda" and torch.cuda.is_available() else "cpu")
         pred_cfg = cfg["model"].get("predicates", {})
+        visual_cfg = cfg["model"].get("visual_encoder", {})
         model = ACPRInteractFlowPPModel(
             pretrained_weights=cfg["paths"]["dino_weights"],
             predicate_config="configs/acpr_interactflow_predicates.yaml",
@@ -211,7 +212,12 @@ def run_audit(config: str, output_dir: str, device: str = "cpu", write_review_pa
             require_oia_transfer_source=bool(pred_cfg.get("require_oia_transfer_source", False)),
             require_transformer_text=bool(pred_cfg.get("require_transformer_text", False)),
             action_dim=int(cfg["data"]["action_dim"]),
-            dino_chunk_size=int(cfg["model"]["visual_encoder"].get("dino_chunk_size", 2)),
+            dino_chunk_size=int(visual_cfg.get("dino_chunk_size", 2)),
+            anchor_frames=tuple(int(x) for x in visual_cfg.get("anchor_frames", [0, 3, 6, 9, 12, 14])),
+            selected_layers=tuple(int(x) for x in visual_cfg.get("selected_layers", [3, 7, 11])),
+            dino_input_height=int(visual_cfg.get("dino_input_height", cfg["data"].get("image_height", 320))),
+            dino_input_width=int(visual_cfg.get("dino_input_width", cfg["data"].get("image_width", 576))),
+            patch_size=int(cfg["data"].get("patch_size", 8)),
             use_mock_dino=True,
         ).to(dev)
         frames = torch.randn(2, 15, 3, int(cfg["data"]["image_height"]), int(cfg["data"]["image_width"]), device=dev)
@@ -229,7 +235,7 @@ def run_audit(config: str, output_dir: str, device: str = "cpu", write_review_pa
             and output.predicates.predicate_token_trajectory.shape[:3] == (2, 15, 48)
         )
         functional["predicate_evidence_geometry"] = (
-            output.predicates.predicate_evidence_maps.shape == (2, 15, 48, 45, 80)
+            output.predicates.predicate_evidence_maps.shape == (2, 15, 48, output.visual.stats["grid_h"], output.visual.stats["grid_w"])
             and output.predicates.predicate_centroids.shape == (2, 15, 48, 2)
             and output.predicates.predicate_corridor_mass.shape == (2, 15, 48, 4)
         )

@@ -22,9 +22,15 @@ class InteractVisualEncoder(nn.Module):
         use_mock_dino: bool = False,
         dim: int = 384,
         dino_chunk_size: int = 2,
+        dino_input_height: int = 320,
+        dino_input_width: int = 576,
+        patch_size: int = 8,
     ) -> None:
         super().__init__()
         self.anchor_frames = tuple(anchor_frames)
+        self.dino_input_height = int(dino_input_height)
+        self.dino_input_width = int(dino_input_width)
+        self.patch_size = int(patch_size)
         self.dino = ACPRDinoFieldExtractor(
             selected_layers=selected_layers,
             pretrained_weights=pretrained_weights,
@@ -41,6 +47,7 @@ class InteractVisualEncoder(nn.Module):
             nn.AdaptiveAvgPool2d(1),
         )
         self.fast_motion_proj = nn.Linear(64, self.dim)
+        self.lowres_motion_proj = nn.Linear(3, self.dim)
         self.temporal_proj = nn.Linear(self.dim * 2, self.dim)
 
     def forward(self, frames: torch.Tensor) -> InteractVisualOutput:
@@ -52,10 +59,13 @@ class InteractVisualEncoder(nn.Module):
         fast_flat = frames.reshape(b * t, c, h, w)
         fast_motion = self.fast_motion_cnn(fast_flat).flatten(1).reshape(b, t, 64)
         fast_motion_tokens = self.fast_motion_proj(fast_motion)
+        lowres_rgb = F.adaptive_avg_pool2d(fast_flat, output_size=(16, 28))
+        lowres_motion_maps = self.lowres_motion_proj(lowres_rgb.permute(0, 2, 3, 1)).reshape(b, t, 16, 28, self.dim)
         anchors = frames[:, list(self.anchor_frames)]
         flat = anchors.reshape(b * len(self.anchor_frames), c, h, w)
-        if flat.shape[-2:] != (360, 640):
-            flat = F.interpolate(flat, size=(360, 640), mode="bilinear", align_corners=False)
+        dino_size = (self.dino_input_height, self.dino_input_width)
+        if flat.shape[-2:] != dino_size:
+            flat = F.interpolate(flat, size=dino_size, mode="bilinear", align_corners=False)
         patch_chunks = []
         cls_chunks = []
         for chunk in flat.split(self.dino_chunk_size, dim=0):
@@ -64,7 +74,15 @@ class InteractVisualEncoder(nn.Module):
             cls_chunks.append(dino["cls_tokens_by_layer"])
         patch_all = torch.cat(patch_chunks, dim=0)
         cls_all = torch.cat(cls_chunks, dim=0)
-        patches = patch_all.reshape(b, len(self.anchor_frames), len(self.dino.selected_layers), 3600, self.dim)
+        grid_h = self.dino_input_height // self.patch_size
+        grid_w = self.dino_input_width // self.patch_size
+        num_patches = grid_h * grid_w
+        if patch_all.shape[-2] != num_patches:
+            raise RuntimeError(
+                f"DINO returned {patch_all.shape[-2]} patches but config implies {num_patches} "
+                f"({self.dino_input_height}x{self.dino_input_width}/patch{self.patch_size})"
+            )
+        patches = patch_all.reshape(b, len(self.anchor_frames), len(self.dino.selected_layers), num_patches, self.dim)
         cls = cls_all.reshape(b, len(self.anchor_frames), len(self.dino.selected_layers), self.dim)
         first_last = torch.cat([patches[:, 0].mean(1), patches[:, -1].mean(1)], dim=-1)
         motion_tokens = self.temporal_proj(first_last)
@@ -73,18 +91,25 @@ class InteractVisualEncoder(nn.Module):
             "anchor_count": len(self.anchor_frames),
             "input_h": h,
             "input_w": w,
-            "dino_grid_h": 45,
-            "dino_grid_w": 80,
+            "dino_input_h": self.dino_input_height,
+            "dino_input_w": self.dino_input_width,
+            "grid_h": grid_h,
+            "grid_w": grid_w,
+            "dino_grid_h": grid_h,
+            "dino_grid_w": grid_w,
+            "num_patches": num_patches,
             "formal_target_frame_used": False,
             "dino_chunk_size": self.dino_chunk_size,
+            "anchor_indices": list(self.anchor_frames),
         }
         return InteractVisualOutput(
             anchor_tokens=anchor_tokens,
             fast_motion_tokens=fast_motion_tokens,
+            lowres_motion_maps=lowres_motion_maps,
             motion_tokens=motion_tokens,
             cls_tokens=cls.mean(2),
             patch_tokens_by_layer=patches,
-            grid_hw=(45, 80),
+            grid_hw=(grid_h, grid_w),
             anchor_indices=list(self.anchor_frames),
             stats=stats,
         )

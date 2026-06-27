@@ -64,10 +64,13 @@ model:
   visual_encoder:
     type: dino_anchor_plus_fast_motion
     anchor_frames: [0, 3, 6, 9, 12, 14]
+    dino_input_height: 320
+    dino_input_width: 576
+    patch_size: 8
     optional_full15_dino_mode: true
     default_full15_dino_mode: false
     selected_layers: [3, 7, 11]
-    dino_chunk_size: 2
+    dino_chunk_size: 6
     freeze_dino_backbone: true
     adapter_type: lora
     adapter_rank: 4
@@ -122,21 +125,32 @@ model:
 
 loss:
   action_final_soft_kl: 1.00
-  action_global_soft_kl: 0.50
-  ledger_residual_soft_kl: 0.20
-  non_degradation_hinge: 0.10
+  action_global_soft_kl: 0.40
+  ledger_residual_soft_kl: 0.15
+  non_degradation_soft_kl_hinge: 0.08
+  benefit_gate_advantage_bce: 0.04
 
-  exp29_masked_asl: 0.30
-  predicate_nnpu: 0.10
-  interaction_state_semantic: 0.05
-  response_lag_consistency: 0.03
-  contribution_alignment_js: 0.05
-  temporal_consistency: 0.02
-  gate_entropy: 0.002
-  group_sparsity: 0.002
+  predicate_pu: 0.08
+  predicate_structural_weak: 0.03
+  interaction_state_semantic: 0.04
+  response_lag_consistency: 0.010
+  response_lag_temporal_consistency: 0.020
+  temporal_consistency: 0.020
+
+  exp29_raw_asl: 0.12
+  exp29_calibrated_asl: 0.25
+  exp29_pu: 0.04
+  exp29_soft_f1: 0.08
+  exp29_positive_rate: 0.04
+  exp29_cardinality: 0.02
+  exp29_pairwise_rank: 0.04
+  exp29_ledger_alignment_js: 0.06
+
+  gate_prior_noncollapse: 0.004
+  factor_sparsity: 0.001
+  contribution_alignment_js: 0.0
 
   hard_action_ce_only: false
-  all_zero_exp29_negative_bce: false
   contribution_magnitude_residual: false
   test_threshold_leakage: false
 
@@ -227,9 +241,6 @@ traffic_influence:
 
 profile:
   candidates:
-    - {batch_size: 1, gradient_accumulation_steps: 64}
-    - {batch_size: 16, gradient_accumulation_steps: 2}
-    - {batch_size: 12, gradient_accumulation_steps: 3}
     - {batch_size: 8, gradient_accumulation_steps: 4}
     - {batch_size: 6, gradient_accumulation_steps: 5}
     - {batch_size: 4, gradient_accumulation_steps: 8}
@@ -237,8 +248,8 @@ profile:
     - {batch_size: 2, gradient_accumulation_steps: 16}
   warmup_batches: 10
   measured_batches: 100
-  preferred_peak_reserved_gib: [34.0, 42.0]
-  hard_peak_reserved_limit_gib: 44.0
+  preferred_peak_reserved_gib: [42.0, 45.0]
+  hard_peak_reserved_limit_gib: 46.0
   max_projected_epoch_plus_eval_hours: 2.5
   max_data_time_fraction: 0.25
   selection_metric: samples_per_second

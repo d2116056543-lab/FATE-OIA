@@ -25,6 +25,19 @@ def _mean_dict(rows: list[dict]) -> dict:
     return out
 
 
+def _threshold_sweep(logits: torch.Tensor, labels: torch.Tensor, mask: torch.Tensor) -> dict:
+    thresholds = [0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
+    rows = []
+    best = {"threshold": 0.50, "Exp_mF1": -1.0, "Exp_oF1": -1.0}
+    for threshold in thresholds:
+        metrics = compute_psi_exp29_metrics(logits, labels, mask, threshold=threshold)
+        row = {"threshold": threshold, "Exp_mF1": metrics["Exp_mF1"], "Exp_oF1": metrics["Exp_oF1"]}
+        rows.append(row)
+        if row["Exp_mF1"] > best["Exp_mF1"]:
+            best = row
+    return {"diagnostic_only": True, "thresholds": rows, "best_global": best}
+
+
 @torch.no_grad()
 def evaluate(model: ACPRInteractFlowPPModel, loader: DataLoader, device: torch.device, output_dir: str | Path | None = None, epoch: int = 0) -> dict:
     model.eval()
@@ -112,6 +125,7 @@ def evaluate(model: ACPRInteractFlowPPModel, loader: DataLoader, device: torch.d
     action = compute_psi_action_metrics(al, ay, asoft)
     exp_raw = compute_psi_exp29_metrics(el, ey, em)
     exp_calibrated = compute_psi_exp29_metrics(ecal, ey, em)
+    exp_diag = _threshold_sweep(ecal, ey, em)
     exp = exp_calibrated
     joint = 0.60 * action["Act_mAcc"] + 0.25 * action["Act_stopF1"] + 0.15 * exp["Exp_mF1"]
     innovation = _mean_dict(innovation_rows)
@@ -131,6 +145,7 @@ def evaluate(model: ACPRInteractFlowPPModel, loader: DataLoader, device: torch.d
         "exp29": exp,
         "exp29_raw_fixed": exp_raw,
         "exp29_calibrated_fixed": exp_calibrated,
+        "exp29_diagnostic_threshold_sweep": exp_diag,
         "exp29_primary": "calibrated_fixed",
         "innovation": innovation,
     }
@@ -158,6 +173,7 @@ def evaluate(model: ACPRInteractFlowPPModel, loader: DataLoader, device: torch.d
         )
         append_jsonl(Path(output_dir) / "innovation_intermediate_metrics.jsonl", {"epoch": epoch, **innovation})
         write_json(Path(output_dir) / "innovation_intermediate_latest.json", {"epoch": epoch, **innovation})
+        write_json(Path(output_dir) / "exp29_diagnostic_threshold_sweep.json", exp_diag)
         write_json(Path(output_dir) / "metrics_latest.json", metrics)
     return metrics
 
@@ -187,6 +203,7 @@ def main() -> None:
     args = parser.parse_args()
     cfg = load_interactflow_config(args.config)
     pred_cfg = cfg["model"].get("predicates", {})
+    visual_cfg = cfg["model"].get("visual_encoder", {})
     device = torch.device(args.device if torch.cuda.is_available() and args.device == "cuda" else "cpu")
     model = ACPRInteractFlowPPModel(
         pretrained_weights=cfg["paths"]["dino_weights"],
@@ -198,7 +215,12 @@ def main() -> None:
         require_oia_transfer_source=bool(pred_cfg.get("require_oia_transfer_source", False)),
         require_transformer_text=bool(pred_cfg.get("require_transformer_text", False)),
         action_dim=int(cfg["data"]["action_dim"]),
-        dino_chunk_size=int(cfg["model"]["visual_encoder"].get("dino_chunk_size", 2)),
+        dino_chunk_size=int(visual_cfg.get("dino_chunk_size", 2)),
+        anchor_frames=tuple(int(x) for x in visual_cfg.get("anchor_frames", [0, 3, 6, 9, 12, 14])),
+        selected_layers=tuple(int(x) for x in visual_cfg.get("selected_layers", [3, 7, 11])),
+        dino_input_height=int(visual_cfg.get("dino_input_height", cfg["data"].get("image_height", 320))),
+        dino_input_width=int(visual_cfg.get("dino_input_width", cfg["data"].get("image_width", 576))),
+        patch_size=int(cfg["data"].get("patch_size", 8)),
     ).to(device)
     if args.checkpoint:
         ckpt = torch.load(args.checkpoint, map_location="cpu")

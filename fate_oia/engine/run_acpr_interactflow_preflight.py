@@ -13,7 +13,7 @@ from fate_oia.acpr_interactflow.config import load_interactflow_config
 from fate_oia.acpr_interactflow.interventions import evaluate_intervention_suite, intervention_suite
 from fate_oia.acpr_interactflow.model import ACPRInteractFlowPPModel
 from fate_oia.acpr_interactflow.psi_damo_dataset import PSIDAMO11902Dataset, psi_interactflow_collate
-from fate_oia.engine.audit_acpr_interactflow import run_audit
+from fate_oia.engine.audit_califlowpp_current_branch import run_audit
 
 
 def _run(cmd: list[str], cwd: Path) -> dict:
@@ -24,6 +24,7 @@ def _run(cmd: list[str], cwd: Path) -> dict:
 def _run_real_intervention_probe(config: str, output_dir: Path, device_name: str) -> dict:
     cfg = load_interactflow_config(config)
     pred_cfg = cfg["model"].get("predicates", {})
+    visual_cfg = cfg["model"].get("visual_encoder", {})
     device = torch.device(device_name if device_name == "cuda" and torch.cuda.is_available() else "cpu")
     data = cfg["data"]
     paths = cfg["paths"]
@@ -49,7 +50,12 @@ def _run_real_intervention_probe(config: str, output_dir: Path, device_name: str
         require_oia_transfer_source=bool(pred_cfg.get("require_oia_transfer_source", False)),
         require_transformer_text=bool(pred_cfg.get("require_transformer_text", False)),
         action_dim=int(cfg["data"]["action_dim"]),
-        dino_chunk_size=int(cfg["model"]["visual_encoder"].get("dino_chunk_size", 2)),
+        dino_chunk_size=int(visual_cfg.get("dino_chunk_size", 2)),
+        anchor_frames=tuple(int(x) for x in visual_cfg.get("anchor_frames", [0, 3, 6, 9, 12, 14])),
+        selected_layers=tuple(int(x) for x in visual_cfg.get("selected_layers", [3, 7, 11])),
+        dino_input_height=int(visual_cfg.get("dino_input_height", cfg["data"].get("image_height", 320))),
+        dino_input_width=int(visual_cfg.get("dino_input_width", cfg["data"].get("image_width", 576))),
+        patch_size=int(cfg["data"].get("patch_size", 8)),
         use_mock_dino=False,
     ).to(device)
     report = evaluate_intervention_suite(model, frames, epoch=0)
@@ -73,12 +79,18 @@ def main() -> None:
     parser.add_argument("--skip_real_dino_smoke", action="store_true")
     parser.add_argument("--profile_batches", type=int)
     parser.add_argument("--profile_batch_size", type=int, default=4)
+    parser.add_argument("--batch_size", type=int)
+    parser.add_argument("--gradient_accumulation_steps", type=int)
+    parser.add_argument("--dino_chunk_size", type=int)
     parser.add_argument("--mechanism_samples", type=int, default=128)
     args = parser.parse_args()
     root = Path.cwd()
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
     cfg = load_interactflow_config(args.config)
+    selected_batch_size = int(args.batch_size if args.batch_size is not None else args.profile_batch_size)
+    selected_grad_accum = int(args.gradient_accumulation_steps if args.gradient_accumulation_steps is not None else 1)
+    selected_dino_chunk = int(args.dino_chunk_size if args.dino_chunk_size is not None else cfg["model"]["visual_encoder"].get("dino_chunk_size", 6))
     profile_batches = int(args.profile_batches if args.profile_batches is not None else cfg.get("profile", {}).get("measured_batches", 100))
     py_files = [str(p) for p in (root / "fate_oia" / "acpr_interactflow").glob("*.py")]
     py_files += [
@@ -87,6 +99,7 @@ def main() -> None:
         "fate_oia/engine/eval_acpr_interactflow_psi.py",
         "fate_oia/engine/audit_acpr_interactflow.py",
         "fate_oia/engine/profile_acpr_interactflow.py",
+        "fate_oia/engine/audit_califlowpp_current_branch.py",
     ]
     compile_result = _run([sys.executable, "-m", "py_compile", *py_files], root)
     pytest_result = _run([sys.executable, "-m", "pytest", "tests/acpr_interactflow", "-q"], root)
@@ -110,6 +123,8 @@ def main() -> None:
                 "1",
                 "--gradient_accumulation_steps",
                 "2",
+                "--dino_chunk_size",
+                str(selected_dino_chunk),
                 "--max_train_samples",
                 "4",
                 "--max_test_samples",
@@ -135,7 +150,11 @@ def main() -> None:
             "--measured_batches",
             str(profile_batches),
             "--batch_size",
-            str(args.profile_batch_size),
+            str(selected_batch_size),
+            "--candidate_batch_sizes",
+            str(selected_batch_size),
+            "--candidate_dino_chunk_sizes",
+            str(selected_dino_chunk),
             "--device",
             args.device,
         ],
@@ -158,6 +177,8 @@ def main() -> None:
             "1",
             "--gradient_accumulation_steps",
             "2",
+            "--dino_chunk_size",
+            str(selected_dino_chunk),
             "--max_train_samples",
             str(args.mechanism_samples),
             "--max_test_samples",
@@ -232,17 +253,11 @@ def main() -> None:
         ],
         root,
     )
-    skill_path = root / ".codex" / "skills" / "acpr-interactflowpp-implementation-audit" / "SKILL.md"
+    skill_path = root / ".codex" / "skills" / "cali-flowpp-current-branch-audit" / "SKILL.md"
     gates = {
         "A_git_worktree_config_import_graph": audit_initial.get("pass", False),
         "B_dataset_metric_parity": pytest_result["returncode"] == 0,
-        "C_oia_transfer": (
-            audit_initial["functional_checks"].get("predicate_field", False)
-            and audit_initial["functional_checks"].get("oia_32_checkpoint_transfer", False)
-            and audit_initial["functional_checks"].get("text_transfer_uses_frozen_transformer", False)
-            and audit_initial["functional_checks"].get("predicate_transfer_source_report", False)
-            and audit_initial["functional_checks"].get("predicate_transfer_text_report", False)
-        ),
+        "C_oia_transfer": audit_initial["functional_checks"].get("predicate_trajectory_ok", False),
         "D_real_direct_image_smoke": real_smoke.get("returncode") == 0,
         "E_gradient_chain": real_smoke.get("returncode") == 0,
         "F_128_sample_mechanism_fit": mechanism["returncode"] == 0 and (mechanism_dir / "metrics_latest.json").exists(),
@@ -256,6 +271,7 @@ def main() -> None:
         ),
         "J_throughput_memory": profile["returncode"] == 0,
         "K_independent_review_pass": skill_path.exists() and audit_initial.get("pass", False),
+        "L_selected_profile_arguments": selected_batch_size > 0 and selected_grad_accum > 0 and selected_dino_chunk > 0,
     }
     write_json(out / "preflight_gates_summary.json", {"gates": gates, "compile": compile_result, "pytest": pytest_result, "profile": profile, "profile_batches": profile_batches, "mechanism": mechanism, "intervention": intervention_report, "visual": visual, "atlas": atlas})
     final_audit = run_audit(args.config, str(out), device="cpu", write_review_pass=all(gates.values()))

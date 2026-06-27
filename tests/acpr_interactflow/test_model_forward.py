@@ -19,7 +19,8 @@ def test_model_forward_shapes_and_ledger_identity():
     assert out.exp29_logits.shape == (2, 29)
     assert out.predicates.predicate_logits.shape == (2, 48)
     assert out.predicates.predicate_logits_trajectory.shape == (2, 15, 48)
-    assert out.predicates.predicate_evidence_maps.shape == (2, 15, 48, 45, 80)
+    gh, gw = out.visual.grid_hw
+    assert out.predicates.predicate_evidence_maps.shape == (2, 15, 48, gh, gw)
     assert out.predicates.predicate_centroids.shape == (2, 15, 48, 2)
     assert out.predicates.predicate_corridor_mass.shape == (2, 15, 48, 4)
     assert out.predicates.transfer_gate.shape == (48,)

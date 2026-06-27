@@ -72,8 +72,17 @@ class DynamicPredicateField(nn.Module):
     def names(self) -> list[str]:
         return self.ontology.names
 
-    def forward(self, patch_tokens_by_layer: torch.Tensor) -> InteractPredicateField:
+    def forward(
+        self,
+        patch_tokens_by_layer: torch.Tensor,
+        lowres_motion_maps: torch.Tensor | None = None,
+        fast_motion_tokens: torch.Tensor | None = None,
+        grid_hw: tuple[int, int] | None = None,
+    ) -> InteractPredicateField:
         b, a, s, n, d = patch_tokens_by_layer.shape
+        if grid_hw is None:
+            side = int(n ** 0.5)
+            grid_hw = (side, n // max(1, side))
         flat = patch_tokens_by_layer.reshape(b * a, s, n, d)
         oia = self.oia_head(flat)
         oia_tokens = oia["predicate_tokens"].reshape(b, a, 32, d)
@@ -102,24 +111,58 @@ class DynamicPredicateField(nn.Module):
         transfer = self.transfer(tokens)
         transfer_gate = transfer["transfer_gate"].to(tokens.device, tokens.dtype).view(1, -1, 1)
         tokens = tokens + 0.1 * transfer_gate * transfer["transferred_predicate_tokens"]
-        traj_index = self._trajectory_indices(a, 15, patch_tokens_by_layer.device)
         logits_anchor = torch.cat([oia_logits, psi_logits_anchor], dim=2)
         probs_anchor = torch.sigmoid(logits_anchor)
         tokens_anchor = torch.cat([oia_tokens, psi_tokens_anchor], dim=2)
-        evidence_maps_anchor = attention_anchor.reshape(b, a, 48, 45, 80)
-        centroids_anchor, corridor_mass_anchor = self._attention_geometry(attention_anchor)
-        predicate_logits_trajectory = logits_anchor[:, traj_index]
-        predicate_probs_trajectory = probs_anchor[:, traj_index]
-        predicate_token_trajectory = tokens_anchor[:, traj_index]
-        predicate_evidence_maps = evidence_maps_anchor[:, traj_index]
-        predicate_centroids = centroids_anchor[:, traj_index]
-        predicate_corridor_mass = corridor_mass_anchor[:, traj_index]
+        gh, gw = grid_hw
+        evidence_maps_anchor = attention_anchor.reshape(b, a, 48, gh, gw)
+        centroids_anchor, corridor_mass_anchor = self._attention_geometry(attention_anchor, grid_hw=grid_hw)
+
+        # Interpolate anchor evidence to all 15 observed frames. This preserves
+        # a temporal trajectory instead of copying nearest anchors.
+        predicate_logits_trajectory = torch.nn.functional.interpolate(
+            logits_anchor.permute(0, 2, 1), size=15, mode="linear", align_corners=True
+        ).permute(0, 2, 1)
+        predicate_probs_trajectory = torch.sigmoid(predicate_logits_trajectory)
+        token_interp = torch.nn.functional.interpolate(
+            tokens_anchor.permute(0, 2, 3, 1).reshape(b * 48 * d, 1, a),
+            size=15,
+            mode="linear",
+            align_corners=True,
+        ).reshape(b, 48, d, 15).permute(0, 3, 1, 2)
+        if fast_motion_tokens is not None:
+            motion_gate = torch.tanh(fast_motion_tokens[:, :15].unsqueeze(2))
+            token_interp = token_interp + 0.05 * motion_gate
+        predicate_token_trajectory = token_interp
+        map_interp = torch.nn.functional.interpolate(
+            evidence_maps_anchor.permute(0, 2, 3, 4, 1).reshape(b * 48 * gh * gw, 1, a),
+            size=15,
+            mode="linear",
+            align_corners=True,
+        ).reshape(b, 48, gh, gw, 15).permute(0, 4, 1, 2, 3)
+        predicate_evidence_maps = map_interp
+        centroid_interp = torch.nn.functional.interpolate(
+            centroids_anchor.permute(0, 2, 3, 1).reshape(b * 48 * 2, 1, a),
+            size=15,
+            mode="linear",
+            align_corners=True,
+        ).reshape(b, 48, 2, 15).permute(0, 3, 1, 2)
+        predicate_centroids = centroid_interp
+        corridor_interp = torch.nn.functional.interpolate(
+            corridor_mass_anchor.permute(0, 2, 3, 1).reshape(b * 48 * 4, 1, a),
+            size=15,
+            mode="linear",
+            align_corners=True,
+        ).reshape(b, 48, 4, 15).permute(0, 3, 1, 2)
+        predicate_corridor_mass = corridor_interp
+        predicate_relative_motion = predicate_centroids[:, 1:] - predicate_centroids[:, :-1]
         predicate_confidence = (predicate_probs_trajectory - 0.5).abs() * 2.0
         temporal_stats = {
             "predicate_count": 48,
             "temporal_anchor_count": a,
             "predicate_trajectory_length": int(predicate_logits_trajectory.shape[1]),
             "predicate_positive_rate": float((probs > 0.5).float().mean().detach().cpu()),
+            "predicate_trajectory_positive_rate": float((predicate_probs_trajectory > 0.5).float().mean().detach().cpu()),
             "attention_entropy": float((-(attention.clamp_min(1e-9).log() * attention).sum(-1)).mean().detach().cpu()),
             "transfer_gate_mean": float(transfer["transfer_gate"].detach().mean().cpu()),
             "text_embedding_source": transfer.get("text_embedding_source", "unknown"),
@@ -136,6 +179,7 @@ class DynamicPredicateField(nn.Module):
             predicate_evidence_maps=predicate_evidence_maps,
             predicate_confidence=predicate_confidence,
             predicate_centroids=predicate_centroids,
+            predicate_relative_motion=predicate_relative_motion,
             predicate_corridor_mass=predicate_corridor_mass,
             transfer_gate=transfer["transfer_gate"],
             predicate_names=self.ontology.names,
