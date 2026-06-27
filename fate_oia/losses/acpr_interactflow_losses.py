@@ -82,6 +82,66 @@ def intervention_margin_loss(selected_drop: torch.Tensor | None = None, random_d
     return F.relu(margin - (selected_drop - random_drop)).mean()
 
 
+def interaction_state_semantic_loss(state_logits: torch.Tensor, action_majority: torch.Tensor) -> torch.Tensor:
+    """Weakly align interaction-state groups with the PSI action target.
+
+    The PSI package does not provide dense interaction-state labels. The plan
+    still requires the state branch to receive a semantic training signal, so we
+    use a conservative action-derived weak target instead of leaving the loss at
+    zero. Group order follows configs/acpr_interactflow_state_grammar.yaml.
+    """
+    if state_logits.numel() == 0:
+        return state_logits.new_zeros(())
+    b, g = state_logits.shape
+    target = state_logits.new_zeros(b, g)
+    action = action_majority.long().clamp_min(0)
+
+    # maintain_speed: drivable/ego/global context should be active.
+    maintain = action == 0
+    if g > 4:
+        target[maintain, 4] = 1.0
+    if g > 5:
+        target[maintain, 5] = 1.0
+    if g > 7:
+        target[maintain, 7] = 0.5
+
+    # reduce_speed: caution from front object, actor crossing, lane or geometry.
+    reduce = action == 1
+    for idx in (1, 2, 3, 6):
+        if g > idx:
+            target[reduce, idx] = 1.0
+
+    # stop_car: traffic/front-object/actor-crossing/ego-stop groups.
+    stop = action == 2
+    for idx in (0, 1, 2, 5):
+        if g > idx:
+            target[stop, idx] = 1.0
+
+    # Unknown/extra classes, if any, get a weak global-context target only.
+    unknown = action > 2
+    if g > 7:
+        target[unknown, 7] = 0.5
+    return F.binary_cross_entropy_with_logits(state_logits, target)
+
+
+def temporal_consistency_loss(predicate_probs_trajectory: torch.Tensor, motion_tokens: torch.Tensor | None = None) -> torch.Tensor:
+    """Smooth predicate trajectories without forcing them constant.
+
+    Adjacent predicate probabilities should not jitter frame-to-frame, but the
+    penalty is Huber-style so real motion changes can still pass through. Motion
+    tokens reduce the penalty for highly dynamic clips.
+    """
+    if predicate_probs_trajectory.ndim != 3 or predicate_probs_trajectory.shape[1] < 2:
+        return predicate_probs_trajectory.new_zeros(())
+    diff = predicate_probs_trajectory[:, 1:] - predicate_probs_trajectory[:, :-1]
+    penalty = F.smooth_l1_loss(diff, torch.zeros_like(diff), reduction="none").mean(-1)
+    if motion_tokens is not None and motion_tokens.ndim == 3 and motion_tokens.shape[1] >= 2:
+        motion_delta = (motion_tokens[:, 1:] - motion_tokens[:, :-1]).norm(dim=-1)
+        motion_gate = torch.exp(-motion_delta.detach()).clamp(0.2, 1.0)
+        penalty = penalty * motion_gate
+    return penalty.mean()
+
+
 DEFAULT_INTERACTFLOW_LOSS_WEIGHTS = {
     "action_final_soft_kl": 1.00,
     "action_global_soft_kl": 0.50,
@@ -107,14 +167,17 @@ def compute_interactflow_losses(output, batch, weights: dict[str, float] | None 
     terms["ledger_residual_soft_kl"] = action_soft_kl_loss(output.action_logits - residual_logits.detach(), batch.action_soft, batch.paper_effective_weight)
     terms["exp29_masked_asl"] = exp29_masked_bce_loss(output.exp29_logits, batch.exp29, batch.exp29_mask)
     terms["predicate_nnpu"] = exp29_positive_unlabeled_loss(output.exp29_logits, batch.exp29, batch.exp29_mask)
-    terms["interaction_state_semantic"] = output.action_logits.new_zeros(())
+    terms["interaction_state_semantic"] = interaction_state_semantic_loss(output.flow.state_logits, batch.action_majority)
     terms["group_sparsity"] = flow_sparsity_loss(output.flow.flow_edges)
     terms["ledger_identity"] = ledger_identity_loss(output.ledger.identity_error)
     base_logits = output.ledger.visual_logits + 0.35 * output.ledger.motion_logits + 0.25 * output.ledger.predicate_logits
     terms["non_degradation_hinge"] = non_degradation_hinge_loss(output.action_logits, base_logits, batch.action_majority)
     terms["contribution_alignment_js"] = contribution_alignment_js_loss(output.ledger.contribution_terms)
     terms["response_lag_consistency"] = lag_entropy_loss(output.flow.lag_weights)
-    terms["temporal_consistency"] = output.action_logits.new_zeros(())
+    terms["temporal_consistency"] = temporal_consistency_loss(
+        output.predicates.predicate_probs_trajectory,
+        output.visual.fast_motion_tokens,
+    )
     terms["gate_entropy"] = lag_entropy_loss(output.ledger.gate)
     total = sum(float(w.get(k, 0.0)) * v for k, v in terms.items())
     terms["total_loss"] = total

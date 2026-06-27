@@ -5,14 +5,59 @@ import subprocess
 import sys
 from pathlib import Path
 
+import torch
+from torch.utils.data import DataLoader
+
 from fate_oia.acpr_interactflow.artifacts import write_json
-from fate_oia.acpr_interactflow.interventions import intervention_suite
+from fate_oia.acpr_interactflow.config import load_interactflow_config
+from fate_oia.acpr_interactflow.interventions import evaluate_intervention_suite, intervention_suite
+from fate_oia.acpr_interactflow.model import ACPRInteractFlowPPModel
+from fate_oia.acpr_interactflow.psi_damo_dataset import PSIDAMO11902Dataset, psi_interactflow_collate
 from fate_oia.engine.audit_acpr_interactflow import run_audit
 
 
 def _run(cmd: list[str], cwd: Path) -> dict:
     proc = subprocess.run(cmd, cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     return {"cmd": cmd, "returncode": proc.returncode, "output_tail": proc.stdout[-4000:]}
+
+
+def _run_real_intervention_probe(config: str, output_dir: Path, device_name: str) -> dict:
+    cfg = load_interactflow_config(config)
+    device = torch.device(device_name if device_name == "cuda" and torch.cuda.is_available() else "cpu")
+    data = cfg["data"]
+    paths = cfg["paths"]
+    ds = PSIDAMO11902Dataset(
+        paths["psi_package_root"],
+        "test",
+        frames_root=paths.get("psi2_root_reference_only"),
+        image_size=(int(data["image_height"]), int(data["image_width"])),
+        action_dim=int(data["action_dim"]),
+        strict_counts=False,
+        max_samples=2,
+    )
+    loader = DataLoader(ds, batch_size=1, shuffle=False, num_workers=0, collate_fn=psi_interactflow_collate)
+    batch = next(iter(loader))
+    frames = batch.input_frames.to(device)
+    model = ACPRInteractFlowPPModel(
+        pretrained_weights=cfg["paths"]["dino_weights"],
+        predicate_config="configs/acpr_interactflow_predicates.yaml",
+        grammar_path=cfg["model"]["interaction_flow"]["grammar_yaml"],
+        exp29_names_path=cfg["paths"].get("psi_label_embedding_json"),
+        action_dim=int(cfg["data"]["action_dim"]),
+        dino_chunk_size=int(cfg["model"]["visual_encoder"].get("dino_chunk_size", 2)),
+        use_mock_dino=False,
+    ).to(device)
+    report = evaluate_intervention_suite(model, frames, epoch=0)
+    temporal_names = {"temporal_reverse", "temporal_shuffle", "lag_disabled", "last_frame_only", "prefix_5", "prefix_10"}
+    temporal_results = {k: v for k, v in report["results"].items() if k in temporal_names}
+    report["temporal_lag_pass"] = any(v["action_prob_l1_delta"] > 1e-7 for v in temporal_results.values())
+    report["temporal_results"] = temporal_results
+    write_json(output_dir / "intervention_audit.json", report)
+    write_json(output_dir / "gate_temporal_lag.json", {
+        "pass": bool(report["temporal_lag_pass"]),
+        "temporal_results": temporal_results,
+    })
+    return report
 
 
 def main() -> None:
@@ -142,6 +187,14 @@ def main() -> None:
         "missing": sorted(expected_interventions.difference(actual_interventions)),
         "pass": expected_interventions.issubset(actual_interventions),
     }
+    real_intervention_report = _run_real_intervention_probe(args.config, out, args.device)
+    intervention_report["real_probe_pass"] = bool(real_intervention_report.get("pass", False))
+    intervention_report["temporal_lag_pass"] = bool(real_intervention_report.get("temporal_lag_pass", False))
+    intervention_report["pass"] = (
+        expected_interventions.issubset(actual_interventions)
+        and intervention_report["real_probe_pass"]
+        and intervention_report["temporal_lag_pass"]
+    )
     write_json(out / "intervention_gate.json", intervention_report)
     visual_dir = out / "visual_gate"
     visual = _run(
@@ -164,7 +217,7 @@ def main() -> None:
         "D_real_direct_image_smoke": real_smoke.get("returncode") == 0,
         "E_gradient_chain": real_smoke.get("returncode") == 0,
         "F_128_sample_mechanism_fit": mechanism["returncode"] == 0 and (mechanism_dir / "metrics_latest.json").exists(),
-        "G_temporal_lag_necessity": True,
+        "G_temporal_lag_necessity": intervention_report["temporal_lag_pass"],
         "H_intervention": intervention_report["pass"],
         "I_visualization": visual["returncode"] == 0 and (visual_dir / "visual_export_manifest.json").exists(),
         "J_throughput_memory": profile["returncode"] == 0,

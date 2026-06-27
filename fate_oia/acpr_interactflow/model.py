@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import torch
 from torch import nn
 
@@ -43,15 +45,73 @@ class ACPRInteractFlowPPModel(nn.Module):
         self.exp29 = Exp29Head(dim=dim, exp_dim=29, label_names_path=exp29_names_path)
         self.calalign = NNPUCalAlignHead(action_dim=action_dim, exp_dim=29)
 
-    def forward(self, input_frames: torch.Tensor, epoch: int = 0) -> ACPRInteractFlowPPOutput:
+    def _factor_mask(self, name: str, device: torch.device) -> torch.Tensor:
+        mask = torch.ones(self.flow.num_factors, device=device)
+        factors = self.flow.grammar.flow_factors
+        if name == "factor_off":
+            mask.zero_()
+        elif name == "regime_off":
+            for i, item in enumerate(factors):
+                text = str(item.get("name", ""))
+                if any(key in text for key in ("clear", "caution", "yield", "stop")):
+                    mask[i] = 0.0
+        elif name == "phase_off":
+            for i, item in enumerate(factors):
+                text = str(item.get("name", ""))
+                if any(key in text for key in ("waiting", "approaching", "entering", "crossing", "decelerating")):
+                    mask[i] = 0.0
+        elif name == "source_off":
+            for i, item in enumerate(factors):
+                source = str(item.get("source", ""))
+                if source and source != "global_context":
+                    mask[i] = 0.0
+        return mask
+
+    def forward(
+        self,
+        input_frames: torch.Tensor,
+        epoch: int = 0,
+        intervention: str | None = None,
+    ) -> ACPRInteractFlowPPOutput:
         visual = self.visual(input_frames)
         motion = self.motion(visual.fast_motion_tokens)
         predicates = self.predicates(visual.patch_tokens_by_layer)
+        if intervention in {"predicate_off", "evidence_tube_off"}:
+            predicates = replace(
+                predicates,
+                predicate_logits=torch.zeros_like(predicates.predicate_logits),
+                predicate_probs=torch.zeros_like(predicates.predicate_probs),
+                predicate_logits_trajectory=torch.zeros_like(predicates.predicate_logits_trajectory),
+                predicate_probs_trajectory=torch.zeros_like(predicates.predicate_probs_trajectory),
+                predicate_tokens=torch.zeros_like(predicates.predicate_tokens),
+                predicate_token_trajectory=torch.zeros_like(predicates.predicate_token_trajectory),
+                predicate_attention=torch.zeros_like(predicates.predicate_attention),
+                predicate_evidence_maps=torch.zeros_like(predicates.predicate_evidence_maps),
+                predicate_confidence=torch.zeros_like(predicates.predicate_confidence),
+            )
         state_bank = self.state_bank(predicates.predicate_tokens, predicates.predicate_probs)
-        flow = self.flow(predicates.predicate_tokens, predicates.predicate_probs, motion["motion_token"])
+        factor_mask = None
+        if intervention in {"regime_off", "phase_off", "source_off", "factor_off"}:
+            factor_mask = self._factor_mask(intervention, input_frames.device)
+        flow = self.flow(
+            predicates.predicate_tokens,
+            predicates.predicate_probs,
+            motion["motion_token"],
+            lag_disabled=(intervention == "lag_disabled"),
+            factor_mask=factor_mask,
+        )
         visual_token = visual.anchor_tokens[:, -1]
         predicate_token = predicates.predicate_tokens.mean(1) + state_bank["state_tokens"].mean(1)
         ledger = self.ledger(visual_token, motion["motion_token"], predicate_token, flow.factor_tokens, flow.flow_edges)
+        if intervention == "global_only":
+            final_logits = ledger.global_logits + ledger.calibration_delta
+            ledger = replace(
+                ledger,
+                gated_state_contributions=torch.zeros_like(ledger.gated_state_contributions),
+                flow_delta_logits=torch.zeros_like(ledger.flow_delta_logits),
+                final_logits=final_logits,
+                identity_error=(final_logits - (ledger.global_logits + ledger.calibration_delta)).abs().max(),
+            )
         exp29 = self.exp29(flow.factor_tokens, predicates.predicate_tokens)
         cal = self.calalign(ledger.final_logits, exp29.logits)
         aux = {

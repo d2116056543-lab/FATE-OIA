@@ -21,7 +21,14 @@ class InteractionFlowReasoner(nn.Module):
         self.state_head = nn.Linear(dim, len(self.grammar.state_groups))
         self.lag = ResponseLagEstimator(dim=dim, max_lag=max(self.grammar.response_lags))
 
-    def forward(self, predicate_tokens: torch.Tensor, predicate_probs: torch.Tensor, motion_token: torch.Tensor) -> InteractionFlowState:
+    def forward(
+        self,
+        predicate_tokens: torch.Tensor,
+        predicate_probs: torch.Tensor,
+        motion_token: torch.Tensor,
+        lag_disabled: bool = False,
+        factor_mask: torch.Tensor | None = None,
+    ) -> InteractionFlowState:
         d = predicate_tokens.shape[-1]
         q = self.factor_queries.view(1, self.num_factors, d)
         k = self.predicate_key(predicate_tokens)
@@ -29,7 +36,12 @@ class InteractionFlowReasoner(nn.Module):
         score = score + predicate_probs.clamp_min(1e-4).log().unsqueeze(1)
         attn = entmax15_bisect(score, dim=-1)
         factor_tokens = torch.einsum("bfp,bpd->bfd", attn, self.factor_value(predicate_tokens))
-        lag_weights = self.lag(motion_token)
+        lag_weights, lag_context = self.lag(motion_token, disabled=lag_disabled)
+        factor_tokens = factor_tokens + 0.1 * lag_context.unsqueeze(1)
+        if factor_mask is not None:
+            mask = factor_mask.to(device=factor_tokens.device, dtype=factor_tokens.dtype).view(1, -1, 1)
+            factor_tokens = factor_tokens * mask
+            attn = attn * mask
         flow_edges = self.edge_head(factor_tokens)
         state_token = factor_tokens.mean(1)
         state_logits = self.state_head(state_token)
@@ -37,6 +49,8 @@ class InteractionFlowReasoner(nn.Module):
             "flow_factor_count": self.num_factors,
             "factor_attention_entropy": float((-(attn.clamp_min(1e-9).log() * attn).sum(-1)).mean().detach().cpu()),
             "lag_argmax_mean": float(lag_weights.argmax(-1).float().mean().detach().cpu()),
+            "lag_disabled": bool(lag_disabled),
+            "lag_context_norm": float(lag_context.norm(dim=-1).mean().detach().cpu()),
         }
         return InteractionFlowState(
             state_tokens=state_token,

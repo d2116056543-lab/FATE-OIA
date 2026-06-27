@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import tempfile
 import time
 from pathlib import Path
 
@@ -83,6 +84,32 @@ def _build_optimizer(model: ACPRInteractFlowPPModel, cfg: dict) -> torch.optim.O
     return torch.optim.AdamW(groups)
 
 
+def _atomic_torch_save(payload: dict, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".tmp", delete=False) as handle:
+        tmp_path = Path(handle.name)
+    try:
+        torch.save(payload, tmp_path)
+        tmp_path.replace(path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
+def _build_warmup_cosine_scheduler(opt: torch.optim.Optimizer, cfg: dict, total_updates: int):
+    opt_cfg = cfg["optimization"]
+    warmup_updates = max(1, int(float(opt_cfg.get("warmup_ratio", 0.05)) * total_updates))
+    min_lr_ratio = float(opt_cfg.get("min_lr_ratio", 0.10))
+
+    def lr_lambda(step: int) -> float:
+        if step < warmup_updates:
+            return max((step + 1) / warmup_updates, min_lr_ratio)
+        progress = (step - warmup_updates) / max(total_updates - warmup_updates, 1)
+        return min_lr_ratio + 0.5 * (1.0 - min_lr_ratio) * (1.0 + math.cos(math.pi * progress))
+
+    return torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lr_lambda), warmup_updates
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
@@ -131,8 +158,11 @@ def main() -> None:
     model = _build_model(cfg).to(device)
     params = [p for p in model.parameters() if p.requires_grad]
     opt = _build_optimizer(model, cfg)
-    steps_total = max(1, math.ceil(len(train_loader) / max(1, args.gradient_accumulation_steps)) * epochs)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=steps_total, eta_min=1e-5)
+    updates_per_epoch = max(1, math.ceil(len(train_loader) / max(1, args.gradient_accumulation_steps)))
+    steps_total = updates_per_epoch * epochs
+    sched, warmup_updates = _build_warmup_cosine_scheduler(opt, cfg, steps_total)
+    precision = str(cfg["optimization"].get("precision", "fp32")).lower()
+    use_bf16 = precision == "bf16" and device.type == "cuda" and torch.cuda.is_bf16_supported()
     manifest = {
         "config": args.config,
         "command_line": vars(args),
@@ -143,9 +173,17 @@ def main() -> None:
         "eval_splits": ["test"],
         "train_count": len(train_ds),
         "test_count": len(test_ds),
+        "precision": precision,
+        "bf16_autocast_enabled": bool(use_bf16),
+        "scheduler": cfg["optimization"].get("scheduler", "cosine"),
+        "warmup_ratio": cfg["optimization"].get("warmup_ratio", 0.05),
+        "warmup_updates": warmup_updates,
+        "optimizer_groups": [{"name": g.get("name"), "lr": g.get("lr"), "weight_decay": g.get("weight_decay")} for g in opt.param_groups],
     }
     write_json(out_dir / "run_manifest.json", manifest)
     best_joint = -1.0
+    best_action = -1.0
+    best_exp = -1.0
     global_step = 0
     for epoch in range(epochs):
         model.train()
@@ -170,8 +208,9 @@ def main() -> None:
                 sample_id=batch.sample_id,
                 meta=batch.meta,
             )
-            output = model(frames, epoch=epoch)
-            loss, terms = compute_interactflow_losses(output, batch, weights=cfg.get("loss", {}))
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16):
+                output = model(frames, epoch=epoch)
+                loss, terms = compute_interactflow_losses(output, batch, weights=cfg.get("loss", {}))
             (loss / args.gradient_accumulation_steps).backward()
             if step % args.gradient_accumulation_steps == 0:
                 torch.nn.utils.clip_grad_norm_(params, float(cfg["optimization"]["gradient_clip_norm"]))
@@ -189,7 +228,14 @@ def main() -> None:
                     "identity_error": float(output.ledger.identity_error.detach().cpu()),
                     "predicate_positive_rate": output.predicates.temporal_stats.get("predicate_positive_rate"),
                 }
-                append_jsonl(out_dir / "loss_components.jsonl", {**row, **{k: float(v.detach().cpu()) for k, v in terms.items()}})
+                loss_weights = cfg.get("loss", {})
+                term_values = {k: float(v.detach().cpu()) for k, v in terms.items()}
+                weighted_values = {
+                    f"{k}_weighted": float(loss_weights.get(k, 1.0 if k == "total_loss" else 0.0)) * val
+                    for k, val in term_values.items()
+                    if k != "total_loss"
+                }
+                append_jsonl(out_dir / "loss_components.jsonl", {**row, **term_values, **weighted_values})
                 print("interactflow_batch " + str(row), flush=True)
         metrics = evaluate(model, test_loader, device, out_dir, epoch=epoch)
         append_jsonl(out_dir / "metrics_summary.jsonl", metrics)
@@ -206,11 +252,22 @@ def main() -> None:
             "epoch": epoch,
             "calibration_bias_mean": float(model.ledger.calibration_bias.detach().mean().cpu()),
         })
-        torch.save({"model": model.state_dict(), "epoch": epoch, "metrics": metrics}, out_dir / "checkpoint_latest.pth")
+        ckpt = {"model": model.state_dict(), "epoch": epoch, "metrics": metrics, "optimizer": opt.state_dict(), "scheduler": sched.state_dict()}
+        _atomic_torch_save(ckpt, out_dir / "checkpoint_latest.pth")
         if metrics["joint"] > best_joint:
             best_joint = metrics["joint"]
-            torch.save({"model": model.state_dict(), "epoch": epoch, "metrics": metrics}, out_dir / "checkpoint_best_test_joint.pth")
+            _atomic_torch_save(ckpt, out_dir / "checkpoint_best_joint.pth")
+            _atomic_torch_save(ckpt, out_dir / "checkpoint_best_test.pth")
+            _atomic_torch_save(ckpt, out_dir / "checkpoint_best_test_joint.pth")
             write_json(out_dir / "metrics_best_test_joint.json", metrics)
+        action_score = float(metrics["action"]["Act_mAcc"])
+        exp_score = float(metrics["exp29"]["Exp_mF1"])
+        if action_score > best_action:
+            best_action = action_score
+            _atomic_torch_save(ckpt, out_dir / "checkpoint_best_action.pth")
+        if exp_score > best_exp:
+            best_exp = exp_score
+            _atomic_torch_save(ckpt, out_dir / "checkpoint_best_exp.pth")
         print(
             f"interactflow_epoch epoch={epoch} joint={metrics['joint']:.4f} "
             f"Act_mAcc={metrics['action']['Act_mAcc']:.4f} StopF1={metrics['action']['Act_stopF1']:.4f} "

@@ -24,6 +24,7 @@ class DynamicPredicateField(nn.Module):
             nn.GELU(),
             nn.Conv1d(dim, dim, kernel_size=1),
         )
+        self.oia_temporal_logit = nn.Linear(dim, 1)
         self.transfer = TextPredicateTransfer(self.ontology.names, dim=dim)
 
     @staticmethod
@@ -64,7 +65,10 @@ class DynamicPredicateField(nn.Module):
         temporal_seq = oia_tokens.transpose(1, 2).reshape(b * 32, a, d)
         temporal_oia, _ = self.temporal(temporal_seq)
         tcn_delta = self.tcn(temporal_oia.transpose(1, 2)).transpose(1, 2)
-        temporal_oia = (temporal_oia + 0.25 * tcn_delta)[:, -1].reshape(b, 32, d)
+        temporal_oia_seq = temporal_oia + 0.25 * tcn_delta
+        temporal_oia = temporal_oia_seq[:, -1].reshape(b, 32, d)
+        temporal_oia_anchor = temporal_oia_seq.reshape(b, 32, a, d).transpose(1, 2)
+        oia_logits = oia_logits + 0.10 * self.oia_temporal_logit(temporal_oia_anchor).squeeze(-1)
         oia_logits_t = oia_logits.mean(1)
         psi_base_anchor = patch_tokens_by_layer.mean(2)
         psi_score_anchor = torch.einsum("pd,band->bapn", self.psi_queries, psi_base_anchor) / (d ** 0.5)

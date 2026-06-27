@@ -101,6 +101,10 @@ def run_audit(config: str, output_dir: str, device: str = "cpu", write_review_pa
     functional["exp29_unknown_policy"] = cfg["data"].get("all_zero_exp29_is_unknown") is True
     train_source = (root / "fate_oia" / "engine" / "train_acpr_interactflow_psi.py").read_text(encoding="utf-8", errors="ignore")
     model_source = (root / "fate_oia" / "acpr_interactflow" / "model.py").read_text(encoding="utf-8", errors="ignore")
+    loss_source = (root / "fate_oia" / "losses" / "acpr_interactflow_losses.py").read_text(encoding="utf-8", errors="ignore")
+    preflight_source = (root / "fate_oia" / "engine" / "run_acpr_interactflow_preflight.py").read_text(encoding="utf-8", errors="ignore")
+    intervention_source = (root / "fate_oia" / "acpr_interactflow" / "interventions.py").read_text(encoding="utf-8", errors="ignore")
+    flow_source = (root / "fate_oia" / "acpr_interactflow" / "interaction_flow.py").read_text(encoding="utf-8", errors="ignore")
     transfer_source = (root / "fate_oia" / "acpr_interactflow" / "predicate_transfer.py").read_text(encoding="utf-8", errors="ignore")
     eval_source = (root / "fate_oia" / "engine" / "eval_acpr_interactflow_psi.py").read_text(encoding="utf-8", errors="ignore")
     export_source = (root / "fate_oia" / "engine" / "export_acpr_interactflow_visuals.py").read_text(encoding="utf-8", errors="ignore")
@@ -109,6 +113,27 @@ def run_audit(config: str, output_dir: str, device: str = "cpu", write_review_pa
     functional["text_transfer_not_hash_embedding"] = "hashlib" not in transfer_source and "build_bow_text_embeddings" in transfer_source
     functional["eval_saves_ledger_middle_outputs"] = "ledger_gated_state_contributions" in eval_source and "logits_action_global" in eval_source
     functional["visual_export_real_ledger"] = "decision_ledger.png" in export_source and "Missing eval tensors" in export_source
+    functional["state_temporal_losses_not_zero_placeholders"] = (
+        "interaction_state_semantic_loss(output.flow.state_logits" in loss_source
+        and "temporal_consistency_loss(" in loss_source
+        and 'terms["interaction_state_semantic"] = output.action_logits.new_zeros' not in loss_source
+        and 'terms["temporal_consistency"] = output.action_logits.new_zeros' not in loss_source
+    )
+    functional["response_lag_affects_flow"] = "lag_context" in flow_source and "factor_tokens = factor_tokens + 0.1 * lag_context" in flow_source
+    functional["intervention_real_forward_probe"] = (
+        "evaluate_intervention_suite" in intervention_source
+        and "full_model_from_frames" in intervention_source
+        and "downstream_recompute_from_formal_hook" in intervention_source
+        and '"G_temporal_lag_necessity": True' not in preflight_source
+    )
+    functional["bf16_warmup_atomic_checkpoints"] = (
+        "torch.autocast" in train_source
+        and "_build_warmup_cosine_scheduler" in train_source
+        and "_atomic_torch_save" in train_source
+        and "checkpoint_best_action.pth" in train_source
+        and "checkpoint_best_exp.pth" in train_source
+        and "checkpoint_best_test.pth" in train_source
+    )
     try:
         dev = torch.device(device if device == "cuda" and torch.cuda.is_available() else "cpu")
         model = ACPRInteractFlowPPModel(
@@ -122,6 +147,10 @@ def run_audit(config: str, output_dir: str, device: str = "cpu", write_review_pa
         frames = torch.randn(2, 15, 3, int(cfg["data"]["image_height"]), int(cfg["data"]["image_width"]), device=dev)
         output = model(frames, epoch=0)
         functional["model_forward"] = output.action_logits.shape == (2, int(cfg["data"]["action_dim"])) and output.exp29_logits.shape == (2, 29)
+        output_lag0 = model(frames, epoch=0, intervention="lag_disabled")
+        functional["lag_disabled_changes_forward_path"] = bool((output.action_logits - output_lag0.action_logits).abs().mean().detach().cpu() > 1e-8)
+        output_pred_off = model(frames, epoch=0, intervention="predicate_off")
+        functional["predicate_off_changes_forward_path"] = bool((output.action_logits - output_pred_off.action_logits).abs().mean().detach().cpu() > 1e-8)
         functional["dino_anchor_chunking"] = output.visual.stats.get("dino_chunk_size") == int(cfg["model"]["visual_encoder"].get("dino_chunk_size", 2))
         functional["predicate_field"] = output.predicates.predicate_logits.shape == (2, 48)
         functional["predicate_trajectory"] = (
