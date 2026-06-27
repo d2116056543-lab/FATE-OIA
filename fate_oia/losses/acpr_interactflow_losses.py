@@ -28,9 +28,52 @@ def action_majority_ce_loss(logits: torch.Tensor, majority: torch.Tensor, weight
     return loss.mean()
 
 
-def exp29_masked_bce_loss(logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    loss = F.binary_cross_entropy_with_logits(logits, targets.float(), reduction="none")
-    return (loss * mask.float()).sum() / mask.float().sum().clamp_min(1.0)
+def exp29_masked_asl_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    mask: torch.Tensor,
+    gamma_neg: float = 4.0,
+    gamma_pos: float = 0.0,
+    clip: float = 0.05,
+) -> torch.Tensor:
+    """Masked asymmetric loss for sparse PSI explanation labels.
+
+    The previous implementation used plain BCE under the ASL name. With 29
+    sparse labels this makes the easiest optimum "predict no positives" at a
+    fixed 0.5 threshold. ASL keeps positive gradients strong while down-weighting
+    easy negatives, without using test-derived thresholds.
+    """
+    targets = targets.float()
+    mask = mask.float()
+    probs = torch.sigmoid(logits)
+    pos_probs = probs
+    neg_probs = 1.0 - probs
+    if clip > 0:
+        neg_probs = (neg_probs + clip).clamp(max=1.0)
+
+    pos_loss = targets * torch.log(pos_probs.clamp_min(1e-8))
+    neg_loss = (1.0 - targets) * torch.log(neg_probs.clamp_min(1e-8))
+
+    if gamma_neg > 0 or gamma_pos > 0:
+        pos_weight = (1.0 - probs).pow(gamma_pos)
+        neg_weight = probs.pow(gamma_neg)
+        loss = pos_loss * pos_weight + neg_loss * neg_weight
+    else:
+        loss = pos_loss + neg_loss
+    return (-(loss) * mask).sum() / mask.sum().clamp_min(1.0)
+
+
+def exp29_soft_f1_loss(logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    targets = targets.float()
+    mask = mask.float()
+    probs = torch.sigmoid(logits) * mask
+    targets = targets * mask
+    tp = (probs * targets).sum(dim=0)
+    fp = (probs * (1.0 - targets) * mask).sum(dim=0)
+    fn = ((1.0 - probs) * targets).sum(dim=0)
+    valid = (targets.sum(dim=0) > 0).float()
+    f1 = (2.0 * tp + eps) / (2.0 * tp + fp + fn + eps)
+    return 1.0 - (f1 * valid).sum() / valid.sum().clamp_min(1.0)
 
 
 def exp29_positive_unlabeled_loss(logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor, positive_prior: float = 0.08) -> torch.Tensor:
@@ -148,6 +191,8 @@ DEFAULT_INTERACTFLOW_LOSS_WEIGHTS = {
     "ledger_residual_soft_kl": 0.20,
     "non_degradation_hinge": 0.10,
     "exp29_masked_asl": 0.30,
+    "exp29_calibrated_asl": 0.20,
+    "exp29_soft_f1": 0.06,
     "predicate_nnpu": 0.10,
     "interaction_state_semantic": 0.05,
     "response_lag_consistency": 0.03,
@@ -165,7 +210,10 @@ def compute_interactflow_losses(output, batch, weights: dict[str, float] | None 
     terms["action_global_soft_kl"] = action_soft_kl_loss(output.ledger.global_logits, batch.action_soft, batch.paper_effective_weight)
     residual_logits = output.ledger.flow_delta_logits + output.ledger.calibration_delta
     terms["ledger_residual_soft_kl"] = action_soft_kl_loss(output.action_logits - residual_logits.detach(), batch.action_soft, batch.paper_effective_weight)
-    terms["exp29_masked_asl"] = exp29_masked_bce_loss(output.exp29_logits, batch.exp29, batch.exp29_mask)
+    calibrated_exp_logits = output.aux.get("exp29_logits_calibrated", output.exp29_logits)
+    terms["exp29_masked_asl"] = exp29_masked_asl_loss(output.exp29_logits, batch.exp29, batch.exp29_mask)
+    terms["exp29_calibrated_asl"] = exp29_masked_asl_loss(calibrated_exp_logits, batch.exp29, batch.exp29_mask)
+    terms["exp29_soft_f1"] = exp29_soft_f1_loss(calibrated_exp_logits, batch.exp29, batch.exp29_mask)
     terms["predicate_nnpu"] = exp29_positive_unlabeled_loss(output.exp29_logits, batch.exp29, batch.exp29_mask)
     terms["interaction_state_semantic"] = interaction_state_semantic_loss(output.flow.state_logits, batch.action_majority)
     terms["group_sparsity"] = flow_sparsity_loss(output.flow.flow_edges)

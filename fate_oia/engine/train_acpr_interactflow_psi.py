@@ -16,7 +16,7 @@ from fate_oia.acpr_interactflow.interventions import evaluate_intervention_suite
 from fate_oia.acpr_interactflow.model import ACPRInteractFlowPPModel
 from fate_oia.acpr_interactflow.psi_damo_dataset import PSIDAMO11902Dataset, psi_interactflow_collate
 from fate_oia.engine.eval_acpr_interactflow_psi import evaluate
-from fate_oia.losses.acpr_interactflow_losses import compute_interactflow_losses
+from fate_oia.losses.acpr_interactflow_losses import DEFAULT_INTERACTFLOW_LOSS_WEIGHTS, compute_interactflow_losses
 
 
 def _loader(ds, batch_size: int, cfg: dict, shuffle: bool) -> DataLoader:
@@ -117,6 +117,7 @@ def _write_epoch_prediction_artifacts(run_dir: Path, epoch_dir: Path) -> None:
 
     logits_action_path = run_dir / "logits_action_test.pt"
     logits_exp_path = run_dir / "logits_exp29_test.pt"
+    logits_exp_cal_path = run_dir / "logits_exp29_calibrated_test.pt"
     labels_action_path = run_dir / "labels_action_test.pt"
     labels_exp_path = run_dir / "labels_exp29_test.pt"
     files_path = run_dir / "file_names_test.json"
@@ -129,6 +130,7 @@ def _write_epoch_prediction_artifacts(run_dir: Path, epoch_dir: Path) -> None:
     files = json.loads(files_path.read_text(encoding="utf-8"))
     action_probs = torch.softmax(action_logits, dim=-1)
     exp_probs = torch.sigmoid(exp_logits)
+    exp_probs_calibrated = torch.sigmoid(torch.load(logits_exp_cal_path, map_location="cpu")) if logits_exp_cal_path.exists() else exp_probs
     action_rows = []
     exp_rows = []
     for i, file_name in enumerate(files):
@@ -142,12 +144,15 @@ def _write_epoch_prediction_artifacts(run_dir: Path, epoch_dir: Path) -> None:
             }
         )
         top_exp = torch.topk(exp_probs[i], k=min(5, exp_probs.shape[1])).indices.tolist()
+        top_exp_cal = torch.topk(exp_probs_calibrated[i], k=min(5, exp_probs_calibrated.shape[1])).indices.tolist()
         exp_rows.append(
             {
                 "epoch": epoch_dir.name,
                 "sample_id": file_name,
                 "top_exp29": [int(x) for x in top_exp],
                 "exp29_probs_top5": [float(exp_probs[i, x]) for x in top_exp],
+                "top_exp29_calibrated": [int(x) for x in top_exp_cal],
+                "exp29_probs_calibrated_top5": [float(exp_probs_calibrated[i, x]) for x in top_exp_cal],
                 "positive_exp29_indices": [int(x) for x in torch.nonzero(exp_labels[i] > 0.5, as_tuple=False).flatten().tolist()],
             }
         )
@@ -169,6 +174,8 @@ def _write_epoch_artifacts(
     epoch_dir.mkdir(parents=True, exist_ok=True)
     write_json(epoch_dir / "action_metrics.json", metrics["action"])
     write_json(epoch_dir / "exp29_metrics.json", metrics["exp29"])
+    write_json(epoch_dir / "exp29_raw_fixed_metrics.json", metrics.get("exp29_raw_fixed", {}))
+    write_json(epoch_dir / "exp29_calibrated_fixed_metrics.json", metrics.get("exp29_calibrated_fixed", {}))
     write_json(epoch_dir / "joint_metrics.json", {"epoch": epoch, "joint": metrics["joint"], "formula": "0.60*Act_mAcc + 0.25*Stop_F1 + 0.15*Exp_mF1"})
     _write_jsonl_rows(epoch_dir / "loss_components.jsonl", loss_rows)
     write_json(epoch_dir / "gradient_norms.json", {"epoch": epoch, "optimizer_steps": grad_rows})
@@ -179,6 +186,9 @@ def _write_epoch_artifacts(
         "action_bias": model.calalign.action_bias.clamp(-2, 2).detach().cpu().tolist(),
         "exp29_temperature": torch.exp(model.calalign.exp_temp.clamp(-1.0, 1.0)).detach().cpu().tolist(),
         "exp29_bias": model.calalign.exp_bias.clamp(-2, 2).detach().cpu().tolist(),
+        "exp29_primary_metric": metrics.get("exp29_primary", "calibrated_fixed"),
+        "exp29_raw_fixed": metrics.get("exp29_raw_fixed", {}),
+        "exp29_calibrated_fixed": metrics.get("exp29_calibrated_fixed", {}),
     })
     write_json(epoch_dir / "interaction_state_stats.json", {"epoch": epoch, **output.aux.get("state_stats", {})})
     write_json(epoch_dir / "response_lag_stats.json", {"epoch": epoch, **output.flow.stats})
@@ -366,7 +376,7 @@ def main() -> None:
                     "identity_error": float(output.ledger.identity_error.detach().cpu()),
                     "predicate_positive_rate": output.predicates.temporal_stats.get("predicate_positive_rate"),
                 }
-                loss_weights = cfg.get("loss", {})
+                loss_weights = {**DEFAULT_INTERACTFLOW_LOSS_WEIGHTS, **cfg.get("loss", {})}
                 term_values = {k: float(v.detach().cpu()) for k, v in terms.items()}
                 weighted_values = {
                     f"{k}_weighted": float(loss_weights.get(k, 1.0 if k == "total_loss" else 0.0)) * val
@@ -398,7 +408,17 @@ def main() -> None:
         })
         append_jsonl(out_dir / "calibration_diagnostics.jsonl", {
             "epoch": epoch,
-            "calibration_bias_mean": float(model.ledger.calibration_bias.detach().mean().cpu()),
+            "ledger_action_calibration_bias_mean": float(model.ledger.calibration_bias.detach().mean().cpu()),
+            "calalign_action_bias_mean": float(model.calalign.action_bias.clamp(-2, 2).detach().mean().cpu()),
+            "calalign_exp29_bias_mean": float(model.calalign.exp_bias.clamp(-2, 2).detach().mean().cpu()),
+            "calalign_exp29_bias_min": float(model.calalign.exp_bias.clamp(-2, 2).detach().min().cpu()),
+            "calalign_exp29_bias_max": float(model.calalign.exp_bias.clamp(-2, 2).detach().max().cpu()),
+            "calalign_exp29_temp_mean": float(torch.exp(model.calalign.exp_temp.clamp(-1.0, 1.0)).detach().mean().cpu()),
+            "exp29_primary_metric": metrics.get("exp29_primary", "calibrated_fixed"),
+            "exp29_raw_fixed_mF1": float(metrics.get("exp29_raw_fixed", {}).get("Exp_mF1", 0.0)),
+            "exp29_calibrated_fixed_mF1": float(metrics.get("exp29_calibrated_fixed", {}).get("Exp_mF1", 0.0)),
+            "exp29_raw_fixed_mAP": float(metrics.get("exp29_raw_fixed", {}).get("Exp_mAP", 0.0)),
+            "exp29_calibrated_fixed_mAP": float(metrics.get("exp29_calibrated_fixed", {}).get("Exp_mAP", 0.0)),
         })
         if device.type == "cuda":
             append_jsonl(out_dir / "gpu_memory.jsonl", {
@@ -426,7 +446,10 @@ def main() -> None:
         print(
             f"interactflow_epoch epoch={epoch} joint={metrics['joint']:.4f} "
             f"Act_mAcc={metrics['action']['Act_mAcc']:.4f} StopF1={metrics['action']['Act_stopF1']:.4f} "
-            f"Exp_mF1={metrics['exp29']['Exp_mF1']:.4f} elapsed={time.time()-start:.1f}s",
+            f"Exp_mF1={metrics['exp29']['Exp_mF1']:.4f} "
+            f"ExpRaw_mF1={metrics.get('exp29_raw_fixed', {}).get('Exp_mF1', 0.0):.4f} "
+            f"ExpCal_mF1={metrics.get('exp29_calibrated_fixed', {}).get('Exp_mF1', 0.0):.4f} "
+            f"elapsed={time.time()-start:.1f}s",
             flush=True,
         )
     completion = {"completed": True, "best_joint": best_joint, "best_action": best_action, "best_exp": best_exp}

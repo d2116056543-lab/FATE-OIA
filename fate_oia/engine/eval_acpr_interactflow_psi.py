@@ -6,7 +6,7 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
-from fate_oia.acpr_interactflow.artifacts import save_epoch_tensors, write_json
+from fate_oia.acpr_interactflow.artifacts import append_jsonl, save_epoch_tensors, write_json
 from fate_oia.acpr_interactflow.config import load_interactflow_config
 from fate_oia.acpr_interactflow.model import ACPRInteractFlowPPModel
 from fate_oia.acpr_interactflow.psi_damo_dataset import PSIDAMO11902Dataset, psi_interactflow_collate
@@ -16,15 +16,18 @@ from fate_oia.acpr_interactflow.psi_metrics import compute_psi_action_metrics, c
 @torch.no_grad()
 def evaluate(model: ACPRInteractFlowPPModel, loader: DataLoader, device: torch.device, output_dir: str | Path | None = None, epoch: int = 0) -> dict:
     model.eval()
-    action_logits, exp_logits, action_labels, action_soft, exp_labels, exp_mask = [], [], [], [], [], []
+    action_logits, exp_logits, exp_logits_calibrated, action_labels, action_soft, exp_labels, exp_mask = [], [], [], [], [], [], []
     global_logits, flow_delta_logits, calibration_delta, visual_logits, motion_logits, predicate_logits = [], [], [], [], [], []
     gated_state_contrib, benefit_gate, ledger_gate = [], [], []
     file_names: list[str] = []
-    for batch in loader:
+    progress_path = Path(output_dir) / "eval_progress.jsonl" if output_dir is not None else None
+    total_batches = len(loader) if hasattr(loader, "__len__") else None
+    for batch_idx, batch in enumerate(loader, start=1):
         frames = batch.input_frames.to(device, non_blocking=True)
         out = model(frames, epoch=epoch)
         action_logits.append(out.action_logits.detach().cpu())
         exp_logits.append(out.exp29_logits.detach().cpu())
+        exp_logits_calibrated.append(out.aux.get("exp29_logits_calibrated", out.exp29_logits).detach().cpu())
         global_logits.append(out.ledger.global_logits.detach().cpu())
         flow_delta_logits.append(out.ledger.flow_delta_logits.detach().cpu())
         calibration_delta.append(out.ledger.calibration_delta.detach().cpu())
@@ -39,16 +42,38 @@ def evaluate(model: ACPRInteractFlowPPModel, loader: DataLoader, device: torch.d
         exp_labels.append(batch.exp29.detach().cpu())
         exp_mask.append(batch.exp29_mask.detach().cpu())
         file_names.extend(batch.sample_id)
+        if progress_path is not None and (batch_idx == 1 or batch_idx % 50 == 0 or (total_batches is not None and batch_idx == total_batches)):
+            append_jsonl(
+                progress_path,
+                {
+                    "epoch": epoch,
+                    "batch": batch_idx,
+                    "total_batches": total_batches,
+                    "phase": "eval_test",
+                },
+            )
+            print(f"interactflow_eval epoch={epoch} batch={batch_idx}/{total_batches}", flush=True)
     al = torch.cat(action_logits)
     el = torch.cat(exp_logits)
+    ecal = torch.cat(exp_logits_calibrated)
     ay = torch.cat(action_labels)
     asoft = torch.cat(action_soft)
     ey = torch.cat(exp_labels)
     em = torch.cat(exp_mask)
     action = compute_psi_action_metrics(al, ay, asoft)
-    exp = compute_psi_exp29_metrics(el, ey, em)
+    exp_raw = compute_psi_exp29_metrics(el, ey, em)
+    exp_calibrated = compute_psi_exp29_metrics(ecal, ey, em)
+    exp = exp_calibrated
     joint = 0.60 * action["Act_mAcc"] + 0.25 * action["Act_stopF1"] + 0.15 * exp["Exp_mF1"]
-    metrics = {"epoch": epoch, "joint": joint, "action": action, "exp29": exp}
+    metrics = {
+        "epoch": epoch,
+        "joint": joint,
+        "action": action,
+        "exp29": exp,
+        "exp29_raw_fixed": exp_raw,
+        "exp29_calibrated_fixed": exp_calibrated,
+        "exp29_primary": "calibrated_fixed",
+    }
     if output_dir is not None:
         save_epoch_tensors(
             output_dir,
@@ -59,6 +84,7 @@ def evaluate(model: ACPRInteractFlowPPModel, loader: DataLoader, device: torch.d
             ey,
             file_names,
             extra_tensors={
+                "logits_exp29_calibrated": ecal,
                 "logits_action_global": torch.cat(global_logits),
                 "logits_action_visual": torch.cat(visual_logits),
                 "logits_action_motion": torch.cat(motion_logits),
