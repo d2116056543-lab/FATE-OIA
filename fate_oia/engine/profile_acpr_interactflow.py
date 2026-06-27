@@ -31,7 +31,19 @@ def main() -> None:
         action_dim=int(cfg["data"]["action_dim"]),
         max_samples=max(args.batch_size * args.measured_batches, args.batch_size),
     )
-    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=0, collate_fn=psi_interactflow_collate)
+    data_cfg = cfg["data"]
+    workers = int(data_cfg.get("num_workers", 0))
+    loader_kwargs = {
+        "batch_size": args.batch_size,
+        "shuffle": False,
+        "num_workers": workers,
+        "pin_memory": bool(data_cfg.get("pin_memory", False)),
+        "collate_fn": psi_interactflow_collate,
+    }
+    if workers > 0:
+        loader_kwargs["persistent_workers"] = bool(data_cfg.get("persistent_workers", False))
+        loader_kwargs["prefetch_factor"] = int(data_cfg.get("prefetch_factor", 2))
+    loader = DataLoader(ds, **loader_kwargs)
     model = ACPRInteractFlowPPModel(
         pretrained_weights=cfg["paths"]["dino_weights"],
         predicate_config="configs/acpr_interactflow_predicates.yaml",
@@ -66,6 +78,10 @@ def main() -> None:
         "profile_kind": "real_dataset_forward_profile",
         "completed_batches": count,
         "batch_size": args.batch_size,
+        "num_workers": workers,
+        "pin_memory": bool(data_cfg.get("pin_memory", False)),
+        "persistent_workers": bool(data_cfg.get("persistent_workers", False)) if workers > 0 else False,
+        "prefetch_factor": int(data_cfg.get("prefetch_factor", 2)) if workers > 0 else None,
         "device": str(device),
         "use_mock_dino": False,
         "data_time_sec": load_time,
