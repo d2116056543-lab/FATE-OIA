@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import torch
 
+from fate_oia.acpr_interactflow.calibrated_exp29 import fit_exp29_theta_from_train_logits
+
 from fate_oia.losses.acpr_interactflow_losses import (
     exp29_cardinality_loss,
     exp29_masked_asl_loss,
@@ -31,3 +33,31 @@ def test_exp29_calibrated_logits_drive_fixed_threshold_losses() -> None:
     assert torch.isfinite(soft_f1)
     assert not torch.allclose(raw_asl, cal_asl)
     assert (calibrated.sigmoid() >= 0.5).any()
+
+
+
+def test_train_only_theta_fit_creates_fixed_threshold_positives_without_test_labels() -> None:
+    logits = torch.tensor([[-2.0, -1.0], [-1.0, 0.0], [0.0, 1.0], [1.0, 2.0]], dtype=torch.float32)
+    targets = torch.tensor([[0, 0], [0, 1], [1, 0], [0, 0]], dtype=torch.float32)
+    mask = torch.ones_like(targets)
+
+    theta, rates = fit_exp29_theta_from_train_logits(logits, targets, mask, pi_min=0.25, pi_max=0.50)
+    theta_with_margin, _ = fit_exp29_theta_from_train_logits(
+        logits,
+        targets,
+        mask,
+        pi_min=0.25,
+        pi_max=0.50,
+        deploy_logit_margin=0.25,
+    )
+    calibrated = logits - theta.view(1, -1)
+    calibrated_with_margin = logits - theta_with_margin.view(1, -1)
+    pred_rate = (torch.sigmoid(calibrated) >= 0.5).float().mean(0)
+    pred_rate_with_margin = (torch.sigmoid(calibrated_with_margin) >= 0.5).float().mean(0)
+
+    assert torch.isfinite(theta).all()
+    assert torch.all(rates >= 0.25)
+    assert torch.all(pred_rate > 0.0)
+    assert torch.all(pred_rate <= 0.50)
+    assert torch.all(theta_with_margin < theta)
+    assert torch.all(pred_rate_with_margin >= pred_rate)

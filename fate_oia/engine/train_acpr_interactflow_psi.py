@@ -11,6 +11,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from fate_oia.acpr_interactflow.artifacts import append_jsonl, write_json
+from fate_oia.acpr_interactflow.calibrated_exp29 import fit_exp29_theta_from_train_logits
 from fate_oia.acpr_interactflow.config import load_interactflow_config
 from fate_oia.acpr_interactflow.interventions import evaluate_intervention_suite
 from fate_oia.acpr_interactflow.model import ACPRInteractFlowPPModel
@@ -268,6 +269,86 @@ def _build_warmup_cosine_scheduler(opt: torch.optim.Optimizer, cfg: dict, total_
     return torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lr_lambda), warmup_updates
 
 
+
+def _maybe_initialize_exp29_train_calibration(
+    model: ACPRInteractFlowPPModel,
+    train_loader: DataLoader,
+    device: torch.device,
+    cfg: dict,
+    out_dir: Path,
+    use_bf16: bool,
+    epoch: int | None = None,
+    stage: str = "initial",
+) -> None:
+    exp_cfg = cfg.get("model", {}).get("exp29", {})
+    init_cfg = exp_cfg.get("train_calibration_init", {})
+    artifact_path = out_dir / ("exp29_train_calibration_init.json" if stage == "initial" else "exp29_train_calibration_current.json")
+    if init_cfg and not bool(init_cfg.get("enabled", True)):
+        payload = {"available": False, "reason": "disabled", "stage": stage, "epoch": epoch}
+        write_json(artifact_path, payload)
+        append_jsonl(out_dir / "exp29_train_calibration_history.jsonl", payload)
+        return
+    max_samples = int(init_cfg.get("max_samples", 128)) if isinstance(init_cfg, dict) else 128
+    pi_min = float(init_cfg.get("pi_min", 0.03)) if isinstance(init_cfg, dict) else 0.03
+    pi_max = float(init_cfg.get("pi_max", 0.35)) if isinstance(init_cfg, dict) else 0.35
+    deploy_logit_margin = float(init_cfg.get("deploy_logit_margin", 0.0)) if isinstance(init_cfg, dict) else 0.0
+    logits_rows: list[torch.Tensor] = []
+    target_rows: list[torch.Tensor] = []
+    mask_rows: list[torch.Tensor] = []
+    seen = 0
+    model.eval()
+    with torch.no_grad():
+        for batch in train_loader:
+            frames = batch.input_frames.to(device, non_blocking=True)
+            action_soft = batch.action_soft.to(device, non_blocking=True)
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16):
+                output = model(frames, epoch=0 if epoch is None else epoch, action_soft_target=action_soft)
+            logits_rows.append(output.exp29.logits_raw.detach().float().cpu())
+            target_rows.append(batch.exp29.detach().float().cpu())
+            mask_rows.append(batch.exp29_mask.detach().float().cpu())
+            seen += int(output.exp29.logits_raw.shape[0])
+            if seen >= max_samples:
+                break
+    if not logits_rows:
+        payload = {"available": False, "reason": "no_train_batches", "stage": stage, "epoch": epoch}
+        write_json(artifact_path, payload)
+        append_jsonl(out_dir / "exp29_train_calibration_history.jsonl", payload)
+        model.train()
+        return
+    logits = torch.cat(logits_rows, dim=0)[:max_samples]
+    targets = torch.cat(target_rows, dim=0)[:max_samples]
+    mask = torch.cat(mask_rows, dim=0)[:max_samples]
+    theta, rates = fit_exp29_theta_from_train_logits(
+        logits,
+        targets,
+        mask,
+        pi_min=pi_min,
+        pi_max=pi_max,
+        deploy_logit_margin=deploy_logit_margin,
+    )
+    model.exp29.theta.data.copy_(theta.to(device=device, dtype=model.exp29.theta.dtype))
+    calibrated = logits - theta.view(1, -1)
+    payload = {
+        "available": True,
+        "stage": stage,
+        "epoch": epoch,
+        "source_split": "train",
+        "max_samples": max_samples,
+        "used_samples": int(logits.shape[0]),
+        "pi_min": pi_min,
+        "pi_max": pi_max,
+        "deploy_logit_margin": deploy_logit_margin,
+        "theta_mean": float(theta.mean()),
+        "theta_min": float(theta.min()),
+        "theta_max": float(theta.max()),
+        "target_rate_mean": float(rates.mean()),
+        "calibrated_pred_positive_rate_at_0p5": float((torch.sigmoid(calibrated) >= 0.5).float().mean()),
+    }
+    write_json(artifact_path, payload)
+    append_jsonl(out_dir / "exp29_train_calibration_history.jsonl", payload)
+    model.train()
+
+
 def _git_head() -> str:
     try:
         return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
@@ -357,6 +438,7 @@ def main() -> None:
     config_path = Path(args.config)
     if config_path.exists():
         (out_dir / "config_resolved.yaml").write_text(config_path.read_text(encoding="utf-8"), encoding="utf-8")
+    _maybe_initialize_exp29_train_calibration(model, train_loader, device, cfg, out_dir, use_bf16, stage="initial")
     best_joint = -1.0
     best_action = -1.0
     best_exp = -1.0
@@ -466,6 +548,7 @@ def main() -> None:
                 epoch_loss_rows.append(log_row)
                 print("interactflow_batch " + str(row), flush=True)
             last_step_end = time.perf_counter()
+        _maybe_initialize_exp29_train_calibration(model, train_loader, device, cfg, out_dir, use_bf16, epoch=epoch, stage="pre_eval")
         metrics = evaluate(model, test_loader, device, out_dir, epoch=epoch)
         influence = {"epoch": epoch, "available": False}
         if last_frames_for_audit is not None:

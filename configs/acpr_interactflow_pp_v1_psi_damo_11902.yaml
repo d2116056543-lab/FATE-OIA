@@ -120,6 +120,12 @@ model:
     enabled: true
     label_embedding_source: psi_exp29
     masked_unknown_loss: true
+    train_calibration_init:
+      enabled: true
+      max_samples: 128
+      pi_min: 0.03
+      pi_max: 0.35
+      deploy_logit_margin: 0.12
     reliability_weighted: true
     contribution_alignment: true
 
