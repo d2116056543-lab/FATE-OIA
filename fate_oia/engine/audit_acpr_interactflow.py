@@ -195,6 +195,9 @@ def run_audit(config: str, output_dir: str, device: str = "cpu", write_review_pa
         and "Worktree is dirty" in ps1_source
         and "GitHub branch HEAD mismatch" in ps1_source
     )
+    functional["preflight_profile_uses_yaml_measured_batches"] = (
+        "profile_batches = int(args.profile_batches if args.profile_batches is not None else cfg.get(\"profile\", {}).get(\"measured_batches\", 100))" in preflight_source
+    )
     try:
         dev = torch.device(device if device == "cuda" and torch.cuda.is_available() else "cpu")
         pred_cfg = cfg["model"].get("predicates", {})

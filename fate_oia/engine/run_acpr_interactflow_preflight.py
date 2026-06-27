@@ -71,13 +71,15 @@ def main() -> None:
     parser.add_argument("--output_dir", default=".background_runs/acpr_interactflow_pp_v1_preflight")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--skip_real_dino_smoke", action="store_true")
-    parser.add_argument("--profile_batches", type=int, default=5)
+    parser.add_argument("--profile_batches", type=int)
     parser.add_argument("--profile_batch_size", type=int, default=4)
     parser.add_argument("--mechanism_samples", type=int, default=128)
     args = parser.parse_args()
     root = Path.cwd()
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
+    cfg = load_interactflow_config(args.config)
+    profile_batches = int(args.profile_batches if args.profile_batches is not None else cfg.get("profile", {}).get("measured_batches", 100))
     py_files = [str(p) for p in (root / "fate_oia" / "acpr_interactflow").glob("*.py")]
     py_files += [
         "fate_oia/losses/acpr_interactflow_losses.py",
@@ -131,7 +133,7 @@ def main() -> None:
             "--output_dir",
             str(out),
             "--measured_batches",
-            str(args.profile_batches),
+            str(profile_batches),
             "--batch_size",
             str(args.profile_batch_size),
             "--device",
@@ -255,7 +257,7 @@ def main() -> None:
         "J_throughput_memory": profile["returncode"] == 0,
         "K_independent_review_pass": skill_path.exists() and audit_initial.get("pass", False),
     }
-    write_json(out / "preflight_gates_summary.json", {"gates": gates, "compile": compile_result, "pytest": pytest_result, "profile": profile, "mechanism": mechanism, "intervention": intervention_report, "visual": visual, "atlas": atlas})
+    write_json(out / "preflight_gates_summary.json", {"gates": gates, "compile": compile_result, "pytest": pytest_result, "profile": profile, "profile_batches": profile_batches, "mechanism": mechanism, "intervention": intervention_report, "visual": visual, "atlas": atlas})
     final_audit = run_audit(args.config, str(out), device="cpu", write_review_pass=all(gates.values()))
     write_json(out / "preflight_summary.json", {"compile": compile_result, "pytest": pytest_result, "initial_audit": audit_initial, "real_smoke": real_smoke, "profile": profile, "gates": gates, "final_audit": final_audit})
     if not all([compile_result["returncode"] == 0, pytest_result["returncode"] == 0, final_audit["pass"]]):
