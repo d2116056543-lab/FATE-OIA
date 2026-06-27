@@ -10,6 +10,20 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
 
+$RuntimeRoot = "E:\sbw\runtime_cache"
+$TempRoot = Join-Path $RuntimeRoot "tmp"
+$HfRoot = "E:\sbw\hf_cache"
+New-Item -ItemType Directory -Force -Path $TempRoot | Out-Null
+New-Item -ItemType Directory -Force -Path $HfRoot | Out-Null
+$env:TMP = $TempRoot
+$env:TEMP = $TempRoot
+$env:HF_HOME = $HfRoot
+$env:TRANSFORMERS_CACHE = Join-Path $HfRoot "transformers"
+$env:TRANSFORMERS_NO_TF = "1"
+$env:TRANSFORMERS_NO_FLAX = "1"
+$env:USE_TF = "0"
+$env:USE_FLAX = "0"
+
 $ReviewPass = Join-Path $Root ".background_runs\acpr_interactflow_pp_v1_preflight\REVIEW_PASS_ACPR_INTERACTFLOW_PP_V1.txt"
 if ($RequireReviewPass -and -not (Test-Path $ReviewPass)) {
   throw "Missing REVIEW_PASS_ACPR_INTERACTFLOW_PP_V1.txt"
