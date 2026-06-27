@@ -23,6 +23,7 @@ def main() -> None:
     parser.add_argument("--warmup_batches", type=int)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--candidate_batch_sizes", default="")
+    parser.add_argument("--gradient_accumulation_steps", type=int)
     parser.add_argument("--candidate_dino_chunk_sizes", default="")
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
@@ -33,6 +34,12 @@ def main() -> None:
         args.batch_size = int(str(args.candidate_batch_sizes).split(",")[0])
     if args.candidate_dino_chunk_sizes:
         cfg["model"]["visual_encoder"]["dino_chunk_size"] = int(str(args.candidate_dino_chunk_sizes).split(",")[0])
+    if args.gradient_accumulation_steps is None:
+        profile_candidates = cfg.get("profile", {}).get("candidates", [])
+        if profile_candidates:
+            args.gradient_accumulation_steps = int(profile_candidates[0].get("gradient_accumulation_steps", 5))
+        else:
+            args.gradient_accumulation_steps = int(cfg.get("training", {}).get("gradient_accumulation_steps", 5))
     warmup_batches = int(args.warmup_batches if args.warmup_batches is not None else cfg.get("profile", {}).get("warmup_batches", 0))
     device = torch.device(args.device if args.device == "cuda" and torch.cuda.is_available() else "cpu")
     ds = PSIDAMO11902Dataset(
@@ -144,7 +151,7 @@ def main() -> None:
         "samples_per_second": (count * args.batch_size) / max(total_wall, 1e-9),
         "peak_reserved_gib": peak,
         "selected_batch_size": args.batch_size,
-        "selected_grad_accum": None,
+        "selected_grad_accum": int(args.gradient_accumulation_steps),
         "selected_dino_chunk_size": int(cfg["model"]["visual_encoder"].get("dino_chunk_size", 2)),
         "projected_train_epoch_time": None,
         "projected_test_eval_time": None,

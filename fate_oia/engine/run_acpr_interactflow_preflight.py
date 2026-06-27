@@ -155,6 +155,8 @@ def main() -> None:
             str(selected_batch_size),
             "--candidate_dino_chunk_sizes",
             str(selected_dino_chunk),
+            "--gradient_accumulation_steps",
+            str(selected_grad_accum),
             "--device",
             args.device,
         ],

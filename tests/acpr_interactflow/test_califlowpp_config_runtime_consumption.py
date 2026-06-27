@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import yaml
 
+from fate_oia.engine.audit_califlowpp_current_branch import _coalesce_int
+
 
 def test_formal_config_consumes_runtime_image_cache_eval_and_loss_fields() -> None:
     with open("configs/acpr_interactflow_pp_v1_psi_damo_11902.yaml", "r", encoding="utf-8") as f:
@@ -21,3 +23,9 @@ def test_formal_config_consumes_runtime_image_cache_eval_and_loss_fields() -> No
     assert "test" in cfg["evaluation"]["eval_splits"]
     assert cfg["loss"]["action_final_soft_kl"] == 1.0
     assert cfg["loss"]["exp29_calibrated_asl"] == 0.25
+
+
+def test_review_pass_profile_null_grad_accum_falls_back_to_config() -> None:
+    assert _coalesce_int(None, "5", default=1) == 5
+    assert _coalesce_int(None, None, default=6) == 6
+    assert _coalesce_int("bad", 8, default=1) == 8

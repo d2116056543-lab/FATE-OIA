@@ -84,6 +84,18 @@ def _scan_forbidden(root: Path) -> dict[str, list[str]]:
     return hits
 
 
+def _coalesce_int(*values: object, default: int) -> int:
+    for value in values:
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return int(default)
+
+
+
 def _model_forward_check(cfg: dict, device_name: str) -> dict:
     device = torch.device(device_name if device_name == "cuda" and torch.cuda.is_available() else "cpu")
     pred_cfg = cfg["model"].get("predicates", {})
@@ -242,9 +254,10 @@ def run_audit(config: str, output_dir: str, device: str = "cpu", write_review_pa
                 profile_report = {}
         profile_candidates = cfg.get("profile", {}).get("candidates", [])
         fallback_candidate = profile_candidates[0] if profile_candidates else {"batch_size": 6, "gradient_accumulation_steps": 5}
-        selected_batch_size = int(profile_report.get("selected_batch_size", fallback_candidate.get("batch_size", 6)))
-        selected_grad_accum = int(profile_report.get("selected_grad_accum", fallback_candidate.get("gradient_accumulation_steps", 5)))
-        selected_dino_chunk = int(profile_report.get("selected_dino_chunk_size", cfg["model"]["visual_encoder"].get("dino_chunk_size", 6)))
+        training_cfg = cfg.get("training", {})
+        selected_batch_size = _coalesce_int(profile_report.get("selected_batch_size"), fallback_candidate.get("batch_size"), training_cfg.get("batch_size"), default=6)
+        selected_grad_accum = _coalesce_int(profile_report.get("selected_grad_accum"), fallback_candidate.get("gradient_accumulation_steps"), training_cfg.get("gradient_accumulation_steps"), default=5)
+        selected_dino_chunk = _coalesce_int(profile_report.get("selected_dino_chunk_size"), cfg["model"]["visual_encoder"].get("dino_chunk_size"), default=6)
         review = {
             "pass": True,
             "method": "CALI-Flow++",
