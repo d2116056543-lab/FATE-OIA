@@ -85,6 +85,7 @@ class InteractionDecisionLedger:
     calibration_delta: torch.Tensor
     final_logits: torch.Tensor
     gate: torch.Tensor
+    benefit_gate_logits: torch.Tensor
     benefit_gate: torch.Tensor
     benefit_target: torch.Tensor | None
     contribution_attention: torch.Tensor

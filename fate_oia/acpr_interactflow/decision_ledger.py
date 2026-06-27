@@ -39,7 +39,8 @@ class DecisionLedgerHead(nn.Module):
         motion_logits = self.motion_head(motion_token)
         predicate_logits = self.predicate_head(predicate_token)
         gate = torch.sigmoid(self.flow_gate(factor_tokens)).clamp(0.05, 0.95)
-        benefit = torch.sigmoid(self.benefit_gate(factor_tokens)).clamp(0.0, 1.0)
+        benefit_logits = self.benefit_gate(factor_tokens)
+        benefit = torch.sigmoid(benefit_logits).clamp(0.0, 1.0)
         global_logits = visual_logits + 0.35 * motion_logits + 0.25 * predicate_logits
         raw_state_contributions = flow_edges.clamp(-0.35, 0.35)
         benefit_target = None
@@ -69,6 +70,7 @@ class DecisionLedgerHead(nn.Module):
             calibration_delta=calibration_delta,
             final_logits=final,
             gate=gate,
+            benefit_gate_logits=benefit_logits,
             benefit_gate=benefit,
             benefit_target=benefit_target,
             contribution_attention=contribution_attention,

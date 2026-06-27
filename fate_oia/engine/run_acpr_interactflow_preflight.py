@@ -276,7 +276,7 @@ def main() -> None:
     write_json(out / "preflight_gates_summary.json", {"gates": gates, "compile": compile_result, "pytest": pytest_result, "profile": profile, "profile_batches": profile_batches, "mechanism": mechanism, "intervention": intervention_report, "visual": visual, "atlas": atlas})
     final_audit = run_audit(args.config, str(out), device="cpu", write_review_pass=all(gates.values()))
     write_json(out / "preflight_summary.json", {"compile": compile_result, "pytest": pytest_result, "initial_audit": audit_initial, "real_smoke": real_smoke, "profile": profile, "gates": gates, "final_audit": final_audit})
-    if not all([compile_result["returncode"] == 0, pytest_result["returncode"] == 0, final_audit["pass"]]):
+    if not all([compile_result["returncode"] == 0, pytest_result["returncode"] == 0, all(gates.values()), final_audit["pass"]]):
         raise SystemExit(1)
 
 

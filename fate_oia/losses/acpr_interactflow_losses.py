@@ -299,8 +299,8 @@ def compute_interactflow_losses(output, batch, weights: dict[str, float] | None 
     terms["non_degradation_soft_kl_hinge"] = non_degradation_soft_kl_hinge_loss(output.action_logits, base_logits, batch.action_soft)
     if output.ledger.benefit_target is not None:
         target = output.ledger.benefit_target
-        pred = output.ledger.benefit_gate.mean(-1, keepdim=True)
-        terms["benefit_gate_advantage_bce"] = F.binary_cross_entropy(pred.clamp(1e-6, 1 - 1e-6), target)
+        logits = output.ledger.benefit_gate_logits.mean(-1, keepdim=True)
+        terms["benefit_gate_advantage_bce"] = F.binary_cross_entropy_with_logits(logits.float(), target.float())
     else:
         terms["benefit_gate_advantage_bce"] = output.action_logits.new_zeros(())
     terms["exp29_ledger_alignment_js"] = exp29_ledger_alignment_js_loss(
