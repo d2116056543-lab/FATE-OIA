@@ -1,7 +1,7 @@
 param(
   [int]$Epochs = 30,
-  [int]$BatchSize = 4,
-  [int]$GradAccum = 1,
+  [int]$BatchSize = 1,
+  [int]$GradAccum = 64,
   [string]$Device = "cuda",
   [switch]$RequireReviewPass
 )
@@ -28,4 +28,3 @@ E:\Anaconda\envs\sbw39\python.exe -u -m fate_oia.engine.train_acpr_interactflow_
   --test_only `
   --no_feature_cache `
   --require_no_token_compression
-
