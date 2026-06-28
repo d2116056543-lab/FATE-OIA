@@ -1,0 +1,24 @@
+traffic_light_red:
+  positive: ["a red traffic light ahead", "red signal controlling the ego vehicle"]
+  negative: ["no red traffic light", "green light or no visible signal"]
+traffic_light_green:
+  positive: ["a green traffic light ahead", "green signal allows driving"]
+  negative: ["red traffic light", "no visible signal"]
+stop_sign_present:
+  positive: ["a stop sign ahead", "traffic sign requiring stop"]
+  negative: ["no stop sign"]
+front_vehicle_close:
+  positive: ["a close vehicle in front", "front car blocking the ego lane"]
+  negative: ["no close front vehicle"]
+pedestrian_front:
+  positive: ["a pedestrian ahead", "person crossing in front"]
+  negative: ["no pedestrian ahead"]
+lane_left_available:
+  positive: ["left lane is available", "open left lane"]
+  negative: ["no lane on the left"]
+lane_right_available:
+  positive: ["right lane is available", "open right lane"]
+  negative: ["no lane on the right"]
+drivable_center:
+  positive: ["center road area is drivable"]
+  negative: ["center road area is blocked"]

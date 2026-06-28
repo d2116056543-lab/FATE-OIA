@@ -1,0 +1,150 @@
+data_root: E:\sbw\BDD-OIA\data
+raw_root: E:\sbw\BDD-OIA
+bdd100k_root: E:\sbw\BDD100K
+pretrained_weights: ckp\reference\dino_deitsmall8_pretrain.pth
+checkpoint_key: teacher
+
+image_height: 360
+image_width: 640
+patch_size: 8
+action_dim: 4
+reason_dim: 21
+
+eval_splits: [test]
+best_selection_split: test
+best_selection_metric: deploy_fixed_joint
+
+feature_cache_enabled: false
+token_compression: none
+
+experiment:
+  name: acpr_pmcal_v2_direct_image
+  direct_image: true
+  feature_cache_enabled: false
+  token_compression: none
+  test_only_evaluation: true
+  best_selection_split: test
+  best_selection_metric: deploy_fixed_joint
+  no_metric_early_stop: true
+
+backbone:
+  arch: vit_small
+  patch_size: 8
+  selected_layers: [3, 7, 11]
+  pretrained_weights: ckp/reference/dino_deitsmall8_pretrain.pth
+  checkpoint_key: teacher
+  freeze_backbone: true
+  no_grad_backbone: true
+
+model:
+  name: ACPRPMCalV2Model
+  dim: 384
+  action_dim: 4
+  reason_dim: 21
+  num_predicates: 32
+  scene_config: configs/acpr_scene_predicates.yaml
+  grammar_path: configs/acpr_reason_predicate_grammar.yaml
+  text_prompt_config: configs/acpr_pmcal_v2_text_prompts.yaml
+  use_legacy_acpr_trunk_final_action: false
+  use_reason_to_action_final: false
+  action_set_affects_final_action: false
+  graph_delta_to_logits: false
+  predicate_fair_posterior_sources: [visual, text]
+  train_observation_sources: [reason_grammar, bdd100k_geometry]
+  test_observation_sources: [visual, text]
+  token_compression: none
+  feature_cache_enabled: false
+
+pmcal:
+  formula_residual_cap: 0.20
+  formula_gate_max: 0.35
+  action_predicate_cap: 0.06
+  action_predicate_gate_max: 0.35
+  text_prior_max_weight: 0.25
+  instance_threshold_delta_cap: 0.25
+  unknown_entropy_weight: 0.02
+  tail_reason_indices: [12, 9, 5, 14, 6, 11, 10, 13]
+  reliability_min_for_negative: 0.55
+  support_threshold: 0.25
+  contradiction_threshold: 0.55
+  near_boundary_delta: 0.35
+  pair_predicate_gap: 0.20
+
+threshold:
+  enabled: true
+  train_calib_fraction: 0.10
+  split_seed: 20260628
+  init_from_train_frequency: true
+  use_group_shrinkage: true
+  lr_threshold: 0.0006
+  weight_decay_threshold: 0.0
+  start_epoch: 1
+  teacher_update_start_epoch: 2
+  teacher_update_every: 1
+  teacher_ema: 0.20
+  copy_teacher_to_params: false
+  base_detach: true
+  action_threshold_min: 0.10
+  action_threshold_max: 0.90
+  reason_threshold_min: 0.02
+  reason_threshold_max: 0.85
+  tail_reason_threshold_min: 0.01
+  tail_reason_threshold_max: 0.65
+
+training:
+  epochs: 18
+  primary_batch_size: 9
+  primary_gradient_accumulation_steps: 4
+  memory_probe_ladder:
+    - [11, 3]
+    - [10, 3]
+    - [9, 4]
+    - [8, 4]
+    - [7, 5]
+    - [6, 5]
+    - [5, 6]
+    - [4, 8]
+    - [3, 11]
+    - [2, 16]
+  reference_effective_batch: 32
+  target_allocated_gpu_gb_min: 40.0
+  target_allocated_gpu_gb_max: 45.0
+  absolute_oom_guard_gb: 46.0
+  lr_trunk: 0.00018
+  lr_predicate: 0.00020
+  lr_formula: 0.00020
+  lr_action_predicate: 0.00015
+  lr_threshold: 0.00060
+  max_scaled_lr: 0.00022
+  scheduler: warmup_cosine
+  warmup_epochs: 2
+  min_lr: 0.00001
+  weight_decay: 0.05
+  grad_clip: 1.0
+  amp: false
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+  no_metric_early_stop: true
+
+loss_weights:
+  action_asl: 1.0
+  reason_pu_asl: 1.0
+  predicate_measurement: 0.30
+  formula_reason: 0.25
+  calalign: 0.50
+  action_predicate_consistency: 0.02
+  certified_pair: 0.05
+  pair_loss_cap_ratio: 0.08
+  reliability_regularizer: 0.01
+  predicate_attention_compactness: 0.001
+
+runtime:
+  foreground_only: true
+  test_only: true
+  no_feature_cache: true
+  require_no_token_compression: true
+  print_every: 200
+  eval_every_epoch: true
+  save_every_epoch: true
