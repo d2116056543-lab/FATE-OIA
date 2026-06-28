@@ -122,7 +122,10 @@ model:
     masked_unknown_loss: true
     train_calibration_init:
       enabled: true
-      max_samples: 128
+      max_samples: 512
+      min_pred_positive_rate: 0.02
+      accept_mf1_tolerance: 0.005
+      max_global_pred_rate: 0.35
       pi_min: 0.03
       pi_max: 0.35
       deploy_logit_margin: 0.12

@@ -114,11 +114,27 @@ def non_degradation_soft_kl_hinge_loss(
 
 def predicate_pu_loss(predicate_logits_trajectory: torch.Tensor, weak_targets: torch.Tensor | None = None, mask: torch.Tensor | None = None) -> torch.Tensor:
     if weak_targets is None:
-        # Conservative PU proxy: avoid all-zero collapse by treating confident
-        # trajectory activations as unlabeled rather than negatives.
-        weak_targets = torch.zeros_like(predicate_logits_trajectory)
-        mask = torch.ones_like(predicate_logits_trajectory)
+        # No predicate labels means unknown, not negative. Returning a connected
+        # zero keeps the graph valid without pushing every predicate below 0.5.
+        return predicate_logits_trajectory.sum() * 0.0
     return nnpu_binary_loss(predicate_logits_trajectory, weak_targets.float(), (mask if mask is not None else torch.ones_like(predicate_logits_trajectory)).float(), positive_prior=0.08)
+
+
+def predicate_structural_weak_loss(
+    predicate_logits_trajectory: torch.Tensor,
+    predicate_probs_trajectory: torch.Tensor | None = None,
+    target_mean: float = 0.35,
+    min_topk_mean: float = 0.55,
+    topk_fraction: float = 0.05,
+) -> torch.Tensor:
+    probs = predicate_probs_trajectory if predicate_probs_trajectory is not None else torch.sigmoid(predicate_logits_trajectory)
+    smooth = temporal_consistency_loss(probs)
+    mean_loss = (probs.mean() - target_mean).abs()
+    flat = probs.reshape(probs.shape[0], -1)
+    k = max(1, int(flat.shape[-1] * topk_fraction))
+    topk_mean = flat.topk(k, dim=-1).values.mean()
+    activation_floor = F.relu(min_topk_mean - topk_mean)
+    return smooth + 0.25 * mean_loss + activation_floor
 
 
 def exp29_pu_loss(logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor, positive_prior: float = 0.08) -> torch.Tensor:
@@ -256,7 +272,7 @@ DEFAULT_INTERACTFLOW_LOSS_WEIGHTS = {
     "predicate_pu": 0.08,
     "predicate_structural_weak": 0.03,
     "exp29_raw_asl": 0.12,
-    "exp29_calibrated_asl": 0.20,
+    "exp29_calibrated_asl": 0.25,
     "exp29_pu": 0.04,
     "exp29_soft_f1": 0.08,
     "exp29_positive_rate": 0.04,
@@ -290,8 +306,10 @@ def compute_interactflow_losses(output, batch, weights: dict[str, float] | None 
     terms["exp29_cardinality"] = exp29_cardinality_loss(calibrated_exp_logits, batch.exp29, batch.exp29_mask)
     terms["exp29_pairwise_rank"] = exp29_pairwise_rank_loss(calibrated_exp_logits, batch.exp29, batch.exp29_mask)
     terms["predicate_pu"] = predicate_pu_loss(output.predicates.predicate_logits_trajectory)
-    predicate_rate = torch.sigmoid(output.predicates.predicate_logits_trajectory).mean()
-    terms["predicate_structural_weak"] = temporal_consistency_loss(output.predicates.predicate_probs_trajectory) + (predicate_rate - 0.10).abs()
+    terms["predicate_structural_weak"] = predicate_structural_weak_loss(
+        output.predicates.predicate_logits_trajectory,
+        output.predicates.predicate_probs_trajectory,
+    )
     terms["interaction_state_semantic"] = interaction_state_semantic_loss(output.flow.state_logits, batch.action_majority)
     terms["factor_sparsity"] = flow_sparsity_loss(output.flow.flow_edges)
     terms["ledger_identity"] = ledger_identity_loss(output.ledger.identity_error)

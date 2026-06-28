@@ -11,7 +11,11 @@ import torch
 from torch.utils.data import DataLoader
 
 from fate_oia.acpr_interactflow.artifacts import append_jsonl, write_json
-from fate_oia.acpr_interactflow.calibrated_exp29 import fit_exp29_theta_from_train_logits
+from fate_oia.acpr_interactflow.calibrated_exp29 import (
+    exp29_calibration_quality,
+    fit_exp29_theta_from_train_logits,
+    should_accept_exp29_theta,
+)
 from fate_oia.acpr_interactflow.config import load_interactflow_config
 from fate_oia.acpr_interactflow.interventions import evaluate_intervention_suite
 from fate_oia.acpr_interactflow.model import ACPRInteractFlowPPModel
@@ -292,6 +296,9 @@ def _maybe_initialize_exp29_train_calibration(
     pi_min = float(init_cfg.get("pi_min", 0.03)) if isinstance(init_cfg, dict) else 0.03
     pi_max = float(init_cfg.get("pi_max", 0.35)) if isinstance(init_cfg, dict) else 0.35
     deploy_logit_margin = float(init_cfg.get("deploy_logit_margin", 0.0)) if isinstance(init_cfg, dict) else 0.0
+    min_pred_positive_rate = float(init_cfg.get("min_pred_positive_rate", 0.02)) if isinstance(init_cfg, dict) else 0.02
+    accept_mf1_tolerance = float(init_cfg.get("accept_mf1_tolerance", 0.005)) if isinstance(init_cfg, dict) else 0.005
+    max_global_pred_rate = float(init_cfg.get("max_global_pred_rate", pi_max)) if isinstance(init_cfg, dict) else pi_max
     logits_rows: list[torch.Tensor] = []
     target_rows: list[torch.Tensor] = []
     mask_rows: list[torch.Tensor] = []
@@ -325,9 +332,26 @@ def _maybe_initialize_exp29_train_calibration(
         pi_min=pi_min,
         pi_max=pi_max,
         deploy_logit_margin=deploy_logit_margin,
+        max_global_pred_rate=max_global_pred_rate,
     )
-    model.exp29.theta.data.copy_(theta.to(device=device, dtype=model.exp29.theta.dtype))
-    calibrated = logits - theta.view(1, -1)
+    current_theta = model.exp29.theta.detach().float().cpu()
+    current_quality = exp29_calibration_quality(logits, targets, mask, current_theta)
+    candidate_quality = exp29_calibration_quality(logits, targets, mask, theta)
+    force_initial = stage == "initial" and float(getattr(model.exp29, "theta_quality_mf1", torch.tensor(-1.0)).detach().cpu()) < 0.0
+    accepted = force_initial or should_accept_exp29_theta(
+        candidate_quality,
+        current_quality,
+        min_pred_positive_rate=min_pred_positive_rate,
+        mf1_tolerance=accept_mf1_tolerance,
+    )
+    if accepted:
+        model.exp29.theta.data.copy_(theta.to(device=device, dtype=model.exp29.theta.dtype))
+        if hasattr(model.exp29, "theta_quality_mf1"):
+            model.exp29.theta_quality_mf1.copy_(torch.tensor(candidate_quality["mF1"], device=model.exp29.theta_quality_mf1.device))
+            model.exp29.theta_pred_positive_rate.copy_(torch.tensor(candidate_quality["pred_positive_rate"], device=model.exp29.theta_pred_positive_rate.device))
+            model.exp29.theta_last_epoch.copy_(torch.tensor(-1 if epoch is None else int(epoch), device=model.exp29.theta_last_epoch.device))
+    active_theta = theta if accepted else current_theta
+    calibrated = logits - active_theta.view(1, -1)
     payload = {
         "available": True,
         "stage": stage,
@@ -335,13 +359,20 @@ def _maybe_initialize_exp29_train_calibration(
         "source_split": "train",
         "max_samples": max_samples,
         "used_samples": int(logits.shape[0]),
+        "accepted": bool(accepted),
+        "forced_initial": bool(force_initial),
         "pi_min": pi_min,
         "pi_max": pi_max,
         "deploy_logit_margin": deploy_logit_margin,
+        "min_pred_positive_rate": min_pred_positive_rate,
+        "accept_mf1_tolerance": accept_mf1_tolerance,
+        "max_global_pred_rate": max_global_pred_rate,
         "theta_mean": float(theta.mean()),
         "theta_min": float(theta.min()),
         "theta_max": float(theta.max()),
         "target_rate_mean": float(rates.mean()),
+        "candidate_quality": candidate_quality,
+        "current_quality": current_quality,
         "calibrated_pred_positive_rate_at_0p5": float((torch.sigmoid(calibrated) >= 0.5).float().mean()),
     }
     write_json(artifact_path, payload)
@@ -354,6 +385,83 @@ def _git_head() -> str:
         return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     except Exception:
         return "unknown"
+
+
+def _nested_float(mapping: dict, path: tuple[str, ...], default: float = 0.0) -> float:
+    current = mapping
+    for key in path:
+        if not isinstance(current, dict) or key not in current:
+            return default
+        current = current[key]
+    try:
+        value = float(current)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(value):
+        return default
+    return value
+
+
+def epoch_metric_blockers(
+    metrics: dict,
+    max_memory_reserved_gib: float | None = None,
+    hard_memory_cap_gib: float = 46.0,
+    min_expcal_pred_rate: float = 0.02,
+    max_expcal_pred_rate: float = 0.75,
+    min_predicate_positive_rate: float = 1e-5,
+    max_identity_error: float = 1e-6,
+    min_flow_delta_abs_mean: float = 1e-8,
+) -> list[str]:
+    """Return hard blockers that make a formal epoch invalid to continue."""
+    blockers: list[str] = []
+    expcal_rate = _nested_float(metrics, ("innovation", "exp29_calibrated_pred_positive_rate_0p5"), -1.0)
+    if expcal_rate < min_expcal_pred_rate or expcal_rate > max_expcal_pred_rate:
+        blockers.append(
+            "exp29_calibrated_pred_positive_rate_0p5="
+            f"{expcal_rate:.6f} outside [{min_expcal_pred_rate:.6f},{max_expcal_pred_rate:.6f}]"
+        )
+    predicate_rate = _nested_float(metrics, ("innovation", "predicate_positive_rate"), 0.0)
+    if predicate_rate <= min_predicate_positive_rate:
+        blockers.append(f"predicate_positive_rate={predicate_rate:.6f} <= {min_predicate_positive_rate:.6f}")
+    identity_error = _nested_float(metrics, ("innovation", "ledger_identity_error"), 0.0)
+    if abs(identity_error) > max_identity_error:
+        blockers.append(f"ledger_identity_error={identity_error:.8f} > {max_identity_error:.8f}")
+    flow_delta = _nested_float(metrics, ("innovation", "ledger_flow_delta_abs_mean"), 0.0)
+    if flow_delta <= min_flow_delta_abs_mean:
+        blockers.append(f"ledger_flow_delta_abs_mean={flow_delta:.8f} <= {min_flow_delta_abs_mean:.8f}")
+    expcal_mf1 = _nested_float(metrics, ("ExpCal_mF1",), 0.0)
+    exp_map = _nested_float(metrics, ("Exp_mAP",), 0.0)
+    if expcal_mf1 == 0.0 and exp_map > 0.0:
+        blockers.append(f"ExpCal_mF1=0 while Exp_mAP={exp_map:.6f} indicates ranking signal but fixed deploy collapse")
+    if max_memory_reserved_gib is not None and max_memory_reserved_gib > hard_memory_cap_gib:
+        blockers.append(f"memory_reserved_gib={max_memory_reserved_gib:.3f} > hard_cap_gib={hard_memory_cap_gib:.3f}")
+    return blockers
+
+
+def _write_epoch_failure_debug_report(
+    out_dir: Path,
+    epoch: int,
+    blockers: list[str],
+    metrics: dict,
+    loss_rows: list[dict],
+    max_memory_reserved_gib: float,
+) -> None:
+    latest_loss = loss_rows[-1] if loss_rows else {}
+    report = {
+        "epoch": epoch,
+        "blockers": blockers,
+        "metrics_core": {
+            key: metrics.get(key)
+            for key in ("joint", "Act_mAcc", "Act_oAcc", "Exp_mF1", "Exp_oF1", "Exp_mAP", "ExpRaw_mF1", "ExpCal_mF1")
+        },
+        "action": metrics.get("action", {}),
+        "innovation": metrics.get("innovation", {}),
+        "latest_loss": latest_loss,
+        "max_memory_reserved_gib": max_memory_reserved_gib,
+        "debug_reason": "formal epoch sanity guard stopped a run whose intermediate paths indicate invalid training/evaluation behavior",
+    }
+    write_json(out_dir / f"epoch_{epoch:03d}_failure_debug_report.json", report)
+    write_json(out_dir / "epoch_failure_debug_report.json", report)
 
 
 def main() -> None:
@@ -595,13 +703,34 @@ def main() -> None:
             "exp29_raw_fixed_mAP": float(metrics.get("exp29_raw_fixed", {}).get("Exp_mAP", 0.0)),
             "exp29_calibrated_fixed_mAP": float(metrics.get("exp29_calibrated_fixed", {}).get("Exp_mAP", 0.0)),
         })
+        max_memory_reserved_gib = 0.0
         if device.type == "cuda":
+            max_memory_reserved_gib = torch.cuda.max_memory_reserved() / (1024 ** 3)
             append_jsonl(out_dir / "gpu_memory.jsonl", {
                 "epoch": epoch,
                 "max_memory_allocated_gib": torch.cuda.max_memory_allocated() / (1024 ** 3),
-                "max_memory_reserved_gib": torch.cuda.max_memory_reserved() / (1024 ** 3),
+                "max_memory_reserved_gib": max_memory_reserved_gib,
             })
         _write_epoch_artifacts(out_dir, epoch, metrics, output, model, epoch_loss_rows, epoch_grad_rows, influence)
+        guard_cfg = cfg.get("training", {}).get("epoch_sanity_guard", {})
+        guard_enabled = bool(guard_cfg.get("enabled", True))
+        min_eval_samples = int(guard_cfg.get("min_eval_samples", 128))
+        hard_memory_cap_gib = float(cfg.get("profile", {}).get("hard_peak_reserved_limit_gib", guard_cfg.get("hard_memory_cap_gib", 46.0)))
+        if guard_enabled and len(test_ds) >= min_eval_samples:
+            blockers = epoch_metric_blockers(
+                metrics,
+                max_memory_reserved_gib=max_memory_reserved_gib,
+                hard_memory_cap_gib=hard_memory_cap_gib,
+                min_expcal_pred_rate=float(guard_cfg.get("min_expcal_pred_rate", 0.02)),
+                max_expcal_pred_rate=float(guard_cfg.get("max_expcal_pred_rate", 0.75)),
+                min_predicate_positive_rate=float(guard_cfg.get("min_predicate_positive_rate", 1e-5)),
+            )
+            if blockers:
+                _write_epoch_failure_debug_report(out_dir, epoch, blockers, metrics, epoch_loss_rows, max_memory_reserved_gib)
+                raise RuntimeError("CALI-Flow++ epoch sanity failed: " + "; ".join(blockers))
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats(device)
         ckpt = {"model": model.state_dict(), "epoch": epoch, "metrics": metrics, "optimizer": opt.state_dict(), "scheduler": sched.state_dict()}
         _atomic_torch_save(ckpt, out_dir / "checkpoint_latest.pth")
         if metrics["joint"] > best_joint:

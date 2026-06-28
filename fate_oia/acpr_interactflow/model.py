@@ -18,6 +18,11 @@ from .types import ACPRInteractFlowPPOutput
 from .visual_encoder import InteractVisualEncoder
 
 
+def bounded_exp29_calalign_delta(calibrated_logits: torch.Tensor, raw_logits: torch.Tensor, max_delta: float = 0.05) -> torch.Tensor:
+    """Keep learned Exp29 CalAlign from overriding train-only deploy theta."""
+    return (calibrated_logits - raw_logits).clamp(-max_delta, max_delta)
+
+
 class ACPRInteractFlowPPModel(nn.Module):
     """Formal PSI model. It does not instantiate legacy OIA model or dataset classes."""
 
@@ -170,7 +175,7 @@ class ACPRInteractFlowPPModel(nn.Module):
                 action_logits=ledger.final_logits,
             )
             cal = self.calalign(ledger.final_logits, exp29.logits)
-        exp29_logits_calibrated = exp29.logits_calibrated + (cal["exp29_logits_calibrated"] - exp29.logits).clamp(-0.25, 0.25)
+        exp29_logits_calibrated = exp29.logits_calibrated + bounded_exp29_calalign_delta(cal["exp29_logits_calibrated"], exp29.logits, max_delta=0.05)
         aux = {
             "action_logits_calibrated": cal["action_logits_calibrated"],
             "exp29_logits_calibrated": exp29_logits_calibrated,

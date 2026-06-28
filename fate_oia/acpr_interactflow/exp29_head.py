@@ -32,6 +32,9 @@ class Exp29Head(nn.Module):
         self.theta = nn.Parameter(torch.zeros(exp_dim))
         self.delta_scale = nn.Parameter(torch.zeros(exp_dim))
         self.register_buffer("cluster_reliability_prior", torch.ones(exp_dim), persistent=True)
+        self.register_buffer("theta_quality_mf1", torch.tensor(-1.0), persistent=True)
+        self.register_buffer("theta_pred_positive_rate", torch.tensor(0.0), persistent=True)
+        self.register_buffer("theta_last_epoch", torch.tensor(-1), persistent=True)
         prior = torch.full((exp_dim, max_factors), 1.0 / max(1, max_factors))
         self.register_buffer("cluster_to_state_prior_full", prior, persistent=True)
 
