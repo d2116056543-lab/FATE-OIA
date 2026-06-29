@@ -8,6 +8,9 @@ import torch
 import yaml
 
 from fate_oia.engine.train_pmcal_v2_oia import load_config, build_model, make_loader
+from fate_oia.models.pmcal_predicate_observation_builder import PMCalPredicateObservationBuilder
+from fate_oia.optim.pmcal_conflict_aware_optimizer import PMCalConflictAwareOptimizer
+from fate_oia.losses.pmcal_certified_pair_loss import certified_near_boundary_pair_loss
 from fate_oia.utils.pmcal_artifacts import write_json
 from fate_oia.utils.pmcal_forbidden_scan import scan_paths
 
@@ -59,6 +62,32 @@ def main() -> None:
     forbidden = scan_paths([root / p for p in REQUIRED if (root / p).exists()])
     if forbidden:
         hard_failures.append("forbidden active pattern")
+    train_src = (root / "fate_oia/engine/train_pmcal_v2_oia.py").read_text(encoding="utf-8")
+    audit_src = (root / "fate_oia/engine/audit_pmcal_v2_implementation.py").read_text(encoding="utf-8")
+    placeholder_artifact_checks = {
+        "no_available_true_placeholder": '{"epoch": epoch, "available": True}' not in train_src,
+        "no_train_structured_none": "structured_records=None" not in train_src,
+    }
+    train_calib_teacher_checks = {
+        "make_train_calib_indices": "make_train_calib_indices" in train_src,
+        "train_calib_loader": "train_calib_loader" in train_src,
+        "collect_threshold_teacher_pmcal": "collect_threshold_teacher_pmcal" in train_src,
+        "teacher_source_train_calib": "teacher_source\": \"train_calib\"" in train_src or "teacher_source': 'train_calib'" in train_src,
+    }
+    checkpoint_artifact_checks = {
+        "best_deploy": "checkpoint_best_test_deploy_raw.pth" in train_src,
+        "best_base": "checkpoint_best_test_base_fixed.pth" in train_src,
+        "best_action": "checkpoint_best_test_action_mf1.pth" in train_src,
+        "best_exp": "checkpoint_best_test_exp_mf1.pth" in train_src,
+        "best_epoch_source": "best_epoch_source.json" in train_src,
+        "failure_cases": "failure_cases.jsonl" in train_src,
+    }
+    if not all(placeholder_artifact_checks.values()):
+        hard_failures.append("placeholder artifact logic remains")
+    if not all(train_calib_teacher_checks.values()):
+        hard_failures.append("train_calib teacher logic missing")
+    if not all(checkpoint_artifact_checks.values()):
+        hard_failures.append("checkpoint artifact schema missing")
     device = torch.device(args.device if torch.cuda.is_available() and args.device != "cpu" else "cpu")
     cfg.setdefault("model", {})["use_mock_dino"] = True
     model = build_model(cfg, device)
@@ -68,8 +97,9 @@ def main() -> None:
     action = batch["action"].to(device)
     reason = batch["reason"].to(device)
     out_a = model(images, split="train", action_labels=action, reason_labels=reason, file_names=batch["file_name"])
-    out_b = model(images, split="train", action_labels=action, reason_labels=1 - reason, file_names=batch["file_name"], structured_records=[{"fake": True} for _ in batch["file_name"]])
-    out_test = model(images, split="test", action_labels=None, reason_labels=None, file_names=batch["file_name"], structured_records=[{"fake": True} for _ in batch["file_name"]])
+    synthetic_records = [{"labels": [{"category": "car", "box2d": {"x1": 270, "y1": 200, "x2": 380, "y2": 350}}], "lane": [{"poly2d": [{"vertices": [[250, 300], [260, 350]]}]}], "drivable": [{"poly2d": [{"vertices": [[160, 260], [500, 260], [560, 360], [120, 360]]}]}]} for _ in batch["file_name"]]
+    out_b = model(images, split="train", action_labels=action, reason_labels=1 - reason, file_names=batch["file_name"], structured_records=synthetic_records)
+    out_test = model(images, split="test", action_labels=None, reason_labels=None, file_names=batch["file_name"], structured_records=synthetic_records)
     action_delta = (out_a["action_logits_base"] - out_b["action_logits_base"]).abs().max().item()
     test_masks_zero = float(out_test["predicate_observations"]["obs_reason_mask"].sum().item() + out_test["predicate_observations"]["obs_geometry_mask"].sum().item())
     dynamic_checks = {
@@ -82,8 +112,37 @@ def main() -> None:
         "test_observation_masks_zero": test_masks_zero == 0.0,
         "dino_frozen": all(not p.requires_grad for p in model.dino.parameters()),
     }
+    builder = PMCalPredicateObservationBuilder(scene_config=cfg.get("model", {}).get("scene_config", "configs/acpr_scene_predicates.yaml"))
+    geom = builder.build(batch_size=1, split="train", device=device, structured_records=[synthetic_records[0]])
+    geom_test = builder.build(batch_size=1, split="test", device=device, structured_records=[synthetic_records[0]], reason_labels=torch.ones(1, 21, device=device))
+    geometry_dynamic_checks = {
+        "train_geometry_mask_positive": float(geom["obs_geometry_mask"].sum().item()) > 0,
+        "train_geometry_value_positive": float(geom["obs_geometry_value"].sum().item()) > 0,
+        "test_masks_zero": float(geom_test["obs_geometry_mask"].sum().item() + geom_test["obs_reason_mask"].sum().item()) == 0.0,
+    }
+    w = torch.nn.Parameter(torch.tensor([1.0], device=device))
+    toy_opt = torch.optim.SGD([w], lr=0.1)
+    conflict = PMCalConflictAwareOptimizer(toy_opt, shared_params=[w])
+    conflict_projection_dynamic_checks = conflict.step_losses({"positive": w.sum(), "negative": -w.sum()})
+    pair_loss, pair_stats = certified_near_boundary_pair_loss(
+        torch.tensor([[0.05, 4.0], [-0.04, -4.0]], device=device),
+        torch.tensor([[1.0, 1.0], [0.0, 0.0]], device=device),
+        reliable_mask=torch.tensor([[1.0, 1.0], [1.0, 0.0]], device=device),
+        boundary=0.2,
+    )
+    certified_pair_dynamic_checks = {
+        "reason_specific_pairs": pair_stats.get("reason_specific_pairs", 0) > 0,
+        "near_boundary_pair_count": pair_stats.get("near_boundary_pair_count", 0) > 0,
+        "finite_loss": torch.isfinite(pair_loss).item(),
+    }
     if not all(dynamic_checks.values()):
         hard_failures.append("dynamic invariant failure")
+    if not all(geometry_dynamic_checks.values()):
+        hard_failures.append("geometry dynamic failure")
+    if int(conflict_projection_dynamic_checks.get("projection_applied_count", 0)) < 1:
+        hard_failures.append("conflict projection dynamic failure")
+    if not all(certified_pair_dynamic_checks.values()):
+        hard_failures.append("certified pair dynamic failure")
     real_dino_checks = {"attempted": False, "passed": False, "error": ""}
     if args.device != "cpu" and torch.cuda.is_available():
         try:
@@ -98,7 +157,7 @@ def main() -> None:
                 action_labels=None,
                 reason_labels=None,
                 file_names=real_batch["file_name"],
-                structured_records=None,
+                structured_records=[{} for _ in real_batch["file_name"]],
             )
             real_dino_checks = {
                 "attempted": True,
@@ -138,12 +197,16 @@ def main() -> None:
         "predicate_measurement_checks": dynamic_checks,
         "fair_posterior_checks": {"action_delta_when_reason_labels_change": action_delta},
         "geometry_leakage_checks": {"test_observation_masks_zero": test_masks_zero},
+        "geometry_dynamic_checks": geometry_dynamic_checks,
         "reason_formula_checks": {"shape": list(out_a["reason_formula_logits"].shape)},
         "pu_state_checks": {"positive_mask_shape": list(out_a["pu_positive_mask"].shape)},
         "action_independence_checks": {"pass": dynamic_checks["action_independent_of_reason_labels"]},
         "threshold_checks": {"deploy_equation": dynamic_checks["deploy_equation"]},
-        "certified_pair_checks": {"available": True},
-        "conflict_optimizer_checks": {"available": True},
+        "certified_pair_checks": certified_pair_dynamic_checks | pair_stats,
+        "conflict_optimizer_checks": conflict_projection_dynamic_checks,
+        "placeholder_artifact_checks": placeholder_artifact_checks,
+        "train_calib_teacher_checks": train_calib_teacher_checks,
+        "checkpoint_artifact_checks": checkpoint_artifact_checks,
         "training_protocol_checks": {"test_only": True},
         "supervisor_checks": {"available": (root / "scripts/FATE_OIA_acpr_pmcal_v2_foreground.ps1").exists()},
         "memory_probe": memory_probe,

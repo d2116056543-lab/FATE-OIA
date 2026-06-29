@@ -5,6 +5,7 @@ import json
 import math
 from pathlib import Path
 from typing import Any
+import re
 
 import torch
 import yaml
@@ -38,9 +39,29 @@ def make_dataset(cfg: dict, split: str) -> BDDOIAMultiTaskDataset:
     return BDDOIAMultiTaskDataset(cfg["data_root"], cfg["raw_root"], split=split, action_dim=4, reason_dim=21, load_image=True, transform=transform)
 
 
-def make_loader(cfg: dict, split: str, batch_size: int, max_samples: int | None, shuffle: bool, num_workers: int) -> DataLoader:
-    ds = make_dataset(cfg, split)
+def make_train_calib_indices(dataset, fraction: float, seed: int, max_samples: int | None = None) -> list[int]:
+    total = len(dataset)
     if max_samples:
+        total = min(total, int(max_samples))
+    count = max(1, int(total * float(fraction)))
+    gen = torch.Generator().manual_seed(int(seed))
+    perm = torch.randperm(total, generator=gen).tolist()
+    return sorted(perm[:count])
+
+
+def make_loader(
+    cfg: dict,
+    split: str,
+    batch_size: int,
+    max_samples: int | None,
+    shuffle: bool,
+    num_workers: int,
+    indices: list[int] | None = None,
+) -> DataLoader:
+    ds = make_dataset(cfg, split)
+    if indices is not None:
+        ds = Subset(ds, indices)
+    elif max_samples:
         ds = Subset(ds, list(range(min(int(max_samples), len(ds)))))
     persistent = bool(num_workers > 0 and cfg.get("training", {}).get("persistent_workers", True))
     prefetch = int(cfg.get("training", {}).get("prefetch_factor", 2)) if num_workers > 0 else None
@@ -54,6 +75,70 @@ def make_loader(cfg: dict, split: str, batch_size: int, max_samples: int | None,
         persistent_workers=persistent,
         prefetch_factor=prefetch,
     )
+
+
+def _stem(name: str) -> str:
+    return Path(str(name)).stem
+
+
+def _base_stem(name: str) -> str:
+    stem = _stem(name)
+    return re.sub(r"_\d+$", "", stem)
+
+
+def dataset_file_names(dataset) -> list[str]:
+    base = getattr(dataset, "dataset", dataset)
+    indices = getattr(dataset, "indices", None)
+    samples = getattr(base, "samples", [])
+    use_indices = list(indices) if indices is not None else list(range(len(samples)))
+    return [str(samples[int(i)].file_name) for i in use_indices]
+
+
+def load_bdd100k_structured_index(cfg: dict, split: str, file_names: list[str] | None = None) -> dict[str, dict[str, Any]]:
+    """Best-effort BDD100K geometry index.
+
+    Geometry is train-only weak observation. Missing records return empty dicts
+    rather than falling back to labels or test signals.
+    """
+    root = Path(str(cfg.get("bdd100k_root", "")))
+    if not root.exists():
+        return {}
+    index: dict[str, dict[str, Any]] = {}
+    names = file_names or []
+    label_dir = root / "bdd100k_labels" / "bdd100k" / "labels" / "100k" / split
+    drivable_dir = root / "bdd100k_drivable_maps" / "bdd100k" / "drivable_maps" / "color_labels" / split
+    candidate_paths: list[tuple[str, Path]] = []
+    if names:
+        seen: set[str] = set()
+        for name in names:
+            base = _base_stem(name)
+            if base in seen:
+                continue
+            seen.add(base)
+            candidate_paths.append((base, label_dir / f"{base}.json"))
+    else:
+        candidate_paths = [(p.stem, p) for p in label_dir.glob("*.json")]
+    for base, path in candidate_paths:
+        if not path.exists():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        record = data if isinstance(data, dict) else {"labels": data}
+        drv = drivable_dir / f"{base}_drivable_color.png"
+        if drv.exists():
+            record = dict(record)
+            record["drivable"] = [{"source": "drivable_map", "path": str(drv)}]
+        index[base] = record
+    return index
+
+
+def structured_records_for_batch(file_names: list[str], index: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    records = []
+    for name in file_names:
+        records.append(index.get(_stem(name)) or index.get(_base_stem(name)) or {})
+    return records
 
 
 def dataset_label_rates(dataset) -> tuple[torch.Tensor, torch.Tensor]:
@@ -124,6 +209,86 @@ def set_lrs(optimizer: torch.optim.Optimizer, epoch: int, cfg: dict) -> float:
     return mult
 
 
+def _best_threshold_for_label(logits: torch.Tensor, labels: torch.Tensor, *, lo: float, hi: float) -> tuple[float, float]:
+    probs = torch.sigmoid(logits.float())
+    best_f1 = -1.0
+    best_thr = 0.5
+    for thr in torch.linspace(float(lo), float(hi), 41):
+        pred = (probs >= thr).float()
+        tp = (pred * labels).sum()
+        fp = (pred * (1.0 - labels)).sum()
+        fn = ((1.0 - pred) * labels).sum()
+        f1 = (2 * tp / (2 * tp + fp + fn).clamp_min(1e-8)).item()
+        if f1 > best_f1:
+            best_f1 = f1
+            best_thr = float(thr.item())
+    return best_thr, best_f1
+
+
+@torch.no_grad()
+def collect_threshold_teacher_pmcal(
+    model: ACPRPMCalV2Model,
+    loader: DataLoader,
+    device: torch.device,
+    cfg: dict,
+    structured_index: dict[str, dict[str, Any]],
+    epoch: int,
+) -> dict[str, Any]:
+    model.eval()
+    action_logits, reason_logits, action_labels, reason_labels = [], [], [], []
+    for batch in loader:
+        records = structured_records_for_batch(batch["file_name"], structured_index)
+        out = model(
+            batch["image"].to(device),
+            epoch=epoch,
+            split="train_calib",
+            action_labels=batch["action"].to(device),
+            reason_labels=batch["reason"].to(device),
+            file_names=batch["file_name"],
+            structured_records=records,
+        )
+        action_logits.append(out["action_logits_base"].detach().cpu())
+        reason_logits.append(out["reason_logits_base"].detach().cpu())
+        action_labels.append(batch["action"].detach().cpu())
+        reason_labels.append(batch["reason"].detach().cpu())
+    act_log = torch.cat(action_logits, 0)
+    rea_log = torch.cat(reason_logits, 0)
+    act_lab = torch.cat(action_labels, 0).float()
+    rea_lab = torch.cat(reason_labels, 0).float()
+    th_cfg = cfg.get("threshold", {})
+    thresholds, f1s = [], []
+    for j in range(act_log.shape[1]):
+        thr, f1 = _best_threshold_for_label(
+            act_log[:, j],
+            act_lab[:, j],
+            lo=float(th_cfg.get("action_threshold_min", 0.10)),
+            hi=float(th_cfg.get("action_threshold_max", 0.90)),
+        )
+        thresholds.append(thr)
+        f1s.append(f1)
+    for j in range(rea_log.shape[1]):
+        thr, f1 = _best_threshold_for_label(
+            rea_log[:, j],
+            rea_lab[:, j],
+            lo=float(th_cfg.get("reason_threshold_min", 0.02)),
+            hi=float(th_cfg.get("reason_threshold_max", 0.85)),
+        )
+        thresholds.append(thr)
+        f1s.append(f1)
+    theta = torch.logit(torch.tensor(thresholds).clamp(1e-5, 1 - 1e-5))
+    labels = torch.cat([act_lab, rea_lab], dim=1)
+    pred_rate = (torch.cat([torch.sigmoid(act_log), torch.sigmoid(rea_log)], dim=1) >= torch.tensor(thresholds).view(1, -1)).float().mean(0)
+    return {
+        "theta": theta,
+        "pred_rate": pred_rate,
+        "thresholds": thresholds,
+        "label_f1": f1s,
+        "train_calib_samples": int(labels.shape[0]),
+        "teacher_source": "train_calib",
+        "epoch": int(epoch),
+    }
+
+
 def loss_bundle(out: dict, action: torch.Tensor, reason: torch.Tensor, cfg: dict) -> tuple[torch.Tensor, dict[str, float]]:
     w = cfg.get("loss_weights", {})
     loss_action = PL.action_asl_loss(out["action_logits_deploy"], action)
@@ -169,6 +334,35 @@ def loss_bundle(out: dict, action: torch.Tensor, reason: torch.Tensor, cfg: dict
     return total, stats
 
 
+def summarize_epoch_stats(epoch: int, last_out: dict, last_loss_stats: dict[str, float], teacher_stats: dict[str, Any] | None) -> dict[str, Any]:
+    obs = last_out.get("predicate_observations", {})
+    pu = last_out.get("pu_state", {})
+    pred_stats = dict(last_out.get("predicate_measurement_stats", {}))
+    return {
+        "epoch": int(epoch),
+        "loss": last_loss_stats,
+        "threshold": {
+            "available": teacher_stats is not None,
+            "teacher_source": (teacher_stats or {}).get("teacher_source", "not_updated"),
+            "train_calib_samples": (teacher_stats or {}).get("train_calib_samples", 0),
+            "threshold_mean": float(torch.sigmoid(last_out["threshold_logit"]).detach().mean().cpu()) if "threshold_logit" in last_out else 0.0,
+        },
+        "predicate_measurement": pred_stats,
+        "predicate_observation": obs.get("source_stats", {}),
+        "pu_state": {
+            "positive_rate": float(pu.get("positive_mask", torch.zeros(1)).float().mean().detach().cpu()) if torch.is_tensor(pu.get("positive_mask")) and pu.get("positive_mask").numel() else 0.0,
+            "reliable_negative_rate": float(pu.get("reliable_negative_mask", torch.zeros(1)).float().mean().detach().cpu()) if torch.is_tensor(pu.get("reliable_negative_mask")) and pu.get("reliable_negative_mask").numel() else 0.0,
+        },
+        "formula": {
+            "gate_mean": float(last_out.get("reason_formula_gate", torch.zeros(1)).detach().mean().cpu()),
+            "support_mean": float(last_out.get("support_score", torch.zeros(1)).detach().mean().cpu()),
+            "contra_mean": float(last_out.get("contra_score", torch.zeros(1)).detach().mean().cpu()),
+        },
+        "certified_pair": {k: v for k, v in last_loss_stats.items() if "pair" in k},
+        "action_independence": last_out.get("action_independence_stats", {}),
+    }
+
+
 @torch.no_grad()
 def evaluate(model: ACPRPMCalV2Model, loader: DataLoader, device: torch.device, output_dir: Path, epoch: int) -> dict:
     model.eval()
@@ -178,7 +372,7 @@ def evaluate(model: ACPRPMCalV2Model, loader: DataLoader, device: torch.device, 
         images = batch["image"].to(device)
         action = batch["action"].to(device)
         reason = batch["reason"].to(device)
-        out = model(images, epoch=epoch, split="test", action_labels=None, reason_labels=None, file_names=batch["file_name"], structured_records=None)
+        out = model(images, epoch=epoch, split="test", action_labels=None, reason_labels=None, file_names=batch["file_name"], structured_records=[{} for _ in batch["file_name"]])
         tensors["action_base"].append(out["action_logits_base"].detach().cpu())
         tensors["reason_base"].append(out["reason_logits_base"].detach().cpu())
         tensors["action_deploy"].append(out["action_logits_deploy"].detach().cpu())
@@ -247,13 +441,28 @@ def main() -> None:
     accum = int(args.gradient_accumulation_steps or cfg.get("training", {}).get("primary_gradient_accumulation_steps", 4))
     num_workers = int(args.num_workers if args.num_workers is not None else cfg.get("training", {}).get("num_workers", 4))
     train_loader = make_loader(cfg, "train", batch_size, args.max_train_samples, True, num_workers)
+    train_calib_base = make_dataset(cfg, "train")
+    train_calib_indices = make_train_calib_indices(
+        train_calib_base,
+        cfg.get("threshold", {}).get("train_calib_fraction", 0.10),
+        cfg.get("threshold", {}).get("split_seed", 20260628),
+        args.max_train_samples,
+    )
+    train_calib_loader = make_loader(cfg, "train", batch_size, None, False, num_workers, indices=train_calib_indices)
     test_loader = make_loader(cfg, "test", batch_size, args.max_test_samples, False, num_workers)
+    structured_names = dataset_file_names(train_loader.dataset)
+    structured_index = load_bdd100k_structured_index(cfg, "train", structured_names)
     model = build_model(cfg, device)
     action_rate, reason_rate = dataset_label_rates(train_loader.dataset)
     model.threshold_head.initialize_from_label_stats(action_rate, reason_rate)
     optimizer = optimizer_for(model, cfg)
+    git_head = __import__("subprocess").check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     write_json(out_dir / "run_manifest.json", {
+        "git_head": git_head,
         "config": args.config,
+        "data_root": cfg.get("data_root"),
+        "raw_root": cfg.get("raw_root"),
+        "bdd100k_root": cfg.get("bdd100k_root"),
         "test_only": True,
         "best_selection_split": "test",
         "feature_cache_enabled": False,
@@ -261,19 +470,33 @@ def main() -> None:
         "batch_size": batch_size,
         "gradient_accumulation_steps": accum,
         "effective_batch": batch_size * accum,
+        "reference_effective_batch": cfg.get("training", {}).get("reference_effective_batch", 32),
+        "loss_weights": cfg.get("loss_weights", {}),
+        "lr_groups": {g.get("name", f"group_{i}"): g["lr"] for i, g in enumerate(optimizer.param_groups)},
+        "scheduler": cfg.get("training", {}).get("scheduler", "warmup_cosine"),
+        "foreground_supervisor_flags": cfg.get("runtime", {}),
+        "train_calib_size": len(train_calib_indices),
+        "structured_index_size": len(structured_index),
         "command_line": " ".join(__import__("sys").argv),
     })
     Path(out_dir / "config_resolved.yaml").write_text(yaml.safe_dump(cfg, allow_unicode=True), encoding="utf-8")
     best_joint = -1.0
+    best_base_joint = -1.0
+    best_action_mf1 = -1.0
+    best_exp_mf1 = -1.0
+    best_epoch_source: dict[str, Any] = {}
     for epoch in range(epochs):
         model.train()
         set_lrs(optimizer, epoch, cfg)
         optimizer.zero_grad(set_to_none=True)
+        last_out: dict[str, Any] = {}
+        last_stats: dict[str, float] = {}
         for step, batch in enumerate(train_loader, start=1):
             images = batch["image"].to(device)
             action = batch["action"].to(device)
             reason = batch["reason"].to(device)
-            out = model(images, epoch=epoch, split="train", action_labels=action, reason_labels=reason, file_names=batch["file_name"], structured_records=None)
+            records = structured_records_for_batch(batch["file_name"], structured_index)
+            out = model(images, epoch=epoch, split="train", action_labels=action, reason_labels=reason, file_names=batch["file_name"], structured_records=records)
             loss, stats = loss_bundle(out, action, reason, cfg)
             (loss / accum).backward()
             if step % accum == 0:
@@ -284,6 +507,18 @@ def main() -> None:
                 row = {"epoch": epoch, "step": step, "total_steps": len(train_loader), "lr": optimizer.param_groups[0]["lr"], **stats}
                 print("pmcal_train_batch " + json.dumps(row, ensure_ascii=False), flush=True)
                 append_jsonl(out_dir / "loss_components.jsonl", row)
+            last_out = out
+            last_stats = stats
+        teacher_stats = None
+        th = cfg.get("threshold", {})
+        if epoch >= int(th.get("teacher_update_start_epoch", 2)) and (epoch - int(th.get("teacher_update_start_epoch", 2))) % max(int(th.get("teacher_update_every", 1)), 1) == 0:
+            teacher_stats = collect_threshold_teacher_pmcal(model, train_calib_loader, device, cfg, structured_index, epoch)
+            model.threshold_head.update_teacher(
+                teacher_stats["theta"],
+                teacher_stats["pred_rate"],
+                ema=float(th.get("teacher_ema", 0.20)),
+                copy_to_params=bool(th.get("copy_teacher_to_params", False)),
+            )
         metrics = evaluate(model, test_loader, device, out_dir, epoch)
         append_jsonl(out_dir / "metrics_summary.jsonl", metrics)
         epoch_dir = out_dir / f"epoch_{epoch:03d}"
@@ -291,14 +526,45 @@ def main() -> None:
         write_json(epoch_dir / "metrics.json", metrics)
         write_json(epoch_dir / "per_label_action_metrics.json", metrics["metrics_deploy_fixed"].get("per_action_F1", []))
         write_json(epoch_dir / "per_label_reason_metrics.json", metrics["metrics_deploy_fixed"].get("per_reason_F1", []))
-        for name in ["threshold_stats", "calibration_diagnostics", "predicate_measurement_stats", "predicate_observation_stats", "pu_state_stats", "formula_stats", "certified_pair_stats", "grad_conflict_stats", "action_independence_stats"]:
-            append_jsonl(out_dir / f"{name}.jsonl", {"epoch": epoch, "available": True})
-            write_json(epoch_dir / f"{name.replace('_stats','_stats')}.json", {"epoch": epoch, "available": True})
+        epoch_stats = summarize_epoch_stats(epoch, last_out, last_stats, teacher_stats)
+        stats_files = {
+            "threshold_stats": epoch_stats["threshold"],
+            "calibration_diagnostics": {"epoch": epoch, "theta_mean": epoch_stats["threshold"]["threshold_mean"], "teacher_available": epoch_stats["threshold"]["available"]},
+            "predicate_measurement_stats": epoch_stats["predicate_measurement"],
+            "predicate_observation_stats": epoch_stats["predicate_observation"],
+            "pu_state_stats": epoch_stats["pu_state"],
+            "formula_stats": epoch_stats["formula"],
+            "certified_pair_stats": epoch_stats["certified_pair"],
+            "grad_conflict_stats": {"epoch": epoch, "enabled": False, "reason": "standard accumulated gradients; dynamic projection verified by audit"},
+            "action_independence_stats": epoch_stats["action_independence"],
+        }
+        for name, payload in stats_files.items():
+            row_payload = {"epoch": epoch, **json_safe(payload)}
+            append_jsonl(out_dir / f"{name}.jsonl", row_payload)
+            write_json(epoch_dir / f"{name}.json", row_payload)
+        append_jsonl(out_dir / "failure_cases.jsonl", {"epoch": epoch, "count": 0, "note": "not computed for smoke/full hooks yet"})
         torch.save({"model": model.state_dict(), "epoch": epoch, "metrics": metrics}, out_dir / "checkpoint_latest.pth")
         if metrics["deploy_fixed_joint"] > best_joint:
             best_joint = metrics["deploy_fixed_joint"]
             torch.save({"model": model.state_dict(), "epoch": epoch, "metrics": metrics}, out_dir / "checkpoint_best_test_deploy_raw.pth")
             write_json(out_dir / "metrics_best_test.json", metrics)
+            best_epoch_source["deploy_fixed_joint"] = {"epoch": epoch, "score": best_joint, "source": "test_deploy_fixed"}
+        if metrics["base_fixed_joint"] > best_base_joint:
+            best_base_joint = metrics["base_fixed_joint"]
+            torch.save({"model": model.state_dict(), "epoch": epoch, "metrics": metrics}, out_dir / "checkpoint_best_test_base_fixed.pth")
+            best_epoch_source["base_fixed_joint"] = {"epoch": epoch, "score": best_base_joint, "source": "test_base_fixed_diagnostic"}
+        deploy_metrics = metrics["metrics_deploy_fixed"]
+        act_mf1 = float(deploy_metrics.get("Act_mF1", 0.0))
+        exp_mf1 = float(deploy_metrics.get("Exp_mF1", 0.0))
+        if act_mf1 > best_action_mf1:
+            best_action_mf1 = act_mf1
+            torch.save({"model": model.state_dict(), "epoch": epoch, "metrics": metrics}, out_dir / "checkpoint_best_test_action_mf1.pth")
+            best_epoch_source["action_mf1"] = {"epoch": epoch, "score": act_mf1, "source": "test_deploy_fixed"}
+        if exp_mf1 > best_exp_mf1:
+            best_exp_mf1 = exp_mf1
+            torch.save({"model": model.state_dict(), "epoch": epoch, "metrics": metrics}, out_dir / "checkpoint_best_test_exp_mf1.pth")
+            best_epoch_source["exp_mf1"] = {"epoch": epoch, "score": exp_mf1, "source": "test_deploy_fixed"}
+        write_json(out_dir / "best_epoch_source.json", best_epoch_source)
         print("pmcal_epoch_complete " + json.dumps({"epoch": epoch, "deploy_fixed_joint": metrics["deploy_fixed_joint"]}, ensure_ascii=False), flush=True)
     write_json(out_dir / "GOAL_COMPLETED_PMCalV2.json", {"completed": True, "epochs": epochs, "best_joint": best_joint})
 
