@@ -11,7 +11,16 @@ from .acpr_ntmcal_text_atoms import NativeTextAtomEncoder
 
 
 class NativeTextTopKPredicateMeasurement(nn.Module):
-    def __init__(self, predicate_bank: NativePredicateBank, atom_encoder: NativeTextAtomEncoder, dim: int = 384, selected_layers: tuple[int, ...] = (3, 7, 11), topk: int = 64, temperature_min: float = 0.2, temperature_max: float = 5.0) -> None:
+    def __init__(
+        self,
+        predicate_bank: NativePredicateBank,
+        atom_encoder: NativeTextAtomEncoder,
+        dim: int = 384,
+        selected_layers: tuple[int, ...] = (3, 7, 11),
+        topk: int = 64,
+        temperature_min: float = 0.2,
+        temperature_max: float = 5.0,
+    ) -> None:
         super().__init__()
         self.predicate_bank = predicate_bank
         self.atom_encoder = atom_encoder
@@ -29,7 +38,6 @@ class NativeTextTopKPredicateMeasurement(nn.Module):
         self.log_temperature = nn.Parameter(torch.zeros(len(predicate_bank.specs)))
 
     def _region_prior(self, region_masks: dict[str, torch.Tensor] | None, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        p = len(self.predicate_bank.specs)
         n = 3600
         rows = []
         for spec in self.predicate_bank.specs:
@@ -56,10 +64,12 @@ class NativeTextTopKPredicateMeasurement(nn.Module):
         flat_score = score.flatten(start_dim=2)
         k = min(self.topk, flat_score.shape[-1])
         topk_score, topk_idx = flat_score.topk(k=k, dim=-1)
+
+        # Gather only selected predicate evidence tokens. Do not expand values to [B,P,L*N,D].
         flat_values = values.reshape(b, l * n, d)
-        gather_idx = topk_idx.unsqueeze(-1).expand(-1, -1, -1, d)
-        expanded_values = flat_values.unsqueeze(1).expand(-1, p, -1, -1)
-        topk_value = torch.gather(expanded_values, 2, gather_idx)
+        batch_idx = torch.arange(b, device=flat_values.device).view(b, 1, 1)
+        topk_value = flat_values[batch_idx, topk_idx]
+
         tau = self.log_temperature.exp().clamp(self.temperature_min, self.temperature_max).view(1, p, 1)
         attn = entmax15_bisect(topk_score / tau, dim=-1)
         h_pred = torch.einsum("bpk,bpkd->bpd", attn, topk_value)
@@ -69,7 +79,10 @@ class NativeTextTopKPredicateMeasurement(nn.Module):
         layer_idx = torch.div(topk_idx, n, rounding_mode="floor")
         layer_consistency = torch.nn.functional.one_hot(layer_idx.clamp_max(l - 1), num_classes=l).float().mean(-2).max(-1).values
         region_mass = attn.sum(-1)
-        rho_in = torch.cat([h_pred, q_logit.abs().unsqueeze(-1), entropy.unsqueeze(-1), region_mass.unsqueeze(-1), layer_consistency.unsqueeze(-1)], dim=-1)
+        rho_in = torch.cat(
+            [h_pred, q_logit.abs().unsqueeze(-1), entropy.unsqueeze(-1), region_mass.unsqueeze(-1), layer_consistency.unsqueeze(-1)],
+            dim=-1,
+        )
         rho_pred = torch.sigmoid(self.rho_head(rho_in).squeeze(-1))
         stats = {
             "predicate_support_size": float((attn > 1e-5).float().sum(-1).mean().detach().cpu()),
@@ -85,4 +98,12 @@ class NativeTextTopKPredicateMeasurement(nn.Module):
             "predicate_rho_max": float(rho_pred.max().detach().cpu()),
             "dense_bpnd_materialized": False,
         }
-        return {"predicate_q": q_pred, "predicate_rho": rho_pred, "predicate_tokens": h_pred, "predicate_topk_indices": topk_idx, "predicate_topk_attention": attn, "predicate_region_mass": region_mass, "predicate_stats": stats}
+        return {
+            "predicate_q": q_pred,
+            "predicate_rho": rho_pred,
+            "predicate_tokens": h_pred,
+            "predicate_topk_indices": topk_idx,
+            "predicate_topk_attention": attn,
+            "predicate_region_mass": region_mass,
+            "predicate_stats": stats,
+        }

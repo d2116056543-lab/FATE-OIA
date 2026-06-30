@@ -25,11 +25,31 @@ class NativeTextObservationBuilder:
             for name in r.get("contra_predicates", []):
                 self.contra[rid, self.bank.name_to_id[name]] = 1.0
 
-    def __call__(self, reason_labels: torch.Tensor | None, *, file_names=None, structured_records=None, split: str = "train") -> dict[str, torch.Tensor | dict]:
+    def __call__(
+        self,
+        reason_labels: torch.Tensor | None,
+        *,
+        file_names=None,
+        structured_records=None,
+        split: str = "train",
+        batch_size: int | None = None,
+        device: torch.device | None = None,
+    ) -> dict[str, torch.Tensor | dict]:
         p = len(self.bank.specs)
         if split != "train" or reason_labels is None:
-            b = 1 if reason_labels is None else int(reason_labels.shape[0])
-            return {"obs_value": torch.zeros(b, p), "obs_mask": torch.zeros(b, p), "obs_soft_negative": torch.zeros(b, p), "source_stats": {"test_ignored": True, "text_obs_positive_count": 0, "text_obs_unknown_count": int(b * p)}}
+            b = int(batch_size or (reason_labels.shape[0] if reason_labels is not None else 1))
+            dev = device or (reason_labels.device if reason_labels is not None else torch.device("cpu"))
+            return {
+                "obs_value": torch.zeros(b, p, device=dev),
+                "obs_mask": torch.zeros(b, p, device=dev),
+                "obs_soft_negative": torch.zeros(b, p, device=dev),
+                "source_stats": {
+                    "test_ignored": True,
+                    "text_obs_positive_count": 0,
+                    "text_obs_soft_negative_count": 0,
+                    "text_obs_unknown_count": int(b * p),
+                },
+            }
         device = reason_labels.device
         support = self.support.to(device)
         contra = self.contra.to(device)
@@ -38,4 +58,14 @@ class NativeTextObservationBuilder:
         mask = (pos + soft_neg).clamp(0, 1)
         value = pos
         unk = (1.0 - mask).clamp(0, 1)
-        return {"obs_value": value, "obs_mask": mask, "obs_soft_negative": soft_neg, "source_stats": {"test_ignored": False, "text_obs_positive_count": int(pos.sum().detach().cpu()), "text_obs_soft_negative_count": int(soft_neg.sum().detach().cpu()), "text_obs_unknown_count": int(unk.sum().detach().cpu())}}
+        return {
+            "obs_value": value,
+            "obs_mask": mask,
+            "obs_soft_negative": soft_neg,
+            "source_stats": {
+                "test_ignored": False,
+                "text_obs_positive_count": int(pos.sum().detach().cpu()),
+                "text_obs_soft_negative_count": int(soft_neg.sum().detach().cpu()),
+                "text_obs_unknown_count": int(unk.sum().detach().cpu()),
+            },
+        }
