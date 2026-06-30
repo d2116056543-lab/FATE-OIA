@@ -115,9 +115,11 @@ def main() -> None:
     ap.add_argument("--config", required=True); ap.add_argument("--output_dir", required=True)
     ap.add_argument("--epochs", type=int); ap.add_argument("--batch_size", type=int); ap.add_argument("--gradient_accumulation_steps", type=int); ap.add_argument("--num_workers", type=int, default=None)
     ap.add_argument("--max_train_samples", type=int); ap.add_argument("--max_test_samples", type=int); ap.add_argument("--device", default="cuda")
-    ap.add_argument("--test_only", action="store_true"); ap.add_argument("--no_feature_cache", action="store_true"); ap.add_argument("--token_compression", default="none"); ap.add_argument("--require_review_pass", default=None); ap.add_argument("--amp_dtype", default="bf16")
+    ap.add_argument("--test_only", action="store_true"); ap.add_argument("--no_feature_cache", action="store_true"); ap.add_argument("--token_compression", default="none"); ap.add_argument("--require_no_token_compression", action="store_true"); ap.add_argument("--require_review_pass", default=None); ap.add_argument("--amp_dtype", default="bf16")
     args = ap.parse_args()
     cfg = load_config(args.config)
+    if args.require_no_token_compression and args.token_compression != "none":
+        raise SystemExit("NTMCal requires token_compression none when --require_no_token_compression is set")
     if args.token_compression != "none" or not args.no_feature_cache or not args.test_only:
         raise SystemExit("NTMCal requires --test_only --no_feature_cache --token_compression none")
     if args.require_review_pass and not Path(args.require_review_pass).exists():
@@ -193,4 +195,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 

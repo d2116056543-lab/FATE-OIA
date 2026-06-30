@@ -6,3 +6,5 @@ def test_train_protocol_forbids_val_and_cache():
     assert "checkpoint_best_val" not in txt
     assert 'split="test"' in txt
     assert "no_feature_cache" in txt
+    assert "require_no_token_compression" in txt
+    assert "token_compression none" in txt
