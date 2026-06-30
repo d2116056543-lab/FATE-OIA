@@ -1,0 +1,77 @@
+﻿from __future__ import annotations
+
+import torch
+import torch.nn.functional as F
+
+from fate_oia.models.acpr_ntmcal_text_atoms import native_text_structure_loss
+
+
+def action_asl_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    return F.binary_cross_entropy_with_logits(logits, targets.float())
+
+
+def ntmcal_reason_pu_loss(logits: torch.Tensor, reason_targets: torch.Tensor, pu_state: dict, epoch: int) -> torch.Tensor:
+    pos = pu_state["positive_mask"].float()
+    soft_neg = pu_state["soft_negative_weight"].float()
+    hard_neg = pu_state["hard_negative_mask"].float()
+    weight = pos + soft_neg + hard_neg
+    target = pos
+    bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+    if weight.sum() <= 0:
+        return logits.sum() * 0.0
+    return (bce * weight).sum() / weight.sum().clamp_min(1.0)
+
+
+def native_predicate_measurement_loss(q_pred: torch.Tensor, rho_pred: torch.Tensor, observations: dict, epoch: int) -> torch.Tensor:
+    mask = observations["obs_mask"].to(q_pred.device).float()
+    value = observations["obs_value"].to(q_pred.device).float()
+    soft_neg = observations["obs_soft_negative"].to(q_pred.device).float()
+    q = q_pred.float().clamp(1e-5, 1 - 1e-5)
+    pos_loss = -(value.float() * q.log() + (1.0 - value.float()) * (1.0 - q).clamp_min(1e-5).log()) * mask
+    neg_w = soft_neg if epoch >= 3 else torch.zeros_like(soft_neg)
+    neg_loss = -torch.log((1 - q_pred).clamp_min(1e-5)) * neg_w
+    rho_reg = ((rho_pred - 0.5).pow(2)).mean() * 0.01
+    denom = (mask + neg_w).sum().clamp_min(1.0)
+    return (pos_loss + neg_loss).sum() / denom + rho_reg
+
+
+def ntmcal_calibration_loss(out: dict, action_targets: torch.Tensor, reason_targets: torch.Tensor) -> torch.Tensor:
+    return 0.5 * F.binary_cross_entropy_with_logits(out["action_logits_deploy"], action_targets.float()) + 0.5 * ntmcal_reason_pu_loss(out["reason_logits_deploy"], reason_targets, out["pu_state"], 99)
+
+
+def action_predicate_margin_loss(out: dict, action_targets: torch.Tensor, epoch: int) -> torch.Tensor:
+    if epoch < 7:
+        return out["action_logits_deploy"].sum() * 0.0
+    return F.relu(0.1 - out["action_logits_ntmcal"] * (action_targets.float() * 2 - 1)).mean() * out["predicate_q"].mean().detach()
+
+
+def predicate_attention_sparsity_loss(attn: torch.Tensor) -> torch.Tensor:
+    entropy = -(attn.clamp_min(1e-8).log() * attn).sum(-1)
+    return entropy.mean()
+
+
+def schedule_weights(epoch: int) -> dict[str, float]:
+    if epoch <= 2:
+        return {"action": 1.0, "reason": 1.0, "pred": 0.35, "text": 0.10, "cal": 0.15, "res": 0.0, "act_pred": 0.0, "pair": 0.0, "sparse": 0.01}
+    if epoch <= 6:
+        return {"action": 1.0, "reason": 1.0, "pred": 0.30, "text": 0.10, "cal": 0.45, "res": 0.05, "act_pred": 0.0, "pair": 0.0, "sparse": 0.01}
+    if epoch <= 12:
+        return {"action": 1.0, "reason": 1.0, "pred": 0.20, "text": 0.05, "cal": 0.55, "res": 0.05, "act_pred": 0.02, "pair": 0.03, "sparse": 0.005}
+    return {"action": 1.0, "reason": 1.0, "pred": 0.10, "text": 0.02, "cal": 0.60, "res": 0.02, "act_pred": 0.02, "pair": 0.01, "sparse": 0.0}
+
+
+def acpr_ntmcal_loss_bundle(out: dict, action_targets: torch.Tensor, reason_targets: torch.Tensor, epoch: int, cfg: dict) -> tuple[torch.Tensor, dict]:
+    w = schedule_weights(epoch)
+    l_action = action_asl_loss(out["action_logits_deploy"], action_targets)
+    l_reason = ntmcal_reason_pu_loss(out["reason_logits_deploy"], reason_targets, out["pu_state"], epoch)
+    l_pred = native_predicate_measurement_loss(out["predicate_q"], out["predicate_rho"], out["native_text_observations"], epoch)
+    l_text = native_text_structure_loss(out["_atom_encoder"], out["_predicate_specs"])["native_text_structure_loss"] if "_atom_encoder" in out else out["action_logits_deploy"].sum() * 0.0
+    l_cal = ntmcal_calibration_loss(out, action_targets, reason_targets)
+    l_act_pred = action_predicate_margin_loss(out, action_targets, epoch)
+    l_sparse = predicate_attention_sparsity_loss(out["predicate_topk_attention"])
+    main = l_action + l_reason
+    l_pair, pair_stats = out["_pair_memory"].loss(out["reason_logits_deploy"], reason_targets, out["pu_state"], epoch, main_loss=main) if "_pair_memory" in out else (main * 0.0, {})
+    total = w["action"] * l_action + w["reason"] * l_reason + w["pred"] * l_pred + w["text"] * l_text + w["cal"] * l_cal + w["act_pred"] * l_act_pred + w["pair"] * l_pair + w["sparse"] * l_sparse
+    stats = {"loss_total": float(total.detach().cpu()), "loss_action": float(l_action.detach().cpu()), "loss_reason_pu": float(l_reason.detach().cpu()), "loss_predicate_measurement": float(l_pred.detach().cpu()), "loss_native_text_structure": float(l_text.detach().cpu()), "loss_ntmcal_calibration": float(l_cal.detach().cpu()), "loss_action_predicate": float(l_act_pred.detach().cpu()), "loss_pair": float(l_pair.detach().cpu()), "loss_attention_sparsity": float(l_sparse.detach().cpu()), **{f"weight_{k}": v for k, v in w.items()}, **pair_stats}
+    return total, stats
+

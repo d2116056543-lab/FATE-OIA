@@ -1,0 +1,28 @@
+﻿actions:
+  - {id: 0, name: forward, text: "go forward"}
+  - {id: 1, name: stop, text: "stop or slow"}
+  - {id: 2, name: left, text: "turn left or move left"}
+  - {id: 3, name: right, text: "turn right or move right"}
+tail_reason_indices: [12, 9, 5, 14, 6, 11, 10, 13]
+reasons:
+  - {id: 0, name: traffic_light_red, text: "traffic light is red", support_predicates: [traffic_light_visible, traffic_light_red], contra_predicates: [traffic_light_green], compatible_actions: [stop], text_type: traffic_control, polarity: constraint}
+  - {id: 1, name: traffic_light_green, text: "traffic light is green", support_predicates: [traffic_light_visible, traffic_light_green], contra_predicates: [traffic_light_red], compatible_actions: [forward, left, right], text_type: traffic_control, polarity: availability}
+  - {id: 2, name: stop_sign_present, text: "stop sign is present", support_predicates: [traffic_sign_visible, stop_sign_present], contra_predicates: [], compatible_actions: [stop], text_type: traffic_control, polarity: constraint}
+  - {id: 3, name: front_vehicle_close, text: "front vehicle is close", support_predicates: [front_vehicle_close, lead_vehicle_braking], contra_predicates: [front_vehicle_far, road_clear], compatible_actions: [stop], text_type: object, polarity: obstacle}
+  - {id: 4, name: pedestrian_front, text: "pedestrian is in front", support_predicates: [pedestrian_front, crosswalk_region], contra_predicates: [road_clear], compatible_actions: [stop], text_type: object, polarity: obstacle}
+  - {id: 5, name: cyclist_front, text: "cyclist is in front", support_predicates: [cyclist_front], contra_predicates: [road_clear], compatible_actions: [stop], text_type: object, polarity: obstacle}
+  - {id: 6, name: obstacle_front, text: "obstacle is in front", support_predicates: [obstacle_front, low_front_visibility], contra_predicates: [road_clear], compatible_actions: [stop], text_type: object, polarity: obstacle}
+  - {id: 7, name: road_clear, text: "road ahead is clear", support_predicates: [road_clear, drivable_center, front_vehicle_far], contra_predicates: [front_vehicle_close, pedestrian_front, cyclist_front, obstacle_front, road_crowded], compatible_actions: [forward], text_type: road_state, polarity: availability}
+  - {id: 8, name: lane_left_available, text: "left lane is available", support_predicates: [lane_left_available, drivable_left, open_left_gap], contra_predicates: [lane_absent_left, left_solid_boundary, vehicle_left], compatible_actions: [left], text_type: lane, polarity: availability}
+  - {id: 9, name: lane_right_available, text: "right lane is available", support_predicates: [lane_right_available, drivable_right, open_right_gap], contra_predicates: [lane_absent_right, right_solid_boundary, vehicle_right], compatible_actions: [right], text_type: lane, polarity: availability}
+  - {id: 10, name: left_solid_boundary, text: "left boundary is solid", support_predicates: [left_solid_boundary, lane_marking_left_visible], contra_predicates: [lane_left_available, open_left_gap], compatible_actions: [forward, stop], text_type: lane, polarity: constraint}
+  - {id: 11, name: right_solid_boundary, text: "right boundary is solid", support_predicates: [right_solid_boundary, lane_marking_right_visible], contra_predicates: [lane_right_available, open_right_gap], compatible_actions: [forward, stop], text_type: lane, polarity: constraint}
+  - {id: 12, name: lane_absent_left, text: "left lane is absent", support_predicates: [lane_absent_left, left_solid_boundary], contra_predicates: [lane_left_available, open_left_gap], compatible_actions: [forward, stop], text_type: lane, polarity: constraint}
+  - {id: 13, name: lane_absent_right, text: "right lane is absent", support_predicates: [lane_absent_right, right_solid_boundary], contra_predicates: [lane_right_available, open_right_gap], compatible_actions: [forward, stop], text_type: lane, polarity: constraint}
+  - {id: 14, name: open_left_gap, text: "left gap is open", support_predicates: [open_left_gap, left_merge_context], contra_predicates: [left_solid_boundary, lane_absent_left, vehicle_left], compatible_actions: [left], text_type: gap, polarity: availability}
+  - {id: 15, name: open_right_gap, text: "right gap is open", support_predicates: [open_right_gap, right_merge_context], contra_predicates: [right_solid_boundary, lane_absent_right, vehicle_right], compatible_actions: [right], text_type: gap, polarity: availability}
+  - {id: 16, name: vehicle_left, text: "vehicle is on the left", support_predicates: [vehicle_left, parked_vehicle_left], contra_predicates: [open_left_gap], compatible_actions: [forward, stop], text_type: object, polarity: obstacle}
+  - {id: 17, name: vehicle_right, text: "vehicle is on the right", support_predicates: [vehicle_right, parked_vehicle_right], contra_predicates: [open_right_gap], compatible_actions: [forward, stop], text_type: object, polarity: obstacle}
+  - {id: 18, name: crosswalk_region, text: "crosswalk or intersection is ahead", support_predicates: [crosswalk_region, intersection_region], contra_predicates: [], compatible_actions: [stop, forward], text_type: road_state, polarity: context}
+  - {id: 19, name: ego_lane_centered, text: "ego vehicle is centered in lane", support_predicates: [ego_lane_centered, drivable_center], contra_predicates: [lane_absent_left, lane_absent_right], compatible_actions: [forward], text_type: lane, polarity: context}
+  - {id: 20, name: road_crowded, text: "road scene is crowded", support_predicates: [road_crowded, global_scene_context], contra_predicates: [road_clear], compatible_actions: [stop], text_type: road_state, polarity: obstacle}

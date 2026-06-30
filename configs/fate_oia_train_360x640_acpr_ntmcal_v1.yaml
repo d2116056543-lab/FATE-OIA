@@ -1,0 +1,80 @@
+﻿data_root: E:\sbw\BDD-OIA\data
+raw_root: E:\sbw\BDD-OIA
+image_height: 360
+image_width: 640
+patch_size: 8
+action_dim: 4
+reason_dim: 21
+pretrained_weights: ckp\reference\dino_deitsmall8_pretrain.pth
+backbone:
+  selected_layers: [3, 7, 11]
+  checkpoint_key: teacher
+model:
+  selected_layers: [3, 7, 11]
+  use_mock_dino: false
+  dino_no_grad: true
+  predicate_topk: 64
+  predicate_topk_max: 96
+  no_dense_predicate_field: true
+  reason_delta_cap_max: 0.18
+  action_predicate_enabled_epoch: 6
+  action_delta_cap_max: 0.05
+  token_compression: none
+  feature_cache_enabled: false
+ntmcal:
+  threshold_enabled: true
+  delta_cap_reason: 0.15
+  delta_cap_action: 0.05
+  teacher_source: train_calib
+  oracle_test_thresholds: diagnostic_only
+  tail_reason_indices: [12, 9, 5, 14, 6, 11, 10, 13]
+pu:
+  hard_negative_start_epoch: 7
+  soft_negative_start_epoch: 3
+  support_threshold: 0.30
+  contra_threshold: 0.55
+  rho_threshold: 0.50
+pair:
+  enabled: true
+  start_epoch: 7
+  active_epoch: 10
+  capacity_per_reason: 256
+  near_boundary_delta: 0.35
+  loss_cap_ratio: 0.05
+training:
+  epochs: 18
+  batch_size: 8
+  gradient_accumulation_steps: 4
+  effective_batch_size: 32
+  num_workers: 8
+  persistent_workers: true
+  prefetch_factor: 4
+  device: cuda
+  amp_dtype: bf16
+  lr_trunk: 0.0002
+  lr_predicate: 0.0002
+  lr_text_atoms: 0.0001
+  lr_reason_residual: 0.00015
+  lr_action_predicate: 0.0001
+  lr_threshold: 0.0006
+  weight_decay: 0.05
+  scheduler: cosine
+  warmup_epochs: 1
+  min_lr_ratio: 0.05
+  log_every: 200
+  test_every_epoch: true
+  best_selection_split: test
+  best_selection_metric: joint_test_score
+  no_feature_cache: true
+  token_compression: none
+evaluation:
+  splits: [test]
+  threshold_mode: deploy_fixed
+  save_base_logits: true
+  save_deploy_logits: true
+  save_oracle_diagnostics: true
+runtime:
+  foreground_only: true
+  no_feature_cache: true
+  token_compression: none
+  require_review_pass: true
