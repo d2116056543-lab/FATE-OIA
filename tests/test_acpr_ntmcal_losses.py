@@ -40,3 +40,19 @@ def test_predicate_measurement_loss_pushes_observed_rho_up():
     assert rho.grad[observed].mean() < 0.0
 
 
+def test_predicate_measurement_loss_pulls_saturated_rho_down():
+    q = torch.full((2, 4), 0.5, requires_grad=True)
+    rho = torch.full((2, 4), 0.99, requires_grad=True)
+    observations = {
+        "obs_mask": torch.tensor([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]),
+        "obs_value": torch.tensor([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]),
+        "obs_soft_negative": torch.tensor([[0.0, 0.5, 0.0, 0.0], [0.0, 0.0, 0.5, 0.0]]),
+    }
+    loss = native_predicate_measurement_loss(q, rho, observations, epoch=7)
+    loss.backward()
+    observed = (observations["obs_mask"] + observations["obs_soft_negative"]) > 0
+    unknown = ~observed
+    assert rho.grad[observed].mean() > 0.0
+    assert rho.grad[unknown].mean() > 0.0
+
+

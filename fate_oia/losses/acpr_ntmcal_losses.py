@@ -34,12 +34,17 @@ def native_predicate_measurement_loss(q_pred: torch.Tensor, rho_pred: torch.Tens
     neg_w = soft_neg if epoch >= 3 else torch.zeros_like(soft_neg)
     neg_loss = -torch.log((1 - q).clamp_min(1e-5)) * neg_w
     rho = rho_pred.float().clamp(1e-5, 1 - 1e-5)
-    rho_observed = ((mask + soft_neg) > 0).float()
-    rho_obs_loss = -rho.log()
-    rho_obs_loss = (rho_obs_loss * rho_observed).sum() / rho_observed.sum().clamp_min(1.0)
-    rho_neutral = ((rho - 0.5).pow(2) * (1.0 - rho_observed)).sum() / (1.0 - rho_observed).sum().clamp_min(1.0)
+    pos_observed = (mask > 0).float()
+    soft_observed = ((soft_neg > 0).float() * (1.0 - pos_observed)).clamp(0, 1)
+    unknown = (1.0 - (pos_observed + soft_observed).clamp(0, 1)).clamp(0, 1)
+    # Reliability should not be a free escape variable for PU loss, but it also should not
+    # saturate to all-one. Keep observed predicates more reliable than unknown predicates
+    # while preserving label-wise discrimination for hard-negative mining.
+    rho_target = 0.50 * unknown + 0.70 * pos_observed + 0.62 * soft_observed
+    rho_weight = 0.25 * unknown + 1.00 * pos_observed + 0.75 * soft_observed
+    rho_calibration = ((rho - rho_target).pow(2) * rho_weight).sum() / rho_weight.sum().clamp_min(1.0)
     denom = (mask + neg_w).sum().clamp_min(1.0)
-    return (pos_loss + neg_loss).sum() / denom + 0.05 * rho_obs_loss + 0.001 * rho_neutral
+    return (pos_loss + neg_loss).sum() / denom + 0.05 * rho_calibration
 
 
 def ntmcal_calibration_loss(out: dict, action_targets: torch.Tensor, reason_targets: torch.Tensor) -> torch.Tensor:
