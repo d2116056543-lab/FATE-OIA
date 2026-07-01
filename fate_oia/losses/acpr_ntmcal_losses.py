@@ -13,8 +13,10 @@ def action_asl_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor
 
 def ntmcal_reason_pu_loss(logits: torch.Tensor, reason_targets: torch.Tensor, pu_state: dict, epoch: int) -> torch.Tensor:
     pos = pu_state["positive_mask"].float()
-    soft_neg = pu_state["soft_negative_weight"].float()
-    hard_neg = pu_state["hard_negative_mask"].float()
+    # PU reliability is produced by the predicate measurement branch. Detach it here so
+    # the reason loss cannot reduce its own penalty by collapsing predicate rho to zero.
+    soft_neg = pu_state["soft_negative_weight"].float().detach()
+    hard_neg = pu_state["hard_negative_mask"].float().detach()
     weight = pos + soft_neg + hard_neg
     target = pos
     bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
@@ -31,9 +33,13 @@ def native_predicate_measurement_loss(q_pred: torch.Tensor, rho_pred: torch.Tens
     pos_loss = -(value * q.log() + (1.0 - value) * (1.0 - q).clamp_min(1e-5).log()) * mask
     neg_w = soft_neg if epoch >= 3 else torch.zeros_like(soft_neg)
     neg_loss = -torch.log((1 - q).clamp_min(1e-5)) * neg_w
-    rho_reg = ((rho_pred.float() - 0.5).pow(2)).mean() * 0.01
+    rho = rho_pred.float().clamp(1e-5, 1 - 1e-5)
+    rho_observed = ((mask + soft_neg) > 0).float()
+    rho_obs_loss = -rho.log()
+    rho_obs_loss = (rho_obs_loss * rho_observed).sum() / rho_observed.sum().clamp_min(1.0)
+    rho_neutral = ((rho - 0.5).pow(2) * (1.0 - rho_observed)).sum() / (1.0 - rho_observed).sum().clamp_min(1.0)
     denom = (mask + neg_w).sum().clamp_min(1.0)
-    return (pos_loss + neg_loss).sum() / denom + rho_reg
+    return (pos_loss + neg_loss).sum() / denom + 0.05 * rho_obs_loss + 0.001 * rho_neutral
 
 
 def ntmcal_calibration_loss(out: dict, action_targets: torch.Tensor, reason_targets: torch.Tensor) -> torch.Tensor:
@@ -109,3 +115,4 @@ def acpr_ntmcal_loss_bundle(out: dict, action_targets: torch.Tensor, reason_targ
         **pair_stats,
     }
     return total, stats
+
