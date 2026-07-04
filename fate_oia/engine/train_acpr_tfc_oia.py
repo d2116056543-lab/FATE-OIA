@@ -14,7 +14,7 @@ from fate_oia.datasets.bdd_oia_multitask import BDDOIAMultiTaskDataset
 from fate_oia.metrics import multilabel_metrics_from_logits
 from fate_oia.models.acpr_tfc_model import ACPRTFCModel
 from fate_oia.transforms import AspectRatioLetterboxTransform
-from fate_oia.losses.tfc_losses import compute_tfc_losses
+from fate_oia.losses.tfc_losses import calalign_softf1_loss, compute_tfc_losses, threshold_smooth_loss
 from fate_oia.utils.acpr_train_calib_split import make_train_calib_indices
 
 
@@ -74,6 +74,16 @@ def build_model(cfg: dict, device: torch.device) -> ACPRTFCModel:
     ).to(device)
 
 
+def set_trainable(model: ACPRTFCModel, base_requires: dict[str, bool], mode: str) -> None:
+    for name, param in model.named_parameters():
+        if mode == "main":
+            param.requires_grad_(base_requires[name] and not name.startswith("calalign."))
+        elif mode == "calalign":
+            param.requires_grad_(base_requires[name] and name.startswith("calalign."))
+        else:
+            param.requires_grad_(base_requires[name])
+
+
 @torch.no_grad()
 def evaluate(model: ACPRTFCModel, loader: DataLoader, device: torch.device, epoch: int, out_dir: Path) -> dict:
     model.eval()
@@ -103,16 +113,27 @@ def evaluate(model: ACPRTFCModel, loader: DataLoader, device: torch.device, epoc
     torch.save(action_labels, epoch_dir / "labels_action_test.pt")
     torch.save(reason_labels, epoch_dir / "labels_reason_test.pt")
     write_json(epoch_dir / "file_names_test.json", names)
+    action_visual_logits = torch.cat(act_visual)
+    action_delta_off_logits = torch.cat(act_delta_off)
+    visual_pred = torch.sigmoid(action_visual_logits) >= 0.5
+    final_pred = torch.sigmoid(action_logits) >= 0.5
+    labels_bool = action_labels > 0.5
+    fp_to_tp = ((~visual_pred) & final_pred & labels_bool).sum(0).to(torch.int64).tolist()
+    tp_to_fn = (visual_pred & (~final_pred) & labels_bool).sum(0).to(torch.int64).tolist()
+    tn_to_fp = ((~visual_pred) & final_pred & (~labels_bool)).sum(0).to(torch.int64).tolist()
+    fn_to_tn = (visual_pred & (~final_pred) & (~labels_bool)).sum(0).to(torch.int64).tolist()
     write_json(epoch_dir / "action_branch_metrics.json", {
-        "action_visual_only": multilabel_metrics_from_logits(torch.cat(act_visual), action_labels, prefix="Act_"),
-        "action_tfc_delta_off": multilabel_metrics_from_logits(torch.cat(act_delta_off), action_labels, prefix="Act_"),
+        "action_visual_only": multilabel_metrics_from_logits(action_visual_logits, action_labels, prefix="Act_"),
+        "action_tfc_delta_off": multilabel_metrics_from_logits(action_delta_off_logits, action_labels, prefix="Act_"),
         "action_tfc_delta_on": action_metrics,
         "action_threshold_delta_off": action_metrics,
         "action_final_deploy": action_metrics,
         "action_oracle": action_metrics,
         "per_action_AP_AUC_F1": action_metrics.get("Act_per_label_f1", []),
-        "FP_to_TP": {},
-        "TP_to_FN": {},
+        "FP_to_TP": fp_to_tp,
+        "TP_to_FN": tp_to_fn,
+        "TN_to_FP": tn_to_fp,
+        "FN_to_TN": fn_to_tn,
     })
     return metrics
 
@@ -144,10 +165,15 @@ def main() -> None:
     train_ds = BDDOIAMultiTaskDataset(cfg["data_root"], cfg.get("raw_root"), split="train")
     main_idx, calib_idx = make_train_calib_indices(train_ds, calib_fraction=0.10)
     train_loader = make_loader(cfg, "train", batch_size, args.max_train_samples, True, workers, indices=main_idx if args.max_train_samples is None else None)
+    train_calib_loader = make_loader(cfg, "train", batch_size, None, True, workers, indices=calib_idx)
     test_loader = make_loader(cfg, "test", batch_size, args.max_test_samples, False, workers)
     model = build_model(cfg, device)
     weights = cfg.get("loss_weights", {})
-    optimizer = torch.optim.AdamW(model.parameters(), lr=float(train_cfg.get("lr_action", 2e-4)), weight_decay=float(train_cfg.get("weight_decay", 0.05)))
+    base_requires = {name: param.requires_grad for name, param in model.named_parameters()}
+    main_params = [param for name, param in model.named_parameters() if param.requires_grad and not name.startswith("calalign.")]
+    calalign_params = [param for name, param in model.named_parameters() if param.requires_grad and name.startswith("calalign.")]
+    optimizer = torch.optim.AdamW(main_params, lr=float(train_cfg.get("lr_action", 2e-4)), weight_decay=float(train_cfg.get("weight_decay", 0.05)))
+    threshold_optimizer = torch.optim.AdamW(calalign_params, lr=float(cfg.get("threshold", {}).get("lr_threshold", train_cfg.get("lr_threshold", 7e-4))), weight_decay=0.0)
     write_json(out_dir / "run_manifest.json", {
         "config": args.config,
         "data_root": cfg["data_root"],
@@ -159,12 +185,16 @@ def main() -> None:
         "gradient_accumulation_steps": accum,
         "num_workers": workers,
         "train_calib_count": len(calib_idx),
+        "train_calib_threshold_only": True,
+        "main_optimizer_excludes_calalign": True,
     })
     best_joint = -1.0
     last_loss_row = {}
     last_train_stats = {}
+    qrho_collapse_epochs = 0
     for epoch in range(epochs):
         model.train()
+        set_trainable(model, base_requires, "main")
         optimizer.zero_grad(set_to_none=True)
         for step, batch in enumerate(train_loader):
             img = batch["image"].to(device, non_blocking=True)
@@ -178,7 +208,7 @@ def main() -> None:
                 raise RuntimeError("NaN/Inf TFC loss")
             loss.backward()
             if (step + 1) % accum == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(main_params, 1.0)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             row = {k: float(v.detach().cpu()) for k, v in losses.items() if torch.is_tensor(v)}
@@ -202,12 +232,35 @@ def main() -> None:
                 append_jsonl(out_dir / "loss_components.jsonl", row)
             if args.max_train_samples and step * batch_size >= args.max_train_samples:
                 break
+        set_trainable(model, base_requires, "calalign")
+        threshold_optimizer.zero_grad(set_to_none=True)
+        calib_loss_value = 0.0
+        calib_steps = 0
+        for calib_step, batch in enumerate(train_calib_loader):
+            img = batch["image"].to(device, non_blocking=True)
+            action = batch["action"].to(device)
+            reason = batch["reason"].to(device)
+            out = model(img, action, reason, epoch=epoch, split="train", run_deletion=False)
+            t_loss = calalign_softf1_loss(out["action_logits_deploy"], out["reason_logits_deploy"], action, reason, out["pu_state"])
+            t_loss = t_loss + threshold_smooth_loss(out["theta_delta_action"], out["theta_delta_reason"])
+            if not torch.isfinite(t_loss):
+                write_json(out_dir / "run_stop_reason.json", {"reason": "nan_or_inf_threshold_loss", "epoch": epoch, "step": calib_step})
+                raise RuntimeError("NaN/Inf TFC threshold loss")
+            t_loss.backward()
+            threshold_optimizer.step()
+            threshold_optimizer.zero_grad(set_to_none=True)
+            calib_loss_value += float(t_loss.detach().cpu())
+            calib_steps += 1
+            if args.max_train_samples and calib_step >= 1:
+                break
+        set_trainable(model, base_requires, "all")
         metrics = evaluate(model, test_loader, device, epoch, out_dir)
         row = {"epoch": epoch, **metrics}
         append_jsonl(out_dir / "metrics_summary.jsonl", row)
         epoch_dir = out_dir / f"epoch_{epoch:03d}"
         write_json(epoch_dir / "run_manifest.json", json.loads((out_dir / "run_manifest.json").read_text(encoding="utf-8")))
         append_jsonl(epoch_dir / "loss_components.jsonl", last_loss_row)
+        append_jsonl(out_dir / "threshold_train_calib_loss.jsonl", {"epoch": epoch, "loss": calib_loss_value / max(calib_steps, 1), "steps": calib_steps})
         factor_row = {"epoch": epoch, **{k: v for k, v in last_train_stats.items() if k.startswith("factor_")}}
         append_jsonl(out_dir / "factor_measurement_stats.jsonl", factor_row)
         append_jsonl(epoch_dir / "factor_measurement_stats.jsonl", factor_row)
@@ -245,6 +298,7 @@ def main() -> None:
             "deploy_oracle_gap_action": 0.0,
             "deploy_oracle_gap_reason": 0.0,
             "threshold_input_stopgrad_check": True,
+            "threshold_optimizer_source": "train_calib_only",
         }
         append_jsonl(out_dir / "threshold_stats.jsonl", th_row)
         append_jsonl(epoch_dir / "threshold_stats.jsonl", th_row)
@@ -258,6 +312,28 @@ def main() -> None:
         if metrics["joint"] > best_joint:
             best_joint = metrics["joint"]
             torch.save(ckpt, out_dir / "checkpoint_best_test_joint.pth")
+        collapse_values = [
+            last_train_stats.get("factor_action_prob_mean", 0.5),
+            last_train_stats.get("factor_reason_prob_mean", 0.5),
+            last_train_stats.get("factor_action_rho_mean", 0.5),
+            last_train_stats.get("factor_reason_rho_mean", 0.5),
+        ]
+        collapse = any(v < 0.05 or v > 0.95 for v in collapse_values)
+        qrho_collapse_epochs = qrho_collapse_epochs + 1 if collapse else 0
+        stop_reason = None
+        if qrho_collapse_epochs >= 2:
+            stop_reason = {"reason": "q_rho_collapse_for_2_epochs", "epoch": epoch, "values": collapse_values}
+        elif epoch > 5 and last_train_stats.get("deletion_gap_mean", 0.0) <= 0.0:
+            stop_reason = {"reason": "selected_vs_random_deletion_gap_non_positive_after_epoch5", "epoch": epoch, "gap": last_train_stats.get("deletion_gap_mean", 0.0)}
+        elif float(last_train_stats.get("pu_stats", {}).get("hard_negative_rate", 0.0)) > float(cfg.get("pu", {}).get("max_hard_negative_rate", 0.20)):
+            stop_reason = {"reason": "hard_negative_rate_exceeds_configured_max", "epoch": epoch, "hard_negative_rate": last_train_stats.get("pu_stats", {}).get("hard_negative_rate", 0.0)}
+        branch = json.loads((epoch_dir / "action_branch_metrics.json").read_text(encoding="utf-8"))
+        if stop_reason is None and epoch >= 6 and any(t > f for t, f in zip(branch.get("TP_to_FN", []), branch.get("FP_to_TP", []))):
+            stop_reason = {"reason": "tp_to_fn_exceeds_fp_to_tp_after_action_delta_start", "epoch": epoch, "TP_to_FN": branch.get("TP_to_FN", []), "FP_to_TP": branch.get("FP_to_TP", [])}
+        if stop_reason is not None:
+            write_json(out_dir / "run_stop_reason.json", stop_reason)
+            print("tfc_stop " + json.dumps(stop_reason), flush=True)
+            break
         print(f"tfc_epoch epoch={epoch} Act_mF1={metrics['Act_mF1']:.6f} Act_oF1={metrics['Act_oF1']:.6f} Exp_mF1={metrics['Exp_mF1']:.6f} Exp_oF1={metrics['Exp_oF1']:.6f} joint={metrics['joint']:.6f}", flush=True)
 
 

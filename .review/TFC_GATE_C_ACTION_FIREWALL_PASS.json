@@ -1,0 +1,6 @@
+{
+  "pass": true,
+  "reason_zero_action_max_abs_diff": 0.0,
+  "reason_loss_action_adapter_grad": 0.0,
+  "action_loss_reason_adapter_grad": 0.0
+}

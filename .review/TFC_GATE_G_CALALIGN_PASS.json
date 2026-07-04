@@ -1,0 +1,5 @@
+{
+  "pass": true,
+  "deploy_equation_exact": true,
+  "threshold_input_stopgrad_check": true
+}
