@@ -29,6 +29,40 @@ def append_jsonl(path: Path, data: dict) -> None:
         f.write(json.dumps(data, ensure_ascii=False) + "\n")
 
 
+REQUIRED_PRETRAIN_GATES = [
+    "TFC_GATE_A_CODE_AUDIT_PASS.json",
+    "TFC_GATE_B_NO_TEST_LEAKAGE_PASS.json",
+    "TFC_GATE_C_ACTION_FIREWALL_PASS.json",
+    "TFC_GATE_D_FACTOR_GROUNDING_PASS.json",
+    "TFC_GATE_E_SELECTED_DELETION_GT_RANDOM_PASS.json",
+    "TFC_GATE_F_PU_STATE_PASS.json",
+    "TFC_GATE_G_CALALIGN_PASS.json",
+    "TFC_GATE_H_MEMORY_PROBE_PASS.json",
+    "acpr_tfc_v1_REVIEW_PASS.json",
+]
+
+
+def missing_pretrain_gates(review_dir: Path = Path(".review")) -> list[str]:
+    return [name for name in REQUIRED_PRETRAIN_GATES if not (review_dir / name).exists()]
+
+
+def enforce_pretrain_gates(allow_failed_gates: bool, require_review_pass: bool) -> list[str]:
+    """Full training is gate-first by default; smoke/debug must opt out explicitly."""
+    review_dir = Path(".review")
+    if allow_failed_gates:
+        if require_review_pass and not (review_dir / "acpr_tfc_v1_REVIEW_PASS.json").exists():
+            raise FileNotFoundError(".review/acpr_tfc_v1_REVIEW_PASS.json missing")
+        return missing_pretrain_gates(review_dir)
+    missing = missing_pretrain_gates(review_dir)
+    if missing:
+        raise FileNotFoundError(
+            "Missing required TFC pretrain gates: "
+            + ", ".join(missing)
+            + ". Run audit_tfc_gates first or pass --allow_failed_gates only for targeted smoke/debug."
+        )
+    return []
+
+
 def collate(batch: list[dict]) -> dict:
     return {
         "image": torch.stack([b["image"] for b in batch]),
@@ -400,8 +434,7 @@ def main() -> None:
     args = ap.parse_args()
     cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
     train_cfg = cfg.get("training", {})
-    if args.require_review_pass and not Path(".review/acpr_tfc_v1_REVIEW_PASS.json").exists():
-        raise FileNotFoundError(".review/acpr_tfc_v1_REVIEW_PASS.json missing")
+    missing_gates_at_launch = enforce_pretrain_gates(args.allow_failed_gates, args.require_review_pass)
     device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
     epochs = int(args.epochs or train_cfg.get("epochs", 14))
     batch_size = int(args.batch_size or train_cfg.get("batch_size", 4))
@@ -433,6 +466,10 @@ def main() -> None:
         "train_calib_count": len(calib_idx),
         "train_calib_threshold_only": True,
         "main_optimizer_excludes_calalign": True,
+        "pretrain_gates_required": not args.allow_failed_gates,
+        "allow_failed_gates": bool(args.allow_failed_gates),
+        "required_pretrain_gates": REQUIRED_PRETRAIN_GATES,
+        "missing_gates_at_launch": missing_gates_at_launch,
     })
     best_joint = -1.0
     best_action_mf1 = -1.0
@@ -440,6 +477,11 @@ def main() -> None:
     last_loss_row = {}
     last_train_stats = {}
     qrho_collapse_epochs = 0
+    oracle_act_drop_epochs = 0
+    prev_oracle_act_mf1: float | None = None
+    prev_act_map: float | None = None
+    prev_exp_mf1: float | None = None
+    prev_exp_deploy_oracle_gap: float | None = None
     for epoch in range(epochs):
         model.train()
         set_trainable(model, base_requires, "main")
@@ -602,6 +644,49 @@ def main() -> None:
         branch = json.loads((epoch_dir / "action_branch_metrics.json").read_text(encoding="utf-8"))
         if stop_reason is None and epoch >= 6 and any(t > f for t, f in zip(branch.get("TP_to_FN", []), branch.get("FP_to_TP", []))):
             stop_reason = {"reason": "tp_to_fn_exceeds_fp_to_tp_after_action_delta_start", "epoch": epoch, "TP_to_FN": branch.get("TP_to_FN", []), "FP_to_TP": branch.get("FP_to_TP", [])}
+        oracle_act = metrics.get("Act_oracle_mF1")
+        if epoch >= 6 and prev_oracle_act_mf1 is not None and oracle_act is not None and (prev_oracle_act_mf1 - oracle_act) > 0.004:
+            oracle_act_drop_epochs += 1
+        else:
+            oracle_act_drop_epochs = 0
+        if stop_reason is None and epoch >= 6 and oracle_act_drop_epochs >= 2:
+            stop_reason = {
+                "reason": "oracle_act_mf1_drops_for_2_epochs_after_action_delta_start",
+                "epoch": epoch,
+                "prev_oracle_act_mf1": prev_oracle_act_mf1,
+                "current_oracle_act_mf1": oracle_act,
+                "consecutive_drop_epochs": oracle_act_drop_epochs,
+            }
+        current_act_map = metrics.get("Act_mAP")
+        current_exp_mf1 = metrics.get("Exp_mF1")
+        current_exp_gap = metrics.get("Exp_oracle_mF1", current_exp_mf1) - current_exp_mf1 if current_exp_mf1 is not None else None
+        if (
+            stop_reason is None
+            and epoch >= 6
+            and prev_act_map is not None
+            and prev_exp_mf1 is not None
+            and prev_exp_deploy_oracle_gap is not None
+            and current_act_map is not None
+            and current_exp_mf1 is not None
+            and current_exp_gap is not None
+            and current_act_map < prev_act_map
+            and current_exp_mf1 > prev_exp_mf1
+            and current_exp_gap >= prev_exp_deploy_oracle_gap
+        ):
+            stop_reason = {
+                "reason": "act_map_drops_while_exp_rises_through_threshold_movement",
+                "epoch": epoch,
+                "prev_act_map": prev_act_map,
+                "current_act_map": current_act_map,
+                "prev_exp_mf1": prev_exp_mf1,
+                "current_exp_mf1": current_exp_mf1,
+                "prev_exp_deploy_oracle_gap": prev_exp_deploy_oracle_gap,
+                "current_exp_deploy_oracle_gap": current_exp_gap,
+            }
+        prev_oracle_act_mf1 = oracle_act
+        prev_act_map = current_act_map
+        prev_exp_mf1 = current_exp_mf1
+        prev_exp_deploy_oracle_gap = current_exp_gap
         if stop_reason is not None:
             write_json(out_dir / "run_stop_reason.json", stop_reason)
             print("tfc_stop " + json.dumps(stop_reason), flush=True)

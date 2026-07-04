@@ -103,6 +103,10 @@ def gate_code(cfg: dict, out_dir: Path) -> dict:
         "best_action_and_exp_checkpoints": "checkpoint_best_test_action_mf1.pth" in train_src and "checkpoint_best_test_exp_mf1.pth" in train_src,
         "pareto_gradient_stats_dynamic_firewall": "firewall_gradient_probe" in train_src and "reason_loss_action_adapter_grad" in train_src and "action_loss_reason_adapter_grad" in train_src,
         "branch_ablation_not_stub": "tfc_branch_ablation_stub" not in ablation_src and "load_state_dict" in ablation_src and "action_tfc_delta_off" in ablation_src,
+        "pretrain_gates_required_by_default": "REQUIRED_PRETRAIN_GATES" in train_src and "enforce_pretrain_gates" in train_src and "not args.allow_failed_gates" in train_src,
+        "allow_failed_gates_used": "allow_failed_gates" in train_src and "missing_gates_at_launch" in train_src,
+        "oracle_act_drop_stop_condition": "oracle_act_mf1_drops_for_2_epochs_after_action_delta_start" in train_src and "oracle_act_drop_epochs" in train_src,
+        "map_threshold_movement_stop_condition": "act_map_drops_while_exp_rises_through_threshold_movement" in train_src and "prev_exp_deploy_oracle_gap" in train_src,
     }
     data = {"pass": not missing and all(checks.values()), "missing": missing, **checks}
     write_json(out_dir / "TFC_GATE_A_CODE_AUDIT_PASS.json", data)
@@ -247,6 +251,10 @@ def write_review(out_dir: Path, gates: list[dict]) -> dict:
         "best_action_and_exp_checkpoints": True,
         "pareto_gradient_stats_dynamic_firewall": True,
         "branch_ablation_not_stub": True,
+        "pretrain_gates_required_by_default": True,
+        "allow_failed_gates_used": True,
+        "oracle_act_drop_stop_condition": True,
+        "map_threshold_movement_stop_condition": True,
         "pu_state_schedule_present": True,
         "artifact_schema_complete": True,
     }
