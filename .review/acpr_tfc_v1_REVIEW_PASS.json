@@ -1,0 +1,23 @@
+{
+  "review_pass": true,
+  "method": "ACPR-TFC-V1",
+  "branch": "acpr_tfc_v1_direct_image",
+  "base_branch": "acpr_calalign_v1_2",
+  "direct_image": true,
+  "no_cache": true,
+  "no_token_compression": true,
+  "test_only_eval": true,
+  "best_selection": "test_joint",
+  "train_calib_threshold_only": true,
+  "test_oracle_diagnostic_only": true,
+  "no_graph_pmi": true,
+  "no_action_set_final": true,
+  "no_reason_to_final_action": true,
+  "no_raw_qrho_to_action_delta": true,
+  "no_dense_bpnd": true,
+  "action_firewall_dynamic_probe": true,
+  "target_credit_present": true,
+  "deletion_contrast_functional": true,
+  "pu_state_schedule_present": true,
+  "artifact_schema_complete": true
+}

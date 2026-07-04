@@ -1,0 +1,79 @@
+﻿seed: 42
+data_root: E:/sbw/BDD-OIA
+raw_root: E:/sbw/BDD-OIA
+pretrained_weights: ckp/reference/dino_deitsmall8_pretrain.pth
+image_height: 360
+image_width: 640
+patch_size: 8
+training:
+  epochs: 14
+  batch_size: 4
+  grad_accumulation_steps: 8
+  num_workers: 4
+  persistent_workers: true
+  prefetch_factor: 4
+  pin_memory: true
+  amp_dtype: bf16
+  dino_frozen: true
+  lr_action: 0.0002
+  lr_reason: 0.0002
+  lr_factor: 0.00015
+  lr_credit: 0.00015
+  lr_threshold: 0.0007
+  weight_decay: 0.05
+  scheduler: cosine
+  warmup_epochs: 2
+  min_lr_ratio: 0.05
+  eval_split: test
+  best_selection: test_joint
+  evaluate_each_epoch: true
+  save_branch_logits: true
+model:
+  selected_layers: [3, 7, 11]
+  dim: 384
+  use_mock_dino: false
+  no_feature_cache: true
+  token_compression: false
+tfc:
+  factor_bank: configs/acpr_tfc_factors.yaml
+  num_factor_prototypes: 4
+  factor_topk_tokens: 64
+  max_factors_per_target: 6
+  max_deletion_factors_per_sample: 4
+  deletion_recompute_dino: false
+  action_delta_max: 0.06
+  reason_delta_max: 0.15
+  require_selected_gt_random_for_action_delta: true
+  same_region_background: ema
+pu:
+  soft_negative_start_epoch: 3
+  hard_negative_start_epoch: 7
+  unknown_entropy_weight: 0.02
+  max_hard_negative_rate: 0.20
+threshold:
+  enabled: true
+  calibration_source: train_calib
+  test_oracle: diagnostic_only
+  action_threshold_min: 0.10
+  action_threshold_max: 0.90
+  reason_threshold_min: 0.02
+  reason_threshold_max: 0.85
+  tail_reason_threshold_min: 0.01
+  tail_reason_threshold_max: 0.65
+  lr_threshold: 0.0007
+loss_weights:
+  action_asl: 1.0
+  action_rank: 0.15
+  reason_pu: 1.0
+  factor_measurement: 0.25
+  prototype_consistency: 0.05
+  target_credit: 0.10
+  deletion_contrast: 0.05
+  calalign: 0.50
+  action_safe: 0.50
+gates:
+  require_review_pass: true
+  require_action_firewall: true
+  require_no_test_leakage: true
+  require_no_dense_bpnd: true
+  require_no_graph_pmi: true

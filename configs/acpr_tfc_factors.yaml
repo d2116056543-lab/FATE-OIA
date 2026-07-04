@@ -1,0 +1,148 @@
+﻿version: acpr_tfc_v1
+action_targets:
+  - stop_slow
+  - forward
+  - turn_left
+  - turn_right
+reason_targets:
+  count: 21
+  aliases:
+    obstacle_front: 0
+    obstacle_car: 1
+    obstacle_pedestrian: 2
+    red_light: 3
+    green_light: 4
+    follow_traffic: 5
+    no_left_lane: 6
+    solid_line_left: 7
+    no_right_lane: 8
+    solid_line_right: 9
+    drivable_blocked: 10
+    lane_available_left: 11
+    lane_available_right: 12
+    clear_path: 13
+factors:
+  front_vehicle_close:
+    entity: vehicle
+    attribute: close
+    spatial: front_center
+    polarity: risk
+    region_prior: front_center
+    target_scope:
+      action_support: [stop_slow]
+      action_inhibit: [forward]
+      reason_support: [obstacle_car, obstacle_front]
+  pedestrian_front:
+    entity: pedestrian
+    attribute: close
+    spatial: front_center
+    polarity: risk
+    region_prior: front_center
+    target_scope:
+      action_support: [stop_slow]
+      action_inhibit: [forward]
+      reason_support: [obstacle_pedestrian, obstacle_front]
+  traffic_light_red:
+    entity: traffic_light
+    attribute: red
+    spatial: upper_front
+    polarity: stop_constraint
+    region_prior: upper_front
+    target_scope:
+      action_support: [stop_slow]
+      action_inhibit: [forward]
+      reason_support: [red_light, follow_traffic]
+      factor_conflict: [traffic_light_green]
+  traffic_light_green:
+    entity: traffic_light
+    attribute: green
+    spatial: upper_front
+    polarity: go_affordance
+    region_prior: upper_front
+    target_scope:
+      action_support: [forward]
+      reason_support: [green_light, follow_traffic]
+      factor_conflict: [traffic_light_red]
+  lane_left_available:
+    entity: lane
+    attribute: available
+    spatial: left_corridor
+    polarity: affordance
+    region_prior: left_corridor
+    target_scope:
+      action_support: [turn_left]
+      reason_support: [lane_available_left]
+      reason_conflict: [no_left_lane, solid_line_left]
+      factor_conflict: [left_solid_boundary, lane_absent_left]
+  left_solid_boundary:
+    entity: lane_marking
+    attribute: solid
+    spatial: left_corridor
+    polarity: constraint
+    region_prior: left_corridor
+    target_scope:
+      action_inhibit: [turn_left]
+      reason_support: [solid_line_left, no_left_lane]
+      factor_conflict: [lane_left_available]
+  lane_absent_left:
+    entity: lane
+    attribute: absent
+    spatial: left_corridor
+    polarity: constraint
+    region_prior: left_corridor
+    target_scope:
+      action_inhibit: [turn_left]
+      reason_support: [no_left_lane]
+      factor_conflict: [lane_left_available]
+  lane_right_available:
+    entity: lane
+    attribute: available
+    spatial: right_corridor
+    polarity: affordance
+    region_prior: right_corridor
+    target_scope:
+      action_support: [turn_right]
+      reason_support: [lane_available_right]
+      reason_conflict: [no_right_lane, solid_line_right]
+      factor_conflict: [right_solid_boundary, lane_absent_right]
+  right_solid_boundary:
+    entity: lane_marking
+    attribute: solid
+    spatial: right_corridor
+    polarity: constraint
+    region_prior: right_corridor
+    target_scope:
+      action_inhibit: [turn_right]
+      reason_support: [solid_line_right, no_right_lane]
+      factor_conflict: [lane_right_available]
+  lane_absent_right:
+    entity: lane
+    attribute: absent
+    spatial: right_corridor
+    polarity: constraint
+    region_prior: right_corridor
+    target_scope:
+      action_inhibit: [turn_right]
+      reason_support: [no_right_lane]
+      factor_conflict: [lane_right_available]
+  blocked_drivable_center:
+    entity: drivable_area
+    attribute: blocked
+    spatial: center_corridor
+    polarity: risk
+    region_prior: center_corridor
+    target_scope:
+      action_support: [stop_slow]
+      action_inhibit: [forward]
+      reason_support: [obstacle_front, drivable_blocked]
+      factor_conflict: [drivable_center_clear]
+  drivable_center_clear:
+    entity: drivable_area
+    attribute: clear
+    spatial: center_corridor
+    polarity: affordance
+    region_prior: center_corridor
+    target_scope:
+      action_support: [forward]
+      reason_support: [clear_path]
+      factor_conflict: [blocked_drivable_center]
