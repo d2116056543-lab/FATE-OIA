@@ -29,6 +29,10 @@
   "random_indices_sampled_per_batch_item": true,
   "target_credit_stats_not_placeholder": true,
   "oracle_metrics_not_deploy_copy": true,
+  "failure_flip_cases_not_placeholder": true,
+  "per_action_ap_auc_schema": true,
+  "deletion_summary_not_overwritten_by_non_deletion_batch": true,
+  "target_credit_reason_deletion_availability": true,
   "pu_state_schedule_present": true,
   "artifact_schema_complete": true
 }

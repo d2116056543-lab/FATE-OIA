@@ -124,6 +124,86 @@ def oracle_threshold_metrics(logits: torch.Tensor, labels: torch.Tensor, prefix:
     return thresholded_metrics_from_logits(logits, labels, torch.stack(thresholds), prefix)
 
 
+def _average_precision(scores: torch.Tensor, labels: torch.Tensor) -> float:
+    order = torch.argsort(scores, descending=True)
+    y = labels[order].float()
+    positives = y.sum()
+    if float(positives) <= 0:
+        return 0.0
+    ranks = torch.arange(1, y.numel() + 1, device=scores.device, dtype=torch.float32)
+    precision_at_k = torch.cumsum(y, dim=0) / ranks
+    return float((precision_at_k * y).sum().div(positives).cpu())
+
+
+def _auc_roc(scores: torch.Tensor, labels: torch.Tensor) -> float:
+    y = labels.float()
+    positives = y.sum()
+    negatives = y.numel() - positives
+    if float(positives) <= 0 or float(negatives) <= 0:
+        return 0.5
+    order = torch.argsort(scores)
+    ranks = torch.empty_like(scores, dtype=torch.float32)
+    ranks[order] = torch.arange(1, scores.numel() + 1, device=scores.device, dtype=torch.float32)
+    pos_rank_sum = (ranks * y).sum()
+    auc = (pos_rank_sum - positives * (positives + 1) / 2) / (positives * negatives).clamp_min(1e-8)
+    return float(auc.cpu())
+
+
+def per_label_ranking_metrics(logits: torch.Tensor, labels: torch.Tensor, f1_values: list[float]) -> list[dict]:
+    probs = torch.sigmoid(logits.float())
+    labels_bool = labels.float() > 0.5
+    rows: list[dict] = []
+    for label_idx in range(labels.shape[1]):
+        rows.append({
+            "label_id": label_idx,
+            "F1": float(f1_values[label_idx]) if label_idx < len(f1_values) else None,
+            "AP": _average_precision(probs[:, label_idx], labels_bool[:, label_idx]),
+            "AUC": _auc_roc(probs[:, label_idx], labels_bool[:, label_idx]),
+        })
+    return rows
+
+
+def build_flip_cases(
+    epoch: int,
+    file_names: list[str],
+    visual_logits: torch.Tensor,
+    final_logits: torch.Tensor,
+    labels: torch.Tensor,
+    max_cases: int = 200,
+) -> list[dict]:
+    visual_pred = torch.sigmoid(visual_logits) >= 0.5
+    final_pred = torch.sigmoid(final_logits) >= 0.5
+    labels_bool = labels > 0.5
+    cases: list[dict] = []
+    for sample_idx, file_name in enumerate(file_names):
+        for action_id in range(labels.shape[1]):
+            before = bool(visual_pred[sample_idx, action_id])
+            after = bool(final_pred[sample_idx, action_id])
+            gt = bool(labels_bool[sample_idx, action_id])
+            if before == after:
+                continue
+            if (not before) and after and gt:
+                transition = "FP_to_TP"
+            elif before and (not after) and gt:
+                transition = "TP_to_FN"
+            elif (not before) and after and (not gt):
+                transition = "TN_to_FP"
+            else:
+                transition = "FN_to_TN"
+            cases.append({
+                "epoch": epoch,
+                "file_name": file_name,
+                "action_id": action_id,
+                "transition": transition,
+                "gt": gt,
+                "visual_prob": float(torch.sigmoid(visual_logits[sample_idx, action_id]).cpu()),
+                "final_prob": float(torch.sigmoid(final_logits[sample_idx, action_id]).cpu()),
+            })
+            if len(cases) >= max_cases:
+                return cases
+    return cases
+
+
 def build_target_credit_rows(epoch: int, out: dict, action_targets: torch.Tensor, reason_targets: torch.Tensor) -> list[dict]:
     rows: list[dict] = []
     comp = out["compatibility"]
@@ -162,6 +242,7 @@ def build_target_credit_rows(epoch: int, out: dict, action_targets: torch.Tensor
             "deletion_selected": float(selected_effect[:, target_id].mean().cpu()),
             "deletion_random": float(random_effect[:, target_id].mean().cpu()),
             "selected_vs_random_gap": float(gap[:, target_id].mean().cpu()),
+            "deletion_available": True,
             "positive_credit_sign_acc": pos_acc,
             "inhibitory_credit_sign_acc": inh_acc,
         })
@@ -177,9 +258,10 @@ def build_target_credit_rows(epoch: int, out: dict, action_targets: torch.Tensor
             "credit_mean": float(mean_credit[factor_id].cpu()),
             "credit_topk": float(credit_reason[:, factor_id, target_id].abs().mean().cpu()),
             "compatibility": float(native_reason[factor_id, target_id].cpu()),
-            "deletion_selected": None,
-            "deletion_random": None,
-            "selected_vs_random_gap": None,
+            "deletion_selected": 0.0,
+            "deletion_random": 0.0,
+            "selected_vs_random_gap": 0.0,
+            "deletion_available": False,
             "positive_credit_sign_acc": pos_acc,
             "inhibitory_credit_sign_acc": inh_acc,
         })
@@ -230,6 +312,8 @@ def evaluate(model: ACPRTFCModel, loader: DataLoader, device: torch.device, epoc
     tp_to_fn = (visual_pred & (~final_pred) & labels_bool).sum(0).to(torch.int64).tolist()
     tn_to_fp = ((~visual_pred) & final_pred & (~labels_bool)).sum(0).to(torch.int64).tolist()
     fn_to_tn = (visual_pred & (~final_pred) & (~labels_bool)).sum(0).to(torch.int64).tolist()
+    action_ranking = per_label_ranking_metrics(action_logits, action_labels, action_metrics.get("Act_per_label_f1", []))
+    flip_cases = build_flip_cases(epoch, names, action_visual_logits, action_logits, action_labels)
     write_json(epoch_dir / "action_branch_metrics.json", {
         "action_visual_only": multilabel_metrics_from_logits(action_visual_logits, action_labels, prefix="Act_"),
         "action_tfc_delta_off": multilabel_metrics_from_logits(action_delta_off_logits, action_labels, prefix="Act_"),
@@ -237,12 +321,14 @@ def evaluate(model: ACPRTFCModel, loader: DataLoader, device: torch.device, epoc
         "action_threshold_delta_off": multilabel_metrics_from_logits(action_base_logits, action_labels, prefix="Act_"),
         "action_final_deploy": action_metrics,
         "action_oracle": action_oracle,
-        "per_action_AP_AUC_F1": action_metrics.get("Act_per_label_f1", []),
+        "per_action_AP_AUC_F1": action_ranking,
         "FP_to_TP": fp_to_tp,
         "TP_to_FN": tp_to_fn,
         "TN_to_FP": tn_to_fp,
         "FN_to_TN": fn_to_tn,
     })
+    append_jsonl(out_dir / "failure_flip_cases.jsonl", {"epoch": epoch, "cases": flip_cases})
+    append_jsonl(epoch_dir / "failure_flip_cases.jsonl", {"epoch": epoch, "cases": flip_cases})
     return metrics
 
 
@@ -304,6 +390,8 @@ def main() -> None:
         model.train()
         set_trainable(model, base_requires, "main")
         optimizer.zero_grad(set_to_none=True)
+        epoch_deletion_summary: dict | None = None
+        epoch_credit_rows: list[dict] = []
         for step, batch in enumerate(train_loader):
             img = batch["image"].to(device, non_blocking=True)
             action = batch["action"].to(device)
@@ -336,6 +424,14 @@ def main() -> None:
                 "theta_delta_reason_abs_mean": float(out["theta_delta_reason"].detach().abs().mean().cpu()),
                 "credit_rows": build_target_credit_rows(epoch, out, action, reason),
             }
+            valid_pairs = int(out["deletion_stats"].get("stats", {}).get("valid_pairs", 0))
+            if valid_pairs > 0:
+                epoch_deletion_summary = {
+                    "deletion_gap_mean": last_train_stats["deletion_gap_mean"],
+                    "deletion_selected_gt_random_rate": last_train_stats["deletion_selected_gt_random_rate"],
+                    "valid_pairs": valid_pairs,
+                }
+                epoch_credit_rows = last_train_stats["credit_rows"]
             if step % 200 == 0:
                 print("tfc_batch " + json.dumps(row), flush=True)
                 append_jsonl(out_dir / "loss_components.jsonl", row)
@@ -367,19 +463,25 @@ def main() -> None:
         row = {"epoch": epoch, **metrics}
         append_jsonl(out_dir / "metrics_summary.jsonl", row)
         epoch_dir = out_dir / f"epoch_{epoch:03d}"
+        deletion_summary = epoch_deletion_summary or {
+            "deletion_gap_mean": 0.0,
+            "deletion_selected_gt_random_rate": 0.0,
+            "valid_pairs": 0,
+        }
         write_json(epoch_dir / "run_manifest.json", json.loads((out_dir / "run_manifest.json").read_text(encoding="utf-8")))
         append_jsonl(epoch_dir / "loss_components.jsonl", last_loss_row)
         append_jsonl(out_dir / "threshold_train_calib_loss.jsonl", {"epoch": epoch, "loss": calib_loss_value / max(calib_steps, 1), "steps": calib_steps})
         factor_row = {"epoch": epoch, **{k: v for k, v in last_train_stats.items() if k.startswith("factor_")}}
         append_jsonl(out_dir / "factor_measurement_stats.jsonl", factor_row)
         append_jsonl(epoch_dir / "factor_measurement_stats.jsonl", factor_row)
-        for credit_row in last_train_stats.get("credit_rows", []):
+        for credit_row in epoch_credit_rows:
             append_jsonl(out_dir / "target_credit_stats.jsonl", credit_row)
             append_jsonl(epoch_dir / "target_credit_stats.jsonl", credit_row)
         del_row = {
             "epoch": epoch,
-            "selected_vs_random_gap_mean": last_train_stats.get("deletion_gap_mean", 0.0),
-            "selected_gt_random_rate": last_train_stats.get("deletion_selected_gt_random_rate", 0.0),
+            "selected_vs_random_gap_mean": deletion_summary["deletion_gap_mean"],
+            "selected_gt_random_rate": deletion_summary["deletion_selected_gt_random_rate"],
+            "valid_pairs": deletion_summary["valid_pairs"],
         }
         append_jsonl(out_dir / "deletion_contrast_stats.jsonl", del_row)
         append_jsonl(epoch_dir / "deletion_contrast_stats.jsonl", del_row)
@@ -401,8 +503,6 @@ def main() -> None:
         pareto_row = {"epoch": epoch, "enabled": "structural_firewall", "cosine_action_reason": None, "projection_count": 0}
         append_jsonl(out_dir / "pareto_gradient_stats.jsonl", pareto_row)
         append_jsonl(epoch_dir / "pareto_gradient_stats.jsonl", pareto_row)
-        append_jsonl(out_dir / "failure_flip_cases.jsonl", {"epoch": epoch, "cases": []})
-        append_jsonl(epoch_dir / "failure_flip_cases.jsonl", {"epoch": epoch, "cases": []})
         ckpt = {"model": model.state_dict(), "epoch": epoch, "metrics": metrics}
         torch.save(ckpt, out_dir / "checkpoint_latest.pth")
         if metrics["joint"] > best_joint:
@@ -419,8 +519,8 @@ def main() -> None:
         stop_reason = None
         if qrho_collapse_epochs >= 2:
             stop_reason = {"reason": "q_rho_collapse_for_2_epochs", "epoch": epoch, "values": collapse_values}
-        elif epoch > 5 and last_train_stats.get("deletion_gap_mean", 0.0) <= 0.0:
-            stop_reason = {"reason": "selected_vs_random_deletion_gap_non_positive_after_epoch5", "epoch": epoch, "gap": last_train_stats.get("deletion_gap_mean", 0.0)}
+        elif epoch > 5 and deletion_summary["deletion_gap_mean"] <= 0.0:
+            stop_reason = {"reason": "selected_vs_random_deletion_gap_non_positive_after_epoch5", "epoch": epoch, "gap": deletion_summary["deletion_gap_mean"], "valid_pairs": deletion_summary["valid_pairs"]}
         elif float(last_train_stats.get("pu_stats", {}).get("hard_negative_rate", 0.0)) > float(cfg.get("pu", {}).get("max_hard_negative_rate", 0.20)):
             stop_reason = {"reason": "hard_negative_rate_exceeds_configured_max", "epoch": epoch, "hard_negative_rate": last_train_stats.get("pu_stats", {}).get("hard_negative_rate", 0.0)}
         branch = json.loads((epoch_dir / "action_branch_metrics.json").read_text(encoding="utf-8"))

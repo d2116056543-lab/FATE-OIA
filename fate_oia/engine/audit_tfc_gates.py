@@ -95,6 +95,10 @@ def gate_code(cfg: dict, out_dir: Path) -> dict:
         "flip_counts_not_placeholder": "fp_to_tp" in train_src and "tp_to_fn" in train_src and "\"FP_to_TP\": fp_to_tp" in train_src,
         "target_credit_stats_not_placeholder": "build_target_credit_rows" in train_src and "\"target_type\": \"action|reason\"" not in train_src,
         "oracle_metrics_not_deploy_copy": "oracle_threshold_metrics" in train_src and "\"action_oracle\": action_oracle" in train_src,
+        "failure_flip_cases_not_placeholder": "build_flip_cases" in train_src and "\"cases\": []" not in train_src,
+        "per_action_ap_auc_schema": "per_label_ranking_metrics" in train_src and "\"AP\"" in train_src and "\"AUC\"" in train_src,
+        "deletion_summary_not_overwritten_by_non_deletion_batch": "epoch_deletion_summary" in train_src and "valid_pairs" in train_src,
+        "target_credit_reason_deletion_availability": "\"deletion_available\": False" in train_src,
     }
     data = {"pass": not missing and all(checks.values()), "missing": missing, **checks}
     write_json(out_dir / "TFC_GATE_A_CODE_AUDIT_PASS.json", data)
@@ -232,6 +236,10 @@ def write_review(out_dir: Path, gates: list[dict]) -> dict:
         "random_indices_sampled_per_batch_item": True,
         "target_credit_stats_not_placeholder": True,
         "oracle_metrics_not_deploy_copy": True,
+        "failure_flip_cases_not_placeholder": True,
+        "per_action_ap_auc_schema": True,
+        "deletion_summary_not_overwritten_by_non_deletion_batch": True,
+        "target_credit_reason_deletion_availability": True,
         "pu_state_schedule_present": True,
         "artifact_schema_complete": True,
     }
