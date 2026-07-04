@@ -51,7 +51,7 @@ class TFCActionHead(nn.Module):
             gate = torch.zeros_like(action_visual_logits)
         else:
             deletion_gap = torch.zeros_like(action_visual_logits)
-            selected_mask = torch.ones_like(action_visual_logits, dtype=torch.bool)
+            selected_mask = torch.zeros_like(action_visual_logits, dtype=torch.bool)
             if deletion_stats is not None:
                 deletion_gap = deletion_stats.get("selected_vs_random_gap", deletion_gap).detach()
                 selected_mask = deletion_stats.get("selected_gt_random_mask", selected_mask).detach().bool()

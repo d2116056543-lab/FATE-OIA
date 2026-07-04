@@ -17,7 +17,9 @@
   "no_dense_bpnd": true,
   "action_firewall_dynamic_probe": true,
   "target_credit_present": true,
+  "target_credit_uses_factor_features": true,
   "deletion_contrast_functional": true,
+  "deletion_uses_same_region_random_indices": true,
   "pu_state_schedule_present": true,
   "artifact_schema_complete": true
 }

@@ -83,7 +83,7 @@ def evaluate(model: ACPRTFCModel, loader: DataLoader, device: torch.device, epoc
         img = batch["image"].to(device, non_blocking=True)
         a = batch["action"].to(device)
         r = batch["reason"].to(device)
-        out = model(img, None, None, epoch=epoch, split="test", run_deletion=False)
+        out = model(img, None, None, epoch=epoch, split="test", run_deletion=True)
         act_logits.append(out["action_logits_deploy"].cpu())
         rea_logits.append(out["reason_logits_deploy"].cpu())
         act_visual.append(out["action_visual_logits"].cpu())

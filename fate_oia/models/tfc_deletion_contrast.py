@@ -33,6 +33,7 @@ class TFCDeletionContrast(nn.Module):
         target_labels: torch.Tensor | None = None,
         max_factors_per_sample: int = 4,
         same_region_background: str = "ema",
+        random_indices: torch.Tensor | None = None,
     ) -> dict:
         b, factors, k = topk_indices.shape
         targets = credit_norm.shape[-1]
@@ -52,8 +53,10 @@ class TFCDeletionContrast(nn.Module):
                 if score[f, t] <= 0:
                     continue
                 sel_idx = topk_indices[i, f].view(1, -1)
-                rand_pool = torch.randperm(topk_indices.shape[-1] * max(1, factors), device=device)[: sel_idx.numel()]
-                rand_idx = rand_pool.remainder(patch_tokens.shape[1] * patch_tokens.shape[2]).view(1, -1)
+                if random_indices is not None:
+                    rand_idx = random_indices[i, f].view(1, -1)
+                else:
+                    rand_idx = topk_indices[i, f, torch.randperm(topk_indices.shape[-1], device=device)].view(1, -1)
                 patched_sel = self._replace(patch_tokens[i : i + 1], sel_idx)
                 patched_rand = self._replace(patch_tokens[i : i + 1], rand_idx)
                 sel_logits = head_fn(patched_sel)

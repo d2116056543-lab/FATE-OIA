@@ -69,6 +69,9 @@ def gate_code(cfg: dict, out_dir: Path) -> dict:
     missing = [p for p in REQUIRED if not Path(p).exists()]
     text_targets = [Path("fate_oia/models/acpr_tfc_model.py"), Path("fate_oia/models/tfc_action_head.py")]
     joined = "\n".join(p.read_text(encoding="utf-8", errors="ignore") for p in text_targets if p.exists())
+    credit_src = Path("fate_oia/models/tfc_target_credit.py").read_text(encoding="utf-8", errors="ignore")
+    deletion_src = Path("fate_oia/models/tfc_deletion_contrast.py").read_text(encoding="utf-8", errors="ignore")
+    action_src = Path("fate_oia/models/tfc_action_head.py").read_text(encoding="utf-8", errors="ignore")
     checks = {
         "no_graph_pmi": not any(x in joined.lower() for x in ["pmi", "cooccurrence", "co_occurrence", "label_graph"]),
         "no_action_set_final": "action_set" not in joined,
@@ -77,6 +80,9 @@ def gate_code(cfg: dict, out_dir: Path) -> dict:
         "no_dense_bpnd": all(x not in joined for x in ["repeat(", ".clone().expand", "bfnd", "bpnd"]),
         "no_cache": not bool(cfg.get("model", {}).get("feature_cache_enabled", False)),
         "no_token_compression": not bool(cfg.get("model", {}).get("token_compression", False)),
+        "target_credit_uses_factor_features": "factor_features" in credit_src and "action_target_embeddings" in credit_src and "reason_target_embeddings" in credit_src,
+        "deletion_uses_same_region_random_indices": "random_indices" in deletion_src,
+        "action_delta_requires_deletion_mask": "selected_mask = torch.zeros_like" in action_src,
     }
     data = {"pass": not missing and all(checks.values()), "missing": missing, **checks}
     write_json(out_dir / "TFC_GATE_A_CODE_AUDIT_PASS.json", data)
@@ -200,7 +206,9 @@ def write_review(out_dir: Path, gates: list[dict]) -> dict:
         "no_dense_bpnd": True,
         "action_firewall_dynamic_probe": True,
         "target_credit_present": True,
+        "target_credit_uses_factor_features": True,
         "deletion_contrast_functional": True,
+        "deletion_uses_same_region_random_indices": True,
         "pu_state_schedule_present": True,
         "artifact_schema_complete": True,
     }

@@ -42,7 +42,7 @@ class ACPRTFCModel(nn.Module):
         self.prototype_bank = TFCPrototypeBank(self.factor_bank.num_factors, dim=dim, num_prototypes=num_factor_prototypes)
         self.measure_action = TFCTopKFactorMeasurement(dim=dim, topk=factor_topk_tokens)
         self.measure_reason = TFCTopKFactorMeasurement(dim=dim, topk=factor_topk_tokens)
-        self.target_credit = TFCTargetCredit(self.factor_bank.num_factors, action_dim=action_dim, reason_dim=reason_dim)
+        self.target_credit = TFCTargetCredit(self.factor_bank.num_factors, action_dim=action_dim, reason_dim=reason_dim, dim=dim)
         self.action_head = TFCActionHead(dim=dim, action_dim=action_dim, max_delta=action_delta_max)
         self.reason_head = TFCReasonHead(dim=dim, reason_dim=reason_dim, max_delta=reason_delta_max)
         self.pu_state = TFCPUStateBuilder()
@@ -99,6 +99,7 @@ class ACPRTFCModel(nn.Module):
                 self.action_head.visual_logits_from_patch,
                 action_visual,
                 action_targets,
+                random_indices=meas_action.get("random_indices"),
             )
         action = self.action_head(
             lanes["patch_action"],

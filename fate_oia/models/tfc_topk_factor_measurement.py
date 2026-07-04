@@ -66,6 +66,12 @@ class TFCTopKFactorMeasurement(nn.Module):
         rho_base = self.rho_head(factor_features).squeeze(-1)
         factor_rho = torch.sigmoid(rho_base - entropy / max(float(k), 1.0))
         top_region = priors.view(1, f, 1, n).expand(b, f, layers, n).flatten(2).gather(2, top_idx)
+        random_indices = []
+        for factor_idx in range(f):
+            prob = priors[factor_idx].view(1, n).expand(layers, n).reshape(layers * n).clamp_min(1e-6)
+            prob = prob / prob.sum()
+            random_indices.append(torch.multinomial(prob, num_samples=k, replacement=True).view(1, k).expand(b, k))
+        random_indices_t = torch.stack(random_indices, dim=1)
         return {
             "factor_features": factor_features,
             "factor_logits": factor_logits,
@@ -73,6 +79,8 @@ class TFCTopKFactorMeasurement(nn.Module):
             "factor_rho": factor_rho,
             "topk_indices": top_idx,
             "topk_scores": top_scores,
+            "random_indices": random_indices_t,
             "attention_entropy": entropy,
             "region_mass": top_region.mean(-1),
         }
+

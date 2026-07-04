@@ -21,3 +21,5 @@ def test_tfc_model_forward_shapes_and_firewall():
     assert out["reason_logits_deploy"].shape == (2, 21)
     assert torch.isfinite(out["action_logits_deploy"]).all()
     assert torch.allclose(out["action_logits_deploy"], out["action_logits_base"] - out["action_theta"], atol=1e-6)
+    out_no_del = model(images, action, reason, epoch=7, split="train", run_deletion=False)
+    assert torch.allclose(out_no_del["action_tfc_delta"], torch.zeros_like(out_no_del["action_tfc_delta"]))
