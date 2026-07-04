@@ -14,7 +14,7 @@ from fate_oia.datasets.bdd_oia_multitask import BDDOIAMultiTaskDataset
 from fate_oia.metrics import multilabel_metrics_from_logits
 from fate_oia.models.acpr_tfc_model import ACPRTFCModel
 from fate_oia.transforms import AspectRatioLetterboxTransform
-from fate_oia.losses.tfc_losses import calalign_softf1_loss, compute_tfc_losses, threshold_smooth_loss
+from fate_oia.losses.tfc_losses import action_asl_loss, calalign_softf1_loss, compute_tfc_losses, reason_pu_asl_loss, threshold_smooth_loss
 from fate_oia.utils.acpr_train_calib_split import make_train_calib_indices
 
 
@@ -204,6 +204,58 @@ def build_flip_cases(
     return cases
 
 
+def _grad_abs_sum(module: torch.nn.Module) -> float:
+    total = 0.0
+    for param in module.parameters():
+        if param.grad is not None:
+            total += float(param.grad.detach().abs().sum().cpu())
+    return total
+
+
+def firewall_gradient_probe(model: ACPRTFCModel, batch: dict, device: torch.device, epoch: int) -> dict:
+    """Probe the structural firewall without stepping optimizers."""
+    was_training = model.training
+    model.train()
+    img = batch["image"].to(device, non_blocking=True)
+    action = batch["action"].to(device)
+    reason = batch["reason"].to(device)
+
+    model.zero_grad(set_to_none=True)
+    out_reason = model(img, action, reason, epoch=epoch, split="train", run_deletion=False)
+    reason_loss = reason_pu_asl_loss(out_reason["reason_logits_deploy"], reason, out_reason["pu_state"])
+    reason_loss.backward()
+    reason_loss_action_adapter_grad = _grad_abs_sum(model.lane_adapter.action_adapter)
+    reason_loss_action_head_grad = _grad_abs_sum(model.action_head)
+
+    model.zero_grad(set_to_none=True)
+    out_action = model(img, action, reason, epoch=epoch, split="train", run_deletion=False)
+    action_loss = action_asl_loss(out_action["action_logits_deploy"], action)
+    action_loss.backward()
+    action_loss_reason_adapter_grad = _grad_abs_sum(model.lane_adapter.reason_adapter)
+    action_loss_reason_head_grad = _grad_abs_sum(model.reason_head)
+    model.zero_grad(set_to_none=True)
+    model.train(was_training)
+
+    return {
+        "epoch": epoch,
+        "enabled": "structural_firewall",
+        "cosine_action_reason": None,
+        "cosine_action_factor": None,
+        "cosine_action_credit": None,
+        "projection_count": 0,
+        "reason_loss_action_adapter_grad": reason_loss_action_adapter_grad,
+        "reason_loss_action_head_grad": reason_loss_action_head_grad,
+        "action_loss_reason_adapter_grad": action_loss_reason_adapter_grad,
+        "action_loss_reason_head_grad": action_loss_reason_head_grad,
+        "firewall_pass": (
+            reason_loss_action_adapter_grad == 0.0
+            and reason_loss_action_head_grad == 0.0
+            and action_loss_reason_adapter_grad == 0.0
+            and action_loss_reason_head_grad == 0.0
+        ),
+    }
+
+
 def build_target_credit_rows(epoch: int, out: dict, action_targets: torch.Tensor, reason_targets: torch.Tensor) -> list[dict]:
     rows: list[dict] = []
     comp = out["compatibility"]
@@ -383,6 +435,8 @@ def main() -> None:
         "main_optimizer_excludes_calalign": True,
     })
     best_joint = -1.0
+    best_action_mf1 = -1.0
+    best_exp_mf1 = -1.0
     last_loss_row = {}
     last_train_stats = {}
     qrho_collapse_epochs = 0
@@ -392,7 +446,14 @@ def main() -> None:
         optimizer.zero_grad(set_to_none=True)
         epoch_deletion_summary: dict | None = None
         epoch_credit_rows: list[dict] = []
+        probe_batch: dict | None = None
         for step, batch in enumerate(train_loader):
+            if probe_batch is None:
+                probe_batch = {
+                    "image": batch["image"][: min(2, batch["image"].shape[0])].detach().clone(),
+                    "action": batch["action"][: min(2, batch["action"].shape[0])].detach().clone(),
+                    "reason": batch["reason"][: min(2, batch["reason"].shape[0])].detach().clone(),
+                }
             img = batch["image"].to(device, non_blocking=True)
             action = batch["action"].to(device)
             reason = batch["reason"].to(device)
@@ -500,7 +561,16 @@ def main() -> None:
         }
         append_jsonl(out_dir / "threshold_stats.jsonl", th_row)
         append_jsonl(epoch_dir / "threshold_stats.jsonl", th_row)
-        pareto_row = {"epoch": epoch, "enabled": "structural_firewall", "cosine_action_reason": None, "projection_count": 0}
+        pareto_row = firewall_gradient_probe(model, probe_batch, device, epoch) if probe_batch is not None else {
+            "epoch": epoch,
+            "enabled": "structural_firewall",
+            "cosine_action_reason": None,
+            "cosine_action_factor": None,
+            "cosine_action_credit": None,
+            "projection_count": 0,
+            "firewall_pass": False,
+            "missing_probe_batch": True,
+        }
         append_jsonl(out_dir / "pareto_gradient_stats.jsonl", pareto_row)
         append_jsonl(epoch_dir / "pareto_gradient_stats.jsonl", pareto_row)
         ckpt = {"model": model.state_dict(), "epoch": epoch, "metrics": metrics}
@@ -508,6 +578,12 @@ def main() -> None:
         if metrics["joint"] > best_joint:
             best_joint = metrics["joint"]
             torch.save(ckpt, out_dir / "checkpoint_best_test_joint.pth")
+        if metrics["Act_mF1"] > best_action_mf1:
+            best_action_mf1 = metrics["Act_mF1"]
+            torch.save(ckpt, out_dir / "checkpoint_best_test_action_mf1.pth")
+        if metrics["Exp_mF1"] > best_exp_mf1:
+            best_exp_mf1 = metrics["Exp_mF1"]
+            torch.save(ckpt, out_dir / "checkpoint_best_test_exp_mf1.pth")
         collapse_values = [
             last_train_stats.get("factor_action_prob_mean", 0.5),
             last_train_stats.get("factor_reason_prob_mean", 0.5),

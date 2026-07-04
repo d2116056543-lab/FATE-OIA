@@ -27,3 +27,6 @@ def test_tfc_audit_gates_smoke(tmp_path):
     assert review["review_pass"] is True
     assert review["no_reason_to_final_action"] is True
     assert review["no_raw_qrho_to_action_delta"] is True
+    assert review["best_action_and_exp_checkpoints"] is True
+    assert review["pareto_gradient_stats_dynamic_firewall"] is True
+    assert review["branch_ablation_not_stub"] is True

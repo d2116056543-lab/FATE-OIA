@@ -32,7 +32,7 @@
   "epoch7": {
     "positive_count": 0.0,
     "unknown_count": 42.0,
-    "soft_negative_weight_sum": 7.269817352294922,
+    "soft_negative_weight_sum": 7.175625801086426,
     "hard_negative_count": 0.0,
     "hard_negative_by_reason": [
       0.0,

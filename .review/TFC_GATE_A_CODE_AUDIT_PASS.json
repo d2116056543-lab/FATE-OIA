@@ -23,5 +23,8 @@
   "failure_flip_cases_not_placeholder": true,
   "per_action_ap_auc_schema": true,
   "deletion_summary_not_overwritten_by_non_deletion_batch": true,
-  "target_credit_reason_deletion_availability": true
+  "target_credit_reason_deletion_availability": true,
+  "best_action_and_exp_checkpoints": true,
+  "pareto_gradient_stats_dynamic_firewall": true,
+  "branch_ablation_not_stub": true
 }

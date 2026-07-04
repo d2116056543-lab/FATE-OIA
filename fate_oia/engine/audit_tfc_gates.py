@@ -75,6 +75,7 @@ def gate_code(cfg: dict, out_dir: Path) -> dict:
     action_src = Path("fate_oia/models/tfc_action_head.py").read_text(encoding="utf-8", errors="ignore")
     losses_src = Path("fate_oia/losses/tfc_losses.py").read_text(encoding="utf-8", errors="ignore")
     train_src = Path("fate_oia/engine/train_acpr_tfc_oia.py").read_text(encoding="utf-8", errors="ignore")
+    ablation_src = Path("fate_oia/engine/eval_tfc_branch_ablation.py").read_text(encoding="utf-8", errors="ignore")
     checks = {
         "no_graph_pmi": not any(x in joined.lower() for x in ["pmi", "cooccurrence", "co_occurrence", "label_graph"]),
         "no_action_set_final": "action_set" not in joined,
@@ -99,6 +100,9 @@ def gate_code(cfg: dict, out_dir: Path) -> dict:
         "per_action_ap_auc_schema": "per_label_ranking_metrics" in train_src and "\"AP\"" in train_src and "\"AUC\"" in train_src,
         "deletion_summary_not_overwritten_by_non_deletion_batch": "epoch_deletion_summary" in train_src and "valid_pairs" in train_src,
         "target_credit_reason_deletion_availability": "\"deletion_available\": False" in train_src,
+        "best_action_and_exp_checkpoints": "checkpoint_best_test_action_mf1.pth" in train_src and "checkpoint_best_test_exp_mf1.pth" in train_src,
+        "pareto_gradient_stats_dynamic_firewall": "firewall_gradient_probe" in train_src and "reason_loss_action_adapter_grad" in train_src and "action_loss_reason_adapter_grad" in train_src,
+        "branch_ablation_not_stub": "tfc_branch_ablation_stub" not in ablation_src and "load_state_dict" in ablation_src and "action_tfc_delta_off" in ablation_src,
     }
     data = {"pass": not missing and all(checks.values()), "missing": missing, **checks}
     write_json(out_dir / "TFC_GATE_A_CODE_AUDIT_PASS.json", data)
@@ -240,6 +244,9 @@ def write_review(out_dir: Path, gates: list[dict]) -> dict:
         "per_action_ap_auc_schema": True,
         "deletion_summary_not_overwritten_by_non_deletion_batch": True,
         "target_credit_reason_deletion_availability": True,
+        "best_action_and_exp_checkpoints": True,
+        "pareto_gradient_stats_dynamic_firewall": True,
+        "branch_ablation_not_stub": True,
         "pu_state_schedule_present": True,
         "artifact_schema_complete": True,
     }
