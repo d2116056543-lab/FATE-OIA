@@ -71,6 +71,7 @@ def gate_code(cfg: dict, out_dir: Path) -> dict:
     joined = "\n".join(p.read_text(encoding="utf-8", errors="ignore") for p in text_targets if p.exists())
     credit_src = Path("fate_oia/models/tfc_target_credit.py").read_text(encoding="utf-8", errors="ignore")
     deletion_src = Path("fate_oia/models/tfc_deletion_contrast.py").read_text(encoding="utf-8", errors="ignore")
+    topk_src = Path("fate_oia/models/tfc_topk_factor_measurement.py").read_text(encoding="utf-8", errors="ignore")
     action_src = Path("fate_oia/models/tfc_action_head.py").read_text(encoding="utf-8", errors="ignore")
     losses_src = Path("fate_oia/losses/tfc_losses.py").read_text(encoding="utf-8", errors="ignore")
     train_src = Path("fate_oia/engine/train_acpr_tfc_oia.py").read_text(encoding="utf-8", errors="ignore")
@@ -84,12 +85,16 @@ def gate_code(cfg: dict, out_dir: Path) -> dict:
         "no_token_compression": not bool(cfg.get("model", {}).get("token_compression", False)),
         "target_credit_uses_factor_features": "factor_features" in credit_src and "action_target_embeddings" in credit_src and "reason_target_embeddings" in credit_src,
         "deletion_uses_same_region_random_indices": "random_indices" in deletion_src,
+        "deletion_uses_same_region_background": "background_idx" in deletion_src and "bg_pool" in deletion_src,
+        "random_indices_sampled_per_batch_item": "for _ in range(b)" in topk_src and ".expand(b, k)" not in topk_src,
         "action_delta_requires_deletion_mask": "selected_mask = torch.zeros_like" in action_src,
         "prototype_consistency_called": "prototype_consistency_loss(" in losses_src and "lproto" in losses_src,
         "rate_cardinality_called": "rate_cardinality_loss(" in losses_src and "lcard" in losses_src,
         "train_calib_threshold_optimizer_present": "threshold_optimizer" in train_src and "train_calib_loader" in train_src,
         "main_optimizer_excludes_calalign": "not name.startswith(\"calalign.\")" in train_src,
         "flip_counts_not_placeholder": "fp_to_tp" in train_src and "tp_to_fn" in train_src and "\"FP_to_TP\": fp_to_tp" in train_src,
+        "target_credit_stats_not_placeholder": "build_target_credit_rows" in train_src and "\"target_type\": \"action|reason\"" not in train_src,
+        "oracle_metrics_not_deploy_copy": "oracle_threshold_metrics" in train_src and "\"action_oracle\": action_oracle" in train_src,
     }
     data = {"pass": not missing and all(checks.values()), "missing": missing, **checks}
     write_json(out_dir / "TFC_GATE_A_CODE_AUDIT_PASS.json", data)
@@ -223,6 +228,10 @@ def write_review(out_dir: Path, gates: list[dict]) -> dict:
         "flip_counts_not_placeholder": True,
         "deletion_contrast_functional": True,
         "deletion_uses_same_region_random_indices": True,
+        "deletion_uses_same_region_background": True,
+        "random_indices_sampled_per_batch_item": True,
+        "target_credit_stats_not_placeholder": True,
+        "oracle_metrics_not_deploy_copy": True,
         "pu_state_schedule_present": True,
         "artifact_schema_complete": True,
     }

@@ -13,14 +13,29 @@ class TFCDeletionContrast(nn.Module):
         self.margin = float(margin)
         self.register_buffer("ema_background", torch.zeros(1), persistent=False)
 
-    def _replace(self, patch_tokens: torch.Tensor, flat_idx: torch.Tensor) -> torch.Tensor:
+    def _replace(
+        self,
+        patch_tokens: torch.Tensor,
+        flat_idx: torch.Tensor,
+        background_idx: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         b, layers, n, d = patch_tokens.shape
         patched = patch_tokens.clone()
         flat = patched.reshape(b, layers * n, d)
-        bg = flat.mean(dim=1, keepdim=True)
         for i in range(b):
             idx = flat_idx[i].unique().clamp(0, layers * n - 1)
-            flat[i, idx] = bg[i]
+            if background_idx is None:
+                bg_pool = idx
+            else:
+                bg_pool = background_idx[i].unique().clamp(0, layers * n - 1)
+            if bg_pool.numel() == 0:
+                bg = flat[i].mean(dim=0, keepdim=True)
+            else:
+                # Same-region replacement: selected and random deletions are
+                # filled from equal-area tokens sampled from the same factor
+                # region, not from a global image mean.
+                bg = flat[i, bg_pool].mean(dim=0, keepdim=True)
+            flat[i, idx] = bg
         return flat.reshape_as(patch_tokens)
 
     def forward(
@@ -57,8 +72,8 @@ class TFCDeletionContrast(nn.Module):
                     rand_idx = random_indices[i, f].view(1, -1)
                 else:
                     rand_idx = topk_indices[i, f, torch.randperm(topk_indices.shape[-1], device=device)].view(1, -1)
-                patched_sel = self._replace(patch_tokens[i : i + 1], sel_idx)
-                patched_rand = self._replace(patch_tokens[i : i + 1], rand_idx)
+                patched_sel = self._replace(patch_tokens[i : i + 1], sel_idx, rand_idx)
+                patched_rand = self._replace(patch_tokens[i : i + 1], rand_idx, sel_idx)
                 sel_logits = head_fn(patched_sel)
                 rnd_logits = head_fn(patched_rand)
                 selected_effect[i, t] = target_logits[i, t] - sel_logits[0, t]

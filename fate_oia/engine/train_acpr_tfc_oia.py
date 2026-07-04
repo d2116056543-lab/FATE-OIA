@@ -84,11 +84,113 @@ def set_trainable(model: ACPRTFCModel, base_requires: dict[str, bool], mode: str
             param.requires_grad_(base_requires[name])
 
 
+def thresholded_metrics_from_logits(logits: torch.Tensor, labels: torch.Tensor, thresholds: torch.Tensor, prefix: str) -> dict:
+    probs = torch.sigmoid(logits.float())
+    labels_bool = labels.float() > 0.5
+    preds = probs >= thresholds.view(1, -1)
+    tp = (preds & labels_bool).sum(0).float()
+    fp = (preds & (~labels_bool)).sum(0).float()
+    fn = ((~preds) & labels_bool).sum(0).float()
+    per_f1 = (2 * tp / (2 * tp + fp + fn).clamp_min(1e-8)).tolist()
+    micro_tp = tp.sum()
+    micro_fp = fp.sum()
+    micro_fn = fn.sum()
+    return {
+        f"{prefix}mF1": float(torch.tensor(per_f1).mean()),
+        f"{prefix}oF1": float(2 * micro_tp / (2 * micro_tp + micro_fp + micro_fn).clamp_min(1e-8)),
+        f"{prefix}per_label_f1": per_f1,
+        f"{prefix}thresholds": [float(x) for x in thresholds.detach().cpu()],
+    }
+
+
+def oracle_threshold_metrics(logits: torch.Tensor, labels: torch.Tensor, prefix: str) -> dict:
+    candidates = torch.linspace(0.05, 0.95, 19, device=logits.device)
+    probs = torch.sigmoid(logits.float())
+    thresholds = []
+    for label_idx in range(labels.shape[1]):
+        best_threshold = candidates[0]
+        best_f1 = logits.new_tensor(-1.0)
+        y = labels[:, label_idx].float() > 0.5
+        for threshold in candidates:
+            pred = probs[:, label_idx] >= threshold
+            tp = (pred & y).sum().float()
+            fp = (pred & (~y)).sum().float()
+            fn = ((~pred) & y).sum().float()
+            f1 = 2 * tp / (2 * tp + fp + fn).clamp_min(1e-8)
+            if f1 > best_f1:
+                best_f1 = f1
+                best_threshold = threshold
+        thresholds.append(best_threshold)
+    return thresholded_metrics_from_logits(logits, labels, torch.stack(thresholds), prefix)
+
+
+def build_target_credit_rows(epoch: int, out: dict, action_targets: torch.Tensor, reason_targets: torch.Tensor) -> list[dict]:
+    rows: list[dict] = []
+    comp = out["compatibility"]
+    credit_action = out["credit_action"].detach()
+    credit_reason = out["credit_reason"].detach()
+    native_action = (comp["factor_to_action_support"] - comp["factor_to_action_inhibit"]).to(credit_action.device)
+    native_reason = (comp["factor_to_reason_support"] - comp["factor_to_reason_inhibit"]).to(credit_reason.device)
+    selected_effect = out["deletion_stats"]["selected_effect"].detach()
+    random_effect = out["deletion_stats"]["random_effect"].detach()
+    gap = out["deletion_stats"]["selected_vs_random_gap"].detach()
+
+    def sign_acc(values: torch.Tensor, labels: torch.Tensor, compat: torch.Tensor, target_id: int) -> tuple:
+        pos_mask = labels[:, target_id] > 0.5
+        support = compat > 0
+        inhibit = compat < 0
+        pos_acc = None
+        inh_acc = None
+        if bool(pos_mask.any()) and bool(support.item()):
+            pos_acc = float((values[pos_mask] > 0).float().mean().cpu())
+        if bool(pos_mask.any()) and bool(inhibit.item()):
+            inh_acc = float((values[pos_mask] < 0).float().mean().cpu())
+        return pos_acc, inh_acc
+
+    for target_id in range(action_targets.shape[1]):
+        mean_credit = credit_action[:, :, target_id].mean(0)
+        factor_id = int(mean_credit.abs().argmax().cpu())
+        pos_acc, inh_acc = sign_acc(credit_action[:, factor_id, target_id], action_targets, native_action[factor_id, target_id], target_id)
+        rows.append({
+            "epoch": epoch,
+            "target_type": "action",
+            "target_id": target_id,
+            "factor_id": factor_id,
+            "credit_mean": float(mean_credit[factor_id].cpu()),
+            "credit_topk": float(credit_action[:, factor_id, target_id].abs().mean().cpu()),
+            "compatibility": float(native_action[factor_id, target_id].cpu()),
+            "deletion_selected": float(selected_effect[:, target_id].mean().cpu()),
+            "deletion_random": float(random_effect[:, target_id].mean().cpu()),
+            "selected_vs_random_gap": float(gap[:, target_id].mean().cpu()),
+            "positive_credit_sign_acc": pos_acc,
+            "inhibitory_credit_sign_acc": inh_acc,
+        })
+    for target_id in range(reason_targets.shape[1]):
+        mean_credit = credit_reason[:, :, target_id].mean(0)
+        factor_id = int(mean_credit.abs().argmax().cpu())
+        pos_acc, inh_acc = sign_acc(credit_reason[:, factor_id, target_id], reason_targets, native_reason[factor_id, target_id], target_id)
+        rows.append({
+            "epoch": epoch,
+            "target_type": "reason",
+            "target_id": target_id,
+            "factor_id": factor_id,
+            "credit_mean": float(mean_credit[factor_id].cpu()),
+            "credit_topk": float(credit_reason[:, factor_id, target_id].abs().mean().cpu()),
+            "compatibility": float(native_reason[factor_id, target_id].cpu()),
+            "deletion_selected": None,
+            "deletion_random": None,
+            "selected_vs_random_gap": None,
+            "positive_credit_sign_acc": pos_acc,
+            "inhibitory_credit_sign_acc": inh_acc,
+        })
+    return rows
+
+
 @torch.no_grad()
 def evaluate(model: ACPRTFCModel, loader: DataLoader, device: torch.device, epoch: int, out_dir: Path) -> dict:
     model.eval()
     act_logits = []; rea_logits = []; act_labels = []; rea_labels = []; names = []
-    act_visual = []; act_delta_off = []
+    act_visual = []; act_delta_off = []; act_base = []
     for batch in loader:
         img = batch["image"].to(device, non_blocking=True)
         a = batch["action"].to(device)
@@ -98,12 +200,17 @@ def evaluate(model: ACPRTFCModel, loader: DataLoader, device: torch.device, epoc
         rea_logits.append(out["reason_logits_deploy"].cpu())
         act_visual.append(out["action_visual_logits"].cpu())
         act_delta_off.append((out["action_logits_base"] - out["action_tfc_delta"]).cpu())
+        act_base.append(out["action_logits_base"].cpu())
         act_labels.append(a.cpu()); rea_labels.append(r.cpu()); names.extend(batch["file_name"])
     action_logits = torch.cat(act_logits); reason_logits = torch.cat(rea_logits)
     action_labels = torch.cat(act_labels); reason_labels = torch.cat(rea_labels)
     action_metrics = multilabel_metrics_from_logits(action_logits, action_labels, prefix="Act_")
     reason_metrics = multilabel_metrics_from_logits(reason_logits, reason_labels, prefix="Exp_")
+    action_oracle = oracle_threshold_metrics(action_logits, action_labels, prefix="Act_")
+    reason_oracle = oracle_threshold_metrics(reason_logits, reason_labels, prefix="Exp_")
     metrics = {**action_metrics, **reason_metrics}
+    metrics["Act_oracle_mF1"] = action_oracle["Act_mF1"]
+    metrics["Exp_oracle_mF1"] = reason_oracle["Exp_mF1"]
     metrics["joint"] = 0.5 * metrics["Act_mF1"] + 0.5 * metrics["Exp_mF1"]
     epoch_dir = out_dir / f"epoch_{epoch:03d}"
     epoch_dir.mkdir(parents=True, exist_ok=True)
@@ -115,6 +222,7 @@ def evaluate(model: ACPRTFCModel, loader: DataLoader, device: torch.device, epoc
     write_json(epoch_dir / "file_names_test.json", names)
     action_visual_logits = torch.cat(act_visual)
     action_delta_off_logits = torch.cat(act_delta_off)
+    action_base_logits = torch.cat(act_base)
     visual_pred = torch.sigmoid(action_visual_logits) >= 0.5
     final_pred = torch.sigmoid(action_logits) >= 0.5
     labels_bool = action_labels > 0.5
@@ -125,10 +233,10 @@ def evaluate(model: ACPRTFCModel, loader: DataLoader, device: torch.device, epoc
     write_json(epoch_dir / "action_branch_metrics.json", {
         "action_visual_only": multilabel_metrics_from_logits(action_visual_logits, action_labels, prefix="Act_"),
         "action_tfc_delta_off": multilabel_metrics_from_logits(action_delta_off_logits, action_labels, prefix="Act_"),
-        "action_tfc_delta_on": action_metrics,
-        "action_threshold_delta_off": action_metrics,
+        "action_tfc_delta_on": multilabel_metrics_from_logits(action_base_logits, action_labels, prefix="Act_"),
+        "action_threshold_delta_off": multilabel_metrics_from_logits(action_base_logits, action_labels, prefix="Act_"),
         "action_final_deploy": action_metrics,
-        "action_oracle": action_metrics,
+        "action_oracle": action_oracle,
         "per_action_AP_AUC_F1": action_metrics.get("Act_per_label_f1", []),
         "FP_to_TP": fp_to_tp,
         "TP_to_FN": tp_to_fn,
@@ -226,6 +334,7 @@ def main() -> None:
                 "pu_stats": out["pu_state"]["stats"],
                 "theta_delta_action_abs_mean": float(out["theta_delta_action"].detach().abs().mean().cpu()),
                 "theta_delta_reason_abs_mean": float(out["theta_delta_reason"].detach().abs().mean().cpu()),
+                "credit_rows": build_target_credit_rows(epoch, out, action, reason),
             }
             if step % 200 == 0:
                 print("tfc_batch " + json.dumps(row), flush=True)
@@ -264,22 +373,9 @@ def main() -> None:
         factor_row = {"epoch": epoch, **{k: v for k, v in last_train_stats.items() if k.startswith("factor_")}}
         append_jsonl(out_dir / "factor_measurement_stats.jsonl", factor_row)
         append_jsonl(epoch_dir / "factor_measurement_stats.jsonl", factor_row)
-        credit_row = {
-            "epoch": epoch,
-            "target_type": "action|reason",
-            "target_id": 0,
-            "factor_id": 0,
-            "credit_mean": last_train_stats.get("credit_action_abs_mean", 0.0),
-            "credit_topk": last_train_stats.get("credit_reason_abs_mean", 0.0),
-            "compatibility": 1.0,
-            "deletion_selected": last_train_stats.get("deletion_gap_mean", 0.0),
-            "deletion_random": 0.0,
-            "selected_vs_random_gap": last_train_stats.get("deletion_gap_mean", 0.0),
-            "positive_credit_sign_acc": 0.0,
-            "inhibitory_credit_sign_acc": 0.0,
-        }
-        append_jsonl(out_dir / "target_credit_stats.jsonl", credit_row)
-        append_jsonl(epoch_dir / "target_credit_stats.jsonl", credit_row)
+        for credit_row in last_train_stats.get("credit_rows", []):
+            append_jsonl(out_dir / "target_credit_stats.jsonl", credit_row)
+            append_jsonl(epoch_dir / "target_credit_stats.jsonl", credit_row)
         del_row = {
             "epoch": epoch,
             "selected_vs_random_gap_mean": last_train_stats.get("deletion_gap_mean", 0.0),
@@ -295,8 +391,8 @@ def main() -> None:
             "train_calib_theta": True,
             "theta_delta_action_abs_mean": last_train_stats.get("theta_delta_action_abs_mean", 0.0),
             "theta_delta_reason_abs_mean": last_train_stats.get("theta_delta_reason_abs_mean", 0.0),
-            "deploy_oracle_gap_action": 0.0,
-            "deploy_oracle_gap_reason": 0.0,
+            "deploy_oracle_gap_action": metrics.get("Act_oracle_mF1", metrics["Act_mF1"]) - metrics["Act_mF1"],
+            "deploy_oracle_gap_reason": metrics.get("Exp_oracle_mF1", metrics["Exp_mF1"]) - metrics["Exp_mF1"],
             "threshold_input_stopgrad_check": True,
             "threshold_optimizer_source": "train_calib_only",
         }

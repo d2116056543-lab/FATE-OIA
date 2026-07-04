@@ -2,6 +2,7 @@
 
 from fate_oia.losses.tfc_losses import compute_tfc_losses
 from fate_oia.models.acpr_tfc_model import ACPRTFCModel
+from fate_oia.models.tfc_deletion_contrast import TFCDeletionContrast
 
 
 def test_tfc_model_forward_shapes_and_firewall():
@@ -29,3 +30,11 @@ def test_tfc_model_forward_shapes_and_firewall():
     assert "prototype" in losses
     assert "cardinality" in losses
     assert torch.isfinite(losses["total"])
+
+
+def test_deletion_replacement_uses_same_region_background():
+    deletion = TFCDeletionContrast()
+    patch = torch.arange(6, dtype=torch.float32).view(1, 1, 6, 1)
+    patched = deletion._replace(patch, torch.tensor([[0, 1]]), torch.tensor([[4, 5]]))
+    assert torch.allclose(patched[0, 0, 0, 0], torch.tensor(4.5))
+    assert torch.allclose(patched[0, 0, 1, 0], torch.tensor(4.5))

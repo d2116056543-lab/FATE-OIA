@@ -25,6 +25,10 @@
   "flip_counts_not_placeholder": true,
   "deletion_contrast_functional": true,
   "deletion_uses_same_region_random_indices": true,
+  "deletion_uses_same_region_background": true,
+  "random_indices_sampled_per_batch_item": true,
+  "target_credit_stats_not_placeholder": true,
+  "oracle_metrics_not_deploy_copy": true,
   "pu_state_schedule_present": true,
   "artifact_schema_complete": true
 }

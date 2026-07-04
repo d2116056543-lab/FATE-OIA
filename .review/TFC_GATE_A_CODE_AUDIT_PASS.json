@@ -10,10 +10,14 @@
   "no_token_compression": true,
   "target_credit_uses_factor_features": true,
   "deletion_uses_same_region_random_indices": true,
+  "deletion_uses_same_region_background": true,
+  "random_indices_sampled_per_batch_item": true,
   "action_delta_requires_deletion_mask": true,
   "prototype_consistency_called": true,
   "rate_cardinality_called": true,
   "train_calib_threshold_optimizer_present": true,
   "main_optimizer_excludes_calalign": true,
-  "flip_counts_not_placeholder": true
+  "flip_counts_not_placeholder": true,
+  "target_credit_stats_not_placeholder": true,
+  "oracle_metrics_not_deploy_copy": true
 }

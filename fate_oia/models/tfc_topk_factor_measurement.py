@@ -70,7 +70,8 @@ class TFCTopKFactorMeasurement(nn.Module):
         for factor_idx in range(f):
             prob = priors[factor_idx].view(1, n).expand(layers, n).reshape(layers * n).clamp_min(1e-6)
             prob = prob / prob.sum()
-            random_indices.append(torch.multinomial(prob, num_samples=k, replacement=True).view(1, k).expand(b, k))
+            samples = [torch.multinomial(prob, num_samples=k, replacement=True) for _ in range(b)]
+            random_indices.append(torch.stack(samples, dim=0))
         random_indices_t = torch.stack(random_indices, dim=1)
         return {
             "factor_features": factor_features,
