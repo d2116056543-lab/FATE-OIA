@@ -42,7 +42,7 @@ def _threshold_sweep(logits: torch.Tensor, labels: torch.Tensor, mask: torch.Ten
 def evaluate(model: ACPRInteractFlowPPModel, loader: DataLoader, device: torch.device, output_dir: str | Path | None = None, epoch: int = 0) -> dict:
     model.eval()
     action_logits, exp_logits, exp_logits_calibrated, action_labels, action_soft, exp_labels, exp_mask = [], [], [], [], [], [], []
-    global_logits, flow_delta_logits, calibration_delta, visual_logits, motion_logits, predicate_logits = [], [], [], [], [], []
+    global_logits, flow_delta_logits, calibration_delta, visual_logits, direct_logits, motion_logits, predicate_logits = [], [], [], [], [], [], []
     gated_state_contrib, benefit_gate, ledger_gate = [], [], []
     innovation_rows: list[dict] = []
     file_names: list[str] = []
@@ -58,6 +58,7 @@ def evaluate(model: ACPRInteractFlowPPModel, loader: DataLoader, device: torch.d
         flow_delta_logits.append(out.ledger.flow_delta_logits.detach().cpu())
         calibration_delta.append(out.ledger.calibration_delta.detach().cpu())
         visual_logits.append(out.ledger.visual_logits.detach().cpu())
+        direct_logits.append(out.aux.get("action_logits_direct", out.ledger.visual_logits).detach().cpu())
         motion_logits.append(out.ledger.motion_logits.detach().cpu())
         predicate_logits.append(out.ledger.predicate_logits.detach().cpu())
         gated_state_contrib.append(out.ledger.gated_state_contributions.detach().cpu())
@@ -90,6 +91,7 @@ def evaluate(model: ACPRInteractFlowPPModel, loader: DataLoader, device: torch.d
                 "ledger_benefit_gate_mean": float(out.ledger.benefit_gate.detach().mean().cpu()),
                 "ledger_flow_delta_abs_mean": float(out.ledger.flow_delta_logits.detach().abs().mean().cpu()),
                 "ledger_calibration_delta_abs_mean": float(out.ledger.calibration_delta.detach().abs().mean().cpu()),
+                "action_direct_attention_entropy": float(out.aux.get("action_direct_attention_entropy", torch.tensor(0.0)).detach().cpu()),
                 "ledger_identity_error": float(out.ledger.identity_error.detach().cpu()),
                 "exp29_raw_prob_mean": float(exp_prob_raw.detach().mean().cpu()),
                 "exp29_raw_prob_max": float(exp_prob_raw.detach().max().cpu()),
@@ -162,6 +164,7 @@ def evaluate(model: ACPRInteractFlowPPModel, loader: DataLoader, device: torch.d
                 "logits_exp29_calibrated": ecal,
                 "logits_action_global": torch.cat(global_logits),
                 "logits_action_visual": torch.cat(visual_logits),
+                "logits_action_direct": torch.cat(direct_logits),
                 "logits_action_motion": torch.cat(motion_logits),
                 "logits_action_predicate": torch.cat(predicate_logits),
                 "logits_action_flow_delta": torch.cat(flow_delta_logits),

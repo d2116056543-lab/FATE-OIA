@@ -34,14 +34,18 @@ class DecisionLedgerHead(nn.Module):
         factor_tokens: torch.Tensor,
         flow_edges: torch.Tensor,
         action_soft_target: torch.Tensor | None = None,
+        direct_action_logits: torch.Tensor | None = None,
     ) -> InteractionDecisionLedger:
-        visual_logits = self.visual_head(visual_token)
+        visual_logits = direct_action_logits if direct_action_logits is not None else self.visual_head(visual_token)
         motion_logits = self.motion_head(motion_token)
         predicate_logits = self.predicate_head(predicate_token)
         gate = torch.sigmoid(self.flow_gate(factor_tokens)).clamp(0.05, 0.95)
         benefit_logits = self.benefit_gate(factor_tokens)
         benefit = torch.sigmoid(benefit_logits).clamp(0.0, 1.0)
-        global_logits = visual_logits + 0.35 * motion_logits + 0.25 * predicate_logits
+        if direct_action_logits is not None:
+            global_logits = visual_logits
+        else:
+            global_logits = visual_logits + 0.35 * motion_logits + 0.25 * predicate_logits
         raw_state_contributions = flow_edges.clamp(-0.35, 0.35)
         benefit_target = None
         if action_soft_target is not None:

@@ -106,6 +106,7 @@ def _build_optimizer(model: ACPRInteractFlowPPModel, cfg: dict) -> torch.optim.O
         groups.append({"params": [model.flow.factor_queries], "lr": float(lr_cfg.get("interaction_flow", 1e-4)), "weight_decay": default_wd, "name": "flow_factor_queries"})
         used.add(id(model.flow.factor_queries))
     add_group("response_lag", [model.flow.lag], "response_lag", 1e-4)
+    add_group("direct_action", [model.direct_action], "direct_action", 1e-4)
     add_group("decision_ledger", [model.ledger], "decision_ledger", 1e-4)
     add_group("exp29_head", [model.exp29], "exp29_head", 1e-4)
     add_group("calibration_thresholds", [model.calalign], "calibration_thresholds", 2e-4)

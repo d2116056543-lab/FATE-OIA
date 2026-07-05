@@ -17,7 +17,10 @@ def test_formal_config_consumes_runtime_image_cache_eval_and_loss_fields() -> No
     assert cfg["data"]["feature_cache_enabled"] is False
     assert cfg["data"]["token_cache_enabled"] is False
     assert cfg["data"]["logit_cache_enabled"] is False
-    assert cfg["data"]["formal_input_uses_target_frame"] is False
+    assert cfg["data"]["frame_protocol"] == "target_current_15"
+    assert cfg["data"]["eval_frame_protocol"] == "target_current_15"
+    assert cfg["data"]["formal_input_uses_target_frame"] is True
+    assert cfg["data"]["allow_target_frame_in_input"] is True
     assert cfg["evaluation"]["eval_splits"] == ["test"]
     assert cfg["evaluation"]["best_selector"]["primary"] == "joint"
     assert "test" in cfg["evaluation"]["eval_splits"]

@@ -30,3 +30,20 @@ def test_model_forward_shapes_and_ledger_identity():
     assert out.ledger.benefit_gate.shape == out.ledger.gate.shape
     assert float(out.ledger.identity_error) < 1e-5
     assert "state_group_logits" in out.aux
+
+
+def test_formal_action_uses_direct_dino_probe_style_branch():
+    model = ACPRInteractFlowPPModel(
+        pretrained_weights="missing-is-ok-with-mock",
+        predicate_config="configs/acpr_interactflow_predicates.yaml",
+        grammar_path="configs/acpr_interactflow_state_grammar.yaml",
+        action_dim=3,
+        use_mock_dino=True,
+    )
+    frames = torch.randn(2, 15, 3, 32, 64)
+    out = model(frames)
+    direct = out.aux["action_logits_direct"]
+    assert direct.shape == (2, 3)
+    assert out.ledger.global_logits.shape == direct.shape
+    assert torch.allclose(out.ledger.global_logits, direct, atol=1e-6)
+    expected = direct + out.ledger.flow_delta_logits + out.ledger.calibration_delta

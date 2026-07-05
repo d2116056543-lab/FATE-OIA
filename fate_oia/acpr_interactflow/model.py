@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import replace
 
@@ -16,6 +17,51 @@ from .state_bank import ObjectiveEnvironmentStateBank
 from .timing import StepTimer
 from .types import ACPRInteractFlowPPOutput
 from .visual_encoder import InteractVisualEncoder
+
+
+class DirectVisualActionHead(nn.Module):
+    """DINO-probe-style direct action path for PSI action classification."""
+
+    def __init__(self, dim: int = 384, num_actions: int = 3, spatial_queries: int = 8) -> None:
+        super().__init__()
+        self.dim = int(dim)
+        self.num_actions = int(num_actions)
+        self.spatial_queries_count = max(1, int(spatial_queries))
+        self.spatial_queries = nn.Parameter(torch.randn(self.spatial_queries_count, self.dim) * 0.02)
+        self.spatial_norm = nn.LayerNorm(self.dim)
+        frame_dim = self.dim * (1 + self.spatial_queries_count)
+        pooled_dim = frame_dim * 3
+        self.token_proj = nn.Sequential(
+            nn.LayerNorm(pooled_dim),
+            nn.Linear(pooled_dim, self.dim),
+            nn.GELU(),
+            nn.LayerNorm(self.dim),
+        )
+        self.action_head = nn.Sequential(
+            nn.Linear(self.dim, self.dim),
+            nn.GELU(),
+            nn.Linear(self.dim, self.num_actions),
+        )
+
+    def forward(self, visual) -> dict[str, torch.Tensor]:
+        cls_tokens = visual.cls_tokens
+        patch_tokens = visual.patch_tokens_by_layer
+        b, anchors, layers, patches, dim = patch_tokens.shape
+        if dim != self.dim:
+            raise ValueError(f"DirectVisualActionHead expected dim={self.dim}, got {dim}")
+        dense_tokens = patch_tokens.reshape(b, anchors, layers * patches, dim)
+        normalized = self.spatial_norm(dense_tokens)
+        scores = torch.einsum("qd,band->baqn", self.spatial_queries, normalized) / math.sqrt(float(dim))
+        attention = torch.softmax(scores, dim=-1)
+        attended = torch.einsum("baqn,band->baqd", attention, dense_tokens).reshape(b, anchors, -1)
+        frame_features = torch.cat([cls_tokens, attended], dim=-1)
+        mean_feat = frame_features.mean(dim=1)
+        last_feat = frame_features[:, -1]
+        delta_feat = frame_features[:, -1] - frame_features[:, 0]
+        decision_features = self.token_proj(torch.cat([mean_feat, last_feat, delta_feat], dim=-1))
+        logits = self.action_head(decision_features)
+        entropy = -(attention * attention.clamp_min(1e-8).log()).sum(-1).mean()
+        return {"logits": logits, "features": decision_features, "attention_entropy": entropy}
 
 
 def bounded_exp29_calalign_delta(calibrated_logits: torch.Tensor, raw_logits: torch.Tensor, max_delta: float = 0.05) -> torch.Tensor:
@@ -59,6 +105,7 @@ class ACPRInteractFlowPPModel(nn.Module):
             patch_size=patch_size,
         )
         self.motion = MotionPathEncoder(dim=dim)
+        self.direct_action = DirectVisualActionHead(dim=self.visual.dim, num_actions=action_dim, spatial_queries=8)
         self.predicates = DynamicPredicateField(
             predicate_config=predicate_config,
             dim=dim,
@@ -107,6 +154,7 @@ class ACPRInteractFlowPPModel(nn.Module):
             visual = self.visual(input_frames)
         with timer.section("visual_motion"):
             motion = self.motion(visual.fast_motion_tokens)
+            direct_action = self.direct_action(visual)
         with timer.section("predicate"):
             predicates = self.predicates(
                 visual.patch_tokens_by_layer,
@@ -146,7 +194,7 @@ class ACPRInteractFlowPPModel(nn.Module):
         response_lag_time = float(flow.stats.get("response_lag_time", 0.0))
         timer.add("response_lag", response_lag_time)
         timer.add("interaction_flow", max(flow_total - response_lag_time, 0.0))
-        visual_token = visual.anchor_tokens[:, -1]
+        visual_token = direct_action["features"]
         predicate_token = predicates.predicate_tokens.mean(1) + state_bank["state_tokens"].mean(1)
         with timer.section("decision_ledger"):
             ledger = self.ledger(
@@ -156,6 +204,7 @@ class ACPRInteractFlowPPModel(nn.Module):
                 flow.factor_tokens,
                 flow.flow_edges,
                 action_soft_target=action_soft_target,
+                direct_action_logits=direct_action["logits"],
             )
         if intervention == "global_only":
             final_logits = ledger.global_logits + ledger.calibration_delta
@@ -185,6 +234,9 @@ class ACPRInteractFlowPPModel(nn.Module):
             "state_stats": state_bank["state_stats"],
             "motion_logits": motion["motion_logits"],
             "epoch": epoch,
+            "action_logits_direct": direct_action["logits"],
+            "action_direct_features": direct_action["features"],
+            "action_direct_attention_entropy": direct_action["attention_entropy"],
         }
         aux["model_timing"] = timer.summary(reset=False)
         return ACPRInteractFlowPPOutput(
