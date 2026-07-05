@@ -3,6 +3,18 @@ import subprocess
 import sys
 from pathlib import Path
 
+from fate_oia.models.tfc_action_head import action_delta_cap
+from fate_oia.models.tfc_reason_head import reason_delta_cap
+
+
+def test_tfc_delta_schedule_matches_plan():
+    assert [round(action_delta_cap(e), 4) for e in range(0, 12)] == [
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.02, 0.03, 0.04, 0.05, 0.06, 0.04
+    ]
+    assert [round(reason_delta_cap(e), 4) for e in range(0, 12)] == [
+        0.0, 0.0, 0.0, 0.05, 0.05, 0.05, 0.08, 0.09, 0.10, 0.11, 0.12, 0.10
+    ]
+
 
 def test_tfc_audit_gates_smoke(tmp_path):
     out = tmp_path / "review"
@@ -42,3 +54,4 @@ def test_tfc_audit_gates_smoke(tmp_path):
     assert review["train_checks_gate_json_pass_values"] is True
     assert review["audit_exits_nonzero_on_failed_review"] is True
     assert review["target_credit_stats_written_every_epoch"] is True
+    assert review["delta_schedule_matches_plan"] is True

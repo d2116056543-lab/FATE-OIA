@@ -11,8 +11,8 @@ def reason_delta_cap(epoch: int, max_cap: float = 0.15) -> float:
     if epoch <= 5:
         return min(max_cap, 0.05)
     if epoch <= 10:
-        return min(max_cap, 0.10)
-    return min(max_cap, 0.15)
+        return min(max_cap, 0.08 + 0.01 * (epoch - 6))
+    return min(max_cap, 0.10)
 
 
 class TFCReasonHead(nn.Module):

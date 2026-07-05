@@ -8,11 +8,9 @@ import torch.nn.functional as F
 def action_delta_cap(epoch: int, max_cap: float = 0.06) -> float:
     if epoch <= 5:
         return 0.0
-    if epoch <= 8:
-        return min(max_cap, 0.02)
     if epoch <= 10:
-        return min(max_cap, 0.04)
-    return min(max_cap, 0.06)
+        return min(max_cap, 0.02 + 0.01 * (epoch - 6))
+    return min(max_cap, 0.04)
 
 
 class TFCActionHead(nn.Module):

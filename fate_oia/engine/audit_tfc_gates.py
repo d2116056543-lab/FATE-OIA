@@ -10,6 +10,8 @@ import yaml
 
 from fate_oia.models.acpr_tfc_model import ACPRTFCModel
 from fate_oia.models.tfc_factor_bank import TFCFactorBank
+from fate_oia.models.tfc_action_head import action_delta_cap
+from fate_oia.models.tfc_reason_head import reason_delta_cap
 from fate_oia.losses.tfc_losses import action_asl_loss, reason_pu_asl_loss
 
 
@@ -74,6 +76,7 @@ CODE_REVIEW_FIELDS = [
     "train_checks_gate_json_pass_values",
     "audit_exits_nonzero_on_failed_review",
     "target_credit_stats_written_every_epoch",
+    "delta_schedule_matches_plan",
 ]
 
 
@@ -151,6 +154,12 @@ def gate_code(cfg: dict, out_dir: Path) -> dict:
         "train_checks_gate_json_pass_values": "pretrain_gate_failures" in train_src and "\"review_pass\"" in train_src and "=false" in train_src and "json.loads" in train_src,
         "audit_exits_nonzero_on_failed_review": "sys.exit(1)" in Path("fate_oia/engine/audit_tfc_gates.py").read_text(encoding="utf-8", errors="ignore"),
         "target_credit_stats_written_every_epoch": "credit_rows_to_write = epoch_credit_rows or last_train_stats.get(\"credit_rows\", [])" in train_src and "\"deletion_available\": False" in train_src,
+        "delta_schedule_matches_plan": (
+            [round(action_delta_cap(e), 4) for e in range(0, 12)]
+            == [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.02, 0.03, 0.04, 0.05, 0.06, 0.04]
+            and [round(reason_delta_cap(e), 4) for e in range(0, 12)]
+            == [0.0, 0.0, 0.0, 0.05, 0.05, 0.05, 0.08, 0.09, 0.10, 0.11, 0.12, 0.10]
+        ),
     }
     data = {"pass": not missing and all(checks.values()), "missing": missing, **checks}
     write_json(out_dir / "TFC_GATE_A_CODE_AUDIT_PASS.json", data)
