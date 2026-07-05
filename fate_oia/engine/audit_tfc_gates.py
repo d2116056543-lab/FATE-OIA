@@ -272,7 +272,8 @@ def gate_firewall(cfg: dict, out_dir: Path, device: torch.device) -> dict:
     reason = torch.zeros(2, 21, device=device); reason[:, 0] = 1
     out1 = model(images, action, reason, epoch=7, split="train", run_deletion=False)
     out2 = model(images, action, torch.zeros_like(reason), epoch=7, split="test", run_deletion=False)
-    max_diff = (out1["action_visual_logits"] - out2["action_visual_logits"]).abs().max().item()
+    visual_max_diff = (out1["action_visual_logits"] - out2["action_visual_logits"]).abs().max().item()
+    final_max_diff = (out1["action_logits_deploy"] - out2["action_logits_deploy"]).abs().max().item()
     model.zero_grad(set_to_none=True)
     reason_loss = reason_pu_asl_loss(out1["reason_logits_deploy"], reason, out1["pu_state"])
     reason_loss.backward(retain_graph=True)
@@ -288,8 +289,9 @@ def gate_firewall(cfg: dict, out_dir: Path, device: torch.device) -> dict:
         if p.grad is not None:
             reason_grad += float(p.grad.detach().abs().sum().cpu())
     data = {
-        "pass": max_diff < 1e-6 and action_grad == 0.0 and reason_grad == 0.0,
-        "reason_zero_action_max_abs_diff": max_diff,
+        "pass": final_max_diff < 1e-6 and action_grad == 0.0 and reason_grad == 0.0,
+        "reason_zero_action_max_abs_diff": final_max_diff,
+        "reason_zero_action_visual_max_abs_diff": visual_max_diff,
         "reason_loss_action_adapter_grad": action_grad,
         "action_loss_reason_adapter_grad": reason_grad,
     }
