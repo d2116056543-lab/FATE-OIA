@@ -322,9 +322,22 @@ def gate_factor_pu_cal(cfg: dict, out_dir: Path, device: torch.device) -> list[d
     }
     write_json(out_dir / "TFC_GATE_F_PU_STATE_PASS.json", data_f)
     fp = out["factor_probs_action"].detach().clone().requires_grad_(True)
-    cal = model.calalign(out["action_logits_base"], out["reason_logits_base"], fp.detach().sum(1, keepdim=True).expand(-1, 4), out["credit_confidence_reason"])
+    cal = model.calalign(
+        out["action_logits_base"],
+        out["reason_logits_base"],
+        fp.detach().sum(1, keepdim=True).expand(-1, 4),
+        out["credit_confidence_reason"],
+    )
     deploy_exact = torch.allclose(cal["action_logits_deploy"], out["action_logits_base"] - cal["action_theta"], atol=1e-7)
-    data_g = {"pass": bool(deploy_exact), "deploy_equation_exact": bool(deploy_exact), "threshold_input_stopgrad_check": True}
+    model.zero_grad(set_to_none=True)
+    threshold_loss = cal["action_theta"].sum() + cal["reason_theta"].sum()
+    threshold_loss.backward()
+    stopgrad_ok = fp.grad is None or float(fp.grad.detach().abs().sum().cpu()) == 0.0
+    data_g = {
+        "pass": bool(deploy_exact) and bool(stopgrad_ok),
+        "deploy_equation_exact": bool(deploy_exact),
+        "threshold_input_stopgrad_check": bool(stopgrad_ok),
+    }
     write_json(out_dir / "TFC_GATE_G_CALALIGN_PASS.json", data_g)
     return [data_d, data_e, data_f, data_g]
 

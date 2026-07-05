@@ -64,6 +64,23 @@ def test_random_deletion_indices_are_equal_area_unique():
             assert random_indices[sample, factor].unique().numel() == random_indices.shape[-1]
 
 
+def test_calalign_threshold_inputs_stopgrad_factor_probs():
+    model = ACPRTFCModel(use_mock_dino=True, factor_topk_tokens=8)
+    images = torch.randn(2, 3, 360, 640)
+    action = torch.zeros(2, 4)
+    reason = torch.zeros(2, 21)
+    out = model(images, action, reason, epoch=7, split="train", run_deletion=True)
+    factor_probs = out["factor_probs_action"].detach().clone().requires_grad_(True)
+    cal = model.calalign(
+        out["action_logits_base"],
+        out["reason_logits_base"],
+        factor_probs.detach().sum(1, keepdim=True).expand(-1, 4),
+        out["credit_confidence_reason"],
+    )
+    (cal["action_theta"].sum() + cal["reason_theta"].sum()).backward()
+    assert factor_probs.grad is None or factor_probs.grad.abs().sum() == 0
+
+
 def test_tfc_target_credit_cannot_create_unknown_native_credit():
     module = TFCTargetCredit(num_factors=2, action_dim=2, reason_dim=3, dim=4)
     factor_probs = torch.ones(1, 2)
