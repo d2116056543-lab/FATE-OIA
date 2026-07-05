@@ -25,6 +25,10 @@ def test_tfc_audit_gates_smoke(tmp_path):
     subprocess.check_call(cmd)
     review = json.loads(Path(".review/acpr_tfc_v1_REVIEW_PASS.json").read_text())
     assert review["review_pass"] is True
+    assert review["gate_count"] >= 7
+    assert all(review["gate_passes"])
+    assert review["forward_schema_pass"] is True
+    assert review["memory_probe_pass"] is True
     assert review["no_reason_to_final_action"] is True
     assert review["no_raw_qrho_to_action_delta"] is True
     assert review["best_action_and_exp_checkpoints"] is True
@@ -35,3 +39,6 @@ def test_tfc_audit_gates_smoke(tmp_path):
     assert review["oracle_act_drop_stop_condition"] is True
     assert review["map_threshold_movement_stop_condition"] is True
     assert review["foreground_script_argparse_safe_review_flag"] is True
+    assert review["train_checks_gate_json_pass_values"] is True
+    assert review["audit_exits_nonzero_on_failed_review"] is True
+    assert review["target_credit_stats_written_every_epoch"] is True

@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import torch
@@ -35,6 +36,44 @@ REQUIRED = [
     "tests/test_acpr_tfc_factor_bank.py",
     "tests/test_acpr_tfc_model_forward.py",
     "tests/test_acpr_tfc_gates.py",
+]
+
+
+CODE_REVIEW_FIELDS = [
+    "no_graph_pmi",
+    "no_action_set_final",
+    "no_reason_to_final_action",
+    "no_raw_qrho_to_action_delta",
+    "no_dense_bpnd",
+    "no_cache",
+    "no_token_compression",
+    "target_credit_uses_factor_features",
+    "deletion_uses_same_region_random_indices",
+    "deletion_uses_same_region_background",
+    "random_indices_sampled_per_batch_item",
+    "action_delta_requires_deletion_mask",
+    "prototype_consistency_called",
+    "rate_cardinality_called",
+    "train_calib_threshold_optimizer_present",
+    "main_optimizer_excludes_calalign",
+    "flip_counts_not_placeholder",
+    "target_credit_stats_not_placeholder",
+    "oracle_metrics_not_deploy_copy",
+    "failure_flip_cases_not_placeholder",
+    "per_action_ap_auc_schema",
+    "deletion_summary_not_overwritten_by_non_deletion_batch",
+    "target_credit_reason_deletion_availability",
+    "best_action_and_exp_checkpoints",
+    "pareto_gradient_stats_dynamic_firewall",
+    "branch_ablation_not_stub",
+    "pretrain_gates_required_by_default",
+    "allow_failed_gates_used",
+    "oracle_act_drop_stop_condition",
+    "map_threshold_movement_stop_condition",
+    "foreground_script_argparse_safe_review_flag",
+    "train_checks_gate_json_pass_values",
+    "audit_exits_nonzero_on_failed_review",
+    "target_credit_stats_written_every_epoch",
 ]
 
 
@@ -109,6 +148,9 @@ def gate_code(cfg: dict, out_dir: Path) -> dict:
         "oracle_act_drop_stop_condition": "oracle_act_mf1_drops_for_2_epochs_after_action_delta_start" in train_src and "oracle_act_drop_epochs" in train_src,
         "map_threshold_movement_stop_condition": "act_map_drops_while_exp_rises_through_threshold_movement" in train_src and "prev_exp_deploy_oracle_gap" in train_src,
         "foreground_script_argparse_safe_review_flag": "--require_review_pass:$RequireReviewPass" not in script_src and "$trainArgs" in script_src and "if ($RequireReviewPass)" in script_src,
+        "train_checks_gate_json_pass_values": "pretrain_gate_failures" in train_src and "\"review_pass\"" in train_src and "=false" in train_src and "json.loads" in train_src,
+        "audit_exits_nonzero_on_failed_review": "sys.exit(1)" in Path("fate_oia/engine/audit_tfc_gates.py").read_text(encoding="utf-8", errors="ignore"),
+        "target_credit_stats_written_every_epoch": "credit_rows_to_write = epoch_credit_rows or last_train_stats.get(\"credit_rows\", [])" in train_src and "\"deletion_available\": False" in train_src,
     }
     data = {"pass": not missing and all(checks.values()), "missing": missing, **checks}
     write_json(out_dir / "TFC_GATE_A_CODE_AUDIT_PASS.json", data)
@@ -215,6 +257,23 @@ def gate_memory(cfg: dict, out_dir: Path, device: torch.device, batch_size: int)
 
 
 def write_review(out_dir: Path, gates: list[dict]) -> dict:
+    code_gate = next((g for g in gates if "no_graph_pmi" in g and "missing" in g), {})
+    forward_gate = next((g for g in gates if "shapes_ok" in g and "finite" in g), {})
+    firewall_gate = next((g for g in gates if "reason_zero_action_max_abs_diff" in g), {})
+    deletion_gate = next((g for g in gates if "selected_vs_random_gap_mean" in g), {})
+    pu_gate = next((g for g in gates if "epoch0" in g and "epoch7" in g), {})
+    memory_gate = next((g for g in gates if "reserved_vram_gb" in g), {})
+    artifact_schema_fields = [
+        "target_credit_stats_not_placeholder",
+        "failure_flip_cases_not_placeholder",
+        "per_action_ap_auc_schema",
+        "deletion_summary_not_overwritten_by_non_deletion_batch",
+        "target_credit_reason_deletion_availability",
+        "best_action_and_exp_checkpoints",
+        "pareto_gradient_stats_dynamic_firewall",
+        "branch_ablation_not_stub",
+        "target_credit_stats_written_every_epoch",
+    ]
     review = {
         "review_pass": all(bool(g.get("pass")) for g in gates),
         "method": "ACPR-TFC-V1",
@@ -227,40 +286,18 @@ def write_review(out_dir: Path, gates: list[dict]) -> dict:
         "best_selection": "test_joint",
         "train_calib_threshold_only": True,
         "test_oracle_diagnostic_only": True,
-        "no_graph_pmi": True,
-        "no_action_set_final": True,
-        "no_reason_to_final_action": True,
-        "no_raw_qrho_to_action_delta": True,
-        "no_dense_bpnd": True,
-        "action_firewall_dynamic_probe": True,
-        "target_credit_present": True,
-        "target_credit_uses_factor_features": True,
-        "prototype_consistency_called": True,
-        "rate_cardinality_called": True,
-        "train_calib_threshold_optimizer_present": True,
-        "main_optimizer_excludes_calalign": True,
-        "flip_counts_not_placeholder": True,
-        "deletion_contrast_functional": True,
-        "deletion_uses_same_region_random_indices": True,
-        "deletion_uses_same_region_background": True,
-        "random_indices_sampled_per_batch_item": True,
-        "target_credit_stats_not_placeholder": True,
-        "oracle_metrics_not_deploy_copy": True,
-        "failure_flip_cases_not_placeholder": True,
-        "per_action_ap_auc_schema": True,
-        "deletion_summary_not_overwritten_by_non_deletion_batch": True,
-        "target_credit_reason_deletion_availability": True,
-        "best_action_and_exp_checkpoints": True,
-        "pareto_gradient_stats_dynamic_firewall": True,
-        "branch_ablation_not_stub": True,
-        "pretrain_gates_required_by_default": True,
-        "allow_failed_gates_used": True,
-        "oracle_act_drop_stop_condition": True,
-        "map_threshold_movement_stop_condition": True,
-        "foreground_script_argparse_safe_review_flag": True,
-        "pu_state_schedule_present": True,
-        "artifact_schema_complete": True,
+        "gate_count": len(gates),
+        "gate_passes": [bool(g.get("pass")) for g in gates],
+        "forward_schema_pass": bool(forward_gate.get("pass", False)),
+        "action_firewall_dynamic_probe": bool(firewall_gate.get("pass", False)),
+        "target_credit_present": bool(code_gate.get("target_credit_uses_factor_features", False)),
+        "deletion_contrast_functional": bool(deletion_gate.get("pass", False)),
+        "pu_state_schedule_present": bool(pu_gate.get("pass", False)),
+        "memory_probe_pass": bool(memory_gate.get("pass", False)),
+        "artifact_schema_complete": all(bool(code_gate.get(field, False)) for field in artifact_schema_fields),
     }
+    for field in CODE_REVIEW_FIELDS:
+        review[field] = bool(code_gate.get(field, False))
     Path(".review").mkdir(exist_ok=True)
     write_json(Path(".review/acpr_tfc_v1_REVIEW_PASS.json"), review)
     write_json(out_dir / "acpr_tfc_v1_REVIEW_PASS.json", review)
@@ -292,8 +329,13 @@ def main() -> None:
     if args.write_review_pass or args.mode == "all":
         review = write_review(out_dir, gates)
         print(json.dumps(review, indent=2))
+        if not bool(review.get("review_pass")):
+            sys.exit(1)
     else:
-        print(json.dumps({"pass": all(bool(g.get("pass")) for g in gates), "gates": gates}, indent=2))
+        data = {"pass": all(bool(g.get("pass")) for g in gates), "gates": gates}
+        print(json.dumps(data, indent=2))
+        if not bool(data["pass"]):
+            sys.exit(1)
 
 
 if __name__ == "__main__":

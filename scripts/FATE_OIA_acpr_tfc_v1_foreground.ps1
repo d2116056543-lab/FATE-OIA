@@ -11,7 +11,10 @@ if (!(Test-Path $Python)) { $Python = "python" }
 Write-Host "Running ACPR-TFC gates..."
 & $Python -m fate_oia.engine.audit_tfc_gates --config configs\fate_oia_train_360x640_acpr_tfc_v1.yaml --mode all --device $Device --batch_size $BatchSize --write_review_pass
 if ($LASTEXITCODE -ne 0) { throw "TFC audit gates failed" }
-if ($RequireReviewPass -and !(Test-Path ".review\acpr_tfc_v1_REVIEW_PASS.json")) { throw "Missing review pass" }
+$reviewPath = ".review\acpr_tfc_v1_REVIEW_PASS.json"
+if (!(Test-Path $reviewPath)) { throw "Missing review pass" }
+$review = Get-Content -LiteralPath $reviewPath -Raw | ConvertFrom-Json
+if (-not $review.review_pass) { throw "TFC review_pass=false" }
 Write-Host "Starting ACPR-TFC foreground training..."
 $trainArgs = @(
   "-u", "-m", "fate_oia.engine.train_acpr_tfc_oia",

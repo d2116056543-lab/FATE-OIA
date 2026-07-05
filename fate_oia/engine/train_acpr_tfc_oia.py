@@ -46,18 +46,36 @@ def missing_pretrain_gates(review_dir: Path = Path(".review")) -> list[str]:
     return [name for name in REQUIRED_PRETRAIN_GATES if not (review_dir / name).exists()]
 
 
+def pretrain_gate_failures(review_dir: Path = Path(".review")) -> list[str]:
+    failures: list[str] = []
+    for name in REQUIRED_PRETRAIN_GATES:
+        path = review_dir / name
+        if not path.exists():
+            failures.append(f"{name}:missing")
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:  # pragma: no cover - defensive for corrupt gate artifacts.
+            failures.append(f"{name}:invalid_json:{exc}")
+            continue
+        key = "review_pass" if name == "acpr_tfc_v1_REVIEW_PASS.json" else "pass"
+        if not bool(data.get(key, False)):
+            failures.append(f"{name}:{key}=false")
+    return failures
+
+
 def enforce_pretrain_gates(allow_failed_gates: bool, require_review_pass: bool) -> list[str]:
     """Full training is gate-first by default; smoke/debug must opt out explicitly."""
     review_dir = Path(".review")
     if allow_failed_gates:
         if require_review_pass and not (review_dir / "acpr_tfc_v1_REVIEW_PASS.json").exists():
             raise FileNotFoundError(".review/acpr_tfc_v1_REVIEW_PASS.json missing")
-        return missing_pretrain_gates(review_dir)
-    missing = missing_pretrain_gates(review_dir)
-    if missing:
+        return pretrain_gate_failures(review_dir)
+    failures = pretrain_gate_failures(review_dir)
+    if failures:
         raise FileNotFoundError(
-            "Missing required TFC pretrain gates: "
-            + ", ".join(missing)
+            "Missing or failed required TFC pretrain gates: "
+            + ", ".join(failures)
             + ". Run audit_tfc_gates first or pass --allow_failed_gates only for targeted smoke/debug."
         )
     return []
@@ -470,6 +488,7 @@ def main() -> None:
         "allow_failed_gates": bool(args.allow_failed_gates),
         "required_pretrain_gates": REQUIRED_PRETRAIN_GATES,
         "missing_gates_at_launch": missing_gates_at_launch,
+        "gate_failures_at_launch": missing_gates_at_launch,
     })
     best_joint = -1.0
     best_action_mf1 = -1.0
@@ -577,7 +596,19 @@ def main() -> None:
         factor_row = {"epoch": epoch, **{k: v for k, v in last_train_stats.items() if k.startswith("factor_")}}
         append_jsonl(out_dir / "factor_measurement_stats.jsonl", factor_row)
         append_jsonl(epoch_dir / "factor_measurement_stats.jsonl", factor_row)
-        for credit_row in epoch_credit_rows:
+        credit_rows_to_write = epoch_credit_rows or last_train_stats.get("credit_rows", [])
+        if not epoch_credit_rows:
+            credit_rows_to_write = [
+                {
+                    **credit_row,
+                    "deletion_selected": 0.0,
+                    "deletion_random": 0.0,
+                    "selected_vs_random_gap": 0.0,
+                    "deletion_available": False,
+                }
+                for credit_row in credit_rows_to_write
+            ]
+        for credit_row in credit_rows_to_write:
             append_jsonl(out_dir / "target_credit_stats.jsonl", credit_row)
             append_jsonl(epoch_dir / "target_credit_stats.jsonl", credit_row)
         del_row = {
