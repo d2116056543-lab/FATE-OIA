@@ -13,13 +13,18 @@ Write-Host "Running ACPR-TFC gates..."
 if ($LASTEXITCODE -ne 0) { throw "TFC audit gates failed" }
 if ($RequireReviewPass -and !(Test-Path ".review\acpr_tfc_v1_REVIEW_PASS.json")) { throw "Missing review pass" }
 Write-Host "Starting ACPR-TFC foreground training..."
-& $Python -u -m fate_oia.engine.train_acpr_tfc_oia `
-  --config configs\fate_oia_train_360x640_acpr_tfc_v1.yaml `
-  --output_dir .background_runs\acpr_tfc_v1_full `
-  --epochs $Epochs `
-  --batch_size $BatchSize `
-  --gradient_accumulation_steps $GradAccum `
-  --num_workers 4 `
-  --device $Device `
-  --require_review_pass:$RequireReviewPass
+$trainArgs = @(
+  "-u", "-m", "fate_oia.engine.train_acpr_tfc_oia",
+  "--config", "configs\fate_oia_train_360x640_acpr_tfc_v1.yaml",
+  "--output_dir", ".background_runs\acpr_tfc_v1_full",
+  "--epochs", "$Epochs",
+  "--batch_size", "$BatchSize",
+  "--gradient_accumulation_steps", "$GradAccum",
+  "--num_workers", "4",
+  "--device", "$Device"
+)
+if ($RequireReviewPass) {
+  $trainArgs += "--require_review_pass"
+}
+& $Python @trainArgs
 exit $LASTEXITCODE

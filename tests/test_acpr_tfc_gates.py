@@ -34,3 +34,4 @@ def test_tfc_audit_gates_smoke(tmp_path):
     assert review["allow_failed_gates_used"] is True
     assert review["oracle_act_drop_stop_condition"] is True
     assert review["map_threshold_movement_stop_condition"] is True
+    assert review["foreground_script_argparse_safe_review_flag"] is True

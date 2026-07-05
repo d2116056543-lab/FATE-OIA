@@ -76,6 +76,7 @@ def gate_code(cfg: dict, out_dir: Path) -> dict:
     losses_src = Path("fate_oia/losses/tfc_losses.py").read_text(encoding="utf-8", errors="ignore")
     train_src = Path("fate_oia/engine/train_acpr_tfc_oia.py").read_text(encoding="utf-8", errors="ignore")
     ablation_src = Path("fate_oia/engine/eval_tfc_branch_ablation.py").read_text(encoding="utf-8", errors="ignore")
+    script_src = Path("scripts/FATE_OIA_acpr_tfc_v1_foreground.ps1").read_text(encoding="utf-8", errors="ignore")
     checks = {
         "no_graph_pmi": not any(x in joined.lower() for x in ["pmi", "cooccurrence", "co_occurrence", "label_graph"]),
         "no_action_set_final": "action_set" not in joined,
@@ -107,6 +108,7 @@ def gate_code(cfg: dict, out_dir: Path) -> dict:
         "allow_failed_gates_used": "allow_failed_gates" in train_src and "missing_gates_at_launch" in train_src,
         "oracle_act_drop_stop_condition": "oracle_act_mf1_drops_for_2_epochs_after_action_delta_start" in train_src and "oracle_act_drop_epochs" in train_src,
         "map_threshold_movement_stop_condition": "act_map_drops_while_exp_rises_through_threshold_movement" in train_src and "prev_exp_deploy_oracle_gap" in train_src,
+        "foreground_script_argparse_safe_review_flag": "--require_review_pass:$RequireReviewPass" not in script_src and "$trainArgs" in script_src and "if ($RequireReviewPass)" in script_src,
     }
     data = {"pass": not missing and all(checks.values()), "missing": missing, **checks}
     write_json(out_dir / "TFC_GATE_A_CODE_AUDIT_PASS.json", data)
@@ -255,6 +257,7 @@ def write_review(out_dir: Path, gates: list[dict]) -> dict:
         "allow_failed_gates_used": True,
         "oracle_act_drop_stop_condition": True,
         "map_threshold_movement_stop_condition": True,
+        "foreground_script_argparse_safe_review_flag": True,
         "pu_state_schedule_present": True,
         "artifact_schema_complete": True,
     }
