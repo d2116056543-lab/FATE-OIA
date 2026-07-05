@@ -28,7 +28,7 @@ class FactorSpec:
     factor_conflict: tuple[int, ...]
 
 
-def _resolve_names(names: Any, mapping: dict[str, int], field: str) -> tuple[int, ...]:
+def _resolve_names(names: Any, mapping: dict[str, int], field: str, dim: int) -> tuple[int, ...]:
     if names is None:
         return ()
     if not isinstance(names, list):
@@ -36,11 +36,17 @@ def _resolve_names(names: Any, mapping: dict[str, int], field: str) -> tuple[int
     out: list[int] = []
     for name in names:
         if isinstance(name, int):
-            out.append(int(name))
+            idx = int(name)
+            if idx < 0 or idx >= dim:
+                raise ValueError(f"{field} index out of range: {idx}")
+            out.append(idx)
             continue
         if str(name) not in mapping:
             raise ValueError(f"Unknown {field} target: {name}")
-        out.append(mapping[str(name)])
+        idx = int(mapping[str(name)])
+        if idx < 0 or idx >= dim:
+            raise ValueError(f"{field} alias index out of range: {name} -> {idx}")
+        out.append(idx)
     return tuple(sorted(set(out)))
 
 
@@ -61,6 +67,9 @@ class TFCFactorBank(nn.Module):
             cfg = yaml.safe_load(f)
         if cfg.get("version") != "acpr_tfc_v1":
             raise ValueError("configs/acpr_tfc_factors.yaml must use version=acpr_tfc_v1")
+        action_targets = cfg.get("action_targets") or []
+        if set(map(str, action_targets)) != set(ACTION_ALIASES):
+            raise ValueError("action_targets must exactly define stop_slow/forward/turn_left/turn_right")
         reason_aliases = {str(k): int(v) for k, v in (cfg.get("reason_targets", {}).get("aliases") or {}).items()}
         if int(cfg.get("reason_targets", {}).get("count", reason_dim)) != reason_dim:
             raise ValueError("reason_targets.count must match reason_dim")
@@ -84,11 +93,11 @@ class TFCFactorBank(nn.Module):
                     spatial=str(raw["spatial"]),
                     polarity=str(raw["polarity"]),
                     region_prior=str(raw["region_prior"]),
-                    action_support=_resolve_names(scope.get("action_support"), ACTION_ALIASES, "action_support"),
-                    action_inhibit=_resolve_names(scope.get("action_inhibit"), ACTION_ALIASES, "action_inhibit"),
-                    reason_support=_resolve_names(scope.get("reason_support"), reason_aliases, "reason_support"),
-                    reason_inhibit=_resolve_names(scope.get("reason_inhibit"), reason_aliases, "reason_inhibit"),
-                    reason_conflict=_resolve_names(scope.get("reason_conflict"), reason_aliases, "reason_conflict"),
+                    action_support=_resolve_names(scope.get("action_support"), ACTION_ALIASES, "action_support", action_dim),
+                    action_inhibit=_resolve_names(scope.get("action_inhibit"), ACTION_ALIASES, "action_inhibit", action_dim),
+                    reason_support=_resolve_names(scope.get("reason_support"), reason_aliases, "reason_support", reason_dim),
+                    reason_inhibit=_resolve_names(scope.get("reason_inhibit"), reason_aliases, "reason_inhibit", reason_dim),
+                    reason_conflict=_resolve_names(scope.get("reason_conflict"), reason_aliases, "reason_conflict", reason_dim),
                     factor_conflict=tuple(name_to_idx[c] for c in conflicts),
                 )
             )

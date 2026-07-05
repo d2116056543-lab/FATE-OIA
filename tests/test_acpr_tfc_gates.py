@@ -56,3 +56,4 @@ def test_tfc_audit_gates_smoke(tmp_path):
     assert review["target_credit_stats_written_every_epoch"] is True
     assert review["delta_schedule_matches_plan"] is True
     assert review["scheduler_and_lr_groups_used"] is True
+    assert review["factor_bank_target_indices_range_checked"] is True

@@ -78,6 +78,7 @@ CODE_REVIEW_FIELDS = [
     "target_credit_stats_written_every_epoch",
     "delta_schedule_matches_plan",
     "scheduler_and_lr_groups_used",
+    "factor_bank_target_indices_range_checked",
 ]
 
 
@@ -120,6 +121,7 @@ def gate_code(cfg: dict, out_dir: Path) -> dict:
     train_src = Path("fate_oia/engine/train_acpr_tfc_oia.py").read_text(encoding="utf-8", errors="ignore")
     ablation_src = Path("fate_oia/engine/eval_tfc_branch_ablation.py").read_text(encoding="utf-8", errors="ignore")
     script_src = Path("scripts/FATE_OIA_acpr_tfc_v1_foreground.ps1").read_text(encoding="utf-8", errors="ignore")
+    factor_bank_src = Path("fate_oia/models/tfc_factor_bank.py").read_text(encoding="utf-8", errors="ignore")
     checks = {
         "no_graph_pmi": not any(x in joined.lower() for x in ["pmi", "cooccurrence", "co_occurrence", "label_graph"]),
         "no_action_set_final": "action_set" not in joined,
@@ -175,6 +177,7 @@ def gate_code(cfg: dict, out_dir: Path) -> dict:
                 "\"lr_threshold\"",
             ]
         ),
+        "factor_bank_target_indices_range_checked": "index out of range" in factor_bank_src and "action_targets must exactly define" in factor_bank_src,
     }
     data = {"pass": not missing and all(checks.values()), "missing": missing, **checks}
     write_json(out_dir / "TFC_GATE_A_CODE_AUDIT_PASS.json", data)
