@@ -61,3 +61,5 @@ def test_tfc_audit_gates_smoke(tmp_path):
     assert review["pu_hard_negative_requires_deletion_gate"] is True
     assert review["reason_delta_requires_deletion_mask"] is True
     assert review["reason_deletion_stats_written"] is True
+    assert review["factor_measurement_lr_group_names_correct"] is True
+    assert review["pareto_optimizer_functional"] is True

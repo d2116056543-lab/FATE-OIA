@@ -83,6 +83,8 @@ CODE_REVIEW_FIELDS = [
     "pu_hard_negative_requires_deletion_gate",
     "reason_delta_requires_deletion_mask",
     "reason_deletion_stats_written",
+    "factor_measurement_lr_group_names_correct",
+    "pareto_optimizer_functional",
 ]
 
 
@@ -186,6 +188,11 @@ def gate_code(cfg: dict, out_dir: Path) -> dict:
         "pu_hard_negative_requires_deletion_gate": "deletion_gate_reason" in Path("fate_oia/models/tfc_pu_state.py").read_text(encoding="utf-8", errors="ignore") and "& deletion_gate_reason" in Path("fate_oia/models/tfc_pu_state.py").read_text(encoding="utf-8", errors="ignore"),
         "reason_delta_requires_deletion_mask": "deletion_stats" in Path("fate_oia/models/tfc_reason_head.py").read_text(encoding="utf-8", errors="ignore") and "* selected_mask.float()" in Path("fate_oia/models/tfc_reason_head.py").read_text(encoding="utf-8", errors="ignore"),
         "reason_deletion_stats_written": "deletion_stats_reason" in Path("fate_oia/models/acpr_tfc_model.py").read_text(encoding="utf-8", errors="ignore") and "deletion_gap_mean_reason" in train_src and "valid_pairs_reason" in train_src,
+        "factor_measurement_lr_group_names_correct": "measure_action." in train_src and "measure_reason." in train_src and "measurement_action." not in train_src,
+        "pareto_optimizer_functional": all(
+            marker in Path("fate_oia/optim/tfc_pareto_optimizer.py").read_text(encoding="utf-8", errors="ignore")
+            for marker in ["project_away_from_action", "combine_action_priority", "assign_flat_grad"]
+        ),
     }
     data = {"pass": not missing and all(checks.values()), "missing": missing, **checks}
     write_json(out_dir / "TFC_GATE_A_CODE_AUDIT_PASS.json", data)

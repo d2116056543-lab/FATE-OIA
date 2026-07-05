@@ -141,7 +141,7 @@ def _group_for_param(name: str) -> str:
         return "action"
     if name.startswith("reason_head.") or name.startswith("lane_adapter.reason_adapter.") or name.startswith("pu_state."):
         return "reason"
-    if name.startswith("prototype_bank.") or name.startswith("measurement_action.") or name.startswith("measurement_reason."):
+    if name.startswith("prototype_bank.") or name.startswith("measure_action.") or name.startswith("measure_reason."):
         return "factor"
     if name.startswith("target_credit."):
         return "credit"
