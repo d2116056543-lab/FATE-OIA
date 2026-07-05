@@ -42,6 +42,8 @@ class ACPRTFCModel(nn.Module):
         factor_bank_path: str = "configs/acpr_tfc_factors.yaml",
         factor_topk_tokens: int = 64,
         num_factor_prototypes: int = 4,
+        max_deletion_factors_per_sample: int = 4,
+        same_region_background: str = "ema",
         use_mock_dino: bool = False,
         action_delta_max: float = 0.06,
         reason_delta_max: float = 0.15,
@@ -61,6 +63,13 @@ class ACPRTFCModel(nn.Module):
         self.pu_state = TFCPUStateBuilder()
         self.calalign = TFCCalAlignHead(action_dim=action_dim, reason_dim=reason_dim)
         self.deletion = TFCDeletionContrast()
+        self.max_deletion_factors_per_sample = int(max_deletion_factors_per_sample)
+        self.same_region_background = str(same_region_background)
+
+    def deletion_max_factors_for_epoch(self, epoch: int) -> int:
+        if epoch <= 5:
+            return max(1, min(2, self.max_deletion_factors_per_sample))
+        return self.max_deletion_factors_per_sample
 
     def forward(
         self,
@@ -100,6 +109,7 @@ class ACPRTFCModel(nn.Module):
         deletion_stats_action = None
         deletion_stats_reason = None
         if run_deletion:
+            max_deletion_factors = self.deletion_max_factors_for_epoch(epoch)
             deletion_stats_action = self.deletion(
                 lanes["patch_action"],
                 meas_action["topk_indices"],
@@ -107,6 +117,8 @@ class ACPRTFCModel(nn.Module):
                 self.action_head.visual_logits_from_patch,
                 action_visual,
                 action_targets,
+                max_factors_per_sample=max_deletion_factors,
+                same_region_background=self.same_region_background,
                 random_indices=meas_action.get("random_indices"),
             )
             deletion_stats_reason = self.deletion(
@@ -116,6 +128,8 @@ class ACPRTFCModel(nn.Module):
                 self.reason_head.visual_logits_from_patch,
                 reason_visual,
                 reason_targets,
+                max_factors_per_sample=max_deletion_factors,
+                same_region_background=self.same_region_background,
                 random_indices=meas_reason.get("random_indices"),
             )
         if deletion_stats_action is None:
@@ -200,6 +214,14 @@ class ACPRTFCModel(nn.Module):
                 "factor_support_mean_reason": meas_reason["factor_probs"].mean().detach(),
                 "selected_vs_random_gap_mean": torch.as_tensor(deletion_stats_action["stats"]["selected_vs_random_gap_mean"], device=images.device),
                 "selected_vs_random_gap_mean_reason": torch.as_tensor(deletion_stats_reason["stats"]["selected_vs_random_gap_mean"], device=images.device),
+                "deletion_max_factors_used": torch.as_tensor(
+                    self.deletion_max_factors_for_epoch(epoch) if run_deletion else 0,
+                    device=images.device,
+                ),
+                "same_region_background_is_ema": torch.as_tensor(
+                    1.0 if self.same_region_background.lower() == "ema" else 0.0,
+                    device=images.device,
+                ),
             },
             "topk_indices_action": meas_action["topk_indices"],
             "topk_indices_reason": meas_reason["topk_indices"],

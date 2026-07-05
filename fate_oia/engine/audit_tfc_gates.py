@@ -86,6 +86,12 @@ CODE_REVIEW_FIELDS = [
     "factor_measurement_lr_group_names_correct",
     "pareto_optimizer_functional",
     "bf16_autocast_and_tf32_runtime",
+    "deletion_config_and_schedule_used",
+    "same_region_ema_background_functional",
+    "deletion_max_factor_epoch_schedule",
+    "deletion_runtime_artifacts_logged",
+    "random_deletion_equal_area_without_replacement",
+    "train_calib_uses_formal_deletion_path",
 ]
 
 
@@ -109,6 +115,8 @@ def build_model(cfg: dict, device: torch.device, mock: bool = True) -> ACPRTFCMo
         factor_bank_path=str(tfc.get("factor_bank", "configs/acpr_tfc_factors.yaml")),
         factor_topk_tokens=int(tfc.get("factor_topk_tokens", 64)),
         num_factor_prototypes=int(tfc.get("num_factor_prototypes", 4)),
+        max_deletion_factors_per_sample=int(tfc.get("max_deletion_factors_per_sample", 4)),
+        same_region_background=str(tfc.get("same_region_background", "ema")),
         use_mock_dino=mock,
         action_delta_max=float(tfc.get("action_delta_max", 0.06)),
         reason_delta_max=float(tfc.get("reason_delta_max", 0.15)),
@@ -141,10 +149,12 @@ def gate_code(cfg: dict, out_dir: Path) -> dict:
         "deletion_uses_same_region_random_indices": "random_indices" in deletion_src,
         "deletion_uses_same_region_background": "background_idx" in deletion_src and "bg_pool" in deletion_src,
         "random_indices_sampled_per_batch_item": "for _ in range(b)" in topk_src and ".expand(b, k)" not in topk_src,
+        "random_deletion_equal_area_without_replacement": "replacement=False" in topk_src,
         "action_delta_requires_deletion_mask": "selected_mask = torch.zeros_like" in action_src,
         "prototype_consistency_called": "prototype_consistency_loss(" in losses_src and "lproto" in losses_src,
         "rate_cardinality_called": "rate_cardinality_loss(" in losses_src and "lcard" in losses_src,
         "train_calib_threshold_optimizer_present": "threshold_optimizer" in train_src and "train_calib_loader" in train_src,
+        "train_calib_uses_formal_deletion_path": "run_deletion=(epoch >= 3)" in train_src and "threshold_optimizer" in train_src,
         "main_optimizer_excludes_calalign": "not name.startswith(\"calalign.\")" in train_src,
         "flip_counts_not_placeholder": "fp_to_tp" in train_src and "tp_to_fn" in train_src and "\"FP_to_TP\": fp_to_tp" in train_src,
         "target_credit_stats_not_placeholder": "build_target_credit_rows" in train_src and "\"target_type\": \"action|reason\"" not in train_src,
@@ -197,6 +207,22 @@ def gate_code(cfg: dict, out_dir: Path) -> dict:
         "bf16_autocast_and_tf32_runtime": all(
             marker in train_src
             for marker in ["autocast_context", "amp_dtype", "torch.autocast", "allow_tf32", "cuda_tf32_enabled"]
+        ),
+        "deletion_config_and_schedule_used": all(
+            marker in train_src + losses_src + Path("fate_oia/models/acpr_tfc_model.py").read_text(encoding="utf-8", errors="ignore")
+            for marker in ["max_deletion_factors_per_sample", "same_region_background", "deletion_weight_schedule", "epoch=epoch"]
+        ),
+        "same_region_ema_background_functional": all(
+            marker in deletion_src
+            for marker in ["ema_background", "same_region_background", "def _background", "self._background"]
+        ),
+        "deletion_max_factor_epoch_schedule": all(
+            marker in Path("fate_oia/models/acpr_tfc_model.py").read_text(encoding="utf-8", errors="ignore")
+            for marker in ["deletion_max_factors_for_epoch", "epoch <= 5", "min(2, self.max_deletion_factors_per_sample)"]
+        ),
+        "deletion_runtime_artifacts_logged": all(
+            marker in train_src and marker in Path("fate_oia/models/acpr_tfc_model.py").read_text(encoding="utf-8", errors="ignore")
+            for marker in ["deletion_max_factors_used", "same_region_background_is_ema"]
         ),
     }
     data = {"pass": not missing and all(checks.values()), "missing": missing, **checks}

@@ -88,6 +88,16 @@ def deletion_contrast_loss(selected_effect: torch.Tensor, random_effect: torch.T
     return F.relu(0.02 - (selected_effect - random_effect)).mean()
 
 
+def deletion_weight_schedule(epoch: int) -> float:
+    if epoch <= 2:
+        return 0.0
+    if epoch <= 5:
+        return 0.02
+    if epoch <= 10:
+        return 0.05
+    return 0.02
+
+
 def calalign_softf1_loss(action_deploy: torch.Tensor, reason_deploy: torch.Tensor, action_targets: torch.Tensor, reason_targets: torch.Tensor, pu_state: dict) -> torch.Tensor:
     return action_asl_loss(action_deploy, action_targets) + reason_pu_asl_loss(reason_deploy, reason_targets, pu_state)
 
@@ -100,7 +110,7 @@ def threshold_smooth_loss(theta_delta_action: torch.Tensor, theta_delta_reason: 
     return 0.01 * (theta_delta_action.pow(2).mean() + theta_delta_reason.pow(2).mean())
 
 
-def compute_tfc_losses(out: dict, action_targets: torch.Tensor, reason_targets: torch.Tensor, weights: dict) -> dict[str, torch.Tensor]:
+def compute_tfc_losses(out: dict, action_targets: torch.Tensor, reason_targets: torch.Tensor, weights: dict, epoch: int = 0) -> dict[str, torch.Tensor]:
     la = action_asl_loss(out["action_logits_deploy"], action_targets)
     lar = action_rank_loss(out["action_logits_deploy"], action_targets)
     lsafe = action_safe_loss(out["action_logits_base"], out["action_visual_logits"], action_targets)
@@ -142,7 +152,7 @@ def compute_tfc_losses(out: dict, action_targets: torch.Tensor, reason_targets: 
         + weights.get("factor_measurement", 0.25) * lf
         + weights.get("prototype_consistency", 0.05) * lproto
         + weights.get("target_credit", 0.10) * lc
-        + weights.get("deletion_contrast", 0.05) * ld
+        + deletion_weight_schedule(epoch) * ld
         + weights.get("calalign", 0.50) * (lcal + lsmooth)
         + weights.get("rate_cardinality", 0.05) * lcard
         + weights.get("action_safe", 0.50) * lsafe
@@ -155,6 +165,7 @@ def compute_tfc_losses(out: dict, action_targets: torch.Tensor, reason_targets: 
         "prototype": lproto,
         "credit": lc,
         "deletion": ld,
+        "deletion_weight": out["action_logits_deploy"].new_tensor(deletion_weight_schedule(epoch)),
         "calalign": lcal + lsmooth,
         "cardinality": lcard,
         "action_safe": lsafe,

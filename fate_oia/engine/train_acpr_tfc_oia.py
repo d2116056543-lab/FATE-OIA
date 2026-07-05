@@ -142,6 +142,8 @@ def build_model(cfg: dict, device: torch.device) -> ACPRTFCModel:
         factor_bank_path=str(tfc.get("factor_bank", "configs/acpr_tfc_factors.yaml")),
         factor_topk_tokens=int(tfc.get("factor_topk_tokens", 64)),
         num_factor_prototypes=int(tfc.get("num_factor_prototypes", 4)),
+        max_deletion_factors_per_sample=int(tfc.get("max_deletion_factors_per_sample", 4)),
+        same_region_background=str(tfc.get("same_region_background", "ema")),
         use_mock_dino=bool(model_cfg.get("use_mock_dino", False)),
         action_delta_max=float(tfc.get("action_delta_max", 0.06)),
         reason_delta_max=float(tfc.get("reason_delta_max", 0.15)),
@@ -619,7 +621,7 @@ def main() -> None:
             reason = batch["reason"].to(device)
             with autocast_context(device, train_cfg):
                 out = model(img, action, reason, epoch=epoch, split="train", run_deletion=(epoch >= 3 and step % 10 == 0))
-                losses = compute_tfc_losses(out, action, reason, weights)
+                losses = compute_tfc_losses(out, action, reason, weights, epoch=epoch)
             loss = losses["total"] / accum
             if not torch.isfinite(loss):
                 write_json(out_dir / "run_stop_reason.json", {"reason": "nan_or_inf_loss", "epoch": epoch, "step": step})
@@ -641,6 +643,8 @@ def main() -> None:
                 "lr_reason": current_lrs.get("reason"),
                 "lr_factor": current_lrs.get("factor"),
                 "lr_credit": current_lrs.get("credit"),
+                "deletion_max_factors_used": float(out["artifact_stats"]["deletion_max_factors_used"].detach().cpu()),
+                "same_region_background_is_ema": float(out["artifact_stats"]["same_region_background_is_ema"].detach().cpu()),
             })
             last_loss_row = row
             last_train_stats = {
@@ -659,6 +663,8 @@ def main() -> None:
                 "pu_stats": out["pu_state"]["stats"],
                 "theta_delta_action_abs_mean": float(out["theta_delta_action"].detach().abs().mean().cpu()),
                 "theta_delta_reason_abs_mean": float(out["theta_delta_reason"].detach().abs().mean().cpu()),
+                "deletion_max_factors_used": float(out["artifact_stats"]["deletion_max_factors_used"].detach().cpu()),
+                "same_region_background_is_ema": float(out["artifact_stats"]["same_region_background_is_ema"].detach().cpu()),
                 "credit_rows": build_target_credit_rows(epoch, out, action, reason),
             }
             valid_pairs_action = int(out["deletion_stats_action"].get("stats", {}).get("valid_pairs", 0))
@@ -691,7 +697,7 @@ def main() -> None:
             action = batch["action"].to(device)
             reason = batch["reason"].to(device)
             with autocast_context(device, train_cfg):
-                out = model(img, action, reason, epoch=epoch, split="train", run_deletion=False)
+                out = model(img, action, reason, epoch=epoch, split="train", run_deletion=(epoch >= 3))
                 t_loss = calalign_softf1_loss(out["action_logits_deploy"], out["reason_logits_deploy"], action, reason, out["pu_state"])
                 t_loss = t_loss + threshold_smooth_loss(out["theta_delta_action"], out["theta_delta_reason"])
             if not torch.isfinite(t_loss):

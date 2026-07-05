@@ -5,6 +5,7 @@ from pathlib import Path
 
 from fate_oia.models.tfc_action_head import action_delta_cap
 from fate_oia.models.tfc_reason_head import reason_delta_cap
+from fate_oia.losses.tfc_losses import deletion_weight_schedule
 
 
 def test_tfc_delta_schedule_matches_plan():
@@ -13,6 +14,9 @@ def test_tfc_delta_schedule_matches_plan():
     ]
     assert [round(reason_delta_cap(e), 4) for e in range(0, 12)] == [
         0.0, 0.0, 0.0, 0.05, 0.05, 0.05, 0.08, 0.09, 0.10, 0.11, 0.12, 0.10
+    ]
+    assert [round(deletion_weight_schedule(e), 4) for e in range(0, 12)] == [
+        0.0, 0.0, 0.0, 0.02, 0.02, 0.02, 0.05, 0.05, 0.05, 0.05, 0.05, 0.02
     ]
 
 
@@ -64,3 +68,9 @@ def test_tfc_audit_gates_smoke(tmp_path):
     assert review["factor_measurement_lr_group_names_correct"] is True
     assert review["pareto_optimizer_functional"] is True
     assert review["bf16_autocast_and_tf32_runtime"] is True
+    assert review["deletion_config_and_schedule_used"] is True
+    assert review["same_region_ema_background_functional"] is True
+    assert review["deletion_max_factor_epoch_schedule"] is True
+    assert review["deletion_runtime_artifacts_logged"] is True
+    assert review["random_deletion_equal_area_without_replacement"] is True
+    assert review["train_calib_uses_formal_deletion_path"] is True

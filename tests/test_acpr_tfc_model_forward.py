@@ -5,6 +5,7 @@ from fate_oia.models.acpr_tfc_model import ACPRTFCModel
 from fate_oia.models.tfc_deletion_contrast import TFCDeletionContrast
 from fate_oia.models.tfc_pu_state import TFCPUStateBuilder
 from fate_oia.models.tfc_target_credit import TFCTargetCredit
+from fate_oia.models.tfc_topk_factor_measurement import TFCTopKFactorMeasurement
 
 
 def test_tfc_model_forward_shapes_and_firewall():
@@ -36,11 +37,31 @@ def test_tfc_model_forward_shapes_and_firewall():
 
 
 def test_deletion_replacement_uses_same_region_background():
-    deletion = TFCDeletionContrast()
+    deletion = TFCDeletionContrast(ema_momentum=0.0)
     patch = torch.arange(6, dtype=torch.float32).view(1, 1, 6, 1)
     patched = deletion._replace(patch, torch.tensor([[0, 1]]), torch.tensor([[4, 5]]))
     assert torch.allclose(patched[0, 0, 0, 0], torch.tensor(4.5))
     assert torch.allclose(patched[0, 0, 1, 0], torch.tensor(4.5))
+    assert torch.allclose(deletion.ema_background.view(-1), torch.tensor([4.5]))
+
+
+def test_deletion_max_factors_schedule_limits_early_epochs():
+    model = ACPRTFCModel(use_mock_dino=True, factor_topk_tokens=8, max_deletion_factors_per_sample=4)
+    assert model.deletion_max_factors_for_epoch(0) == 2
+    assert model.deletion_max_factors_for_epoch(5) == 2
+    assert model.deletion_max_factors_for_epoch(6) == 4
+
+
+def test_random_deletion_indices_are_equal_area_unique():
+    measurement = TFCTopKFactorMeasurement(dim=4, topk=4, grid_hw=(2, 3))
+    patches = torch.randn(2, 1, 6, 4)
+    queries = torch.randn(3, 4)
+    out = measurement(patches, queries, ["front_center", "left_corridor", "right_corridor"])
+    random_indices = out["random_indices"]
+    assert random_indices.shape == (2, 3, 4)
+    for sample in range(random_indices.shape[0]):
+        for factor in range(random_indices.shape[1]):
+            assert random_indices[sample, factor].unique().numel() == random_indices.shape[-1]
 
 
 def test_tfc_target_credit_cannot_create_unknown_native_credit():

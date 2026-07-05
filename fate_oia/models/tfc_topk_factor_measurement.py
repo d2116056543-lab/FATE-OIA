@@ -70,7 +70,10 @@ class TFCTopKFactorMeasurement(nn.Module):
         for factor_idx in range(f):
             prob = priors[factor_idx].view(1, n).expand(layers, n).reshape(layers * n).clamp_min(1e-6)
             prob = prob / prob.sum()
-            samples = [torch.multinomial(prob, num_samples=k, replacement=True) for _ in range(b)]
+            # Sample without replacement so selected and random deletion remove
+            # the same number of unique tokens. Duplicates would be collapsed by
+            # deletion-time unique(), silently weakening the random baseline.
+            samples = [torch.multinomial(prob, num_samples=k, replacement=False) for _ in range(b)]
             random_indices.append(torch.stack(samples, dim=0))
         random_indices_t = torch.stack(random_indices, dim=1)
         return {
