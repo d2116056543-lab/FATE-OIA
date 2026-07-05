@@ -92,6 +92,8 @@ CODE_REVIEW_FIELDS = [
     "deletion_runtime_artifacts_logged",
     "random_deletion_equal_area_without_replacement",
     "train_calib_uses_formal_deletion_path",
+    "train_uses_action_priority_pcgrad",
+    "run_manifest_records_core_config",
 ]
 
 
@@ -174,6 +176,9 @@ def gate_code(cfg: dict, out_dir: Path) -> dict:
         "train_checks_gate_json_pass_values": "pretrain_gate_failures" in train_src and "\"review_pass\"" in train_src and "=false" in train_src and "json.loads" in train_src,
         "audit_exits_nonzero_on_failed_review": "sys.exit(1)" in Path("fate_oia/engine/audit_tfc_gates.py").read_text(encoding="utf-8", errors="ignore"),
         "target_credit_stats_written_every_epoch": "credit_rows_to_write = epoch_credit_rows or last_train_stats.get(\"credit_rows\", [])" in train_src and "\"deletion_available\": False" in train_src,
+        "run_manifest_records_core_config": all(
+            marker in train_src for marker in ["\"loss_weights\"", "\"tfc_config\"", "\"threshold_config\"", "\"model_config\""]
+        ),
         "delta_schedule_matches_plan": (
             [round(action_delta_cap(e), 4) for e in range(0, 12)]
             == [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.02, 0.03, 0.04, 0.05, 0.06, 0.04]
@@ -203,6 +208,11 @@ def gate_code(cfg: dict, out_dir: Path) -> dict:
         "pareto_optimizer_functional": all(
             marker in Path("fate_oia/optim/tfc_pareto_optimizer.py").read_text(encoding="utf-8", errors="ignore")
             for marker in ["project_away_from_action", "combine_action_priority", "assign_flat_grad"]
+        ),
+        "train_uses_action_priority_pcgrad": (
+            "action_priority_pcgrad_backward" in train_src
+            and "combine_action_priority" in train_src
+            and str(cfg.get("training", {}).get("pareto_optimizer", "")) == "action_priority_pcgrad"
         ),
         "bf16_autocast_and_tf32_runtime": all(
             marker in train_src

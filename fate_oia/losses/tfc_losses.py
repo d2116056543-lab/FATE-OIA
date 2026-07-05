@@ -145,17 +145,22 @@ def compute_tfc_losses(out: dict, action_targets: torch.Tensor, reason_targets: 
     lcal = calalign_softf1_loss(out["action_logits_deploy"], out["reason_logits_deploy"], action_targets, reason_targets, out["pu_state"])
     lsmooth = threshold_smooth_loss(out["theta_delta_action"], out["theta_delta_reason"])
     lcard = rate_cardinality_loss(out["action_logits_deploy"], action_targets)
-    total = (
+    weighted_action_group = (
         weights.get("action_asl", 1.0) * la
         + weights.get("action_rank", 0.15) * lar
-        + weights.get("reason_pu", 1.0) * lr
-        + weights.get("factor_measurement", 0.25) * lf
-        + weights.get("prototype_consistency", 0.05) * lproto
-        + weights.get("target_credit", 0.10) * lc
-        + deletion_weight_schedule(epoch) * ld
-        + weights.get("calalign", 0.50) * (lcal + lsmooth)
-        + weights.get("rate_cardinality", 0.05) * lcard
         + weights.get("action_safe", 0.50) * lsafe
+        + weights.get("rate_cardinality", 0.05) * lcard
+    )
+    weighted_reason_group = weights.get("reason_pu", 1.0) * lr
+    weighted_factor_group = weights.get("factor_measurement", 0.25) * lf + weights.get("prototype_consistency", 0.05) * lproto
+    weighted_credit_group = weights.get("target_credit", 0.10) * lc + deletion_weight_schedule(epoch) * ld
+    weighted_calalign_group = weights.get("calalign", 0.50) * (lcal + lsmooth)
+    total = (
+        weighted_action_group
+        + weighted_reason_group
+        + weighted_factor_group
+        + weighted_credit_group
+        + weighted_calalign_group
     )
     return {
         "total": total,
@@ -171,4 +176,9 @@ def compute_tfc_losses(out: dict, action_targets: torch.Tensor, reason_targets: 
         "action_safe": lsafe,
         "action_asl": la,
         "action_rank": lar,
+        "weighted_action_group": weighted_action_group,
+        "weighted_reason_group": weighted_reason_group,
+        "weighted_factor_group": weighted_factor_group,
+        "weighted_credit_group": weighted_credit_group,
+        "weighted_calalign_group": weighted_calalign_group,
     }

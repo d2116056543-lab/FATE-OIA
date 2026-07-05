@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader, Subset
 from fate_oia.datasets.bdd_oia_multitask import BDDOIAMultiTaskDataset
 from fate_oia.metrics import multilabel_metrics_from_logits
 from fate_oia.models.acpr_tfc_model import ACPRTFCModel
+from fate_oia.optim.tfc_pareto_optimizer import TFCParetoOptimizer
 from fate_oia.transforms import AspectRatioLetterboxTransform
 from fate_oia.losses.tfc_losses import action_asl_loss, calalign_softf1_loss, compute_tfc_losses, reason_pu_asl_loss, threshold_smooth_loss
 from fate_oia.utils.acpr_train_calib_split import make_train_calib_indices
@@ -220,6 +221,61 @@ def apply_lr_schedule(optimizer: torch.optim.Optimizer, progress_epoch: float, t
         group["lr"] = base_lr * scale
         current[str(group.get("group_name", idx))] = float(group["lr"])
     return current
+
+
+def _flat_current_grad(params: list[torch.nn.Parameter]) -> torch.Tensor:
+    chunks = []
+    for param in params:
+        if param.grad is None:
+            chunks.append(torch.zeros(param.numel(), device=param.device, dtype=param.dtype))
+        else:
+            chunks.append(param.grad.detach().flatten())
+    if not chunks:
+        return torch.zeros(1)
+    return torch.cat(chunks)
+
+
+def _flat_autograd_grad(loss: torch.Tensor, params: list[torch.nn.Parameter], retain_graph: bool) -> torch.Tensor:
+    if not loss.requires_grad:
+        chunks = [torch.zeros(param.numel(), device=param.device, dtype=param.dtype) for param in params]
+        return torch.cat(chunks) if chunks else loss.new_zeros(1)
+    grads = torch.autograd.grad(loss, params, retain_graph=retain_graph, allow_unused=True)
+    chunks = []
+    for param, grad in zip(params, grads):
+        if grad is None:
+            chunks.append(torch.zeros(param.numel(), device=param.device, dtype=param.dtype))
+        else:
+            chunks.append(grad.detach().flatten())
+    if not chunks:
+        return loss.new_zeros(1)
+    return torch.cat(chunks)
+
+
+def action_priority_pcgrad_backward(losses: dict[str, torch.Tensor], params: list[torch.nn.Parameter], accum: int) -> dict:
+    scale = 1.0 / max(int(accum), 1)
+    action_loss = losses["weighted_action_group"] * scale
+    other_losses = [
+        losses["weighted_reason_group"] * scale,
+        losses["weighted_factor_group"] * scale,
+        losses["weighted_credit_group"] * scale,
+        losses["weighted_calalign_group"] * scale,
+    ]
+    existing_grad = _flat_current_grad(params)
+    action_grad = _flat_autograd_grad(action_loss, params, retain_graph=True)
+    other_grads = [
+        _flat_autograd_grad(group_loss, params, retain_graph=(idx < len(other_losses) - 1))
+        for idx, group_loss in enumerate(other_losses)
+    ]
+    combined, stats = TFCParetoOptimizer.combine_action_priority(action_grad, other_grads)
+    TFCParetoOptimizer(params).assign_flat_grad(existing_grad + combined)
+    return {
+        "enabled": "action_priority_pcgrad",
+        "projection_count": int(stats["projection_count"]),
+        "cosine_action_reason": stats["cosines"][0] if len(stats["cosines"]) > 0 else None,
+        "cosine_action_factor": stats["cosines"][1] if len(stats["cosines"]) > 1 else None,
+        "cosine_action_credit": stats["cosines"][2] if len(stats["cosines"]) > 2 else None,
+        "cosine_action_calalign": stats["cosines"][3] if len(stats["cosines"]) > 3 else None,
+    }
 
 
 def thresholded_metrics_from_logits(logits: torch.Tensor, labels: torch.Tensor, thresholds: torch.Tensor, prefix: str) -> dict:
@@ -579,11 +635,16 @@ def main() -> None:
         "main_optimizer_excludes_calalign": True,
         "lr_groups": main_lr_by_group,
         "lr_threshold": threshold_lr,
+        "loss_weights": weights,
+        "tfc_config": cfg.get("tfc", {}),
+        "threshold_config": cfg.get("threshold", {}),
+        "model_config": cfg.get("model", {}),
         "scheduler": train_cfg.get("scheduler", "cosine"),
         "warmup_epochs": train_cfg.get("warmup_epochs", 2),
         "min_lr_ratio": train_cfg.get("min_lr_ratio", 0.05),
         "amp_dtype": train_cfg.get("amp_dtype", "none"),
         "cuda_tf32_enabled": bool(torch.cuda.is_available() and torch.backends.cuda.matmul.allow_tf32),
+        "pareto_optimizer": train_cfg.get("pareto_optimizer", "action_priority_pcgrad"),
         "pretrain_gates_required": not args.allow_failed_gates,
         "allow_failed_gates": bool(args.allow_failed_gates),
         "required_pretrain_gates": REQUIRED_PRETRAIN_GATES,
@@ -601,6 +662,8 @@ def main() -> None:
     prev_act_map: float | None = None
     prev_exp_mf1: float | None = None
     prev_exp_deploy_oracle_gap: float | None = None
+    last_pareto_train_stats: dict = {"enabled": "not_run", "projection_count": 0}
+    pareto_mode = str(train_cfg.get("pareto_optimizer", "action_priority_pcgrad")).lower()
     steps_per_epoch = max(1, len(train_loader))
     for epoch in range(epochs):
         model.train()
@@ -626,7 +689,11 @@ def main() -> None:
             if not torch.isfinite(loss):
                 write_json(out_dir / "run_stop_reason.json", {"reason": "nan_or_inf_loss", "epoch": epoch, "step": step})
                 raise RuntimeError("NaN/Inf TFC loss")
-            loss.backward()
+            if pareto_mode in {"action_priority_pcgrad", "pcgrad", "pareto"}:
+                last_pareto_train_stats = action_priority_pcgrad_backward(losses, main_params, accum)
+            else:
+                loss.backward()
+                last_pareto_train_stats = {"enabled": "standard_backward", "projection_count": 0}
             if (step + 1) % accum == 0:
                 current_lrs = apply_lr_schedule(optimizer, epoch + (step + 1) / steps_per_epoch, epochs, train_cfg)
                 torch.nn.utils.clip_grad_norm_(main_params, 1.0)
@@ -645,6 +712,12 @@ def main() -> None:
                 "lr_credit": current_lrs.get("credit"),
                 "deletion_max_factors_used": float(out["artifact_stats"]["deletion_max_factors_used"].detach().cpu()),
                 "same_region_background_is_ema": float(out["artifact_stats"]["same_region_background_is_ema"].detach().cpu()),
+                "pareto_enabled": last_pareto_train_stats.get("enabled"),
+                "pareto_projection_count": last_pareto_train_stats.get("projection_count"),
+                "cosine_action_reason": last_pareto_train_stats.get("cosine_action_reason"),
+                "cosine_action_factor": last_pareto_train_stats.get("cosine_action_factor"),
+                "cosine_action_credit": last_pareto_train_stats.get("cosine_action_credit"),
+                "cosine_action_calalign": last_pareto_train_stats.get("cosine_action_calalign"),
             })
             last_loss_row = row
             last_train_stats = {
@@ -787,6 +860,14 @@ def main() -> None:
             "firewall_pass": False,
             "missing_probe_batch": True,
         }
+        pareto_row.update({
+            "train_pareto_enabled": last_pareto_train_stats.get("enabled"),
+            "train_projection_count": last_pareto_train_stats.get("projection_count"),
+            "train_cosine_action_reason": last_pareto_train_stats.get("cosine_action_reason"),
+            "train_cosine_action_factor": last_pareto_train_stats.get("cosine_action_factor"),
+            "train_cosine_action_credit": last_pareto_train_stats.get("cosine_action_credit"),
+            "train_cosine_action_calalign": last_pareto_train_stats.get("cosine_action_calalign"),
+        })
         append_jsonl(out_dir / "pareto_gradient_stats.jsonl", pareto_row)
         append_jsonl(epoch_dir / "pareto_gradient_stats.jsonl", pareto_row)
         ckpt = {"model": model.state_dict(), "epoch": epoch, "metrics": metrics}

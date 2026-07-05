@@ -74,3 +74,5 @@ def test_tfc_audit_gates_smoke(tmp_path):
     assert review["deletion_runtime_artifacts_logged"] is True
     assert review["random_deletion_equal_area_without_replacement"] is True
     assert review["train_calib_uses_formal_deletion_path"] is True
+    assert review["train_uses_action_priority_pcgrad"] is True
+    assert review["run_manifest_records_core_config"] is True

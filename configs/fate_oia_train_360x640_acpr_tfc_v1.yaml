@@ -24,6 +24,7 @@ training:
   scheduler: cosine
   warmup_epochs: 2
   min_lr_ratio: 0.05
+  pareto_optimizer: action_priority_pcgrad
   eval_split: test
   best_selection: test_joint
   evaluate_each_epoch: true
