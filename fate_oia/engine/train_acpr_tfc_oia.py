@@ -3,6 +3,7 @@
 import argparse
 import json
 import math
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,27 @@ def append_jsonl(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(data, ensure_ascii=False) + "\n")
+
+
+def configure_accelerated_runtime(train_cfg: dict) -> None:
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+
+
+def autocast_context(device: torch.device, train_cfg: dict):
+    dtype_name = str(train_cfg.get("amp_dtype", "")).lower()
+    if device.type != "cuda" or dtype_name in {"", "none", "fp32", "float32"}:
+        return nullcontext()
+    if dtype_name in {"bf16", "bfloat16"}:
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    if dtype_name in {"fp16", "float16"}:
+        return torch.autocast(device_type="cuda", dtype=torch.float16)
+    return nullcontext()
 
 
 REQUIRED_PRETRAIN_GATES = [
@@ -438,7 +460,7 @@ def build_target_credit_rows(epoch: int, out: dict, action_targets: torch.Tensor
 
 
 @torch.no_grad()
-def evaluate(model: ACPRTFCModel, loader: DataLoader, device: torch.device, epoch: int, out_dir: Path) -> dict:
+def evaluate(model: ACPRTFCModel, loader: DataLoader, device: torch.device, epoch: int, out_dir: Path, train_cfg: dict) -> dict:
     model.eval()
     act_logits = []; rea_logits = []; act_labels = []; rea_labels = []; names = []
     act_visual = []; act_delta_off = []; act_base = []
@@ -446,7 +468,8 @@ def evaluate(model: ACPRTFCModel, loader: DataLoader, device: torch.device, epoc
         img = batch["image"].to(device, non_blocking=True)
         a = batch["action"].to(device)
         r = batch["reason"].to(device)
-        out = model(img, None, None, epoch=epoch, split="test", run_deletion=True)
+        with autocast_context(device, train_cfg):
+            out = model(img, None, None, epoch=epoch, split="test", run_deletion=True)
         act_logits.append(out["action_logits_deploy"].cpu())
         rea_logits.append(out["reason_logits_deploy"].cpu())
         act_visual.append(out["action_visual_logits"].cpu())
@@ -519,6 +542,7 @@ def main() -> None:
     train_cfg = cfg.get("training", {})
     missing_gates_at_launch = enforce_pretrain_gates(args.allow_failed_gates, args.require_review_pass)
     device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
+    configure_accelerated_runtime(train_cfg)
     epochs = int(args.epochs or train_cfg.get("epochs", 14))
     batch_size = int(args.batch_size or train_cfg.get("batch_size", 4))
     accum = int(args.gradient_accumulation_steps or train_cfg.get("grad_accumulation_steps", 8))
@@ -556,6 +580,8 @@ def main() -> None:
         "scheduler": train_cfg.get("scheduler", "cosine"),
         "warmup_epochs": train_cfg.get("warmup_epochs", 2),
         "min_lr_ratio": train_cfg.get("min_lr_ratio", 0.05),
+        "amp_dtype": train_cfg.get("amp_dtype", "none"),
+        "cuda_tf32_enabled": bool(torch.cuda.is_available() and torch.backends.cuda.matmul.allow_tf32),
         "pretrain_gates_required": not args.allow_failed_gates,
         "allow_failed_gates": bool(args.allow_failed_gates),
         "required_pretrain_gates": REQUIRED_PRETRAIN_GATES,
@@ -591,8 +617,9 @@ def main() -> None:
             img = batch["image"].to(device, non_blocking=True)
             action = batch["action"].to(device)
             reason = batch["reason"].to(device)
-            out = model(img, action, reason, epoch=epoch, split="train", run_deletion=(epoch >= 3 and step % 10 == 0))
-            losses = compute_tfc_losses(out, action, reason, weights)
+            with autocast_context(device, train_cfg):
+                out = model(img, action, reason, epoch=epoch, split="train", run_deletion=(epoch >= 3 and step % 10 == 0))
+                losses = compute_tfc_losses(out, action, reason, weights)
             loss = losses["total"] / accum
             if not torch.isfinite(loss):
                 write_json(out_dir / "run_stop_reason.json", {"reason": "nan_or_inf_loss", "epoch": epoch, "step": step})
@@ -663,9 +690,10 @@ def main() -> None:
             img = batch["image"].to(device, non_blocking=True)
             action = batch["action"].to(device)
             reason = batch["reason"].to(device)
-            out = model(img, action, reason, epoch=epoch, split="train", run_deletion=False)
-            t_loss = calalign_softf1_loss(out["action_logits_deploy"], out["reason_logits_deploy"], action, reason, out["pu_state"])
-            t_loss = t_loss + threshold_smooth_loss(out["theta_delta_action"], out["theta_delta_reason"])
+            with autocast_context(device, train_cfg):
+                out = model(img, action, reason, epoch=epoch, split="train", run_deletion=False)
+                t_loss = calalign_softf1_loss(out["action_logits_deploy"], out["reason_logits_deploy"], action, reason, out["pu_state"])
+                t_loss = t_loss + threshold_smooth_loss(out["theta_delta_action"], out["theta_delta_reason"])
             if not torch.isfinite(t_loss):
                 write_json(out_dir / "run_stop_reason.json", {"reason": "nan_or_inf_threshold_loss", "epoch": epoch, "step": calib_step})
                 raise RuntimeError("NaN/Inf TFC threshold loss")
@@ -678,7 +706,7 @@ def main() -> None:
             if args.max_train_samples and calib_step >= 1:
                 break
         set_trainable(model, base_requires, "all")
-        metrics = evaluate(model, test_loader, device, epoch, out_dir)
+        metrics = evaluate(model, test_loader, device, epoch, out_dir, train_cfg)
         row = {"epoch": epoch, **metrics}
         append_jsonl(out_dir / "metrics_summary.jsonl", row)
         epoch_dir = out_dir / f"epoch_{epoch:03d}"

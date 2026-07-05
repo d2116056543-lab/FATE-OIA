@@ -63,3 +63,4 @@ def test_tfc_audit_gates_smoke(tmp_path):
     assert review["reason_deletion_stats_written"] is True
     assert review["factor_measurement_lr_group_names_correct"] is True
     assert review["pareto_optimizer_functional"] is True
+    assert review["bf16_autocast_and_tf32_runtime"] is True

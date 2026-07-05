@@ -85,6 +85,7 @@ CODE_REVIEW_FIELDS = [
     "reason_deletion_stats_written",
     "factor_measurement_lr_group_names_correct",
     "pareto_optimizer_functional",
+    "bf16_autocast_and_tf32_runtime",
 ]
 
 
@@ -192,6 +193,10 @@ def gate_code(cfg: dict, out_dir: Path) -> dict:
         "pareto_optimizer_functional": all(
             marker in Path("fate_oia/optim/tfc_pareto_optimizer.py").read_text(encoding="utf-8", errors="ignore")
             for marker in ["project_away_from_action", "combine_action_priority", "assign_flat_grad"]
+        ),
+        "bf16_autocast_and_tf32_runtime": all(
+            marker in train_src
+            for marker in ["autocast_context", "amp_dtype", "torch.autocast", "allow_tf32", "cuda_tf32_enabled"]
         ),
     }
     data = {"pass": not missing and all(checks.values()), "missing": missing, **checks}
