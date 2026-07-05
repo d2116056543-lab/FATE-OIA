@@ -377,9 +377,12 @@ def build_target_credit_rows(epoch: int, out: dict, action_targets: torch.Tensor
     credit_reason = out["credit_reason"].detach()
     native_action = (comp["factor_to_action_support"] - comp["factor_to_action_inhibit"]).to(credit_action.device)
     native_reason = (comp["factor_to_reason_support"] - comp["factor_to_reason_inhibit"]).to(credit_reason.device)
-    selected_effect = out["deletion_stats"]["selected_effect"].detach()
-    random_effect = out["deletion_stats"]["random_effect"].detach()
-    gap = out["deletion_stats"]["selected_vs_random_gap"].detach()
+    selected_effect_action = out["deletion_stats_action"]["selected_effect"].detach()
+    random_effect_action = out["deletion_stats_action"]["random_effect"].detach()
+    gap_action = out["deletion_stats_action"]["selected_vs_random_gap"].detach()
+    selected_effect_reason = out["deletion_stats_reason"]["selected_effect"].detach()
+    random_effect_reason = out["deletion_stats_reason"]["random_effect"].detach()
+    gap_reason = out["deletion_stats_reason"]["selected_vs_random_gap"].detach()
 
     def sign_acc(values: torch.Tensor, labels: torch.Tensor, compat: torch.Tensor, target_id: int) -> tuple:
         pos_mask = labels[:, target_id] > 0.5
@@ -405,9 +408,9 @@ def build_target_credit_rows(epoch: int, out: dict, action_targets: torch.Tensor
             "credit_mean": float(mean_credit[factor_id].cpu()),
             "credit_topk": float(credit_action[:, factor_id, target_id].abs().mean().cpu()),
             "compatibility": float(native_action[factor_id, target_id].cpu()),
-            "deletion_selected": float(selected_effect[:, target_id].mean().cpu()),
-            "deletion_random": float(random_effect[:, target_id].mean().cpu()),
-            "selected_vs_random_gap": float(gap[:, target_id].mean().cpu()),
+            "deletion_selected": float(selected_effect_action[:, target_id].mean().cpu()),
+            "deletion_random": float(random_effect_action[:, target_id].mean().cpu()),
+            "selected_vs_random_gap": float(gap_action[:, target_id].mean().cpu()),
             "deletion_available": True,
             "positive_credit_sign_acc": pos_acc,
             "inhibitory_credit_sign_acc": inh_acc,
@@ -424,10 +427,10 @@ def build_target_credit_rows(epoch: int, out: dict, action_targets: torch.Tensor
             "credit_mean": float(mean_credit[factor_id].cpu()),
             "credit_topk": float(credit_reason[:, factor_id, target_id].abs().mean().cpu()),
             "compatibility": float(native_reason[factor_id, target_id].cpu()),
-            "deletion_selected": 0.0,
-            "deletion_random": 0.0,
-            "selected_vs_random_gap": 0.0,
-            "deletion_available": False,
+            "deletion_selected": float(selected_effect_reason[:, target_id].mean().cpu()),
+            "deletion_random": float(random_effect_reason[:, target_id].mean().cpu()),
+            "selected_vs_random_gap": float(gap_reason[:, target_id].mean().cpu()),
+            "deletion_available": True,
             "positive_credit_sign_acc": pos_acc,
             "inhibitory_credit_sign_acc": inh_acc,
         })
@@ -620,19 +623,31 @@ def main() -> None:
                 "factor_reason_rho_mean": float(out["factor_rho_reason"].detach().mean().cpu()),
                 "credit_action_abs_mean": float(out["credit_action"].detach().abs().mean().cpu()),
                 "credit_reason_abs_mean": float(out["credit_reason"].detach().abs().mean().cpu()),
-                "deletion_gap_mean": float(out["deletion_stats"]["selected_vs_random_gap"].detach().mean().cpu()),
-                "deletion_selected_gt_random_rate": float(out["deletion_stats"]["selected_gt_random_rate"].detach().cpu()),
+                "deletion_gap_mean_action": float(out["deletion_stats_action"]["selected_vs_random_gap"].detach().mean().cpu()),
+                "deletion_gap_mean_reason": float(out["deletion_stats_reason"]["selected_vs_random_gap"].detach().mean().cpu()),
+                "deletion_gap_mean": float(0.5 * (out["deletion_stats_action"]["selected_vs_random_gap"].detach().mean() + out["deletion_stats_reason"]["selected_vs_random_gap"].detach().mean()).cpu()),
+                "deletion_selected_gt_random_rate_action": float(out["deletion_stats_action"]["selected_gt_random_rate"].detach().cpu()),
+                "deletion_selected_gt_random_rate_reason": float(out["deletion_stats_reason"]["selected_gt_random_rate"].detach().cpu()),
+                "deletion_selected_gt_random_rate": float(0.5 * (out["deletion_stats_action"]["selected_gt_random_rate"].detach() + out["deletion_stats_reason"]["selected_gt_random_rate"].detach()).cpu()),
                 "pu_stats": out["pu_state"]["stats"],
                 "theta_delta_action_abs_mean": float(out["theta_delta_action"].detach().abs().mean().cpu()),
                 "theta_delta_reason_abs_mean": float(out["theta_delta_reason"].detach().abs().mean().cpu()),
                 "credit_rows": build_target_credit_rows(epoch, out, action, reason),
             }
-            valid_pairs = int(out["deletion_stats"].get("stats", {}).get("valid_pairs", 0))
+            valid_pairs_action = int(out["deletion_stats_action"].get("stats", {}).get("valid_pairs", 0))
+            valid_pairs_reason = int(out["deletion_stats_reason"].get("stats", {}).get("valid_pairs", 0))
+            valid_pairs = valid_pairs_action + valid_pairs_reason
             if valid_pairs > 0:
                 epoch_deletion_summary = {
                     "deletion_gap_mean": last_train_stats["deletion_gap_mean"],
+                    "deletion_gap_mean_action": last_train_stats["deletion_gap_mean_action"],
+                    "deletion_gap_mean_reason": last_train_stats["deletion_gap_mean_reason"],
                     "deletion_selected_gt_random_rate": last_train_stats["deletion_selected_gt_random_rate"],
+                    "deletion_selected_gt_random_rate_action": last_train_stats["deletion_selected_gt_random_rate_action"],
+                    "deletion_selected_gt_random_rate_reason": last_train_stats["deletion_selected_gt_random_rate_reason"],
                     "valid_pairs": valid_pairs,
+                    "valid_pairs_action": valid_pairs_action,
+                    "valid_pairs_reason": valid_pairs_reason,
                 }
                 epoch_credit_rows = last_train_stats["credit_rows"]
             if step % 200 == 0:
@@ -669,8 +684,14 @@ def main() -> None:
         epoch_dir = out_dir / f"epoch_{epoch:03d}"
         deletion_summary = epoch_deletion_summary or {
             "deletion_gap_mean": 0.0,
+            "deletion_gap_mean_action": 0.0,
+            "deletion_gap_mean_reason": 0.0,
             "deletion_selected_gt_random_rate": 0.0,
+            "deletion_selected_gt_random_rate_action": 0.0,
+            "deletion_selected_gt_random_rate_reason": 0.0,
             "valid_pairs": 0,
+            "valid_pairs_action": 0,
+            "valid_pairs_reason": 0,
         }
         write_json(epoch_dir / "run_manifest.json", json.loads((out_dir / "run_manifest.json").read_text(encoding="utf-8")))
         append_jsonl(epoch_dir / "loss_components.jsonl", last_loss_row)
@@ -696,8 +717,14 @@ def main() -> None:
         del_row = {
             "epoch": epoch,
             "selected_vs_random_gap_mean": deletion_summary["deletion_gap_mean"],
+            "selected_vs_random_gap_mean_action": deletion_summary["deletion_gap_mean_action"],
+            "selected_vs_random_gap_mean_reason": deletion_summary["deletion_gap_mean_reason"],
             "selected_gt_random_rate": deletion_summary["deletion_selected_gt_random_rate"],
+            "selected_gt_random_rate_action": deletion_summary["deletion_selected_gt_random_rate_action"],
+            "selected_gt_random_rate_reason": deletion_summary["deletion_selected_gt_random_rate_reason"],
             "valid_pairs": deletion_summary["valid_pairs"],
+            "valid_pairs_action": deletion_summary["valid_pairs_action"],
+            "valid_pairs_reason": deletion_summary["valid_pairs_reason"],
         }
         append_jsonl(out_dir / "deletion_contrast_stats.jsonl", del_row)
         append_jsonl(epoch_dir / "deletion_contrast_stats.jsonl", del_row)

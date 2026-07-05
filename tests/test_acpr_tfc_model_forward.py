@@ -3,6 +3,8 @@
 from fate_oia.losses.tfc_losses import compute_tfc_losses
 from fate_oia.models.acpr_tfc_model import ACPRTFCModel
 from fate_oia.models.tfc_deletion_contrast import TFCDeletionContrast
+from fate_oia.models.tfc_pu_state import TFCPUStateBuilder
+from fate_oia.models.tfc_target_credit import TFCTargetCredit
 
 
 def test_tfc_model_forward_shapes_and_firewall():
@@ -16,7 +18,7 @@ def test_tfc_model_forward_shapes_and_firewall():
         "factor_probs_action", "factor_rho_action", "factor_probs_reason", "factor_rho_reason",
         "credit_action", "credit_reason", "credit_confidence_action", "credit_confidence_reason",
         "action_theta", "reason_theta", "theta_delta_action", "theta_delta_reason", "pu_state",
-        "deletion_stats", "artifact_stats", "factor_features_action", "factor_features_reason",
+        "deletion_stats", "deletion_stats_action", "deletion_stats_reason", "artifact_stats", "factor_features_action", "factor_features_reason",
         "factor_prototypes", "factor_queries", "native_similarity", "factor_conflict", "compatibility",
     ]:
         assert key in out
@@ -26,6 +28,7 @@ def test_tfc_model_forward_shapes_and_firewall():
     assert torch.allclose(out["action_logits_deploy"], out["action_logits_base"] - out["action_theta"], atol=1e-6)
     out_no_del = model(images, action, reason, epoch=7, split="train", run_deletion=False)
     assert torch.allclose(out_no_del["action_tfc_delta"], torch.zeros_like(out_no_del["action_tfc_delta"]))
+    assert torch.allclose(out_no_del["reason_tfc_delta"], torch.zeros_like(out_no_del["reason_tfc_delta"]))
     losses = compute_tfc_losses(out, action, reason, {"prototype_consistency": 0.05, "rate_cardinality": 0.05})
     assert "prototype" in losses
     assert "cardinality" in losses
@@ -38,3 +41,41 @@ def test_deletion_replacement_uses_same_region_background():
     patched = deletion._replace(patch, torch.tensor([[0, 1]]), torch.tensor([[4, 5]]))
     assert torch.allclose(patched[0, 0, 0, 0], torch.tensor(4.5))
     assert torch.allclose(patched[0, 0, 1, 0], torch.tensor(4.5))
+
+
+def test_tfc_target_credit_cannot_create_unknown_native_credit():
+    module = TFCTargetCredit(num_factors=2, action_dim=2, reason_dim=3, dim=4)
+    factor_probs = torch.ones(1, 2)
+    factor_rho = torch.ones(1, 2)
+    factor_features = torch.randn(1, 2, 4)
+    compatibility = {
+        "factor_to_action_support": torch.tensor([[1.0, 0.0], [0.0, 0.0]]),
+        "factor_to_action_inhibit": torch.zeros(2, 2),
+        "factor_to_reason_support": torch.tensor([[0.0, 1.0, 0.0], [0.0, 0.0, 0.0]]),
+        "factor_to_reason_inhibit": torch.zeros(2, 3),
+    }
+    out = module(factor_probs, factor_rho, factor_features, compatibility)
+    assert out["credit_action"][0, 0, 0].abs() > 0
+    assert torch.allclose(out["credit_action"][0, :, 1], torch.zeros(2), atol=1e-7)
+    assert torch.allclose(out["credit_action"][0, 1], torch.zeros(2), atol=1e-7)
+    assert out["credit_reason"][0, 0, 1].abs() > 0
+    assert torch.allclose(out["credit_reason"][0, :, 0], torch.zeros(2), atol=1e-7)
+
+
+def test_tfc_pu_hard_negative_requires_deletion_gate():
+    builder = TFCPUStateBuilder(max_hard_negative_rate=1.0)
+    reason_targets = torch.zeros(1, 3)
+    credit_reason = torch.tensor([[[-0.5, -0.6, -0.7]]])
+    factor_probs = torch.ones(1, 1)
+    factor_rho = torch.ones(1, 1)
+    no_gate = builder(reason_targets, credit_reason, factor_probs, factor_rho, epoch=7)
+    assert no_gate["hard_negative_mask"].sum() == 0
+    with_gate = builder(
+        reason_targets,
+        credit_reason,
+        factor_probs,
+        factor_rho,
+        epoch=7,
+        deletion_gate_reason=torch.ones(1, 3, dtype=torch.bool),
+    )
+    assert with_gate["hard_negative_mask"].sum() > 0

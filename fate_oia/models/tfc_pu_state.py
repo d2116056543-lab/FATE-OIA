@@ -16,6 +16,7 @@ class TFCPUStateBuilder(nn.Module):
         factor_probs: torch.Tensor,
         factor_rho: torch.Tensor,
         epoch: int,
+        deletion_gate_reason: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor | dict]:
         b, _, reason_dim = credit_reason.shape
         device = credit_reason.device
@@ -30,11 +31,21 @@ class TFCPUStateBuilder(nn.Module):
         unknown_mask = ~positive_mask
         soft_negative_weight = torch.zeros_like(reason_targets)
         hard_negative_mask = torch.zeros_like(positive_mask)
+        if deletion_gate_reason is None:
+            deletion_gate_reason = torch.zeros_like(positive_mask)
+        else:
+            deletion_gate_reason = deletion_gate_reason.to(device=device).bool()
         if epoch >= 3:
             soft_negative_weight = (contra_credit.detach() / (support_credit.detach() + contra_credit.detach() + 1e-6)).clamp(0, 0.4)
             soft_negative_weight = soft_negative_weight * (~positive_mask).float()
         if epoch >= 7:
-            candidate = (~positive_mask) & (support_credit.detach() < 0.05) & (contra_credit.detach() > 0.10) & (rho_reason.detach() > 0.20)
+            candidate = (
+                (~positive_mask)
+                & (support_credit.detach() < 0.05)
+                & (contra_credit.detach() > 0.10)
+                & (rho_reason.detach() > 0.20)
+                & deletion_gate_reason
+            )
             max_count = max(1, int(self.max_hard_negative_rate * reason_dim))
             hard_negative_mask = torch.zeros_like(candidate)
             for i in range(b):
@@ -49,6 +60,8 @@ class TFCPUStateBuilder(nn.Module):
             "unknown_count": float(unknown_mask.float().sum().detach().cpu()),
             "soft_negative_weight_sum": float(soft_negative_weight.sum().detach().cpu()),
             "hard_negative_count": float(hard_negative_mask.float().sum().detach().cpu()),
+            "hard_negative_rate": float(hard_negative_mask.float().mean().detach().cpu()),
+            "deletion_gate_reason_count": float(deletion_gate_reason.float().sum().detach().cpu()),
             "hard_negative_by_reason": [float(x) for x in hard_negative_mask.float().sum(0).detach().cpu()],
         }
         return {

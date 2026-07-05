@@ -34,6 +34,8 @@ class TFCTargetCredit(nn.Module):
         instance_reason_compat = torch.einsum("bfd,rd->bfr", feat, reason_embed).tanh()
         learned_action = torch.tanh(self.learned_action).to(qrho.device, qrho.dtype).unsqueeze(0) + 0.25 * instance_action_compat
         learned_reason = torch.tanh(self.learned_reason).to(qrho.device, qrho.dtype).unsqueeze(0) + 0.25 * instance_reason_compat
+        action_scale = (1.0 + 0.25 * learned_action).clamp(0.5, 1.5)
+        reason_scale = (1.0 + 0.25 * learned_reason).clamp(0.5, 1.5)
         if action_margins is None:
             action_gate = torch.ones(qrho.shape[0], self.action_dim, device=qrho.device, dtype=qrho.dtype)
         else:
@@ -42,8 +44,11 @@ class TFCTargetCredit(nn.Module):
             reason_gate = torch.ones(qrho.shape[0], self.reason_dim, device=qrho.device, dtype=qrho.dtype)
         else:
             reason_gate = torch.sigmoid(1.0 - reason_margins.detach().abs())
-        credit_action = qrho.unsqueeze(-1) * (native_action.unsqueeze(0) + 0.25 * learned_action) * action_gate.unsqueeze(1)
-        credit_reason = qrho.unsqueeze(-1) * (native_reason.unsqueeze(0) + 0.25 * learned_reason) * reason_gate.unsqueeze(1)
+        # Native compatibility is the causal sign/mask. Learned terms may only
+        # modulate known support/inhibit relations, never create residual credit
+        # for unknown factor-target pairs.
+        credit_action = qrho.unsqueeze(-1) * native_action.unsqueeze(0) * action_scale * action_gate.unsqueeze(1)
+        credit_reason = qrho.unsqueeze(-1) * native_reason.unsqueeze(0) * reason_scale * reason_gate.unsqueeze(1)
         credit_action_norm = credit_action / (credit_action.abs().sum(dim=1, keepdim=True) + 1e-6)
         credit_reason_norm = credit_reason / (credit_reason.abs().sum(dim=1, keepdim=True) + 1e-6)
         return {

@@ -42,6 +42,7 @@ class TFCReasonHead(nn.Module):
         credit_confidence_reason: torch.Tensor,
         pu_state: dict,
         epoch: int,
+        deletion_stats: dict | None = None,
     ) -> dict[str, torch.Tensor]:
         reason_visual_logits = self.visual_logits_from_patch(patch_reason)
         factor_target = torch.einsum("bfr,bfd->brd", credit_reason_norm, factor_features_reason)
@@ -52,8 +53,11 @@ class TFCReasonHead(nn.Module):
         else:
             support = pu_state.get("support_credit", torch.zeros_like(reason_visual_logits)).detach()
             contra = pu_state.get("contra_credit", torch.zeros_like(reason_visual_logits)).detach()
+            selected_mask = torch.zeros_like(reason_visual_logits, dtype=torch.bool)
+            if deletion_stats is not None:
+                selected_mask = deletion_stats.get("selected_gt_random_mask", selected_mask).detach().bool()
             gate_in = torch.stack([credit_confidence_reason.detach(), support, contra], dim=-1)
-            gate = torch.sigmoid(self.gate(gate_in).squeeze(-1))
+            gate = torch.sigmoid(self.gate(gate_in).squeeze(-1)) * selected_mask.float()
             delta = torch.tanh(self.delta_head(factor_target).squeeze(-1)) * cap * gate
         return {
             "reason_visual_logits": reason_visual_logits,

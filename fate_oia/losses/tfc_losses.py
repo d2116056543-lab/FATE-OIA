@@ -129,7 +129,9 @@ def compute_tfc_losses(out: dict, action_targets: torch.Tensor, reason_targets: 
         out["compatibility"],
         out["pu_state"],
     )
-    ld = out["deletion_stats"].get("deletion_contrast_loss", out["action_logits_deploy"].new_tensor(0.0))
+    ld_action = out.get("deletion_stats_action", out["deletion_stats"]).get("deletion_contrast_loss", out["action_logits_deploy"].new_tensor(0.0))
+    ld_reason = out.get("deletion_stats_reason", {}).get("deletion_contrast_loss", out["action_logits_deploy"].new_tensor(0.0))
+    ld = 0.5 * (ld_action + ld_reason)
     lcal = calalign_softf1_loss(out["action_logits_deploy"], out["reason_logits_deploy"], action_targets, reason_targets, out["pu_state"])
     lsmooth = threshold_smooth_loss(out["theta_delta_action"], out["theta_delta_reason"])
     lcard = rate_cardinality_loss(out["action_logits_deploy"], action_targets)

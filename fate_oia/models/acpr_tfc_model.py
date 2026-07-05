@@ -18,6 +18,19 @@ from .tfc_target_credit import TFCTargetCredit
 from .tfc_topk_factor_measurement import TFCTopKFactorMeasurement
 
 
+def _zero_deletion_stats(logits: torch.Tensor) -> dict:
+    z = torch.zeros_like(logits)
+    return {
+        "selected_effect": z,
+        "random_effect": z,
+        "selected_vs_random_gap": z,
+        "selected_gt_random_mask": z.bool(),
+        "selected_gt_random_rate": z.mean(),
+        "deletion_contrast_loss": z.mean(),
+        "stats": {"selected_vs_random_gap_mean": 0.0, "selected_gt_random_rate": 0.0, "valid_pairs": 0},
+    }
+
+
 class ACPRTFCModel(nn.Module):
     def __init__(
         self,
@@ -82,17 +95,12 @@ class ACPRTFCModel(nn.Module):
             meas_reason["factor_features"],
             compat,
         )
-        pu_state = self.pu_state(
-            reason_targets_for_pu,
-            credit_reason["credit_reason"],
-            meas_reason["factor_probs"],
-            meas_reason["factor_rho"],
-            epoch,
-        )
         action_visual = self.action_head.visual_logits_from_patch(lanes["patch_action"])
-        deletion_stats = None
+        reason_visual = self.reason_head.visual_logits_from_patch(lanes["patch_reason"])
+        deletion_stats_action = None
+        deletion_stats_reason = None
         if run_deletion:
-            deletion_stats = self.deletion(
+            deletion_stats_action = self.deletion(
                 lanes["patch_action"],
                 meas_action["topk_indices"],
                 credit_action["credit_action_norm"],
@@ -101,12 +109,33 @@ class ACPRTFCModel(nn.Module):
                 action_targets,
                 random_indices=meas_action.get("random_indices"),
             )
+            deletion_stats_reason = self.deletion(
+                lanes["patch_reason"],
+                meas_reason["topk_indices"],
+                credit_reason["credit_reason_norm"],
+                self.reason_head.visual_logits_from_patch,
+                reason_visual,
+                reason_targets,
+                random_indices=meas_reason.get("random_indices"),
+            )
+        if deletion_stats_action is None:
+            deletion_stats_action = _zero_deletion_stats(action_visual)
+        if deletion_stats_reason is None:
+            deletion_stats_reason = _zero_deletion_stats(reason_visual)
+        pu_state = self.pu_state(
+            reason_targets_for_pu,
+            credit_reason["credit_reason"],
+            meas_reason["factor_probs"],
+            meas_reason["factor_rho"],
+            epoch,
+            deletion_gate_reason=deletion_stats_reason["selected_gt_random_mask"],
+        )
         action = self.action_head(
             lanes["patch_action"],
             meas_action["factor_features"],
             credit_action["credit_action_norm"],
             credit_action["credit_confidence_action"],
-            deletion_stats,
+            deletion_stats_action,
             epoch,
         )
         reason = self.reason_head(
@@ -116,6 +145,7 @@ class ACPRTFCModel(nn.Module):
             credit_reason["credit_confidence_reason"],
             pu_state,
             epoch,
+            deletion_stats=deletion_stats_reason,
         )
         cal = self.calalign(
             action["action_logits"],
@@ -127,17 +157,6 @@ class ACPRTFCModel(nn.Module):
             reason_contra=pu_state["contra_credit"],
             reason_rho=pu_state["rho_reason"],
         )
-        if deletion_stats is None:
-            z = torch.zeros_like(action["action_logits"])
-            deletion_stats = {
-                "selected_effect": z,
-                "random_effect": z,
-                "selected_vs_random_gap": z,
-                "selected_gt_random_mask": z.bool(),
-                "selected_gt_random_rate": z.mean(),
-                "deletion_contrast_loss": z.mean(),
-                "stats": {"selected_vs_random_gap_mean": 0.0, "selected_gt_random_rate": 0.0, "valid_pairs": 0},
-            }
         out = {
             **field,
             "patch_action": lanes["patch_action"],
@@ -173,11 +192,14 @@ class ACPRTFCModel(nn.Module):
             "theta_delta_reason": cal["theta_delta_reason"],
             "logits_deploy": cal["logits_deploy"],
             "pu_state": pu_state,
-            "deletion_stats": deletion_stats,
+            "deletion_stats": deletion_stats_action,
+            "deletion_stats_action": deletion_stats_action,
+            "deletion_stats_reason": deletion_stats_reason,
             "artifact_stats": {
                 "factor_support_mean_action": meas_action["factor_probs"].mean().detach(),
                 "factor_support_mean_reason": meas_reason["factor_probs"].mean().detach(),
-                "selected_vs_random_gap_mean": torch.as_tensor(deletion_stats["stats"]["selected_vs_random_gap_mean"], device=images.device),
+                "selected_vs_random_gap_mean": torch.as_tensor(deletion_stats_action["stats"]["selected_vs_random_gap_mean"], device=images.device),
+                "selected_vs_random_gap_mean_reason": torch.as_tensor(deletion_stats_reason["stats"]["selected_vs_random_gap_mean"], device=images.device),
             },
             "topk_indices_action": meas_action["topk_indices"],
             "topk_indices_reason": meas_reason["topk_indices"],

@@ -79,6 +79,10 @@ CODE_REVIEW_FIELDS = [
     "delta_schedule_matches_plan",
     "scheduler_and_lr_groups_used",
     "factor_bank_target_indices_range_checked",
+    "target_credit_masks_unknown_native_zero",
+    "pu_hard_negative_requires_deletion_gate",
+    "reason_delta_requires_deletion_mask",
+    "reason_deletion_stats_written",
 ]
 
 
@@ -178,6 +182,10 @@ def gate_code(cfg: dict, out_dir: Path) -> dict:
             ]
         ),
         "factor_bank_target_indices_range_checked": "index out of range" in factor_bank_src and "action_targets must exactly define" in factor_bank_src,
+        "target_credit_masks_unknown_native_zero": "native_action.unsqueeze(0) * action_scale" in credit_src and "native_reason.unsqueeze(0) * reason_scale" in credit_src,
+        "pu_hard_negative_requires_deletion_gate": "deletion_gate_reason" in Path("fate_oia/models/tfc_pu_state.py").read_text(encoding="utf-8", errors="ignore") and "& deletion_gate_reason" in Path("fate_oia/models/tfc_pu_state.py").read_text(encoding="utf-8", errors="ignore"),
+        "reason_delta_requires_deletion_mask": "deletion_stats" in Path("fate_oia/models/tfc_reason_head.py").read_text(encoding="utf-8", errors="ignore") and "* selected_mask.float()" in Path("fate_oia/models/tfc_reason_head.py").read_text(encoding="utf-8", errors="ignore"),
+        "reason_deletion_stats_written": "deletion_stats_reason" in Path("fate_oia/models/acpr_tfc_model.py").read_text(encoding="utf-8", errors="ignore") and "deletion_gap_mean_reason" in train_src and "valid_pairs_reason" in train_src,
     }
     data = {"pass": not missing and all(checks.values()), "missing": missing, **checks}
     write_json(out_dir / "TFC_GATE_A_CODE_AUDIT_PASS.json", data)
@@ -197,6 +205,7 @@ def gate_forward(cfg: dict, out_dir: Path, device: torch.device) -> dict:
         "credit_action", "credit_reason", "credit_confidence_action", "credit_confidence_reason",
         "action_theta", "reason_theta", "theta_delta_action", "theta_delta_reason", "pu_state",
         "deletion_stats", "artifact_stats",
+        "deletion_stats_action", "deletion_stats_reason",
         "factor_features_action", "factor_features_reason", "factor_prototypes", "factor_queries",
         "native_similarity", "factor_conflict", "compatibility",
     ]
@@ -254,9 +263,14 @@ def gate_factor_pu_cal(cfg: dict, out_dir: Path, device: torch.device) -> list[d
     pu0 = model.pu_state(reason, out["credit_reason"], out["factor_probs_reason"], out["factor_rho_reason"], epoch=0)
     pu7 = model.pu_state(reason, out["credit_reason"], out["factor_probs_reason"], out["factor_rho_reason"], epoch=7)
     data_f = {
-        "pass": float(pu0["hard_negative_mask"].float().sum()) == 0.0 and float(pu0["soft_negative_weight"].sum()) == 0.0,
+        "pass": (
+            float(pu0["hard_negative_mask"].float().sum()) == 0.0
+            and float(pu0["soft_negative_weight"].sum()) == 0.0
+            and float(pu7["hard_negative_mask"].float().sum()) == 0.0
+        ),
         "epoch0": pu0["stats"],
         "epoch7": pu7["stats"],
+        "hard_negative_requires_deletion_gate": True,
     }
     write_json(out_dir / "TFC_GATE_F_PU_STATE_PASS.json", data_f)
     fp = out["factor_probs_action"].detach().clone().requires_grad_(True)

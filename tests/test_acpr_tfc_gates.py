@@ -57,3 +57,7 @@ def test_tfc_audit_gates_smoke(tmp_path):
     assert review["delta_schedule_matches_plan"] is True
     assert review["scheduler_and_lr_groups_used"] is True
     assert review["factor_bank_target_indices_range_checked"] is True
+    assert review["target_credit_masks_unknown_native_zero"] is True
+    assert review["pu_hard_negative_requires_deletion_gate"] is True
+    assert review["reason_delta_requires_deletion_mask"] is True
+    assert review["reason_deletion_stats_written"] is True
