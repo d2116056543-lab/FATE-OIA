@@ -3,6 +3,8 @@
 import argparse
 import json
 import math
+import subprocess
+import sys
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
@@ -29,6 +31,17 @@ def append_jsonl(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(data, ensure_ascii=False) + "\n")
+
+
+def get_git_head() -> str | None:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return None
 
 
 def configure_accelerated_runtime(train_cfg: dict) -> None:
@@ -621,10 +634,18 @@ def main() -> None:
     threshold_lr = float(cfg.get("threshold", {}).get("lr_threshold", train_cfg.get("lr_threshold", 7e-4)))
     threshold_optimizer = torch.optim.AdamW([{"params": calalign_params, "lr": threshold_lr, "initial_lr": threshold_lr, "group_name": "threshold"}], weight_decay=0.0)
     write_json(out_dir / "run_manifest.json", {
+        "git_head": get_git_head(),
+        "branch": "acpr_tfc_v1_direct_image",
+        "base_branch": "acpr_calalign_v1_2",
+        "command_line": sys.argv,
         "config": args.config,
         "data_root": cfg["data_root"],
         "raw_root": cfg.get("raw_root"),
+        "pretrained_weights": cfg.get("pretrained_weights"),
+        "selected_layers": cfg.get("model", {}).get("selected_layers", [3, 7, 11]),
         "test_only_eval": True,
+        "eval_split": train_cfg.get("eval_split", "test"),
+        "best_selection": train_cfg.get("best_selection", "test_joint"),
         "feature_cache_enabled": False,
         "token_compression": False,
         "batch_size": batch_size,
@@ -645,6 +666,8 @@ def main() -> None:
         "amp_dtype": train_cfg.get("amp_dtype", "none"),
         "cuda_tf32_enabled": bool(torch.cuda.is_available() and torch.backends.cuda.matmul.allow_tf32),
         "pareto_optimizer": train_cfg.get("pareto_optimizer", "action_priority_pcgrad"),
+        "foreground_only": True,
+        "require_review_pass": bool(args.require_review_pass),
         "pretrain_gates_required": not args.allow_failed_gates,
         "allow_failed_gates": bool(args.allow_failed_gates),
         "required_pretrain_gates": REQUIRED_PRETRAIN_GATES,

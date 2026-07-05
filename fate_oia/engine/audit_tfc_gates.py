@@ -38,6 +38,7 @@ REQUIRED = [
     "tests/test_acpr_tfc_factor_bank.py",
     "tests/test_acpr_tfc_model_forward.py",
     "tests/test_acpr_tfc_gates.py",
+    "tests/test_acpr_tfc_static_contracts.py",
 ]
 
 
@@ -68,6 +69,7 @@ CODE_REVIEW_FIELDS = [
     "best_action_and_exp_checkpoints",
     "pareto_gradient_stats_dynamic_firewall",
     "branch_ablation_not_stub",
+    "branch_ablation_full_diagnostics",
     "pretrain_gates_required_by_default",
     "allow_failed_gates_used",
     "oracle_act_drop_stop_condition",
@@ -94,6 +96,7 @@ CODE_REVIEW_FIELDS = [
     "train_calib_uses_formal_deletion_path",
     "train_uses_action_priority_pcgrad",
     "run_manifest_records_core_config",
+    "run_manifest_records_reproducibility_fields",
 ]
 
 
@@ -168,6 +171,18 @@ def gate_code(cfg: dict, out_dir: Path) -> dict:
         "best_action_and_exp_checkpoints": "checkpoint_best_test_action_mf1.pth" in train_src and "checkpoint_best_test_exp_mf1.pth" in train_src,
         "pareto_gradient_stats_dynamic_firewall": "firewall_gradient_probe" in train_src and "reason_loss_action_adapter_grad" in train_src and "action_loss_reason_adapter_grad" in train_src,
         "branch_ablation_not_stub": "tfc_branch_ablation_stub" not in ablation_src and "load_state_dict" in ablation_src and "action_tfc_delta_off" in ablation_src,
+        "branch_ablation_full_diagnostics": all(
+            marker in ablation_src
+            for marker in [
+                "action_threshold_delta_off",
+                "per_action_AP_AUC_F1",
+                "FP_to_TP",
+                "TP_to_FN",
+                "TN_to_FP",
+                "FN_to_TN",
+                "deploy_vs_base_delta",
+            ]
+        ),
         "pretrain_gates_required_by_default": "REQUIRED_PRETRAIN_GATES" in train_src and "enforce_pretrain_gates" in train_src and "not args.allow_failed_gates" in train_src,
         "allow_failed_gates_used": "allow_failed_gates" in train_src and "missing_gates_at_launch" in train_src,
         "oracle_act_drop_stop_condition": "oracle_act_mf1_drops_for_2_epochs_after_action_delta_start" in train_src and "oracle_act_drop_epochs" in train_src,
@@ -178,6 +193,18 @@ def gate_code(cfg: dict, out_dir: Path) -> dict:
         "target_credit_stats_written_every_epoch": "credit_rows_to_write = epoch_credit_rows or last_train_stats.get(\"credit_rows\", [])" in train_src and "\"deletion_available\": False" in train_src,
         "run_manifest_records_core_config": all(
             marker in train_src for marker in ["\"loss_weights\"", "\"tfc_config\"", "\"threshold_config\"", "\"model_config\""]
+        ),
+        "run_manifest_records_reproducibility_fields": all(
+            marker in train_src
+            for marker in [
+                "\"git_head\"",
+                "\"command_line\"",
+                "\"pretrained_weights\"",
+                "\"selected_layers\"",
+                "\"best_selection\"",
+                "\"foreground_only\"",
+                "\"require_review_pass\"",
+            ]
         ),
         "delta_schedule_matches_plan": (
             [round(action_delta_cap(e), 4) for e in range(0, 12)]
@@ -364,9 +391,25 @@ def write_review(out_dir: Path, gates: list[dict]) -> dict:
     code_gate = next((g for g in gates if "no_graph_pmi" in g and "missing" in g), {})
     forward_gate = next((g for g in gates if "shapes_ok" in g and "finite" in g), {})
     firewall_gate = next((g for g in gates if "reason_zero_action_max_abs_diff" in g), {})
+    factor_gate = next((g for g in gates if "native_similarity_finite" in g), {})
     deletion_gate = next((g for g in gates if "selected_vs_random_gap_mean" in g), {})
     pu_gate = next((g for g in gates if "epoch0" in g and "epoch7" in g), {})
+    calalign_gate = next((g for g in gates if "deploy_equation_exact" in g), {})
     memory_gate = next((g for g in gates if "reserved_vram_gb" in g), {})
+    required_review_gate_names = {
+        "TFC_GATE_A_CODE_AUDIT_PASS.json": code_gate,
+        "TFC_GATE_B_NO_TEST_LEAKAGE_PASS.json": forward_gate,
+        "TFC_GATE_C_ACTION_FIREWALL_PASS.json": firewall_gate,
+        "TFC_GATE_D_FACTOR_GROUNDING_PASS.json": factor_gate,
+        "TFC_GATE_E_SELECTED_DELETION_GT_RANDOM_PASS.json": deletion_gate,
+        "TFC_GATE_F_PU_STATE_PASS.json": pu_gate,
+        "TFC_GATE_G_CALALIGN_PASS.json": calalign_gate,
+        "TFC_GATE_H_MEMORY_PROBE_PASS.json": memory_gate,
+    }
+    missing_review_gates = [name for name, gate in required_review_gate_names.items() if not gate]
+    required_review_gates_pass = not missing_review_gates and all(
+        bool(gate.get("pass", False)) for gate in required_review_gate_names.values()
+    )
     artifact_schema_fields = [
         "target_credit_stats_not_placeholder",
         "failure_flip_cases_not_placeholder",
@@ -376,10 +419,11 @@ def write_review(out_dir: Path, gates: list[dict]) -> dict:
         "best_action_and_exp_checkpoints",
         "pareto_gradient_stats_dynamic_firewall",
         "branch_ablation_not_stub",
+        "branch_ablation_full_diagnostics",
         "target_credit_stats_written_every_epoch",
     ]
     review = {
-        "review_pass": all(bool(g.get("pass")) for g in gates),
+        "review_pass": required_review_gates_pass,
         "method": "ACPR-TFC-V1",
         "branch": "acpr_tfc_v1_direct_image",
         "base_branch": "acpr_calalign_v1_2",
@@ -392,6 +436,8 @@ def write_review(out_dir: Path, gates: list[dict]) -> dict:
         "test_oracle_diagnostic_only": True,
         "gate_count": len(gates),
         "gate_passes": [bool(g.get("pass")) for g in gates],
+        "required_review_gate_names": list(required_review_gate_names.keys()),
+        "missing_review_gates": missing_review_gates,
         "forward_schema_pass": bool(forward_gate.get("pass", False)),
         "action_firewall_dynamic_probe": bool(firewall_gate.get("pass", False)),
         "target_credit_present": bool(code_gate.get("target_credit_uses_factor_features", False)),

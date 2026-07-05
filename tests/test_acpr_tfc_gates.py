@@ -50,6 +50,7 @@ def test_tfc_audit_gates_smoke(tmp_path):
     assert review["best_action_and_exp_checkpoints"] is True
     assert review["pareto_gradient_stats_dynamic_firewall"] is True
     assert review["branch_ablation_not_stub"] is True
+    assert review["branch_ablation_full_diagnostics"] is True
     assert review["pretrain_gates_required_by_default"] is True
     assert review["allow_failed_gates_used"] is True
     assert review["oracle_act_drop_stop_condition"] is True
@@ -76,3 +77,4 @@ def test_tfc_audit_gates_smoke(tmp_path):
     assert review["train_calib_uses_formal_deletion_path"] is True
     assert review["train_uses_action_priority_pcgrad"] is True
     assert review["run_manifest_records_core_config"] is True
+    assert review["run_manifest_records_reproducibility_fields"] is True

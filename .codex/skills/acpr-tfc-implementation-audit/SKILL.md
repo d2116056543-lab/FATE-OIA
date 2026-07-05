@@ -174,6 +174,7 @@ scripts/FATE_OIA_acpr_tfc_v1_foreground.ps1
 tests/test_acpr_tfc_factor_bank.py
 tests/test_acpr_tfc_model_forward.py
 tests/test_acpr_tfc_gates.py
+tests/test_acpr_tfc_static_contracts.py
 ```
 
 ---
@@ -184,7 +185,7 @@ Run:
 
 ```bash
 python -m py_compile $(git ls-files "*.py")
-python -m pytest tests/test_acpr_tfc_factor_bank.py tests/test_acpr_tfc_model_forward.py tests/test_acpr_tfc_gates.py -q
+python -m pytest tests/test_acpr_tfc_factor_bank.py tests/test_acpr_tfc_model_forward.py tests/test_acpr_tfc_gates.py tests/test_acpr_tfc_static_contracts.py -q
 ```
 
 Then scan source text for forbidden patterns. The audit script should create:
