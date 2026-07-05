@@ -55,3 +55,4 @@ def test_tfc_audit_gates_smoke(tmp_path):
     assert review["audit_exits_nonzero_on_failed_review"] is True
     assert review["target_credit_stats_written_every_epoch"] is True
     assert review["delta_schedule_matches_plan"] is True
+    assert review["scheduler_and_lr_groups_used"] is True

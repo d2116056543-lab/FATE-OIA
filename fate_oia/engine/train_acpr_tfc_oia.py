@@ -136,6 +136,68 @@ def set_trainable(model: ACPRTFCModel, base_requires: dict[str, bool], mode: str
             param.requires_grad_(base_requires[name])
 
 
+def _group_for_param(name: str) -> str:
+    if name.startswith("action_head.") or name.startswith("lane_adapter.action_adapter."):
+        return "action"
+    if name.startswith("reason_head.") or name.startswith("lane_adapter.reason_adapter.") or name.startswith("pu_state."):
+        return "reason"
+    if name.startswith("prototype_bank.") or name.startswith("measurement_action.") or name.startswith("measurement_reason."):
+        return "factor"
+    if name.startswith("target_credit."):
+        return "credit"
+    return "action"
+
+
+def build_main_param_groups(model: ACPRTFCModel, train_cfg: dict) -> tuple[list[dict], dict[str, float]]:
+    lr_by_group = {
+        "action": float(train_cfg.get("lr_action", 2e-4)),
+        "reason": float(train_cfg.get("lr_reason", train_cfg.get("lr_action", 2e-4))),
+        "factor": float(train_cfg.get("lr_factor", train_cfg.get("lr_action", 2e-4))),
+        "credit": float(train_cfg.get("lr_credit", train_cfg.get("lr_action", 2e-4))),
+    }
+    grouped: dict[str, list[torch.nn.Parameter]] = {name: [] for name in lr_by_group}
+    for name, param in model.named_parameters():
+        if not param.requires_grad or name.startswith("calalign."):
+            continue
+        grouped[_group_for_param(name)].append(param)
+    param_groups = [
+        {"params": params, "lr": lr_by_group[group_name], "initial_lr": lr_by_group[group_name], "group_name": group_name}
+        for group_name, params in grouped.items()
+        if params
+    ]
+    return param_groups, lr_by_group
+
+
+def warmup_cosine_scale(progress_epoch: float, total_epochs: int, warmup_epochs: float, min_lr_ratio: float) -> float:
+    if total_epochs <= 0:
+        return 1.0
+    warmup_epochs = max(float(warmup_epochs), 0.0)
+    min_lr_ratio = float(min(max(min_lr_ratio, 0.0), 1.0))
+    if warmup_epochs > 0 and progress_epoch < warmup_epochs:
+        return max(progress_epoch / warmup_epochs, 1.0 / max(total_epochs, 1))
+    denom = max(float(total_epochs) - warmup_epochs, 1e-8)
+    cosine_progress = min(max((progress_epoch - warmup_epochs) / denom, 0.0), 1.0)
+    return min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (1.0 + math.cos(math.pi * cosine_progress))
+
+
+def apply_lr_schedule(optimizer: torch.optim.Optimizer, progress_epoch: float, total_epochs: int, train_cfg: dict) -> dict[str, float]:
+    scheduler = str(train_cfg.get("scheduler", "cosine")).lower()
+    if scheduler not in {"cosine", "warmup_cosine", "warmup_cosine_by_update"}:
+        return {str(group.get("group_name", idx)): float(group["lr"]) for idx, group in enumerate(optimizer.param_groups)}
+    scale = warmup_cosine_scale(
+        progress_epoch,
+        total_epochs,
+        float(train_cfg.get("warmup_epochs", 2)),
+        float(train_cfg.get("min_lr_ratio", 0.05)),
+    )
+    current: dict[str, float] = {}
+    for idx, group in enumerate(optimizer.param_groups):
+        base_lr = float(group.get("initial_lr", group["lr"]))
+        group["lr"] = base_lr * scale
+        current[str(group.get("group_name", idx))] = float(group["lr"])
+    return current
+
+
 def thresholded_metrics_from_logits(logits: torch.Tensor, labels: torch.Tensor, thresholds: torch.Tensor, prefix: str) -> dict:
     probs = torch.sigmoid(logits.float())
     labels_bool = labels.float() > 0.5
@@ -467,10 +529,12 @@ def main() -> None:
     model = build_model(cfg, device)
     weights = cfg.get("loss_weights", {})
     base_requires = {name: param.requires_grad for name, param in model.named_parameters()}
-    main_params = [param for name, param in model.named_parameters() if param.requires_grad and not name.startswith("calalign.")]
+    main_param_groups, main_lr_by_group = build_main_param_groups(model, train_cfg)
+    main_params = [param for group in main_param_groups for param in group["params"]]
     calalign_params = [param for name, param in model.named_parameters() if param.requires_grad and name.startswith("calalign.")]
-    optimizer = torch.optim.AdamW(main_params, lr=float(train_cfg.get("lr_action", 2e-4)), weight_decay=float(train_cfg.get("weight_decay", 0.05)))
-    threshold_optimizer = torch.optim.AdamW(calalign_params, lr=float(cfg.get("threshold", {}).get("lr_threshold", train_cfg.get("lr_threshold", 7e-4))), weight_decay=0.0)
+    optimizer = torch.optim.AdamW(main_param_groups, weight_decay=float(train_cfg.get("weight_decay", 0.05)))
+    threshold_lr = float(cfg.get("threshold", {}).get("lr_threshold", train_cfg.get("lr_threshold", 7e-4)))
+    threshold_optimizer = torch.optim.AdamW([{"params": calalign_params, "lr": threshold_lr, "initial_lr": threshold_lr, "group_name": "threshold"}], weight_decay=0.0)
     write_json(out_dir / "run_manifest.json", {
         "config": args.config,
         "data_root": cfg["data_root"],
@@ -484,6 +548,11 @@ def main() -> None:
         "train_calib_count": len(calib_idx),
         "train_calib_threshold_only": True,
         "main_optimizer_excludes_calalign": True,
+        "lr_groups": main_lr_by_group,
+        "lr_threshold": threshold_lr,
+        "scheduler": train_cfg.get("scheduler", "cosine"),
+        "warmup_epochs": train_cfg.get("warmup_epochs", 2),
+        "min_lr_ratio": train_cfg.get("min_lr_ratio", 0.05),
         "pretrain_gates_required": not args.allow_failed_gates,
         "allow_failed_gates": bool(args.allow_failed_gates),
         "required_pretrain_gates": REQUIRED_PRETRAIN_GATES,
@@ -501,6 +570,7 @@ def main() -> None:
     prev_act_map: float | None = None
     prev_exp_mf1: float | None = None
     prev_exp_deploy_oracle_gap: float | None = None
+    steps_per_epoch = max(1, len(train_loader))
     for epoch in range(epochs):
         model.train()
         set_trainable(model, base_requires, "main")
@@ -526,11 +596,22 @@ def main() -> None:
                 raise RuntimeError("NaN/Inf TFC loss")
             loss.backward()
             if (step + 1) % accum == 0:
+                current_lrs = apply_lr_schedule(optimizer, epoch + (step + 1) / steps_per_epoch, epochs, train_cfg)
                 torch.nn.utils.clip_grad_norm_(main_params, 1.0)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+            else:
+                current_lrs = {str(group.get("group_name", idx)): float(group["lr"]) for idx, group in enumerate(optimizer.param_groups)}
             row = {k: float(v.detach().cpu()) for k, v in losses.items() if torch.is_tensor(v)}
-            row.update({"epoch": epoch, "step": step, "lr": optimizer.param_groups[0]["lr"]})
+            row.update({
+                "epoch": epoch,
+                "step": step,
+                "lr": optimizer.param_groups[0]["lr"],
+                "lr_action": current_lrs.get("action"),
+                "lr_reason": current_lrs.get("reason"),
+                "lr_factor": current_lrs.get("factor"),
+                "lr_credit": current_lrs.get("credit"),
+            })
             last_loss_row = row
             last_train_stats = {
                 "factor_action_prob_mean": float(out["factor_probs_action"].detach().mean().cpu()),
@@ -574,6 +655,7 @@ def main() -> None:
                 write_json(out_dir / "run_stop_reason.json", {"reason": "nan_or_inf_threshold_loss", "epoch": epoch, "step": calib_step})
                 raise RuntimeError("NaN/Inf TFC threshold loss")
             t_loss.backward()
+            threshold_lrs = apply_lr_schedule(threshold_optimizer, epoch + 1.0, epochs, train_cfg)
             threshold_optimizer.step()
             threshold_optimizer.zero_grad(set_to_none=True)
             calib_loss_value += float(t_loss.detach().cpu())
@@ -592,7 +674,7 @@ def main() -> None:
         }
         write_json(epoch_dir / "run_manifest.json", json.loads((out_dir / "run_manifest.json").read_text(encoding="utf-8")))
         append_jsonl(epoch_dir / "loss_components.jsonl", last_loss_row)
-        append_jsonl(out_dir / "threshold_train_calib_loss.jsonl", {"epoch": epoch, "loss": calib_loss_value / max(calib_steps, 1), "steps": calib_steps})
+        append_jsonl(out_dir / "threshold_train_calib_loss.jsonl", {"epoch": epoch, "loss": calib_loss_value / max(calib_steps, 1), "steps": calib_steps, "lr_threshold": threshold_lrs.get("threshold", threshold_optimizer.param_groups[0]["lr"]) if calib_steps else threshold_optimizer.param_groups[0]["lr"]})
         factor_row = {"epoch": epoch, **{k: v for k, v in last_train_stats.items() if k.startswith("factor_")}}
         append_jsonl(out_dir / "factor_measurement_stats.jsonl", factor_row)
         append_jsonl(epoch_dir / "factor_measurement_stats.jsonl", factor_row)

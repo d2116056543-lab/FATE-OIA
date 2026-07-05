@@ -77,6 +77,7 @@ CODE_REVIEW_FIELDS = [
     "audit_exits_nonzero_on_failed_review",
     "target_credit_stats_written_every_epoch",
     "delta_schedule_matches_plan",
+    "scheduler_and_lr_groups_used",
 ]
 
 
@@ -159,6 +160,20 @@ def gate_code(cfg: dict, out_dir: Path) -> dict:
             == [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.02, 0.03, 0.04, 0.05, 0.06, 0.04]
             and [round(reason_delta_cap(e), 4) for e in range(0, 12)]
             == [0.0, 0.0, 0.0, 0.05, 0.05, 0.05, 0.08, 0.09, 0.10, 0.11, 0.12, 0.10]
+        ),
+        "scheduler_and_lr_groups_used": all(
+            marker in train_src
+            for marker in [
+                "build_main_param_groups",
+                "warmup_cosine_scale",
+                "apply_lr_schedule",
+                "\"lr_groups\"",
+                "\"lr_action\"",
+                "\"lr_reason\"",
+                "\"lr_factor\"",
+                "\"lr_credit\"",
+                "\"lr_threshold\"",
+            ]
         ),
     }
     data = {"pass": not missing and all(checks.values()), "missing": missing, **checks}
