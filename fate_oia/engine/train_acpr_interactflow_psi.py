@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import subprocess
 import tempfile
@@ -8,7 +9,7 @@ import time
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from fate_oia.acpr_interactflow.artifacts import append_jsonl, write_json
 from fate_oia.acpr_interactflow.calibrated_exp29 import (
@@ -28,13 +29,25 @@ from fate_oia.losses.acpr_interactflow_losses import DEFAULT_INTERACTFLOW_LOSS_W
 def _loader(ds, batch_size: int, cfg: dict, shuffle: bool) -> DataLoader:
     data = cfg["data"]
     workers = int(data.get("num_workers", 0))
+    sampler = None
+    sampler_cfg = data.get("balanced_action_sampler", {}) if shuffle else {}
+    if bool(sampler_cfg.get("enabled", False)):
+        weights = ds.build_sampling_weights(
+            class_weights=sampler_cfg.get("class_weights", [1.0, 1.2, 5.0]),
+            exp_aligned_boost=float(sampler_cfg.get("exp_aligned_boost", 1.0)),
+        )
+        sampler = WeightedRandomSampler(torch.tensor(weights, dtype=torch.double), num_samples=len(weights), replacement=True)
+        shuffle = False
     kwargs = {
         "batch_size": batch_size,
-        "shuffle": shuffle,
         "num_workers": workers,
         "pin_memory": bool(data.get("pin_memory", False)),
         "collate_fn": psi_interactflow_collate,
     }
+    if sampler is not None:
+        kwargs["sampler"] = sampler
+    else:
+        kwargs["shuffle"] = shuffle
     if workers > 0:
         kwargs["persistent_workers"] = bool(data.get("persistent_workers", False))
         kwargs["prefetch_factor"] = int(data.get("prefetch_factor", 2))
@@ -387,6 +400,28 @@ def _git_head() -> str:
         return "unknown"
 
 
+def _restore_best_scores(metrics_path: Path, fallback_metrics: dict | None = None) -> tuple[float, float, float]:
+    best_joint = -1.0
+    best_action = -1.0
+    best_exp = -1.0
+    if metrics_path.exists():
+        for line in metrics_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                metrics = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            best_joint = max(best_joint, float(metrics.get("joint", -1.0)))
+            best_action = max(best_action, _nested_float(metrics, ("action", "Act_mAcc"), -1.0))
+            best_exp = max(best_exp, _nested_float(metrics, ("exp29", "Exp_mF1"), -1.0))
+    if fallback_metrics:
+        best_joint = max(best_joint, float(fallback_metrics.get("joint", -1.0)))
+        best_action = max(best_action, _nested_float(fallback_metrics, ("action", "Act_mAcc"), -1.0))
+        best_exp = max(best_exp, _nested_float(fallback_metrics, ("exp29", "Exp_mF1"), -1.0))
+    return best_joint, best_action, best_exp
+
+
 def _nested_float(mapping: dict, path: tuple[str, ...], default: float = 0.0) -> float:
     current = mapping
     for key in path:
@@ -478,6 +513,7 @@ def main() -> None:
     parser.add_argument("--test_only", action="store_true")
     parser.add_argument("--no_feature_cache", action="store_true")
     parser.add_argument("--require_no_token_compression", action="store_true")
+    parser.add_argument("--resume_checkpoint")
     args = parser.parse_args()
     cfg = load_interactflow_config(args.config)
     if args.dino_chunk_size is not None:
@@ -492,14 +528,25 @@ def main() -> None:
     data = cfg["data"]
     paths = cfg["paths"]
     epochs = int(args.epochs or cfg["optimization"]["epochs"])
+    protocol_index_cfg = data.get("protocol_index", {})
+    protocol_index_enabled = bool(protocol_index_cfg.get("enabled", False))
     train_ds = PSIDAMO11902Dataset(
         paths["psi_package_root"],
         "train",
         frames_root=paths.get("psi2_root_reference_only"),
         image_size=(int(data["image_height"]), int(data["image_width"])),
         action_dim=int(data["action_dim"]),
-        strict_counts=args.max_train_samples is None,
+        strict_counts=bool(data.get("strict_counts", True)) and args.max_train_samples is None,
         max_samples=args.max_train_samples,
+        max_sample_strategy=str(data.get("max_sample_strategy", "head")),
+        max_sample_seed=int(data.get("max_sample_seed", 7)),
+        frame_protocol=str(data.get("frame_protocol", "recorded_observed")),
+        allow_target_frame_in_input=bool(data.get("allow_target_frame_in_input", False)),
+        exp_supervision_policy=str(data.get("exp_supervision_policy", "record_mask")),
+        exp_near_keyframe_max_gap=int(data.get("exp_near_keyframe_max_gap", 30)),
+        use_decision_group_weight=bool(data.get("use_decision_group_weight", False)),
+        protocol_index_dir=protocol_index_cfg.get("dir") if protocol_index_enabled else None,
+        protocol_name=protocol_index_cfg.get("name") if protocol_index_enabled else None,
     )
     test_ds = PSIDAMO11902Dataset(
         paths["psi_package_root"],
@@ -507,8 +554,17 @@ def main() -> None:
         frames_root=paths.get("psi2_root_reference_only"),
         image_size=(int(data["image_height"]), int(data["image_width"])),
         action_dim=int(data["action_dim"]),
-        strict_counts=args.max_test_samples is None,
+        strict_counts=bool(data.get("strict_counts", True)) and args.max_test_samples is None,
         max_samples=args.max_test_samples,
+        max_sample_strategy=str(data.get("eval_max_sample_strategy", data.get("max_sample_strategy", "head"))),
+        max_sample_seed=int(data.get("max_sample_seed", 7)) + 1000,
+        frame_protocol=str(data.get("eval_frame_protocol", data.get("frame_protocol", "recorded_observed"))),
+        allow_target_frame_in_input=bool(data.get("allow_target_frame_in_input", False)),
+        exp_supervision_policy=str(data.get("eval_exp_supervision_policy", data.get("exp_supervision_policy", "record_mask"))),
+        exp_near_keyframe_max_gap=int(data.get("exp_near_keyframe_max_gap", 30)),
+        use_decision_group_weight=False,
+        protocol_index_dir=protocol_index_cfg.get("dir") if protocol_index_enabled else None,
+        protocol_name=protocol_index_cfg.get("name") if protocol_index_enabled else None,
     )
     train_loader = _loader(train_ds, args.batch_size, cfg, shuffle=True)
     test_loader = _loader(test_ds, max(1, min(args.batch_size, 8)), cfg, shuffle=False)
@@ -524,7 +580,20 @@ def main() -> None:
         "config": args.config,
         "command_line": vars(args),
         "test_only": True,
-        "formal_input_uses_target_frame": False,
+        "dataset_protocol": cfg.get("dataset_protocol"),
+        "frame_protocol": data.get("frame_protocol", "recorded_observed"),
+        "eval_frame_protocol": data.get("eval_frame_protocol", data.get("frame_protocol", "recorded_observed")),
+        "formal_input_uses_target_frame": bool(data.get("formal_input_uses_target_frame", False)),
+        "allow_target_frame_in_input": bool(data.get("allow_target_frame_in_input", False)),
+        "exp_supervision_policy": data.get("exp_supervision_policy", "record_mask"),
+        "eval_exp_supervision_policy": data.get("eval_exp_supervision_policy", data.get("exp_supervision_policy", "record_mask")),
+        "exp_near_keyframe_max_gap": data.get("exp_near_keyframe_max_gap", 30),
+        "max_sample_strategy": data.get("max_sample_strategy", "head"),
+        "eval_max_sample_strategy": data.get("eval_max_sample_strategy", data.get("max_sample_strategy", "head")),
+        "max_sample_seed": data.get("max_sample_seed", 7),
+        "protocol_index": protocol_index_cfg if protocol_index_enabled else {"enabled": False},
+        "balanced_action_sampler": data.get("balanced_action_sampler", {}),
+        "use_decision_group_weight": bool(data.get("use_decision_group_weight", False)),
         "feature_cache_enabled": False,
         "token_compression": "none",
         "eval_splits": ["test"],
@@ -538,6 +607,7 @@ def main() -> None:
         "optimizer_groups": [{"name": g.get("name"), "lr": g.get("lr"), "weight_decay": g.get("weight_decay")} for g in opt.param_groups],
         "oia_transfer_source_loaded": bool(model.predicates.transfer.report().get("source_loaded", False)),
         "oia_transfer_text_embedding_source": model.predicates.transfer.report().get("text_embedding_source"),
+        "resume_checkpoint": args.resume_checkpoint,
     }
     write_json(out_dir / "run_manifest.json", manifest)
     write_json(out_dir / "oia_transfer_report.json", model.predicates.transfer.report())
@@ -546,12 +616,52 @@ def main() -> None:
     config_path = Path(args.config)
     if config_path.exists():
         (out_dir / "config_resolved.yaml").write_text(config_path.read_text(encoding="utf-8"), encoding="utf-8")
-    _maybe_initialize_exp29_train_calibration(model, train_loader, device, cfg, out_dir, use_bf16, stage="initial")
+    start_epoch = 0
     best_joint = -1.0
     best_action = -1.0
     best_exp = -1.0
     global_step = 0
-    for epoch in range(epochs):
+    if args.resume_checkpoint:
+        resume_path = Path(args.resume_checkpoint)
+        if not resume_path.exists():
+            raise FileNotFoundError(f"resume checkpoint not found: {resume_path}")
+        checkpoint = torch.load(resume_path, map_location=device)
+        load_result = model.load_state_dict(checkpoint["model"], strict=False)
+        allowed_unexpected = [
+            key
+            for key in load_result.unexpected_keys
+            if key.startswith("visual.dino.backbone.blocks.") and ".attn.vproj." in key
+        ]
+        bad_unexpected = sorted(set(load_result.unexpected_keys) - set(allowed_unexpected))
+        if load_result.missing_keys or bad_unexpected:
+            raise RuntimeError(
+                "resume checkpoint is incompatible: "
+                f"missing_keys={load_result.missing_keys}; unexpected_keys={bad_unexpected}"
+            )
+        if "optimizer" in checkpoint:
+            opt.load_state_dict(checkpoint["optimizer"])
+        if "scheduler" in checkpoint:
+            sched.load_state_dict(checkpoint["scheduler"])
+        start_epoch = int(checkpoint.get("epoch", -1)) + 1
+        if start_epoch >= epochs:
+            raise ValueError(f"resume checkpoint epoch {start_epoch - 1} is already >= requested final epochs {epochs}")
+        best_joint, best_action, best_exp = _restore_best_scores(out_dir / "metrics_summary.jsonl", checkpoint.get("metrics"))
+        global_step = int(getattr(sched, "_step_count", 0))
+        write_json(
+            out_dir / "resume_state.json",
+            {
+                "resume_checkpoint": str(resume_path),
+                "start_epoch": start_epoch,
+                "requested_final_epochs": epochs,
+                "restored_best_joint": best_joint,
+                "restored_best_action": best_action,
+                "restored_best_exp": best_exp,
+            },
+        )
+    else:
+        _maybe_initialize_exp29_train_calibration(model, train_loader, device, cfg, out_dir, use_bf16, stage="initial")
+
+    for epoch in range(start_epoch, epochs):
         model.train()
         opt.zero_grad(set_to_none=True)
         start = time.time()

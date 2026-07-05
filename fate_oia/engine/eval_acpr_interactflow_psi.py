@@ -181,14 +181,25 @@ def evaluate(model: ACPRInteractFlowPPModel, loader: DataLoader, device: torch.d
 def build_eval_loader(cfg: dict, max_test_samples: int | None = None) -> DataLoader:
     data = cfg["data"]
     paths = cfg["paths"]
+    protocol_index_cfg = data.get("protocol_index", {})
+    protocol_index_enabled = bool(protocol_index_cfg.get("enabled", False))
     ds = PSIDAMO11902Dataset(
         paths["psi_package_root"],
         "test",
         frames_root=paths.get("psi2_root_reference_only"),
         image_size=(int(data["image_height"]), int(data["image_width"])),
         action_dim=int(data["action_dim"]),
-        strict_counts=max_test_samples is None,
+        strict_counts=bool(data.get("strict_counts", True)) and max_test_samples is None,
         max_samples=max_test_samples,
+        max_sample_strategy=str(data.get("eval_max_sample_strategy", data.get("max_sample_strategy", "head"))),
+        max_sample_seed=int(data.get("max_sample_seed", 7)) + 1000,
+        frame_protocol=str(data.get("eval_frame_protocol", data.get("frame_protocol", "recorded_observed"))),
+        allow_target_frame_in_input=bool(data.get("allow_target_frame_in_input", False)),
+        exp_supervision_policy=str(data.get("eval_exp_supervision_policy", data.get("exp_supervision_policy", "record_mask"))),
+        exp_near_keyframe_max_gap=int(data.get("exp_near_keyframe_max_gap", 30)),
+        use_decision_group_weight=False,
+        protocol_index_dir=protocol_index_cfg.get("dir") if protocol_index_enabled else None,
+        protocol_name=protocol_index_cfg.get("name") if protocol_index_enabled else None,
     )
     return DataLoader(ds, batch_size=1, shuffle=False, num_workers=0, collate_fn=psi_interactflow_collate)
 

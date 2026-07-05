@@ -47,6 +47,7 @@ data:
   exp_supervision_policy: record_mask
   eval_exp_supervision_policy: record_mask
   exp_near_keyframe_max_gap: 30
+  strict_counts: false
   use_decision_group_weight: false
   protocol_index:
 
