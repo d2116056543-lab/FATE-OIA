@@ -25,6 +25,8 @@ class TFCTargetCredit(nn.Module):
         reason_margins: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         qrho = factor_probs * factor_rho
+        active_mass = qrho.sum(dim=1, keepdim=True).clamp_min(1.0)
+        qrho_credit = qrho / active_mass
         native_action = (compatibility["factor_to_action_support"] - compatibility["factor_to_action_inhibit"]).to(qrho.device, qrho.dtype)
         native_reason = (compatibility["factor_to_reason_support"] - compatibility["factor_to_reason_inhibit"]).to(qrho.device, qrho.dtype)
         feat = torch.nn.functional.normalize(self.feature_proj(factor_features), dim=-1)
@@ -47,8 +49,8 @@ class TFCTargetCredit(nn.Module):
         # Native compatibility is the causal sign/mask. Learned terms may only
         # modulate known support/inhibit relations, never create residual credit
         # for unknown factor-target pairs.
-        credit_action = qrho.unsqueeze(-1) * native_action.unsqueeze(0) * action_scale * action_gate.unsqueeze(1)
-        credit_reason = qrho.unsqueeze(-1) * native_reason.unsqueeze(0) * reason_scale * reason_gate.unsqueeze(1)
+        credit_action = qrho_credit.unsqueeze(-1) * native_action.unsqueeze(0) * action_scale * action_gate.unsqueeze(1)
+        credit_reason = qrho_credit.unsqueeze(-1) * native_reason.unsqueeze(0) * reason_scale * reason_gate.unsqueeze(1)
         credit_action_norm = credit_action / (credit_action.abs().sum(dim=1, keepdim=True) + 1e-6)
         credit_reason_norm = credit_reason / (credit_reason.abs().sum(dim=1, keepdim=True) + 1e-6)
         return {

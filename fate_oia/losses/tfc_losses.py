@@ -36,12 +36,43 @@ def reason_pu_asl_loss(reason_logits: torch.Tensor, reason_targets: torch.Tensor
     return (bce * weight).sum() / weight.sum().clamp_min(1.0)
 
 
-def factor_measurement_loss(factor_probs_action: torch.Tensor, factor_probs_reason: torch.Tensor) -> torch.Tensor:
-    qa = factor_probs_action.float().clamp(1e-4, 1 - 1e-4)
-    qr = factor_probs_reason.float().clamp(1e-4, 1 - 1e-4)
-    entropy = -(qa * qa.log() + (1 - qa) * (1 - qa).log()).mean()
-    entropy = entropy + (-(qr * qr.log() + (1 - qr) * (1 - qr).log()).mean())
-    return 0.01 * entropy
+def _factor_activation_regularizer(
+    probs: torch.Tensor,
+    target_rate: float,
+    high_watermark: float = 0.85,
+) -> torch.Tensor:
+    q = probs.float().clamp(1e-4, 1 - 1e-4)
+    per_sample_rate = q.mean(dim=1)
+    rate_loss = (per_sample_rate - target_rate).pow(2).mean() + (q.mean() - target_rate).pow(2)
+    high_saturation = F.relu(q - high_watermark).pow(2).mean()
+    all_off = F.relu(0.02 - per_sample_rate).pow(2).mean()
+    return rate_loss + 0.25 * high_saturation + all_off
+
+
+def _rho_regularizer(rho: torch.Tensor, target_rate: float = 0.55, high_watermark: float = 0.85) -> torch.Tensor:
+    r = rho.float().clamp(1e-4, 1 - 1e-4)
+    per_sample_rate = r.mean(dim=1)
+    rate_loss = (per_sample_rate - target_rate).pow(2).mean() + (r.mean() - target_rate).pow(2)
+    high_saturation = F.relu(r - high_watermark).pow(2).mean()
+    all_off = F.relu(0.05 - per_sample_rate).pow(2).mean()
+    return rate_loss + 0.25 * high_saturation + all_off
+
+
+def factor_measurement_loss(
+    factor_probs_action: torch.Tensor,
+    factor_probs_reason: torch.Tensor,
+    factor_rho_action: torch.Tensor | None = None,
+    factor_rho_reason: torch.Tensor | None = None,
+) -> torch.Tensor:
+    # The selector should identify a sparse subset of useful factors. A pure
+    # entropy minimization objective rewards the degenerate all-on solution.
+    loss = _factor_activation_regularizer(factor_probs_action, target_rate=0.25)
+    loss = loss + _factor_activation_regularizer(factor_probs_reason, target_rate=0.20)
+    if factor_rho_action is not None:
+        loss = loss + 0.5 * _rho_regularizer(factor_rho_action)
+    if factor_rho_reason is not None:
+        loss = loss + 0.5 * _rho_regularizer(factor_rho_reason)
+    return loss
 
 
 def target_credit_sign_loss(
@@ -115,7 +146,12 @@ def compute_tfc_losses(out: dict, action_targets: torch.Tensor, reason_targets: 
     lar = action_rank_loss(out["action_logits_deploy"], action_targets)
     lsafe = action_safe_loss(out["action_logits_base"], out["action_visual_logits"], action_targets)
     lr = reason_pu_asl_loss(out["reason_logits_deploy"], reason_targets, out["pu_state"])
-    lf = factor_measurement_loss(out["factor_probs_action"], out["factor_probs_reason"])
+    lf = factor_measurement_loss(
+        out["factor_probs_action"],
+        out["factor_probs_reason"],
+        out.get("factor_rho_action"),
+        out.get("factor_rho_reason"),
+    )
     lp_action, _ = prototype_consistency_loss(
         out["factor_features_action"],
         out["factor_queries"],

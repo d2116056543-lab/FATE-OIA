@@ -4,6 +4,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+ACTION_DELETION_GAP_MIN = 0.002
+
 
 def action_delta_cap(epoch: int, max_cap: float = 0.06) -> float:
     if epoch <= 5:
@@ -53,6 +55,7 @@ class TFCActionHead(nn.Module):
             if deletion_stats is not None:
                 deletion_gap = deletion_stats.get("selected_vs_random_gap", deletion_gap).detach()
                 selected_mask = deletion_stats.get("selected_gt_random_mask", selected_mask).detach().bool()
+                selected_mask = selected_mask & (deletion_gap > ACTION_DELETION_GAP_MIN)
             visual_margin = action_visual_logits.detach().abs()
             gate_in = torch.stack([credit_confidence_action.detach(), deletion_gap, visual_margin], dim=-1)
             gate = torch.sigmoid(self.gate(gate_in).squeeze(-1)) * selected_mask.float()

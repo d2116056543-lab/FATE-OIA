@@ -2,6 +2,7 @@
 
 from fate_oia.losses.tfc_losses import compute_tfc_losses
 from fate_oia.models.acpr_tfc_model import ACPRTFCModel
+from fate_oia.models.tfc_action_head import TFCActionHead
 from fate_oia.models.tfc_deletion_contrast import TFCDeletionContrast
 from fate_oia.models.tfc_pu_state import TFCPUStateBuilder
 from fate_oia.models.tfc_target_credit import TFCTargetCredit
@@ -183,3 +184,20 @@ def test_tfc_pu_hard_negative_requires_deletion_gate():
         deletion_gate_reason=torch.ones(1, 3, dtype=torch.bool),
     )
     assert with_gate["hard_negative_mask"].sum() > 0
+
+
+def test_action_delta_requires_robust_positive_deletion_gap():
+    head = TFCActionHead(dim=4, action_dim=2)
+    patch = torch.randn(1, 1, 6, 4)
+    factor_features = torch.randn(1, 2, 4)
+    credit_norm = torch.zeros(1, 2, 2)
+    credit_norm[:, 0, :] = 1.0
+    confidence = torch.ones(1, 2)
+    weak_positive_deletion = {
+        "selected_vs_random_gap": torch.full((1, 2), 0.0005),
+        "selected_gt_random_mask": torch.ones(1, 2, dtype=torch.bool),
+    }
+
+    out = head(patch, factor_features, credit_norm, confidence, weak_positive_deletion, epoch=6)
+
+    assert torch.allclose(out["action_tfc_delta"], torch.zeros_like(out["action_tfc_delta"]))
