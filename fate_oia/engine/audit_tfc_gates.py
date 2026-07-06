@@ -51,6 +51,7 @@ CODE_REVIEW_FIELDS = [
     "no_cache",
     "no_token_compression",
     "target_credit_uses_factor_features",
+    "target_credit_receives_visual_margins",
     "deletion_uses_same_region_random_indices",
     "deletion_uses_same_region_background",
     "random_indices_sampled_per_batch_item",
@@ -142,6 +143,12 @@ def gate_code(cfg: dict, out_dir: Path) -> dict:
     ablation_src = Path("fate_oia/engine/eval_tfc_branch_ablation.py").read_text(encoding="utf-8", errors="ignore")
     script_src = Path("scripts/FATE_OIA_acpr_tfc_v1_foreground.ps1").read_text(encoding="utf-8", errors="ignore")
     factor_bank_src = Path("fate_oia/models/tfc_factor_bank.py").read_text(encoding="utf-8", errors="ignore")
+    model_src = Path("fate_oia/models/acpr_tfc_model.py").read_text(encoding="utf-8", errors="ignore")
+    action_credit_start = model_src.find("credit_action = self.target_credit")
+    reason_credit_start = model_src.find("credit_reason = self.target_credit")
+    after_credit_start = model_src.find("deletion_stats_action", reason_credit_start)
+    action_credit_block = model_src[action_credit_start:reason_credit_start] if action_credit_start >= 0 and reason_credit_start >= 0 else ""
+    reason_credit_block = model_src[reason_credit_start:after_credit_start] if reason_credit_start >= 0 and after_credit_start >= 0 else ""
     checks = {
         "no_graph_pmi": not any(x in joined.lower() for x in ["pmi", "cooccurrence", "co_occurrence", "label_graph"]),
         "no_action_set_final": "action_set" not in joined,
@@ -151,6 +158,14 @@ def gate_code(cfg: dict, out_dir: Path) -> dict:
         "no_cache": not bool(cfg.get("model", {}).get("feature_cache_enabled", False)),
         "no_token_compression": not bool(cfg.get("model", {}).get("token_compression", False)),
         "target_credit_uses_factor_features": "factor_features" in credit_src and "action_target_embeddings" in credit_src and "reason_target_embeddings" in credit_src,
+        "target_credit_receives_visual_margins": (
+            "action_margins=action_visual" in action_credit_block
+            and "reason_margins=reason_visual" not in action_credit_block
+            and "reason_margins=reason_visual" in reason_credit_block
+            and "action_margins=action_visual" not in reason_credit_block
+            and model_src.find("action_visual = self.action_head.visual_logits_from_patch") < model_src.find("credit_action = self.target_credit")
+            and model_src.find("reason_visual = self.reason_head.visual_logits_from_patch") < model_src.find("credit_reason = self.target_credit")
+        ),
         "deletion_uses_same_region_random_indices": "random_indices" in deletion_src,
         "deletion_uses_same_region_background": "background_idx" in deletion_src and "bg_pool" in deletion_src,
         "random_indices_sampled_per_batch_item": "for _ in range(b)" in topk_src and ".expand(b, k)" not in topk_src,

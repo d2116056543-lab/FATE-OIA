@@ -91,21 +91,23 @@ class ACPRTFCModel(nn.Module):
         spatial_names = [s.region_prior for s in self.factor_bank.specs]
         meas_action = self.measure_action(lanes["patch_action"], proto["factor_queries"], spatial_names)
         meas_reason = self.measure_reason(lanes["patch_reason"], proto["factor_queries"], spatial_names)
+        action_visual = self.action_head.visual_logits_from_patch(lanes["patch_action"])
+        reason_visual = self.reason_head.visual_logits_from_patch(lanes["patch_reason"])
         compat = self.factor_bank.compatibility_matrices()
         credit_action = self.target_credit(
             meas_action["factor_probs"],
             meas_action["factor_rho"],
             meas_action["factor_features"],
             compat,
+            action_margins=action_visual,
         )
         credit_reason = self.target_credit(
             meas_reason["factor_probs"],
             meas_reason["factor_rho"],
             meas_reason["factor_features"],
             compat,
+            reason_margins=reason_visual,
         )
-        action_visual = self.action_head.visual_logits_from_patch(lanes["patch_action"])
-        reason_visual = self.reason_head.visual_logits_from_patch(lanes["patch_reason"])
         deletion_stats_action = None
         deletion_stats_reason = None
         if run_deletion:

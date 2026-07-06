@@ -8,6 +8,17 @@ from fate_oia.models.tfc_target_credit import TFCTargetCredit
 from fate_oia.models.tfc_topk_factor_measurement import TFCTopKFactorMeasurement
 
 
+class _CaptureTargetCredit(torch.nn.Module):
+    def __init__(self, inner: torch.nn.Module) -> None:
+        super().__init__()
+        self.inner = inner
+        self.calls = []
+
+    def forward(self, *args, action_margins=None, reason_margins=None, **kwargs):
+        self.calls.append((action_margins, reason_margins))
+        return self.inner(*args, action_margins=action_margins, reason_margins=reason_margins, **kwargs)
+
+
 def test_tfc_model_forward_shapes_and_firewall():
     model = ACPRTFCModel(use_mock_dino=True, factor_topk_tokens=8)
     images = torch.randn(2, 3, 360, 640)
@@ -34,6 +45,26 @@ def test_tfc_model_forward_shapes_and_firewall():
     assert "prototype" in losses
     assert "cardinality" in losses
     assert torch.isfinite(losses["total"])
+
+
+def test_tfc_model_passes_visual_margins_into_target_credit():
+    model = ACPRTFCModel(use_mock_dino=True, factor_topk_tokens=8)
+    capture = _CaptureTargetCredit(model.target_credit)
+    model.target_credit = capture
+    images = torch.randn(2, 3, 360, 640)
+    action = torch.zeros(2, 4)
+    reason = torch.zeros(2, 21)
+    out = model(images, action, reason, epoch=7, split="train", run_deletion=False)
+    assert len(capture.calls) == 2
+    action_call, reason_call = capture.calls
+    assert action_call[0] is not None
+    assert action_call[1] is None
+    assert reason_call[0] is None
+    assert reason_call[1] is not None
+    assert action_call[0].shape == (2, 4)
+    assert reason_call[1].shape == (2, 21)
+    assert torch.allclose(action_call[0], out["action_visual_logits"], atol=1e-6)
+    assert torch.allclose(reason_call[1], out["reason_visual_logits"], atol=1e-6)
 
 
 def test_deletion_replacement_uses_same_region_background():
