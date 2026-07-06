@@ -76,8 +76,43 @@ def test_deletion_replacement_uses_same_region_background():
     assert torch.allclose(deletion.ema_background.view(-1), torch.tensor([4.5]))
 
 
+def test_deletion_ema_does_not_update_in_eval_mode():
+    deletion = TFCDeletionContrast(ema_momentum=0.0)
+    patch = torch.arange(6, dtype=torch.float32).view(1, 1, 6, 1)
+    deletion.train()
+    deletion._replace(patch, torch.tensor([[0, 1]]), torch.tensor([[4, 5]]), same_region_background="ema")
+    before = deletion.ema_background.clone()
+    deletion.eval()
+    deletion._replace(patch, torch.tensor([[0, 1]]), torch.tensor([[2, 3]]), same_region_background="ema")
+    assert torch.allclose(deletion.ema_background, before)
+
+
+def test_deletion_gate_accepts_inhibitory_negative_credit_evidence():
+    deletion = TFCDeletionContrast(ema_momentum=0.0)
+    patch = torch.tensor([[[[2.0], [0.0], [0.0]]]])
+
+    def head_fn(patched: torch.Tensor) -> torch.Tensor:
+        return -patched[:, :, 0, :].sum(dim=(1, 2)).unsqueeze(-1)
+
+    target_logits = head_fn(patch)
+    out = deletion(
+        patch,
+        topk_indices=torch.tensor([[[0]]]),
+        credit_norm=torch.tensor([[[-1.0]]]),
+        head_fn=head_fn,
+        target_logits=target_logits,
+        max_factors_per_sample=1,
+        same_region_background="same_region",
+        random_indices=torch.tensor([[[2]]]),
+    )
+    assert out["raw_selected_vs_random_gap"][0, 0] < 0
+    assert out["selected_vs_random_gap"][0, 0] > 0
+    assert bool(out["selected_gt_random_mask"][0, 0])
+
+
 def test_deletion_max_factors_schedule_limits_early_epochs():
     model = ACPRTFCModel(use_mock_dino=True, factor_topk_tokens=8, max_deletion_factors_per_sample=4)
+    assert model.deletion_action is not model.deletion_reason
     assert model.deletion_max_factors_for_epoch(0) == 2
     assert model.deletion_max_factors_for_epoch(5) == 2
     assert model.deletion_max_factors_for_epoch(6) == 4

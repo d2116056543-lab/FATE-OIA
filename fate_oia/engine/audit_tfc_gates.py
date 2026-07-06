@@ -54,6 +54,9 @@ CODE_REVIEW_FIELDS = [
     "target_credit_receives_visual_margins",
     "deletion_uses_same_region_random_indices",
     "deletion_uses_same_region_background",
+    "deletion_gate_is_credit_sign_aware",
+    "deletion_ema_eval_no_update",
+    "deletion_background_is_lane_separate",
     "random_indices_sampled_per_batch_item",
     "action_delta_requires_deletion_mask",
     "prototype_consistency_called",
@@ -82,6 +85,7 @@ CODE_REVIEW_FIELDS = [
     "delta_schedule_matches_plan",
     "scheduler_and_lr_groups_used",
     "factor_bank_target_indices_range_checked",
+    "factor_bank_reason_aliases_cover_all_labels",
     "target_credit_masks_unknown_native_zero",
     "pu_hard_negative_requires_deletion_gate",
     "reason_delta_requires_deletion_mask",
@@ -98,6 +102,7 @@ CODE_REVIEW_FIELDS = [
     "train_uses_action_priority_pcgrad",
     "run_manifest_records_core_config",
     "run_manifest_records_reproducibility_fields",
+    "audit_factor_bank_and_deletion_modes_run_gates",
 ]
 
 
@@ -144,6 +149,7 @@ def gate_code(cfg: dict, out_dir: Path) -> dict:
     script_src = Path("scripts/FATE_OIA_acpr_tfc_v1_foreground.ps1").read_text(encoding="utf-8", errors="ignore")
     factor_bank_src = Path("fate_oia/models/tfc_factor_bank.py").read_text(encoding="utf-8", errors="ignore")
     model_src = Path("fate_oia/models/acpr_tfc_model.py").read_text(encoding="utf-8", errors="ignore")
+    audit_src = Path("fate_oia/engine/audit_tfc_gates.py").read_text(encoding="utf-8", errors="ignore")
     action_credit_start = model_src.find("credit_action = self.target_credit")
     reason_credit_start = model_src.find("credit_reason = self.target_credit")
     after_credit_start = model_src.find("deletion_stats_action", reason_credit_start)
@@ -168,6 +174,9 @@ def gate_code(cfg: dict, out_dir: Path) -> dict:
         ),
         "deletion_uses_same_region_random_indices": "random_indices" in deletion_src,
         "deletion_uses_same_region_background": "background_idx" in deletion_src and "bg_pool" in deletion_src,
+        "deletion_gate_is_credit_sign_aware": "credit_sign" in deletion_src and "raw_selected_vs_random_gap" in deletion_src and "gap = raw_gap * credit_sign" in deletion_src,
+        "deletion_ema_eval_no_update": "if not self.training" in deletion_src and "return current_detached" in deletion_src,
+        "deletion_background_is_lane_separate": "deletion_action" in model_src and "deletion_reason" in model_src and "self.deletion = self.deletion_action" in model_src,
         "random_indices_sampled_per_batch_item": "for _ in range(b)" in topk_src and ".expand(b, k)" not in topk_src,
         "random_deletion_equal_area_without_replacement": "replacement=False" in topk_src,
         "action_delta_requires_deletion_mask": "selected_mask = torch.zeros_like" in action_src,
@@ -242,6 +251,7 @@ def gate_code(cfg: dict, out_dir: Path) -> dict:
             ]
         ),
         "factor_bank_target_indices_range_checked": "index out of range" in factor_bank_src and "action_targets must exactly define" in factor_bank_src,
+        "factor_bank_reason_aliases_cover_all_labels": "reason_alias_coverage" in factor_bank_src and "aliases must cover all" in factor_bank_src,
         "target_credit_masks_unknown_native_zero": "native_action.unsqueeze(0) * action_scale" in credit_src and "native_reason.unsqueeze(0) * reason_scale" in credit_src,
         "pu_hard_negative_requires_deletion_gate": "deletion_gate_reason" in Path("fate_oia/models/tfc_pu_state.py").read_text(encoding="utf-8", errors="ignore") and "& deletion_gate_reason" in Path("fate_oia/models/tfc_pu_state.py").read_text(encoding="utf-8", errors="ignore"),
         "reason_delta_requires_deletion_mask": "deletion_stats" in Path("fate_oia/models/tfc_reason_head.py").read_text(encoding="utf-8", errors="ignore") and "* selected_mask.float()" in Path("fate_oia/models/tfc_reason_head.py").read_text(encoding="utf-8", errors="ignore"),
@@ -276,6 +286,7 @@ def gate_code(cfg: dict, out_dir: Path) -> dict:
             marker in train_src and marker in Path("fate_oia/models/acpr_tfc_model.py").read_text(encoding="utf-8", errors="ignore")
             for marker in ["deletion_max_factors_used", "same_region_background_is_ema"]
         ),
+        "audit_factor_bank_and_deletion_modes_run_gates": "args.mode == \"factor-bank\"" in audit_src and "args.mode == \"deletion\"" in audit_src and "if not gates" in audit_src,
     }
     data = {"pass": not missing and all(checks.values()), "missing": missing, **checks}
     write_json(out_dir / "TFC_GATE_A_CODE_AUDIT_PASS.json", data)
@@ -341,16 +352,57 @@ def gate_firewall(cfg: dict, out_dir: Path, device: torch.device) -> dict:
     return data
 
 
-def gate_factor_pu_cal(cfg: dict, out_dir: Path, device: torch.device) -> list[dict]:
+def gate_factor_bank(cfg: dict, out_dir: Path, device: torch.device | None = None) -> dict:
+    del device
     bank = TFCFactorBank.from_yaml(cfg["tfc"]["factor_bank"])
-    data_d = {"pass": bank.num_factors >= 10, "num_factors": bank.num_factors, "native_similarity_finite": bool(torch.isfinite(bank.native_similarity).all())}
-    write_json(out_dir / "TFC_GATE_D_FACTOR_GROUNDING_PASS.json", data_d)
+    coverage_ok = bool(torch.all(bank.reason_alias_coverage > 0).item()) and int(bank.reason_alias_coverage.sum().item()) == bank.reason_dim
+    data = {
+        "pass": bank.num_factors >= 10 and coverage_ok and bool(torch.isfinite(bank.native_similarity).all()),
+        "num_factors": bank.num_factors,
+        "native_similarity_finite": bool(torch.isfinite(bank.native_similarity).all()),
+        "reason_alias_coverage_count": int(bank.reason_alias_coverage.sum().item()),
+        "reason_alias_coverage_complete": coverage_ok,
+    }
+    write_json(out_dir / "TFC_GATE_D_FACTOR_GROUNDING_PASS.json", data)
+    return data
+
+
+def gate_deletion(cfg: dict, out_dir: Path, device: torch.device) -> dict:
+    model = build_model(cfg, device, mock=True)
+    images = torch.randn(2, 3, 360, 640, device=device)
+    action = torch.zeros(2, 4, device=device)
+    reason = torch.zeros(2, 21, device=device)
+    out = model(images, action, reason, epoch=7, split="train", run_deletion=True)
+    gap = out["deletion_stats"]["selected_vs_random_gap"]
+    raw_gap_present = "raw_selected_vs_random_gap" in out["deletion_stats"]
+    sign_present = "credit_sign" in out["deletion_stats"]
+    data = {
+        "pass": bool(torch.isfinite(gap).all().item()) and raw_gap_present and sign_present,
+        "selected_vs_random_gap_mean": float(gap.mean().detach().cpu()),
+        "raw_gap_present": raw_gap_present,
+        "credit_sign_present": sign_present,
+        "pretrain_functional_only": True,
+        "strict_gt_random": bool((gap > 0).float().mean().detach().cpu() > 0),
+    }
+    write_json(out_dir / "TFC_GATE_E_SELECTED_DELETION_GT_RANDOM_PASS.json", data)
+    return data
+
+
+def gate_factor_pu_cal(cfg: dict, out_dir: Path, device: torch.device) -> list[dict]:
+    data_d = gate_factor_bank(cfg, out_dir, device)
     model = build_model(cfg, device, mock=True)
     images = torch.randn(2, 3, 360, 640, device=device)
     action = torch.zeros(2, 4, device=device); reason = torch.zeros(2, 21, device=device)
     out = model(images, action, reason, epoch=7, split="train", run_deletion=True)
     gap = out["deletion_stats"]["selected_vs_random_gap"]
-    data_e = {"pass": torch.isfinite(gap).all().item(), "selected_vs_random_gap_mean": float(gap.mean().detach().cpu())}
+    data_e = {
+        "pass": torch.isfinite(gap).all().item() and "raw_selected_vs_random_gap" in out["deletion_stats"] and "credit_sign" in out["deletion_stats"],
+        "selected_vs_random_gap_mean": float(gap.mean().detach().cpu()),
+        "raw_gap_present": "raw_selected_vs_random_gap" in out["deletion_stats"],
+        "credit_sign_present": "credit_sign" in out["deletion_stats"],
+        "pretrain_functional_only": True,
+        "strict_gt_random": bool((gap > 0).float().mean().detach().cpu() > 0),
+    }
     write_json(out_dir / "TFC_GATE_E_SELECTED_DELETION_GT_RANDOM_PASS.json", data_e)
     pu0 = model.pu_state(reason, out["credit_reason"], out["factor_probs_reason"], out["factor_rho_reason"], epoch=0)
     pu7 = model.pu_state(reason, out["credit_reason"], out["factor_probs_reason"], out["factor_rho_reason"], epoch=7)
@@ -485,12 +537,20 @@ def main() -> None:
     gates = []
     if args.mode in {"code", "all"}:
         gates.append(gate_code(cfg, out_dir))
+    if args.mode == "factor-bank":
+        gates.append(gate_factor_bank(cfg, out_dir, device))
     if args.mode in {"smoke", "pretrain", "all"}:
         gates.append(gate_forward(cfg, out_dir, device))
         gates.append(gate_firewall(cfg, out_dir, device))
         gates.extend(gate_factor_pu_cal(cfg, out_dir, device))
+    if args.mode == "deletion":
+        gates.append(gate_deletion(cfg, out_dir, device))
     if args.mode in {"memory", "all"}:
         gates.append(gate_memory(cfg, out_dir, device, args.batch_size))
+    if not gates:
+        data = {"pass": False, "error": f"mode {args.mode!r} produced no gates"}
+        print(json.dumps(data, indent=2))
+        sys.exit(1)
     if args.write_review_pass or args.mode == "all":
         review = write_review(out_dir, gates)
         print(json.dumps(review, indent=2))

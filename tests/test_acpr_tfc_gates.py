@@ -60,9 +60,13 @@ def test_tfc_audit_gates_smoke(tmp_path):
     assert review["audit_exits_nonzero_on_failed_review"] is True
     assert review["target_credit_stats_written_every_epoch"] is True
     assert review["target_credit_receives_visual_margins"] is True
+    assert review["deletion_gate_is_credit_sign_aware"] is True
+    assert review["deletion_ema_eval_no_update"] is True
+    assert review["deletion_background_is_lane_separate"] is True
     assert review["delta_schedule_matches_plan"] is True
     assert review["scheduler_and_lr_groups_used"] is True
     assert review["factor_bank_target_indices_range_checked"] is True
+    assert review["factor_bank_reason_aliases_cover_all_labels"] is True
     assert review["target_credit_masks_unknown_native_zero"] is True
     assert review["pu_hard_negative_requires_deletion_gate"] is True
     assert review["reason_delta_requires_deletion_mask"] is True
@@ -79,3 +83,30 @@ def test_tfc_audit_gates_smoke(tmp_path):
     assert review["train_uses_action_priority_pcgrad"] is True
     assert review["run_manifest_records_core_config"] is True
     assert review["run_manifest_records_reproducibility_fields"] is True
+    assert review["audit_factor_bank_and_deletion_modes_run_gates"] is True
+
+
+def test_tfc_audit_specific_modes_do_not_empty_pass(tmp_path):
+    for mode, expected_file in [
+        ("factor-bank", "TFC_GATE_D_FACTOR_GROUNDING_PASS.json"),
+        ("deletion", "TFC_GATE_E_SELECTED_DELETION_GT_RANDOM_PASS.json"),
+    ]:
+        out = tmp_path / mode
+        cmd = [
+            sys.executable,
+            "-m",
+            "fate_oia.engine.audit_tfc_gates",
+            "--config",
+            "configs/fate_oia_train_360x640_acpr_tfc_v1.yaml",
+            "--mode",
+            mode,
+            "--device",
+            "cpu",
+            "--batch_size",
+            "1",
+            "--output_dir",
+            str(out),
+        ]
+        subprocess.check_call(cmd)
+        payload = json.loads((out / expected_file).read_text())
+        assert payload["pass"] is True

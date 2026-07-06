@@ -29,6 +29,10 @@ class TFCDeletionContrast(nn.Module):
 
         if mode == "ema":
             current_detached = current.detach()
+            if not self.training:
+                if self.ema_background.numel() == current_detached.numel() and self.ema_background.device == current_detached.device:
+                    return self.ema_background.to(dtype=flat.dtype)
+                return current_detached
             if self.ema_background.numel() != current_detached.numel() or self.ema_background.device != current_detached.device:
                 self.ema_background = current_detached.clone()
             else:
@@ -83,6 +87,7 @@ class TFCDeletionContrast(nn.Module):
         device = patch_tokens.device
         selected_effect = torch.zeros(b, targets, device=device, dtype=patch_tokens.dtype)
         random_effect = torch.zeros_like(selected_effect)
+        credit_sign = torch.zeros_like(selected_effect)
         selected_mask = torch.zeros_like(selected_effect, dtype=torch.bool)
         for i in range(b):
             score = credit_norm[i].abs()
@@ -116,9 +121,15 @@ class TFCDeletionContrast(nn.Module):
                 rnd_logits = head_fn(patched_rand)
                 selected_effect[i, t] = target_logits[i, t] - sel_logits[0, t]
                 random_effect[i, t] = target_logits[i, t] - rnd_logits[0, t]
+                credit_sign[i, t] = credit_norm[i, f, t].sign()
                 selected_mask[i, t] = True
                 used += 1
-        gap = selected_effect - random_effect
+        raw_gap = selected_effect - random_effect
+        # Positive-credit factors should make z_t drop when deleted; inhibitory
+        # negative-credit factors should make z_t rise when deleted. Use the
+        # credit sign so both support and inhibit evidence can pass the same
+        # selected-vs-random gate instead of silently dropping all inhibitors.
+        gap = raw_gap * credit_sign.where(credit_sign != 0, torch.ones_like(credit_sign))
         valid = selected_mask
         if bool(valid.any()):
             loss = F.relu(self.margin - gap[valid]).mean()
@@ -131,6 +142,8 @@ class TFCDeletionContrast(nn.Module):
         return {
             "selected_effect": selected_effect,
             "random_effect": random_effect,
+            "raw_selected_vs_random_gap": raw_gap,
+            "credit_sign": credit_sign,
             "deletion_contrast_loss": loss,
             "selected_gt_random_rate": rate,
             "selected_gt_random_mask": gap > 0,
