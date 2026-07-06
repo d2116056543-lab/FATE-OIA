@@ -37,8 +37,8 @@ def reason_pu_asl_loss(reason_logits: torch.Tensor, reason_targets: torch.Tensor
 
 
 def factor_measurement_loss(factor_probs_action: torch.Tensor, factor_probs_reason: torch.Tensor) -> torch.Tensor:
-    qa = factor_probs_action.clamp(1e-4, 1 - 1e-4)
-    qr = factor_probs_reason.clamp(1e-4, 1 - 1e-4)
+    qa = factor_probs_action.float().clamp(1e-4, 1 - 1e-4)
+    qr = factor_probs_reason.float().clamp(1e-4, 1 - 1e-4)
     entropy = -(qa * qa.log() + (1 - qa) * (1 - qa).log()).mean()
     entropy = entropy + (-(qr * qr.log() + (1 - qr) * (1 - qr).log()).mean())
     return 0.01 * entropy
