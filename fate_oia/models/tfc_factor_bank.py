@@ -51,11 +51,22 @@ def _resolve_names(names: Any, mapping: dict[str, int], field: str, dim: int) ->
 
 
 class TFCFactorBank(nn.Module):
-    def __init__(self, specs: list[FactorSpec], action_dim: int = 4, reason_dim: int = 21) -> None:
+    def __init__(
+        self,
+        specs: list[FactorSpec],
+        action_dim: int = 4,
+        reason_dim: int = 21,
+        reason_aliases: dict[str, int] | None = None,
+    ) -> None:
         super().__init__()
         self.specs = specs
         self.action_dim = int(action_dim)
         self.reason_dim = int(reason_dim)
+        self.reason_aliases = dict(reason_aliases or {})
+        coverage = torch.zeros(self.reason_dim)
+        for idx in self.reason_aliases.values():
+            coverage[int(idx)] = 1.0
+        self.register_buffer("reason_alias_coverage", coverage)
         mats = self._build_matrices()
         for name, tensor in mats.items():
             self.register_buffer(name, tensor)
@@ -73,6 +84,12 @@ class TFCFactorBank(nn.Module):
         reason_aliases = {str(k): int(v) for k, v in (cfg.get("reason_targets", {}).get("aliases") or {}).items()}
         if int(cfg.get("reason_targets", {}).get("count", reason_dim)) != reason_dim:
             raise ValueError("reason_targets.count must match reason_dim")
+        alias_values = set(reason_aliases.values())
+        expected_values = set(range(reason_dim))
+        if alias_values != expected_values:
+            missing_values = sorted(expected_values - alias_values)
+            extra_values = sorted(alias_values - expected_values)
+            raise ValueError(f"reason_targets aliases must cover all 0..{reason_dim - 1}; missing={missing_values}; extra={extra_values}")
         factors = cfg.get("factors") or {}
         if not factors:
             raise ValueError("No factors configured")
@@ -114,7 +131,7 @@ class TFCFactorBank(nn.Module):
             green = specs[name_to_idx["traffic_light_green"]]
             if name_to_idx["traffic_light_green"] not in red.factor_conflict or name_to_idx["traffic_light_red"] not in green.factor_conflict:
                 raise ValueError("traffic_light_red/green contradiction must be symmetric")
-        return cls(specs, action_dim=action_dim, reason_dim=reason_dim)
+        return cls(specs, action_dim=action_dim, reason_dim=reason_dim, reason_aliases=reason_aliases)
 
     @property
     def num_factors(self) -> int:

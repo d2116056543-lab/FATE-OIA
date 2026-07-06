@@ -21,6 +21,13 @@ reason_targets:
     lane_available_left: 11
     lane_available_right: 12
     clear_path: 13
+    bdd_oia_reason_14_unmapped: 14
+    bdd_oia_reason_15_unmapped: 15
+    bdd_oia_reason_16_unmapped: 16
+    bdd_oia_reason_17_unmapped: 17
+    bdd_oia_reason_18_unmapped: 18
+    bdd_oia_reason_19_unmapped: 19
+    bdd_oia_reason_20_unmapped: 20
 factors:
   front_vehicle_close:
     entity: vehicle

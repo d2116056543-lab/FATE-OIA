@@ -62,7 +62,9 @@ class ACPRTFCModel(nn.Module):
         self.reason_head = TFCReasonHead(dim=dim, reason_dim=reason_dim, max_delta=reason_delta_max)
         self.pu_state = TFCPUStateBuilder()
         self.calalign = TFCCalAlignHead(action_dim=action_dim, reason_dim=reason_dim)
-        self.deletion = TFCDeletionContrast()
+        self.deletion_action = TFCDeletionContrast()
+        self.deletion_reason = TFCDeletionContrast()
+        self.deletion = self.deletion_action
         self.max_deletion_factors_per_sample = int(max_deletion_factors_per_sample)
         self.same_region_background = str(same_region_background)
 
@@ -91,26 +93,28 @@ class ACPRTFCModel(nn.Module):
         spatial_names = [s.region_prior for s in self.factor_bank.specs]
         meas_action = self.measure_action(lanes["patch_action"], proto["factor_queries"], spatial_names)
         meas_reason = self.measure_reason(lanes["patch_reason"], proto["factor_queries"], spatial_names)
+        action_visual = self.action_head.visual_logits_from_patch(lanes["patch_action"])
+        reason_visual = self.reason_head.visual_logits_from_patch(lanes["patch_reason"])
         compat = self.factor_bank.compatibility_matrices()
         credit_action = self.target_credit(
             meas_action["factor_probs"],
             meas_action["factor_rho"],
             meas_action["factor_features"],
             compat,
+            action_margins=action_visual,
         )
         credit_reason = self.target_credit(
             meas_reason["factor_probs"],
             meas_reason["factor_rho"],
             meas_reason["factor_features"],
             compat,
+            reason_margins=reason_visual,
         )
-        action_visual = self.action_head.visual_logits_from_patch(lanes["patch_action"])
-        reason_visual = self.reason_head.visual_logits_from_patch(lanes["patch_reason"])
         deletion_stats_action = None
         deletion_stats_reason = None
         if run_deletion:
             max_deletion_factors = self.deletion_max_factors_for_epoch(epoch)
-            deletion_stats_action = self.deletion(
+            deletion_stats_action = self.deletion_action(
                 lanes["patch_action"],
                 meas_action["topk_indices"],
                 credit_action["credit_action_norm"],
@@ -121,7 +125,7 @@ class ACPRTFCModel(nn.Module):
                 same_region_background=self.same_region_background,
                 random_indices=meas_action.get("random_indices"),
             )
-            deletion_stats_reason = self.deletion(
+            deletion_stats_reason = self.deletion_reason(
                 lanes["patch_reason"],
                 meas_reason["topk_indices"],
                 credit_reason["credit_reason_norm"],
