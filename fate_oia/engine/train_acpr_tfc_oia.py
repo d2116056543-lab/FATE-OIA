@@ -19,6 +19,7 @@ from fate_oia.models.acpr_tfc_model import ACPRTFCModel
 from fate_oia.optim.tfc_pareto_optimizer import TFCParetoOptimizer
 from fate_oia.transforms import AspectRatioLetterboxTransform
 from fate_oia.losses.tfc_losses import action_asl_loss, calalign_softf1_loss, compute_tfc_losses, reason_pu_asl_loss, threshold_smooth_loss
+from fate_oia.engine.tfc_transfer_metrics import aggregate_target_evidence_transfer, build_target_evidence_transfer_rows
 from fate_oia.utils.acpr_train_calib_split import make_train_calib_indices
 
 
@@ -530,17 +531,39 @@ def build_target_credit_rows(epoch: int, out: dict, action_targets: torch.Tensor
     return rows
 
 
+def build_target_transfer_rows(epoch: int, out: dict, action_targets: torch.Tensor, reason_targets: torch.Tensor) -> list[dict]:
+    rows = build_target_evidence_transfer_rows(
+        epoch=epoch,
+        target_type="action",
+        deletion_stats=out["deletion_stats_action"],
+        credit=out["credit_action"],
+        labels=action_targets,
+    )
+    rows.extend(
+        build_target_evidence_transfer_rows(
+            epoch=epoch,
+            target_type="reason",
+            deletion_stats=out["deletion_stats_reason"],
+            credit=out["credit_reason"],
+            labels=reason_targets,
+        )
+    )
+    return rows
+
+
 @torch.no_grad()
 def evaluate(model: ACPRTFCModel, loader: DataLoader, device: torch.device, epoch: int, out_dir: Path, train_cfg: dict) -> dict:
     model.eval()
     act_logits = []; rea_logits = []; act_labels = []; rea_labels = []; names = []
     act_visual = []; act_delta_off = []; act_base = []
+    transfer_rows: list[dict] = []
     for batch in loader:
         img = batch["image"].to(device, non_blocking=True)
         a = batch["action"].to(device)
         r = batch["reason"].to(device)
         with autocast_context(device, train_cfg):
             out = model(img, None, None, epoch=epoch, split="test", run_deletion=True)
+        transfer_rows.extend(build_target_transfer_rows(epoch, out, a, r))
         act_logits.append(out["action_logits_deploy"].cpu())
         rea_logits.append(out["reason_logits_deploy"].cpu())
         act_visual.append(out["action_visual_logits"].cpu())
@@ -554,6 +577,7 @@ def evaluate(model: ACPRTFCModel, loader: DataLoader, device: torch.device, epoc
     action_oracle = oracle_threshold_metrics(action_logits, action_labels, prefix="Act_")
     reason_oracle = oracle_threshold_metrics(reason_logits, reason_labels, prefix="Exp_")
     metrics = {**action_metrics, **reason_metrics}
+    metrics.update(aggregate_target_evidence_transfer(transfer_rows))
     metrics["Act_oracle_mF1"] = action_oracle["Act_mF1"]
     metrics["Exp_oracle_mF1"] = reason_oracle["Exp_mF1"]
     metrics["joint"] = 0.5 * metrics["Act_mF1"] + 0.5 * metrics["Exp_mF1"]
@@ -592,6 +616,13 @@ def evaluate(model: ACPRTFCModel, loader: DataLoader, device: torch.device, epoc
     })
     append_jsonl(out_dir / "failure_flip_cases.jsonl", {"epoch": epoch, "cases": flip_cases})
     append_jsonl(epoch_dir / "failure_flip_cases.jsonl", {"epoch": epoch, "cases": flip_cases})
+    transfer_summary = aggregate_target_evidence_transfer(transfer_rows)
+    append_jsonl(out_dir / "target_evidence_transfer_summary.jsonl", {"epoch": epoch, "split": "test", **transfer_summary})
+    append_jsonl(epoch_dir / "target_evidence_transfer_summary.jsonl", {"epoch": epoch, "split": "test", **transfer_summary})
+    for transfer_row in transfer_rows:
+        transfer_row = {"split": "test", **transfer_row}
+        append_jsonl(out_dir / "target_evidence_transfer_stats.jsonl", transfer_row)
+        append_jsonl(epoch_dir / "target_evidence_transfer_stats.jsonl", transfer_row)
     return metrics
 
 
@@ -694,6 +725,7 @@ def main() -> None:
         optimizer.zero_grad(set_to_none=True)
         epoch_deletion_summary: dict | None = None
         epoch_credit_rows: list[dict] = []
+        epoch_transfer_rows: list[dict] = []
         probe_batch: dict | None = None
         for step, batch in enumerate(train_loader):
             if probe_batch is None:
@@ -795,6 +827,7 @@ def main() -> None:
                     "valid_pairs_reason": valid_pairs_reason,
                 }
                 epoch_credit_rows = last_train_stats["credit_rows"]
+                epoch_transfer_rows = build_target_transfer_rows(epoch, out, action, reason)
             if step % 200 == 0:
                 print("tfc_batch " + json.dumps(row), flush=True)
                 append_jsonl(out_dir / "loss_components.jsonl", row)
@@ -860,6 +893,42 @@ def main() -> None:
         for credit_row in credit_rows_to_write:
             append_jsonl(out_dir / "target_credit_stats.jsonl", credit_row)
             append_jsonl(epoch_dir / "target_credit_stats.jsonl", credit_row)
+        transfer_rows_to_write = epoch_transfer_rows
+        if not transfer_rows_to_write:
+            transfer_rows_to_write = [
+                {
+                    "epoch": epoch,
+                    "split": "train",
+                    "target_type": "action",
+                    "target_id": target_id,
+                    "valid_pairs": 0,
+                    "target_evidence_transfer_gap": 0.0,
+                    "target_evidence_specificity": 0.0,
+                    "credit_causality_agreement": None,
+                    "deletion_available": False,
+                }
+                for target_id in range(4)
+            ] + [
+                {
+                    "epoch": epoch,
+                    "split": "train",
+                    "target_type": "reason",
+                    "target_id": target_id,
+                    "valid_pairs": 0,
+                    "target_evidence_transfer_gap": 0.0,
+                    "target_evidence_specificity": 0.0,
+                    "credit_causality_agreement": None,
+                    "deletion_available": False,
+                }
+                for target_id in range(21)
+            ]
+        train_transfer_summary = aggregate_target_evidence_transfer(transfer_rows_to_write)
+        append_jsonl(out_dir / "target_evidence_transfer_summary.jsonl", {"epoch": epoch, "split": "train", **train_transfer_summary})
+        append_jsonl(epoch_dir / "target_evidence_transfer_summary.jsonl", {"epoch": epoch, "split": "train", **train_transfer_summary})
+        for transfer_row in transfer_rows_to_write:
+            transfer_row = {"split": "train", **transfer_row}
+            append_jsonl(out_dir / "target_evidence_transfer_stats.jsonl", transfer_row)
+            append_jsonl(epoch_dir / "target_evidence_transfer_stats.jsonl", transfer_row)
         del_row = {
             "epoch": epoch,
             "selected_vs_random_gap_mean": deletion_summary["deletion_gap_mean"],

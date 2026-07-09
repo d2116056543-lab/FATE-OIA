@@ -87,7 +87,11 @@ class TFCDeletionContrast(nn.Module):
         device = patch_tokens.device
         selected_effect = torch.zeros(b, targets, device=device, dtype=patch_tokens.dtype)
         random_effect = torch.zeros_like(selected_effect)
+        selected_effect_all_targets = torch.zeros(b, targets, targets, device=device, dtype=patch_tokens.dtype)
+        random_effect_all_targets = torch.zeros_like(selected_effect_all_targets)
         credit_sign = torch.zeros_like(selected_effect)
+        selected_credit_value = torch.zeros_like(selected_effect)
+        selected_factor_id = torch.full((b, targets), -1, device=device, dtype=torch.long)
         selected_mask = torch.zeros_like(selected_effect, dtype=torch.bool)
         for i in range(b):
             score = credit_norm[i].abs()
@@ -119,9 +123,15 @@ class TFCDeletionContrast(nn.Module):
                 )
                 sel_logits = head_fn(patched_sel)
                 rnd_logits = head_fn(patched_rand)
+                selected_delta_all = target_logits[i] - sel_logits[0]
+                random_delta_all = target_logits[i] - rnd_logits[0]
                 selected_effect[i, t] = target_logits[i, t] - sel_logits[0, t]
                 random_effect[i, t] = target_logits[i, t] - rnd_logits[0, t]
+                selected_effect_all_targets[i, t] = selected_delta_all
+                random_effect_all_targets[i, t] = random_delta_all
                 credit_sign[i, t] = credit_norm[i, f, t].sign()
+                selected_credit_value[i, t] = credit_norm[i, f, t]
+                selected_factor_id[i, t] = f
                 selected_mask[i, t] = True
                 used += 1
         raw_gap = selected_effect - random_effect
@@ -142,8 +152,13 @@ class TFCDeletionContrast(nn.Module):
         return {
             "selected_effect": selected_effect,
             "random_effect": random_effect,
+            "selected_effect_all_targets": selected_effect_all_targets,
+            "random_effect_all_targets": random_effect_all_targets,
             "raw_selected_vs_random_gap": raw_gap,
             "credit_sign": credit_sign,
+            "selected_credit_value": selected_credit_value,
+            "selected_factor_id": selected_factor_id,
+            "selected_pair_mask": selected_mask,
             "deletion_contrast_loss": loss,
             "selected_gt_random_rate": rate,
             "selected_gt_random_mask": gap > 0,
