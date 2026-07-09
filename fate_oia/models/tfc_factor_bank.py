@@ -82,6 +82,12 @@ class TFCFactorBank(nn.Module):
         if set(map(str, action_targets)) != set(ACTION_ALIASES):
             raise ValueError("action_targets must exactly define stop_slow/forward/turn_left/turn_right")
         reason_aliases = {str(k): int(v) for k, v in (cfg.get("reason_targets", {}).get("aliases") or {}).items()}
+        placeholder_aliases = [
+            name for name in reason_aliases
+            if any(bad in name.lower() for bad in ("unmapped", "placeholder", "reason_"))
+        ]
+        if placeholder_aliases:
+            raise ValueError(f"reason_targets aliases must be semantic names, not placeholders: {placeholder_aliases}")
         if int(cfg.get("reason_targets", {}).get("count", reason_dim)) != reason_dim:
             raise ValueError("reason_targets.count must match reason_dim")
         alias_values = set(reason_aliases.values())

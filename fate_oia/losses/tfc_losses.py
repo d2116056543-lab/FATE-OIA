@@ -24,7 +24,12 @@ def action_safe_loss(action_final_logits: torch.Tensor, action_visual_logits: to
     return 0.1 * F.l1_loss(action_final_logits, action_visual_logits.detach())
 
 
-def reason_pu_asl_loss(reason_logits: torch.Tensor, reason_targets: torch.Tensor, pu_state: dict) -> torch.Tensor:
+def reason_pu_asl_loss(
+    reason_logits: torch.Tensor,
+    reason_targets: torch.Tensor,
+    pu_state: dict,
+    unknown_entropy_weight: float = 0.02,
+) -> torch.Tensor:
     y = reason_targets.float()
     bce = F.binary_cross_entropy_with_logits(reason_logits, y, reduction="none")
     pos = pu_state["positive_mask"].float()
@@ -32,8 +37,18 @@ def reason_pu_asl_loss(reason_logits: torch.Tensor, reason_targets: torch.Tensor
     hard_neg = pu_state["hard_negative_mask"].float()
     weight = pos + soft_neg + hard_neg
     if float(weight.sum().detach().cpu()) <= 0:
-        return reason_logits.new_tensor(0.0)
-    return (bce * weight).sum() / weight.sum().clamp_min(1.0)
+        supervised = reason_logits.new_tensor(0.0)
+    else:
+        supervised = (bce * weight).sum() / weight.sum().clamp_min(1.0)
+    unknown = pu_state.get("unknown_mask")
+    if unknown is None or float(unknown.float().sum().detach().cpu()) <= 0 or unknown_entropy_weight <= 0:
+        return supervised
+    probs = torch.sigmoid(reason_logits).clamp(1e-6, 1 - 1e-6)
+    # Minimize negative entropy for unknown labels so they remain uncertain
+    # rather than being silently treated as hard negatives.
+    negative_entropy = probs * probs.log() + (1.0 - probs) * (1.0 - probs).log()
+    unknown_uncertainty = (negative_entropy * unknown.float()).sum() / unknown.float().sum().clamp_min(1.0)
+    return supervised + float(unknown_entropy_weight) * unknown_uncertainty
 
 
 def _factor_activation_regularizer(
@@ -145,7 +160,12 @@ def compute_tfc_losses(out: dict, action_targets: torch.Tensor, reason_targets: 
     la = action_asl_loss(out["action_logits_deploy"], action_targets)
     lar = action_rank_loss(out["action_logits_deploy"], action_targets)
     lsafe = action_safe_loss(out["action_logits_base"], out["action_visual_logits"], action_targets)
-    lr = reason_pu_asl_loss(out["reason_logits_deploy"], reason_targets, out["pu_state"])
+    lr = reason_pu_asl_loss(
+        out["reason_logits_deploy"],
+        reason_targets,
+        out["pu_state"],
+        unknown_entropy_weight=weights.get("reason_unknown_entropy", 0.02),
+    )
     lf = factor_measurement_loss(
         out["factor_probs_action"],
         out["factor_probs_reason"],

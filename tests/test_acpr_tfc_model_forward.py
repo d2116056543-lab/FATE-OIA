@@ -201,3 +201,85 @@ def test_action_delta_requires_robust_positive_deletion_gap():
     out = head(patch, factor_features, credit_norm, confidence, weak_positive_deletion, epoch=6)
 
     assert torch.allclose(out["action_tfc_delta"], torch.zeros_like(out["action_tfc_delta"]))
+
+
+def test_action_delta_is_blocked_when_rank_safety_would_worsen():
+    head = TFCActionHead(dim=4, action_dim=2)
+    patch = torch.randn(1, 1, 6, 4)
+    factor_features = torch.randn(1, 2, 4)
+    credit_norm = torch.zeros(1, 2, 2)
+    credit_norm[:, 0, :] = 1.0
+    confidence = torch.ones(1, 2)
+    strong_deletion = {
+        "selected_vs_random_gap": torch.ones(1, 2),
+        "selected_gt_random_mask": torch.ones(1, 2, dtype=torch.bool),
+    }
+    with torch.no_grad():
+        head.visual_head.weight.zero_()
+        head.visual_head.bias.copy_(torch.tensor([1.0]))
+        head.delta_head[-1].weight.zero_()
+        head.delta_head[-1].bias.copy_(torch.tensor([-10.0]))
+        head.gate[-1].weight.zero_()
+        head.gate[-1].bias.fill_(10.0)
+
+    out = head(
+        patch,
+        factor_features,
+        credit_norm,
+        confidence,
+        strong_deletion,
+        epoch=8,
+        action_targets=torch.tensor([[1.0, 1.0]]),
+    )
+
+    assert torch.allclose(out["action_tfc_delta"], torch.zeros_like(out["action_tfc_delta"]), atol=1e-6)
+    assert "action_rank_safety_mask" in out
+    assert out["action_rank_safety_mask"].sum() == 0
+
+
+def test_action_delta_without_labels_preserves_base_logit_direction():
+    head = TFCActionHead(dim=4, action_dim=2)
+    patch = torch.randn(1, 1, 6, 4)
+    factor_features = torch.randn(1, 2, 4)
+    credit_norm = torch.zeros(1, 2, 2)
+    credit_norm[:, 0, :] = 1.0
+    confidence = torch.ones(1, 2)
+    strong_deletion = {
+        "selected_vs_random_gap": torch.ones(1, 2),
+        "selected_gt_random_mask": torch.ones(1, 2, dtype=torch.bool),
+    }
+    with torch.no_grad():
+        head.visual_head.weight.zero_()
+        head.visual_head.bias.copy_(torch.tensor([1.0]))
+        head.delta_head[-1].weight.zero_()
+        head.delta_head[-1].bias.copy_(torch.tensor([-10.0]))
+        head.gate[-1].weight.zero_()
+        head.gate[-1].bias.fill_(10.0)
+
+    out = head(patch, factor_features, credit_norm, confidence, strong_deletion, epoch=8)
+
+    assert torch.allclose(out["action_tfc_delta"], torch.zeros_like(out["action_tfc_delta"]), atol=1e-6)
+    assert "action_deploy_safety_mask" in out
+    assert out["action_deploy_safety_mask"].sum() == 0
+
+
+def test_factor_measurement_exposes_named_grounding_audit_stats():
+    measurement = TFCTopKFactorMeasurement(dim=4, topk=4, grid_hw=(2, 3))
+    patches = torch.randn(2, 1, 6, 4)
+    queries = torch.randn(4, 4)
+    out = measurement(
+        patches,
+        queries,
+        ["upper_front", "front_center", "left_corridor", "right_corridor"],
+        factor_names=["traffic_light_red", "front_vehicle_close", "lane_left_available", "lane_right_available"],
+    )
+    stats = out["grounding_audit_stats"]
+    for key in [
+        "traffic_control_upper_region_mass",
+        "obstacle_front_center_mass",
+        "left_lane_corridor_mass",
+        "right_lane_corridor_mass",
+        "left_right_mirror_mass_gap",
+    ]:
+        assert key in stats
+        assert torch.isfinite(stats[key])

@@ -41,7 +41,19 @@ class TFCTopKFactorMeasurement(nn.Module):
         self.rho_head = nn.Linear(dim, 1)
         self.region_bias_scale = nn.Parameter(torch.tensor(1.0))
 
-    def forward(self, patch_tokens_by_layer: torch.Tensor, factor_queries: torch.Tensor, spatial_names: list[str]) -> dict[str, torch.Tensor]:
+    @staticmethod
+    def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        if not bool(mask.any()):
+            return values.new_tensor(0.0)
+        return values[:, mask].mean()
+
+    def forward(
+        self,
+        patch_tokens_by_layer: torch.Tensor,
+        factor_queries: torch.Tensor,
+        spatial_names: list[str],
+        factor_names: list[str] | None = None,
+    ) -> dict[str, torch.Tensor]:
         b, layers, n, d = patch_tokens_by_layer.shape
         f = factor_queries.shape[0]
         k = min(self.topk, layers * n)
@@ -66,6 +78,39 @@ class TFCTopKFactorMeasurement(nn.Module):
         rho_base = self.rho_head(factor_features).squeeze(-1)
         factor_rho = torch.sigmoid(rho_base - entropy / max(float(k), 1.0))
         top_region = priors.view(1, f, 1, n).expand(b, f, layers, n).flatten(2).gather(2, top_idx)
+        names = factor_names or ["" for _ in range(f)]
+        name_l = [name.lower() for name in names]
+        spatial_l = [name.lower() for name in spatial_names]
+        device = patch_tokens_by_layer.device
+        traffic_mask = torch.tensor(
+            [("traffic_light" in name or "traffic_sign" in name) for name in name_l],
+            device=device,
+            dtype=torch.bool,
+        )
+        obstacle_mask = torch.tensor(
+            [("vehicle" in name or "pedestrian" in name or "rider" in name or "obstacle" in name) and "front" in spatial_l[i] for i, name in enumerate(name_l)],
+            device=device,
+            dtype=torch.bool,
+        )
+        left_mask = torch.tensor(["left_corridor" in spatial_l[i] for i in range(f)], device=device, dtype=torch.bool)
+        right_mask = torch.tensor(["right_corridor" in spatial_l[i] for i in range(f)], device=device, dtype=torch.bool)
+        upper_mask = torch.tensor(["upper" in spatial_l[i] for i in range(f)], device=device, dtype=torch.bool)
+        traffic_upper_mask = traffic_mask & upper_mask
+        red_idx = next((i for i, name in enumerate(name_l) if "traffic_light_red" in name), None)
+        green_idx = next((i for i, name in enumerate(name_l) if "traffic_light_green" in name), None)
+        if red_idx is not None and green_idx is not None:
+            red_green_contradiction = (factor_probs[:, red_idx] * factor_probs[:, green_idx]).mean()
+        else:
+            red_green_contradiction = factor_probs.new_tensor(0.0)
+        grounding_audit_stats = {
+            "traffic_control_upper_region_mass": self._masked_mean(top_region, traffic_upper_mask),
+            "obstacle_front_center_mass": self._masked_mean(top_region, obstacle_mask),
+            "left_lane_corridor_mass": self._masked_mean(top_region, left_mask),
+            "right_lane_corridor_mass": self._masked_mean(top_region, right_mask),
+            "prototype_assignment_entropy": entropy.mean(),
+            "red_green_contradiction": red_green_contradiction,
+            "left_right_mirror_mass_gap": (self._masked_mean(top_region, left_mask) - self._masked_mean(top_region, right_mask)).abs(),
+        }
         random_indices = []
         for factor_idx in range(f):
             prob = priors[factor_idx].view(1, n).expand(layers, n).reshape(layers * n).clamp_min(1e-6)
@@ -86,5 +131,6 @@ class TFCTopKFactorMeasurement(nn.Module):
             "random_indices": random_indices_t,
             "attention_entropy": entropy,
             "region_mass": top_region.mean(-1),
+            "grounding_audit_stats": grounding_audit_stats,
         }
 

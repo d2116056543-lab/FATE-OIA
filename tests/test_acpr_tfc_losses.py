@@ -1,6 +1,7 @@
 import torch
+import torch.nn.functional as F
 
-from fate_oia.losses.tfc_losses import factor_measurement_loss
+from fate_oia.losses.tfc_losses import factor_measurement_loss, reason_pu_asl_loss
 from fate_oia.models.tfc_target_credit import TFCTargetCredit
 
 
@@ -42,3 +43,22 @@ def test_target_credit_confidence_does_not_reward_all_on_factor_activation():
 
     assert all_on["credit_confidence_action"].max() <= one["credit_confidence_action"].max() * 1.25
     assert all_on["credit_confidence_reason"].max() <= one["credit_confidence_reason"].max() * 1.25
+
+
+def test_reason_pu_loss_adds_unknown_entropy_without_hard_negative_labels():
+    logits = torch.tensor([[0.0, 4.0, -4.0]], requires_grad=True)
+    targets = torch.tensor([[1.0, 0.0, 0.0]])
+    pu_state = {
+        "positive_mask": torch.tensor([[True, False, False]]),
+        "unknown_mask": torch.tensor([[False, True, False]]),
+        "soft_negative_weight": torch.zeros(1, 3),
+        "hard_negative_mask": torch.zeros(1, 3, dtype=torch.bool),
+    }
+
+    loss = reason_pu_asl_loss(logits, targets, pu_state, unknown_entropy_weight=0.25)
+    expected_entropy = F.binary_cross_entropy_with_logits(logits[:, 1], torch.sigmoid(logits[:, 1]).detach())
+
+    assert loss > expected_entropy * 0.20
+    loss.backward()
+    assert logits.grad is not None
+    assert logits.grad[0, 1].abs() > 0

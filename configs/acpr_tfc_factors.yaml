@@ -7,27 +7,27 @@ action_targets:
 reason_targets:
   count: 21
   aliases:
-    obstacle_front: 0
-    obstacle_car: 1
-    obstacle_pedestrian: 2
-    red_light: 3
-    green_light: 4
-    follow_traffic: 5
-    no_left_lane: 6
-    solid_line_left: 7
-    no_right_lane: 8
-    solid_line_right: 9
-    drivable_blocked: 10
-    lane_available_left: 11
-    lane_available_right: 12
-    clear_path: 13
-    bdd_oia_reason_14_unmapped: 14
-    bdd_oia_reason_15_unmapped: 15
-    bdd_oia_reason_16_unmapped: 16
-    bdd_oia_reason_17_unmapped: 17
-    bdd_oia_reason_18_unmapped: 18
-    bdd_oia_reason_19_unmapped: 19
-    bdd_oia_reason_20_unmapped: 20
+    green_light: 0
+    follow_traffic: 1
+    clear_path: 2
+    traffic_light_visible: 3
+    traffic_sign_visible: 4
+    obstacle_car: 5
+    obstacle_pedestrian: 6
+    obstacle_rider: 7
+    obstacle_other: 8
+    no_left_lane: 9
+    obstacle_left_lane: 10
+    solid_line_left: 11
+    left_turn_lane: 12
+    traffic_light_allows_left: 13
+    front_car_turning_left: 14
+    no_right_lane: 15
+    obstacle_right_lane: 16
+    solid_line_right: 17
+    right_turn_lane: 18
+    traffic_light_allows_right: 19
+    front_car_turning_right: 20
 factors:
   front_vehicle_close:
     entity: vehicle
@@ -38,7 +38,7 @@ factors:
     target_scope:
       action_support: [stop_slow]
       action_inhibit: [forward]
-      reason_support: [obstacle_car, obstacle_front]
+      reason_support: [obstacle_car]
   pedestrian_front:
     entity: pedestrian
     attribute: close
@@ -48,7 +48,27 @@ factors:
     target_scope:
       action_support: [stop_slow]
       action_inhibit: [forward]
-      reason_support: [obstacle_pedestrian, obstacle_front]
+      reason_support: [obstacle_pedestrian]
+  rider_front:
+    entity: rider
+    attribute: close
+    spatial: front_center
+    polarity: risk
+    region_prior: front_center
+    target_scope:
+      action_support: [stop_slow]
+      action_inhibit: [forward]
+      reason_support: [obstacle_rider]
+  obstacle_other_front:
+    entity: obstacle
+    attribute: close
+    spatial: front_center
+    polarity: risk
+    region_prior: front_center
+    target_scope:
+      action_support: [stop_slow]
+      action_inhibit: [forward]
+      reason_support: [obstacle_other]
   traffic_light_red:
     entity: traffic_light
     attribute: red
@@ -58,7 +78,7 @@ factors:
     target_scope:
       action_support: [stop_slow]
       action_inhibit: [forward]
-      reason_support: [red_light, follow_traffic]
+      reason_support: [traffic_light_visible, follow_traffic]
       factor_conflict: [traffic_light_green]
   traffic_light_green:
     entity: traffic_light
@@ -70,6 +90,33 @@ factors:
       action_support: [forward]
       reason_support: [green_light, follow_traffic]
       factor_conflict: [traffic_light_red]
+  traffic_sign_visible:
+    entity: traffic_sign
+    attribute: visible
+    spatial: upper_front
+    polarity: control
+    region_prior: upper_front
+    target_scope:
+      action_support: [stop_slow]
+      reason_support: [traffic_sign_visible, follow_traffic]
+  traffic_light_left_arrow:
+    entity: traffic_light
+    attribute: left_arrow
+    spatial: upper_front
+    polarity: turn_affordance
+    region_prior: upper_front
+    target_scope:
+      action_support: [turn_left]
+      reason_support: [traffic_light_allows_left, follow_traffic]
+  traffic_light_right_arrow:
+    entity: traffic_light
+    attribute: right_arrow
+    spatial: upper_front
+    polarity: turn_affordance
+    region_prior: upper_front
+    target_scope:
+      action_support: [turn_right]
+      reason_support: [traffic_light_allows_right, follow_traffic]
   lane_left_available:
     entity: lane
     attribute: available
@@ -78,9 +125,18 @@ factors:
     region_prior: left_corridor
     target_scope:
       action_support: [turn_left]
-      reason_support: [lane_available_left]
+      reason_support: [left_turn_lane]
       reason_conflict: [no_left_lane, solid_line_left]
       factor_conflict: [left_solid_boundary, lane_absent_left]
+  left_turn_lane:
+    entity: lane
+    attribute: turn_lane
+    spatial: left_corridor
+    polarity: affordance
+    region_prior: left_corridor
+    target_scope:
+      action_support: [turn_left]
+      reason_support: [left_turn_lane]
   left_solid_boundary:
     entity: lane_marking
     attribute: solid
@@ -101,6 +157,25 @@ factors:
       action_inhibit: [turn_left]
       reason_support: [no_left_lane]
       factor_conflict: [lane_left_available]
+  obstacle_left_lane:
+    entity: obstacle
+    attribute: occupied
+    spatial: left_corridor
+    polarity: risk
+    region_prior: left_corridor
+    target_scope:
+      action_inhibit: [turn_left]
+      reason_support: [obstacle_left_lane]
+      factor_conflict: [lane_left_available]
+  front_car_turning_left:
+    entity: vehicle
+    attribute: turning_left
+    spatial: front_center
+    polarity: interaction
+    region_prior: front_center
+    target_scope:
+      action_support: [stop_slow]
+      reason_support: [front_car_turning_left, obstacle_car]
   lane_right_available:
     entity: lane
     attribute: available
@@ -109,9 +184,18 @@ factors:
     region_prior: right_corridor
     target_scope:
       action_support: [turn_right]
-      reason_support: [lane_available_right]
+      reason_support: [right_turn_lane]
       reason_conflict: [no_right_lane, solid_line_right]
       factor_conflict: [right_solid_boundary, lane_absent_right]
+  right_turn_lane:
+    entity: lane
+    attribute: turn_lane
+    spatial: right_corridor
+    polarity: affordance
+    region_prior: right_corridor
+    target_scope:
+      action_support: [turn_right]
+      reason_support: [right_turn_lane]
   right_solid_boundary:
     entity: lane_marking
     attribute: solid
@@ -132,6 +216,25 @@ factors:
       action_inhibit: [turn_right]
       reason_support: [no_right_lane]
       factor_conflict: [lane_right_available]
+  obstacle_right_lane:
+    entity: obstacle
+    attribute: occupied
+    spatial: right_corridor
+    polarity: risk
+    region_prior: right_corridor
+    target_scope:
+      action_inhibit: [turn_right]
+      reason_support: [obstacle_right_lane]
+      factor_conflict: [lane_right_available]
+  front_car_turning_right:
+    entity: vehicle
+    attribute: turning_right
+    spatial: front_center
+    polarity: interaction
+    region_prior: front_center
+    target_scope:
+      action_support: [stop_slow]
+      reason_support: [front_car_turning_right, obstacle_car]
   blocked_drivable_center:
     entity: drivable_area
     attribute: blocked
@@ -141,7 +244,7 @@ factors:
     target_scope:
       action_support: [stop_slow]
       action_inhibit: [forward]
-      reason_support: [obstacle_front, drivable_blocked]
+      reason_support: [obstacle_other]
       factor_conflict: [drivable_center_clear]
   drivable_center_clear:
     entity: drivable_area

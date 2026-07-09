@@ -91,8 +91,9 @@ class ACPRTFCModel(nn.Module):
         lanes = self.lane_adapter(patch)
         proto = self.prototype_bank()
         spatial_names = [s.region_prior for s in self.factor_bank.specs]
-        meas_action = self.measure_action(lanes["patch_action"], proto["factor_queries"], spatial_names)
-        meas_reason = self.measure_reason(lanes["patch_reason"], proto["factor_queries"], spatial_names)
+        factor_names = self.factor_bank.names
+        meas_action = self.measure_action(lanes["patch_action"], proto["factor_queries"], spatial_names, factor_names=factor_names)
+        meas_reason = self.measure_reason(lanes["patch_reason"], proto["factor_queries"], spatial_names, factor_names=factor_names)
         action_visual = self.action_head.visual_logits_from_patch(lanes["patch_action"])
         reason_visual = self.reason_head.visual_logits_from_patch(lanes["patch_reason"])
         compat = self.factor_bank.compatibility_matrices()
@@ -155,6 +156,7 @@ class ACPRTFCModel(nn.Module):
             credit_action["credit_confidence_action"],
             deletion_stats_action,
             epoch,
+            action_targets=action_targets if split != "test" else None,
         )
         reason = self.reason_head(
             lanes["patch_reason"],
@@ -181,6 +183,8 @@ class ACPRTFCModel(nn.Module):
             "patch_reason": lanes["patch_reason"],
             "action_visual_logits": action["action_visual_logits"],
             "action_tfc_delta": action["action_tfc_delta"],
+            "action_rank_safety_mask": action["action_rank_safety_mask"],
+            "action_deploy_safety_mask": action["action_deploy_safety_mask"],
             "action_logits_base": action["action_logits"],
             "action_logits_deploy": cal["action_logits_deploy"],
             "reason_visual_logits": reason["reason_visual_logits"],
@@ -226,6 +230,14 @@ class ACPRTFCModel(nn.Module):
                     1.0 if self.same_region_background.lower() == "ema" else 0.0,
                     device=images.device,
                 ),
+                "traffic_control_upper_region_mass_action": meas_action["grounding_audit_stats"]["traffic_control_upper_region_mass"],
+                "obstacle_front_center_mass_action": meas_action["grounding_audit_stats"]["obstacle_front_center_mass"],
+                "left_lane_corridor_mass_action": meas_action["grounding_audit_stats"]["left_lane_corridor_mass"],
+                "right_lane_corridor_mass_action": meas_action["grounding_audit_stats"]["right_lane_corridor_mass"],
+                "traffic_control_upper_region_mass_reason": meas_reason["grounding_audit_stats"]["traffic_control_upper_region_mass"],
+                "obstacle_front_center_mass_reason": meas_reason["grounding_audit_stats"]["obstacle_front_center_mass"],
+                "left_lane_corridor_mass_reason": meas_reason["grounding_audit_stats"]["left_lane_corridor_mass"],
+                "right_lane_corridor_mass_reason": meas_reason["grounding_audit_stats"]["right_lane_corridor_mass"],
             },
             "topk_indices_action": meas_action["topk_indices"],
             "topk_indices_reason": meas_reason["topk_indices"],

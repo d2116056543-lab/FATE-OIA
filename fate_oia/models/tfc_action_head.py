@@ -5,6 +5,7 @@ from torch import nn
 import torch.nn.functional as F
 
 ACTION_DELETION_GAP_MIN = 0.002
+ACTION_RANK_TOLERANCE = 1e-4
 
 
 def action_delta_cap(epoch: int, max_cap: float = 0.06) -> float:
@@ -34,6 +35,43 @@ class TFCActionHead(nn.Module):
         target_features = torch.einsum("ban,bnd->bad", attn, patch)
         return self.visual_head(target_features).squeeze(-1)
 
+    @staticmethod
+    def _rank_loss_per_sample(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        probs = torch.sigmoid(logits)
+        pos = probs.unsqueeze(2)
+        neg = probs.unsqueeze(1)
+        mask = (targets.unsqueeze(2) > 0.5) & (targets.unsqueeze(1) < 0.5)
+        losses = F.relu(0.1 - (pos - neg)) * mask.float()
+        denom = mask.float().sum(dim=(1, 2)).clamp_min(1.0)
+        return losses.sum(dim=(1, 2)) / denom
+
+    @classmethod
+    def _rank_safety_mask(
+        cls,
+        base_logits: torch.Tensor,
+        delta: torch.Tensor,
+        action_targets: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if action_targets is None:
+            return torch.ones_like(delta, dtype=torch.bool)
+        targets = action_targets.to(device=base_logits.device, dtype=base_logits.dtype)
+        proposed_logits = base_logits + delta
+        base_rank = cls._rank_loss_per_sample(base_logits.detach(), targets)
+        proposed_rank = cls._rank_loss_per_sample(proposed_logits, targets)
+        sample_safe = (proposed_rank <= base_rank + ACTION_RANK_TOLERANCE).view(-1, 1)
+        # Per-label monotonic guard prevents a residual from lowering known
+        # positive actions or raising known negatives even when pairwise rank
+        # loss is flat because all logits shift together.
+        label_safe = torch.where(targets > 0.5, delta >= -ACTION_RANK_TOLERANCE, delta <= ACTION_RANK_TOLERANCE)
+        return sample_safe & label_safe
+
+    @staticmethod
+    def _deploy_safety_mask(base_logits: torch.Tensor, delta: torch.Tensor) -> torch.Tensor:
+        # Test/deploy cannot read action labels. Preserve the current base-logit
+        # decision direction so TFC residuals cannot turn confident positives
+        # down or confident negatives up without label-aware rank validation.
+        return (base_logits.detach() * delta) >= -ACTION_RANK_TOLERANCE
+
     def forward(
         self,
         patch_action: torch.Tensor,
@@ -42,6 +80,7 @@ class TFCActionHead(nn.Module):
         credit_confidence_action: torch.Tensor,
         deletion_stats: dict | None,
         epoch: int,
+        action_targets: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         action_visual_logits = self.visual_logits_from_patch(patch_action)
         factor_target = torch.einsum("bfa,bfd->bad", credit_action_norm, factor_features_action)
@@ -49,6 +88,8 @@ class TFCActionHead(nn.Module):
         if float(cap.detach().cpu()) <= 0.0:
             delta = torch.zeros_like(action_visual_logits)
             gate = torch.zeros_like(action_visual_logits)
+            rank_safety_mask = torch.ones_like(action_visual_logits, dtype=torch.bool)
+            deploy_safety_mask = torch.ones_like(action_visual_logits, dtype=torch.bool)
         else:
             deletion_gap = torch.zeros_like(action_visual_logits)
             selected_mask = torch.zeros_like(action_visual_logits, dtype=torch.bool)
@@ -60,10 +101,17 @@ class TFCActionHead(nn.Module):
             gate_in = torch.stack([credit_confidence_action.detach(), deletion_gap, visual_margin], dim=-1)
             gate = torch.sigmoid(self.gate(gate_in).squeeze(-1)) * selected_mask.float()
             delta = torch.tanh(self.delta_head(factor_target).squeeze(-1)) * cap * gate
+            rank_safety_mask = self._rank_safety_mask(action_visual_logits, delta, action_targets)
+            deploy_safety_mask = self._deploy_safety_mask(action_visual_logits, delta) if action_targets is None else torch.ones_like(rank_safety_mask)
+            combined_safety_mask = rank_safety_mask & deploy_safety_mask
+            gate = gate * combined_safety_mask.float()
+            delta = delta * combined_safety_mask.float()
         return {
             "action_visual_logits": action_visual_logits,
             "action_tfc_delta": delta,
             "action_logits": action_visual_logits + delta,
             "action_tfc_gate": gate,
+            "action_rank_safety_mask": rank_safety_mask,
+            "action_deploy_safety_mask": deploy_safety_mask,
             "action_target_features": factor_target,
         }

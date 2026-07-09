@@ -16,6 +16,16 @@ def test_tfc_factor_bank_contract():
     assert mats["native_similarity"].isfinite().all()
     assert bank.reason_alias_coverage.sum().item() == 21
     assert set(bank.reason_aliases.values()) == set(range(21))
+    assert not any("unmapped" in name for name in bank.reason_aliases)
+    semantic_factor_names = set(bank.names)
+    for required in [
+        "front_car_turning_left",
+        "front_car_turning_right",
+        "traffic_sign_visible",
+        "obstacle_left_lane",
+        "obstacle_right_lane",
+    ]:
+        assert required in semantic_factor_names
 
 
 def test_tfc_factor_bank_rejects_invalid_target_indices(tmp_path):
@@ -45,7 +55,7 @@ def test_tfc_factor_bank_rejects_incomplete_reason_alias_coverage(tmp_path):
     with open("configs/acpr_tfc_factors.yaml", "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
     bad = copy.deepcopy(cfg)
-    bad["reason_targets"]["aliases"].pop("bdd_oia_reason_20_unmapped")
+    bad["reason_targets"]["aliases"].pop("front_car_turning_right")
     path = tmp_path / "bad_reason_aliases.yaml"
     path.write_text(yaml.safe_dump(bad), encoding="utf-8")
     with pytest.raises(ValueError, match="reason_targets aliases must cover all"):
