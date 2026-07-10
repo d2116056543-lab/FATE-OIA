@@ -1,0 +1,36 @@
+action_dim: 4
+reason_dim: 21
+actions:
+  - {index: 0, name: forward, aliases: [move_forward, go], group: motion}
+  - {index: 1, name: stop, aliases: [slow_down, halt], group: motion}
+  - {index: 2, name: left, aliases: [turn_left, merge_left], group: lateral}
+  - {index: 3, name: right, aliases: [turn_right, merge_right], group: lateral}
+reasons:
+  - {index: 0, name: "Traffic light is green"}
+  - {index: 1, name: "Follow traffic"}
+  - {index: 2, name: "Road is clear"}
+  - {index: 3, name: "Traffic light"}
+  - {index: 4, name: "Traffic sign"}
+  - {index: 5, name: "Obstacle: car"}
+  - {index: 6, name: "Obstacle: person"}
+  - {index: 7, name: "Obstacle: rider"}
+  - {index: 8, name: "Obstacle: others"}
+  - {index: 9, name: "No lane on the left"}
+  - {index: 10, name: "Obstacles on the left lane"}
+  - {index: 11, name: "Solid line on the left"}
+  - {index: 12, name: "On the left-turn lane"}
+  - {index: 13, name: "Traffic light allows left"}
+  - {index: 14, name: "Front car turning left"}
+  - {index: 15, name: "No lane on the right"}
+  - {index: 16, name: "Obstacles on the right lane"}
+  - {index: 17, name: "Solid line on the right"}
+  - {index: 18, name: "On the right-turn lane"}
+  - {index: 19, name: "Traffic light allows right"}
+  - {index: 20, name: "Front car turning right"}
+reason_semantics:
+  semantic_source: official_cvpr2020_table1_category_order
+  raw_json_contains_names: false
+  official_mapping_verified: true
+  training_role: canonical_index_semantics_and_weak_factor_config
+  source_file: configs/bdd_oia_reason_names_cvpr2020_table1.yaml
+  source_sha256: DCB3B28E7FCA784953CC01BC7406B4D74CAE288AADD95215029CA8294065AD24

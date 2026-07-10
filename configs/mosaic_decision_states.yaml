@@ -1,0 +1,33 @@
+states:
+  front_risk:
+    required_groups:
+      - any_of: [front_vehicle_near, pedestrian_front_visible, rider_front_visible, center_corridor_occupied]
+    veto: []
+  stop_obligation:
+    required_groups:
+      - any_of: [red_light_visible, front_risk]
+    veto: []
+  forward_feasible:
+    required_groups:
+      - any_of: [center_drivable_visible]
+    veto: [stop_obligation]
+  lane_follow_permitted:
+    required_groups:
+      - any_of: [center_drivable_visible, left_lane_marking_visible, right_lane_marking_visible]
+    veto: [center_corridor_occupied]
+  left_affordance:
+    required_groups:
+      - any_of: [left_drivable_visible, left_turn_marking_visible]
+    veto: [left_corridor_occupied]
+  left_veto:
+    required_groups:
+      - any_of: [left_solid_boundary_visible, left_obstacle_visible, left_corridor_occupied]
+    veto: []
+  right_affordance:
+    required_groups:
+      - any_of: [right_drivable_visible, right_turn_marking_visible]
+    veto: [right_corridor_occupied]
+  right_veto:
+    required_groups:
+      - any_of: [right_solid_boundary_visible, right_obstacle_visible, right_corridor_occupied]
+    veto: []
