@@ -55,9 +55,12 @@ def test_runtime_profiler_measures_loader_and_cuda_timing_after_warmup() -> None
     assert "dataloader_load_time_sec" in run_source
     assert "device_step_time_sec" in run_source
     assert "dataloader_stalls" in run_source
+    assert "max_dataloader_load_sec" in run_source
+    assert "dataloader_stall_steps" in run_source
     assert "median_step_sec" in run_source and "p95_step_sec" in run_source
     assert "median_step_ms" in run_source and "p95_step_ms" in run_source
     assert "cuda_retries" in run_source and "nan_count" in run_source
     assert "warmup_steps=warmup_steps" in profile_source
+    assert "write_json(output, failure_payload)" in profile_source
     train_source = inspect.getsource(__import__("fate_oia.engine.train_acpr_mosaic_ad", fromlist=["train_representation_epoch"]).train_representation_epoch)
     assert "torch.cuda.Event" in train_source

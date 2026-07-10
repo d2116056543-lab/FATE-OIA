@@ -117,6 +117,7 @@ def _run_steps(
     timed_rows = rows["loss_components.jsonl"][warmup_steps:]
     device_times = [float(row["device_step_time_sec"]) for row in timed_rows]
     load_times = [float(row["dataloader_load_time_sec"]) for row in timed_rows]
+    stall_rows = [row for row in timed_rows if bool(row["dataloader_stall"])]
     host_compute_times = [float(row["step_time_sec"]) for row in timed_rows]
     step_times = [host + load for host, load in zip(host_compute_times, load_times)]
     sorted_times = sorted(step_times)
@@ -138,7 +139,9 @@ def _run_steps(
         "p95_device_step_sec": float(sorted(device_times)[percentile_index]),
         "median_dataloader_load_sec": float(statistics.median(load_times)),
         "p95_dataloader_load_sec": float(sorted(load_times)[percentile_index]),
-        "dataloader_stalls": sum(bool(row["dataloader_stall"]) for row in timed_rows),
+        "max_dataloader_load_sec": float(max(load_times)),
+        "dataloader_stalls": len(stall_rows),
+        "dataloader_stall_steps": [int(row["step"]) for row in stall_rows],
         "max_allocated_gb": torch.cuda.max_memory_allocated(device) / 2**30 if device.type == "cuda" else 0.0,
         "max_reserved_gb": torch.cuda.max_memory_reserved(device) / 2**30 if device.type == "cuda" else 0.0,
         "allocation_retries": cuda_retries,
@@ -236,6 +239,24 @@ def profile(config_path: str, output: str, *, device_name: str, quick: bool = Fa
             **stability_metrics,
         }
         if not stability["pass"]:
+            failure_payload = {
+                "pass": False,
+                "quick_diagnostic": False,
+                "phase_d_full_path": True,
+                "selection_rule": "max_samples_per_sec_subject_to_reserved_le_43gb",
+                "selected": {
+                    "batch_size": selected["batch_size"],
+                    "grad_accum": selected["grad_accum"],
+                    "effective_batch": selected["effective_batch"],
+                    "num_workers": selected["num_workers"],
+                    "samples_per_sec": selected["samples_per_sec"],
+                    "max_reserved_gb": selected["max_reserved_gb"],
+                },
+                "candidates": results,
+                "stability_probe": stability,
+                "failure_reason": "selected_runtime_failed_stability_probe",
+            }
+            write_json(output, failure_payload)
             raise RuntimeError(f"selected MOSAIC runtime failed stability probe: {stability}")
     payload = {
         "pass": not quick,
