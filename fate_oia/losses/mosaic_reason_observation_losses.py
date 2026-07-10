@@ -66,8 +66,9 @@ def build_mosaic_reason_loss(
         raise ValueError("M-step posterior target must be detached")
 
     observed = observed_reason_targets.to(dtype=reason_logits_latent.dtype)
-    observation_nll = F.binary_cross_entropy(
-        observation_probability.clamp(1e-7, 1.0 - 1e-7), observed
+    observation_probability_fp32 = observation_probability.float().clamp(1e-7, 1.0 - 1e-7)
+    observation_nll = F.binary_cross_entropy_with_logits(
+        torch.logit(observation_probability_fp32), observed.float()
     )
     posterior_bce = F.binary_cross_entropy_with_logits(reason_logits_latent, posterior_detached)
     if rank_loss is None:

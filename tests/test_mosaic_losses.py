@@ -13,6 +13,13 @@ from fate_oia.losses.mosaic_reason_observation_losses import build_mosaic_reason
 from fate_oia.losses.mosaic_state_losses import build_mosaic_state_loss
 
 
+def test_formal_mosaic_losses_do_not_use_autocast_unsafe_probability_bce() -> None:
+    root = __import__("pathlib").Path(__file__).resolve().parents[1] / "fate_oia" / "losses"
+    for path in root.glob("mosaic_*.py"):
+        source = path.read_text(encoding="utf-8")
+        assert "F.binary_cross_entropy(" not in source, path.name
+
+
 def test_action_asl_is_the_true_clipped_asymmetric_formula_not_plain_bce() -> None:
     logits = torch.tensor([[2.0, -1.0]])
     targets = torch.tensor([[1.0, 0.0]])
