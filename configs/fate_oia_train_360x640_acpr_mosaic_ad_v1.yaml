@@ -1,0 +1,167 @@
+experiment:
+  name: acpr_mosaic_ad_v1
+  direct_image: true
+  initialization: public_dino_vits8_teacher_only
+  no_metric_early_stop: true
+  eval_splits: [test]
+  best_selection_split: test
+  best_selection_metric: deploy_fixed_joint
+
+data:
+  data_root: E:\sbw\BDD-OIA\data
+  raw_root: E:\sbw\BDD-OIA
+  bdd100k_root: E:\sbw\BDD100K
+  image_height: 360
+  image_width: 640
+  patch_size: 8
+  action_dim: 4
+  reason_dim: 21
+  train_calib_fraction: 0.10
+  train_calib_seed: 20260710
+  train_calib_min_positive_per_label: 20
+  num_workers_candidates: [2, 4, 0]
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+
+backbone:
+  arch: vit_small
+  patch_size: 8
+  selected_layers: [3, 7, 11]
+  pretrained_weights: E:\sbw\SNNA_repro\SNNA\ckp\reference\dino_deitsmall8_pretrain.pth
+  checkpoint_key: teacher
+  freeze_backbone: true
+  no_grad_backbone: true
+  feature_cache: false
+  token_compression: none
+
+model:
+  formal_class: MOSAICADModel
+  dim: 384
+  decoder_layers: 2
+  self_attention_heads: 4
+  highres_topk: 256
+  midres_topk: 128
+  anchors_per_factor: 2
+  typed_attention_heads: 4
+  point_samples: 8
+  curve_samples: 12
+  region_samples: 12
+  spatial_prior_scale_init: 0.05
+  spatial_prior_scale_max: 0.20
+  spatial_prior_dropout: 0.50
+  content_temperature_init: 0.07
+  action_state_gate_cap_max: 0.25
+  state_residual_cap: 0.20
+  reason_state_contribution_cap_max: 0.20
+
+selective_observation:
+  pi_min: 0.20
+  pi_max: 0.95
+  false_positive_max: 0.05
+  group_names: [traffic_control, obstacle, lane, other]
+  synthetic_missing_positive_fraction: 0.20
+  posterior_queue_size: 2048
+
+loss:
+  action:
+    gamma_pos: 0.0
+    gamma_neg: 4.0
+    clip: 0.05
+    rank_weight: 0.10
+    cardinality_weight: 0.02
+  factor:
+    geometry_mask_weight: 0.10
+    view_consistency_weight: 0.05
+    flip_equivariance_weight: 0.05
+    prototype_occupancy_weight: 0.02
+    prototype_repulsion_weight: 0.01
+    prior_scale_weight: 0.01
+    contradiction_weight: 0.02
+  state:
+    sparsity_weight: 0.02
+    residual_weight: 0.02
+    uncertainty_weight: 0.02
+  reason:
+    posterior_bce_weight: 0.30
+    posterior_rank_weight: 0.08
+    missing_recovery_weight: 0.10
+    latent_rate_range_weight: 0.03
+    propensity_regularization_weight: 0.01
+
+optimizer:
+  name: AdamW
+  fused_when_supported: true
+  weight_decay: 0.05
+  grad_clip: 1.0
+  scheduler: warmup_cosine
+  warmup_epochs: 1
+  min_lr_ratio: 0.05
+  aux_shared_lambda_max: 0.25
+  action_anchor_kappa: 0.70
+  lr:
+    visual_pyramid: 0.00010
+    action_adapter: 0.00015
+    reason_adapter: 0.00015
+    factor_measurement: 0.00020
+    prototypes: 0.00010
+    state_composer: 0.00020
+    action_decoder: 0.00020
+    reason_decoder: 0.00020
+    propensity: 0.00010
+    threshold: 0.00050
+
+training:
+  epochs: 15
+  bf16: true
+  tf32: true
+  torch_compile: false
+  no_metric_early_stop: true
+  print_every: 200
+  factor_audit_epochs: [5, 8, 11]
+  factor_audit_samples: 128
+  runtime_candidates:
+    - {batch_size: 8, grad_accum: 4, effective_batch: 32}
+    - {batch_size: 6, grad_accum: 5, effective_batch: 30}
+    - {batch_size: 5, grad_accum: 6, effective_batch: 30}
+    - {batch_size: 4, grad_accum: 8, effective_batch: 32}
+  max_reserved_vram_gb: 43.0
+
+calibration:
+  enabled: true
+  steps_per_epoch: 100
+  batch_size: 256
+  surrogate_temperature: 0.20
+  soft_f1_weight: 1.00
+  bce_weight: 0.05
+  rate_weight: 0.02
+  delta_weight: 0.01
+  cardinality_weight: 0.02
+  label_delta_max: 1.0
+  groups: [actions, common_reasons, tail_reasons]
+  tail_reason_indices: [12, 9, 5, 14, 6, 11, 10, 13]
+  train_calib_only: true
+  representation_frozen: true
+  deploy_equation: raw_minus_theta
+  test_oracle_diagnostic_only: true
+
+evaluation:
+  eval_splits: [test]
+  eval_every_epoch: true
+  best_selection_split: test
+  best_selection_metric: deploy_fixed_joint
+  threshold: 0.5
+  report_raw: true
+  report_deploy_fixed: true
+  report_train_calib_teacher_diagnostic: true
+  report_test_oracle_diagnostic: true
+
+runtime:
+  foreground_only: true
+  no_feature_cache: true
+  require_no_token_compression: true
+  require_runtime_selection: true
+  runtime_selection_path: .review/mosaic_runtime_selection.json
+  warmup_profile_steps: 20
+  timed_profile_steps: 100
+  dataloader_stability_minutes: 15
