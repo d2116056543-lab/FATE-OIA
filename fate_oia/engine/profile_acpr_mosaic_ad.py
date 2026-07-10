@@ -225,6 +225,7 @@ def profile(config_path: str, output: str, *, device_name: str, quick: bool = Fa
             grad_accum=int(selected["grad_accum"]),
             num_workers=int(selected["num_workers"]),
             steps=stability_steps,
+            warmup_steps=warmup_steps,
         )
         actual_seconds = time.perf_counter() - stability_start
         stability = {
