@@ -117,8 +117,9 @@ def build_mosaic_factor_loss(
     geometry_factor_valid = observations["geometry_mask_valid"] > 0
     geometry_valid = geometry_factor_valid[..., None, None].expand_as(soft_masks)
     geometry_reliability = source_reliability[..., None, None].expand_as(soft_masks)
-    geometry_values = F.binary_cross_entropy(
-        soft_masks.clamp(1e-6, 1.0 - 1e-6), geometry_target, reduction="none"
+    geometry_probability_fp32 = soft_masks.float().clamp(1e-6, 1.0 - 1e-6)
+    geometry_values = F.binary_cross_entropy_with_logits(
+        torch.logit(geometry_probability_fp32), geometry_target.float(), reduction="none"
     )
     loss_geometry, _ = _masked_mean(
         geometry_values, geometry_valid, reliability=geometry_reliability
