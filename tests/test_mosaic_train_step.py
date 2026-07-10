@@ -21,6 +21,16 @@ from fate_oia.optim.mosaic_action_anchor import MOSAICActionAnchoredGradient
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _contains_tensor(value) -> bool:
+    if isinstance(value, torch.Tensor):
+        return True
+    if isinstance(value, dict):
+        return any(_contains_tensor(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_tensor(item) for item in value)
+    return False
+
+
 class _NoGroundingIndex:
     def lookup(self, _file_name):
         return SimpleNamespace(label_json=None, drivable_map=None)
@@ -79,6 +89,7 @@ def test_one_batch_phase_a_training_executes_the_real_integrated_path(tmp_path) 
     assert rows["loss_components.jsonl"]
     assert rows["factor_grounding_stats.jsonl"]
     assert rows["posterior_recovery_stats.jsonl"][-1]["summary"] is True
+    assert not _contains_tensor(rows)
 
 
 def test_one_batch_phase_d_executes_posterior_and_action_anchor() -> None:
@@ -113,3 +124,4 @@ def test_one_batch_phase_d_executes_posterior_and_action_anchor() -> None:
     assert rows["action_anchor_stats.jsonl"][0]["constraint_pass"]
     assert rows["posterior_recovery_stats.jsonl"][-1]["hidden_positive_count"] == 1
     assert rows["selective_observation_stats.jsonl"][0]["posterior_available"] is True
+    assert not _contains_tensor(rows)

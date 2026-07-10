@@ -288,6 +288,18 @@ def _loader(
     return DataLoader(dataset, **kwargs)
 
 
+def _detach_artifact_value(value: Any) -> Any:
+    """Detach per-step diagnostics immediately so epoch logs cannot retain autograd graphs."""
+    if isinstance(value, torch.Tensor):
+        detached = value.detach().cpu()
+        return detached.item() if detached.numel() == 1 else detached.tolist()
+    if isinstance(value, dict):
+        return {str(key): _detach_artifact_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_detach_artifact_value(item) for item in value]
+    return value
+
+
 def _sample_multilabel_vector(sample: Any) -> tuple[int, ...]:
     action = sample["action"] if isinstance(sample, dict) else sample.action
     reason = sample["reason"] if isinstance(sample, dict) else sample.reason
@@ -715,6 +727,7 @@ def train_representation_epoch(
     recovery_targets: list[torch.Tensor] = []
     iterator = iter(loader)
     for step in range(len(loader)):
+        row_offsets = {name: len(values) for name, values in rows.items()}
         load_started = time.perf_counter()
         batch = next(iterator)
         load_time_sec = time.perf_counter() - load_started
@@ -940,6 +953,11 @@ def train_representation_epoch(
                 "source_coverage_rate": (observations["source_code"] > 0).float().mean(),
             }
         )
+        for name, offset in row_offsets.items():
+            if len(rows[name]) > offset:
+                rows[name][offset:] = [
+                    _detach_artifact_value(row) for row in rows[name][offset:]
+                ]
         if step % int(config["training"].get("print_every", 200)) == 0:
             payload = {
                 "event": "mosaic_batch", "epoch": epoch, "phase": controls.phase,
