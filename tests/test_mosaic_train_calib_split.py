@@ -7,6 +7,10 @@ from pathlib import Path
 import pytest
 
 from fate_oia.datasets.mosaic_train_calib_split import (
+    _canonical_json_bytes,
+    _repair_coverage_with_milp,
+    _split_payload,
+    _stable_rank,
     make_multilabel_train_calib_indices,
     verify_train_calib_split_artifacts,
 )
@@ -38,6 +42,21 @@ class _WrongLengthDataset(_MetadataOnlyDataset):
         return len(self.samples) + 1
 
 
+class _SubsetLike:
+    def __init__(self, dataset: _MetadataOnlyDataset, indices: list[object]) -> None:
+        self.dataset = dataset
+        self.indices = indices
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+
+class _ShadowSamplesSubset(_SubsetLike):
+    def __init__(self, dataset: _MetadataOnlyDataset, indices: list[object], samples: list[_Sample]) -> None:
+        super().__init__(dataset, indices)
+        self.samples = samples
+
+
 def _dataset(count: int = 300, order: list[int] | None = None) -> _MetadataOnlyDataset:
     samples: list[_Sample] = []
     for index in range(count):
@@ -53,6 +72,22 @@ def _dataset(count: int = 300, order: list[int] | None = None) -> _MetadataOnlyD
         samples.append(_Sample("train", f"clip_{index:04d}.jpg", tuple(action), tuple(reason)))
     if order is not None:
         samples = [samples[index] for index in order]
+    return _MetadataOnlyDataset(samples)
+
+
+def _coverage_trap_dataset() -> _MetadataOnlyDataset:
+    samples: list[_Sample] = []
+    patterns = [([0, 1, 2], 20), ([3, 4, 5], 20), ([0, 1, 3, 4], 20), ([], 340)]
+    sample_id = 0
+    for positive_labels, count in patterns:
+        for _ in range(count):
+            flat = [0.0] * 25
+            for label in positive_labels:
+                flat[label] = 1.0
+            samples.append(
+                _Sample("train", f"trap_{sample_id:04d}.jpg", tuple(flat[:4]), tuple(flat[4:]))
+            )
+            sample_id += 1
     return _MetadataOnlyDataset(samples)
 
 
@@ -168,4 +203,121 @@ def test_split_hash_binds_per_label_stats(tmp_path: Path) -> None:
     stats["all_targets_met"] = False
     stats_path.write_text(json.dumps(stats), encoding="utf-8")
     with pytest.raises(ValueError, match="split stats hash mismatch"):
+        verify_train_calib_split_artifacts(tmp_path, dataset)
+
+
+def test_split_uses_exact_feasibility_repair_when_greedy_misses_targets(tmp_path: Path) -> None:
+    dataset = _coverage_trap_dataset()
+    _, calib = make_multilabel_train_calib_indices(dataset, output_dir=tmp_path)
+    counts = [sum((dataset.samples[index].action + dataset.samples[index].reason)[label] for index in calib) for label in range(6)]
+    assert counts == [20, 20, 20, 20, 20, 20]
+    stats = json.loads((tmp_path / "train_calib_split_stats.json").read_text(encoding="utf-8"))
+    assert stats["all_targets_met"] is True
+    assert stats["coverage_solver"] == "scipy_milp_exact_repair"
+
+
+def test_artifact_verifier_rejects_test_split_relabeling(tmp_path: Path) -> None:
+    dataset = _dataset()
+    make_multilabel_train_calib_indices(dataset, output_dir=tmp_path)
+    original = dataset.samples[0]
+    dataset.samples[0] = _Sample("test", original.file_name, original.action, original.reason)
+    with pytest.raises(ValueError, match="train samples only"):
+        verify_train_calib_split_artifacts(tmp_path, dataset)
+
+
+def test_split_protocol_constants_are_not_user_overridable() -> None:
+    dataset = _dataset()
+    with pytest.raises(ValueError, match="protocol requires calib_fraction=0.10"):
+        make_multilabel_train_calib_indices(dataset, calib_fraction=0.2)
+    with pytest.raises(ValueError, match="protocol requires seed=20260710"):
+        make_multilabel_train_calib_indices(dataset, seed=7)
+    with pytest.raises(ValueError, match="protocol requires min_calib_positives=20"):
+        make_multilabel_train_calib_indices(dataset, min_calib_positives=5)
+
+
+def test_verifier_binds_protocol_fields_in_hash_record(tmp_path: Path) -> None:
+    dataset = _dataset()
+    make_multilabel_train_calib_indices(dataset, output_dir=tmp_path)
+    record_path = tmp_path / "train_calib_split_hash.json"
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    record["seed"] = 7
+    record["calib_fraction"] = 0.2
+    record_path.write_text(json.dumps(record), encoding="utf-8")
+    with pytest.raises(ValueError, match="split hash metadata mismatch"):
+        verify_train_calib_split_artifacts(tmp_path, dataset)
+
+
+def test_subset_indices_require_exact_non_negative_integers() -> None:
+    base = _dataset()
+    with pytest.raises(ValueError, match="subset indices must be exact non-negative integers"):
+        make_multilabel_train_calib_indices(_SubsetLike(base, [0, 1.0, 2]))
+    with pytest.raises(ValueError, match="subset indices must be exact non-negative integers"):
+        make_multilabel_train_calib_indices(_SubsetLike(base, [0, -1, 2]))
+
+
+def test_subset_metadata_cannot_be_shadowed_to_bypass_real_indices() -> None:
+    base = _dataset()
+    leaked = base.samples[0]
+    base.samples[0] = _Sample("test", leaked.file_name, leaked.action, leaked.reason)
+    shadow = _dataset().samples
+    with pytest.raises(ValueError, match="train samples only"):
+        make_multilabel_train_calib_indices(_ShadowSamplesSubset(base, list(range(len(base))), shadow))
+
+
+def test_exact_repair_is_file_name_deterministic_across_input_orders() -> None:
+    names = ["a.jpg", "b.jpg", "c.jpg", "d.jpg"]
+    labels = [
+        tuple([1, 0, 1, 0] + [0] * 21),
+        tuple([1, 0, 0, 1] + [0] * 21),
+        tuple([0, 1, 1, 0] + [0] * 21),
+        tuple([0, 1, 0, 1] + [0] * 21),
+    ]
+    selected_name_sets: set[tuple[str, ...]] = set()
+    for order in ([0, 1, 2, 3], [3, 2, 1, 0], [1, 3, 0, 2], [2, 0, 3, 1]):
+        ordered_names = [names[index] for index in order]
+        ordered_labels = [labels[index] for index in order]
+        selected, status = _repair_coverage_with_milp(
+            labels=ordered_labels,
+            targets=[1, 1, 1, 1] + [0] * 21,
+            calib_count=2,
+            greedy_selected=[ordered_names.index("a.jpg"), ordered_names.index("b.jpg")],
+            ranks=[_stable_rank(20260710, name) for name in ordered_names],
+            file_names=ordered_names,
+        )
+        assert selected is not None and status == "scipy_milp_exact_repair"
+        selected_name_sets.add(tuple(sorted(ordered_names[index] for index in selected)))
+    assert len(selected_name_sets) == 1
+
+
+def test_verifier_recomputes_deterministic_partition_not_only_self_consistent_hashes(tmp_path: Path) -> None:
+    dataset = _dataset()
+    make_multilabel_train_calib_indices(dataset, output_dir=tmp_path)
+    original_calib = json.loads((tmp_path / "train_calib_indices.json").read_text(encoding="utf-8"))
+    replacement_calib = list(range(len(original_calib)))
+    assert replacement_calib != original_calib
+    replacement_main = [index for index in range(len(dataset)) if index not in set(replacement_calib)]
+    (tmp_path / "train_main_indices.json").write_text(json.dumps(replacement_main), encoding="utf-8")
+    (tmp_path / "train_calib_indices.json").write_text(json.dumps(replacement_calib), encoding="utf-8")
+
+    stats = json.loads((tmp_path / "train_calib_split_stats.json").read_text(encoding="utf-8"))
+    record_path = tmp_path / "train_calib_split_hash.json"
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    file_names = [sample.file_name for sample in dataset.samples]
+    labels = [tuple(int(value) for value in sample.action + sample.reason) for sample in dataset.samples]
+    payload = _split_payload(
+        seed=20260710,
+        calib_fraction=0.10,
+        file_names=file_names,
+        label_sha256=record["label_sha256"],
+        min_calib_positives=20,
+        main_indices=replacement_main,
+        calib_indices=replacement_calib,
+    )
+    import hashlib
+
+    record["split_sha256"] = hashlib.sha256(_canonical_json_bytes(payload)).hexdigest().upper()
+    record["stats_sha256"] = hashlib.sha256(_canonical_json_bytes(stats)).hexdigest().upper()
+    record_path.write_text(json.dumps(record), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="deterministic protocol partition"):
         verify_train_calib_split_artifacts(tmp_path, dataset)

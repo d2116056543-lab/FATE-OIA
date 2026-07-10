@@ -6,10 +6,20 @@ from pathlib import Path
 import pytest
 import yaml
 
+from fate_oia.engine import audit_acpr_mosaic_ad as implementation_audit
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SKILL_PATH = REPO_ROOT / ".codex" / "skills" / "acpr-mosaic-ad-implementation-audit" / "SKILL.md"
 EXPECTED_BODY_SHA256 = "912955363D8302ABE67CCF6A248B56473B311636021E734D2E1212D9241D8072"
+
+
+def test_required_files_gate_returns_a_real_complete_result() -> None:
+    result = implementation_audit._required_files_gate(REPO_ROOT)
+    assert isinstance(result, dict)
+    assert result["pass"] is True
+    assert result["missing_files"] == []
+    assert result["missing_tests"] == []
 
 
 def _split_skill(text: str) -> tuple[str, str]:

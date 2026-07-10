@@ -68,6 +68,8 @@ _EXPECTED_REASON_PAPER_URL = (
     "Xu_Explainable_Object-Induced_Action_Decision_for_Autonomous_Vehicles_CVPR_2020_paper.pdf"
 )
 _EXPECTED_FACTOR_SCHEMA_SHA256 = "A0B95058D79DEC40005B914E0281E9CAB49BCAEBEA0871AEE8A3F48D0578422F"
+_EXPECTED_STATE_SCHEMA_SHA256 = "CCE45554D990858AAE10FA2BC89314DF2B56046822D4CDD90E47E88C0F6078F9"
+_EXPECTED_REASON_OBSERVATION_SHA256 = "820F7F4A6C7C02C69FC5E0F383FE83C93D93D1AE4C3CCF50BCE71B31D7D06A50"
 _EXPECTED_ACTION_NAMES = ("forward", "stop", "left", "right")
 _EXPECTED_REASON_NAMES = (
     "Traffic light is green",
@@ -313,6 +315,34 @@ def _factor_schema_fingerprint(factors: list[dict[str, Any]]) -> str:
                 for key, value in factor.items()
             }
         )
+    payload = json.dumps(normalized, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest().upper()
+
+
+def _state_schema_fingerprint(states: dict[str, Any]) -> str:
+    normalized = {
+        state_name: {
+            "required_groups": sorted(sorted(group["any_of"]) for group in spec["required_groups"]),
+            "veto": sorted(spec["veto"]),
+        }
+        for state_name, spec in sorted(states.items())
+    }
+    payload = json.dumps(normalized, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest().upper()
+
+
+def _reason_observation_fingerprint(reason_observation: dict[int, Any]) -> str:
+    unordered_fields = {"support_factors", "contradiction_factors", "support_states", "visibility_factors"}
+    normalized = [
+        {
+            "reason_id": reason_id,
+            **{
+                key: sorted(value) if key in unordered_fields else value
+                for key, value in mapping.items()
+            },
+        }
+        for reason_id, mapping in sorted(reason_observation.items())
+    ]
     payload = json.dumps(normalized, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(payload).hexdigest().upper()
 
@@ -598,6 +628,10 @@ def validate_mosaic_schema_bundle(bundle: dict[str, Any]) -> None:
 
     if _factor_schema_fingerprint(factors) != _EXPECTED_FACTOR_SCHEMA_SHA256:
         raise ValueError("observable factors do not match the canonical factor schema")
+    if _state_schema_fingerprint(states) != _EXPECTED_STATE_SCHEMA_SHA256:
+        raise ValueError("decision states do not match the canonical decision state schema")
+    if _reason_observation_fingerprint(reason_observation) != _EXPECTED_REASON_OBSERVATION_SHA256:
+        raise ValueError("reason observations do not match the canonical reason observation schema")
 
 
 def load_mosaic_schema_bundle(config_root: str | Path) -> dict[str, Any]:

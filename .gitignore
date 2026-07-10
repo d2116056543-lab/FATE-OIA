@@ -51,4 +51,9 @@ tests/**/__pycache__/
 tests/**/*.pyc
 
 .background_runs/
+.review/*
+!.review/source_branch.txt
+!.review/source_commit.txt
+!.review/new_branch.txt
+!.review/worktree_path.txt
 docs/FATE_*_IMPLEMENTATION_STATUS_*.md

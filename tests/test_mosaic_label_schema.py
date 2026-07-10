@@ -432,6 +432,19 @@ def test_schema_validation_rejects_duplicate_or_unhashable_references(mutate, er
             ),
             "canonical factor schema",
         ),
+        (
+            lambda b: b["states"].update(
+                left_affordance=deepcopy(b["states"]["right_affordance"])
+            ),
+            "canonical decision state schema",
+        ),
+        (
+            lambda b: b["reason_observation"][1].update(
+                support_factors=["front_vehicle_visible", "green_light_visible"],
+                visibility_factors=["green_light_visible"],
+            ),
+            "canonical reason observation schema",
+        ),
     ],
 )
 def test_schema_validation_rejects_semantic_training_conflicts(mutate, error: str) -> None:
