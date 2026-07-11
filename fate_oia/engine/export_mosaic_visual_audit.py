@@ -17,6 +17,7 @@ from fate_oia.datasets.mosaic_grounding_observations import MOSAICGroundingObser
 from fate_oia.datasets.mosaic_multiview import MOSAICWeakMultiView
 from fate_oia.models.acpr_mosaic_ad_model import MOSAICADModel
 from fate_oia.transforms import AspectRatioLetterboxTransform
+from fate_oia.utils.mosaic_checkpoint import load_mosaic_model_state_strict
 from fate_oia.utils.mosaic_artifacts import write_json
 
 
@@ -276,7 +277,7 @@ def main() -> None:
         state_residual_cap=float(config["model"]["state_residual_cap"]),
     ).to(device)
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    model.load_state_dict(checkpoint["model"])
+    load_mosaic_model_state_strict(model, checkpoint["model"])
     transform = AspectRatioLetterboxTransform(
         int(config["data"]["image_height"]),
         int(config["data"]["image_width"]),

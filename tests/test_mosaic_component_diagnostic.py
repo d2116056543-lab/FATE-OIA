@@ -7,9 +7,9 @@ import torch
 
 from fate_oia.engine.diagnose_acpr_mosaic_ad_components import (
     _load_checkpoint_optimizers,
-    _remove_verified_vproj_aliases,
     _summarize_training_rows,
 )
+from fate_oia.utils.mosaic_checkpoint import remove_verified_dino_vproj_aliases
 
 
 def test_component_diagnostic_supports_fresh_two_stage_mode() -> None:
@@ -54,14 +54,14 @@ def test_checkpoint_loader_removes_only_equal_dino_vproj_aliases() -> None:
         "dino.backbone.blocks.0.attn.vproj.weight": projection.clone(),
         "head.weight": torch.randn(2, 2),
     }
-    cleaned = _remove_verified_vproj_aliases(state)
+    cleaned = remove_verified_dino_vproj_aliases(state)
     assert "dino.backbone.blocks.0.attn.vproj.weight" not in cleaned
     assert set(cleaned) == {"dino.backbone.blocks.0.attn.proj.weight", "head.weight"}
 
 
 def test_checkpoint_loader_rejects_non_alias_vproj_values() -> None:
     with pytest.raises(RuntimeError, match="unverified DINO vproj"):
-        _remove_verified_vproj_aliases(
+        remove_verified_dino_vproj_aliases(
             {
                 "dino.backbone.blocks.0.attn.proj.weight": torch.zeros(2, 2),
                 "dino.backbone.blocks.0.attn.vproj.weight": torch.ones(2, 2),

@@ -14,6 +14,7 @@ from fate_oia.models.acpr_mosaic_ad_model import MOSAICADModel
 from fate_oia.models.mosaic_group_threshold import MOSAICGroupThresholdHead
 from fate_oia.threshold_tuning import tune_per_label_thresholds
 from fate_oia.transforms import AspectRatioLetterboxTransform
+from fate_oia.utils.mosaic_checkpoint import load_mosaic_model_state_strict
 from fate_oia.utils.mosaic_artifacts import write_json
 
 
@@ -253,7 +254,7 @@ def main() -> None:
         tail_reason_indices=config["calibration"]["tail_reason_indices"]
     ).to(args.device)
     checkpoint = torch.load(args.checkpoint, map_location=args.device, weights_only=False)
-    model.load_state_dict(checkpoint["model"])
+    load_mosaic_model_state_strict(model, checkpoint["model"])
     threshold.load_state_dict(checkpoint["calibrator"])
     data = config["data"]
     transform = AspectRatioLetterboxTransform(

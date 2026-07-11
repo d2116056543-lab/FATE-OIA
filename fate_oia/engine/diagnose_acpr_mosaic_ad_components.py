@@ -25,6 +25,10 @@ from fate_oia.engine.train_acpr_mosaic_ad import (
 from fate_oia.engine.eval_acpr_mosaic_ad import evaluate_mosaic
 from fate_oia.optim.mosaic_action_anchor import MOSAICActionAnchoredGradient
 from fate_oia.utils.mosaic_artifacts import write_json
+from fate_oia.utils.mosaic_checkpoint import (
+    load_mosaic_model_state_strict,
+    remove_verified_dino_vproj_aliases,
+)
 
 
 def _metrics(evaluation: dict[str, Any]) -> dict[str, float]:
@@ -42,18 +46,6 @@ def _metrics(evaluation: dict[str, Any]) -> dict[str, float]:
 
 def _active_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [row for row in rows if row.get("available", True)]
-
-
-def _remove_verified_vproj_aliases(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """Remove only the DINO runtime alias that duplicates each attention projection."""
-    cleaned = dict(state_dict)
-    alias_keys = [key for key in cleaned if ".attn.vproj." in key]
-    for alias_key in alias_keys:
-        projection_key = alias_key.replace(".attn.vproj.", ".attn.proj.")
-        if projection_key not in cleaned or not torch.equal(cleaned[alias_key], cleaned[projection_key]):
-            raise RuntimeError(f"unverified DINO vproj checkpoint alias: {alias_key}")
-        del cleaned[alias_key]
-    return cleaned
 
 
 def _load_checkpoint_optimizers(
@@ -160,7 +152,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
         if int(checkpoint["epoch"]) != 4:
             raise ValueError("component diagnostic requires the completed epoch-4 checkpoint")
-        model.load_state_dict(_remove_verified_vproj_aliases(checkpoint["model"]), strict=True)
+        load_mosaic_model_state_strict(model, checkpoint["model"])
         selective.load_state_dict(checkpoint["selective_observation"])
         threshold.load_state_dict(checkpoint["calibrator"])
         action_queue.load_state_dict(checkpoint["action_queue"])
