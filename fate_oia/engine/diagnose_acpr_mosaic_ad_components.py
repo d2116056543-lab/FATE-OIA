@@ -14,6 +14,7 @@ from fate_oia.datasets.mosaic_multiview import MOSAICWeakMultiView
 from fate_oia.engine.mosaic_schedule import mosaic_phase_controls
 from fate_oia.engine.train_acpr_mosaic_ad import (
     _apply_phase,
+    _git_head,
     build_loaders,
     build_model_components,
     build_optimizers,
@@ -265,6 +266,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "no_loader_stall": training["loader_stalls"] == 0,
         "posterior_fully_active": training["posterior_active_rate"] == 1.0,
         "posterior_not_collapsed": 0.01 < training["posterior_mean"] < 0.99,
+        "posterior_recovery_positive": training["posterior_recovery"].get("improvement", 0.0) > 0.0,
         "propensity_not_collapsed": 0.05 < training["propensity_mean"] < 0.95,
         "action_anchor_pass": training["anchor_pass_rate"] >= 0.95,
         "anchor_cosine_finite": math.isfinite(training["anchor_cosine_mean"]),
@@ -293,6 +295,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     result = {
         "pass": all(checks.values()),
+        "git_head": _git_head(),
         "source_checkpoint_epoch": int(checkpoint["epoch"]) if checkpoint else None,
         "fresh_two_stage": checkpoint is None,
         "foundation_training": foundation_summary,

@@ -34,6 +34,41 @@ def test_user_approved_pre_full_pilot_uses_one_complete_seed() -> None:
     assert '$env:TMP = $runtimeTemp' in script
 
 
+def test_audit_accepts_only_head_bound_fresh_component_diagnostic(tmp_path) -> None:
+    artifact_dir = tmp_path / "artifacts"
+    diagnostic_dir = tmp_path / "diagnostic"
+    diagnostic_dir.mkdir()
+    (diagnostic_dir / "component_diagnostic.json").write_text(
+        __import__("json").dumps(
+            {
+                "pass": True,
+                "git_head": "head-a",
+                "fresh_two_stage": True,
+                "checks": {"posterior_recovery_positive": True},
+                "training": {"posterior_recovery": {"improvement": 0.1}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    visual = diagnostic_dir / "visual_audit"
+    visual.mkdir()
+    (visual / "summary.json").write_text(
+        __import__("json").dumps(
+            {"pass": True, "full_factor_metric": 0.8, "prior_only_factor_metric": 0.4, "content_only_retention": 0.9}
+        ),
+        encoding="utf-8",
+    )
+    _, pilot, visual_gate = implementation_audit._pilot_and_artifact_gates(
+        None, artifact_dir, diagnostic_dir, "head-a"
+    )
+    assert pilot["pass"] is True
+    assert visual_gate["pass"] is True
+    _, wrong_head, _ = implementation_audit._pilot_and_artifact_gates(
+        None, artifact_dir, diagnostic_dir, "head-b"
+    )
+    assert wrong_head["pass"] is False
+
+
 def _split_skill(text: str) -> tuple[str, str]:
     assert text.startswith("---\n"), "skill must start with YAML frontmatter"
     frontmatter, separator, body = text[4:].partition("\n---\n")

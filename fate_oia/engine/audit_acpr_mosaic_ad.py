@@ -619,6 +619,8 @@ def _calibration_gate(config: dict[str, Any]) -> dict[str, Any]:
 def _pilot_and_artifact_gates(
     pilot_dir: Path | None,
     artifact_smoke_dir: Path | None,
+    component_diagnostic_dir: Path | None = None,
+    expected_git_head: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     if artifact_smoke_dir is not None and artifact_smoke_dir.exists():
         artifacts = validate_artifact_schema(
@@ -633,6 +635,33 @@ def _pilot_and_artifact_gates(
             "status": "PENDING",
             "reason": "two-epoch artifact smoke not supplied",
         }
+    if component_diagnostic_dir is not None and component_diagnostic_dir.exists():
+        diagnostic_path = component_diagnostic_dir / "component_diagnostic.json"
+        visual_path = component_diagnostic_dir / "visual_audit" / "summary.json"
+        diagnostic = json.loads(diagnostic_path.read_text(encoding="utf-8")) if diagnostic_path.exists() else {}
+        visual_summary = json.loads(visual_path.read_text(encoding="utf-8")) if visual_path.exists() else {}
+        checks = diagnostic.get("checks", {})
+        diagnostic_pass = (
+            diagnostic.get("pass") is True
+            and checks
+            and all(checks.values())
+            and diagnostic.get("git_head") == expected_git_head
+            and diagnostic.get("fresh_two_stage") is True
+        )
+        visual_pass = (
+            visual_summary.get("pass") is True
+            and visual_summary.get("full_factor_metric", 0.0)
+            > visual_summary.get("prior_only_factor_metric", float("inf"))
+            and visual_summary.get("content_only_retention", 0.0) >= 0.70
+        )
+        pilot = {
+            "pass": diagnostic_pass,
+            "mode": "fresh_two_stage_component_diagnostic",
+            "diagnostic": diagnostic,
+            "recovery": [diagnostic.get("training", {}).get("posterior_recovery", {})],
+        }
+        visual = {"pass": visual_pass, "visual_results": [visual_summary]}
+        return artifacts, pilot, visual
     if pilot_dir is None or not pilot_dir.exists():
         pending = {"pass": False, "status": "PENDING", "reason": "configured pilot seed not supplied"}
         return artifacts, pending, pending.copy()
@@ -861,6 +890,7 @@ def audit(
     device_name: str,
     pilot_dir: str | None,
     artifact_smoke_dir: str | None,
+    component_diagnostic_dir: str | None,
     write_review_pass: bool,
 ) -> dict[str, Any]:
     repo_root = Path(__file__).resolve().parents[2]
@@ -886,6 +916,7 @@ def audit(
             "dirty_paths": status_lines,
             "pilot_dir": str(Path(pilot_dir).resolve()) if pilot_dir else None,
             "artifact_smoke_dir": str(Path(artifact_smoke_dir).resolve()) if artifact_smoke_dir else None,
+            "component_diagnostic_dir": str(Path(component_diagnostic_dir).resolve()) if component_diagnostic_dir else None,
             "worktree_context": worktree_context,
         },
     )
@@ -945,6 +976,8 @@ def audit(
     artifacts, pilot, visual = _pilot_and_artifact_gates(
         Path(pilot_dir) if pilot_dir else None,
         Path(artifact_smoke_dir) if artifact_smoke_dir else None,
+        Path(component_diagnostic_dir) if component_diagnostic_dir else None,
+        git_head,
     )
     runtime_path = output / "mosaic_runtime_selection.json"
     runtime = _runtime_gate(runtime_path, config)
@@ -995,6 +1028,7 @@ def main() -> None:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--pilot_dir")
     parser.add_argument("--artifact_smoke_dir")
+    parser.add_argument("--component_diagnostic_dir")
     parser.add_argument("--write_review_pass", action="store_true")
     args = parser.parse_args()
     print(
@@ -1005,6 +1039,7 @@ def main() -> None:
                 device_name=args.device,
                 pilot_dir=args.pilot_dir,
                 artifact_smoke_dir=args.artifact_smoke_dir,
+                component_diagnostic_dir=args.component_diagnostic_dir,
                 write_review_pass=args.write_review_pass,
             ),
             indent=2,
