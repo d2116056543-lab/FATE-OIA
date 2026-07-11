@@ -43,6 +43,14 @@ class MOSAICGroundingObservationBuilder:
         SOURCE_LANE_POLYLINE: 0.75,
         SOURCE_DRIVABLE_MASK: 0.90,
     }
+    # An absent instance in an available BDD100K source is useful but weaker
+    # than a positive annotation. Keeping these below 0.5 prevents incomplete
+    # weak labels from becoming hard negatives.
+    _NEGATIVE_RELIABILITY = {
+        SOURCE_BOX2D: 0.30,
+        SOURCE_LANE_POLYLINE: 0.25,
+        SOURCE_DRIVABLE_MASK: 0.35,
+    }
     _UNRELIABLE_REASON_ATTRIBUTES = {"near", "left_indicator", "right_indicator"}
 
     def __init__(self, factors: Sequence[dict[str, Any]], *, grid_hw: tuple[int, int] = (45, 80)) -> None:
@@ -113,6 +121,20 @@ class MOSAICGroundingObservationBuilder:
             return x_norm >= 0.45 and y_norm >= 0.25
         if spatial == "center_corridor":
             return 0.28 <= x_norm <= 0.72 and y_norm >= 0.30
+        return False
+
+    @staticmethod
+    def _occupancy_spatial_accepts(spatial: str, x_norm: float, y_norm: float) -> bool:
+        # Occupancy is a mutually exclusive lane-level state, not a broad
+        # visual prior. Prevent one center object from vetoing all directions.
+        if y_norm < 0.35:
+            return False
+        if spatial == "left_corridor":
+            return x_norm < 0.35
+        if spatial == "center_corridor":
+            return 0.35 <= x_norm <= 0.65
+        if spatial == "right_corridor":
+            return x_norm > 0.65
         return False
 
     @staticmethod
@@ -236,10 +258,16 @@ class MOSAICGroundingObservationBuilder:
                 continue
             center_x = (box[0] + box[2]) / (2.0 * image_hw[1])
             center_y = (box[1] + box[3]) / (2.0 * image_hw[0])
-            if not self._spatial_accepts(str(factor["spatial"]), center_x, center_y):
+            is_occupancy = factor["entity"] == "occupancy"
+            spatial_matches = (
+                self._occupancy_spatial_accepts(str(factor["spatial"]), center_x, center_y)
+                if is_occupancy
+                else self._spatial_accepts(str(factor["spatial"]), center_x, center_y)
+            )
+            if not spatial_matches:
                 continue
-            if factor["entity"] == "occupancy":
-                matched = True
+            if is_occupancy:
+                matched = self._entity_matches("obstacle", str(object_record.get("category", "")))
             else:
                 matched = self._entity_matches(str(factor["entity"]), str(object_record.get("category", "")))
             if not matched or not self._attribute_matches(factor["attribute"], object_record):
@@ -327,19 +355,19 @@ class MOSAICGroundingObservationBuilder:
         geometry_mask = torch.zeros(batch_size, factor_count, *self.grid_hw, device=device)
         geometry_valid = torch.zeros_like(presence_target)
         source_code = torch.zeros(batch_size, factor_count, dtype=torch.long, device=device)
+        weak_negative_mask = torch.zeros_like(presence_target)
 
         for batch_index, record in enumerate(grounding_records):
             positive_reasons = set(torch.nonzero(reason_targets[batch_index] > 0.5, as_tuple=False).flatten().tolist())
-            for factor_index, factor in enumerate(self.factors):
-                if positive_reasons & set(factor["reason_positive_anchors"]) and self._reason_anchor_is_reliable(factor):
-                    presence_target[batch_index, factor_index] = 1.0
-                    presence_mask[batch_index, factor_index] = 1.0
-                    visibility_target[batch_index, factor_index] = 1.0
-                    visibility_mask[batch_index, factor_index] = 1.0
-                    reliability[batch_index, factor_index] = self._RELIABILITY[self.SOURCE_REASON_ANCHOR]
-                    source_code[batch_index, factor_index] = self.SOURCE_REASON_ANCHOR
-
             if record is None:
+                for factor_index, factor in enumerate(self.factors):
+                    if positive_reasons & set(factor["reason_positive_anchors"]) and self._reason_anchor_is_reliable(factor):
+                        presence_target[batch_index, factor_index] = 1.0
+                        presence_mask[batch_index, factor_index] = 1.0
+                        visibility_target[batch_index, factor_index] = 1.0
+                        visibility_mask[batch_index, factor_index] = 1.0
+                        reliability[batch_index, factor_index] = self._RELIABILITY[self.SOURCE_REASON_ANCHOR]
+                        source_code[batch_index, factor_index] = self.SOURCE_REASON_ANCHOR
                 continue
             raw_image_hw = self._record_value(record, "image_size", (720, 1280))
             if not isinstance(raw_image_hw, (list, tuple)) or len(raw_image_hw) != 2:
@@ -350,33 +378,64 @@ class MOSAICGroundingObservationBuilder:
             if drivable_value is None:
                 drivable_value = self._record_value(record, "drivable_map")
             drivable = self._load_drivable_mask(drivable_value)
+            label_json = self._record_value(record, "label_json")
+            box_source_available = label_json is not None or self._record_value(record, "objects") is not None
+            lane_source_available = label_json is not None or self._record_value(record, "lanes") is not None
 
             for factor_index, factor in enumerate(self.factors):
                 matched_mask: torch.Tensor | None = None
                 matched_source = self.SOURCE_UNKNOWN
+                available_source = self.SOURCE_UNKNOWN
                 sources = set(factor["geometry_sources"])
                 if "box2d" in sources:
+                    if box_source_available:
+                        available_source = self.SOURCE_BOX2D
                     matched_mask = self._match_box_factor(factor, objects, image_hw, device)
                     if matched_mask is not None:
                         matched_source = self.SOURCE_BOX2D
                 if matched_mask is None and "lane_polyline" in sources:
+                    if lane_source_available:
+                        available_source = self.SOURCE_LANE_POLYLINE
                     matched_mask = self._match_lane_factor(factor, lanes, image_hw, device)
                     if matched_mask is not None:
                         matched_source = self.SOURCE_LANE_POLYLINE
                 if matched_mask is None and "drivable_mask" in sources and drivable is not None:
+                    available_source = self.SOURCE_DRIVABLE_MASK
                     matched_mask = self._match_drivable_factor(factor, drivable, device)
                     if matched_mask is not None:
                         matched_source = self.SOURCE_DRIVABLE_MASK
-                if matched_mask is None:
+
+                if matched_mask is not None:
+                    presence_target[batch_index, factor_index] = 1.0
+                    presence_mask[batch_index, factor_index] = 1.0
+                    visibility_target[batch_index, factor_index] = 1.0
+                    visibility_mask[batch_index, factor_index] = 1.0
+                    reliability[batch_index, factor_index] = self._RELIABILITY[matched_source]
+                    geometry_mask[batch_index, factor_index] = matched_mask
+                    geometry_valid[batch_index, factor_index] = 1.0
+                    source_code[batch_index, factor_index] = matched_source
                     continue
-                presence_target[batch_index, factor_index] = 1.0
-                presence_mask[batch_index, factor_index] = 1.0
-                visibility_target[batch_index, factor_index] = 1.0
-                visibility_mask[batch_index, factor_index] = 1.0
-                reliability[batch_index, factor_index] = self._RELIABILITY[matched_source]
-                geometry_mask[batch_index, factor_index] = matched_mask
-                geometry_valid[batch_index, factor_index] = 1.0
-                source_code[batch_index, factor_index] = matched_source
+
+                # Only attribute-free factors support absence inference from a
+                # complete geometry source. Missing color/distance/indicator
+                # attributes remain unknown, never hard negatives.
+                if available_source != self.SOURCE_UNKNOWN and factor.get("attribute") is None:
+                    presence_target[batch_index, factor_index] = 0.0
+                    presence_mask[batch_index, factor_index] = 1.0
+                    visibility_target[batch_index, factor_index] = 1.0
+                    visibility_mask[batch_index, factor_index] = 1.0
+                    reliability[batch_index, factor_index] = self._NEGATIVE_RELIABILITY[available_source]
+                    source_code[batch_index, factor_index] = available_source
+                    weak_negative_mask[batch_index, factor_index] = 1.0
+                    continue
+
+                if positive_reasons & set(factor["reason_positive_anchors"]) and self._reason_anchor_is_reliable(factor):
+                    presence_target[batch_index, factor_index] = 1.0
+                    presence_mask[batch_index, factor_index] = 1.0
+                    visibility_target[batch_index, factor_index] = 1.0
+                    visibility_mask[batch_index, factor_index] = 1.0
+                    reliability[batch_index, factor_index] = self._RELIABILITY[self.SOURCE_REASON_ANCHOR]
+                    source_code[batch_index, factor_index] = self.SOURCE_REASON_ANCHOR
 
         return {
             "presence_target": presence_target,
@@ -387,4 +446,5 @@ class MOSAICGroundingObservationBuilder:
             "geometry_mask": geometry_mask,
             "geometry_mask_valid": geometry_valid,
             "source_code": source_code,
+            "weak_negative_mask": weak_negative_mask,
         }

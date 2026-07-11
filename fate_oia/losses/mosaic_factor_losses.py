@@ -46,6 +46,41 @@ def _optional_consistency(
     return _masked_mean(values, valid_mask)
 
 
+def _factor_balanced_binary_mean(
+    values: torch.Tensor,
+    targets: torch.Tensor,
+    valid_mask: torch.Tensor,
+    reliability: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Balance observed positive/negative evidence within each factor.
+
+    Unknown observations remain masked. This only prevents the much more
+    frequent confirmed positives from overwhelming available weak negatives.
+    """
+    if not (values.shape == targets.shape == valid_mask.shape == reliability.shape):
+        raise ValueError("balanced factor loss tensors must have matching [B,F] shapes")
+    if values.ndim != 2:
+        raise ValueError("balanced factor loss expects [B,F] tensors")
+    base_weight = valid_mask.to(values.dtype) * reliability.to(values.dtype).clamp(0.0, 1.0)
+    positive_weight = base_weight * (targets > 0.5).to(values.dtype)
+    negative_weight = base_weight * (targets <= 0.5).to(values.dtype)
+    positive_denominator = positive_weight.sum(dim=0)
+    negative_denominator = negative_weight.sum(dim=0)
+    positive_mean = (values * positive_weight).sum(dim=0) / positive_denominator.clamp_min(1e-12)
+    negative_mean = (values * negative_weight).sum(dim=0) / negative_denominator.clamp_min(1e-12)
+    positive_available = positive_denominator > 0
+    negative_available = negative_denominator > 0
+    class_count = positive_available.to(values.dtype) + negative_available.to(values.dtype)
+    factor_loss = (
+        positive_mean * positive_available.to(values.dtype)
+        + negative_mean * negative_available.to(values.dtype)
+    ) / class_count.clamp_min(1.0)
+    factor_available = class_count > 0
+    loss = factor_loss[factor_available].mean() if factor_available.any() else _zero(values)
+    count = (valid_mask > 0).sum().detach()
+    return loss, count
+
+
 def build_mosaic_factor_loss(
     predictions: dict[str, Any],
     observations: dict[str, torch.Tensor],
@@ -103,8 +138,11 @@ def build_mosaic_factor_loss(
         observations["visibility_target"].to(dtype=visibility_logits.dtype),
         reduction="none",
     )
-    loss_presence, count_presence = _masked_mean(
-        presence_values, observations["presence_mask"], reliability=source_reliability
+    loss_presence, count_presence = _factor_balanced_binary_mean(
+        presence_values,
+        observations["presence_target"].to(dtype=presence_logits.dtype),
+        observations["presence_mask"],
+        source_reliability,
     )
     loss_visibility, count_visibility = _masked_mean(
         visibility_values, observations["visibility_mask"], reliability=source_reliability

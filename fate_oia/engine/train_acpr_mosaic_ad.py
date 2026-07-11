@@ -730,6 +730,8 @@ def train_representation_epoch(
     warmup_updates = max(1, len(loader) * int(config["optimizer"]["warmup_epochs"]) // grad_accum)
     recovery_scores: list[torch.Tensor] = []
     recovery_targets: list[torch.Tensor] = []
+    factor_positive_counts = torch.zeros(len(factor_names), dtype=torch.long)
+    factor_negative_counts = torch.zeros(len(factor_names), dtype=torch.long)
     iterator = iter(loader)
     for step in range(len(loader)):
         row_offsets = {name: len(values) for name, values in rows.items()}
@@ -774,6 +776,13 @@ def train_representation_epoch(
             observations = grounding_builder(
                 reasons, _grounding_records(grounding_index, batch["file_name"]), split="train"
             )
+            observed_presence = observations["presence_mask"] > 0
+            factor_positive_counts += (
+                observed_presence & (observations["presence_target"] > 0.5)
+            ).sum(dim=0).detach().cpu()
+            factor_negative_counts += (
+                observed_presence & (observations["presence_target"] <= 0.5)
+            ).sum(dim=0).detach().cpu()
             factor_predictions = {
                 **out1,
                 "view_factor_presence_prob": out2["factor_presence_prob"],
@@ -958,6 +967,8 @@ def train_representation_epoch(
                 "visibility_valid_count": factor_losses["count_visibility"],
                 "geometry_valid_count": factor_losses["count_geometry_mask"],
                 "source_coverage_rate": (observations["source_code"] > 0).float().mean(),
+                "weak_negative_count": observations["weak_negative_mask"].sum(),
+                "weak_negative_rate": observations["weak_negative_mask"].float().mean(),
             }
         )
         for name, offset in row_offsets.items():
@@ -973,6 +984,11 @@ def train_representation_epoch(
                 "reason_loss": float(reason_total.detach().cpu()),
                 "factor_loss": float(factor_losses["loss_factor_total"].detach().cpu()),
                 "posterior_mean": float(selective_output["reason_latent_posterior"].mean().detach().cpu()),
+                "factor_presence_mean": float(out1["factor_presence_prob"].mean().detach().cpu()),
+                "factor_presence_saturation_rate": float(
+                    (out1["factor_presence_prob"] > 0.95).float().mean().detach().cpu()
+                ),
+                "weak_negative_rate": float(observations["weak_negative_mask"].float().mean().detach().cpu()),
             }
             print(json.dumps(payload), flush=True)
     all_recovery_scores = torch.cat(recovery_scores) if recovery_scores else torch.zeros(0)
@@ -993,6 +1009,19 @@ def train_representation_epoch(
             "improvement": posterior_auprc - zero_baseline_auprc,
             "hidden_positive_count": int(all_recovery_targets.sum()),
             "recovery_domain_count": int(all_recovery_targets.numel()),
+        }
+    )
+    factor_observed_counts = factor_positive_counts + factor_negative_counts
+    factor_observed_prevalence = factor_positive_counts.float() / factor_observed_counts.clamp_min(1).float()
+    rows["factor_grounding_stats.jsonl"].append(
+        {
+            "epoch": epoch,
+            "summary": True,
+            "factor_names": factor_names,
+            "observed_positive_counts": factor_positive_counts.tolist(),
+            "observed_weak_negative_counts": factor_negative_counts.tolist(),
+            "observed_counts": factor_observed_counts.tolist(),
+            "observed_prevalence": factor_observed_prevalence.tolist(),
         }
     )
     return rows, global_update
@@ -1272,6 +1301,10 @@ def _epoch_stop_reasons(
         **diagnostics,
     }
     history.append(current)
+    if diagnostics.get("factor_presence_saturation_rate", 0.0) > 0.50:
+        return ["factor_presence_saturation_rate_gt_0p50"]
+    if diagnostics.get("factor_unjustified_saturation_rate", 0.0) > 0.25:
+        return ["factor_unjustified_saturation_rate_gt_0p25"]
     if epoch < 8:
         return []
     reasons: list[str] = []
@@ -1507,6 +1540,27 @@ def run(args: argparse.Namespace) -> None:
                 ),
                 {},
             )
+            factor_grounding_summary = next(
+                (
+                    row
+                    for row in reversed(rows["factor_grounding_stats.jsonl"])
+                    if row.get("summary")
+                ),
+                {},
+            )
+            observed_prevalence = factor_grounding_summary.get("observed_prevalence", [])
+            observed_negative_counts = factor_grounding_summary.get(
+                "observed_weak_negative_counts", []
+            )
+            unjustified_saturation = [
+                float(row.get("presence_mean", 0.0)) > 0.95
+                and float(row.get("visibility_mean", 0.0)) > 0.95
+                and index < len(observed_prevalence)
+                and index < len(observed_negative_counts)
+                and float(observed_prevalence[index]) < 0.80
+                and int(observed_negative_counts[index]) >= 20
+                for index, row in enumerate(evaluation["factor_rows"])
+            ]
             diagnostics = {
                 "propensity_bound_rate": (
                     sum(float(row["propensity_bound_rate"]) for row in selective_rows)
@@ -1530,6 +1584,24 @@ def run(args: argparse.Namespace) -> None:
                 "posterior_recovery_improvement": float(recovery_summary.get("improvement", 0.0)),
                 "factor_audit_available": bool(factor_mode_audit.get("available", False)),
                 "prior_to_full_ratio": float(factor_mode_audit.get("prior_to_full_ratio", 0.0)),
+                "factor_presence_saturation_rate": (
+                    sum(
+                        float(row.get("presence_mean", 0.0)) > 0.95
+                        and float(row.get("visibility_mean", 0.0)) > 0.95
+                        for row in evaluation["factor_rows"]
+                    )
+                    / max(len(evaluation["factor_rows"]), 1)
+                ),
+                "factor_unjustified_saturation_rate": (
+                    sum(unjustified_saturation) / max(len(unjustified_saturation), 1)
+                ),
+                "factor_unjustified_saturation_names": [
+                    row.get("factor_name", str(index))
+                    for index, (row, failed) in enumerate(
+                        zip(evaluation["factor_rows"], unjustified_saturation)
+                    )
+                    if failed
+                ],
             }
             reasons = _epoch_stop_reasons(epoch, evaluation, failure_history, diagnostics)
         decision = {

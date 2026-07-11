@@ -111,6 +111,76 @@ def test_explicit_attribute_is_required_for_near_or_directional_box_factors() ->
     assert with_attribute["presence_mask"][0, 1] == 1
 
 
+def test_complete_geometry_sources_emit_weak_negative_presence_without_treating_unknown_attributes_as_negative() -> None:
+    builder = MOSAICGroundingObservationBuilder(FACTORS)
+    record = {
+        "image_size": (100, 200),
+        "objects": [],
+        "lanes": [],
+        "drivable_mask": torch.zeros(100, 200),
+    }
+
+    output = builder(_reasons(), [record], split="train")
+
+    # Source-complete, attribute-free factors have an observed absence. The
+    # model can inspect the region (visibility=1) while presence is negative.
+    assert output["presence_target"].tolist() == [[0.0, 0.0, 0.0, 0.0]]
+    assert output["presence_mask"].tolist() == [[1.0, 0.0, 1.0, 1.0]]
+    assert output["visibility_target"].tolist() == [[1.0, 0.0, 1.0, 1.0]]
+    assert output["visibility_mask"].tolist() == [[1.0, 0.0, 1.0, 1.0]]
+    assert output["weak_negative_mask"].tolist() == [[1.0, 0.0, 1.0, 1.0]]
+    assert output["source_code"].tolist() == [[2, 0, 3, 4]]
+    assert torch.all(output["source_reliability"][0, [0, 2, 3]] > 0)
+    assert torch.all(output["source_reliability"][0, [0, 2, 3]] < 0.5)
+
+
+def test_reason_anchor_does_not_override_a_complete_geometry_negative() -> None:
+    builder = MOSAICGroundingObservationBuilder(FACTORS)
+    reasons = _reasons()
+    reasons[0, 5] = 1
+    record = {"image_size": (100, 200), "objects": [], "lanes": []}
+
+    output = builder(reasons, [record], split="train")
+
+    assert output["presence_target"][0, 0] == 0
+    assert output["presence_mask"][0, 0] == 1
+    assert output["weak_negative_mask"][0, 0] == 1
+    # `near` is not directly observable from the current BDD100K schema, so
+    # its missing attribute remains unknown rather than becoming a hard zero.
+    assert output["presence_mask"][0, 1] == 0
+
+
+def test_occupancy_ignores_traffic_control_boxes_and_uses_exclusive_corridors() -> None:
+    occupancy_factors = tuple(
+        {
+            "name": f"{spatial}_occupied",
+            "type": "region",
+            "entity": "occupancy",
+            "attribute": None,
+            "spatial": spatial,
+            "reason_positive_anchors": [],
+            "geometry_sources": ["box2d"],
+        }
+        for spatial in ("left_corridor", "center_corridor", "right_corridor")
+    )
+    builder = MOSAICGroundingObservationBuilder(occupancy_factors)
+    record = {
+        "image_size": (100, 200),
+        "objects": [
+            {"category": "traffic light", "box2d": {"x1": 15, "y1": 30, "x2": 35, "y2": 60}},
+            {"category": "car", "box2d": {"x1": 85, "y1": 45, "x2": 115, "y2": 95}},
+        ],
+    }
+
+    output = builder(_reasons(), [record], split="train")
+
+    # The center car must not simultaneously become left/right occupancy,
+    # and the traffic light is not an obstacle occupying the driving lane.
+    assert output["presence_target"].tolist() == [[0.0, 1.0, 0.0]]
+    assert output["presence_mask"].tolist() == [[1.0, 1.0, 1.0]]
+    assert output["weak_negative_mask"].tolist() == [[1.0, 0.0, 1.0]]
+
+
 def test_builder_is_train_only_and_validates_batch_contract() -> None:
     builder = MOSAICGroundingObservationBuilder(FACTORS)
     with pytest.raises(ValueError, match="train-only"):

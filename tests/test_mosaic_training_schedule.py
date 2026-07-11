@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from fate_oia.engine.mosaic_schedule import mosaic_phase_controls
+from fate_oia.engine.train_acpr_mosaic_ad import _epoch_stop_reasons
 
 
 def test_formal_schedule_has_exact_six_phases_and_boundaries() -> None:
@@ -68,3 +69,48 @@ def test_phase_f_is_calibration_only() -> None:
 def test_out_of_range_epoch_fails_closed(epoch: int) -> None:
     with pytest.raises(ValueError):
         mosaic_phase_controls(epoch)
+
+
+def test_factor_presence_collapse_stops_even_during_visual_foundation() -> None:
+    evaluation = {
+        "metrics_summary": {
+            "raw": {"Act_mF1": 0.5, "Exp_mAP": 0.2},
+            "deploy_fixed": {"Exp_mF1": 0.2},
+            "test_oracle_diagnostic": {"Act_mF1": 0.5},
+        },
+        "action_branch_metrics": {
+            "raw": {"Act_per_label_ap": [0.5] * 4},
+            "visual": {"Act_mF1": 0.5},
+        },
+    }
+    reasons = _epoch_stop_reasons(
+        0,
+        evaluation,
+        [],
+        {"factor_presence_saturation_rate": 0.75},
+    )
+    assert reasons == ["factor_presence_saturation_rate_gt_0p50"]
+
+
+def test_unjustified_factor_saturation_stops_even_when_total_saturation_is_below_half() -> None:
+    evaluation = {
+        "metrics_summary": {
+            "raw": {"Act_mF1": 0.5, "Exp_mAP": 0.2},
+            "deploy_fixed": {"Exp_mF1": 0.2},
+            "test_oracle_diagnostic": {"Act_mF1": 0.5},
+        },
+        "action_branch_metrics": {
+            "raw": {"Act_per_label_ap": [0.5] * 4},
+            "visual": {"Act_mF1": 0.5},
+        },
+    }
+    reasons = _epoch_stop_reasons(
+        0,
+        evaluation,
+        [],
+        {
+            "factor_presence_saturation_rate": 0.33,
+            "factor_unjustified_saturation_rate": 0.30,
+        },
+    )
+    assert reasons == ["factor_unjustified_saturation_rate_gt_0p25"]

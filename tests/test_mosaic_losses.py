@@ -92,6 +92,37 @@ def test_factor_losses_respect_unknown_masks_and_emit_valid_counts() -> None:
     assert predictions["factor_presence_logits"].grad[0, 1] == 0
 
 
+def test_factor_presence_loss_balances_confirmed_positive_and_weak_negative_per_factor() -> None:
+    logits = torch.zeros(10, 1, requires_grad=True)
+    predictions = {
+        "factor_presence_logits": logits,
+        "factor_visibility_logits": torch.zeros(10, 1, requires_grad=True),
+        "factor_soft_masks": torch.full((10, 1, 45, 80), 0.5),
+        "factor_presence_prob": torch.full((10, 1), 0.5),
+        "factor_visibility_prob": torch.full((10, 1), 0.5),
+        "prototype_weights": torch.ones(10, 1, 1),
+        "prior_scale": torch.zeros(1),
+    }
+    targets = torch.tensor([[1.0]] * 9 + [[0.0]])
+    observations = {
+        "presence_target": targets,
+        "presence_mask": torch.ones_like(targets),
+        "visibility_target": torch.ones_like(targets),
+        "visibility_mask": torch.ones_like(targets),
+        "source_reliability": torch.ones_like(targets),
+        "geometry_mask": torch.zeros(10, 1, 45, 80),
+        "geometry_mask_valid": torch.zeros(10, 1),
+    }
+
+    output = build_mosaic_factor_loss(predictions, observations)
+    output["loss_factor_total"].backward()
+
+    # A global BCE would have a strong negative gradient because positives
+    # outnumber negatives 9:1. Per-factor class balancing gives equal total
+    # influence to the two confirmed observation classes.
+    assert abs(float(logits.grad.sum())) < 1e-6
+
+
 def test_reason_observation_losses_use_live_q_only_for_hidden_recovery_and_detached_q_for_m_step() -> None:
     logits = torch.zeros(2, 3, requires_grad=True)
     observed = torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
