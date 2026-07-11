@@ -131,6 +131,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if output_dir.exists():
         raise FileExistsError(f"diagnostic output already exists: {output_dir}")
     output_dir.mkdir(parents=True)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
     config = load_config(args.config)
     device = torch.device(args.device)
     train_loader, calib_loader, test_loader, split_stats = build_loaders(
@@ -274,7 +277,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "reason_state_path_active": mechanism["reason_state_logit_delta_abs_mean"] > 1e-6,
         "content_factor_active": factor_modes["full_factor_metric"] > factor_modes["prior_only_factor_metric"],
         "content_only_retained": factor_modes["content_only_retention"] >= 0.70,
-        "action_no_short_collapse": after_metrics["Act_mF1"] >= before_metrics["Act_mF1"] - 0.02,
+        "action_ranking_no_short_collapse": after_metrics["Act_mAP"] >= before_metrics["Act_mAP"] - 0.02,
+        "action_micro_no_short_collapse": after_metrics["Act_oF1"] >= before_metrics["Act_oF1"] - 0.02,
         "reason_map_no_short_collapse": after_metrics["Exp_mAP"] >= before_metrics["Exp_mAP"] - 0.02,
         "threshold_rows_complete": len(threshold_rows) == int(config["calibration"]["steps_per_epoch"]),
     }

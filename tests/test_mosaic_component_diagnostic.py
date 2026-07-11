@@ -20,6 +20,9 @@ def test_component_diagnostic_supports_fresh_two_stage_mode() -> None:
     assert "foundation_controls = mosaic_phase_controls(0)" in source
     assert "controls = mosaic_phase_controls(args.phase_epoch)" in source
     assert "_mechanism_forward_stats" in source
+    assert "torch.manual_seed(args.seed)" in source
+    assert 'after_metrics["Act_mAP"] >= before_metrics["Act_mAP"] - 0.02' in source
+    assert 'after_metrics["Act_oF1"] >= before_metrics["Act_oF1"] - 0.02' in source
 
 
 class _OptimizerRecorder:
