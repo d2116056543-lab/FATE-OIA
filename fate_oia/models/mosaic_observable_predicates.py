@@ -116,7 +116,7 @@ class MOSAICMultiPrototypeFactorBank(nn.Module):
     def _prototype_weights(self, context: torch.Tensor, prior_mode: str) -> torch.Tensor:
         valid = self.prototype_valid_mask.unsqueeze(0)
         if prior_mode == "prior_only":
-            weights = valid.to(dtype=context.dtype)
+            weights = valid.expand(context.shape[0], -1, -1).to(dtype=context.dtype)
             return weights / weights.sum(-1, keepdim=True)
         pooled = context.mean(dim=(-2, -1))
         router_logits = self.context_router(pooled).reshape(

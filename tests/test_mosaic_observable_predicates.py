@@ -117,8 +117,10 @@ def test_observable_layer_has_two_distinct_differentiable_anchors_without_hard_t
 @pytest.mark.parametrize("prior_mode", ["full", "content_only", "prior_only"])
 def test_observable_layer_supports_all_audit_prior_modes(prior_mode: str) -> None:
     layer = MOSAICObservablePredicateLayer(FACTORS, dim=8).eval()
-    output = layer(_pyramid(batch=1), prior_mode=prior_mode)
-    assert output["factor_features"].shape == (1, 4, 8)
+    output = layer(_pyramid(batch=3), prior_mode=prior_mode)
+    assert output["factor_features"].shape == (3, 4, 8)
+    assert output["factor_presence_prob"].shape == (3, 4)
+    assert output["factor_visibility_prob"].shape == (3, 4)
 
 
 def test_prior_only_is_independent_of_high_mid_and_context_image_content() -> None:

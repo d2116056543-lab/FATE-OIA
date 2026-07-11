@@ -37,6 +37,15 @@ def test_formal_model_is_independent_direct_image_and_returns_all_raw_branches()
     assert output["sampling_coordinates"].shape == (1, 24, 2, 4, 12, 2)
 
 
+@pytest.mark.parametrize("prior_mode", ["full", "content_only", "prior_only"])
+def test_full_model_audit_modes_preserve_batch_and_final_output_shapes(prior_mode: str) -> None:
+    output = _model().eval()(torch.randn(2, 3, 360, 640), prior_mode=prior_mode)
+    assert output["factor_presence_prob"].shape == (2, 24)
+    assert output["decision_state_prob"].shape == (2, 8)
+    assert output["action_logits_raw"].shape == (2, 4)
+    assert output["reason_logits_latent"].shape == (2, 21)
+
+
 def test_phase_a_zero_controls_recover_action_visual_branch_exactly() -> None:
     model = _model().eval()
     model.set_phase_controls(state_residual_scale=0.0, action_state_gate_cap=0.0)
