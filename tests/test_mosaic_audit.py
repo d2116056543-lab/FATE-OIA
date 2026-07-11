@@ -30,6 +30,8 @@ def test_user_approved_pre_full_pilot_uses_one_complete_seed() -> None:
     assert "foreach ($seed in @(20260710))" in script
     assert "20260711" not in script
     assert "20260712" not in script
+    assert '$env:TEMP = $runtimeTemp' in script
+    assert '$env:TMP = $runtimeTemp' in script
 
 
 def _split_skill(text: str) -> tuple[str, str]:

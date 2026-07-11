@@ -9,6 +9,11 @@ param(
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
 Set-Location $repo
+$driveRoot = Split-Path -Parent $repo
+$runtimeTemp = Join-Path $driveRoot ".runtime_tmp\acpr_mosaic_ad_v1"
+New-Item -ItemType Directory -Force -Path $runtimeTemp | Out-Null
+$env:TEMP = $runtimeTemp
+$env:TMP = $runtimeTemp
 
 if (-not (Test-Path -LiteralPath $Python)) { throw "Python runtime missing: $Python" }
 if (-not (Test-Path -LiteralPath $Config)) { throw "MOSAIC config missing: $Config" }
@@ -118,7 +123,6 @@ if ($Mode -eq "pilot") {
     if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($remoteLine)) { throw "Cannot verify GitHub branch after pilot" }
     $remoteHead = ($remoteLine -split "\s+")[0]
     if ($remoteHead -ne $head) { throw "GitHub HEAD $remoteHead differs from pilot HEAD $head" }
-    $driveRoot = Split-Path -Parent $repo
     $verify = Join-Path $driveRoot "_verify_acpr_mosaic_ad_v1"
     $resolvedRoot = [IO.Path]::GetFullPath($driveRoot)
     $resolvedVerify = [IO.Path]::GetFullPath($verify)
