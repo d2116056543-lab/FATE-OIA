@@ -86,6 +86,17 @@ def test_calibrator_has_a_fixed_step_budget() -> None:
     assert config["calibration"]["surrogate_temperature"] == 0.20
 
 
+def test_calibration_image_forward_batch_is_separate_from_threshold_batch() -> None:
+    loader_source = inspect.getsource(trainer.build_loaders)
+    assert 'batch_size=int(config["calibration"]["batch_size"])' not in loader_source
+    assert "batch_size=batch_size" in loader_source
+    fit_source = inspect.getsource(trainer.fit_calibrator)
+    assert 'batch_size = int(calibration_config["batch_size"])' in fit_source
+    assert "batch_size != 256" in fit_source
+    assert "with torch.no_grad()" in fit_source
+    assert ".detach()" in fit_source
+
+
 def test_limited_train_and_calib_subsets_are_multilabel_stratified_without_image_decode() -> None:
     class Sample:
         def __init__(self, index: int) -> None:

@@ -432,7 +432,9 @@ def build_loaders(
         _loader(train_main, batch_size=batch_size, shuffle=True, num_workers=num_workers, config=config, generator=torch.Generator().manual_seed(seed)),
         _loader(
             train_calib,
-            batch_size=int(config["calibration"]["batch_size"]),
+            # DINO inference uses the profiled image batch. The fixed calibration
+            # batch of 256 is applied only after detached logits are collected.
+            batch_size=batch_size,
             shuffle=False,
             num_workers=num_workers,
             config=config,
