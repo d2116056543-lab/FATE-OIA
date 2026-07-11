@@ -14,6 +14,22 @@ from fate_oia.utils.mosaic_artifacts import (
     validate_artifact_schema,
     write_epoch_artifacts,
 )
+from fate_oia.engine.train_acpr_mosaic_ad import _fill_inactive_epoch_rows
+
+
+def test_inactive_phase_rows_fill_empty_lists_without_overwriting_real_rows() -> None:
+    rows = {name: [] for name in EPOCH_JSONL_FILES}
+    rows["loss_components.jsonl"] = [{"epoch": 0, "loss": 1.0}]
+    _fill_inactive_epoch_rows(rows, epoch=0, phase="A_visual_foundation")
+    assert rows["loss_components.jsonl"] == [{"epoch": 0, "loss": 1.0}]
+    assert all(rows[name] for name in EPOCH_JSONL_FILES)
+    inactive = rows["action_anchor_stats.jsonl"][0]
+    assert inactive == {
+        "epoch": 0,
+        "phase": "A_visual_foundation",
+        "available": False,
+        "reason": "component_not_active_in_phase",
+    }
 
 
 def _root(tmp_path):

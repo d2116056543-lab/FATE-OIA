@@ -1078,6 +1078,20 @@ def fit_calibrator(
     return rows
 
 
+def _fill_inactive_epoch_rows(rows: dict[str, list[dict[str, Any]]], *, epoch: int, phase: str) -> None:
+    """Record an explicit inactive state without replacing real component diagnostics."""
+    for name in EPOCH_JSONL_FILES:
+        if not rows.get(name):
+            rows[name] = [
+                {
+                    "epoch": epoch,
+                    "phase": phase,
+                    "available": False,
+                    "reason": "component_not_active_in_phase",
+                }
+            ]
+
+
 @torch.no_grad()
 def evaluate_factor_modes(
     model,
@@ -1435,8 +1449,7 @@ def run(args: argparse.Namespace) -> None:
             evaluation["sample_ids"],
             epoch=epoch,
         )
-        for name in EPOCH_JSONL_FILES:
-            rows.setdefault(name, [{"epoch": epoch, "available": False, "reason": "phase_not_active"}])
+        _fill_inactive_epoch_rows(rows, epoch=epoch, phase=controls.phase)
         logit_map = {
             "action_visual.pt": evaluation["logits"]["action_visual"],
             "action_state.pt": evaluation["logits"]["action_state"],
