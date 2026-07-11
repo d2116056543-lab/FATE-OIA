@@ -6,9 +6,35 @@ import pytest
 import torch
 
 from fate_oia.engine.diagnose_acpr_mosaic_ad_components import (
+    _load_checkpoint_optimizers,
     _remove_verified_vproj_aliases,
     _summarize_training_rows,
 )
+
+
+class _OptimizerRecorder:
+    def __init__(self) -> None:
+        self.loaded = None
+
+    def load_state_dict(self, state) -> None:
+        self.loaded = state
+
+
+def test_checkpoint_loader_restores_both_optimizer_states() -> None:
+    representation = _OptimizerRecorder()
+    calibration = _OptimizerRecorder()
+    payload = {
+        "representation": {"state": {1: {}}, "param_groups": [{"params": [1]}]},
+        "calibration": {"state": {2: {}}, "param_groups": [{"params": [2]}]},
+    }
+    _load_checkpoint_optimizers(representation, calibration, payload)
+    assert representation.loaded is payload["representation"]
+    assert calibration.loaded is payload["calibration"]
+
+
+def test_checkpoint_loader_rejects_incomplete_optimizer_payload() -> None:
+    with pytest.raises(RuntimeError, match="representation and calibration"):
+        _load_checkpoint_optimizers(_OptimizerRecorder(), _OptimizerRecorder(), {"representation": {}})
 
 
 def test_checkpoint_loader_removes_only_equal_dino_vproj_aliases() -> None:

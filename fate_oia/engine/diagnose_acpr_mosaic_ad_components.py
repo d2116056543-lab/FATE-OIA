@@ -56,6 +56,20 @@ def _remove_verified_vproj_aliases(state_dict: dict[str, torch.Tensor]) -> dict[
     return cleaned
 
 
+def _load_checkpoint_optimizers(
+    representation_optimizer: torch.optim.Optimizer,
+    calibration_optimizer: torch.optim.Optimizer,
+    payload: dict[str, Any],
+) -> None:
+    if set(payload) != {"representation", "calibration"}:
+        raise RuntimeError("checkpoint optimizer payload must contain representation and calibration")
+    for name in ("representation", "calibration"):
+        if set(payload[name]) != {"state", "param_groups"}:
+            raise RuntimeError(f"invalid {name} optimizer state")
+    representation_optimizer.load_state_dict(payload["representation"])
+    calibration_optimizer.load_state_dict(payload["calibration"])
+
+
 def _summarize_training_rows(rows: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
     loss_rows = rows["loss_components.jsonl"]
     anchors = _active_rows(rows["action_anchor_stats.jsonl"])
@@ -119,7 +133,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     threshold.load_state_dict(checkpoint["calibrator"])
     action_queue.load_state_dict(checkpoint["action_queue"])
     reason_queue.load_state_dict(checkpoint["reason_queue"])
-    representation_optimizer.load_state_dict(checkpoint["optimizer"])
+    _load_checkpoint_optimizers(
+        representation_optimizer, calibration_optimizer, checkpoint["optimizer"]
+    )
 
     controls = mosaic_phase_controls(args.phase_epoch)
     if controls.phase != "D_joint_ranking" or not controls.posterior_enabled:
