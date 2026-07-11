@@ -71,7 +71,8 @@ if ($Mode -eq "pilot") {
     Invoke-ForegroundPython -Arguments $artifactArgs -ManifestDir $artifactSmokeDir
 
     $pilotRoot = ".background_runs\acpr_mosaic_ad_v1_pilot"
-    foreach ($seed in @(20260710, 20260711, 20260712)) {
+    # User-approved single-seed pre-full diagnostic; formal full training is unchanged.
+    foreach ($seed in @(20260710)) {
         $seedDir = Join-Path $pilotRoot "seed_$seed"
         Assert-NewRunDirectory -Path $seedDir
         $trainArgs = @(

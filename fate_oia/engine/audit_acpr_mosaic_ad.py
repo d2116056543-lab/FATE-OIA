@@ -28,6 +28,10 @@ from fate_oia.optim.mosaic_soft_rank_queue import MOSAICSoftRankQueue
 from fate_oia.utils.mosaic_artifacts import validate_artifact_schema, write_json
 
 
+# User-approved pre-full diagnostic scope. Formal training keeps its fixed seed.
+PILOT_SEEDS = (20260710,)
+
+
 GATE_FILES = {
     "code": "compile_test_gate.json",
     "schema": "schema_ontology_gate.json",
@@ -630,9 +634,9 @@ def _pilot_and_artifact_gates(
             "reason": "two-epoch artifact smoke not supplied",
         }
     if pilot_dir is None or not pilot_dir.exists():
-        pending = {"pass": False, "status": "PENDING", "reason": "three-seed pilot not supplied"}
+        pending = {"pass": False, "status": "PENDING", "reason": "configured pilot seed not supplied"}
         return artifacts, pending, pending.copy()
-    seed_dirs = [pilot_dir / f"seed_{seed}" for seed in (20260710, 20260711, 20260712)]
+    seed_dirs = [pilot_dir / f"seed_{seed}" for seed in PILOT_SEEDS]
     pilot_artifact_results = {
         str(path): validate_artifact_schema(
             path,
@@ -680,9 +684,9 @@ def _pilot_and_artifact_gates(
                     }
                 )
     pilot_pass = (
-        len(metric_results) == 3
-        and len(seed_checks) == 3
-        and len(recovery_results) == 3
+        len(metric_results) == len(PILOT_SEEDS)
+        and len(seed_checks) == len(PILOT_SEEDS)
+        and len(recovery_results) == len(PILOT_SEEDS)
         and all(result.get("pass") for result in pilot_artifact_results.values())
         and all(row.get("improvement", 0.0) > 0 for row in recovery_results)
         and all(
@@ -693,7 +697,7 @@ def _pilot_and_artifact_gates(
             for row in seed_checks
         )
     )
-    visual_pass = len(visual_results) == 3 and all(
+    visual_pass = len(visual_results) == len(PILOT_SEEDS) and all(
         row.get("pass") is True
         and row.get("full_factor_metric", 0) > row.get("prior_only_factor_metric", float("inf"))
         and row.get("content_only_retention", 0) >= 0.70
@@ -796,7 +800,7 @@ def _coverage_matrix(
         ("schedule", "Single canonical six-phase schedule", ("schedule",)),
         ("artifacts", "All root/epoch artifacts contain non-placeholder data", ("artifacts",)),
         ("runtime", "Fastest stable Phase-D runtime and 15-minute probe", ("runtime",)),
-        ("pilot", "Three-seed pilot and visual/content gates", ("pilot", "prototype", "synthetic_missing")),
+        ("pilot", "Configured-seed pilot and visual/content gates", ("pilot", "prototype", "synthetic_missing")),
     )
     runtime_gates = {"direct_image", "prototype", "synthetic_missing", "artifacts", "runtime", "pilot"}
     rows = []

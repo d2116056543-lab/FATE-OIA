@@ -22,6 +22,16 @@ def test_required_files_gate_returns_a_real_complete_result() -> None:
     assert result["missing_tests"] == []
 
 
+def test_user_approved_pre_full_pilot_uses_one_complete_seed() -> None:
+    assert implementation_audit.PILOT_SEEDS == (20260710,)
+    script = (REPO_ROOT / "scripts" / "FATE_OIA_acpr_mosaic_ad_v1_foreground.ps1").read_text(
+        encoding="utf-8-sig"
+    )
+    assert "foreach ($seed in @(20260710))" in script
+    assert "20260711" not in script
+    assert "20260712" not in script
+
+
 def _split_skill(text: str) -> tuple[str, str]:
     assert text.startswith("---\n"), "skill must start with YAML frontmatter"
     frontmatter, separator, body = text[4:].partition("\n---\n")
