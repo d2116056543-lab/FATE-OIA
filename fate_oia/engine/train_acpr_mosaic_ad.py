@@ -28,7 +28,10 @@ from fate_oia.losses.mosaic_posterior_ranking import (
     action_cross_image_ranking_loss,
     posterior_weighted_reason_ranking_loss,
 )
-from fate_oia.losses.mosaic_reason_observation_losses import build_mosaic_reason_loss
+from fate_oia.losses.mosaic_reason_observation_losses import (
+    build_mosaic_reason_loss,
+    fixed_propensity_observation_loss,
+)
 from fate_oia.losses.mosaic_state_losses import build_mosaic_state_loss
 from fate_oia.metrics import binary_average_precision
 from fate_oia.models.acpr_mosaic_ad_model import MOSAICADModel
@@ -833,7 +836,9 @@ def train_representation_epoch(
             else:
                 reason_rank = reason_logits.sum() * 0.0
                 reason_rank_stats = {"pair_weight_sum": reason_rank.detach(), "queue_count": reason_rank.detach()}
-                reason_total = _positive_anchor_reason_loss(reason_logits.float(), reasons)
+                reason_total = fixed_propensity_observation_loss(
+                    selective_output["reason_observation_prob"].float(), reasons
+                )
                 reason_losses = {
                     "loss_reason_total": reason_total,
                     "loss_observation_nll": reason_total,

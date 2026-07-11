@@ -17,6 +17,19 @@ def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor
     return torch.where(denominator > 0, loss, _zero(values)), (mask > 0).sum().detach()
 
 
+def fixed_propensity_observation_loss(
+    observation_probability: torch.Tensor,
+    observed_reason_targets: torch.Tensor,
+) -> torch.Tensor:
+    """Observed-label likelihood without converting an unobserved reason into a latent negative."""
+    if observation_probability.shape != observed_reason_targets.shape:
+        raise ValueError("observation probability and observed reasons must have matching shapes")
+    probability = observation_probability.float().clamp(1e-7, 1.0 - 1e-7)
+    return F.binary_cross_entropy_with_logits(
+        torch.logit(probability), observed_reason_targets.float()
+    )
+
+
 def build_mosaic_reason_loss(
     reason_logits_latent: torch.Tensor,
     observed_reason_targets: torch.Tensor,
@@ -66,10 +79,7 @@ def build_mosaic_reason_loss(
         raise ValueError("M-step posterior target must be detached")
 
     observed = observed_reason_targets.to(dtype=reason_logits_latent.dtype)
-    observation_probability_fp32 = observation_probability.float().clamp(1e-7, 1.0 - 1e-7)
-    observation_nll = F.binary_cross_entropy_with_logits(
-        torch.logit(observation_probability_fp32), observed.float()
-    )
+    observation_nll = fixed_propensity_observation_loss(observation_probability, observed)
     posterior_bce = F.binary_cross_entropy_with_logits(reason_logits_latent, posterior_detached)
     if rank_loss is None:
         rank_loss = _zero(reason_logits_latent)

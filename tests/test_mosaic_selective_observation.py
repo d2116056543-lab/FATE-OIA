@@ -4,6 +4,19 @@ from pathlib import Path
 
 import torch
 
+from fate_oia.losses.mosaic_reason_observation_losses import fixed_propensity_observation_loss
+
+
+def test_fixed_propensity_observation_loss_penalizes_all_on_without_hard_latent_targets() -> None:
+    observed = torch.tensor([[1.0, 0.0]])
+    good = torch.tensor([[0.8, 0.1]], requires_grad=True)
+    all_on = torch.tensor([[0.8, 0.8]], requires_grad=True)
+    good_loss = fixed_propensity_observation_loss(good, observed)
+    all_on_loss = fixed_propensity_observation_loss(all_on, observed)
+    assert good_loss < all_on_loss
+    good_loss.backward()
+    assert good.grad is not None and torch.isfinite(good.grad).all()
+
 from fate_oia.models.mosaic_native_semantics import load_mosaic_schema_bundle
 from fate_oia.models.mosaic_selective_observation import MOSAICSelectiveObservationModel
 

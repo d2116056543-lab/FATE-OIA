@@ -12,6 +12,16 @@ from fate_oia.engine.diagnose_acpr_mosaic_ad_components import (
 )
 
 
+def test_component_diagnostic_supports_fresh_two_stage_mode() -> None:
+    import inspect
+    from fate_oia.engine import diagnose_acpr_mosaic_ad_components as diagnostic
+
+    source = inspect.getsource(diagnostic.run)
+    assert "foundation_controls = mosaic_phase_controls(0)" in source
+    assert "controls = mosaic_phase_controls(args.phase_epoch)" in source
+    assert "_mechanism_forward_stats" in source
+
+
 class _OptimizerRecorder:
     def __init__(self) -> None:
         self.loaded = None

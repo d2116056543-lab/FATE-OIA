@@ -104,6 +104,35 @@ def _summarize_training_rows(rows: dict[str, list[dict[str, Any]]]) -> dict[str,
     }
 
 
+@torch.no_grad()
+def _mechanism_forward_stats(model, loader, device, controls) -> dict[str, float]:
+    model.eval()
+    batch = next(iter(loader))
+    images = batch["image"].to(device, non_blocking=True)
+    full = model(images)
+    model.set_phase_controls(
+        state_residual_scale=controls.state_residual_scale,
+        action_state_gate_cap=0.0,
+        reason_state_contribution_cap=0.0,
+    )
+    without_state = model(images)
+    model.set_phase_controls(
+        state_residual_scale=controls.state_residual_scale,
+        action_state_gate_cap=controls.action_state_gate_cap,
+        reason_state_contribution_cap=controls.reason_state_contribution_cap,
+    )
+    return {
+        "action_state_gate_mean": float(full["action_state_gate"].mean().cpu()),
+        "action_state_gate_nonzero_rate": float((full["action_state_gate"].abs() > 1e-8).float().mean().cpu()),
+        "action_state_logit_delta_abs_mean": float(
+            (full["action_logits_raw"] - without_state["action_logits_raw"]).abs().mean().cpu()
+        ),
+        "reason_state_logit_delta_abs_mean": float(
+            (full["reason_logits_latent"] - without_state["reason_logits_latent"]).abs().mean().cpu()
+        ),
+    }
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     output_dir = Path(args.output_dir)
     if output_dir.exists():
@@ -125,17 +154,59 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         config, args.config, device
     )
     representation_optimizer, calibration_optimizer = build_optimizers(model, selective, threshold, config)
-    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    if int(checkpoint["epoch"]) != 4:
-        raise ValueError("component diagnostic requires the completed epoch-4 checkpoint")
-    model.load_state_dict(_remove_verified_vproj_aliases(checkpoint["model"]), strict=True)
-    selective.load_state_dict(checkpoint["selective_observation"])
-    threshold.load_state_dict(checkpoint["calibrator"])
-    action_queue.load_state_dict(checkpoint["action_queue"])
-    reason_queue.load_state_dict(checkpoint["reason_queue"])
-    _load_checkpoint_optimizers(
-        representation_optimizer, calibration_optimizer, checkpoint["optimizer"]
-    )
+    checkpoint = None
+    foundation_summary = None
+    if args.checkpoint:
+        checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
+        if int(checkpoint["epoch"]) != 4:
+            raise ValueError("component diagnostic requires the completed epoch-4 checkpoint")
+        model.load_state_dict(_remove_verified_vproj_aliases(checkpoint["model"]), strict=True)
+        selective.load_state_dict(checkpoint["selective_observation"])
+        threshold.load_state_dict(checkpoint["calibrator"])
+        action_queue.load_state_dict(checkpoint["action_queue"])
+        reason_queue.load_state_dict(checkpoint["reason_queue"])
+        _load_checkpoint_optimizers(
+            representation_optimizer, calibration_optimizer, checkpoint["optimizer"]
+        )
+    else:
+        foundation_controls = mosaic_phase_controls(0)
+        _apply_phase(model, selective, representation_optimizer, foundation_controls)
+        foundation_rows, _ = train_representation_epoch(
+            model=model,
+            selective=selective,
+            action_queue=action_queue,
+            reason_queue=reason_queue,
+            loader=train_loader,
+            optimizer=representation_optimizer,
+            action_anchor=MOSAICActionAnchoredGradient(
+                aux_shared_lambda_max=float(config["optimizer"]["aux_shared_lambda_max"]),
+                action_anchor_kappa=float(config["optimizer"]["action_anchor_kappa"]),
+            ),
+            grounding_builder=MOSAICGroundingObservationBuilder(model.schema_bundle["factors"]),
+            grounding_index=BDD100KGroundingIndex(config["data"]["bdd100k_root"]),
+            multiview=MOSAICWeakMultiView(
+                [factor["name"] for factor in model.schema_bundle["factors"]], seed=args.seed
+            ),
+            controls=foundation_controls,
+            config=config,
+            device=device,
+            epoch=0,
+            grad_accum=args.grad_accum,
+            global_update=0,
+            total_updates=max(1, math.ceil(len(train_loader) / args.grad_accum)),
+            profile_timing=True,
+        )
+        foundation_summary = _summarize_training_rows(foundation_rows)
+        fit_calibrator(
+            model,
+            threshold,
+            calib_loader,
+            calibration_optimizer,
+            device,
+            epoch=0,
+            max_steps=int(config["calibration"]["steps_per_epoch"]),
+            calibration_config=config["calibration"],
+        )
 
     controls = mosaic_phase_controls(args.phase_epoch)
     if controls.phase != "D_joint_ranking" or not controls.posterior_enabled:
@@ -182,6 +253,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         calibration_config=config["calibration"],
     )
     after = evaluate_mosaic(model, threshold, test_loader, device, epoch=args.phase_epoch)
+    mechanism = _mechanism_forward_stats(model, test_loader, device, controls)
     factor_modes = evaluate_factor_modes(
         model,
         calib_loader,
@@ -195,9 +267,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     before_metrics = _metrics(before)
     after_metrics = _metrics(after)
     action_branch = after["action_branch_metrics"]
-    state_gate_effect = abs(
-        float(action_branch["raw"]["Act_mF1"]) - float(action_branch["visual"]["Act_mF1"])
-    )
+    state_gate_effect = abs(float(action_branch["raw"]["Act_mF1"]) - float(action_branch["visual"]["Act_mF1"]))
     checks = {
         "all_losses_finite": training["finite_losses"],
         "no_loader_stall": training["loader_stalls"] == 0,
@@ -206,7 +276,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "propensity_not_collapsed": 0.05 < training["propensity_mean"] < 0.95,
         "action_anchor_pass": training["anchor_pass_rate"] >= 0.95,
         "anchor_cosine_finite": math.isfinite(training["anchor_cosine_mean"]),
-        "state_action_path_active": state_gate_effect > 1e-6,
+        "state_action_path_active": mechanism["action_state_logit_delta_abs_mean"] > 1e-6,
+        "reason_state_path_active": mechanism["reason_state_logit_delta_abs_mean"] > 1e-6,
         "content_factor_active": factor_modes["full_factor_metric"] > factor_modes["prior_only_factor_metric"],
         "content_only_retained": factor_modes["content_only_retention"] >= 0.70,
         "action_no_short_collapse": after_metrics["Act_mF1"] >= before_metrics["Act_mF1"] - 0.02,
@@ -224,13 +295,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "optimizer": representation_optimizer.state_dict(),
             "epoch": args.phase_epoch,
             "phase": controls.phase,
-            "source_checkpoint": str(Path(args.checkpoint).resolve()),
+            "source_checkpoint": str(Path(args.checkpoint).resolve()) if args.checkpoint else None,
         },
         diagnostic_checkpoint,
     )
     result = {
         "pass": all(checks.values()),
-        "source_checkpoint_epoch": int(checkpoint["epoch"]),
+        "source_checkpoint_epoch": int(checkpoint["epoch"]) if checkpoint else None,
+        "fresh_two_stage": checkpoint is None,
+        "foundation_training": foundation_summary,
         "phase_epoch": args.phase_epoch,
         "phase": controls.phase,
         "sample_counts": split_stats,
@@ -239,6 +312,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "delta": {name: after_metrics[name] - before_metrics[name] for name in before_metrics},
         "action_branches": action_branch,
         "state_gate_effect_mf1": state_gate_effect,
+        "mechanism_forward": mechanism,
         "factor_modes": factor_modes,
         "training": training,
         "checks": checks,
@@ -252,7 +326,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
-    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--checkpoint")
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--phase_epoch", type=int, default=9)
