@@ -406,11 +406,19 @@ def _gradient_attribution(
         for loss_name, loss in losses.items():
             model.zero_grad(set_to_none=True)
             selective.zero_grad(set_to_none=True)
+            threshold.zero_grad(set_to_none=True)
             loss.backward(retain_graph=True)
             vectors[loss_name] = {name: _grad_vector(values).detach().cpu() for name, values in params.items()}
             captured[loss_name] = {name: float(vector.norm().item()) for name, vector in vectors[loss_name].items()}
+            threshold_values = [
+                parameter.grad.detach().flatten()
+                for parameter in threshold.parameters()
+                if parameter.grad is not None
+            ]
+            captured[loss_name]["threshold_head"] = float(torch.cat(threshold_values).norm().item()) if threshold_values else 0.0
         model.zero_grad(set_to_none=True)
         selective.zero_grad(set_to_none=True)
+        threshold.zero_grad(set_to_none=True)
         action_to_reason_adapter = torch.autograd.grad(
             output["action_logits_raw"].sum(), params["reason_adapter"], allow_unused=True, retain_graph=True
         )
