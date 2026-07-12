@@ -62,3 +62,23 @@ def mosaic_phase_controls(epoch: int, *, total_epochs: int = 15) -> MOSAICPhaseC
         epoch, "F_calibration_only", 0.10, 0.25, 0.20,
         False, False, False, 0.0, False, True, True, 0.0, True,
     )
+
+
+def mosaic_continuation_phase_controls(epoch: int) -> MOSAICPhaseControls:
+    """Bounded post-best continuation schedule.
+
+    This schedule deliberately reopens representation learning after the formal
+    run's calibration-only tail. It is only for a short continuation loaded from
+    a known best checkpoint, never for the clean formal schedule.
+    """
+    if type(epoch) is not int or epoch < 0 or epoch >= 5:
+        raise ValueError("continuation epoch must be an integer in [0,4]")
+    if epoch < 2:
+        return MOSAICPhaseControls(
+            epoch, "G_post_best_recovery", 0.10, 0.20, 0.15,
+            True, True, True, 0.5, True, True, True, 0.10, False,
+        )
+    return MOSAICPhaseControls(
+        epoch, "G_post_best_recovery", 0.10, 0.25, 0.20,
+        True, True, True, 1.0, True, True, True, 0.20, False,
+    )

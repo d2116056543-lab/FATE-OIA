@@ -21,7 +21,11 @@ from fate_oia.datasets.mosaic_multiview import MOSAICWeakMultiView
 from fate_oia.datasets.mosaic_train_calib_split import make_multilabel_train_calib_indices
 from fate_oia.engine.eval_acpr_mosaic_ad import evaluate_mosaic
 from fate_oia.engine.export_mosaic_visual_audit import _weak_factor_score
-from fate_oia.engine.mosaic_schedule import MOSAICPhaseControls, mosaic_phase_controls
+from fate_oia.engine.mosaic_schedule import (
+    MOSAICPhaseControls,
+    mosaic_continuation_phase_controls,
+    mosaic_phase_controls,
+)
 from fate_oia.losses.mosaic_action_losses import build_mosaic_action_loss
 from fate_oia.losses.mosaic_factor_losses import build_mosaic_factor_loss
 from fate_oia.losses.mosaic_posterior_ranking import (
@@ -1345,6 +1349,75 @@ def _epoch_stop_reasons(
     return reasons
 
 
+def _continuation_safety_reasons(
+    evaluation: dict[str, Any],
+    diagnostics: dict[str, Any],
+    baseline: dict[str, float],
+) -> list[str]:
+    """Safety-only stops for the bounded post-best continuation.
+
+    The formal scientific stop rule is intentionally not reused here: its
+    all-four-AP patience rule is exactly what stopped the original run while
+    explanation was still improving. We retain only hard correctness and
+    catastrophic-regression guards.
+    """
+    summary = evaluation["metrics_summary"]
+    reasons: list[str] = []
+    action = float(summary["deploy_fixed"]["Act_mF1"])
+    explanation = float(summary["deploy_fixed"]["Exp_mF1"])
+    if action < baseline["action"] - 0.010:
+        reasons.append("continuation_action_mf1_drop_gt_0p010")
+    if explanation < baseline["explanation"] - 0.015:
+        reasons.append("continuation_exp_mf1_drop_gt_0p015")
+    if diagnostics.get("factor_presence_saturation_rate", 0.0) > 0.50:
+        reasons.append("factor_presence_saturation_rate_gt_0p50")
+    if diagnostics.get("factor_unjustified_saturation_rate", 0.0) > 0.25:
+        reasons.append("factor_unjustified_saturation_rate_gt_0p25")
+    if diagnostics.get("propensity_bound_rate", 0.0) > 0.90:
+        reasons.append("propensity_at_bounds_gt_0p90")
+    if (
+        diagnostics.get("posterior_all_on_rate", 0.0) > 0.90
+        or diagnostics.get("posterior_all_off_rate", 0.0) > 0.90
+    ):
+        reasons.append("latent_reason_posterior_all_on_or_all_off_gt_0p90")
+    return reasons
+
+
+def _restore_continuation_state(
+    checkpoint_path: str | Path,
+    *,
+    model,
+    selective,
+    threshold,
+    action_queue,
+    reason_queue,
+    representation_optimizer,
+    calibration_optimizer,
+    device: torch.device,
+) -> dict[str, Any]:
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    required = {
+        "model", "selective_observation", "calibrator", "action_queue",
+        "reason_queue", "optimizer", "epoch", "best_metrics",
+    }
+    missing = sorted(required.difference(checkpoint))
+    if missing:
+        raise ValueError(f"continuation checkpoint missing keys: {missing}")
+    if int(checkpoint["epoch"]) != 12:
+        raise ValueError(
+            "continuation must start from the epoch-12 joint-best checkpoint, "
+            f"got epoch={checkpoint['epoch']}"
+        )
+    model.load_state_dict(checkpoint["model"], strict=True)
+    selective.load_state_dict(checkpoint["selective_observation"], strict=True)
+    threshold.load_state_dict(checkpoint["calibrator"], strict=True)
+    action_queue.load_state_dict(checkpoint["action_queue"], strict=True)
+    reason_queue.load_state_dict(checkpoint["reason_queue"], strict=True)
+    representation_optimizer.load_state_dict(checkpoint["optimizer"]["representation"])
+    calibration_optimizer.load_state_dict(checkpoint["optimizer"]["calibration"])
+    return checkpoint
+
+
 def run(args: argparse.Namespace) -> None:
     config = load_config(args.config)
     torch.manual_seed(args.seed)
@@ -1377,6 +1450,25 @@ def run(args: argparse.Namespace) -> None:
     )
     model, selective, threshold, action_queue, reason_queue = build_model_components(config, args.config, device)
     representation_optimizer, calibration_optimizer = build_optimizers(model, selective, threshold, config)
+    continuation = args.resume_checkpoint is not None
+    checkpoint = None
+    reference_best: dict[str, Any] = {}
+    if continuation:
+        checkpoint = _restore_continuation_state(
+            args.resume_checkpoint,
+            model=model,
+            selective=selective,
+            threshold=threshold,
+            action_queue=action_queue,
+            reason_queue=reason_queue,
+            representation_optimizer=representation_optimizer,
+            calibration_optimizer=calibration_optimizer,
+            device=device,
+        )
+        if args.reference_best_json:
+            reference_best = json.loads(Path(args.reference_best_json).read_text(encoding="utf-8"))
+        if not reference_best:
+            reference_best = dict(checkpoint.get("best_metrics", {}))
     grounding_builder = MOSAICGroundingObservationBuilder(model.schema_bundle["factors"])
     grounding_index = BDD100KGroundingIndex(config["data"]["bdd100k_root"])
     factor_names = [factor["name"] for factor in model.schema_bundle["factors"]]
@@ -1406,18 +1498,33 @@ def run(args: argparse.Namespace) -> None:
         "calibration": config["calibration"],
         "split_hash": split_stats["split_hash"],
         "foreground_only": True, "runtime_profile_hash": runtime_profile["sha256"],
+        "continuation": continuation,
+        "resume_checkpoint": str(args.resume_checkpoint) if continuation else None,
+        "reference_best_json": str(args.reference_best_json) if continuation else None,
+        "reference_best_epoch": 12 if continuation else None,
     }
     initialize_run_artifacts(
         output_dir, manifest=manifest, config=config,
         git_state={"head": manifest["git_head"], "branch": "acpr_mosaic_ad_v1_direct_image"},
         runtime_profile=runtime_profile, split_stats=split_stats,
     )
-    total_repr_updates = max(1, math.ceil(len(train_loader) / grad_accum) * 13)
+    total_repr_updates = max(
+        1,
+        math.ceil(len(train_loader) / grad_accum) * (args.epochs if continuation else 13),
+    )
     global_update = 0
-    best: dict[str, Any] = {}
+    best: dict[str, Any] = dict(reference_best)
     failure_history: list[dict[str, Any]] = []
+    continuation_baseline = {
+        "action": float(reference_best.get("action", 0.0)),
+        "explanation": float(reference_best.get("reason", 0.0)),
+    }
     for epoch in range(args.epochs):
-        controls = mosaic_phase_controls(epoch)
+        controls = (
+            mosaic_continuation_phase_controls(epoch)
+            if continuation
+            else mosaic_phase_controls(epoch)
+        )
         _apply_phase(model, selective, representation_optimizer, controls)
         if controls.calibration_only:
             rows = {
@@ -1603,7 +1710,11 @@ def run(args: argparse.Namespace) -> None:
                     if failed
                 ],
             }
-            reasons = _epoch_stop_reasons(epoch, evaluation, failure_history, diagnostics)
+            reasons = (
+                _continuation_safety_reasons(evaluation, diagnostics, continuation_baseline)
+                if continuation
+                else _epoch_stop_reasons(epoch, evaluation, failure_history, diagnostics)
+            )
         decision = {
             "epoch": epoch,
             "event": "continue" if not reasons else "hard_stop",
@@ -1615,9 +1726,13 @@ def run(args: argparse.Namespace) -> None:
         if reasons:
             raise RuntimeError(f"MOSAIC scientific stop rule triggered: {reasons}")
     completion_name = (
+        "CONTINUATION_COMPLETED_ACPR_MOSAIC_AD_V1.json"
+        if continuation
+        else (
         "GOAL_COMPLETED_ACPR_MOSAIC_AD_V1.json"
         if args.epochs == 15 and args.max_train_samples is None
         else "BOUNDED_RUN_COMPLETED_ACPR_MOSAIC_AD_V1.json"
+        )
     )
     write_json(
         output_dir / completion_name,
@@ -1640,8 +1755,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_test_samples", type=int)
     parser.add_argument("--seed", type=int, default=20260710)
     parser.add_argument("--allow_missing_runtime_profile", action="store_true")
+    parser.add_argument("--resume_checkpoint")
+    parser.add_argument("--reference_best_json")
     args = parser.parse_args()
-    if args.epochs != 15 and not (args.max_train_samples and args.epochs > 0):
+    if args.resume_checkpoint and args.epochs != 5:
+        raise ValueError("MOSAIC continuation is bounded to exactly 5 epochs")
+    if not args.resume_checkpoint and args.epochs != 15 and not (args.max_train_samples and args.epochs > 0):
         raise ValueError("only bounded smoke may override the 15-epoch formal schedule")
     args.command_line = list(__import__("sys").argv)
     return args
