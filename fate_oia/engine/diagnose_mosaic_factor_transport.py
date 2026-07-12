@@ -341,7 +341,25 @@ def _cosine(left: torch.Tensor, right: torch.Tensor) -> float:
     return float((left @ right / denom.clamp_min(1e-12)).item()) if denom.item() > 0 else float("nan")
 
 
-def _gradient_attribution(model: nn.Module, selective: nn.Module, batch: dict[str, Any], device: torch.device, observations: dict[str, torch.Tensor]) -> dict[str, Any]:
+def _within_batch_pair_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    terms = []
+    positive = targets > 0.5
+    for label_id in range(targets.shape[1]):
+        pos = logits[:, label_id][positive[:, label_id]]
+        neg = logits[:, label_id][~positive[:, label_id]]
+        if pos.numel() and neg.numel():
+            terms.append(F.softplus(-(pos[:, None] - neg[None, :])).mean())
+    return torch.stack(terms).mean() if terms else logits.sum() * 0.0
+
+
+def _gradient_attribution(
+    model: nn.Module,
+    selective: nn.Module,
+    threshold: nn.Module,
+    batch: dict[str, Any],
+    device: torch.device,
+    observations: dict[str, torch.Tensor],
+) -> dict[str, Any]:
     model.train(False)
     selective.train(False)
     images = batch["image"].to(device)
@@ -350,6 +368,7 @@ def _gradient_attribution(model: nn.Module, selective: nn.Module, batch: dict[st
     with torch.enable_grad():
         output = model(images, return_masks=True, return_intermediates=True)
         selective_output = selective(output["reason_logits_latent"], reasons, output["factor_visibility_prob"], output["factor_uncertainty"])
+        threshold_output = threshold(output["action_logits_raw"], output["reason_logits_latent"])
         action_loss = F.binary_cross_entropy_with_logits(output["action_logits_raw"], actions)
         factor_mask = observations["presence_mask"].to(device)
         factor_target = observations["presence_target"].to(device)
@@ -365,11 +384,21 @@ def _gradient_attribution(model: nn.Module, selective: nn.Module, batch: dict[st
             if pos.numel() and neg.numel():
                 pair_terms.append(F.softplus(-(pos[:, None] - neg[None, :])).mean())
         posterior_ranking_loss = torch.stack(pair_terms).mean() if pair_terms else output["reason_logits_latent"].sum() * 0.0
+        calibration_loss = 0.5 * (
+            F.binary_cross_entropy_with_logits(threshold_output["action_logits_deploy"], actions)
+            + F.binary_cross_entropy_with_logits(threshold_output["reason_logits_deploy"], reasons)
+        )
+        pair_loss = 0.5 * (
+            _within_batch_pair_loss(output["action_logits_raw"], actions)
+            + _within_batch_pair_loss(output["reason_logits_latent"], reasons)
+        )
         losses = {
             "action_loss": action_loss,
             "factor_loss": factor_loss,
             "reason_observation_loss": observation_loss,
             "posterior_ranking_loss": posterior_ranking_loss,
+            "calibration_loss": calibration_loss,
+            "pair_loss": pair_loss,
         }
         params = _module_parameters(model)
         captured: dict[str, dict[str, float]] = {}
@@ -394,7 +423,12 @@ def _gradient_attribution(model: nn.Module, selective: nn.Module, batch: dict[st
             "reason_observation_loss_action_adapter_norm": captured["reason_observation_loss"]["action_adapter"],
         }
         cosine = {}
-        for left_name, right_name in (("action_loss", "reason_observation_loss"), ("action_loss", "factor_loss"), ("action_loss", "posterior_ranking_loss")):
+        for left_name, right_name in (
+            ("action_loss", "reason_observation_loss"),
+            ("action_loss", "factor_loss"),
+            ("action_loss", "calibration_loss"),
+            ("action_loss", "pair_loss"),
+        ):
             cosine[f"{left_name}_vs_{right_name}"] = {
                 name: _cosine(vectors[left_name][name], vectors[right_name][name]) for name in params
             }
@@ -566,6 +600,7 @@ def _collect_checkpoint(
     gradient = _gradient_attribution(
         model,
         selective,
+        threshold,
         first_batch_for_grad,
         device,
         {key: value.to(device) for key, value in (first_observation or {}).items()},
