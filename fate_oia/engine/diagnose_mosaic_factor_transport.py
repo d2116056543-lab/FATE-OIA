@@ -325,8 +325,15 @@ def _module_parameters(model: nn.Module) -> dict[str, list[nn.Parameter]]:
 
 
 def _grad_vector(parameters: list[nn.Parameter]) -> torch.Tensor:
-    values = [parameter.grad.detach().flatten() for parameter in parameters if parameter.grad is not None]
-    return torch.cat(values) if values else torch.zeros(1)
+    if not parameters:
+        return torch.zeros(1)
+    values = [
+        parameter.grad.detach().flatten()
+        if parameter.grad is not None
+        else torch.zeros_like(parameter).flatten()
+        for parameter in parameters
+    ]
+    return torch.cat(values)
 
 
 def _cosine(left: torch.Tensor, right: torch.Tensor) -> float:
