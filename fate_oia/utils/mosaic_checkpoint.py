@@ -19,6 +19,8 @@ def remove_verified_dino_vproj_aliases(
 
 def restore_verified_dino_vproj_aliases(
     state_dict: dict[str, torch.Tensor],
+    *,
+    expected_keys: set[str] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Normalize checkpoints to the current DINO runtime alias contract.
 
@@ -33,10 +35,16 @@ def restore_verified_dino_vproj_aliases(
         if ".attn.proj." not in key:
             continue
         alias_key = key.replace(".attn.proj.", ".attn.vproj.")
-        if alias_key not in cleaned:
+        if alias_key not in cleaned and (expected_keys is None or alias_key in expected_keys):
             cleaned[alias_key] = value.clone()
+    if expected_keys is not None:
+        cleaned = {key: value for key, value in cleaned.items() if key in expected_keys}
     return cleaned
 
 
 def load_mosaic_model_state_strict(model, state_dict: dict[str, torch.Tensor]) -> None:
-    model.load_state_dict(restore_verified_dino_vproj_aliases(state_dict), strict=True)
+    expected_keys = set(model.state_dict())
+    model.load_state_dict(
+        restore_verified_dino_vproj_aliases(state_dict, expected_keys=expected_keys),
+        strict=True,
+    )

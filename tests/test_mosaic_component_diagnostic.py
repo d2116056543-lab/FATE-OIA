@@ -85,6 +85,19 @@ def test_checkpoint_loader_restores_missing_runtime_alias() -> None:
     )
 
 
+def test_checkpoint_loader_matches_current_model_key_contract() -> None:
+    projection = torch.ones(2, 2)
+    state = {
+        "dino.backbone.blocks.0.attn.proj.weight": projection,
+        "dino.backbone.blocks.0.attn.vproj.weight": projection.clone(),
+    }
+    normalized = restore_verified_dino_vproj_aliases(
+        state,
+        expected_keys={"dino.backbone.blocks.0.attn.proj.weight"},
+    )
+    assert set(normalized) == {"dino.backbone.blocks.0.attn.proj.weight"}
+
+
 def test_component_diagnostic_summarizes_real_phase_d_signals() -> None:
     rows = {
         "loss_components.jsonl": [
