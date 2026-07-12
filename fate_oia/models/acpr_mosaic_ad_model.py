@@ -166,10 +166,17 @@ class MOSAICADModel(nn.Module):
         super()._load_from_state_dict(
             state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
         )
-        self._state_residual_scale_value = float(self.state_residual_scale.detach().cpu())
-        self._action_state_gate_cap_value = float(self.action_state_gate_cap.detach().cpu())
-        self._reason_state_contribution_cap_value = float(
-            self.reason_state_contribution_cap.detach().cpu()
+        # Checkpoints store these controls as float32 buffers.  Clamp the
+        # restored Python values so 0.20000000298 does not violate the
+        # documented inclusive upper bound after serialization.
+        self._state_residual_scale_value = min(
+            1.0, max(0.0, float(self.state_residual_scale.detach().cpu()))
+        )
+        self._action_state_gate_cap_value = min(
+            0.25, max(0.0, float(self.action_state_gate_cap.detach().cpu()))
+        )
+        self._reason_state_contribution_cap_value = min(
+            0.20, max(0.0, float(self.reason_state_contribution_cap.detach().cpu()))
         )
 
     def forward(
