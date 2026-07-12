@@ -178,6 +178,7 @@ class MOSAICADModel(nn.Module):
         *,
         prior_mode: str = "full",
         return_masks: bool = False,
+        return_intermediates: bool = False,
     ) -> dict[str, torch.Tensor | dict[str, Any]]:
         field = self.dino(images)
         pyramid = self.visual_pyramid(field["patch_tokens_by_layer"])
@@ -217,4 +218,11 @@ class MOSAICADModel(nn.Module):
             output.pop("factor_soft_masks", None)
             output.pop("sampling_coordinates", None)
             output.pop("reason_factor_masks", None)
+        if return_intermediates:
+            # Diagnostics only: expose exact decoder inputs without changing
+            # the default training/evaluation path.
+            output["_diagnostic_intermediates"] = {
+                "action_pyramid": action_pyramid,
+                "reason_pyramid": reason_pyramid,
+            }
         return output
