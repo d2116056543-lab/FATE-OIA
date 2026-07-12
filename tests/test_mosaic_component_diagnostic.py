@@ -9,7 +9,10 @@ from fate_oia.engine.diagnose_acpr_mosaic_ad_components import (
     _load_checkpoint_optimizers,
     _summarize_training_rows,
 )
-from fate_oia.utils.mosaic_checkpoint import remove_verified_dino_vproj_aliases
+from fate_oia.utils.mosaic_checkpoint import (
+    remove_verified_dino_vproj_aliases,
+    restore_verified_dino_vproj_aliases,
+)
 
 
 def test_component_diagnostic_supports_fresh_two_stage_mode() -> None:
@@ -70,6 +73,16 @@ def test_checkpoint_loader_rejects_non_alias_vproj_values() -> None:
                 "dino.backbone.blocks.0.attn.vproj.weight": torch.ones(2, 2),
             }
         )
+
+
+def test_checkpoint_loader_restores_missing_runtime_alias() -> None:
+    projection = torch.arange(4, dtype=torch.float32).reshape(2, 2)
+    restored = restore_verified_dino_vproj_aliases(
+        {"dino.backbone.blocks.0.attn.proj.weight": projection}
+    )
+    assert torch.equal(
+        restored["dino.backbone.blocks.0.attn.vproj.weight"], projection
+    )
 
 
 def test_component_diagnostic_summarizes_real_phase_d_signals() -> None:
