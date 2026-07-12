@@ -53,6 +53,7 @@ from fate_oia.utils.mosaic_artifacts import (
     write_epoch_artifacts,
     write_json,
 )
+from fate_oia.utils.mosaic_checkpoint import load_mosaic_model_state_strict
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
@@ -1408,7 +1409,10 @@ def _restore_continuation_state(
             "continuation must start from the epoch-12 joint-best checkpoint, "
             f"got epoch={checkpoint['epoch']}"
         )
-    model.load_state_dict(checkpoint["model"], strict=True)
+    # Older formal checkpoints may contain verified runtime-only vproj aliases
+    # added to frozen DINO attention modules. They are not model parameters and
+    # must be removed before the strict trainable-model restore.
+    load_mosaic_model_state_strict(model, checkpoint["model"])
     selective.load_state_dict(checkpoint["selective_observation"], strict=True)
     threshold.load_state_dict(checkpoint["calibrator"], strict=True)
     action_queue.load_state_dict(checkpoint["action_queue"], strict=True)
