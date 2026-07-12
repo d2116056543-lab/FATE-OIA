@@ -49,7 +49,10 @@ def binary_roc_auc(scores: torch.Tensor, targets: torch.Tensor) -> float:
         return float("nan")
     order = torch.argsort(scores, descending=False, stable=True)
     ranks = torch.arange(1, scores.numel() + 1, dtype=torch.float32, device=scores.device)
-    positive_rank_sum = ranks[order][targets[order]].sum()
+    # ``ranks`` is already in ascending-score order; indexing it by the
+    # sorted labels, rather than by original sample indices, gives the true
+    # Mann-Whitney rank statistic.
+    positive_rank_sum = ranks[targets[order]].sum()
     u = positive_rank_sum - positives * (positives + 1) / 2.0
     return float((u / (positives * negatives)).item())
 
