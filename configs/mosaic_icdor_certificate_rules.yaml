@@ -1,0 +1,20 @@
+certificate_rules:
+  version: icdor_v3
+  certified:
+    min_confirmed_positive: 32
+    min_reliable_negative: 32
+    min_geometry_valid: 200
+    min_full_minus_prior_lcb95: 0.02
+    min_content_fraction: 0.70
+    min_query_shuffle_drop_lcb95: 0.01
+    min_image_shuffle_drop_lcb95: 0.01
+    min_grounding_minus_random_lcb95: 0.02
+    min_effective_prototype_count: 1.5
+    max_dominant_prototype_rate: 0.85
+    require_nonzero_presence_visibility_variance: true
+  reason_only:
+    require_stable_content_shuffle: true
+    allow_action_route: false
+  abstained:
+    allow_explicit_routes: false
+    allow_escape_token: true

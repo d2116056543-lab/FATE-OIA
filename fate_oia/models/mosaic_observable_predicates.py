@@ -197,8 +197,8 @@ class MOSAICObservablePredicateLayer(nn.Module):
         dim: int = 384,
         anchors_per_factor: int = 2,
         heads: int = 4,
-        point_samples: int = 8,
-        curve_samples: int = 12,
+        point_samples: int = 4,
+        curve_samples: int = 16,
         region_samples: int = 12,
         prior_scale_init: float = 0.05,
         prior_scale_max: float = 0.20,
@@ -209,9 +209,21 @@ class MOSAICObservablePredicateLayer(nn.Module):
         factors = tuple(factors)
         if not factors:
             raise ValueError("observable predicate layer requires factor definitions")
-        required = {"name", "type", "num_prototypes", "region_prior"}
+        required = {"name", "type", "num_prototypes"}
         if any(not isinstance(factor, dict) or not required <= set(factor) for factor in factors):
             raise ValueError("observable predicate factor definitions are incomplete")
+        region_priors: list[str] = []
+        for factor in factors:
+            if "weak_regions" in factor:
+                weak_regions = factor["weak_regions"]
+                if not isinstance(weak_regions, list) or len(weak_regions) != 1 or not isinstance(weak_regions[0], str):
+                    raise ValueError("IC-DOR factors must provide exactly one observable weak region")
+                region_priors.append(weak_regions[0])
+            elif "region_prior" in factor:
+                # Legacy MOSAIC-AD compatibility; IC-DOR config uses weak_regions.
+                region_priors.append(str(factor["region_prior"]))
+            else:
+                raise ValueError("observable predicate factor definitions require weak_regions")
         self.factor_names = tuple(str(factor["name"]) for factor in factors)
         self.factor_types = tuple(str(factor["type"]) for factor in factors)
         self.factor_count = len(factors)
@@ -219,7 +231,7 @@ class MOSAICObservablePredicateLayer(nn.Module):
         self.anchors_per_factor = anchors_per_factor
         self.prototype_bank = MOSAICMultiPrototypeFactorBank(
             tuple(int(factor["num_prototypes"]) for factor in factors),
-            tuple(str(factor["region_prior"]) for factor in factors),
+            tuple(region_priors),
             dim=dim,
             prior_scale_init=prior_scale_init,
             prior_scale_max=prior_scale_max,
@@ -274,18 +286,22 @@ class MOSAICObservablePredicateLayer(nn.Module):
         self,
         sampled_features: torch.Tensor,
         prototype_weights: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        factor_queries = self._factor_queries(prototype_weights)
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         sampled_features = sampled_features.to(dtype=self.sample_key_proj.weight.dtype)
         sample_keys = F.normalize(self.sample_key_proj(sampled_features), dim=-1, eps=1e-6)
-        queries = F.normalize(factor_queries, dim=-1, eps=1e-6)
-        sample_logits = torch.einsum("bfmhsd,bfd->bfmhs", sample_keys, queries)
-        valid = self.typed_attention.sample_valid_mask.view(1, self.factor_count, 1, 1, -1)
-        sample_logits = sample_logits.masked_fill(~valid, -1e4)
-        flat_attention = entmax15_bisect(sample_logits.flatten(2), dim=-1)
+        prototype_queries = F.normalize(self.prototype_bank.prototypes, dim=-1, eps=1e-6)
+        sample_logits = torch.einsum("bfmhsd,fkd->bfkmhs", sample_keys, prototype_queries)
+        sample_valid = self.typed_attention.sample_valid_mask.view(1, self.factor_count, 1, 1, 1, -1)
+        prototype_valid = self.prototype_bank.prototype_valid_mask.view(
+            1, self.factor_count, self.prototype_bank.max_prototypes, 1, 1, 1
+        )
+        sample_logits = sample_logits.masked_fill(~(sample_valid & prototype_valid), -1e4)
+        flat_attention = entmax15_bisect(sample_logits.flatten(3), dim=-1)
         values = self.sample_value_proj(sampled_features).flatten(2, 4)
-        factor_features = torch.einsum("bft,bftd->bfd", flat_attention, values)
-        return factor_features, flat_attention
+        prototype_features = torch.einsum("bfkt,bftd->bfkd", flat_attention, values)
+        factor_features = torch.einsum("bfk,bfkd->bfd", prototype_weights, prototype_features)
+        prototype_support = (flat_attention > 1e-5).float().sum(-1)
+        return factor_features, flat_attention, prototype_support
 
     def _factor_queries(self, prototype_weights: torch.Tensor) -> torch.Tensor:
         prototype_mask = self.prototype_bank.prototype_valid_mask.to(dtype=self.prototype_bank.prototypes.dtype)
@@ -295,14 +311,16 @@ class MOSAICObservablePredicateLayer(nn.Module):
             self.prototype_bank.prototypes * prototype_mask.unsqueeze(-1),
         )
 
-    def _read_mid_features(self, middle: torch.Tensor, factor_queries: torch.Tensor) -> torch.Tensor:
+    def _read_mid_features(self, middle: torch.Tensor, prototype_weights: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         middle = middle.to(dtype=self.mid_key_proj.weight.dtype)
         keys = F.normalize(self.mid_key_proj(middle).flatten(2).transpose(1, 2), dim=-1, eps=1e-6)
-        queries = F.normalize(factor_queries, dim=-1, eps=1e-6)
-        scores = torch.einsum("bfd,bnd->bfn", queries, keys)
+        queries = F.normalize(self.prototype_bank.prototypes, dim=-1, eps=1e-6)
+        scores = torch.einsum("fkd,bnd->bfkn", queries, keys)
+        scores = scores.masked_fill(~self.prototype_bank.prototype_valid_mask.view(1, self.factor_count, -1, 1), -1e4)
         attention = entmax15_bisect(scores, dim=-1)
         values = self.mid_value_proj(middle).flatten(2).transpose(1, 2)
-        return torch.einsum("bfn,bnd->bfd", attention, values)
+        prototype_features = torch.einsum("bfkn,bnd->bfkd", attention, values)
+        return torch.einsum("bfk,bfkd->bfd", prototype_weights, prototype_features), (attention > 1e-5).float().sum(-1)
 
     @staticmethod
     def _binary_entropy(probability: torch.Tensor) -> torch.Tensor:
@@ -335,11 +353,17 @@ class MOSAICObservablePredicateLayer(nn.Module):
                 * self.typed_attention.heads
                 * self.typed_attention.max_samples,
             )
+            sparse_prototype_support = factor_queries.new_zeros(
+                batch_size, self.factor_count, self.prototype_bank.max_prototypes
+            )
+            mid_prototype_support = sparse_prototype_support.clone()
         else:
-            sparse_features, sample_attention = self._read_sparse_samples(
+            sparse_features, sample_attention, sparse_prototype_support = self._read_sparse_samples(
                 typed_output["sampled_features"], prototype_output["prototype_weights"]
             )
-            mid_features = self._read_mid_features(middle, factor_queries)
+            mid_features, mid_prototype_support = self._read_mid_features(
+                middle, prototype_output["prototype_weights"]
+            )
             factor_features = self.feature_fusion(sparse_features + mid_features)
         presence_logits = self.presence_head(factor_features)
         visibility_logits = self.visibility_head(factor_features)
@@ -358,6 +382,8 @@ class MOSAICObservablePredicateLayer(nn.Module):
             **prototype_output["prototype_stats"],
             "anchor_separation_mean": anchor_separation.mean().detach(),
             "sample_attention_support_mean": (sample_attention > 1e-5).float().sum(-1).mean().detach(),
+            "fine_prototype_support": sparse_prototype_support.detach(),
+            "mid_prototype_support": mid_prototype_support.detach(),
         }
         return {
             "factor_features": factor_features,
@@ -370,6 +396,7 @@ class MOSAICObservablePredicateLayer(nn.Module):
             "factor_uncertainty": uncertainty,
             "factor_soft_masks": soft_masks,
             "prototype_weights": prototype_output["prototype_weights"],
+            "prototype_scores": prototype_output["prototype_scores"],
             "anchor_coordinates": anchors,
             "sampling_coordinates": typed_output["sampling_coordinates"],
             "prior_scale": prototype_output["prior_scale"],

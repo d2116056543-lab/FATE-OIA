@@ -88,7 +88,12 @@ class MOSAICWeakMultiView:
         transformed = image.flip(-1) if metadata["horizontal_flip"] else image
         mean = transformed.mean(dim=(-2, -1), keepdim=True)
         transformed = (transformed - mean) * float(metadata["contrast_factor"]) + mean
-        return (transformed + float(metadata["brightness_delta"])).clamp(0.0, 1.0)
+        transformed = transformed + float(metadata["brightness_delta"])
+        # The formal direct-image loader already applies DINO normalization.
+        # Clamping such tensors to [0,1] destroys the input distribution.
+        if image.detach().amin() >= 0.0 and image.detach().amax() <= 1.0:
+            transformed = transformed.clamp(0.0, 1.0)
+        return transformed
 
     def __call__(self, image: torch.Tensor) -> dict[str, Any]:
         if not isinstance(image, torch.Tensor) or image.ndim != 3 or image.shape[0] != 3:
@@ -129,6 +134,18 @@ class MOSAICWeakMultiView:
             raise ValueError("factor masks must have factor, height, and width axes")
         restored = masks.flip(-1) if metadata["horizontal_flip"] else masks
         return self._restore_factor_axis(restored, metadata, factor_dim)
+
+    def invert_factor_values(
+        self,
+        values: torch.Tensor,
+        metadata: Mapping[str, Any],
+        *,
+        factor_dim: int = -1,
+    ) -> torch.Tensor:
+        """Restore the ontology order for non-spatial per-factor values."""
+        if not isinstance(values, torch.Tensor) or values.ndim < 1:
+            raise ValueError("factor values must expose a factor axis")
+        return self._restore_factor_axis(values, metadata, factor_dim)
 
     def invert_factor_coordinates(
         self,

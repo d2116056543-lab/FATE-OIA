@@ -687,3 +687,215 @@ def load_mosaic_schema_bundle(config_root: str | Path) -> dict[str, Any]:
     }
     validate_mosaic_schema_bundle(bundle)
     return bundle
+
+
+# IC-DOR deliberately uses an ontology that is separate from the legacy
+# decision-state bundle.  The legacy bundle contains state-to-action semantics;
+# this loader accepts only observable factors and target-owned candidate routes.
+_ICDOR_FACTOR_FIELDS = {
+    "name",
+    "type",
+    "num_prototypes",
+    "weak_regions",
+    "mirror_of",
+    "contradicts",
+    "positive_reason_anchors",
+    "grounding_sources",
+}
+_ICDOR_REASON_ROUTE_FIELDS = {
+    "group",
+    "direct_factors",
+    "latent_factors",
+    "contradiction_factors",
+    "escape_allowed",
+}
+_ICDOR_ALLOWED_GROUNDING_SOURCES = {"box2d", "lane_polyline", "drivable_mask", "image_only"}
+_ICDOR_FORBIDDEN_FACTOR_NAMES = {
+    "no_left_lane",
+    "no_right_lane",
+    "left_turn_allowed",
+    "right_turn_allowed",
+    "forward_feasible",
+    "stop_obligation",
+    "lane_follow_permitted",
+}
+
+
+def _icdor_name_list(value: Any, *, field: str, factor_names: set[str]) -> list[str]:
+    if not isinstance(value, list) or any(not isinstance(name, str) or name not in factor_names for name in value):
+        raise ValueError(f"IC-DOR {field} must be a list of known factor names")
+    if len(set(value)) != len(value):
+        raise ValueError(f"IC-DOR {field} must not contain duplicate factors")
+    return list(value)
+
+
+def _icdor_numeric(mapping: dict[str, Any], key: str, expected: float) -> None:
+    value = mapping.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or float(value) != expected:
+        raise ValueError(f"IC-DOR certificate rule {key} must equal {expected}")
+
+
+def load_icdor_ontology(config_root: str | Path) -> dict[str, Any]:
+    """Load the IC-DOR observable-factor and target-route ontology.
+
+    This parser intentionally does not call ``load_mosaic_schema_bundle``:
+    that legacy helper validates decision states, while IC-DOR must prevent
+    decision-state semantics from becoming an input to its action route.
+    """
+
+    config_root = Path(config_root)
+    labels = _load_yaml(config_root / "mosaic_label_schema.yaml")
+    factors_doc = _load_yaml(config_root / "mosaic_icdor_factor_candidates.yaml")
+    action_routes_doc = _load_yaml(config_root / "mosaic_icdor_action_routes.yaml")
+    reason_routes_doc = _load_yaml(config_root / "mosaic_icdor_reason_routes.yaml")
+    certificate_doc = _load_yaml(config_root / "mosaic_icdor_certificate_rules.yaml")
+
+    if not isinstance(labels, dict) or not _LABEL_SCHEMA_FIELDS <= set(labels):
+        raise ValueError("mosaic_label_schema.yaml is missing the IC-DOR label schema fields")
+    if labels["action_dim"] != 4 or labels["reason_dim"] != 21:
+        raise ValueError("IC-DOR requires exactly four actions and 21 reasons")
+    actions = labels["actions"]
+    reasons = labels["reasons"]
+    if not isinstance(actions, list) or not isinstance(reasons, list):
+        raise ValueError("IC-DOR label actions/reasons must be lists")
+    _validate_contiguous(actions, 4, "actions")
+    _validate_contiguous(reasons, 21, "reasons")
+    action_names = tuple(item["name"].strip() for item in actions)
+    reason_names = tuple(item["name"].strip() for item in reasons)
+    if action_names != _EXPECTED_ACTION_NAMES or reason_names != _EXPECTED_REASON_NAMES:
+        raise ValueError("IC-DOR requires the audited BDD-OIA action/reason order")
+
+    factors = _require_document(factors_doc, "factors", list, "mosaic_icdor_factor_candidates.yaml")
+    if len(factors) < 20:
+        raise ValueError("IC-DOR requires a non-trivial observable factor inventory")
+    factor_names: list[str] = []
+    for factor in factors:
+        if not isinstance(factor, dict) or set(factor) != _ICDOR_FACTOR_FIELDS:
+            raise ValueError("IC-DOR factor candidates must use the exact observable-factor schema")
+        name = factor["name"]
+        if not isinstance(name, str) or not name or name in _ICDOR_FORBIDDEN_FACTOR_NAMES or "state" in name:
+            raise ValueError(f"IC-DOR factor {name!r} is not an observable atomic factor")
+        if factor["type"] not in _FACTOR_TYPES:
+            raise ValueError(f"IC-DOR factor {name} has invalid type")
+        if type(factor["num_prototypes"]) is not int or factor["num_prototypes"] < 2:
+            raise ValueError(f"IC-DOR factor {name} needs at least two independent prototypes")
+        if not isinstance(factor["weak_regions"], list) or not factor["weak_regions"]:
+            raise ValueError(f"IC-DOR factor {name} requires at least one weak region")
+        if any(region not in _REGION_PRIORS for region in factor["weak_regions"]):
+            raise ValueError(f"IC-DOR factor {name} has an invalid weak region")
+        if not isinstance(factor["mirror_of"], str) or not factor["mirror_of"]:
+            raise ValueError(f"IC-DOR factor {name} requires mirror_of")
+        if not isinstance(factor["contradicts"], list) or not all(isinstance(item, str) for item in factor["contradicts"]):
+            raise ValueError(f"IC-DOR factor {name} has invalid contradictions")
+        if not isinstance(factor["positive_reason_anchors"], list) or any(
+            type(reason_id) is not int or reason_id not in range(21)
+            for reason_id in factor["positive_reason_anchors"]
+        ):
+            raise ValueError(f"IC-DOR factor {name} has invalid positive reason anchors")
+        if not isinstance(factor["grounding_sources"], list) or not factor["grounding_sources"]:
+            raise ValueError(f"IC-DOR factor {name} requires declared grounding sources")
+        if not set(factor["grounding_sources"]) <= _ICDOR_ALLOWED_GROUNDING_SOURCES:
+            raise ValueError(f"IC-DOR factor {name} has an invalid grounding source")
+        factor_names.append(name)
+    _require_unique_values(factor_names, "IC-DOR factor names must be unique")
+    factor_name_set = set(factor_names)
+    by_factor = {factor["name"]: factor for factor in factors}
+    for factor in factors:
+        mirror = factor["mirror_of"]
+        if mirror not in factor_name_set or by_factor[mirror]["mirror_of"] != factor["name"]:
+            raise ValueError(f"IC-DOR factor {factor['name']} has a non-reciprocal mirror")
+        for contradicted in factor["contradicts"]:
+            if contradicted not in factor_name_set or factor["name"] not in by_factor[contradicted]["contradicts"]:
+                raise ValueError(f"IC-DOR factor {factor['name']} has a non-reciprocal contradiction")
+
+    action_routes = _require_document(action_routes_doc, "action_routes", dict, "mosaic_icdor_action_routes.yaml")
+    if set(action_routes) != set(action_names):
+        raise ValueError("IC-DOR action routes must cover exactly the four official action names")
+    normalized_action_routes: dict[str, dict[str, list[dict[str, str]]]] = {}
+    for action_name, directions in action_routes.items():
+        if not isinstance(directions, dict) or set(directions) != {"support", "veto"}:
+            raise ValueError(f"IC-DOR action route {action_name} must separate support and veto")
+        normalized_action_routes[action_name] = {}
+        for direction, edges in directions.items():
+            if not isinstance(edges, list):
+                raise ValueError(f"IC-DOR {action_name}/{direction} edges must be a list")
+            normalized_edges: list[dict[str, str]] = []
+            for edge in edges:
+                if not isinstance(edge, dict) or set(edge) != {"factor", "polarity"}:
+                    raise ValueError("IC-DOR routes are candidate semantics, not fixed weights")
+                factor_name = edge["factor"]
+                polarity = edge["polarity"]
+                if factor_name not in factor_name_set or polarity not in {"present", "absent"}:
+                    raise ValueError("IC-DOR action route uses an unknown factor or polarity")
+                normalized_edges.append({"factor": factor_name, "polarity": polarity})
+            normalized_action_routes[action_name][direction] = normalized_edges
+
+    reason_routes_raw = _require_document(reason_routes_doc, "reason_routes", dict, "mosaic_icdor_reason_routes.yaml")
+    reason_routes = _normalize_reason_mapping(reason_routes_raw)
+    if set(reason_routes) != set(range(21)):
+        raise ValueError("IC-DOR reason routes must cover exactly the 21 official reason labels")
+    for reason_id, route in reason_routes.items():
+        if not isinstance(route, dict) or set(route) != _ICDOR_REASON_ROUTE_FIELDS:
+            raise ValueError(f"IC-DOR reason route {reason_id} has an invalid schema")
+        if not isinstance(route["group"], str) or not route["group"]:
+            raise ValueError(f"IC-DOR reason route {reason_id} requires a semantic group")
+        for field in ("direct_factors", "latent_factors", "contradiction_factors"):
+            route[field] = _icdor_name_list(route[field], field=field, factor_names=factor_name_set)
+        if type(route["escape_allowed"]) is not bool:
+            raise ValueError(f"IC-DOR reason route {reason_id} escape_allowed must be boolean")
+        if any("state" in name for name in route["latent_factors"]):
+            raise ValueError("IC-DOR latent routes must not reference decision states")
+
+    certificate_rules = _require_document(
+        certificate_doc, "certificate_rules", dict, "mosaic_icdor_certificate_rules.yaml"
+    )
+    if set(certificate_rules) != {"version", "certified", "reason_only", "abstained"}:
+        raise ValueError("IC-DOR certificate rules have an invalid top-level schema")
+    if certificate_rules["version"] != "icdor_v3":
+        raise ValueError("IC-DOR certificate version must be icdor_v3")
+    certified = certificate_rules["certified"]
+    if not isinstance(certified, dict):
+        raise ValueError("IC-DOR certified rules must be a mapping")
+    expected_certified = {
+        "min_confirmed_positive": 32.0,
+        "min_reliable_negative": 32.0,
+        "min_geometry_valid": 200.0,
+        "min_full_minus_prior_lcb95": 0.02,
+        "min_content_fraction": 0.70,
+        "min_query_shuffle_drop_lcb95": 0.01,
+        "min_image_shuffle_drop_lcb95": 0.01,
+        "min_grounding_minus_random_lcb95": 0.02,
+        "min_effective_prototype_count": 1.5,
+        "max_dominant_prototype_rate": 0.85,
+    }
+    if set(certified) != set(expected_certified) | {"require_nonzero_presence_visibility_variance"}:
+        raise ValueError("IC-DOR certified rules must use the complete plan thresholds")
+    for key, expected in expected_certified.items():
+        _icdor_numeric(certified, key, expected)
+    if certified["require_nonzero_presence_visibility_variance"] is not True:
+        raise ValueError("IC-DOR certificate must require non-degenerate presence/visibility")
+    for tier_name, expected_fields in {
+        "reason_only": {"require_stable_content_shuffle", "allow_action_route"},
+        "abstained": {"allow_explicit_routes", "allow_escape_token"},
+    }.items():
+        tier = certificate_rules[tier_name]
+        if not isinstance(tier, dict) or set(tier) != expected_fields:
+            raise ValueError(f"IC-DOR {tier_name} certificate rules are incomplete")
+        if any(type(value) is not bool for value in tier.values()):
+            raise ValueError(f"IC-DOR {tier_name} certificate rules must be boolean")
+    if certificate_rules["reason_only"]["allow_action_route"]:
+        raise ValueError("reason_only factors must never enter the action route")
+    if certificate_rules["abstained"]["allow_explicit_routes"]:
+        raise ValueError("abstained factors must not enter explicit routes")
+
+    return {
+        "action_names": action_names,
+        "reason_names": reason_names,
+        "action_index": {name: index for index, name in enumerate(action_names)},
+        "reason_index": {name: index for index, name in enumerate(reason_names)},
+        "factors": factors,
+        "factor_index": {name: index for index, name in enumerate(factor_names)},
+        "action_routes": normalized_action_routes,
+        "reason_routes": reason_routes,
+        "certificate_rules": certificate_rules,
+    }

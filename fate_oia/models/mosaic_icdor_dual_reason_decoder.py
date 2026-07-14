@@ -1,0 +1,149 @@
+from __future__ import annotations
+
+import math
+from pathlib import Path
+from typing import Any
+
+import torch
+from torch import nn
+
+from .acpr_sparse_ops import entmax15_bisect
+from .mosaic_sparse_label_decoder import MOSAICSparseLabelDecoder
+
+
+class MOSAICICDORVisualReasonDecoder(nn.Module):
+    """Direct visual observed-reason path, independent of factors and states."""
+
+    def __init__(
+        self,
+        *,
+        dim: int = 384,
+        decoder_layers: int = 2,
+        self_attention_heads: int = 4,
+        highres_topk: int = 256,
+        midres_topk: int = 128,
+    ) -> None:
+        super().__init__()
+        self.decoder = MOSAICSparseLabelDecoder(
+            21,
+            dim=dim,
+            decoder_layers=decoder_layers,
+            self_attention_heads=self_attention_heads,
+            highres_topk=highres_topk,
+            midres_topk=midres_topk,
+        )
+
+    def forward(self, reason_pyramid: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        output = self.decoder(reason_pyramid)
+        return {
+            "reason_visual_observed_logits": output["label_logits"],
+            "reason_visual_observed_nodes": output["label_nodes"],
+            "reason_visual_observed_attention": output["retrieval_attention"],
+        }
+
+
+class MOSAICICDORLatentReasonDecoder(nn.Module):
+    """Hard factor-allowed latent reason path with explicit escape tokens."""
+
+    def __init__(
+        self,
+        ontology: dict[str, Any],
+        *,
+        dim: int = 384,
+        decoder_layers: int = 2,
+        self_attention_heads: int = 4,
+        highres_topk: int = 256,
+        midres_topk: int = 128,
+    ) -> None:
+        super().__init__()
+        factor_count = len(ontology["factors"])
+        factor_index = ontology["factor_index"]
+        routes = ontology["reason_routes"]
+        allow = torch.zeros(21, factor_count, dtype=torch.bool)
+        for reason_index, route in routes.items():
+            for factor_name in route["latent_factors"]:
+                allow[reason_index, factor_index[factor_name]] = True
+        if not allow.any(dim=-1).all():
+            raise ValueError("IC-DOR latent reason decoder requires hard factors for every reason")
+        self.register_buffer("reason_factor_allow_mask", allow, persistent=True)
+        self.reason_queries = nn.Parameter(torch.randn(21, dim) * 0.02)
+        self.escape_tokens = nn.Parameter(torch.randn(21, dim) * 0.02)
+        self.factor_key = nn.Linear(dim, dim, bias=False)
+        self.reason_query = nn.Linear(dim, dim, bias=False)
+        self.semantic_norm = nn.LayerNorm(dim)
+        self.decoder = MOSAICSparseLabelDecoder(
+            21,
+            dim=dim,
+            decoder_layers=decoder_layers,
+            self_attention_heads=self_attention_heads,
+            highres_topk=highres_topk,
+            midres_topk=midres_topk,
+            mask_fallback_floor=1e-8,
+        )
+        self.classifier = nn.Linear(2 * dim, 1, bias=False)
+
+    def forward(
+        self,
+        reason_pyramid: dict[str, torch.Tensor],
+        factor_features: torch.Tensor,
+        factor_soft_masks: torch.Tensor,
+        factor_route_enabled: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        batch_size, factor_count, dim = factor_features.shape
+        if tuple(factor_soft_masks.shape) != (batch_size, factor_count, 45, 80):
+            raise ValueError("IC-DOR latent reason decoder factor masks must be [B,F,45,80]")
+        if factor_route_enabled.shape != (factor_count,) or factor_route_enabled.dtype != torch.bool:
+            raise ValueError("IC-DOR latent reason decoder needs a [F] boolean certificate route mask")
+        factor_keys = self.factor_key(factor_features.detach())
+        queries = self.reason_query(self.reason_queries).unsqueeze(0).expand(batch_size, -1, -1)
+        finite_scores = torch.einsum("brd,bfd->brf", queries, factor_keys) / math.sqrt(dim)
+        allowed = self.reason_factor_allow_mask & factor_route_enabled.view(1, -1)
+        unconstrained = entmax15_bisect(
+            torch.cat((finite_scores, finite_scores.new_zeros(batch_size, 21, 1)), dim=-1), dim=-1
+        )
+        factor_weights = unconstrained[:, :, :factor_count] * allowed.unsqueeze(0).to(finite_scores.dtype)
+        escape_weight = 1.0 - factor_weights.sum(dim=-1, keepdim=True)
+        semantic = torch.einsum("brf,bfd->brd", factor_weights, factor_features.detach())
+        semantic = self.semantic_norm(semantic + escape_weight * self.escape_tokens.unsqueeze(0))
+        reason_factor_masks = torch.einsum("brf,bfhw->brhw", factor_weights, factor_soft_masks.detach())
+        active = reason_factor_masks.flatten(2).amax(dim=-1) > 1e-8
+        visual = self.decoder(reason_pyramid, query_seed=semantic, highres_masks=reason_factor_masks)
+        visual_nodes = visual["label_nodes"] * active.unsqueeze(-1).to(semantic.dtype)
+        latent_logits = self.classifier(torch.cat((semantic, visual_nodes), dim=-1)).squeeze(-1)
+        return {
+            "reason_logits_latent": latent_logits,
+            "reason_nodes_latent": semantic,
+            "reason_factor_router_weights": factor_weights,
+            "reason_escape_weight": escape_weight.squeeze(-1),
+            "reason_factor_masks": reason_factor_masks,
+            "reason_latent_visual_nodes": visual_nodes,
+            "reason_latent_visual_attention": visual["retrieval_attention"],
+        }
+
+
+class MOSAICICDORObservedReasonMixer(nn.Module):
+    """Mix direct observed and modeled observation logits without action access."""
+
+    def __init__(self, *, init_mix: float = 0.50) -> None:
+        super().__init__()
+        if not 0.0 < init_mix < 1.0:
+            raise ValueError("IC-DOR observed-reason mix must be in (0,1)")
+        raw = math.log(init_mix / (1.0 - init_mix))
+        self.mix_raw = nn.Parameter(torch.full((21,), raw))
+
+    def forward(
+        self,
+        reason_visual_observed_logits: torch.Tensor,
+        reason_observation_logits: torch.Tensor,
+        *,
+        latent_enabled: bool,
+    ) -> dict[str, torch.Tensor]:
+        if reason_visual_observed_logits.shape != reason_observation_logits.shape or reason_visual_observed_logits.shape[-1] != 21:
+            raise ValueError("IC-DOR observed-reason mixer expects matching [B,21] logits")
+        mix = torch.sigmoid(self.mix_raw).unsqueeze(0)
+        observed = (
+            (1.0 - mix) * reason_visual_observed_logits + mix * reason_observation_logits
+            if latent_enabled
+            else reason_visual_observed_logits
+        )
+        return {"reason_observed_logits": observed, "reason_observed_mix_gate": mix.expand_as(observed)}

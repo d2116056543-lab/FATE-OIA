@@ -1,0 +1,109 @@
+from __future__ import annotations
+
+import torch
+from torch.nn import functional as F
+
+from .mosaic_icdor_action_losses import asymmetric_loss
+
+
+def build_synthetic_hidden_positive_mask(
+    observed_reason_targets: torch.Tensor,
+    *,
+    hide_fraction: float,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Hide a real subset of observed positives for PU recovery diagnostics."""
+    if observed_reason_targets.ndim != 2 or observed_reason_targets.shape[1] != 21:
+        raise ValueError("IC-DOR synthetic hiding requires observed reason targets [B,21]")
+    if not 0.0 <= hide_fraction < 1.0:
+        raise ValueError("IC-DOR synthetic hide fraction must be in [0,1)")
+    positive = observed_reason_targets > 0.5
+    draw = torch.rand(positive.shape, device=positive.device, generator=generator)
+    hidden = positive & (draw < hide_fraction)
+    # Preserve at least one observed positive per non-empty sample whenever possible.
+    for row in range(hidden.shape[0]):
+        indices = torch.nonzero(positive[row], as_tuple=False).flatten()
+        if indices.numel() and hidden[row, indices].all():
+            hidden[row, indices[0]] = False
+    return hidden
+
+
+def reason_observed_losses(
+    reason_visual_observed_logits: torch.Tensor,
+    reason_observed_logits: torch.Tensor,
+    observed_reason_targets: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    if reason_visual_observed_logits.shape != reason_observed_logits.shape or reason_visual_observed_logits.shape != observed_reason_targets.shape:
+        raise ValueError("IC-DOR observed reason losses require matching [B,21] tensors")
+    visual = asymmetric_loss(reason_visual_observed_logits, observed_reason_targets)
+    observed = asymmetric_loss(reason_observed_logits, observed_reason_targets)
+    return {
+        "loss_reason_visual_observed_asl": visual,
+        "loss_reason_observed_asl": observed,
+        "loss_reason_observed_total": 0.50 * visual + observed,
+    }
+
+
+def _posterior_rank_loss(logits: torch.Tensor, posterior: torch.Tensor, *, margin: float = 0.10) -> torch.Tensor:
+    weights_positive = posterior.detach()
+    weights_negative = 1.0 - posterior.detach()
+    positive = torch.sigmoid(logits)
+    losses: list[torch.Tensor] = []
+    for reason_id in range(logits.shape[1]):
+        p = positive[:, reason_id]
+        q_pos = weights_positive[:, reason_id]
+        q_neg = weights_negative[:, reason_id]
+        pair_weight = q_pos[:, None] * q_neg[None, :]
+        if pair_weight.sum().item() > 0:
+            losses.append((F.relu(margin - p[:, None] + p[None, :]) * pair_weight).sum() / pair_weight.sum())
+    return torch.stack(losses).mean() if losses else logits.sum() * 0.0
+
+
+def selective_observation_losses(
+    reason_logits_latent: torch.Tensor,
+    observed_reason_targets: torch.Tensor,
+    reason_observation_probability: torch.Tensor,
+    posterior: torch.Tensor,
+    *,
+    reason_propensity: torch.Tensor,
+    factor_route_support: torch.Tensor,
+    escape_weight: torch.Tensor,
+    synthetic_hidden_positive_mask: torch.Tensor | None = None,
+) -> dict[str, torch.Tensor]:
+    shapes = [observed_reason_targets, reason_observation_probability, posterior, reason_propensity, factor_route_support, escape_weight]
+    if reason_logits_latent.ndim != 2 or reason_logits_latent.shape[-1] != 21 or any(value.shape != reason_logits_latent.shape for value in shapes):
+        raise ValueError("IC-DOR selective observation losses require matching [B,21] tensors")
+    target = observed_reason_targets.to(dtype=reason_logits_latent.dtype)
+    observation_probability = reason_observation_probability.clamp(1e-6, 1.0 - 1e-6)
+    loss_nll = F.binary_cross_entropy(observation_probability, target)
+    loss_posterior = F.binary_cross_entropy_with_logits(reason_logits_latent, posterior.detach())
+    loss_rank = _posterior_rank_loss(reason_logits_latent, posterior)
+    if synthetic_hidden_positive_mask is None:
+        loss_missing_recovery = reason_logits_latent.sum() * 0.0
+    else:
+        if synthetic_hidden_positive_mask.shape != reason_logits_latent.shape or synthetic_hidden_positive_mask.dtype != torch.bool:
+            raise ValueError("IC-DOR synthetic hidden-positive mask must be bool [B,21]")
+        hidden = synthetic_hidden_positive_mask.to(dtype=reason_logits_latent.dtype)
+        loss_missing_recovery = -(hidden * F.logsigmoid(reason_logits_latent)).sum() / hidden.sum().clamp_min(1.0)
+    loss_factor_consistency = F.mse_loss(torch.sigmoid(reason_logits_latent), factor_route_support.detach())
+    loss_escape = escape_weight.mean()
+    loss_propensity = (reason_propensity - 0.50).square().mean()
+    total = (
+        0.30 * loss_nll
+        + 0.30 * loss_posterior
+        + 0.08 * loss_rank
+        + 0.10 * loss_missing_recovery
+        + 0.05 * loss_factor_consistency
+        + 0.01 * loss_escape
+        + 0.01 * loss_propensity
+    )
+    return {
+        "loss_reason_observation_nll": loss_nll,
+        "loss_reason_posterior_bce": loss_posterior,
+        "loss_reason_posterior_rank": loss_rank,
+        "loss_reason_missing_recovery": loss_missing_recovery,
+        "loss_reason_factor_latent_consistency": loss_factor_consistency,
+        "loss_reason_escape": loss_escape,
+        "loss_reason_propensity": loss_propensity,
+        "loss_reason_selective_total": total,
+    }

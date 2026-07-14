@@ -20,8 +20,8 @@ class MOSAICGeometryTypedAttention(nn.Module):
         dim: int = 384,
         anchors_per_factor: int = 2,
         heads: int = 4,
-        point_samples: int = 8,
-        curve_samples: int = 12,
+        point_samples: int = 4,
+        curve_samples: int = 16,
         region_samples: int = 12,
     ) -> None:
         super().__init__()
@@ -40,8 +40,10 @@ class MOSAICGeometryTypedAttention(nn.Module):
         ):
             if type(value) is not int or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
-        if (anchors_per_factor, heads, point_samples, curve_samples, region_samples) != (2, 4, 8, 12, 12):
-            raise ValueError("MOSAIC fixed sampling contract requires M=2, H=4, S=8/12/12")
+        if anchors_per_factor != 2 or heads != 4 or region_samples != 12:
+            raise ValueError("MOSAIC typed attention requires M=2, H=4, and a 3x4 region grid")
+        if (point_samples, curve_samples) not in {(4, 16), (8, 12)}:
+            raise ValueError("MOSAIC typed attention supports IC-DOR 4/16 or legacy 8/12 sampling")
 
         self.factor_types = factor_types
         self.dim = dim
@@ -78,6 +80,23 @@ class MOSAICGeometryTypedAttention(nn.Module):
         )
         self.curve_longitudinal_delta = nn.Parameter(torch.zeros(len(curve_indices), heads, curve_samples))
         self.curve_lateral_delta = nn.Parameter(torch.zeros(len(curve_indices), heads, curve_samples))
+        self.register_buffer(
+            "curve_arc_length_position",
+            torch.linspace(-1.0, 1.0, curve_samples).view(1, curve_samples, 1),
+            persistent=True,
+        )
+        curve_encoder_layer = nn.TransformerEncoderLayer(
+            d_model=dim,
+            nhead=heads,
+            dim_feedforward=2 * dim,
+            dropout=0.05,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.curve_sequence_encoder = nn.TransformerEncoder(curve_encoder_layer, num_layers=2)
+        # Kept explicitly for audit/tests across PyTorch versions.
+        self.curve_sequence_encoder.num_layers = 2
 
         target_extent = 0.18
         extent_fraction = (target_extent - 0.05) / (0.35 - 0.05)
@@ -155,6 +174,16 @@ class MOSAICGeometryTypedAttention(nn.Module):
         padding = self.max_samples - values.shape[-2]
         return F.pad(values, (0, 0, 0, padding)) if padding else values
 
+    def _encode_curve_sequences(self, sampled_features: torch.Tensor) -> torch.Tensor:
+        """Run the ordered, per-factor curve samples through a local 1D encoder."""
+        batch_size, factor_count, anchors, heads, samples, dim = sampled_features.shape
+        if samples != self.curve_samples:
+            raise ValueError("curve sequence encoder received an invalid sample count")
+        sequence = sampled_features.reshape(batch_size * factor_count * anchors * heads, samples, dim)
+        sequence = sequence + self.curve_arc_length_position.to(dtype=sequence.dtype, device=sequence.device)
+        encoded = self.curve_sequence_encoder(sequence)
+        return encoded.reshape(batch_size, factor_count, anchors, heads, samples, dim)
+
     def forward(self, feature_map: torch.Tensor, anchor_coordinates: torch.Tensor) -> dict[str, torch.Tensor]:
         batch_size = feature_map.shape[0] if feature_map.ndim > 0 else -1
         expected_feature_shape = (batch_size, self.dim, 45, 80)
@@ -199,6 +228,7 @@ class MOSAICGeometryTypedAttention(nn.Module):
             curve_anchors = anchor_coordinates.index_select(1, self.curve_indices).float()
             curve_coordinates = self._curve_coordinates(curve_anchors)
             curve_samples = self._sample_geometry_group(sampling_feature_map, curve_coordinates, output_dtype)
+            curve_samples = self._encode_curve_sequences(curve_samples)
             coordinates = coordinates.index_copy(1, self.curve_indices, self._pad_samples(curve_coordinates))
             sampled_features = sampled_features.index_copy(1, self.curve_indices, self._pad_samples(curve_samples))
         if self.region_indices.numel():

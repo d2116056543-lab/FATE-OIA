@@ -117,12 +117,21 @@ class MOSAICSelectiveObservationModel(nn.Module):
         factor_visibility: torch.Tensor,
         factor_uncertainty: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
+        """Compatibility wrapper; formal inference uses ``forward_inference``."""
+        output = self.forward_inference(reason_logits_latent, factor_visibility, factor_uncertainty)
+        output.update(self.posterior_from_observed_targets(reason_logits_latent, observed_reason_targets, output))
+        return output
+
+    def forward_inference(
+        self,
+        reason_logits_latent: torch.Tensor,
+        factor_visibility: torch.Tensor,
+        factor_uncertainty: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Inference-safe observation likelihood with no reason-label input."""
         batch_size = reason_logits_latent.shape[0]
-        if tuple(reason_logits_latent.shape) != (batch_size, 21) or tuple(observed_reason_targets.shape) != (
-            batch_size,
-            21,
-        ):
-            raise ValueError("selective observation expects latent logits and observed targets [B,21]")
+        if tuple(reason_logits_latent.shape) != (batch_size, 21):
+            raise ValueError("selective observation expects latent logits [B,21]")
         factor_shape = (batch_size, len(self.factor_names))
         if tuple(factor_visibility.shape) != factor_shape or tuple(factor_uncertainty.shape) != factor_shape:
             raise ValueError("selective observation factor summaries have invalid shapes")
@@ -137,23 +146,10 @@ class MOSAICSelectiveObservationModel(nn.Module):
             propensity * latent_probability + epsilon.unsqueeze(0) * (1.0 - latent_probability)
         )
 
-        log_latent_positive = F.logsigmoid(reason_logits_latent)
-        log_latent_negative = F.logsigmoid(-reason_logits_latent)
-        log_hidden_positive = log_latent_positive + torch.log1p(-propensity.clamp(max=1.0 - 1e-7))
-        log_true_negative = log_latent_negative + torch.log1p(-epsilon.clamp(max=1.0 - 1e-7)).unsqueeze(0)
-        denominator = torch.logaddexp(log_hidden_positive, log_true_negative)
-        posterior_zero = torch.exp(log_hidden_positive - denominator)
-        posterior_live = torch.where(
-            observed_reason_targets > 0.5,
-            torch.ones_like(posterior_zero),
-            posterior_zero,
-        )
         return {
             "reason_propensity": propensity,
             "reason_false_positive_rate": epsilon,
             "reason_observation_prob": observation_probability,
-            "reason_latent_posterior": posterior_live.detach(),
-            "reason_latent_posterior_live": posterior_live,
             "propensity_visibility_summary": visibility_summary,
             "propensity_uncertainty_summary": uncertainty_summary,
             "propensity_visibility_slopes": F.softplus(self.raw_visibility_weight),
@@ -162,3 +158,22 @@ class MOSAICSelectiveObservationModel(nn.Module):
             "propensity_pi_max": propensity.new_tensor(self.pi_max),
             "reason_false_positive_max": self.false_positive_max,
         }
+
+    @staticmethod
+    def posterior_from_observed_targets(
+        reason_logits_latent: torch.Tensor,
+        observed_reason_targets: torch.Tensor,
+        observation_output: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        """Training/metric-only PU posterior; labels never enter inference forward."""
+        if reason_logits_latent.shape != observed_reason_targets.shape or reason_logits_latent.shape[-1] != 21:
+            raise ValueError("selective-observation posterior requires aligned [B,21] tensors")
+        propensity = observation_output["reason_propensity"].detach().clamp(1e-7, 1.0 - 1e-7)
+        epsilon = observation_output["reason_false_positive_rate"].detach().clamp(1e-7, 1.0 - 1e-7)
+        if epsilon.ndim == 1:
+            epsilon = epsilon.unsqueeze(0)
+        log_hidden_positive = F.logsigmoid(reason_logits_latent.detach()) + torch.log1p(-propensity)
+        log_true_negative = F.logsigmoid(-reason_logits_latent.detach()) + torch.log1p(-epsilon)
+        posterior_zero = torch.exp(log_hidden_positive - torch.logaddexp(log_hidden_positive, log_true_negative))
+        posterior = torch.where(observed_reason_targets > 0.5, torch.ones_like(posterior_zero), posterior_zero)
+        return {"reason_latent_posterior": posterior.detach()}

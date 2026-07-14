@@ -1,0 +1,195 @@
+factors:
+  - name: traffic_light_visible
+    type: point
+    num_prototypes: 3
+    weak_regions: [upper_front]
+    mirror_of: traffic_light_visible
+    contradicts: []
+    positive_reason_anchors: [3]
+    grounding_sources: [box2d]
+  - name: red_light_visible
+    type: point
+    num_prototypes: 3
+    weak_regions: [upper_front]
+    mirror_of: red_light_visible
+    contradicts: [green_light_visible]
+    positive_reason_anchors: []
+    grounding_sources: [image_only]
+  - name: green_light_visible
+    type: point
+    num_prototypes: 3
+    weak_regions: [upper_front]
+    mirror_of: green_light_visible
+    contradicts: [red_light_visible]
+    positive_reason_anchors: [0]
+    grounding_sources: [image_only]
+  - name: traffic_sign_visible
+    type: point
+    num_prototypes: 3
+    weak_regions: [upper_front]
+    mirror_of: traffic_sign_visible
+    contradicts: []
+    positive_reason_anchors: [4]
+    grounding_sources: [box2d]
+  - name: front_vehicle_visible
+    type: object
+    num_prototypes: 4
+    weak_regions: [front_center]
+    mirror_of: front_vehicle_visible
+    contradicts: []
+    positive_reason_anchors: [1, 5, 14, 20]
+    grounding_sources: [box2d]
+  - name: front_vehicle_near
+    type: object
+    num_prototypes: 3
+    weak_regions: [front_center]
+    mirror_of: front_vehicle_near
+    contradicts: []
+    positive_reason_anchors: [5]
+    # A single-frame 2D box cannot identify physical proximity reliably.
+    # Keep this Tier III candidate image-only and out of explicit action routes.
+    grounding_sources: [image_only]
+  - name: pedestrian_front_visible
+    type: object
+    num_prototypes: 3
+    weak_regions: [front_center]
+    mirror_of: pedestrian_front_visible
+    contradicts: []
+    positive_reason_anchors: [6]
+    grounding_sources: [box2d]
+  - name: rider_front_visible
+    type: object
+    num_prototypes: 3
+    weak_regions: [front_center]
+    mirror_of: rider_front_visible
+    contradicts: []
+    positive_reason_anchors: [7]
+    grounding_sources: [box2d]
+  - name: left_obstacle_visible
+    type: object
+    num_prototypes: 3
+    weak_regions: [left_corridor]
+    mirror_of: right_obstacle_visible
+    contradicts: []
+    positive_reason_anchors: [10]
+    grounding_sources: [box2d]
+  - name: right_obstacle_visible
+    type: object
+    num_prototypes: 3
+    weak_regions: [right_corridor]
+    mirror_of: left_obstacle_visible
+    contradicts: []
+    positive_reason_anchors: [16]
+    grounding_sources: [box2d]
+  - name: left_lane_marking_visible
+    type: curve
+    num_prototypes: 3
+    weak_regions: [left_corridor]
+    mirror_of: right_lane_marking_visible
+    contradicts: []
+    positive_reason_anchors: [9, 11, 12]
+    grounding_sources: [lane_polyline]
+  - name: right_lane_marking_visible
+    type: curve
+    num_prototypes: 3
+    weak_regions: [right_corridor]
+    mirror_of: left_lane_marking_visible
+    contradicts: []
+    positive_reason_anchors: [15, 17, 18]
+    grounding_sources: [lane_polyline]
+  - name: left_solid_boundary_visible
+    type: curve
+    num_prototypes: 3
+    weak_regions: [left_corridor]
+    mirror_of: right_solid_boundary_visible
+    contradicts: []
+    positive_reason_anchors: [11]
+    grounding_sources: [lane_polyline]
+  - name: right_solid_boundary_visible
+    type: curve
+    num_prototypes: 3
+    weak_regions: [right_corridor]
+    mirror_of: left_solid_boundary_visible
+    contradicts: []
+    positive_reason_anchors: [17]
+    grounding_sources: [lane_polyline]
+  - name: left_turn_marking_visible
+    type: curve
+    num_prototypes: 3
+    weak_regions: [left_corridor]
+    mirror_of: right_turn_marking_visible
+    contradicts: []
+    positive_reason_anchors: [12]
+    grounding_sources: [lane_polyline]
+  - name: right_turn_marking_visible
+    type: curve
+    num_prototypes: 3
+    weak_regions: [right_corridor]
+    mirror_of: left_turn_marking_visible
+    contradicts: []
+    positive_reason_anchors: [18]
+    grounding_sources: [lane_polyline]
+  - name: center_drivable_region_visible
+    type: region
+    num_prototypes: 3
+    weak_regions: [center_corridor]
+    mirror_of: center_drivable_region_visible
+    contradicts: []
+    positive_reason_anchors: [2]
+    grounding_sources: [drivable_mask]
+  - name: left_drivable_region_visible
+    type: region
+    num_prototypes: 3
+    weak_regions: [left_corridor]
+    mirror_of: right_drivable_region_visible
+    contradicts: []
+    positive_reason_anchors: [9, 12]
+    grounding_sources: [drivable_mask]
+  - name: right_drivable_region_visible
+    type: region
+    num_prototypes: 3
+    weak_regions: [right_corridor]
+    mirror_of: left_drivable_region_visible
+    contradicts: []
+    positive_reason_anchors: [15, 18]
+    grounding_sources: [drivable_mask]
+  - name: center_corridor_occupied
+    type: region
+    num_prototypes: 4
+    weak_regions: [center_corridor]
+    mirror_of: center_corridor_occupied
+    contradicts: []
+    positive_reason_anchors: [8]
+    grounding_sources: [box2d]
+  - name: left_corridor_occupied
+    type: region
+    num_prototypes: 3
+    weak_regions: [left_corridor]
+    mirror_of: right_corridor_occupied
+    contradicts: []
+    positive_reason_anchors: [10]
+    grounding_sources: [box2d]
+  - name: right_corridor_occupied
+    type: region
+    num_prototypes: 3
+    weak_regions: [right_corridor]
+    mirror_of: left_corridor_occupied
+    contradicts: []
+    positive_reason_anchors: [16]
+    grounding_sources: [box2d]
+  - name: front_vehicle_left_indicator_visible
+    type: object
+    num_prototypes: 3
+    weak_regions: [front_center]
+    mirror_of: front_vehicle_right_indicator_visible
+    contradicts: [front_vehicle_right_indicator_visible]
+    positive_reason_anchors: [14]
+    grounding_sources: [image_only]
+  - name: front_vehicle_right_indicator_visible
+    type: object
+    num_prototypes: 3
+    weak_regions: [front_center]
+    mirror_of: front_vehicle_left_indicator_visible
+    contradicts: [front_vehicle_left_indicator_visible]
+    positive_reason_anchors: [20]
+    grounding_sources: [image_only]

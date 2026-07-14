@@ -1,0 +1,25 @@
+action_routes:
+  forward:
+    support:
+      - {factor: center_drivable_region_visible, polarity: present}
+    veto:
+      - {factor: center_corridor_occupied, polarity: present}
+  stop:
+    support:
+      - {factor: center_corridor_occupied, polarity: present}
+      - {factor: red_light_visible, polarity: present}
+    veto: []
+  left:
+    support:
+      - {factor: left_drivable_region_visible, polarity: present}
+      - {factor: left_turn_marking_visible, polarity: present}
+    veto:
+      - {factor: left_solid_boundary_visible, polarity: present}
+      - {factor: left_corridor_occupied, polarity: present}
+  right:
+    support:
+      - {factor: right_drivable_region_visible, polarity: present}
+      - {factor: right_turn_marking_visible, polarity: present}
+    veto:
+      - {factor: right_solid_boundary_visible, polarity: present}
+      - {factor: right_corridor_occupied, polarity: present}

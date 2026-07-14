@@ -1,0 +1,206 @@
+experiment:
+  name: acpr_mosaic_trust_v3_icdor
+  direct_image: true
+  initialization: public_dino_vits8_teacher_only
+  eval_splits: [test]
+  best_selection_split: test
+  best_selection_metric: deploy_fixed_joint
+  no_metric_early_stop: true
+
+data:
+  data_root: E:\sbw\BDD-OIA\data
+  raw_root: E:\sbw\BDD-OIA
+  bdd100k_root: E:\sbw\BDD100K
+  image_height: 360
+  image_width: 640
+  patch_size: 8
+  action_dim: 4
+  reason_dim: 21
+  train_core_fraction: 0.80
+  train_audit_fraction: 0.10
+  train_calib_fraction: 0.10
+  split_seed: 20260713
+  num_workers_candidates: [4, 2, 0]
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+
+backbone:
+  arch: vit_small
+  patch_size: 8
+  selected_layers: [3, 7, 11]
+  pretrained_weights: E:\sbw\SNNA_repro\SNNA\ckp\reference\dino_deitsmall8_pretrain.pth
+  checkpoint_key: teacher
+  freeze_backbone: true
+  no_grad_backbone: true
+  feature_cache: false
+  token_compression: none
+
+model:
+  formal_class: MOSAICTrustICDORModel
+  dim: 384
+  separate_visual_pyramids: true
+  action_set_final: false
+  decoder_layers: 2
+  self_attention_heads: 4
+  adapter:
+    rank: 48
+    activation: gelu
+    rezero_init: 0.0
+    rezero_max: 0.30
+    depthwise_kernel: 3
+    dropout: 0.05
+  typed_attention:
+    anchors_per_factor: 2
+    heads: 4
+    point_samples: 4
+    curve_samples: 16
+    region_samples: 12
+  factor_measurement:
+    spatial_prior_scale_init: 0.05
+    spatial_prior_scale_max: 0.20
+    spatial_prior_dropout: 0.50
+    content_temperature_init: 0.07
+  action_route:
+    gate_init: 0.02
+    gate_max: 0.15
+    shadow_until_edge_admission: true
+    route_strength_target: 0.05
+    route_strength_min: 0.02
+    route_strength_max: 0.15
+  reason:
+    escape_token_penalty: 0.01
+    observed_mix_init: 0.50
+
+factor_certificate:
+  config: configs/mosaic_icdor_certificate_rules.yaml
+  build_epoch: 4
+  freeze_after_build: true
+  bootstrap_replicates: 1000
+
+edge_admission:
+  build_epoch: 6
+  freeze_after_build: true
+  shadow_start_epoch: 5
+  require_certificate_tier: certified
+
+selective_observation:
+  pi_min: 0.20
+  pi_max: 0.95
+  false_positive_max: 0.05
+  group_names: [traffic_control, obstacle, lane, other]
+  synthetic_missing_positive_fraction: 0.20
+  posterior_queue_size: 2048
+
+loss:
+  action:
+    gamma_pos: 0.0
+    gamma_neg: 4.0
+    clip: 0.05
+    base_asl_weight: 1.00
+    rank_weight: 0.10
+    cardinality_weight: 0.02
+  action_route:
+    shadow_asl_weight: 1.00
+    pareto_weight: 1.00
+    sparsity_weight: 0.02
+    dustbin_weight: 0.01
+    strength_weight: 0.02
+    intervention_weight: 0.05
+  factor:
+    presence_weight: 1.00
+    visibility_weight: 1.00
+    geometry_mask_weight: 0.10
+    view_consistency_weight: 0.05
+    flip_equivariance_weight: 0.05
+    prototype_occupancy_weight: 0.02
+    prototype_repulsion_weight: 0.01
+    prior_scale_weight: 0.01
+    contradiction_weight: 0.02
+  reason:
+    visual_observed_asl_weight: 0.50
+    observed_asl_weight: 1.00
+    observed_rank_weight: 0.05
+    observation_nll_weight: 0.30
+    posterior_bce_weight: 0.30
+    posterior_rank_weight: 0.08
+    missing_recovery_weight: 0.10
+    factor_latent_consistency_weight: 0.05
+    escape_token_weight: 0.01
+    propensity_regularization_weight: 0.01
+
+optimizer:
+  name: AdamW
+  fused_when_supported: true
+  weight_decay: 0.05
+  grad_clip: 1.0
+  scheduler: warmup_cosine
+  warmup_epochs: 1
+  min_lr_ratio: 0.05
+  lr:
+    visual_pyramid: 1.0e-4
+    factor_adapter: 1.5e-4
+    factor_extractor: 2.0e-4
+    factor_prototypes: 1.0e-4
+    action_adapter: 1.5e-4
+    action_visual_decoder: 2.0e-4
+    action_router_rereader: 2.0e-4
+    reason_adapter: 1.5e-4
+    reason_visual_decoder: 2.0e-4
+    reason_latent_decoder: 2.0e-4
+    reason_observed_mixer: 1.0e-4
+    observation_model: 1.0e-4
+    threshold_head: 5.0e-4
+
+training:
+  epochs: 12
+  bf16: true
+  tf32: true
+  torch_compile: false
+  no_metric_early_stop: true
+  print_every: 200
+  runtime_candidates:
+    - {batch_size: 8, grad_accum: 4, effective_batch: 32}
+    - {batch_size: 6, grad_accum: 5, effective_batch: 30}
+    - {batch_size: 5, grad_accum: 6, effective_batch: 30}
+    - {batch_size: 4, grad_accum: 8, effective_batch: 32}
+  max_reserved_vram_gb: 43.5
+
+calibration:
+  enabled: true
+  steps_per_epoch: 100
+  batch_size: 256
+  surrogate_temperature: 0.20
+  soft_f1_weight: 1.00
+  bce_weight: 0.05
+  rate_weight: 0.02
+  delta_weight: 0.01
+  cardinality_weight: 0.02
+  label_delta_max: 1.0
+  groups: [actions, common_reasons, tail_reasons]
+  tail_reason_indices: [12, 9, 5, 14, 6, 11, 10, 13]
+  train_calib_only: true
+  representation_frozen: true
+  deploy_equation: raw_minus_theta
+  test_oracle_diagnostic_only: true
+
+evaluation:
+  eval_splits: [test]
+  eval_every_epoch: true
+  best_selection_split: test
+  best_selection_metric: deploy_fixed_joint
+  threshold: 0.5
+  report_raw: true
+  report_deploy_fixed: true
+  report_train_calib_teacher_diagnostic: true
+  report_test_oracle_diagnostic: true
+
+runtime:
+  foreground_only: true
+  no_feature_cache: true
+  require_no_token_compression: true
+  require_runtime_selection: true
+  runtime_selection_path: .review/mosaic_icdor_runtime_selection.json
+  warmup_profile_steps: 20
+  timed_profile_steps: 100
+  dataloader_stability_minutes: 15
