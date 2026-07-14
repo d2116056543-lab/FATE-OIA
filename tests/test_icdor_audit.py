@@ -47,6 +47,11 @@ def test_certificate_audit_checks_builder_and_tier_logic_separately() -> None:
     assert '"models" / "mosaic_factor_certificate.py"' in source
 
 
+def test_real_factor_gate_writer_binds_the_audited_git_head() -> None:
+    source = Path("fate_oia/engine/audit_acpr_mosaic_trust_icdor.py").read_text(encoding="utf-8")
+    assert 'gate["git_head"] = result["git_head"]' in source
+
+
 class _RealForwardModel(nn.Module):
     def __init__(self) -> None:
         super().__init__()

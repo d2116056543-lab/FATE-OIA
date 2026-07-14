@@ -614,6 +614,7 @@ def main() -> None:
         )
         gate["artifact"] = str(real_factor_path.resolve())
         gate["artifact_sha256"] = sha256_file(real_factor_path)
+        gate["git_head"] = result["git_head"]
         result["real_factor_audit"] = gate
         if args.write_real_factor_gate:
             gate_path = Path(args.remediation_gate_dir) / "ICDOR_GATE_REAL_FACTOR_AUDIT_PASS.json"
