@@ -107,3 +107,31 @@ def test_edge_and_transfer_execute_four_real_same_factor_controls() -> None:
         latent_enabled=True,
     )
     _assert_real_arms(transfer_model, transfer["per_target"][0]["matched_control_arms"])
+
+
+def test_transfer_abstains_when_dense_mask_cannot_form_four_controls() -> None:
+    class DenseControlModel(_RuntimeControlModel):
+        def forward(self, images: torch.Tensor, **kwargs: object) -> dict[str, torch.Tensor]:
+            output = super().forward(images, **kwargs)
+            if kwargs.get("factor_mask_override") is None:
+                output["factor_soft_masks"] = torch.ones(images.shape[0], 1, 10, 10, device=images.device)
+            return output
+
+    model = DenseControlModel()
+    transfer = collect_joint_target_transfer_metrics(
+        model,
+        [_batch()],
+        factor_ids=("signal",),
+        action_ids=("brake",),
+        reason_ids=("yield",),
+        action_directions=(("support",),),
+        reason_directions=(("support",),),
+        device=torch.device("cpu"),
+        route_mode="admitted",
+        latent_enabled=True,
+    )
+
+    assert transfer["summary"]["available_pair_count"] == 0
+    assert transfer["per_target"][0]["available"] is False
+    assert transfer["per_target"][0]["unavailable_reason"] == "insufficient_matched_control_rows"
+    assert transfer["per_target"][0]["tes"] is None

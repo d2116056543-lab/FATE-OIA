@@ -141,7 +141,7 @@ def build_batch_matched_factor_control_overrides(
     for sample_index in range(batch):
         source = factor_masks[sample_index, factor_index].detach()
         support = source.gt(0).unsqueeze(0)
-        if not bool(support.any()):
+        def append_unavailable(reason: str) -> None:
             for arm_index in range(arm_count):
                 arm_records[arm_index].append({
                     "schema_version": "icdor_matched_control.v2",
@@ -150,21 +150,31 @@ def build_batch_matched_factor_control_overrides(
                     "factor": factor,
                     "factor_type": factor_type,
                     "region": region,
-                    "control_type": "empty_selected_noop",
+                    "control_type": "unavailable_noop",
                     "available": False,
+                    "unavailable_reason": reason,
                     "selected_mass": 0.0,
                     "control_mass": 0.0,
                     "mass_error": 0.0,
                     "overlap": 0.0,
                 })
+
+        if not bool(support.any()):
+            append_unavailable("empty_selected_factor_mask")
             continue
-        controls = build_matched_factor_controls(
-            support,
-            selected_factor_type=factor_type,
-            selected_region=region,
-            region_mask=region_mask,
-            min_controls=arm_count,
-        )[:arm_count]
+        try:
+            controls = build_matched_factor_controls(
+                support,
+                selected_factor_type=factor_type,
+                selected_region=region,
+                region_mask=region_mask,
+                min_controls=arm_count,
+            )[:arm_count]
+        except ValueError as error:
+            if "at least four non-overlapping equal-mass arms" not in str(error):
+                raise
+            append_unavailable("insufficient_nonoverlapping_equal_mass_controls")
+            continue
         selected_mass = float(source.sum())
         support_mass = int(support.sum())
         if selected_mass <= 0.0 or support_mass <= 0:
@@ -202,7 +212,23 @@ def summarize_matched_control_arms(arm_records: Sequence[Sequence[Mapping[str, A
             raise ValueError("IC-DOR matched control arm has no provenance rows")
         available = [record for record in records if bool(record.get("available", True))]
         if not available:
-            raise ValueError("IC-DOR matched control arm has no non-empty selected-factor rows")
+            first = records[0]
+            summaries.append({
+                "schema_version": "icdor_matched_control.v2",
+                "arm_index": int(first["arm_index"]),
+                "factor": str(first["factor"]),
+                "factor_type": str(first["factor_type"]),
+                "region": str(first["region"]),
+                "control_type": "unavailable_noop",
+                "sample_count": len(records),
+                "available_sample_count": 0,
+                "max_mass_error": None,
+                "max_overlap": None,
+                "selected_mass_total": 0.0,
+                "control_mass_total": 0.0,
+                "unavailable_reason": "insufficient_nonoverlapping_equal_mass_controls",
+            })
+            continue
         first = available[0]
         summaries.append({
             "schema_version": "icdor_matched_control.v2",

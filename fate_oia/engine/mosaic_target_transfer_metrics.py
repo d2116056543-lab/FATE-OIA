@@ -199,13 +199,19 @@ def compute_target_transfer_metrics(inputs: TargetTransferInputs) -> dict[str, A
             if len(arms) < 4:
                 raise ValueError("target transfer requires at least four matched control arms")
             for arm in arms:
-                if not isinstance(arm, dict) or float(arm.get("max_mass_error", 1.0)) > 0.05 or float(arm.get("max_overlap", 1.0)) != 0.0:
+                if not isinstance(arm, dict):
+                    raise ValueError("target transfer matched control metadata must be a mapping")
+                if int(arm.get("available_sample_count", 0)) == 0:
+                    if arm.get("max_mass_error") is not None or arm.get("max_overlap") is not None:
+                        raise ValueError("unavailable matched controls must not fabricate mass or overlap metrics")
+                    continue
+                if float(arm.get("max_mass_error", 1.0)) > 0.05 or float(arm.get("max_overlap", 1.0)) != 0.0:
                     raise ValueError("target transfer matched control metadata violates mass or overlap requirements")
 
     selected_counts = [sum(bool(row[factor]) for row in selected_mask) for factor in range(factor_count)]
     random_counts = [sum(bool(row[factor]) for row in random_mask) for factor in range(factor_count)]
-    if selected_counts != random_counts or any(count == 0 for count in selected_counts):
-        raise ValueError("target transfer requires non-empty matched random masks with equal factor mass")
+    if selected_counts != random_counts:
+        raise ValueError("target transfer requires matched random masks with equal factor availability")
 
     per_target: list[dict[str, Any]] = []
     threshold = float(inputs.evidence_threshold)
@@ -221,8 +227,26 @@ def compute_target_transfer_metrics(inputs: TargetTransferInputs) -> dict[str, A
                 and visual_evidence[sample_index][factor_index] > threshold
             ]
             if not rows:
-                raise ValueError(f"target transfer {factor_id}->{target_id} has no selected visual evidence rows")
+                per_target.append({
+                    "factor_id": factor_id, "target_id": target_id,
+                    "direction": directions[factor_index][target_index],
+                    "available": False, "unavailable_reason": "insufficient_matched_control_rows",
+                    "n": 0, "tes": None, "tet": None, "cca": None,
+                    "ap_delta": None, "admitted": False,
+                    "matched_control_arms": None if matched_control_arms is None else matched_control_arms[factor_index],
+                })
+                continue
             target_labels = [bool(labels[row][target_index]) for row in rows]
+            if not any(target_labels) or all(target_labels):
+                per_target.append({
+                    "factor_id": factor_id, "target_id": target_id,
+                    "direction": directions[factor_index][target_index],
+                    "available": False, "unavailable_reason": "target_one_class_on_matched_control_rows",
+                    "n": len(rows), "tes": None, "tet": None, "cca": None,
+                    "ap_delta": None, "admitted": False,
+                    "matched_control_arms": None if matched_control_arms is None else matched_control_arms[factor_index],
+                })
+                continue
             selected_scores = [selected[row][factor_index][target_index] for row in rows]
             deleted_scores = [deleted[row][factor_index][target_index] for row in rows]
             random_scores = [random[row][factor_index][target_index] for row in rows]
@@ -231,7 +255,14 @@ def compute_target_transfer_metrics(inputs: TargetTransferInputs) -> dict[str, A
             direction = directions[factor_index][target_index]
             direction_rows = [label if direction == "support" else not label for label in target_labels]
             if not any(direction_rows):
-                raise ValueError(f"target transfer {factor_id}->{target_id} has no direction-specific rows")
+                per_target.append({
+                    "factor_id": factor_id, "target_id": target_id, "direction": direction,
+                    "available": False, "unavailable_reason": "no_direction_specific_matched_control_rows",
+                    "n": len(rows), "tes": None, "tet": None, "cca": None,
+                    "ap_delta": None, "admitted": False,
+                    "matched_control_arms": None if matched_control_arms is None else matched_control_arms[factor_index],
+                })
+                continue
             sign = _DIRECTIONS[direction]
             signed_selected = [sign * (on - off) for on, off in zip(selected_scores, deleted_scores)]
             # Both effects share the same full-evidence baseline. This makes
@@ -252,6 +283,8 @@ def compute_target_transfer_metrics(inputs: TargetTransferInputs) -> dict[str, A
                     "factor_id": factor_id,
                     "target_id": target_id,
                     "direction": direction,
+                    "available": True,
+                    "unavailable_reason": None,
                     "n": len(rows),
                     "selected_effect": selected_effect,
                     "matched_random_effect": random_effect,
@@ -271,16 +304,18 @@ def compute_target_transfer_metrics(inputs: TargetTransferInputs) -> dict[str, A
             )
     if not per_target:
         raise ValueError("target transfer has no candidate factor-target pairs")
+    available_pairs = [item for item in per_target if item.get("available") is True]
     summary = {
         "pair_count": len(per_target),
-        "mean_selected_effect": _mean([item["selected_effect"] for item in per_target]),
-        "mean_matched_random_effect": _mean([item["matched_random_effect"] for item in per_target]),
-        "mean_tet": _mean([item["tet"] for item in per_target]),
-        "mean_tes": _mean([item["tes"] for item in per_target]),
-        "mean_cca": _mean([item["cca"] for item in per_target]),
-        "mean_calibration_gain": _mean([item["calibration_gain"] for item in per_target]),
-        "mean_ap_delta": _mean([item["ap_delta"] for item in per_target]),
-        "admitted_rate": _mean([1.0 if item["admitted"] else 0.0 for item in per_target]),
+        "available_pair_count": len(available_pairs),
+        "mean_selected_effect": _mean([item["selected_effect"] for item in available_pairs]) if available_pairs else None,
+        "mean_matched_random_effect": _mean([item["matched_random_effect"] for item in available_pairs]) if available_pairs else None,
+        "mean_tet": _mean([item["tet"] for item in available_pairs]) if available_pairs else None,
+        "mean_tes": _mean([item["tes"] for item in available_pairs]) if available_pairs else None,
+        "mean_cca": _mean([item["cca"] for item in available_pairs]) if available_pairs else None,
+        "mean_calibration_gain": _mean([item["calibration_gain"] for item in available_pairs]) if available_pairs else None,
+        "mean_ap_delta": _mean([item["ap_delta"] for item in available_pairs]) if available_pairs else None,
+        "admitted_rate": _mean([1.0 if item["admitted"] else 0.0 for item in available_pairs]) if available_pairs else None,
     }
     return {"schema_version": _SCHEMA_VERSION, "per_target": per_target, "summary": summary}
 
@@ -314,6 +349,7 @@ def collect_target_transfer_metrics(
     deleted_probability: list[torch.Tensor] = []
     random_deleted_probability: list[torch.Tensor] = []
     control_records: list[list[list[dict[str, Any]]]] = [[[] for _ in range(4)] for _ in range(factor_count)]
+    matched_control_availability: list[torch.Tensor] = []
     was_training = model.training
     model.eval()
     try:
@@ -339,6 +375,7 @@ def collect_target_transfer_metrics(
                 raise ValueError("target transfer requires real factor_soft_masks [batch, factor, height, width]")
             deleted_arms: list[torch.Tensor] = []
             random_arms: list[torch.Tensor] = []
+            batch_availability = torch.zeros(images.shape[0], factor_count, dtype=torch.bool)
             for factor_index in range(factor_count):
                 keep = torch.ones(images.shape[0], factor_count, device=device)
                 keep[:, factor_index] = 0.0
@@ -354,6 +391,11 @@ def collect_target_transfer_metrics(
                 )
                 for arm_index, rows in enumerate(arm_rows):
                     control_records[factor_index][arm_index].extend(rows)
+                for sample_index in range(images.shape[0]):
+                    batch_availability[sample_index, factor_index] = all(
+                        bool(arm_rows[arm_index][sample_index].get("available", False))
+                        for arm_index in range(len(arm_rows))
+                    )
                 random_outputs = []
                 for override in overrides:
                     random_deleted = model(
@@ -368,6 +410,7 @@ def collect_target_transfer_metrics(
             full_probability.append(full_prob[:, None, :].expand(-1, factor_count, -1).cpu())
             deleted_probability.append(torch.stack(deleted_arms, dim=1).cpu())
             random_deleted_probability.append(torch.stack(random_arms, dim=1).cpu())
+            matched_control_availability.append(batch_availability)
     finally:
         model.train(was_training)
     if not labels:
@@ -378,13 +421,14 @@ def collect_target_transfer_metrics(
     deleted = torch.cat(deleted_probability)
     random_deleted = torch.cat(random_deleted_probability)
     sample_count = label.shape[0]
+    availability = torch.cat(matched_control_availability, dim=0)
     return compute_target_transfer_metrics(TargetTransferInputs(
         factor_ids=factor_ids,
         target_ids=target_ids,
         directions=directions,
         factor_visual_evidence=evidence,
-        selected_factor_mask=torch.ones(sample_count, factor_count, dtype=torch.bool),
-        matched_random_factor_mask=torch.ones(sample_count, factor_count, dtype=torch.bool),
+        selected_factor_mask=availability,
+        matched_random_factor_mask=availability,
         target_evaluation_mask=torch.ones(sample_count, target_count, dtype=torch.bool),
         target_labels=label,
         selected_target_prob=selected,
@@ -421,6 +465,7 @@ def collect_joint_target_transfer_metrics(
     deleted_probability: list[torch.Tensor] = []
     random_deleted_probability: list[torch.Tensor] = []
     control_records: list[list[list[dict[str, Any]]]] = [[[] for _ in range(4)] for _ in range(factor_count)]
+    matched_control_availability: list[torch.Tensor] = []
     was_training = model.training
     model.eval()
     try:
@@ -451,6 +496,7 @@ def collect_joint_target_transfer_metrics(
                 raise ValueError("joint target transfer requires real factor_soft_masks [batch, factor, height, width]")
             deleted_arms: list[torch.Tensor] = []
             random_arms: list[torch.Tensor] = []
+            batch_availability = torch.zeros(images.shape[0], factor_count, dtype=torch.bool)
             for factor_index in range(factor_count):
                 keep = torch.ones(images.shape[0], factor_count, device=device)
                 keep[:, factor_index] = 0.0
@@ -467,6 +513,11 @@ def collect_joint_target_transfer_metrics(
                 )
                 for arm_index, rows in enumerate(arm_rows):
                     control_records[factor_index][arm_index].extend(rows)
+                for sample_index in range(images.shape[0]):
+                    batch_availability[sample_index, factor_index] = all(
+                        bool(arm_rows[arm_index][sample_index].get("available", False))
+                        for arm_index in range(len(arm_rows))
+                    )
                 random_outputs = []
                 for override in overrides:
                     output = model(
@@ -488,19 +539,21 @@ def collect_joint_target_transfer_metrics(
             full_probability.append(full_prob[:, None, :].expand(-1, factor_count, -1).cpu())
             deleted_probability.append(torch.stack(deleted_arms, dim=1).cpu())
             random_deleted_probability.append(torch.stack(random_arms, dim=1).cpu())
+            matched_control_availability.append(batch_availability)
     finally:
         model.train(was_training)
     if not labels:
         raise ValueError("joint target transfer collector received no train_audit rows")
     label = torch.cat(labels)
     sample_count = label.shape[0]
+    availability = torch.cat(matched_control_availability, dim=0)
     return compute_target_transfer_metrics(TargetTransferInputs(
         factor_ids=factor_ids,
         target_ids=target_ids,
         directions=directions,
         factor_visual_evidence=torch.cat(visual_evidence),
-        selected_factor_mask=torch.ones(sample_count, factor_count, dtype=torch.bool),
-        matched_random_factor_mask=torch.ones(sample_count, factor_count, dtype=torch.bool),
+        selected_factor_mask=availability,
+        matched_random_factor_mask=availability,
         target_evaluation_mask=torch.ones(sample_count, len(target_ids), dtype=torch.bool),
         target_labels=label,
         selected_target_prob=torch.cat(full_probability),
