@@ -2,7 +2,7 @@
   "status": "code_implemented_and_unit_verified_execution_gates_pending",
   "plan_sha256": "298AF9DD5D2AA2203DCF0A74D24792149D99752B08B1FE6898D360491159A806",
   "review_rounds": 3,
-  "latest_supervisor_status": "all_reported_code_gaps_patched_pending_final_review",
+  "latest_supervisor_status": "APPROVED_clean_head_84efbaa",
   "items": [
     {"id":"T01","status":"implemented_pending_clean_commit","evidence":"source contract manifest and tracked tree are independently hash-bound"},
     {"id":"T02","status":"verified","evidence":"deterministic train_core/train_audit/train_calib/test split tests"},
