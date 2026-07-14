@@ -122,7 +122,7 @@ def _edge_statistics_from_audit(payload: dict[str, Any]) -> dict[tuple[str, str,
         lcb = record.get("bootstrap_lcb95", {})
         counts = record.get("matched_counts", {})
         required_metrics = {"cca", "isolated_edge_ap", "visual_ap"}
-        required_lcb = {"signed_effect", "tet", "tes"}
+        required_lcb = {"signed_effect", "tet", "tes", "tes_identity", "tes_spatial"}
         if not required_metrics <= set(metrics) or not required_lcb <= set(lcb):
             raise ValueError("IC-DOR edge audit is missing real admission metrics")
         valid_samples = min(int(counts.get(name, 0)) for name in ("factor_on", "factor_off", "equal_mass_random"))
@@ -132,6 +132,8 @@ def _edge_statistics_from_audit(payload: dict[str, Any]) -> dict[tuple[str, str,
             signed_effect_lcb95=float(lcb["signed_effect"]),
             tet_lcb95=float(lcb["tet"]),
             tes_lcb95=float(lcb["tes"]),
+            tes_identity_lcb95=float(lcb["tes_identity"]),
+            tes_spatial_lcb95=float(lcb["tes_spatial"]),
             cca=float(metrics["cca"]),
             isolated_edge_ap=float(metrics["isolated_edge_ap"]),
             visual_ap=float(metrics["visual_ap"]),

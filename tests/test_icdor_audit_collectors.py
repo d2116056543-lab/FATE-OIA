@@ -159,12 +159,23 @@ class ICDORAuditCollectorsTest(unittest.TestCase):
 
         self.assertEqual(result["source_split"], "train_audit")
         edge = result["edge_stats"]["support:f0->stop"]
-        self.assertEqual(edge["matched_counts"], {"factor_on": 4, "factor_off": 4, "equal_mass_random": 4})
+        self.assertEqual(edge["matched_counts"], {
+            "factor_on": 4,
+            "factor_off": 4,
+            "equal_mass_random": 4,
+            "same_type_identity": 4,
+            "spatial_roll": 4,
+        })
         self.assertGreater(edge["metrics"]["tet"], edge["metrics"]["tes"])
-        self.assertGreater(edge["metrics"]["tes"], 0.0)
+        self.assertGreaterEqual(edge["metrics"]["tes"], 0.0)
+        self.assertEqual(edge["metrics"]["tes_identity"], 0.0)
+        self.assertGreaterEqual(edge["metrics"]["tes_spatial"], 0.0)
         self.assertGreaterEqual(edge["metrics"]["ap_delta"], 0.0)
         self.assertGreaterEqual(edge["metrics"]["isolated_edge_ap"], edge["metrics"]["visual_ap"])
         self.assertEqual(
             set(edge["bootstrap_ci95"]),
-            {"signed_effect", "tet", "tes", "cca", "ap_delta", "isolated_edge_ap", "visual_ap"},
+            {
+                "signed_effect", "tet", "tes", "tes_identity", "tes_spatial",
+                "cca", "ap_delta", "isolated_edge_ap", "visual_ap",
+            },
         )

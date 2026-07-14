@@ -20,6 +20,8 @@ def test_icdor_edge_admission_requires_all_audit_conditions_and_is_hash_stable()
             signed_effect_lcb95=0.03,
             tet_lcb95=0.02,
             tes_lcb95=0.01,
+            tes_identity_lcb95=0.01,
+            tes_spatial_lcb95=0.01,
             cca=0.70,
             isolated_edge_ap=0.71,
             visual_ap=0.70,
@@ -43,6 +45,8 @@ def test_icdor_edge_admission_fails_closed_for_weak_or_reason_only_edges() -> No
             signed_effect_lcb95=0.01,
             tet_lcb95=0.01,
             tes_lcb95=0.01,
+            tes_identity_lcb95=0.01,
+            tes_spatial_lcb95=0.01,
             cca=0.59,
             isolated_edge_ap=0.60,
             visual_ap=0.70,
@@ -50,3 +54,27 @@ def test_icdor_edge_admission_fails_closed_for_weak_or_reason_only_edges() -> No
     }
     admission = build_edge_admission(stats, ontology, tiers, source_split="train_audit")
     assert not bool(admission.edge_admission_mask.any())
+
+
+def test_edge_admission_rejects_identity_control_failure() -> None:
+    ontology = load_icdor_ontology(Path("configs"))
+    tiers = ["certified"] * len(ontology["factors"])
+    stats = {
+        ("support", "center_drivable_region_visible", "forward"): MOSAICEdgeInterventionStats(
+            valid_samples=80,
+            signed_effect_lcb95=0.03,
+            tet_lcb95=0.02,
+            tes_lcb95=0.01,
+            tes_identity_lcb95=-0.001,
+            tes_spatial_lcb95=0.02,
+            cca=0.70,
+            isolated_edge_ap=0.71,
+            visual_ap=0.70,
+        )
+    }
+
+    admission = build_edge_admission(stats, ontology, tiers, source_split="train_audit")
+
+    entry = admission.entries["support:center_drivable_region_visible:forward"]
+    assert entry["accepted"] is False
+    assert "tes_identity_lcb_not_positive" in entry["reasons"]

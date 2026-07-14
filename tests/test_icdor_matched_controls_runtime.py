@@ -7,7 +7,7 @@ import torch
 import yaml
 from torch import nn
 
-from fate_oia.engine.mosaic_icdor_audit_collectors import collect_edge_intervention_audit
+from fate_oia.engine.mosaic_icdor_audit_collectors import _edge_metrics, collect_edge_intervention_audit
 from fate_oia.engine.mosaic_target_transfer_metrics import collect_joint_target_transfer_metrics
 
 
@@ -88,7 +88,7 @@ def _assert_real_arms(model: _RuntimeControlModel, metadata: list[dict[str, obje
         assert float(arm["max_overlap"]) == 0.0
 
 
-def test_edge_and_transfer_execute_four_real_same_factor_controls() -> None:
+def test_edge_and_transfer_abstain_without_same_type_identity_control() -> None:
     edge_model = _RuntimeControlModel()
     edge = collect_edge_intervention_audit(
         edge_model,
@@ -99,7 +99,8 @@ def test_edge_and_transfer_execute_four_real_same_factor_controls() -> None:
         device=torch.device("cpu"),
         bootstrap_replicates=8,
     )["edge_stats"]["support:signal->brake"]
-    _assert_real_arms(edge_model, edge["matched_control_arms"])
+    assert all(arm["available_sample_count"] == 0 for arm in edge["matched_control_arms"])
+    assert all(arm["control_type"] == "unavailable_noop" for arm in edge["matched_control_arms"])
 
     transfer_model = _RuntimeControlModel()
     transfer = collect_joint_target_transfer_metrics(
@@ -114,7 +115,11 @@ def test_edge_and_transfer_execute_four_real_same_factor_controls() -> None:
         route_mode="admitted",
         latent_enabled=True,
     )
-    _assert_real_arms(transfer_model, transfer["per_target"][0]["matched_control_arms"])
+    assert transfer["summary"]["available_pair_count"] == 0
+    assert all(
+        arm["available_sample_count"] == 0
+        for arm in transfer["per_target"][0]["matched_control_arms"]
+    )
 
 
 def test_transfer_abstains_when_dense_mask_cannot_form_four_controls() -> None:
@@ -173,7 +178,14 @@ def test_joint_transfer_batches_factor_and_control_interventions() -> None:
                 self.control_overrides.append(factor_mask_override.detach().cpu())
             if factor_intervention_keep_mask is not None:
                 active = active * factor_intervention_keep_mask[:, :, None, None]
-            mass = active.sum((-2, -1)).sum(1)
+            y, x = torch.meshgrid(
+                torch.arange(10, device=images.device),
+                torch.arange(10, device=images.device),
+                indexing="ij",
+            )
+            spatial_weight = 1.0 + y.float() * 0.1 + x.float() * 0.01
+            factor_weight = torch.tensor((1.0, 3.0), device=images.device)
+            mass = (active * spatial_weight).sum((-2, -1)).mul(factor_weight).sum(1)
             logits = mass.unsqueeze(1)
             return {
                 "factor_presence_prob": torch.full((images.shape[0], 2), 0.8, device=images.device),
@@ -202,6 +214,26 @@ def test_joint_transfer_batches_factor_and_control_interventions() -> None:
     assert transfer["collection_runtime"]["intervention_forward_calls"] == 3
     assert transfer["collection_runtime"]["sequential_intervention_forward_calls"] == 10
     assert transfer["collection_runtime"]["intervention_chunk_size"] == 4
+    arm_types = [arm["control_type"] for arm in transfer["per_target"][0]["matched_control_arms"]]
+    assert arm_types == ["same_type_identity", "spatial_roll", "spatial_roll", "spatial_roll"]
+
+    sequential_model = TwoFactorControlModel()
+    sequential = collect_joint_target_transfer_metrics(
+        sequential_model,
+        [_batch()],
+        factor_ids=("signal", "vehicle"),
+        action_ids=("brake",),
+        reason_ids=("yield",),
+        action_directions=(("support",), ("support",)),
+        reason_directions=(("support",), ("support",)),
+        device=torch.device("cpu"),
+        route_mode="admitted",
+        latent_enabled=True,
+        intervention_chunk_size=1,
+    )
+    assert sequential_model.forward_calls == 11
+    assert sequential["per_target"] == transfer["per_target"]
+    assert sequential["summary"] == transfer["summary"]
 
 
 def test_training_config_wires_target_transfer_chunk_size() -> None:
@@ -256,3 +288,25 @@ def test_joint_transfer_reuses_and_repeats_batch_local_dino_field() -> None:
         intervention_chunk_size=4,
     )
     assert model.dino_calls == 1
+
+
+def test_edge_metrics_require_identity_and_spatial_controls_separately() -> None:
+    labels = torch.tensor([1.0, 0.0, 1.0, 0.0])
+    on = torch.tensor([1.0, -1.0, 1.0, -1.0])
+    off = torch.tensor([0.0, -1.0, 0.0, -1.0])
+    identity = torch.tensor([1.5, -1.0, 1.5, -1.0])
+    spatial = torch.tensor([-1.0, -1.0, -1.0, -1.0])
+
+    metrics = _edge_metrics(
+        on,
+        off,
+        (identity + 3.0 * spatial) / 4.0,
+        labels,
+        direction="support",
+        random_identity=identity,
+        random_spatial=spatial,
+    )
+
+    assert metrics["tes"] > 0.0
+    assert metrics["tes_identity"] < 0.0
+    assert metrics["tes_spatial"] > 0.0

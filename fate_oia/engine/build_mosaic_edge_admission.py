@@ -14,6 +14,8 @@ class MOSAICEdgeInterventionStats:
     signed_effect_lcb95: float
     tet_lcb95: float
     tes_lcb95: float
+    tes_identity_lcb95: float
+    tes_spatial_lcb95: float
     cca: float
     isolated_edge_ap: float
     visual_ap: float
@@ -84,6 +86,10 @@ def build_edge_admission(
                         reasons.append("tet_lcb_not_positive")
                     if stats.tes_lcb95 <= 0:
                         reasons.append("tes_lcb_not_positive")
+                    if stats.tes_identity_lcb95 <= 0:
+                        reasons.append("tes_identity_lcb_not_positive")
+                    if stats.tes_spatial_lcb95 <= 0:
+                        reasons.append("tes_spatial_lcb_not_positive")
                     if stats.cca < 0.60:
                         reasons.append("cca_below_0p60")
                     if stats.calibration_gain is not None and stats.calibration_gain <= 0.0:

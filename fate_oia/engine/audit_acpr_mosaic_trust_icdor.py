@@ -348,7 +348,10 @@ def functional_hard_gates(
     }
     evidence["edge_admission"] = _require_source_tokens(
         root / "fate_oia" / "engine" / "build_mosaic_edge_admission.py",
-        ("source_split", "train_audit", "signed_effect_lcb95", "tes_lcb95", "isolated_edge_ap"),
+        (
+            "source_split", "train_audit", "signed_effect_lcb95", "tes_lcb95",
+            "tes_identity_lcb95", "tes_spatial_lcb95", "isolated_edge_ap",
+        ),
     )
     evidence["action_firewall"] = {
         "cross_gradient": dynamic["gradient_firewall"]["reason_to_action_adapter"],

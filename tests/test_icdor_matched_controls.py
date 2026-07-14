@@ -28,3 +28,70 @@ def test_matched_controls_have_four_real_nonoverlap_arms_with_mass_tolerance() -
         assert row["factor_type"] == "object"
         assert row["region"] == "front"
 
+
+def test_transfer_admission_must_beat_identity_and_spatial_controls_separately() -> None:
+    module = importlib.import_module("fate_oia.engine.mosaic_target_transfer_metrics")
+    selected = torch.tensor([[[0.9]], [[0.8]], [[0.2]], [[0.1]]])
+    deleted = torch.tensor([[[0.5]], [[0.4]], [[0.9]], [[0.8]]])
+    arm_prob = torch.tensor(
+        [
+            [[0.2, 0.8, 0.8, 0.8]],
+            [[0.1, 0.7, 0.7, 0.7]],
+            [[0.2, 0.2, 0.2, 0.2]],
+            [[0.1, 0.1, 0.1, 0.1]],
+        ]
+    ).unsqueeze(-1)
+    random_mean = arm_prob.mean(dim=2)
+    arm_metadata = [[
+        {
+            "arm_index": index,
+            "control_type": "same_type_identity" if index == 0 else "spatial_roll",
+            "available_sample_count": 4,
+            "max_mass_error": 0.0,
+            "max_overlap": 0.0,
+        }
+        for index in range(4)
+    ]]
+    result = module.compute_target_transfer_metrics(module.TargetTransferInputs(
+        factor_ids=("signal",),
+        target_ids=("action:brake",),
+        directions=(("support",),),
+        factor_visual_evidence=torch.ones(4, 1),
+        selected_factor_mask=torch.ones(4, 1, dtype=torch.bool),
+        matched_random_factor_mask=torch.ones(4, 1, dtype=torch.bool),
+        target_evaluation_mask=torch.ones(4, 1, dtype=torch.bool),
+        target_labels=torch.tensor([[1.0], [1.0], [0.0], [0.0]]),
+        selected_target_prob=selected,
+        matched_random_target_prob=random_mean,
+        matched_random_target_prob_by_arm=arm_prob,
+        deleted_target_prob=deleted,
+        matched_control_arms=arm_metadata,
+    ))
+    row = result["per_target"][0]
+    assert row["tes"] > 0.0
+    assert row["tes_spatial"] > 0.0
+    assert row["tes_identity"] < 0.0
+    assert row["admitted"] is False
+
+
+def test_transfer_without_category_controls_is_diagnostic_only() -> None:
+    module = importlib.import_module("fate_oia.engine.mosaic_target_transfer_metrics")
+    result = module.compute_target_transfer_metrics(module.TargetTransferInputs(
+        factor_ids=("signal",),
+        target_ids=("action:brake",),
+        directions=(("support",),),
+        factor_visual_evidence=torch.ones(4, 1),
+        selected_factor_mask=torch.ones(4, 1, dtype=torch.bool),
+        matched_random_factor_mask=torch.ones(4, 1, dtype=torch.bool),
+        target_evaluation_mask=torch.ones(4, 1, dtype=torch.bool),
+        target_labels=torch.tensor([[1.0], [1.0], [0.0], [0.0]]),
+        selected_target_prob=torch.tensor([[[0.9]], [[0.8]], [[0.2]], [[0.1]]]),
+        matched_random_target_prob=torch.tensor([[[0.6]], [[0.5]], [[0.2]], [[0.1]]]),
+        deleted_target_prob=torch.tensor([[[0.5]], [[0.4]], [[0.9]], [[0.8]]]),
+    ))
+
+    row = result["per_target"][0]
+    assert row["tes"] > 0.0
+    assert row["tes_identity"] is None
+    assert row["tes_spatial"] is None
+    assert row["admitted"] is False

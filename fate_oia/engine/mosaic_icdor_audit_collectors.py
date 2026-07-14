@@ -69,7 +69,17 @@ def build_matched_factor_controls(
             raise ValueError("IC-DOR identity control metadata must align with [N,H,W] masks")
         for index, mask in enumerate(identity_masks):
             if identity_types[index] == selected_factor_type and identity_regions[index] == selected_region:
-                add(mask.unsqueeze(0), "same_type_identity")
+                candidate_scores = mask.float().unsqueeze(0) * eligible.float() * (~occupied).float()
+                available = candidate_scores.gt(0)
+                if int(available.sum()) < mass:
+                    continue
+                flat_scores = candidate_scores.flatten()
+                chosen = torch.topk(flat_scores, k=mass, largest=True, sorted=False).indices
+                identity = torch.zeros_like(flat_scores, dtype=torch.bool)
+                identity[chosen] = True
+                add(identity.reshape_as(selected), "same_type_identity")
+                if any(control["control_type"] == "same_type_identity" for control in controls):
+                    break
     # Cyclic shifts preserve exact mass. Enumerating offsets lets irregular masks
     # reject overlaps rather than silently accepting a near-match.
     height, width = selected.shape[-2:]
@@ -123,6 +133,8 @@ def build_batch_matched_factor_control_overrides(
     factor: str,
     factor_type: str,
     region: str,
+    identity_factor_types: Sequence[str] = (),
+    identity_regions: Sequence[str] = (),
     arm_count: int = 4,
 ) -> tuple[list[torch.Tensor], list[list[dict[str, Any]]]]:
     """Build four batch-local, same-factor spatial intervention masks.
@@ -163,17 +175,31 @@ def build_batch_matched_factor_control_overrides(
             append_unavailable("empty_selected_factor_mask")
             continue
         try:
-            controls = build_matched_factor_controls(
+            candidates = build_matched_factor_controls(
                 support,
                 selected_factor_type=factor_type,
                 selected_region=region,
+                identity_masks=factor_masks[sample_index],
+                identity_types=identity_factor_types,
+                identity_regions=identity_regions,
                 region_mask=region_mask,
                 min_controls=arm_count,
-            )[:arm_count]
+            )
+            identity_controls = [item for item in candidates if item["control_type"] == "same_type_identity"]
+            spatial_controls = [item for item in candidates if item["control_type"] == "spatial_roll"]
+            if not identity_controls or len(spatial_controls) < arm_count - 1:
+                raise ValueError("IC-DOR matched controls require identity and spatial arms")
+            controls = [identity_controls[0], *spatial_controls[: arm_count - 1]]
         except ValueError as error:
-            if "at least four non-overlapping equal-mass arms" not in str(error):
+            if not any(
+                marker in str(error)
+                for marker in (
+                    "at least four non-overlapping equal-mass arms",
+                    "require identity and spatial arms",
+                )
+            ):
                 raise
-            append_unavailable("insufficient_nonoverlapping_equal_mass_controls")
+            append_unavailable("insufficient_identity_or_spatial_equal_mass_controls")
             continue
         selected_mass = float(source.sum())
         support_mass = int(support.sum())
@@ -226,7 +252,7 @@ def summarize_matched_control_arms(arm_records: Sequence[Sequence[Mapping[str, A
                 "max_overlap": None,
                 "selected_mass_total": 0.0,
                 "control_mass_total": 0.0,
-                "unavailable_reason": "insufficient_nonoverlapping_equal_mass_controls",
+                "unavailable_reason": str(first.get("unavailable_reason", "insufficient_matched_controls")),
             })
             continue
         first = available[0]
@@ -602,8 +628,12 @@ def _edge_metrics(
     labels: torch.Tensor,
     *,
     direction: str,
+    random_identity: torch.Tensor,
+    random_spatial: torch.Tensor,
 ) -> dict[str, float]:
     probability_on, probability_off, probability_random = on.sigmoid(), off.sigmoid(), random.sigmoid()
+    probability_identity = random_identity.sigmoid()
+    probability_spatial = random_spatial.sigmoid()
     positive = labels > 0.5
     if not bool(positive.any()) or bool(positive.all()):
         raise ValueError("IC-DOR edge audit requires positive and negative action examples")
@@ -611,16 +641,22 @@ def _edge_metrics(
         evaluation_rows = positive
         signed = probability_on - probability_off
         random_signed = probability_random - probability_off
+        identity_signed = probability_identity - probability_off
+        spatial_signed = probability_spatial - probability_off
     elif direction == "veto":
         evaluation_rows = ~positive
         signed = probability_off - probability_on
         random_signed = probability_off - probability_random
+        identity_signed = probability_off - probability_identity
+        spatial_signed = probability_off - probability_spatial
     else:
         raise ValueError("IC-DOR edge direction must be support or veto")
     if not bool(evaluation_rows.any()):
         raise ValueError("IC-DOR edge audit lacks direction-specific evaluation rows")
     tet = float(signed[evaluation_rows].mean())
     random_effect = float(random_signed[evaluation_rows].mean())
+    identity_effect = float(identity_signed[evaluation_rows].mean())
+    spatial_effect = float(spatial_signed[evaluation_rows].mean())
     calibration_on = 1.0 - (probability_on - labels).abs()
     calibration_off = 1.0 - (probability_off - labels).abs()
     isolated_edge_ap = _average_precision(probability_on, positive)
@@ -629,6 +665,8 @@ def _edge_metrics(
         "signed_effect": tet,
         "tet": tet,
         "tes": tet - random_effect,
+        "tes_identity": tet - identity_effect,
+        "tes_spatial": tet - spatial_effect,
         "cca": float((signed[evaluation_rows] > 0.0).float().mean()),
         "calibration_gain": float((calibration_on[evaluation_rows] - calibration_off[evaluation_rows]).mean()),
         "ap_delta": isolated_edge_ap - visual_ap,
@@ -687,7 +725,10 @@ def collect_edge_intervention_audit(
         on[direction_id, factor_id, action_id] = True
         plans.append((spec, on, off, action_id, factor_id))
     logits: dict[str, dict[str, list[torch.Tensor]]] = {
-        _edge_key(spec): {"on": [], "off": [], "random": [], "labels": []} for spec, *_ in plans
+        _edge_key(spec): {
+            "on": [], "off": [], "random": [], "random_identity": [],
+            "random_spatial": [], "labels": [],
+        } for spec, *_ in plans
     }
     kwargs = dict(forward_kwargs or {})
     if "factor_mask_override" in kwargs:
@@ -695,6 +736,12 @@ def collect_edge_intervention_audit(
     control_records: dict[str, list[list[dict[str, Any]]]] = {
         _edge_key(spec): [[] for _ in range(4)] for spec, *_ in plans
     }
+    identity_specs = [
+        factor_control_spec(model, factor_name=str(name), factor_index=index)
+        for index, name in enumerate(factor_names)
+    ]
+    identity_factor_types = tuple(spec["factor_type"] for spec in identity_specs)
+    identity_regions = tuple(spec["region"] for spec in identity_specs)
     was_training = model.training
     model.eval()
     try:
@@ -724,6 +771,8 @@ def collect_edge_intervention_audit(
                     factor=factor_spec["factor"],
                     factor_type=factor_spec["factor_type"],
                     region=factor_spec["region"],
+                    identity_factor_types=identity_factor_types,
+                    identity_regions=identity_regions,
                 )
                 for arm_index, rows in enumerate(arm_rows):
                     control_records[key][arm_index].extend(rows)
@@ -745,6 +794,8 @@ def collect_edge_intervention_audit(
                     raise ValueError("IC-DOR edge audit forward requires action_final_logits [batch, action]")
                 logits[key]["off"].append(action_logits[:, action_id].detach().float().cpu())
                 logits[key]["random"].append(torch.stack(arm_outputs, dim=0).mean(dim=0))
+                logits[key]["random_identity"].append(arm_outputs[0])
+                logits[key]["random_spatial"].append(torch.stack(arm_outputs[1:], dim=0).mean(dim=0))
                 logits[key]["labels"].append(labels[:, action_id].detach().float().cpu())
     finally:
         setter(base)
@@ -759,6 +810,8 @@ def collect_edge_intervention_audit(
         metrics = _edge_metrics(
             values["on"], values["off"], values["random"], values["labels"],
             direction=str(spec["direction"]),
+            random_identity=values["random_identity"],
+            random_spatial=values["random_spatial"],
         )
         # Calibration gain is reported as a separate descriptive metric; it is
         # not an admission statistic and therefore has no bootstrap gate.
@@ -768,13 +821,21 @@ def collect_edge_intervention_audit(
             sampled = _edge_metrics(
                 values["on"][indices], values["off"][indices], values["random"][indices], values["labels"][indices],
                 direction=str(spec["direction"]),
+                random_identity=values["random_identity"][indices],
+                random_spatial=values["random_spatial"][indices],
             )
             for name in replicate:
                 replicate[name].append(sampled[name])
         intervals = {name: {"lower": _quantile(samples, 0.025), "upper": _quantile(samples, 0.975)} for name, samples in replicate.items()}
         edge_stats[key] = {
             "factor": str(spec["factor"]), "action": str(spec["action"]), "direction": str(spec["direction"]), "polarity": str(spec["polarity"]),
-            "matched_counts": {"factor_on": int(values["on"].numel()), "factor_off": int(values["off"].numel()), "equal_mass_random": int(values["random"].numel())},
+            "matched_counts": {
+                "factor_on": int(values["on"].numel()),
+                "factor_off": int(values["off"].numel()),
+                "equal_mass_random": int(values["random"].numel()),
+                "same_type_identity": int(values["random_identity"].numel()),
+                "spatial_roll": int(values["random_spatial"].numel()),
+            },
             "matched_control_arms": summarize_matched_control_arms(control_records[key]),
             "metrics": metrics,
             "bootstrap_ci95": intervals,
