@@ -437,6 +437,8 @@ def build_review_pass(
     *,
     runtime_sha256: str,
     remediation_gates: Mapping[str, Mapping[str, Any]],
+    final_remediation_plan_sha256: str,
+    audit_addendum_sha256: str,
 ) -> dict[str, Any]:
     """Build a hash-bound REVIEW_PASS only from complete, non-pending evidence."""
     if audit.get("pass") is not True or audit.get("missing_items"):
@@ -462,6 +464,10 @@ def build_review_pass(
         raise ICDORAuditError("pilot gate is not complete")
     if pending:
         raise ICDORAuditError(f"pilot contains pending artifacts: {pending}")
+    if pilot.get("git_head") != audit.get("git_head"):
+        raise ICDORAuditError("pilot gate is not bound to the current audited HEAD")
+    if not final_remediation_plan_sha256 or not audit_addendum_sha256:
+        raise ICDORAuditError("final remediation plan and audit addendum hashes are required")
     failed_remediation = [
         name for name in _REQUIRED_REMEDIATION_GATES
         if not isinstance(remediation_gates.get(name), Mapping)
@@ -469,6 +475,14 @@ def build_review_pass(
     ]
     if failed_remediation:
         raise ICDORAuditError(f"final remediation gates are not passing: {failed_remediation}")
+    stale_remediation = [
+        name for name in _REQUIRED_REMEDIATION_GATES
+        if remediation_gates[name].get("git_head") != audit.get("git_head")
+    ]
+    if stale_remediation:
+        raise ICDORAuditError(
+            f"final remediation gates are not bound to the current audited HEAD: {stale_remediation}"
+        )
     gates = {name: "PASS" for name in _REQUIRED_FUNCTIONAL_CHECKS}
     gates.update({name: "PASS" for name in _REQUIRED_REMEDIATION_GATES})
     gate_hashes = {
@@ -483,6 +497,8 @@ def build_review_pass(
         "contract_manifest_sha256": str(audit["contract_manifest_sha256"]),
         "resolved_config_sha256": str(audit["config_sha256"]),
         "runtime_selection_sha256": runtime_sha256,
+        "final_remediation_plan_sha256": final_remediation_plan_sha256,
+        "audit_addendum_sha256": audit_addendum_sha256,
         "gates": gates,
         "remediation_gate_sha256": gate_hashes,
         "factor_real_audit_completed": True,
@@ -509,6 +525,8 @@ def main() -> None:
     parser.add_argument("--fail_closed", action="store_true")
     parser.add_argument("--write_review_pass", action="store_true")
     parser.add_argument("--pilot_gate")
+    parser.add_argument("--final_remediation_plan")
+    parser.add_argument("--audit_addendum")
     parser.add_argument("--remediation_gate_dir", default=".review/final_remediation_gates")
     parser.add_argument("--max_audit_samples", type=int, default=2)
     parser.add_argument("--audit_batch_size", type=int, default=1)
@@ -615,8 +633,10 @@ def main() -> None:
     if args.fail_closed and result.get("pass") is not True:
         raise ICDORAuditError("fail-closed audit rejected a dirty or incomplete source tree")
     if args.write_review_pass:
-        if not args.runtime_selection or not args.pilot_gate:
-            raise ICDORAuditError("write_review_pass requires runtime_selection and pilot_gate")
+        if not args.runtime_selection or not args.pilot_gate or not args.final_remediation_plan or not args.audit_addendum:
+            raise ICDORAuditError(
+                "write_review_pass requires runtime_selection, pilot_gate, final_remediation_plan, and audit_addendum"
+            )
         runtime = json.loads(Path(args.runtime_selection).read_text(encoding="utf-8"))
         pilot = json.loads(Path(args.pilot_gate).read_text(encoding="utf-8"))
         gate_dir = Path(args.remediation_gate_dir)
@@ -629,6 +649,8 @@ def main() -> None:
         review = build_review_pass(
             result, runtime, pilot, runtime_sha256=sha256_file(args.runtime_selection),
             remediation_gates=remediation_gates,
+            final_remediation_plan_sha256=sha256_file(args.final_remediation_plan),
+            audit_addendum_sha256=sha256_file(args.audit_addendum),
         )
         review_path = output / "acpr_mosaic_trust_v3_icdor_REVIEW_PASS.json"
         review_path.write_text(json.dumps(review, indent=2, sort_keys=True) + "\n", encoding="utf-8")

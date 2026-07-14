@@ -39,6 +39,12 @@ def test_full_cli_cannot_bypass_review_pass() -> None:
     assert "full training requires --require_review_pass" in source
 
 
+def test_pilot_gate_is_bound_to_the_training_git_head() -> None:
+    source = Path("fate_oia/engine/train_acpr_mosaic_trust_icdor.py").read_text(encoding="utf-8")
+    pilot_block = source.split("pilot_gate = {", 1)[1].split("_write_json(output / \"pilot_gate.json\"", 1)[0]
+    assert '"git_head": _git_head()' in pilot_block
+
+
 def test_checkpoint_persists_all_rng_state_for_resume() -> None:
     source = Path("fate_oia/engine/train_acpr_mosaic_trust_icdor.py").read_text(encoding="utf-8")
     for token in ("python_rng_state", "torch_rng_state", "cuda_rng_state_all"):

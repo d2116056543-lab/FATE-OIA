@@ -70,6 +70,46 @@ def test_icdor_certificate_downgrades_without_identifiability_and_rejects_other_
     assert certificate.entries[ontology["factors"][1]["name"]]["reliability"] == 0.0
 
 
+def test_icdor_certificate_abstains_when_identifiability_metrics_are_unavailable() -> None:
+    ontology = load_icdor_ontology(Path("configs"))
+    unavailable = _record()
+    unavailable["counts"] = {
+        **unavailable["counts"],
+        "confirmed_positive": 12,
+        "reliable_negative": 0,
+        "weak_negative": 0,
+        "unknown": 500,
+        "geometry_valid": 0,
+    }
+    for key in (
+        "full",
+        "content_only",
+        "prior_only",
+        "query_shuffle_drop",
+        "image_shuffle_drop",
+        "grounding_minus_random",
+        "ece",
+        "presence_variance",
+    ):
+        unavailable["scores"][key] = None
+    for key in unavailable["bootstrap_lcb95"]:
+        unavailable["bootstrap_lcb95"][key] = None
+
+    factor_name = ontology["factors"][0]["name"]
+    first = build_factor_certificate(
+        {factor_name: unavailable}, ontology["certificate_rules"], source_split="train_audit"
+    )
+    second = build_factor_certificate(
+        {factor_name: unavailable}, ontology["certificate_rules"], source_split="train_audit"
+    )
+
+    entry = first.entries[factor_name]
+    assert entry["tier"] == "abstained"
+    assert entry["reliability"] == 0.0
+    assert "missing_required_identifiability_metric" in entry["reasons"]
+    assert first.sha256 == second.sha256
+
+
 def test_certificate_builder_refuses_non_audit_payload_and_persists_a_frozen_digest(tmp_path: Path) -> None:
     ontology = load_icdor_ontology(Path("configs"))
     payload = {

@@ -1647,6 +1647,7 @@ def main() -> None:
             *schema.get("missing", []), *schema.get("invalid", []), *schema.get("semantic_errors", [])
         ]
         pilot_gate = {
+            "git_head": _git_head(),
             "pass": (
                 bool(schema.get("pass")) and certificate_sha is not None and edge_sha is not None
                 and adaptive_schedule.safe_joint_epochs >= 1 and not adaptive_schedule.failed_closed

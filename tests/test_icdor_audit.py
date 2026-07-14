@@ -30,14 +30,14 @@ def test_real_factor_audit_accepts_honest_abstention_and_rejects_fake_zero() -> 
         validate_real_factor_audit(payload, expected_rows=512, expected_factors=2)
 
 
-def _passing_remediation_gates():
+def _passing_remediation_gates(*, git_head: str = "abc"):
     names = (
         "CANONICAL_MULTIVIEW", "REAL_FACTOR_AUDIT", "HARD_MASK_INVARIANCE",
         "PARETO_FIREWALL", "HIDDEN_RECOVERY_NO_LEAKAGE", "MATCHED_CONTROL_CCA",
         "CONFIG_COVERAGE", "QUEUE_TIMING", "ADAPTIVE_SCHEDULE", "RUNTIME_PROFILE",
         "PILOT", "STRICT_ARTIFACT_VALIDATION",
     )
-    return {name: {"pass": True, "gate": name} for name in names}
+    return {name: {"pass": True, "gate": name, "git_head": git_head} for name in names}
 
 
 def test_certificate_audit_checks_builder_and_tier_logic_separately() -> None:
@@ -144,11 +144,13 @@ def test_review_pass_is_fail_closed_and_binds_all_evidence() -> None:
         "worktree_clean": True,
     }
     runtime = {"pass": True, "selected": {"status": "PASS"}}
-    pilot = {"pass": True, "artifacts_complete": True, "pending_artifacts": []}
+    pilot = {"pass": True, "artifacts_complete": True, "pending_artifacts": [], "git_head": "abc"}
 
     review = build_review_pass(
         audit, runtime, pilot, runtime_sha256="RUNTIME",
         remediation_gates=_passing_remediation_gates(),
+        final_remediation_plan_sha256="PLAN",
+        audit_addendum_sha256="ADDENDUM",
     )
 
     assert review["status"] == "PASS"
@@ -156,12 +158,34 @@ def test_review_pass_is_fail_closed_and_binds_all_evidence() -> None:
     assert review["target_tree"] == "TREE"
     assert review["source_manifest_sha256"] == "SOURCES"
     assert review["contract_manifest_sha256"] == "CONTRACT"
+    assert review["final_remediation_plan_sha256"] == "PLAN"
+    assert review["audit_addendum_sha256"] == "ADDENDUM"
     assert set(review["gates"].values()) == {"PASS"}
     broken = dict(pilot, pending_artifacts=["visual_audit_manifest.json"])
     with pytest.raises(ICDORAuditError, match="pending"):
         build_review_pass(
             audit, runtime, broken, runtime_sha256="RUNTIME",
             remediation_gates=_passing_remediation_gates(),
+            final_remediation_plan_sha256="PLAN",
+            audit_addendum_sha256="ADDENDUM",
+        )
+
+    stale = _passing_remediation_gates()
+    stale["REAL_FACTOR_AUDIT"] = {**stale["REAL_FACTOR_AUDIT"], "git_head": "stale"}
+    with pytest.raises(ICDORAuditError, match="current audited HEAD"):
+        build_review_pass(
+            audit, runtime, pilot, runtime_sha256="RUNTIME",
+            remediation_gates=stale,
+            final_remediation_plan_sha256="PLAN",
+            audit_addendum_sha256="ADDENDUM",
+        )
+
+    with pytest.raises(ICDORAuditError, match="pilot gate.*HEAD"):
+        build_review_pass(
+            audit, runtime, {**pilot, "git_head": "stale"}, runtime_sha256="RUNTIME",
+            remediation_gates=_passing_remediation_gates(),
+            final_remediation_plan_sha256="PLAN",
+            audit_addendum_sha256="ADDENDUM",
         )
 
 
@@ -179,11 +203,13 @@ def test_review_pass_rejects_dirty_or_unbound_source_tree() -> None:
         "missing_items": [],
     }
     runtime = {"pass": True, "selected": {"status": "PASS"}}
-    pilot = {"pass": True, "artifacts_complete": True, "pending_artifacts": []}
+    pilot = {"pass": True, "artifacts_complete": True, "pending_artifacts": [], "git_head": "abc"}
     for mutation in ({"worktree_clean": False}, {"git_tree": ""}, {"source_manifest_sha256": ""}, {"contract_manifest_sha256": ""}):
         with pytest.raises(ICDORAuditError, match="source tree"):
             build_review_pass(
                 dict(base, **mutation), runtime, pilot, runtime_sha256="RUNTIME",
                 remediation_gates=_passing_remediation_gates(),
+                final_remediation_plan_sha256="PLAN",
+                audit_addendum_sha256="ADDENDUM",
             )
 

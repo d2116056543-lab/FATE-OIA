@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+from numbers import Real
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -16,6 +18,10 @@ def _required_mapping(record: Mapping[str, Any], name: str, fields: set[str]) ->
     if not isinstance(value, Mapping) or not fields <= set(value):
         raise ValueError(f"IC-DOR certificate record requires {name} fields {sorted(fields)}")
     return value
+
+
+def _is_finite_number(value: Any) -> bool:
+    return isinstance(value, Real) and not isinstance(value, bool) and math.isfinite(float(value))
 
 
 @dataclass(frozen=True)
@@ -74,6 +80,26 @@ def _tier(record: Mapping[str, Any], certified: Mapping[str, Any]) -> tuple[str,
         "bootstrap_lcb95",
         {"full_minus_prior_only", "query_shuffle_drop", "image_shuffle_drop", "grounding_minus_random"},
     )
+    decision_values = (
+        counts["confirmed_positive"],
+        counts["reliable_negative"],
+        counts["geometry_valid"],
+        scores["full"],
+        scores["content_only"],
+        scores["view_consistency"],
+        scores["mirror_consistency"],
+        scores["presence_variance"],
+        scores["visibility_variance"],
+        prototype["effective_count"],
+        prototype["dominant_rate"],
+        lcb["full_minus_prior_only"],
+        lcb["query_shuffle_drop"],
+        lcb["image_shuffle_drop"],
+    )
+    if not all(_is_finite_number(value) for value in decision_values):
+        return "abstained", ["missing_required_identifiability_metric"]
+    if counts["geometry_valid"] > 0 and not _is_finite_number(lcb["grounding_minus_random"]):
+        return "abstained", ["missing_required_identifiability_metric"]
     count_or_geometry = (
         counts["confirmed_positive"] >= certified["min_confirmed_positive"]
         and counts["reliable_negative"] >= certified["min_reliable_negative"]
