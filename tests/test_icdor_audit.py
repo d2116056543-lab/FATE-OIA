@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 import torch
@@ -12,6 +13,13 @@ from fate_oia.engine.audit_acpr_mosaic_trust_icdor import (
     protocol_hard_gate,
     verify_dynamic_forward_and_gradients,
 )
+
+
+def test_certificate_audit_checks_builder_and_tier_logic_separately() -> None:
+    source = Path("fate_oia/engine/audit_acpr_mosaic_trust_icdor.py").read_text(encoding="utf-8")
+    assert '"builder": _require_source_tokens' in source
+    assert '"certificate_logic": _require_source_tokens' in source
+    assert '"models" / "mosaic_factor_certificate.py"' in source
 
 
 class _RealForwardModel(nn.Module):

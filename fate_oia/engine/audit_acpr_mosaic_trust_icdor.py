@@ -269,10 +269,16 @@ def functional_hard_gates(
     }
     if not evidence["direct_image"]["config"] or evidence["direct_image"]["feature_cache"] is not False or evidence["direct_image"]["token_compression"] != "none":
         raise ICDORAuditError("direct-image/no-cache/no-compression config gate failed")
-    evidence["factor_certificate"] = _require_source_tokens(
-        root / "fate_oia" / "engine" / "build_mosaic_factor_certificate.py",
-        ("source_split", "train_audit", "bootstrap_lcb95", "reason_only", "certified", "abstained"),
-    )
+    evidence["factor_certificate"] = {
+        "builder": _require_source_tokens(
+            root / "fate_oia" / "engine" / "build_mosaic_factor_certificate.py",
+            ("build_factor_certificate", "source_split", "train_audit", "write_json"),
+        ),
+        "certificate_logic": _require_source_tokens(
+            root / "fate_oia" / "models" / "mosaic_factor_certificate.py",
+            ("bootstrap_lcb95", "reason_only", "certified", "abstained", "effective_count"),
+        ),
+    }
     evidence["edge_admission"] = _require_source_tokens(
         root / "fate_oia" / "engine" / "build_mosaic_edge_admission.py",
         ("source_split", "train_audit", "signed_effect_lcb95", "tes_lcb95", "isolated_edge_ap"),
