@@ -1003,8 +1003,8 @@ def fit_icdor_calibration(
     reason_logit = torch.cat(reason_logits)
     action_target = torch.cat(action_targets)
     reason_target = torch.cat(reason_targets)
-    if not torch.cat((action_target, reason_target), dim=1).sum(0).gt(0).all():
-        raise RuntimeError("IC-DOR train_calib lacks positive support for at least one label")
+    positive_support = torch.cat((action_target, reason_target), dim=1).sum(0).gt(0)
+    unsupported_label_ids = torch.where(~positive_support)[0].detach().cpu().tolist()
     calibration = config["calibration"]
     optimizer = torch.optim.AdamW(model.threshold_head.parameters(), lr=float(config["optimizer"]["lr"]["threshold_head"]))
     rows: list[dict[str, Any]] = []
@@ -1017,12 +1017,15 @@ def fit_icdor_calibration(
             soft_f1_weight=float(calibration["soft_f1_weight"]), bce_weight=float(calibration["bce_weight"]),
             rate_weight=float(calibration["rate_weight"]), delta_weight=float(calibration["delta_weight"]),
             cardinality_weight=float(calibration["cardinality_weight"]),
+            valid_label_mask=positive_support,
         )
         optimizer.zero_grad(set_to_none=True)
         objective["loss_calibration_total"].backward()
         optimizer.step()
         rows.append({
             "epoch": epoch, "step": step, "source_split": "train_calib",
+            "positive_support_label_count": int(positive_support.sum().item()),
+            "unsupported_label_ids": unsupported_label_ids,
             **{name: float(value.detach().cpu()) for name, value in objective.items() if value.numel() == 1},
         })
     return rows

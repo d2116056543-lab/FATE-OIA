@@ -91,6 +91,7 @@ class MOSAICGroupThresholdHead(nn.Module):
         rate_weight: float = 0.02,
         delta_weight: float = 0.01,
         cardinality_weight: float = 0.02,
+        valid_label_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         if surrogate_temperature <= 0:
             raise ValueError("calibration surrogate temperature must be positive")
@@ -106,20 +107,37 @@ class MOSAICGroupThresholdHead(nn.Module):
         surrogate_logits = (raw - theta.unsqueeze(0)) / float(surrogate_temperature)
         probability = torch.sigmoid(surrogate_logits)
         positive_support = targets.sum(dim=0) > 0
+        if valid_label_mask is None:
+            data_label_mask = torch.ones_like(positive_support)
+            soft_f1_label_mask = positive_support
+        else:
+            if valid_label_mask.shape != (self.num_labels,):
+                raise ValueError("valid_label_mask must have shape [25]")
+            data_label_mask = valid_label_mask.to(device=raw.device, dtype=torch.bool) & positive_support
+            soft_f1_label_mask = data_label_mask
         numerator = 2.0 * (probability * targets).sum(dim=0) + 1e-8
         denominator = probability.sum(dim=0) + targets.sum(dim=0) + 1e-8
         per_label_soft_f1 = numerator / denominator
-        if positive_support.any():
-            loss_soft_f1 = 1.0 - per_label_soft_f1[positive_support].mean()
+        if soft_f1_label_mask.any():
+            loss_soft_f1 = 1.0 - per_label_soft_f1[soft_f1_label_mask].mean()
+            per_label_bce = F.binary_cross_entropy_with_logits(surrogate_logits, targets, reduction="none").mean(0)
+            loss_bce = per_label_bce[data_label_mask].mean()
+            per_label_rate = (probability.mean(dim=0) - targets.mean(dim=0)).square()
+            loss_rate = per_label_rate[data_label_mask].mean()
         else:
             loss_soft_f1 = surrogate_logits.sum() * 0.0
-        loss_bce = F.binary_cross_entropy_with_logits(surrogate_logits, targets)
-        loss_rate = (probability.mean(dim=0) - targets.mean(dim=0)).square().mean()
+            loss_bce = surrogate_logits.sum() * 0.0
+            loss_rate = surrogate_logits.sum() * 0.0
         loss_delta = self.label_delta.square().mean()
-        loss_cardinality = F.smooth_l1_loss(
-            probability[:, : self.action_dim].sum(dim=-1),
-            targets[:, : self.action_dim].sum(dim=-1),
-            beta=1.0,
+        action_mask = data_label_mask[: self.action_dim]
+        loss_cardinality = (
+            F.smooth_l1_loss(
+                probability[:, : self.action_dim][:, action_mask].sum(dim=-1),
+                targets[:, : self.action_dim][:, action_mask].sum(dim=-1),
+                beta=1.0,
+            )
+            if action_mask.any()
+            else surrogate_logits.sum() * 0.0
         )
         total = (
             soft_f1_weight * loss_soft_f1
@@ -135,7 +153,7 @@ class MOSAICGroupThresholdHead(nn.Module):
             "loss_calibration_delta": loss_delta,
             "loss_calibration_cardinality": loss_cardinality,
             "loss_calibration_total": total,
-            "soft_f1_valid_label_count": positive_support.sum().detach(),
+            "soft_f1_valid_label_count": soft_f1_label_mask.sum().detach(),
             "surrogate_temperature": raw.new_tensor(float(surrogate_temperature)),
             "threshold_logit": theta,
             "threshold_prob": torch.sigmoid(theta),
