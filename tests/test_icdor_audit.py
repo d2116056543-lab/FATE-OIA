@@ -10,9 +10,24 @@ from torch import nn
 from fate_oia.engine.audit_acpr_mosaic_trust_icdor import (
     ICDORAuditError,
     build_review_pass,
+    validate_real_factor_audit,
     protocol_hard_gate,
     verify_dynamic_forward_and_gradients,
 )
+
+
+def test_real_factor_audit_accepts_honest_abstention_and_rejects_fake_zero() -> None:
+    payload = {
+        "source_split": "train_audit", "row_count": 512, "factor_count": 2,
+        "factor_stats": {
+            "available": {"evaluation_mode": "binary_confirmed", "metric_available": True, "presence_auprc": 0.7, "certificate_ceiling": "Certified"},
+            "unknown": {"evaluation_mode": "unavailable", "metric_available": False, "presence_auprc": None, "certificate_ceiling": "Abstained"},
+        },
+    }
+    assert validate_real_factor_audit(payload, expected_rows=512, expected_factors=2)["pass"] is True
+    payload["factor_stats"]["unknown"]["presence_auprc"] = 0.0
+    with pytest.raises(ICDORAuditError, match="forged"):
+        validate_real_factor_audit(payload, expected_rows=512, expected_factors=2)
 
 
 def _passing_remediation_gates():

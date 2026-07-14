@@ -55,6 +55,38 @@ def sha256_file(path: str | Path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest().upper()
 
 
+def validate_real_factor_audit(payload: Mapping[str, Any], *, expected_rows: int, expected_factors: int) -> dict[str, Any]:
+    """Validate real train-audit output without treating abstention as failure."""
+    stats = payload.get("factor_stats")
+    if payload.get("source_split") != "train_audit" or payload.get("row_count") != expected_rows:
+        raise ICDORAuditError("real factor audit row/split contract failed")
+    if not isinstance(stats, Mapping) or len(stats) != expected_factors or payload.get("factor_count") != expected_factors:
+        raise ICDORAuditError("real factor audit did not emit one record per factor")
+    allowed_modes = {"binary_confirmed", "positive_vs_weak_negative", "positive_only", "unavailable"}
+    mode_counts = {mode: 0 for mode in allowed_modes}
+    for name, row in stats.items():
+        if not isinstance(row, Mapping) or row.get("evaluation_mode") not in allowed_modes:
+            raise ICDORAuditError(f"real factor audit has invalid missingness mode for {name}")
+        mode = str(row["evaluation_mode"])
+        mode_counts[mode] += 1
+        available = row.get("metric_available")
+        auprc = row.get("presence_auprc")
+        ceiling = row.get("certificate_ceiling")
+        if mode in {"positive_only", "unavailable"}:
+            if available is not False or auprc is not None or ceiling != "Abstained":
+                raise ICDORAuditError(f"real factor audit forged an unavailable metric for {name}")
+        elif available is not True or not isinstance(auprc, (int, float)):
+            raise ICDORAuditError(f"real factor audit omitted an available metric for {name}")
+    return {
+        "pass": True,
+        "gate": "REAL_FACTOR_AUDIT",
+        "source_split": "train_audit",
+        "row_count": expected_rows,
+        "factor_count": expected_factors,
+        "evaluation_mode_counts": mode_counts,
+    }
+
+
 def _require_tensor(output: Mapping[str, Any], key: str, batch_size: int) -> torch.Tensor:
     value = output.get(key)
     if not isinstance(value, torch.Tensor):
@@ -479,6 +511,11 @@ def main() -> None:
     parser.add_argument("--pilot_gate")
     parser.add_argument("--remediation_gate_dir", default=".review/final_remediation_gates")
     parser.add_argument("--max_audit_samples", type=int, default=2)
+    parser.add_argument("--audit_batch_size", type=int, default=1)
+    parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--real_factor_audit_rows", type=int, default=0)
+    parser.add_argument("--real_factor_audit_bootstrap", type=int, default=100)
+    parser.add_argument("--write_real_factor_gate", action="store_true")
     args = parser.parse_args()
     config_path = Path(args.config)
     if not config_path.is_file():
@@ -489,15 +526,20 @@ def main() -> None:
         raise ICDORAuditError("real-DINO dynamic audit requested CUDA but CUDA is unavailable")
     # Lazy imports avoid a circular import during trainer unit tests.
     from fate_oia.engine.train_acpr_mosaic_trust_icdor import (
+        _audit_batches,
         build_icdor_loaders,
         build_icdor_model,
         build_icdor_parameter_ownership,
         load_config,
     )
+    from fate_oia.datasets.bdd100k_grounding import BDD100KGroundingIndex
+    from fate_oia.datasets.mosaic_icdor_grounding import ICDORGroundingObservationBuilder
+    from fate_oia.engine.mosaic_icdor_audit_collectors import collect_factor_audit
     config = load_config(config_path)
+    requested_audit_rows = max(args.max_audit_samples, args.real_factor_audit_rows)
     _, audit_loader, _, _, split_stats = build_icdor_loaders(
-        config, Path(args.output_dir) / "dynamic_data", batch_size=1, num_workers=0,
-        max_train_samples=1, max_audit_samples=args.max_audit_samples,
+        config, Path(args.output_dir) / "dynamic_data", batch_size=args.audit_batch_size, num_workers=args.num_workers,
+        max_train_samples=1, max_audit_samples=requested_audit_rows,
         max_calib_samples=1, max_test_samples=1,
     )
     first_batch = next(iter(audit_loader))
@@ -529,6 +571,36 @@ def main() -> None:
         "missing_items": [],
         "warnings": [] if clean else ["worktree is dirty; REVIEW_PASS is forbidden until code is committed"],
     }
+    output = Path(args.output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    if args.real_factor_audit_rows:
+        grounding_index = BDD100KGroundingIndex(config["data"]["bdd100k_root"])
+        grounding_builder = ICDORGroundingObservationBuilder(model.ontology["factors"])
+        real_factor_audit = collect_factor_audit(
+            model,
+            _audit_batches(audit_loader, grounding_index),
+            grounding_builder,
+            factor_names=[str(item["name"]) for item in model.ontology["factors"]],
+            factor_definitions=model.ontology["factors"],
+            device=device,
+            bootstrap_replicates=args.real_factor_audit_bootstrap,
+            bootstrap_seed=20260713,
+            forward_kwargs={"route_mode": "off", "latent_enabled": False, "return_masks": True},
+        )
+        real_factor_path = output / "real_factor_audit_512.json"
+        real_factor_path.write_text(json.dumps(real_factor_audit, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        gate = validate_real_factor_audit(
+            real_factor_audit,
+            expected_rows=args.real_factor_audit_rows,
+            expected_factors=len(model.ontology["factors"]),
+        )
+        gate["artifact"] = str(real_factor_path.resolve())
+        gate["artifact_sha256"] = sha256_file(real_factor_path)
+        result["real_factor_audit"] = gate
+        if args.write_real_factor_gate:
+            gate_path = Path(args.remediation_gate_dir) / "ICDOR_GATE_REAL_FACTOR_AUDIT_PASS.json"
+            gate_path.parent.mkdir(parents=True, exist_ok=True)
+            gate_path.write_text(json.dumps(gate, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     if args.review_pass or args.runtime_selection:
         if not args.review_pass or not args.runtime_selection:
             raise ICDORAuditError("review_pass and runtime_selection must be supplied together")
@@ -539,8 +611,6 @@ def main() -> None:
             runtime_sha256=sha256_file(args.runtime_selection),
             required_gates=tuple(_REQUIRED_FUNCTIONAL_CHECKS) + ("runtime_profile", "pilot_artifacts"),
         )
-    output = Path(args.output_dir)
-    output.mkdir(parents=True, exist_ok=True)
     (output / "icdor_source_audit.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     if args.fail_closed and result.get("pass") is not True:
         raise ICDORAuditError("fail-closed audit rejected a dirty or incomplete source tree")

@@ -1492,7 +1492,7 @@ def main() -> None:
 
         factor_audit_payload = collect_factor_audit(
             model, _audit_batches(audit_loader, grounding_index), grounding_builder,
-            factor_names=factor_names, device=device,
+            factor_names=factor_names, factor_definitions=model.ontology["factors"], device=device,
             bootstrap_replicates=(
                 int(config["factor_certificate"]["bootstrap_replicates"])
                 if adaptive_schedule.policy().write_provisional_certificate else 100

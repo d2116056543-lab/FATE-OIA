@@ -5,6 +5,8 @@ from typing import Any
 
 import torch
 
+from fate_oia.datasets.mosaic_icdor_factor_supervision import build_factor_supervision
+
 
 _ABLATION_MODES = ("full", "content_only", "prior_only", "query_shuffled", "image_shuffled")
 _DIRECTION_INDEX = {"support": 0, "veto": 1}
@@ -385,6 +387,7 @@ def collect_factor_audit(
     grounding_builder: Any,
     *,
     factor_names: Sequence[str],
+    factor_definitions: Sequence[Mapping[str, Any]] | None = None,
     device: torch.device,
     bootstrap_replicates: int = 1000,
     bootstrap_seed: int = 0,
@@ -422,6 +425,23 @@ def collect_factor_audit(
             target = _tensor(grounding, "presence_target", rows=images.shape[0], columns=factor_count)
             known = _tensor(grounding, "presence_known_mask", rows=images.shape[0], columns=factor_count).bool()
             weak = _tensor(grounding, "weak_negative_mask", rows=images.shape[0], columns=factor_count).bool()
+            if factor_definitions is not None:
+                if len(factor_definitions) != factor_count:
+                    raise ValueError("IC-DOR factor definitions must align with factor names")
+                reasons = batch.get("reason")
+                if not isinstance(reasons, torch.Tensor) or reasons.shape[0] != images.shape[0]:
+                    raise ValueError("IC-DOR reason-anchor audit requires aligned reason targets")
+                supervision = build_factor_supervision(
+                    grounding,
+                    reasons.to(device),
+                    factor_definitions,
+                    split="train_audit",
+                )
+                target = supervision["supervision_target"].detach().float().cpu()
+                positive = (supervision["geometry_positive_mask"] | supervision["positive_anchor_mask"]).detach().cpu()
+                reliable_negative = supervision["reliable_negative_mask"].detach().cpu()
+                known = positive | reliable_negative
+                weak = supervision["weak_negative_mask"].detach().cpu()
             geometry_known = _tensor(grounding, "geometry_known_mask", rows=images.shape[0], columns=factor_count).bool()
             geometry = _tensor(grounding, "geometry_masks", rows=images.shape[0], columns=factor_count)
             outputs = {mode: _forward(model, images, mode, kwargs) for mode in _ABLATION_MODES}
@@ -541,7 +561,12 @@ def collect_factor_audit(
             "prototype": {"effective_count": effective, "dominant_rate": dominant, "dead_count": dead},
             "bootstrap_lcb95": {key: (_quantile(samples, 0.05) if samples else None) for key, samples in replicate.items()},
         }
-    return {"source_split": "train_audit", "factor_stats": factor_stats}
+    return {
+        "source_split": "train_audit",
+        "row_count": int(values["target"].shape[0]),
+        "factor_count": len(factor_stats),
+        "factor_stats": factor_stats,
+    }
 
 
 def _edge_metrics(

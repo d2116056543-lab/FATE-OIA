@@ -99,10 +99,22 @@ def _batch(split: str = "train_audit") -> dict[str, object]:
         "audit_views": torch.zeros(4, 2, 3, 8, 8),
         "audit_mirror_view": torch.ones(4, 3, 8, 8),
         "action": torch.tensor([[1.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 1.0]]),
+        "reason": torch.tensor([[0.0], [0.0], [1.0], [0.0]]),
     }
 
 
 class ICDORAuditCollectorsTest(unittest.TestCase):
+    def test_factor_collector_uses_same_reason_positive_anchors_as_training(self) -> None:
+        result = collect_factor_audit(
+            _AuditModel(), [_batch()], _Grounding(),
+            factor_names=("f0", "f1"),
+            factor_definitions=({"name": "f0", "positive_reason_anchors": [0]}, {"name": "f1"}),
+            device=torch.device("cpu"), bootstrap_replicates=16, bootstrap_seed=7,
+        )
+        record = result["factor_stats"]["f0"]
+        self.assertEqual(record["counts"]["confirmed_positive"], 3)
+        self.assertEqual(record["counts"]["reliable_negative"], 1)
+
     def test_factor_collector_uses_real_ablations_grounding_views_and_bootstrap(self) -> None:
         result = collect_factor_audit(
             _AuditModel(),
