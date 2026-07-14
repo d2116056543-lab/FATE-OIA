@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from math import isfinite
+from time import perf_counter
 from typing import Any, Sequence
 
 import torch
@@ -17,6 +19,59 @@ from .mosaic_icdor_audit_collectors import (
 
 _DIRECTIONS = {"support": 1.0, "veto": -1.0}
 _SCHEMA_VERSION = "mosaic_target_transfer.v2"
+
+
+def _repeat_batch_field(value: Any, repeats: int, batch_size: int) -> Any:
+    """Repeat only batch-aligned tensors in a batch-local DINO field."""
+    if isinstance(value, torch.Tensor):
+        if value.ndim > 0 and value.shape[0] == batch_size:
+            return torch.cat([value] * repeats, dim=0)
+        return value
+    if isinstance(value, Mapping):
+        return {key: _repeat_batch_field(item, repeats, batch_size) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return tuple(_repeat_batch_field(item, repeats, batch_size) for item in value)
+    if isinstance(value, list):
+        return [_repeat_batch_field(item, repeats, batch_size) for item in value]
+    return value
+
+
+def _chunked_intervention_probabilities(
+    model: torch.nn.Module,
+    images: torch.Tensor,
+    interventions: Sequence[torch.Tensor],
+    *,
+    intervention_argument: str,
+    probability_keys: Sequence[str],
+    route_mode: str,
+    latent_enabled: bool,
+    precomputed_dino_field: Mapping[str, Any] | None,
+    chunk_size: int,
+) -> tuple[list[torch.Tensor], int]:
+    """Execute independent interventions in chunks without changing row order."""
+    if chunk_size <= 0:
+        raise ValueError("intervention_chunk_size must be positive")
+    batch_size = images.shape[0]
+    probabilities: list[torch.Tensor] = []
+    forward_calls = 0
+    for start in range(0, len(interventions), chunk_size):
+        chunk = list(interventions[start : start + chunk_size])
+        repeated_images = torch.cat([images] * len(chunk), dim=0)
+        kwargs: dict[str, Any] = {
+            "route_mode": route_mode,
+            "latent_enabled": latent_enabled,
+            "return_masks": False,
+            intervention_argument: torch.cat(chunk, dim=0),
+        }
+        if precomputed_dino_field is not None:
+            kwargs["precomputed_dino_field"] = _repeat_batch_field(
+                precomputed_dino_field, len(chunk), batch_size
+            )
+        output = model(repeated_images, **kwargs)
+        merged = torch.cat([torch.sigmoid(output[key]) for key in probability_keys], dim=1).float()
+        probabilities.extend(merged.reshape(len(chunk), batch_size, -1).unbind(0))
+        forward_calls += 1
+    return probabilities, forward_calls
 
 
 @dataclass(frozen=True)
@@ -451,8 +506,12 @@ def collect_joint_target_transfer_metrics(
     device: torch.device,
     route_mode: str,
     latent_enabled: bool,
+    intervention_chunk_size: int = 4,
 ) -> dict[str, Any]:
     """Collect action and reason transfer in one intervention sweep."""
+    if intervention_chunk_size <= 0:
+        raise ValueError("intervention_chunk_size must be positive")
+    started_at = perf_counter()
     factor_count = len(factor_ids)
     target_ids = tuple(f"action:{name}" for name in action_ids) + tuple(f"reason:{name}" for name in reason_ids)
     directions = tuple(
@@ -466,10 +525,13 @@ def collect_joint_target_transfer_metrics(
     random_deleted_probability: list[torch.Tensor] = []
     control_records: list[list[list[dict[str, Any]]]] = [[[] for _ in range(4)] for _ in range(factor_count)]
     matched_control_availability: list[torch.Tensor] = []
+    intervention_forward_calls = 0
+    audit_batch_count = 0
     was_training = model.training
     model.eval()
     try:
         for batch in loader:
+            audit_batch_count += 1
             splits = batch.get("split")
             split_values = [splits] if isinstance(splits, str) else list(splits or [])
             if not split_values or any(value != "train_audit" for value in split_values):
@@ -494,17 +556,13 @@ def collect_joint_target_transfer_metrics(
             factor_masks = full.get("factor_soft_masks")
             if not isinstance(factor_masks, torch.Tensor) or factor_masks.ndim != 4 or factor_masks.shape[:2] != (images.shape[0], factor_count):
                 raise ValueError("joint target transfer requires real factor_soft_masks [batch, factor, height, width]")
-            deleted_arms: list[torch.Tensor] = []
-            random_arms: list[torch.Tensor] = []
+            deletion_interventions: list[torch.Tensor] = []
+            random_interventions: list[torch.Tensor] = []
             batch_availability = torch.zeros(images.shape[0], factor_count, dtype=torch.bool)
             for factor_index in range(factor_count):
                 keep = torch.ones(images.shape[0], factor_count, device=device)
                 keep[:, factor_index] = 0.0
-                deleted = model(
-                    images, route_mode=route_mode, latent_enabled=latent_enabled,
-                    return_masks=False, factor_intervention_keep_mask=keep,
-                    **field_kwargs,
-                )
+                deletion_interventions.append(keep)
                 spec = factor_control_spec(model, factor_name=str(factor_ids[factor_index]), factor_index=factor_index)
                 overrides, arm_rows = build_batch_matched_factor_control_overrides(
                     factor_masks,
@@ -518,22 +576,30 @@ def collect_joint_target_transfer_metrics(
                         bool(arm_rows[arm_index][sample_index].get("available", False))
                         for arm_index in range(len(arm_rows))
                     )
-                random_outputs = []
-                for override in overrides:
-                    output = model(
-                        images, route_mode=route_mode, latent_enabled=latent_enabled,
-                        return_masks=False, factor_mask_override=override,
-                        **field_kwargs,
-                    )
-                    random_outputs.append(torch.cat((
-                        torch.sigmoid(output["action_final_logits"]),
-                        torch.sigmoid(output["reason_observed_logits"]),
-                    ), dim=1).float())
-                deleted_arms.append(torch.cat((
-                    torch.sigmoid(deleted["action_final_logits"]),
-                    torch.sigmoid(deleted["reason_observed_logits"]),
-                ), dim=1).float())
-                random_arms.append(torch.stack(random_outputs, dim=0).mean(dim=0))
+                random_interventions.extend(overrides)
+            probability_keys = ("action_final_logits", "reason_observed_logits")
+            deleted_arms, calls = _chunked_intervention_probabilities(
+                model, images, deletion_interventions,
+                intervention_argument="factor_intervention_keep_mask",
+                probability_keys=probability_keys,
+                route_mode=route_mode, latent_enabled=latent_enabled,
+                precomputed_dino_field=audit_field,
+                chunk_size=intervention_chunk_size,
+            )
+            intervention_forward_calls += calls
+            random_outputs, calls = _chunked_intervention_probabilities(
+                model, images, random_interventions,
+                intervention_argument="factor_mask_override",
+                probability_keys=probability_keys,
+                route_mode=route_mode, latent_enabled=latent_enabled,
+                precomputed_dino_field=audit_field,
+                chunk_size=intervention_chunk_size,
+            )
+            intervention_forward_calls += calls
+            random_arms = [
+                torch.stack(random_outputs[index * 4 : (index + 1) * 4], dim=0).mean(dim=0)
+                for index in range(factor_count)
+            ]
             visual_evidence.append(evidence.cpu())
             labels.append(target.cpu())
             full_probability.append(full_prob[:, None, :].expand(-1, factor_count, -1).cpu())
@@ -547,7 +613,7 @@ def collect_joint_target_transfer_metrics(
     label = torch.cat(labels)
     sample_count = label.shape[0]
     availability = torch.cat(matched_control_availability, dim=0)
-    return compute_target_transfer_metrics(TargetTransferInputs(
+    result = compute_target_transfer_metrics(TargetTransferInputs(
         factor_ids=factor_ids,
         target_ids=target_ids,
         directions=directions,
@@ -561,3 +627,11 @@ def collect_joint_target_transfer_metrics(
         deleted_target_prob=torch.cat(deleted_probability),
         matched_control_arms=[summarize_matched_control_arms(arms) for arms in control_records],
     ))
+    result["collection_runtime"] = {
+        "elapsed_seconds": perf_counter() - started_at,
+        "audit_batch_count": audit_batch_count,
+        "intervention_chunk_size": intervention_chunk_size,
+        "intervention_forward_calls": intervention_forward_calls,
+        "sequential_intervention_forward_calls": audit_batch_count * factor_count * 5,
+    }
+    return result

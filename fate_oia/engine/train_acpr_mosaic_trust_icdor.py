@@ -1549,12 +1549,15 @@ def main() -> None:
             action_directions=action_directions,
             reason_directions=reason_directions,
             device=device, route_mode=phase.route_mode, latent_enabled=phase.latent_enabled,
+            intervention_chunk_size=int(config["runtime"]["target_transfer_intervention_chunk_size"]),
         )
         transfer_summary = {
             "epoch": epoch, "available": True, "source_split": "train_audit",
-            "schema_version": transfer["schema_version"], **transfer["summary"],
+            "schema_version": transfer["schema_version"],
+            "collection_runtime": transfer["collection_runtime"],
+            **transfer["summary"],
         }
-        action_ids = set(model.ontology["action_names"])
+        action_ids = {f"action:{name}" for name in model.ontology["action_names"]}
         transfer_rows = [
             {
                 "epoch": epoch, "available": True, "source_split": "train_audit",

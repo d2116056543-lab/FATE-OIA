@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
+import yaml
 from torch import nn
 
 from fate_oia.engine.mosaic_icdor_audit_collectors import collect_edge_intervention_audit
@@ -14,6 +16,7 @@ class _RuntimeControlModel(nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
+        self.forward_calls = 0
         self.ontology = {"factors": ({"name": "signal", "type": "point", "spatial": "upper_front"},)}
         self.action_router = SimpleNamespace(
             candidate_edge_mask=torch.ones(2, 1, 1, dtype=torch.bool),
@@ -32,6 +35,7 @@ class _RuntimeControlModel(nn.Module):
         factor_intervention_keep_mask: torch.Tensor | None = None,
         **kwargs: object,
     ) -> dict[str, torch.Tensor]:
+        self.forward_calls += 1
         assert "action" not in kwargs and "reason" not in kwargs
         masks = torch.zeros(images.shape[0], 1, 10, 10, device=images.device)
         masks[:, 0, 1, 4] = 1.0
@@ -61,8 +65,12 @@ def _batch() -> dict[str, object]:
 
 
 def _assert_real_arms(model: _RuntimeControlModel, metadata: list[dict[str, object]]) -> None:
-    assert len(model.control_overrides) >= 4
-    arms = model.control_overrides[:4]
+    arms: list[torch.Tensor] = []
+    for packed in model.control_overrides:
+        assert packed.shape[0] % 4 == 0
+        arms.extend(packed.split(4, dim=0))
+    assert len(arms) >= 4
+    arms = arms[:4]
     selected = torch.zeros(10, 10, dtype=torch.bool)
     selected[1, 4] = True
     for arm in arms:
@@ -135,3 +143,116 @@ def test_transfer_abstains_when_dense_mask_cannot_form_four_controls() -> None:
     assert transfer["per_target"][0]["available"] is False
     assert transfer["per_target"][0]["unavailable_reason"] == "insufficient_matched_control_rows"
     assert transfer["per_target"][0]["tes"] is None
+
+
+def test_joint_transfer_batches_factor_and_control_interventions() -> None:
+    class TwoFactorControlModel(_RuntimeControlModel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.ontology = {
+                "factors": (
+                    {"name": "signal", "type": "point", "spatial": "upper_front"},
+                    {"name": "vehicle", "type": "point", "spatial": "upper_front"},
+                )
+            }
+
+        def forward(
+            self,
+            images: torch.Tensor,
+            *,
+            factor_mask_override: torch.Tensor | None = None,
+            factor_intervention_keep_mask: torch.Tensor | None = None,
+            **kwargs: object,
+        ) -> dict[str, torch.Tensor]:
+            self.forward_calls += 1
+            masks = torch.zeros(images.shape[0], 2, 10, 10, device=images.device)
+            masks[:, 0, 1, 4] = 1.0
+            masks[:, 1, 2, 5] = 1.0
+            active = masks if factor_mask_override is None else factor_mask_override
+            if factor_mask_override is not None:
+                self.control_overrides.append(factor_mask_override.detach().cpu())
+            if factor_intervention_keep_mask is not None:
+                active = active * factor_intervention_keep_mask[:, :, None, None]
+            mass = active.sum((-2, -1)).sum(1)
+            logits = mass.unsqueeze(1)
+            return {
+                "factor_presence_prob": torch.full((images.shape[0], 2), 0.8, device=images.device),
+                "factor_soft_masks": masks,
+                "action_final_logits": logits,
+                "reason_observed_logits": logits,
+            }
+
+    model = TwoFactorControlModel()
+    transfer = collect_joint_target_transfer_metrics(
+        model,
+        [_batch()],
+        factor_ids=("signal", "vehicle"),
+        action_ids=("brake",),
+        reason_ids=("yield",),
+        action_directions=(("support",), ("support",)),
+        reason_directions=(("support",), ("support",)),
+        device=torch.device("cpu"),
+        route_mode="admitted",
+        latent_enabled=True,
+        intervention_chunk_size=4,
+    )
+
+    assert transfer["summary"]["available_pair_count"] == 4
+    assert model.forward_calls == 4
+    assert transfer["collection_runtime"]["intervention_forward_calls"] == 3
+    assert transfer["collection_runtime"]["sequential_intervention_forward_calls"] == 10
+    assert transfer["collection_runtime"]["intervention_chunk_size"] == 4
+
+
+def test_training_config_wires_target_transfer_chunk_size() -> None:
+    root = Path(__file__).resolve().parents[1]
+    config = yaml.safe_load(
+        (root / "configs" / "fate_oia_train_360x640_acpr_mosaic_trust_v3_icdor.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert config["runtime"]["target_transfer_intervention_chunk_size"] == 4
+    source = (root / "fate_oia" / "engine" / "train_acpr_mosaic_trust_icdor.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'intervention_chunk_size=int(config["runtime"]["target_transfer_intervention_chunk_size"])' in source
+    assert 'action_ids = {f"action:{name}" for name in model.ontology["action_names"]}' in source
+
+
+def test_joint_transfer_reuses_and_repeats_batch_local_dino_field() -> None:
+    class DinoRuntimeModel(_RuntimeControlModel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.dino_calls = 0
+
+        def dino(self, images: torch.Tensor) -> dict[str, object]:
+            self.dino_calls += 1
+            return {
+                "patch_tokens_by_layer": torch.arange(images.shape[0], dtype=torch.float32)[:, None, None, None],
+                "grid_hw": (10, 10),
+                "original_tokens": 101,
+            }
+
+        def forward(self, images: torch.Tensor, **kwargs: object) -> dict[str, torch.Tensor]:
+            field = kwargs.get("precomputed_dino_field")
+            assert isinstance(field, dict)
+            tokens = field["patch_tokens_by_layer"]
+            assert isinstance(tokens, torch.Tensor)
+            assert tokens.shape[0] == images.shape[0]
+            return super().forward(images, **kwargs)
+
+    model = DinoRuntimeModel()
+    collect_joint_target_transfer_metrics(
+        model,
+        [_batch()],
+        factor_ids=("signal",),
+        action_ids=("brake",),
+        reason_ids=("yield",),
+        action_directions=(("support",),),
+        reason_directions=(("support",),),
+        device=torch.device("cpu"),
+        route_mode="admitted",
+        latent_enabled=True,
+        intervention_chunk_size=4,
+    )
+    assert model.dino_calls == 1
