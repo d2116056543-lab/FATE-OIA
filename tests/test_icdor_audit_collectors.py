@@ -16,13 +16,13 @@ class _Grounding:
         assert split == "train"
         assert len(records) == 4
         target = torch.tensor([[1.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 1.0]], device=device)
-        masks = torch.zeros(4, 2, 2, 2, device=device)
+        masks = torch.zeros(4, 2, 8, 8, device=device)
         masks[:2, 0, 0, 0] = 1.0
         masks[1, 0, 0, 0] = 0.0
         masks[1, 0, 0, 1] = 1.0
-        masks[2:, 1, 1, 1] = 1.0
-        masks[3, 1, 1, 1] = 0.0
-        masks[3, 1, 1, 0] = 1.0
+        masks[2:, 1, 6, 6] = 1.0
+        masks[3, 1, 6, 6] = 0.0
+        masks[3, 1, 6, 5] = 1.0
         return {
             "presence_target": target,
             "presence_known_mask": torch.ones_like(target),
@@ -56,19 +56,23 @@ class _AuditModel(torch.nn.Module):
             "image_shuffled": [[0.25, 0.70], [0.30, 0.65], [0.70, 0.30], [0.75, 0.25]],
         }[factor_ablation_mode]
         probability = torch.tensor(probabilities, device=images.device)
-        masks = torch.zeros(4, 2, 2, 2, device=images.device)
+        masks = torch.zeros(4, 2, 8, 8, device=images.device)
         masks[:2, 0, 0, 0] = 1.0
         masks[1, 0, 0, 0] = 0.0
         masks[1, 0, 0, 1] = 1.0
-        masks[2:, 1, 1, 1] = 1.0
-        masks[3, 1, 1, 1] = 0.0
-        masks[3, 1, 1, 0] = 1.0
+        masks[2:, 1, 6, 6] = 1.0
+        masks[3, 1, 6, 6] = 0.0
+        masks[3, 1, 6, 5] = 1.0
+        override = _.get("factor_mask_override")
+        if isinstance(override, torch.Tensor):
+            masks = override.to(images.device)
         if float(images.mean()) > 0.5:
             masks = torch.flip(masks, dims=(-1,))
         edge_gain = self.action_router.edge_admission_mask[0, 0, 0].float()
         random_gain = self.action_router.edge_admission_mask[0, 1, 0].float()
         action_logits = torch.tensor([[2.0, -1.0], [1.5, -1.0], [-1.0, 2.0], [-1.0, 1.5]], device=images.device)
         action_logits[:, 0] += 2.0 * edge_gain + 0.25 * random_gain
+        action_logits[:, 0] += 0.25 * masks[:, 0, 0, 0]
         return {
             "factor_presence_prob": probability,
             "factor_visibility_prob": probability,
@@ -90,10 +94,10 @@ class _AuditModel(torch.nn.Module):
 def _batch(split: str = "train_audit") -> dict[str, object]:
     return {
         "split": [split] * 4,
-        "image": torch.zeros(4, 3, 2, 2),
+        "image": torch.zeros(4, 3, 8, 8),
         "grounding_records": [{"id": index} for index in range(4)],
-        "audit_views": torch.zeros(4, 2, 3, 2, 2),
-        "audit_mirror_view": torch.ones(4, 3, 2, 2),
+        "audit_views": torch.zeros(4, 2, 3, 8, 8),
+        "audit_mirror_view": torch.ones(4, 3, 8, 8),
         "action": torch.tensor([[1.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 1.0]]),
     }
 

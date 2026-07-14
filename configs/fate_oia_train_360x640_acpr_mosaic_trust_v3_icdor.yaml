@@ -117,6 +117,7 @@ loss:
     prototype_repulsion_weight: 0.01
     prior_scale_weight: 0.01
     contradiction_weight: 0.02
+    positive_anchor_weight: 1.00
   reason:
     visual_observed_asl_weight: 0.50
     observed_asl_weight: 1.00
@@ -124,7 +125,6 @@ loss:
     observation_nll_weight: 0.30
     posterior_bce_weight: 0.30
     posterior_rank_weight: 0.08
-    missing_recovery_weight: 0.10
     factor_latent_consistency_weight: 0.05
     escape_token_weight: 0.01
     propensity_regularization_weight: 0.01

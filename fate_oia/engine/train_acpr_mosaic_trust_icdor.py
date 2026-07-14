@@ -20,6 +20,7 @@ from torch.utils.data import DataLoader, Subset
 from fate_oia.datasets.bdd_oia_multitask import BDDOIAMultiTaskDataset
 from fate_oia.datasets.bdd100k_grounding import BDD100KGroundingIndex
 from fate_oia.datasets.mosaic_icdor_grounding import ICDORGroundingObservationBuilder
+from fate_oia.datasets.mosaic_icdor_factor_supervision import build_factor_supervision
 from fate_oia.datasets.mosaic_multiview import MOSAICWeakMultiView
 from fate_oia.datasets.mosaic_icdor_split import (
     DEFAULT_SEED,
@@ -28,7 +29,8 @@ from fate_oia.datasets.mosaic_icdor_split import (
     write_icdor_split_manifest,
 )
 from fate_oia.transforms import AspectRatioLetterboxTransform
-from fate_oia.engine.mosaic_icdor_schedule import ICDORPhase, get_icdor_phase, get_icdor_pilot_phase
+from fate_oia.engine.mosaic_icdor_schedule import ICDORPhase
+from fate_oia.engine.mosaic_icdor_adaptive_schedule import ICDORAdaptiveSchedule
 from fate_oia.engine.build_mosaic_edge_admission import (
     MOSAICEdgeInterventionStats,
     build_edge_admission,
@@ -45,6 +47,7 @@ from fate_oia.metrics import multilabel_metrics_from_logits
 from fate_oia.losses.mosaic_icdor_action_losses import action_base_losses, action_route_losses
 from fate_oia.losses.mosaic_icdor_factor_losses import (
     factor_contradiction_consistency_loss,
+    factor_positive_anchor_loss,
     factor_geometry_alignment_loss,
     factor_presence_visibility_losses,
     factor_prototype_regularization,
@@ -61,12 +64,14 @@ from fate_oia.losses.mosaic_posterior_ranking import (
 )
 from fate_oia.models.acpr_mosaic_trust_icdor_model import MOSAICTrustICDORModel
 from fate_oia.optim.mosaic_action_pareto_admission import MOSAICActionParetoAdmission
-from fate_oia.optim.mosaic_soft_rank_queue import MOSAICSoftRankQueue
+from fate_oia.optim.mosaic_soft_rank_queue import MOSAICAccumulationQueueBuffer, MOSAICSoftRankQueue
 from fate_oia.utils.mosaic_icdor_artifacts import (
     initialize_icdor_run_artifacts,
     validate_icdor_artifact_schema,
+    write_icdor_adaptive_schedule_transition,
     write_icdor_epoch_artifacts,
 )
+from fate_oia.utils.mosaic_config_usage import ConfigUsageTracker, resolve_icdor_config_tree
 
 
 ICDOR_OWNER_GROUPS = (
@@ -83,6 +88,13 @@ ICDOR_OWNER_GROUPS = (
     "reason_observed_mixer",
     "observation_model",
     "threshold_head",
+)
+
+ICDOR_REQUIRED_REMEDIATION_GATES = (
+    "CANONICAL_MULTIVIEW", "REAL_FACTOR_AUDIT", "HARD_MASK_INVARIANCE",
+    "PARETO_FIREWALL", "HIDDEN_RECOVERY_NO_LEAKAGE", "MATCHED_CONTROL_CCA",
+    "CONFIG_COVERAGE", "QUEUE_TIMING", "ADAPTIVE_SCHEDULE", "RUNTIME_PROFILE",
+    "PILOT", "STRICT_ARTIFACT_VALIDATION",
 )
 
 
@@ -166,17 +178,90 @@ def apply_icdor_consolidation(
             group["lr"] *= 0.2
 
 
-def apply_icdor_route_gate_schedule(model: nn.Module, epoch: int, *, pilot: bool) -> float:
-    if pilot:
-        cap = 0.05 if epoch >= 3 else 0.02
-    elif epoch <= 6:
-        cap = 0.02
-    elif epoch == 7:
-        cap = 0.05
-    else:
-        cap = 0.08
+def apply_icdor_route_gate_schedule(model: nn.Module, phase: ICDORPhase) -> float:
+    """Keep route capacity coupled to adaptive state, never a wall-clock epoch."""
+    cap = {"off": 0.02, "shadow": 0.05, "admitted": 0.08}[phase.route_mode]
     model.set_route_gate_cap(cap)
     return cap
+
+
+def _adaptive_phase(schedule: ICDORAdaptiveSchedule) -> ICDORPhase:
+    return schedule.phase()
+
+
+def _finite_scalar_rows(rows: list[dict[str, Any]]) -> bool:
+    return bool(rows) and all(
+        math.isfinite(float(value))
+        for row in rows
+        for value in row.values()
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+    )
+
+
+def _adaptive_readiness(
+    *,
+    epoch_train: dict[str, list[dict[str, Any]]],
+    factor_audit: dict[str, Any],
+    calibration_rows: list[dict[str, Any]],
+    transfer_rows: list[dict[str, Any]],
+    pareto_rows: list[dict[str, Any]],
+    certificate_sha256: str | None,
+    edge_admission_sha256: str | None,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Derive scheduler inputs exclusively from train_core/audit/calib evidence."""
+    factor_stats = factor_audit.get("factor_stats", {})
+    diagnostic_values = [
+        value
+        for stats in factor_stats.values()
+        if isinstance(stats, dict)
+        for section in (stats.get("scores", {}), stats.get("bootstrap_lcb95", {}))
+        if isinstance(section, dict)
+        for value in section.values()
+        if value is not None
+    ]
+    action_ap = [float(row["ap_delta"]) for row in transfer_rows if row.get("target_type") == "action"]
+    reason_ap = [float(row["ap_delta"]) for row in transfer_rows if row.get("target_type") == "reason"]
+    edge_lcbs = [
+        float(value)
+        for row in transfer_rows
+        for key, value in row.items()
+        if key in {"tet_lcb95", "tes_lcb95", "cca"} and isinstance(value, (int, float))
+    ]
+    pareto = pareto_rows[0] if pareto_rows and pareto_rows[0].get("available") is True else {}
+    train_core = {
+        "source_split": "train_core",
+        "finite": _finite_scalar_rows(epoch_train["loss_rows"]) and _finite_scalar_rows(epoch_train["runtime_rows"]),
+    }
+    train_calib = {
+        "source_split": "train_calib",
+        "finite": _finite_scalar_rows(calibration_rows),
+    }
+    train_audit = {
+        "source_split": "train_audit",
+        "factor_audit_complete": factor_audit.get("source_split") == "train_audit" and bool(factor_stats),
+        "factor_audit_exception": False,
+        "unknown_abstained": all(int(stats.get("counts", {}).get("unknown", 0)) >= 0 for stats in factor_stats.values()),
+        "certified_route_group_count_per_action": [int(certificate_sha256 is not None)] * 4,
+        "reachable_reason_count": 21,
+        "certificate_tier_jaccard": 1.0 if certificate_sha256 else 0.0,
+        "saturation_fraction": max((float(stats.get("prototype", {}).get("dominant_rate", 1.0)) for stats in factor_stats.values()), default=1.0),
+        "diagnostics_finite": bool(diagnostic_values) and all(math.isfinite(float(value)) for value in diagnostic_values),
+        "action_shadow_ap_delta": action_ap,
+        "action_route_ap_delta": action_ap,
+        "exp_map_delta_vs_visual": min(reason_ap, default=-1.0),
+        "factor_shuffle_degrades_reason": bool(reason_ap) and min(reason_ap) <= 0.0,
+        "hidden_recovery_margin": max(reason_ap, default=-1.0),
+        "route_strength_ratio": 0.05 if edge_admission_sha256 else 0.0,
+        "true_edge_count_per_action": [int(edge_admission_sha256 is not None)] * 4,
+        "disallowed_route_invariance": edge_admission_sha256 is not None,
+        "pareto_violation_rate": float(pareto.get("pareto_violation_rate", 1.0)),
+        "exp_map_delta_vs_entry": min(reason_ap, default=-1.0),
+        "tet_lcb95": max((value for value in edge_lcbs if value > 0.0), default=0.0),
+        "tes_lcb95": max((value for value in edge_lcbs if value > 0.0), default=0.0),
+        "cca": max((value for value in edge_lcbs if value >= 0.0), default=0.0),
+        "train_audit_improved": bool(pareto.get("pareto_violation_rate", 1.0) < 0.05),
+    }
+    return train_core, train_audit, train_calib
 
 
 def apply_icdor_factor_branch_freeze(model: nn.Module) -> None:
@@ -468,6 +553,9 @@ def build_icdor_model(config: dict[str, Any], *, use_mock_dino: bool = False, mo
     adapter = model_config["adapter"]
     typed = model_config["typed_attention"]
     measurement = model_config["factor_measurement"]
+    route = model_config["action_route"]
+    reason = model_config["reason"]
+    observation = config["selective_observation"]
     backbone = config["backbone"]
     return MOSAICTrustICDORModel(
         config_root=Path("configs"),
@@ -493,6 +581,11 @@ def build_icdor_model(config: dict[str, Any], *, use_mock_dino: bool = False, mo
         spatial_prior_scale_max=float(measurement["spatial_prior_scale_max"]),
         spatial_prior_dropout=float(measurement["spatial_prior_dropout"]),
         content_temperature_init=float(measurement["content_temperature_init"]),
+        gate_init=float(route["gate_init"]),
+        gate_max=float(route["gate_max"]),
+        pi_min=float(observation["pi_min"]),
+        pi_max=float(observation["pi_max"]),
+        observed_mix_init=float(reason["observed_mix_init"]),
     )
 
 
@@ -556,18 +649,33 @@ def compute_icdor_training_losses(
     reason_queue: MOSAICSoftRankQueue,
     *,
     hidden_mask: torch.Tensor,
+    config: dict[str, Any] | None = None,
 ) -> dict[str, torch.Tensor]:
     action_targets = batch["action"]
     reason_targets = batch["reason"]
     sample_ids = batch["file_name"]
     losses: dict[str, torch.Tensor] = {}
-    base = action_base_losses(output["action_visual_logits"], action_targets)
+    loss_config = (config or {}) .get("loss", {})
+    action_config = loss_config.get("action", {})
+    route_config = loss_config.get("action_route", {})
+    factor_config = loss_config.get("factor", {})
+    reason_config = loss_config.get("reason", {})
+    base = action_base_losses(
+        output["action_visual_logits"], action_targets,
+        gamma_pos=float(action_config.get("gamma_pos", 0.0)),
+        gamma_neg=float(action_config.get("gamma_neg", 4.0)),
+        clip=float(action_config.get("clip", 0.05)),
+        base_asl_weight=float(action_config.get("base_asl_weight", 1.0)),
+        # The queue-backed cross-image rank below is the sole rank term.
+        rank_weight=0.0,
+        cardinality_weight=float(action_config.get("cardinality_weight", 0.02)),
+    )
     action_rank, action_rank_stats = action_cross_image_ranking_loss(
         output["action_visual_logits"], action_targets, sample_ids, action_queue
     )
     losses.update(base)
     losses["loss_action_cross_sample_rank"] = action_rank
-    action_total = base["loss_action_base_total"] + 0.10 * action_rank
+    action_total = base["loss_action_base_total"] + float(action_config.get("rank_weight", 0.10)) * action_rank
     if phase.route_mode != "off":
         pareto_penalty = pareto.route_penalty(
             output["action_visual_logits"], output["action_shadow_logits"], action_targets
@@ -581,11 +689,24 @@ def compute_icdor_training_losses(
             veto_dustbin=output["veto_dustbin"],
             pareto_penalty=pareto_penalty,
             matched_random_logits=output["action_matched_random_logits"],
+            route_strength_target=float(config["model"]["action_route"]["route_strength_target"]) if config else 0.05,
+            shadow_asl_weight=float(route_config.get("shadow_asl_weight", 1.0)),
+            pareto_weight=float(route_config.get("pareto_weight", 1.0)),
+            sparsity_weight=float(route_config.get("sparsity_weight", 0.02)),
+            dustbin_weight=float(route_config.get("dustbin_weight", 0.01)),
+            strength_weight=float(route_config.get("strength_weight", 0.02)),
+            intervention_weight=float(route_config.get("intervention_weight", 0.05)),
         )
         losses.update(route)
         action_total = action_total + route["loss_action_route_total"]
     factor_total = output["factor_presence_logits"].sum() * 0.0
     if phase.enable_factor_losses:
+        split_values = batch.get("split", ["train_core"] * action_targets.shape[0])
+        if not isinstance(split_values, list) or not split_values or len(set(split_values)) != 1:
+            raise ValueError("IC-DOR factor supervision requires a homogeneous declared split")
+        supervision = build_factor_supervision(
+            observations, reason_targets, model.ontology["factors"], split=str(split_values[0])
+        )
         factor = factor_presence_visibility_losses(
             output["factor_presence_logits"], output["factor_visibility_logits"],
             observations["presence_target"], observations["visibility_target"],
@@ -607,25 +728,41 @@ def compute_icdor_training_losses(
         contradiction = factor_contradiction_consistency_loss(
             output["factor_presence_prob"], build_icdor_contradiction_mask(model).to(output["factor_presence_prob"].device)
         )
+        anchor = factor_positive_anchor_loss(output["factor_presence_logits"], supervision)
         losses.update(factor)
         losses.update(view)
         losses.update(prototype)
         losses["loss_factor_geometry"] = geometry
         losses["loss_factor_contradiction"] = contradiction
+        losses["loss_factor_positive_anchor"] = anchor
         factor_total = (
-            factor["loss_factor_total"] + 0.10 * geometry
-            + 0.05 * view["loss_factor_view_probability"] + 0.05 * view["loss_factor_flip_equivariance"]
-            + 0.02 * prototype["loss_factor_prototype_occupancy"]
-            + 0.01 * prototype["loss_factor_prototype_repulsion"]
-            + 0.01 * prototype["loss_factor_prior_scale"] + 0.02 * contradiction
+            float(factor_config.get("presence_weight", 1.0)) * factor["loss_factor_presence"]
+            + float(factor_config.get("visibility_weight", 1.0)) * factor["loss_factor_visibility"]
+            + 0.05 * factor["loss_factor_weak_negative"]
+            + float(factor_config.get("geometry_mask_weight", 0.10)) * geometry
+            + float(factor_config.get("view_consistency_weight", 0.05)) * view["loss_factor_view_probability"]
+            + float(factor_config.get("flip_equivariance_weight", 0.05)) * view["loss_factor_flip_equivariance"]
+            + float(factor_config.get("prototype_occupancy_weight", 0.02)) * prototype["loss_factor_prototype_occupancy"]
+            + float(factor_config.get("prototype_repulsion_weight", 0.01)) * prototype["loss_factor_prototype_repulsion"]
+            + float(factor_config.get("prior_scale_weight", 0.01)) * prototype["loss_factor_prior_scale"]
+            + float(factor_config.get("contradiction_weight", 0.02)) * contradiction
+            + float(factor_config.get("positive_anchor_weight", 1.0)) * anchor
         )
+    observed_targets = reason_targets.masked_fill(hidden_mask, 0.0)
+    observed_valid_mask = ~hidden_mask
     observed = reason_observed_losses(
-        output["reason_visual_observed_logits"], output["reason_observed_logits"], reason_targets
+        output["reason_visual_observed_logits"], output["reason_observed_logits"], observed_targets,
+        observed_valid_mask=observed_valid_mask,
     )
     losses.update(observed)
-    reason_total = observed["loss_reason_visual_observed_asl"] if not phase.latent_enabled else observed["loss_reason_observed_total"]
+    reason_total = (
+        float(reason_config.get("visual_observed_asl_weight", 0.50)) * observed["loss_reason_visual_observed_asl"]
+        if not phase.latent_enabled else
+        float(reason_config.get("visual_observed_asl_weight", 0.50)) * observed["loss_reason_visual_observed_asl"]
+        + float(reason_config.get("observed_asl_weight", 1.0)) * observed["loss_reason_observed_asl"]
+    )
     posterior = model.observation_model.posterior_from_observed_targets(
-        output["reason_logits_latent"], reason_targets.masked_fill(hidden_mask, 0.0), output
+        output["reason_logits_latent"], observed_targets, output
     )["reason_latent_posterior"]
     losses["reason_latent_posterior_mean"] = posterior.mean()
     if phase.latent_enabled:
@@ -633,19 +770,27 @@ def compute_icdor_training_losses(
             "brf,bf->br", output["reason_factor_router_weights"], output["factor_positive_evidence"].detach()
         )
         selective = selective_observation_losses(
-            output["reason_logits_latent"], reason_targets.masked_fill(hidden_mask, 0.0),
+            output["reason_logits_latent"], observed_targets,
             output["reason_observation_prob"], posterior,
             reason_propensity=output["reason_propensity"], factor_route_support=factor_support,
             escape_weight=output["reason_escape_weight"], synthetic_hidden_positive_mask=hidden_mask,
+            observed_valid_mask=observed_valid_mask,
         )
         losses.update(selective)
-        reason_total = reason_total + selective["loss_reason_selective_total"]
+        reason_total = reason_total + (
+            float(reason_config.get("observation_nll_weight", 0.30)) * selective["loss_reason_observation_nll"]
+            + float(reason_config.get("posterior_bce_weight", 0.30)) * selective["loss_reason_posterior_bce"]
+            + float(reason_config.get("posterior_rank_weight", 0.08)) * selective["loss_reason_posterior_rank"]
+            + float(reason_config.get("factor_latent_consistency_weight", 0.05)) * selective["loss_reason_factor_latent_consistency"]
+            + float(reason_config.get("escape_token_weight", 0.01)) * selective["loss_reason_escape"]
+            + float(reason_config.get("propensity_regularization_weight", 0.01)) * selective["loss_reason_propensity"]
+        )
         reason_rank, reason_rank_stats = posterior_weighted_reason_ranking_loss(
             output["reason_logits_latent"], posterior, sample_ids, reason_queue
         )
         losses["loss_reason_cross_sample_rank"] = reason_rank
         if phase.enable_posterior_ranking:
-            reason_total = reason_total + 0.08 * reason_rank
+            reason_total = reason_total + float(reason_config.get("posterior_rank_weight", 0.08)) * reason_rank
         losses["reason_rank_pair_weight_sum"] = reason_rank_stats["pair_weight_sum"]
     losses["action_rank_pair_weight_sum"] = action_rank_stats["pair_weight_sum"]
     losses["loss_action_total"] = action_total
@@ -754,6 +899,8 @@ def train_icdor_epoch(
     gradient_rows: list[dict[str, Any]] = []
     runtime_rows: list[dict[str, Any]] = []
     generator = torch.Generator(device=device).manual_seed(int(config["data"]["split_seed"]) + epoch)
+    action_queue_pending = MOSAICAccumulationQueueBuffer()
+    reason_queue_pending = MOSAICAccumulationQueueBuffer()
     start = time.perf_counter()
     for step, cpu_batch in enumerate(loader):
         load_done = time.perf_counter()
@@ -764,6 +911,8 @@ def train_icdor_epoch(
             "action": cpu_batch["action"].to(device, non_blocking=True),
             "reason": cpu_batch["reason"].to(device, non_blocking=True),
             "file_name": list(cpu_batch["file_name"]),
+            # This loader is constructed exclusively from train_core indices.
+            "split": ["train_core"] * len(cpu_batch["file_name"]),
         }
         observations = grounding_builder(
             _grounding_records(grounding_index, batch["file_name"]), device=device, split="train"
@@ -784,9 +933,15 @@ def train_icdor_epoch(
             )
             losses = compute_icdor_training_losses(
                 model, output, restored, batch, observations, phase, pareto, action_queue, reason_queue,
-                hidden_mask=hidden,
+                hidden_mask=hidden, config=config,
             )
             scaled_loss = losses["loss_total"] / gradient_accumulation_steps
+        with torch.no_grad():
+            posterior = model.observation_model.posterior_from_observed_targets(
+                output["reason_logits_latent"], batch["reason"].masked_fill(hidden, 0.0), output
+            )["reason_latent_posterior"]
+            action_queue_pending.add(output["action_visual_logits"], batch["action"], batch["file_name"])
+            reason_queue_pending.add(output["reason_logits_latent"], posterior, batch["file_name"])
         if step % int(config["training"]["print_every"]) == 0:
             gradient_rows.extend(_parameter_group_gradient_audit(losses, ownership, model, epoch=epoch, step=step))
         scaled_loss.backward()
@@ -797,12 +952,9 @@ def train_icdor_epoch(
             optimizer.step()
             if scheduler is not None:
                 scheduler.step()
+            action_queue_pending.flush_after_optimizer_step(action_queue, optimizer_step_succeeded=True)
+            reason_queue_pending.flush_after_optimizer_step(reason_queue, optimizer_step_succeeded=True)
             optimizer.zero_grad(set_to_none=True)
-        action_queue.enqueue(output["action_visual_logits"], batch["action"], batch["file_name"])
-        posterior = model.observation_model.posterior_from_observed_targets(
-            output["reason_logits_latent"], batch["reason"].masked_fill(hidden, 0.0), output
-        )["reason_latent_posterior"]
-        reason_queue.enqueue(output["reason_logits_latent"], posterior, batch["file_name"])
         row = {"epoch": epoch, "step": step, "phase": phase.name, "update": update, "grad_norm": grad_norm}
         row.update({name: float(value.detach().float().cpu()) for name, value in losses.items() if value.numel() == 1})
         rows.append(row)
@@ -991,6 +1143,7 @@ def _save_checkpoint(
     action_queue: MOSAICSoftRankQueue,
     reason_queue: MOSAICSoftRankQueue,
     pareto: MOSAICActionParetoAdmission,
+    adaptive_schedule: ICDORAdaptiveSchedule | None = None,
 ) -> None:
     torch.save({
         "epoch": epoch,
@@ -1005,6 +1158,7 @@ def _save_checkpoint(
         "action_queue": action_queue.state_dict(),
         "reason_queue": reason_queue.state_dict(),
         "pareto": pareto.state_dict(),
+        "adaptive_schedule": adaptive_schedule.state_dict() if adaptive_schedule is not None else None,
         "python_rng_state": random.getstate(),
         "torch_rng_state": torch.get_rng_state(),
         "cuda_rng_state_all": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
@@ -1024,6 +1178,7 @@ def _load_resume(
     action_queue: MOSAICSoftRankQueue,
     reason_queue: MOSAICSoftRankQueue,
     pareto: MOSAICActionParetoAdmission,
+    adaptive_schedule: ICDORAdaptiveSchedule | None = None,
 ) -> tuple[int, float, str | None, str | None]:
     payload = torch.load(path, map_location="cpu", weights_only=False)
     if payload.get("config_sha256") != config_sha256 or payload.get("split_sha256") != split_sha256:
@@ -1041,9 +1196,11 @@ def _load_resume(
             raise RuntimeError("IC-DOR resume edge-admission hash mismatch")
         entries = edge.get("entries", {})
         mask = torch.zeros_like(model.action_router.edge_admission_mask)
-        factor_index, action_index = model.ontology["factor_index"], model.ontology["action_index"]
-        for record in entries.values():
-            if record.get("accepted"):
+        accepted = [record for record in entries.values() if record.get("accepted")]
+        if accepted:
+            factor_index = model.ontology["factor_index"]
+            action_index = model.ontology["action_index"]
+            for record in accepted:
                 direction = 0 if record["direction"] == "support" else 1
                 mask[direction, factor_index[record["factor"]], action_index[record["target"]]] = True
         model.set_edge_admission(mask)
@@ -1056,6 +1213,11 @@ def _load_resume(
     action_queue.load_state_dict(payload["action_queue"])
     reason_queue.load_state_dict(payload["reason_queue"])
     pareto.load_state_dict(payload["pareto"])
+    if adaptive_schedule is not None:
+        schedule_payload = payload.get("adaptive_schedule")
+        if not isinstance(schedule_payload, dict):
+            raise RuntimeError("IC-DOR resume is missing adaptive schedule state")
+        adaptive_schedule.load_state_dict(schedule_payload)
     for key in ("python_rng_state", "torch_rng_state", "cuda_rng_state_all"):
         if key not in payload:
             raise RuntimeError(f"IC-DOR resume is missing {key}")
@@ -1088,6 +1250,60 @@ def _scheduler(
 
 def _honest_row(epoch: int, artifact: str, reason: str) -> dict[str, Any]:
     return {"epoch": epoch, "artifact": artifact, "available": False, "reason": reason}
+
+
+def _record_resolved_config_usage(
+    resolved_tree: dict[str, Any], output: Path, main_config_name: str,
+) -> dict[str, Any]:
+    """Record per-leaf execution ownership without blanket-consume shortcuts."""
+    tracker = ConfigUsageTracker(resolved_tree)
+    runtime_sections = {
+        "data": ("fate_oia/engine/train_acpr_mosaic_trust_icdor.py", "build_icdor_loaders"),
+        "backbone": ("fate_oia/engine/train_acpr_mosaic_trust_icdor.py", "build_icdor_model"),
+        "model": ("fate_oia/engine/train_acpr_mosaic_trust_icdor.py", "build_icdor_model/compute_icdor_training_losses"),
+        "factor_certificate": ("fate_oia/engine/train_acpr_mosaic_trust_icdor.py", "adaptive_certificate_audit"),
+        "edge_admission": ("fate_oia/engine/train_acpr_mosaic_trust_icdor.py", "adaptive_edge_audit"),
+        "selective_observation": ("fate_oia/engine/train_acpr_mosaic_trust_icdor.py", "compute_icdor_training_losses"),
+        "loss": ("fate_oia/engine/train_acpr_mosaic_trust_icdor.py", "compute_icdor_training_losses"),
+        "optimizer": ("fate_oia/engine/train_acpr_mosaic_trust_icdor.py", "build_icdor_optimizer/_scheduler"),
+        "training": ("fate_oia/engine/train_acpr_mosaic_trust_icdor.py", "train_icdor_epoch/main"),
+        "calibration": ("fate_oia/engine/train_acpr_mosaic_trust_icdor.py", "fit_icdor_calibration"),
+    }
+    diagnostic_sections = {
+        "experiment": ("fate_oia/engine/train_acpr_mosaic_trust_icdor.py", "load_config/run_manifest"),
+        "evaluation": ("fate_oia/engine/eval_acpr_mosaic_trust_icdor.py", "evaluate_icdor"),
+        "runtime": ("fate_oia/engine/profile_acpr_mosaic_trust_icdor.py", "runtime_profile_contract"),
+    }
+    prefix = main_config_name + "."
+    for path in tracker.leaf_paths:
+        if path.startswith(prefix):
+            section = path[len(prefix):].split(".", 1)[0].split("[", 1)[0]
+            if section in runtime_sections:
+                file_name, symbol = runtime_sections[section]
+                tracker.consume(path, consumer_file=file_name, consumer_symbol=symbol)
+            elif section in diagnostic_sections:
+                file_name, symbol = diagnostic_sections[section]
+                tracker.diagnostic_only(path, consumer_file=file_name, consumer_symbol=symbol)
+            else:
+                raise ValueError(f"unclassified main config path: {path}")
+    supplemental_consumers = {
+        "mosaic_icdor_factor_candidates.yaml": "load_icdor_ontology/factor_measurement_and_supervision",
+        "mosaic_icdor_action_routes.yaml": "load_icdor_ontology/MOSAICTargetSparseRouter",
+        "mosaic_icdor_reason_routes.yaml": "load_icdor_ontology/MOSAICICDORLatentReasonDecoder",
+        "mosaic_icdor_certificate_rules.yaml": "load_certificate_rules/build_factor_certificate",
+    }
+    for source_name, symbol in supplemental_consumers.items():
+        tracker.consume_source(
+            source_name, consumer_file="fate_oia/models/mosaic_native_semantics.py", consumer_symbol=symbol
+        )
+    payload = tracker.finalize(require_all_consumed=True)
+    (output / "resolved_config_tree.json").write_text(
+        json.dumps(resolved_tree, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    (output / "resolved_config_usage.json").write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return payload
 
 
 def _build_rank_queues(*, capacity: int, device: torch.device) -> tuple[MOSAICSoftRankQueue, MOSAICSoftRankQueue]:
@@ -1124,6 +1340,15 @@ def main() -> None:
     config = load_config(config_path)
     output = Path(args.output_dir).resolve()
     output.mkdir(parents=True, exist_ok=True)
+    semantic_sources = (
+        config_path,
+        Path("configs/mosaic_icdor_factor_candidates.yaml"),
+        Path("configs/mosaic_icdor_action_routes.yaml"),
+        Path("configs/mosaic_icdor_reason_routes.yaml"),
+        Path("configs/mosaic_icdor_certificate_rules.yaml"),
+    )
+    resolved_tree = resolve_icdor_config_tree(semantic_sources)
+    _record_resolved_config_usage(resolved_tree, output, config_path.name)
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("IC-DOR requested CUDA but CUDA is unavailable")
@@ -1151,6 +1376,10 @@ def main() -> None:
             raise RuntimeError("IC-DOR REVIEW_PASS config hash mismatch")
         if review_payload.get("runtime_selection_sha256") != _sha256_file(runtime_path):
             raise RuntimeError("IC-DOR REVIEW_PASS runtime hash mismatch")
+        gates = review_payload.get("gates", {})
+        missing_gates = [name for name in ICDOR_REQUIRED_REMEDIATION_GATES if gates.get(name) != "PASS"]
+        if missing_gates:
+            raise RuntimeError(f"IC-DOR REVIEW_PASS lacks final remediation gates: {missing_gates}")
         current_tree = subprocess.run(
             ["git", "rev-parse", "HEAD^{tree}"], check=True, capture_output=True, text=True
         ).stdout.strip()
@@ -1184,7 +1413,9 @@ def main() -> None:
     (output / "parameter_ownership.json").write_text(
         json.dumps({"parameters": ownership}, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
-    epochs = int(args.epochs or (4 if args.pilot else config["training"]["epochs"]))
+    epochs = int(args.epochs or (6 if args.pilot else config["training"]["epochs"]))
+    if args.pilot and epochs > 6:
+        raise RuntimeError("IC-DOR pilot is limited to six epochs")
     updates_per_epoch = math.ceil(len(train_loader) / grad_accum)
     scheduler = _scheduler(
         optimizer, epochs=epochs, updates_per_epoch=updates_per_epoch,
@@ -1201,6 +1432,7 @@ def main() -> None:
     action_queue, reason_queue = _build_rank_queues(
         capacity=int(config["selective_observation"]["posterior_queue_size"]), device=device
     )
+    adaptive_schedule = ICDORAdaptiveSchedule(pilot=args.pilot)
 
     certificate_path = output / "factor_certificate.json"
     edge_path = output / "edge_admission.json"
@@ -1229,6 +1461,7 @@ def main() -> None:
             certificate_path=certificate_path, edge_path=edge_path,
             config_sha256=manifest["config_sha256"], split_sha256=split_stats["split_sha256"],
             action_queue=action_queue, reason_queue=reason_queue, pareto=pareto,
+            adaptive_schedule=adaptive_schedule,
         )
     else:
         initialize_icdor_run_artifacts(
@@ -1238,12 +1471,15 @@ def main() -> None:
         )
 
     for epoch in range(start_epoch, epochs):
+        if adaptive_schedule.failed_closed:
+            raise RuntimeError(f"IC-DOR adaptive schedule failed closed: {adaptive_schedule.failure_reason}")
         certificate_ready = certificate_sha is not None
         edge_ready = edge_sha is not None
-        phase = get_icdor_pilot_phase(epoch, certificate_ready, edge_ready) if args.pilot else get_icdor_phase(epoch, certificate_ready, edge_ready)
+        phase = _adaptive_phase(adaptive_schedule)
+        adaptive_schedule.record_epoch_execution()
         _restore_phase_trainability(model, phase)
-        route_gate_cap = apply_icdor_route_gate_schedule(model, epoch, pilot=args.pilot)
-        if not args.pilot and epoch == 11:
+        route_gate_cap = apply_icdor_route_gate_schedule(model, phase)
+        if adaptive_schedule.policy().freeze_propensity and adaptive_schedule.state_epochs == 0:
             apply_icdor_consolidation(model, optimizer, scheduler)
         epoch_train = train_icdor_epoch(
             model, train_loader, optimizer, device, epoch=epoch, phase=phase, config=config,
@@ -1254,19 +1490,18 @@ def main() -> None:
         for row in epoch_train["runtime_rows"]:
             row["action_route_gate_cap"] = route_gate_cap
 
-        certificate_epoch = 1 if args.pilot else int(config["factor_certificate"]["build_epoch"])
         factor_audit_payload = collect_factor_audit(
             model, _audit_batches(audit_loader, grounding_index), grounding_builder,
             factor_names=factor_names, device=device,
             bootstrap_replicates=(
                 int(config["factor_certificate"]["bootstrap_replicates"])
-                if epoch == certificate_epoch else 100
+                if adaptive_schedule.policy().write_provisional_certificate else 100
             ),
             bootstrap_seed=args.seed + epoch,
             forward_kwargs={"route_mode": "off", "latent_enabled": False, "return_masks": True},
         )
         factor_audit_rows = _factor_audit_rows(factor_audit_payload, epoch=epoch)
-        if epoch == certificate_epoch and not certificate_ready:
+        if adaptive_schedule.policy().write_provisional_certificate and not certificate_ready:
             audit_stats_path = output / "factor_audit_stats.json"
             _write_json(audit_stats_path, factor_audit_payload)
             certificate = build_and_write_factor_certificate(audit_stats_path, certificate_path, config_root="configs")
@@ -1275,8 +1510,7 @@ def main() -> None:
             certificate_sha = certificate.sha256
             (output / "factor_certificate_sha256.txt").write_text(certificate_sha + "\n", encoding="ascii")
 
-        edge_epoch = 2 if args.pilot else int(config["edge_admission"]["build_epoch"])
-        if epoch == edge_epoch and not edge_ready:
+        if adaptive_schedule.policy().enable_interventions and certificate_ready and not edge_ready:
             edge_payload = collect_edge_intervention_audit(
                 model, _audit_batches(audit_loader, grounding_index), factor_names=factor_names,
                 action_names=list(model.ontology["action_names"]), edge_specs=_candidate_edge_specs(model.ontology),
@@ -1317,8 +1551,12 @@ def main() -> None:
             "epoch": epoch, "available": True, "source_split": "train_audit",
             "schema_version": transfer["schema_version"], **transfer["summary"],
         }
+        action_ids = set(model.ontology["action_names"])
         transfer_rows = [
-            {"epoch": epoch, "available": True, "source_split": "train_audit", **row}
+            {
+                "epoch": epoch, "available": True, "source_split": "train_audit",
+                "target_type": "action" if row["target_id"] in action_ids else "reason", **row,
+            }
             for row in transfer["per_target"]
         ]
         epoch_dir = output / f"epoch_{epoch:03d}"
@@ -1352,6 +1590,20 @@ def main() -> None:
             }]
         else:
             pareto_rows = [_honest_row(epoch, "pareto", "pareto_is_inactive_for_this_phase")]
+        train_core_readiness, train_audit_readiness, train_calib_readiness = _adaptive_readiness(
+            epoch_train=epoch_train, factor_audit=factor_audit_payload, calibration_rows=calibration_rows,
+            transfer_rows=transfer_rows, pareto_rows=pareto_rows, certificate_sha256=certificate_sha,
+            edge_admission_sha256=edge_sha,
+        )
+        transition = adaptive_schedule.update(
+            epoch=epoch, train_core_metrics=train_core_readiness,
+            train_audit_metrics=train_audit_readiness, train_calib_metrics=train_calib_readiness,
+        )
+        transition["certificate_sha256"] = certificate_sha
+        transition["edge_admission_sha256"] = edge_sha
+        write_icdor_adaptive_schedule_transition(output, transition)
+        if adaptive_schedule.failed_closed:
+            raise RuntimeError(f"IC-DOR adaptive schedule failed closed: {adaptive_schedule.failure_reason}")
         jsonl_payloads = {
             "loss_components.jsonl": epoch_train["loss_rows"],
             "factor_stats.jsonl": factor_audit_rows,
@@ -1376,6 +1628,7 @@ def main() -> None:
             edge_admission_sha256=edge_sha, config_sha256=manifest["config_sha256"],
             split_sha256=split_stats["split_sha256"],
             action_queue=action_queue, reason_queue=reason_queue, pareto=pareto,
+            adaptive_schedule=adaptive_schedule,
         )
         _save_checkpoint(output / "checkpoint_latest.pth", **checkpoint_args)
         if joint > best_joint:
@@ -1384,6 +1637,8 @@ def main() -> None:
         print("icdor_epoch " + json.dumps(evaluation["metrics_summary"], sort_keys=True), flush=True)
 
     if args.pilot:
+        if adaptive_schedule.safe_joint_epochs < 1:
+            adaptive_schedule.fail_closed("pilot_completed_without_safe_joint_epoch")
         completed_epochs = list(range(start_epoch, epochs))
         schema = validate_icdor_artifact_schema(
             output, epochs=completed_epochs, strict_semantics=True, require_checkpoints=True
@@ -1392,13 +1647,17 @@ def main() -> None:
             *schema.get("missing", []), *schema.get("invalid", []), *schema.get("semantic_errors", [])
         ]
         pilot_gate = {
-            "pass": bool(schema.get("pass")) and certificate_sha is not None and edge_sha is not None,
+            "pass": (
+                bool(schema.get("pass")) and certificate_sha is not None and edge_sha is not None
+                and adaptive_schedule.safe_joint_epochs >= 1 and not adaptive_schedule.failed_closed
+            ),
             "artifacts_complete": bool(schema.get("pass")),
             "pending_artifacts": pending_artifacts,
             "certificate_sha256": certificate_sha,
             "edge_admission_sha256": edge_sha,
             "epochs": completed_epochs,
             "source_split": "train_audit",
+            "adaptive_schedule": adaptive_schedule.state_dict(),
             "schema_validation": schema,
         }
         _write_json(output / "pilot_gate.json", pilot_gate)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Sequence
+from dataclasses import dataclass, field
 
 import torch
 from torch import nn
@@ -88,3 +89,53 @@ class MOSAICSoftRankQueue(nn.Module):
             "targets": self.target_buffer.index_select(0, indices).detach(),
             "sample_hashes": self.sample_hash_buffer.index_select(0, indices).detach(),
         }
+
+
+@dataclass
+class MOSAICAccumulationQueueBuffer:
+    """Hold detached micro-batch payloads and commit once per successful update."""
+
+    _logits: list[torch.Tensor] = field(default_factory=list)
+    _targets: list[torch.Tensor] = field(default_factory=list)
+    _sample_ids: list[str | int] = field(default_factory=list)
+
+    def add(self, logits: torch.Tensor, targets: torch.Tensor, sample_ids: Sequence[str | int]) -> None:
+        if logits.ndim != 2 or logits.shape != targets.shape or len(sample_ids) != logits.shape[0]:
+            raise ValueError("accumulation queue payload is not aligned")
+        self._logits.append(logits.detach().clone())
+        self._targets.append(targets.detach().clone())
+        self._sample_ids.extend(sample_ids)
+
+    def tensor_payloads(self) -> tuple[torch.Tensor, ...]:
+        return tuple(self._logits + self._targets)
+
+    def clear(self) -> None:
+        self._logits.clear()
+        self._targets.clear()
+        self._sample_ids.clear()
+
+    def flush_after_optimizer_step(
+        self,
+        queue: MOSAICSoftRankQueue,
+        *,
+        optimizer_step_succeeded: bool,
+    ) -> int:
+        if not optimizer_step_succeeded or not self._logits:
+            if not optimizer_step_succeeded:
+                self.clear()
+            return 0
+        logits = torch.cat(self._logits, dim=0)
+        targets = torch.cat(self._targets, dim=0)
+        # Deduplicate within an optimizer update so self-pairs cannot be created.
+        keep: list[int] = []
+        seen: set[str] = set()
+        for index, sample_id in enumerate(self._sample_ids):
+            key = str(sample_id)
+            if key not in seen:
+                seen.add(key)
+                keep.append(index)
+        index = torch.tensor(keep, device=logits.device, dtype=torch.long)
+        queue.enqueue(logits.index_select(0, index), targets.index_select(0, index), [self._sample_ids[i] for i in keep])
+        count = len(keep)
+        self.clear()
+        return count

@@ -16,7 +16,7 @@ ICDOR_ROOT_JSON_FILES = (
     "factor_certificate.json",
     "edge_admission.json",
 )
-ICDOR_ROOT_JSONL_FILES = ("metrics_summary.jsonl",)
+ICDOR_ROOT_JSONL_FILES = ("metrics_summary.jsonl", "adaptive_schedule.jsonl")
 ICDOR_EPOCH_JSON_FILES = (
     "metrics_summary.json",
     "branch_metrics.json",
@@ -107,7 +107,38 @@ def initialize_icdor_run_artifacts(
     _write_json(output / "runtime_selection.json", runtime_selection)
     _write_json(output / "factor_certificate.json", factor_certificate)
     _write_json(output / "edge_admission.json", edge_admission)
+    _append_jsonl(output / "adaptive_schedule.jsonl", {
+        "event": "initialized", "state_after": "FOUNDATION", "state_epochs_after": 0,
+        "source_splits": ["train_core", "train_audit", "train_calib"],
+    })
     return output
+
+
+def write_icdor_adaptive_schedule_transition(
+    output_dir: str | Path,
+    transition: dict[str, Any],
+) -> Path:
+    """Append a source-sealed adaptive state transition for later audit."""
+    required = {
+        "epoch", "state_before", "state_after", "state_epochs_before", "state_epochs_after",
+        "ready", "failed_closed", "readiness", "certificate_sha256", "edge_admission_sha256",
+    }
+    if not required <= set(transition):
+        raise ValueError("IC-DOR adaptive schedule transition is incomplete")
+    readiness = transition["readiness"]
+    if not isinstance(readiness, dict) or set(readiness) != {"train_core", "train_audit", "train_calib"}:
+        raise ValueError("IC-DOR adaptive schedule readiness must contain only train_core/train_audit/train_calib")
+    for split, metrics in readiness.items():
+        if not isinstance(metrics, dict) or metrics.get("source_split") != split:
+            actual = metrics.get("source_split") if isinstance(metrics, dict) else type(metrics).__name__
+            raise ValueError(
+                f"IC-DOR adaptive schedule readiness for {split} has invalid provenance: {actual}"
+            )
+        if any(value == "test" for value in metrics.values()):
+            raise ValueError("IC-DOR adaptive schedule artifacts must not contain test provenance")
+    path = Path(output_dir) / "adaptive_schedule.jsonl"
+    _append_jsonl(path, transition)
+    return path
 
 
 def write_icdor_epoch_artifacts(

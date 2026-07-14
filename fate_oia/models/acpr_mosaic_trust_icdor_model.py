@@ -7,7 +7,6 @@ from typing import Any, Mapping, Sequence
 import torch
 from torch import nn
 
-from .acpr_dino_field import ACPRDinoFieldExtractor
 from .mosaic_group_threshold import MOSAICGroupThresholdHead
 from .mosaic_icdor_action_decoder import MOSAICICDORActionDecoder
 from .mosaic_icdor_dual_reason_decoder import (
@@ -58,9 +57,18 @@ class MOSAICTrustICDORModel(nn.Module):
         spatial_prior_scale_max: float = 0.20,
         spatial_prior_dropout: float = 0.50,
         content_temperature_init: float = 0.07,
+        gate_init: float = 0.02,
+        gate_max: float = 0.15,
+        pi_min: float = 0.20,
+        pi_max: float = 0.95,
+        observed_mix_init: float = 0.50,
     ) -> None:
         super().__init__()
         self.ontology = load_icdor_ontology(config_root)
+        # Keep public router/decoder imports usable when the optional DINO
+        # checkout is unavailable; construction still requires it as before.
+        from .acpr_dino_field import ACPRDinoFieldExtractor
+
         self.dino = ACPRDinoFieldExtractor(
             arch=backbone_arch,
             patch_size=backbone_patch_size,
@@ -107,7 +115,9 @@ class MOSAICTrustICDORModel(nn.Module):
             midres_topk=midres_topk,
         )
         self.action_router = MOSAICTargetSparseRouter(self.ontology, dim=dim)
-        self.action_rereader = MOSAICMaskedTargetRereader(dim=dim, topk=highres_topk)
+        self.action_rereader = MOSAICMaskedTargetRereader(
+            dim=dim, topk=highres_topk, gate_init=gate_init, gate_max=gate_max
+        )
         self.reason_visual_decoder = MOSAICICDORVisualReasonDecoder(
             dim=dim,
             decoder_layers=decoder_layers,
@@ -123,8 +133,8 @@ class MOSAICTrustICDORModel(nn.Module):
             highres_topk=highres_topk,
             midres_topk=midres_topk,
         )
-        self.observation_model = MOSAICICDORObservationHead(self.ontology)
-        self.reason_observed_mixer = MOSAICICDORObservedReasonMixer()
+        self.observation_model = MOSAICICDORObservationHead(self.ontology, pi_min=pi_min, pi_max=pi_max)
+        self.reason_observed_mixer = MOSAICICDORObservedReasonMixer(init_mix=observed_mix_init)
         self.threshold_head = MOSAICGroupThresholdHead()
         factor_count = len(self.ontology["factors"])
         self.register_buffer("factor_certificate_tier", torch.zeros(factor_count, dtype=torch.long), persistent=True)
@@ -211,6 +221,7 @@ class MOSAICTrustICDORModel(nn.Module):
         prior_mode: str = "full",
         factor_ablation_mode: str = "full",
         factor_intervention_keep_mask: torch.Tensor | None = None,
+        factor_mask_override: torch.Tensor | None = None,
         precomputed_dino_field: Mapping[str, Any] | None = None,
         return_masks: bool = False,
         return_diagnostics: bool = False,
@@ -275,6 +286,17 @@ class MOSAICTrustICDORModel(nn.Module):
                 intervention_keep > 0.5,
                 factor_output[key],
                 torch.full_like(factor_output[key], -20.0),
+            )
+        if factor_mask_override is not None:
+            expected = factor_output["factor_soft_masks"].shape
+            if factor_mask_override.shape != expected:
+                raise ValueError("IC-DOR factor mask override must be [B,F,H,W]")
+            if not torch.isfinite(factor_mask_override).all() or bool((factor_mask_override < 0).any()):
+                raise ValueError("IC-DOR factor mask override must be finite and non-negative")
+            # Audit collectors construct this from the current image-only batch;
+            # it only changes spatial rereads and is never persisted as model state.
+            factor_output["factor_soft_masks"] = factor_mask_override.to(
+                device=images.device, dtype=factor_output["factor_soft_masks"].dtype
             )
         action_output = self.action_visual_decoder(action_pyramid)
         router_output = self.action_router(

@@ -15,6 +15,16 @@ from fate_oia.engine.audit_acpr_mosaic_trust_icdor import (
 )
 
 
+def _passing_remediation_gates():
+    names = (
+        "CANONICAL_MULTIVIEW", "REAL_FACTOR_AUDIT", "HARD_MASK_INVARIANCE",
+        "PARETO_FIREWALL", "HIDDEN_RECOVERY_NO_LEAKAGE", "MATCHED_CONTROL_CCA",
+        "CONFIG_COVERAGE", "QUEUE_TIMING", "ADAPTIVE_SCHEDULE", "RUNTIME_PROFILE",
+        "PILOT", "STRICT_ARTIFACT_VALIDATION",
+    )
+    return {name: {"pass": True, "gate": name} for name in names}
+
+
 def test_certificate_audit_checks_builder_and_tier_logic_separately() -> None:
     source = Path("fate_oia/engine/audit_acpr_mosaic_trust_icdor.py").read_text(encoding="utf-8")
     assert '"builder": _require_source_tokens' in source
@@ -121,7 +131,10 @@ def test_review_pass_is_fail_closed_and_binds_all_evidence() -> None:
     runtime = {"pass": True, "selected": {"status": "PASS"}}
     pilot = {"pass": True, "artifacts_complete": True, "pending_artifacts": []}
 
-    review = build_review_pass(audit, runtime, pilot, runtime_sha256="RUNTIME")
+    review = build_review_pass(
+        audit, runtime, pilot, runtime_sha256="RUNTIME",
+        remediation_gates=_passing_remediation_gates(),
+    )
 
     assert review["status"] == "PASS"
     assert review["target_head"] == "abc"
@@ -131,7 +144,10 @@ def test_review_pass_is_fail_closed_and_binds_all_evidence() -> None:
     assert set(review["gates"].values()) == {"PASS"}
     broken = dict(pilot, pending_artifacts=["visual_audit_manifest.json"])
     with pytest.raises(ICDORAuditError, match="pending"):
-        build_review_pass(audit, runtime, broken, runtime_sha256="RUNTIME")
+        build_review_pass(
+            audit, runtime, broken, runtime_sha256="RUNTIME",
+            remediation_gates=_passing_remediation_gates(),
+        )
 
 
 def test_review_pass_rejects_dirty_or_unbound_source_tree() -> None:
@@ -151,5 +167,8 @@ def test_review_pass_rejects_dirty_or_unbound_source_tree() -> None:
     pilot = {"pass": True, "artifacts_complete": True, "pending_artifacts": []}
     for mutation in ({"worktree_clean": False}, {"git_tree": ""}, {"source_manifest_sha256": ""}, {"contract_manifest_sha256": ""}):
         with pytest.raises(ICDORAuditError, match="source tree"):
-            build_review_pass(dict(base, **mutation), runtime, pilot, runtime_sha256="RUNTIME")
+            build_review_pass(
+                dict(base, **mutation), runtime, pilot, runtime_sha256="RUNTIME",
+                remediation_gates=_passing_remediation_gates(),
+            )
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import json
 import subprocess
 from pathlib import Path
@@ -40,6 +41,13 @@ _REQUIRED_FUNCTIONAL_CHECKS = (
     "resume_integrity",
     "visual_audit",
     "foreground_launcher",
+)
+
+_REQUIRED_REMEDIATION_GATES = (
+    "CANONICAL_MULTIVIEW", "REAL_FACTOR_AUDIT", "HARD_MASK_INVARIANCE",
+    "PARETO_FIREWALL", "HIDDEN_RECOVERY_NO_LEAKAGE", "MATCHED_CONTROL_CCA",
+    "CONFIG_COVERAGE", "QUEUE_TIMING", "ADAPTIVE_SCHEDULE", "RUNTIME_PROFILE",
+    "PILOT", "STRICT_ARTIFACT_VALIDATION",
 )
 
 
@@ -96,6 +104,16 @@ def _lane_parameters(model: nn.Module, prefix: str) -> list[nn.Parameter]:
     return parameters
 
 
+def _lane_parameters_many(model: nn.Module, prefixes: tuple[str, ...]) -> list[nn.Parameter]:
+    parameters = [
+        parameter for name, parameter in model.named_parameters()
+        if any(name.startswith(prefix) for prefix in prefixes)
+    ]
+    if not parameters:
+        raise ICDORAuditError(f"gradient audit found no parameters for {prefixes}")
+    return parameters
+
+
 def _joint_lane_gradients(
     output: torch.Tensor,
     owned: list[nn.Parameter],
@@ -145,7 +163,10 @@ def verify_dynamic_forward_and_gradients(model: nn.Module, images: torch.Tensor)
         if any(value <= 0.0 for value in sensitivity.values()):
             raise ICDORAuditError(f"dynamic forward is input-insensitive: {sensitivity}")
         action_parameters = _lane_parameters(model, "action_adapter.")
-        reason_parameters = _lane_parameters(model, "reason_adapter.")
+        reason_parameters = _lane_parameters_many(model, (
+            "reason_adapter.", "reason_visual_decoder.", "reason_latent_decoder.",
+            "reason_observed_mixer.", "observation_model.",
+        ))
         action_owned, action_cross = _joint_lane_gradients(
             first_tensors["action_final_logits"], action_parameters, reason_parameters, retain_graph=True
         )
@@ -158,12 +179,26 @@ def verify_dynamic_forward_and_gradients(model: nn.Module, images: torch.Tensor)
         firewall = {"reason_to_action_adapter": reason_cross, "action_to_reason_adapter": action_cross}
         if any(value != 0.0 for value in firewall.values()):
             raise ICDORAuditError(f"dynamic gradient firewall is violated: {firewall}")
+        forbidden_annotation_parameters = {
+            "action", "action_labels", "reason", "reason_labels", "reason_logits",
+            "reason_propensity", "geometry", "geometry_masks", "factor_targets",
+        }
+        forward_parameters = set(inspect.signature(model.forward).parameters)
+        annotation_parameters = sorted(forward_parameters & forbidden_annotation_parameters)
+        if annotation_parameters:
+            raise ICDORAuditError(f"test forward accepts forbidden annotations: {annotation_parameters}")
         return {
             "pass": True,
             "forward_calls": 2,
             "input_sensitivity": sensitivity,
             "gradient_sum_abs": gradients,
             "gradient_firewall": firewall,
+            "action_information_firewall_pass": reason_cross == 0.0,
+            "test_forward_no_annotation_leakage": not annotation_parameters,
+            "information_boundary_contract": {
+                "action_forbidden": "reason labels/logits/propensity",
+                "action_factor_input": "factor evidence only; never factor raw probability",
+            },
             "required_outputs": list(_REQUIRED_FORWARD_OUTPUTS),
         }
     finally:
@@ -285,6 +320,10 @@ def functional_hard_gates(
     )
     evidence["action_firewall"] = {
         "cross_gradient": dynamic["gradient_firewall"]["reason_to_action_adapter"],
+        "action_information_firewall_pass": dynamic["action_information_firewall_pass"],
+        "test_forward_no_annotation_leakage": dynamic["test_forward_no_annotation_leakage"],
+        "forbidden_inputs": "reason labels/logits/propensity",
+        "factor_boundary": "factor raw probability is not a permitted action input",
         "source": _require_source_tokens(model_path, ("factor_output[\"factor_features\"]", ".detach()")),
     }
     evidence["reason_firewall"] = {
@@ -365,6 +404,7 @@ def build_review_pass(
     pilot: Mapping[str, Any],
     *,
     runtime_sha256: str,
+    remediation_gates: Mapping[str, Mapping[str, Any]],
 ) -> dict[str, Any]:
     """Build a hash-bound REVIEW_PASS only from complete, non-pending evidence."""
     if audit.get("pass") is not True or audit.get("missing_items"):
@@ -390,8 +430,19 @@ def build_review_pass(
         raise ICDORAuditError("pilot gate is not complete")
     if pending:
         raise ICDORAuditError(f"pilot contains pending artifacts: {pending}")
+    failed_remediation = [
+        name for name in _REQUIRED_REMEDIATION_GATES
+        if not isinstance(remediation_gates.get(name), Mapping)
+        or remediation_gates[name].get("pass") is not True
+    ]
+    if failed_remediation:
+        raise ICDORAuditError(f"final remediation gates are not passing: {failed_remediation}")
     gates = {name: "PASS" for name in _REQUIRED_FUNCTIONAL_CHECKS}
-    gates.update({"runtime_profile": "PASS", "pilot_artifacts": "PASS"})
+    gates.update({name: "PASS" for name in _REQUIRED_REMEDIATION_GATES})
+    gate_hashes = {
+        name: hashlib.sha256(json.dumps(dict(remediation_gates[name]), sort_keys=True).encode("utf-8")).hexdigest().upper()
+        for name in _REQUIRED_REMEDIATION_GATES
+    }
     return {
         "status": "PASS",
         "target_head": str(audit["git_head"]),
@@ -401,6 +452,14 @@ def build_review_pass(
         "resolved_config_sha256": str(audit["config_sha256"]),
         "runtime_selection_sha256": runtime_sha256,
         "gates": gates,
+        "remediation_gate_sha256": gate_hashes,
+        "factor_real_audit_completed": True,
+        "hard_mask_invariance_pass": True,
+        "pareto_base_gradient_zero": True,
+        "hidden_recovery_no_label_leakage": True,
+        "matched_controls_pass": True,
+        "adaptive_schedule_pass": True,
+        "unused_config_keys": [],
         "audit_sha256": hashlib.sha256(
             json.dumps(dict(audit), sort_keys=True).encode("utf-8")
         ).hexdigest().upper(),
@@ -418,6 +477,7 @@ def main() -> None:
     parser.add_argument("--fail_closed", action="store_true")
     parser.add_argument("--write_review_pass", action="store_true")
     parser.add_argument("--pilot_gate")
+    parser.add_argument("--remediation_gate_dir", default=".review/final_remediation_gates")
     parser.add_argument("--max_audit_samples", type=int, default=2)
     args = parser.parse_args()
     config_path = Path(args.config)
@@ -489,7 +549,17 @@ def main() -> None:
             raise ICDORAuditError("write_review_pass requires runtime_selection and pilot_gate")
         runtime = json.loads(Path(args.runtime_selection).read_text(encoding="utf-8"))
         pilot = json.loads(Path(args.pilot_gate).read_text(encoding="utf-8"))
-        review = build_review_pass(result, runtime, pilot, runtime_sha256=sha256_file(args.runtime_selection))
+        gate_dir = Path(args.remediation_gate_dir)
+        remediation_gates: dict[str, Mapping[str, Any]] = {}
+        for gate_name in _REQUIRED_REMEDIATION_GATES:
+            gate_path = gate_dir / f"ICDOR_GATE_{gate_name}_PASS.json"
+            if not gate_path.is_file():
+                raise ICDORAuditError(f"required remediation gate is missing: {gate_path}")
+            remediation_gates[gate_name] = json.loads(gate_path.read_text(encoding="utf-8"))
+        review = build_review_pass(
+            result, runtime, pilot, runtime_sha256=sha256_file(args.runtime_selection),
+            remediation_gates=remediation_gates,
+        )
         review_path = output / "acpr_mosaic_trust_v3_icdor_REVIEW_PASS.json"
         review_path.write_text(json.dumps(review, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps(result, indent=2, sort_keys=True))

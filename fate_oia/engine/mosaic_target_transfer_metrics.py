@@ -8,9 +8,15 @@ from typing import Any, Sequence
 
 import torch
 
+from .mosaic_icdor_audit_collectors import (
+    build_batch_matched_factor_control_overrides,
+    factor_control_spec,
+    summarize_matched_control_arms,
+)
+
 
 _DIRECTIONS = {"support": 1.0, "veto": -1.0}
-_SCHEMA_VERSION = "mosaic_target_transfer.v1"
+_SCHEMA_VERSION = "mosaic_target_transfer.v2"
 
 
 @dataclass(frozen=True)
@@ -33,6 +39,7 @@ class TargetTransferInputs:
     selected_target_prob: Any
     matched_random_target_prob: Any
     deleted_target_prob: Any
+    matched_control_arms: Any = None
     evidence_threshold: float = 0.0
 
 
@@ -118,6 +125,34 @@ def _validate_ids(values: Sequence[str], name: str) -> tuple[str, ...]:
     return ids
 
 
+def counterfactual_credit_alignment(
+    on: torch.Tensor,
+    off: torch.Tensor,
+    *,
+    support_rows: torch.Tensor,
+    veto_rows: torch.Tensor,
+) -> torch.Tensor:
+    """Return the fraction of interventions with the ontology-correct sign.
+
+    Support is correct when enabling evidence increases the target probability;
+    veto is correct when enabling evidence decreases it. Rows outside those two
+    disjoint masks are deliberately excluded rather than counted as failures.
+    """
+    if on.shape != off.shape or on.shape != support_rows.shape or on.shape != veto_rows.shape:
+        raise ValueError("CCA inputs must have matching shapes")
+    if support_rows.dtype != torch.bool or veto_rows.dtype != torch.bool:
+        raise ValueError("CCA support/veto masks must be boolean")
+    if bool((support_rows & veto_rows).any()):
+        raise ValueError("CCA support and veto rows must be disjoint")
+    eligible = support_rows | veto_rows
+    if not bool(eligible.any()):
+        raise ValueError("CCA requires at least one eligible row")
+    correct = torch.zeros_like(eligible, dtype=torch.bool)
+    correct[support_rows] = on[support_rows] > off[support_rows]
+    correct[veto_rows] = on[veto_rows] < off[veto_rows]
+    return correct[eligible].float().mean()
+
+
 def compute_target_transfer_metrics(inputs: TargetTransferInputs) -> dict[str, Any]:
     """Measure whether visual factor evidence transfers to every action/reason target.
 
@@ -154,6 +189,18 @@ def compute_target_transfer_metrics(inputs: TargetTransferInputs) -> dict[str, A
     selected = _cube(inputs.selected_target_prob, sample_count, factor_count, target_count, "selected_target_prob")
     random = _cube(inputs.matched_random_target_prob, sample_count, factor_count, target_count, "matched_random_target_prob")
     deleted = _cube(inputs.deleted_target_prob, sample_count, factor_count, target_count, "deleted_target_prob")
+    matched_control_arms = None
+    if inputs.matched_control_arms is not None:
+        matched_control_arms = _sequence(inputs.matched_control_arms, "matched_control_arms")
+        if len(matched_control_arms) != factor_count:
+            raise ValueError("target transfer matched_control_arms must have one factor entry per factor")
+        for factor_arms in matched_control_arms:
+            arms = _sequence(factor_arms, "matched_control_arms")
+            if len(arms) < 4:
+                raise ValueError("target transfer requires at least four matched control arms")
+            for arm in arms:
+                if not isinstance(arm, dict) or float(arm.get("max_mass_error", 1.0)) > 0.05 or float(arm.get("max_overlap", 1.0)) != 0.0:
+                    raise ValueError("target transfer matched control metadata violates mass or overlap requirements")
 
     selected_counts = [sum(bool(row[factor]) for row in selected_mask) for factor in range(factor_count)]
     random_counts = [sum(bool(row[factor]) for row in random_mask) for factor in range(factor_count)]
@@ -193,11 +240,12 @@ def compute_target_transfer_metrics(inputs: TargetTransferInputs) -> dict[str, A
             signed_random = [sign * (on - control) for on, control in zip(selected_scores, random_scores)]
             selected_effect = _mean([effect for effect, keep in zip(signed_selected, direction_rows) if keep])
             random_effect = _mean([effect for effect, keep in zip(signed_random, direction_rows) if keep])
-            calibration_selected = _mean([1.0 - abs(score - label) for score, label in zip(selected_scores, target_labels)])
-            calibration_deleted = _mean([1.0 - abs(score - label) for score, label in zip(deleted_scores, target_labels)])
+            calibration_selected = _mean([1.0 - abs(score - label) for score, label, keep in zip(selected_scores, target_labels, direction_rows) if keep])
+            calibration_deleted = _mean([1.0 - abs(score - label) for score, label, keep in zip(deleted_scores, target_labels, direction_rows) if keep])
             tet = selected_effect
             tes = tet - random_effect
-            cca = calibration_selected - calibration_deleted
+            cca = _mean([1.0 if effect > 0.0 else 0.0 for effect, keep in zip(signed_selected, direction_rows) if keep])
+            calibration_gain = calibration_selected - calibration_deleted
             ap_delta = selected_ap - deleted_ap
             per_target.append(
                 {
@@ -211,10 +259,13 @@ def compute_target_transfer_metrics(inputs: TargetTransferInputs) -> dict[str, A
                     "tet": tet,
                     "tes": tes,
                     "cca": cca,
+                    "direction_accuracy": cca,
+                    "calibration_gain": calibration_gain,
                     "ap_delta": ap_delta,
                     "selected_ap": selected_ap,
                     "deleted_ap": deleted_ap,
                     "visual_evidence_mean": _mean([visual_evidence[row][factor_index] for row in rows]),
+                    "matched_control_arms": None if matched_control_arms is None else matched_control_arms[factor_index],
                     "admitted": tes > 0.0 and cca > 0.0 and ap_delta > 0.0,
                 }
             )
@@ -227,6 +278,7 @@ def compute_target_transfer_metrics(inputs: TargetTransferInputs) -> dict[str, A
         "mean_tet": _mean([item["tet"] for item in per_target]),
         "mean_tes": _mean([item["tes"] for item in per_target]),
         "mean_cca": _mean([item["cca"] for item in per_target]),
+        "mean_calibration_gain": _mean([item["calibration_gain"] for item in per_target]),
         "mean_ap_delta": _mean([item["ap_delta"] for item in per_target]),
         "admitted_rate": _mean([1.0 if item["admitted"] else 0.0 for item in per_target]),
     }
@@ -261,6 +313,7 @@ def collect_target_transfer_metrics(
     full_probability: list[torch.Tensor] = []
     deleted_probability: list[torch.Tensor] = []
     random_deleted_probability: list[torch.Tensor] = []
+    control_records: list[list[list[dict[str, Any]]]] = [[[] for _ in range(4)] for _ in range(factor_count)]
     was_training = model.training
     model.eval()
     try:
@@ -275,12 +328,15 @@ def collect_target_transfer_metrics(
                 raise ValueError("target transfer labels do not match target_ids")
             full = model(
                 images, route_mode=route_mode, latent_enabled=latent_enabled,
-                return_masks=False,
+                return_masks=True,
             )
             full_prob = torch.sigmoid(full[probability_key]).float()
             evidence = full["factor_presence_prob"].float()
             if evidence.shape != (images.shape[0], factor_count):
                 raise ValueError("target transfer factor evidence does not match factor_ids")
+            factor_masks = full.get("factor_soft_masks")
+            if not isinstance(factor_masks, torch.Tensor) or factor_masks.ndim != 4 or factor_masks.shape[:2] != (images.shape[0], factor_count):
+                raise ValueError("target transfer requires real factor_soft_masks [batch, factor, height, width]")
             deleted_arms: list[torch.Tensor] = []
             random_arms: list[torch.Tensor] = []
             for factor_index in range(factor_count):
@@ -290,14 +346,23 @@ def collect_target_transfer_metrics(
                     images, route_mode=route_mode, latent_enabled=latent_enabled,
                     return_masks=False, factor_intervention_keep_mask=keep,
                 )
-                random_keep = torch.ones_like(keep)
-                random_keep[:, (factor_index + 1) % factor_count] = 0.0
-                random_deleted = model(
-                    images, route_mode=route_mode, latent_enabled=latent_enabled,
-                    return_masks=False, factor_intervention_keep_mask=random_keep,
+                spec = factor_control_spec(model, factor_name=str(factor_ids[factor_index]), factor_index=factor_index)
+                overrides, arm_rows = build_batch_matched_factor_control_overrides(
+                    factor_masks,
+                    factor_index=factor_index,
+                    factor=spec["factor"], factor_type=spec["factor_type"], region=spec["region"],
                 )
+                for arm_index, rows in enumerate(arm_rows):
+                    control_records[factor_index][arm_index].extend(rows)
+                random_outputs = []
+                for override in overrides:
+                    random_deleted = model(
+                        images, route_mode=route_mode, latent_enabled=latent_enabled,
+                        return_masks=False, factor_mask_override=override,
+                    )
+                    random_outputs.append(torch.sigmoid(random_deleted[probability_key]).float())
                 deleted_arms.append(torch.sigmoid(deleted[probability_key]).float())
-                random_arms.append(torch.sigmoid(random_deleted[probability_key]).float())
+                random_arms.append(torch.stack(random_outputs, dim=0).mean(dim=0))
             visual_evidence.append(evidence.cpu())
             labels.append(target.cpu())
             full_probability.append(full_prob[:, None, :].expand(-1, factor_count, -1).cpu())
@@ -325,6 +390,7 @@ def collect_target_transfer_metrics(
         selected_target_prob=selected,
         matched_random_target_prob=random_deleted,
         deleted_target_prob=deleted,
+        matched_control_arms=[summarize_matched_control_arms(arms) for arms in control_records],
     ))
 
 
@@ -354,6 +420,7 @@ def collect_joint_target_transfer_metrics(
     full_probability: list[torch.Tensor] = []
     deleted_probability: list[torch.Tensor] = []
     random_deleted_probability: list[torch.Tensor] = []
+    control_records: list[list[list[dict[str, Any]]]] = [[[] for _ in range(4)] for _ in range(factor_count)]
     was_training = model.training
     model.eval()
     try:
@@ -370,7 +437,7 @@ def collect_joint_target_transfer_metrics(
                 raise ValueError("joint target transfer labels do not match action/reason ids")
             full = model(
                 images, route_mode=route_mode, latent_enabled=latent_enabled,
-                return_masks=False, **field_kwargs,
+                return_masks=True, **field_kwargs,
             )
             full_prob = torch.cat((
                 torch.sigmoid(full["action_final_logits"]),
@@ -379,26 +446,43 @@ def collect_joint_target_transfer_metrics(
             evidence = full["factor_presence_prob"].float()
             if evidence.shape != (images.shape[0], factor_count):
                 raise ValueError("joint target transfer factor evidence does not match factor ids")
+            factor_masks = full.get("factor_soft_masks")
+            if not isinstance(factor_masks, torch.Tensor) or factor_masks.ndim != 4 or factor_masks.shape[:2] != (images.shape[0], factor_count):
+                raise ValueError("joint target transfer requires real factor_soft_masks [batch, factor, height, width]")
             deleted_arms: list[torch.Tensor] = []
             random_arms: list[torch.Tensor] = []
             for factor_index in range(factor_count):
                 keep = torch.ones(images.shape[0], factor_count, device=device)
                 keep[:, factor_index] = 0.0
-                random_keep = torch.ones_like(keep)
-                random_keep[:, (factor_index + 1) % factor_count] = 0.0
-                arms = []
-                for intervention in (keep, random_keep):
+                deleted = model(
+                    images, route_mode=route_mode, latent_enabled=latent_enabled,
+                    return_masks=False, factor_intervention_keep_mask=keep,
+                    **field_kwargs,
+                )
+                spec = factor_control_spec(model, factor_name=str(factor_ids[factor_index]), factor_index=factor_index)
+                overrides, arm_rows = build_batch_matched_factor_control_overrides(
+                    factor_masks,
+                    factor_index=factor_index,
+                    factor=spec["factor"], factor_type=spec["factor_type"], region=spec["region"],
+                )
+                for arm_index, rows in enumerate(arm_rows):
+                    control_records[factor_index][arm_index].extend(rows)
+                random_outputs = []
+                for override in overrides:
                     output = model(
                         images, route_mode=route_mode, latent_enabled=latent_enabled,
-                        return_masks=False, factor_intervention_keep_mask=intervention,
+                        return_masks=False, factor_mask_override=override,
                         **field_kwargs,
                     )
-                    arms.append(torch.cat((
+                    random_outputs.append(torch.cat((
                         torch.sigmoid(output["action_final_logits"]),
                         torch.sigmoid(output["reason_observed_logits"]),
                     ), dim=1).float())
-                deleted_arms.append(arms[0])
-                random_arms.append(arms[1])
+                deleted_arms.append(torch.cat((
+                    torch.sigmoid(deleted["action_final_logits"]),
+                    torch.sigmoid(deleted["reason_observed_logits"]),
+                ), dim=1).float())
+                random_arms.append(torch.stack(random_outputs, dim=0).mean(dim=0))
             visual_evidence.append(evidence.cpu())
             labels.append(target.cpu())
             full_probability.append(full_prob[:, None, :].expand(-1, factor_count, -1).cpu())
@@ -422,4 +506,5 @@ def collect_joint_target_transfer_metrics(
         selected_target_prob=torch.cat(full_probability),
         matched_random_target_prob=torch.cat(random_deleted_probability),
         deleted_target_prob=torch.cat(deleted_probability),
+        matched_control_arms=[summarize_matched_control_arms(arms) for arms in control_records],
     ))

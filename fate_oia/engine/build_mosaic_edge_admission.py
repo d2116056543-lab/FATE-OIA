@@ -17,6 +17,7 @@ class MOSAICEdgeInterventionStats:
     cca: float
     isolated_edge_ap: float
     visual_ap: float
+    calibration_gain: float | None = None
 
 
 @dataclass(frozen=True)
@@ -85,6 +86,8 @@ def build_edge_admission(
                         reasons.append("tes_lcb_not_positive")
                     if stats.cca < 0.60:
                         reasons.append("cca_below_0p60")
+                    if stats.calibration_gain is not None and stats.calibration_gain <= 0.0:
+                        reasons.append("calibration_gain_not_positive")
                     if stats.isolated_edge_ap < stats.visual_ap - 0.002:
                         reasons.append("isolated_edge_ap_harms_visual")
                     accepted = not reasons

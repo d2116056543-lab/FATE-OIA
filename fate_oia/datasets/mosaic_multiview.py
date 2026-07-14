@@ -13,6 +13,9 @@ class MOSAICWeakMultiView:
     the geometry sampler, so a horizontal flip negates their x component.
     """
 
+    _ACTION_FLIP_PERMUTATION = (0, 1, 3, 2)
+    _REASON_FLIP_PERMUTATION = (0, 1, 2, 3, 4, 5, 6, 7, 8, 15, 16, 17, 18, 19, 20, 9, 10, 11, 12, 13, 14)
+
     def __init__(
         self,
         factor_names: Sequence[str],
@@ -70,8 +73,10 @@ class MOSAICWeakMultiView:
             permutation[name_to_index[name]] = name_to_index[partner]
         return tuple(permutation)
 
-    def _draw_metadata(self) -> dict[str, Any]:
-        horizontal_flip = bool(torch.rand((), generator=self._generator).item() < self.flip_probability)
+    def _draw_metadata(self, *, allow_horizontal_flip: bool) -> dict[str, Any]:
+        horizontal_flip = allow_horizontal_flip and bool(
+            torch.rand((), generator=self._generator).item() < self.flip_probability
+        )
         brightness_delta = (2.0 * torch.rand((), generator=self._generator).item() - 1.0) * self.brightness_jitter
         contrast_factor = 1.0 + (2.0 * torch.rand((), generator=self._generator).item() - 1.0) * self.contrast_jitter
         return {
@@ -80,6 +85,8 @@ class MOSAICWeakMultiView:
             "contrast_factor": contrast_factor,
             "hue_delta": 0.0,
             "factor_permutation": self._flip_permutation if horizontal_flip else tuple(range(len(self.factor_names))),
+            "action_permutation": self._ACTION_FLIP_PERMUTATION if horizontal_flip else tuple(range(4)),
+            "reason_permutation": self._REASON_FLIP_PERMUTATION if horizontal_flip else tuple(range(21)),
             "coordinate_system": "normalized_minus_one_to_one",
         }
 
@@ -101,7 +108,11 @@ class MOSAICWeakMultiView:
         if not image.is_floating_point() or image.shape[-2] <= 0 or image.shape[-1] <= 0:
             raise ValueError("multiview expects a floating [3,H,W] image tensor")
 
-        metadata = (self._draw_metadata(), self._draw_metadata())
+        # The first view is the canonical label space; only the second view may flip.
+        metadata = (
+            self._draw_metadata(allow_horizontal_flip=False),
+            self._draw_metadata(allow_horizontal_flip=True),
+        )
         images = tuple(self._apply_weak_photometric_transform(image, item) for item in metadata)
         return {
             "images": images,
@@ -122,6 +133,23 @@ class MOSAICWeakMultiView:
         if values.shape[factor_dim] != len(self.factor_names) or permutation.numel() != len(self.factor_names):
             raise ValueError("factor axis does not match multiview factor metadata")
         return torch.empty_like(values).index_copy(factor_dim, permutation, values)
+
+    def _restore_label_axis(
+        self,
+        values: torch.Tensor,
+        metadata: Mapping[str, Any],
+        *,
+        key: str,
+        label_dim: int,
+        axis: int,
+    ) -> torch.Tensor:
+        if not isinstance(values, torch.Tensor) or values.ndim < 1:
+            raise ValueError("label values must expose a label axis")
+        axis = self._canonical_dim(values.ndim, axis)
+        permutation = torch.as_tensor(metadata[key], device=values.device, dtype=torch.long)
+        if values.shape[axis] != label_dim or permutation.numel() != label_dim:
+            raise ValueError("label axis does not match multiview metadata")
+        return torch.empty_like(values).index_copy(axis, permutation, values)
 
     def invert_factor_masks(
         self,
@@ -147,6 +175,38 @@ class MOSAICWeakMultiView:
             raise ValueError("factor values must expose a factor axis")
         return self._restore_factor_axis(values, metadata, factor_dim)
 
+    def invert_action_values(
+        self,
+        values: torch.Tensor,
+        metadata: Mapping[str, Any],
+        *,
+        action_dim: int = -1,
+    ) -> torch.Tensor:
+        """Restore the four action scores to the canonical driving label order."""
+        return self._restore_label_axis(
+            values,
+            metadata,
+            key="action_permutation",
+            label_dim=4,
+            axis=action_dim,
+        )
+
+    def invert_reason_values(
+        self,
+        values: torch.Tensor,
+        metadata: Mapping[str, Any],
+        *,
+        reason_dim: int = -1,
+    ) -> torch.Tensor:
+        """Restore directional reason scores, including the 9<->15 through 14<->20 pairs."""
+        return self._restore_label_axis(
+            values,
+            metadata,
+            key="reason_permutation",
+            label_dim=21,
+            axis=reason_dim,
+        )
+
     def invert_factor_coordinates(
         self,
         coordinates: torch.Tensor,
@@ -160,3 +220,13 @@ class MOSAICWeakMultiView:
         if metadata["horizontal_flip"]:
             restored[..., 0].neg_()
         return self._restore_factor_axis(restored, metadata, factor_dim)
+
+    @staticmethod
+    def invert_geometry_coordinates(coordinates: torch.Tensor, metadata: Mapping[str, Any]) -> torch.Tensor:
+        """Restore geometry coordinates whose final axis is canonical ``(x, y)``."""
+        if not isinstance(coordinates, torch.Tensor) or coordinates.ndim < 1 or coordinates.shape[-1] != 2:
+            raise ValueError("geometry coordinates must end in an xy axis")
+        restored = coordinates.clone()
+        if metadata["horizontal_flip"]:
+            restored[..., 0].neg_()
+        return restored

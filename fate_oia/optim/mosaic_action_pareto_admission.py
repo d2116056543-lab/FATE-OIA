@@ -48,4 +48,6 @@ class MOSAICActionParetoAdmission(nn.Module):
             routed_logits, target, reduction="none"
         ).mean(dim=0)
         violation = (routed_loss - visual_loss - self.tolerance).clamp_min(0.0)
-        return (self.dual_variables.detach() * violation).mean()
+        # Keep a primal non-regression cost even before audit duals activate.
+        # The visual baseline is detached above, so gradients remain route-only.
+        return ((1.0 + self.dual_variables.detach()) * violation).mean()

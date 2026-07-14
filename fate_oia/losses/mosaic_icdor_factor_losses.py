@@ -15,6 +15,26 @@ def _masked_bce(logits: torch.Tensor, targets: torch.Tensor, known_mask: torch.T
     return (value * known).sum() / denominator
 
 
+def factor_positive_anchor_loss(
+    factor_presence_logits: torch.Tensor,
+    supervision: dict[str, torch.Tensor],
+) -> torch.Tensor:
+    """Apply weighted positive-only reason anchors to the factor-presence lane."""
+    positive_anchor_mask = supervision.get("positive_anchor_mask")
+    positive_anchor_weight = supervision.get("positive_anchor_weight")
+    if not isinstance(positive_anchor_mask, torch.Tensor) or not isinstance(positive_anchor_weight, torch.Tensor):
+        raise ValueError("factor anchor supervision requires mask and weight tensors")
+    if factor_presence_logits.shape != positive_anchor_mask.shape or factor_presence_logits.shape != positive_anchor_weight.shape:
+        raise ValueError("factor anchor supervision must match presence logits")
+    weights = positive_anchor_mask.to(dtype=factor_presence_logits.dtype) * positive_anchor_weight.to(
+        dtype=factor_presence_logits.dtype
+    )
+    denominator = weights.sum()
+    if denominator.item() == 0:
+        return factor_presence_logits.sum() * 0.0
+    return (F.softplus(-factor_presence_logits) * weights).sum() / denominator
+
+
 def factor_presence_visibility_losses(
     factor_presence_logits: torch.Tensor,
     factor_visibility_logits: torch.Tensor,
@@ -23,7 +43,7 @@ def factor_presence_visibility_losses(
     presence_known_mask: torch.Tensor,
     visibility_known_mask: torch.Tensor,
     weak_negative_mask: torch.Tensor | None = None,
-    weak_negative_weight: float = 0.30,
+    weak_negative_weight: float = 0.05,
 ) -> dict[str, torch.Tensor]:
     """Supervise only observed/geometry-known factor states; unknown is ignored."""
     loss_presence = _masked_bce(factor_presence_logits, presence_targets, presence_known_mask)

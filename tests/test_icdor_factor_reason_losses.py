@@ -72,8 +72,13 @@ def test_icdor_synthetic_hidden_recovery_really_hides_observed_positives() -> No
         factor_route_support=torch.full_like(observed, 0.5),
         escape_weight=torch.zeros_like(observed),
         synthetic_hidden_positive_mask=hidden,
+        observed_valid_mask=~hidden,
     )
-    assert losses["loss_reason_missing_recovery"] > 0
+    # Hidden truths are evaluation-only and must never enter a recovery loss.
+    assert "loss_reason_missing_recovery" not in losses
+    total = losses["loss_reason_selective_total"]
+    gradient = torch.autograd.grad(total, latent)[0]
+    assert gradient[hidden].abs().max().item() == 0.0
 
 
 def test_icdor_weak_negative_is_weighted_and_unknown_remains_ignored() -> None:

@@ -86,11 +86,21 @@ class MOSAICTargetSparseRouter(nn.Module):
         finite_logits = factor_scores + evidence_by_edge.clamp_min(1e-8).log()
         finite_logits = finite_logits + self.direction_bias[direction_index].view(1, 1, -1)
         dustbin = self.dustbin_logit[direction_index].view(1, 1, -1).expand(finite_logits.shape[0], -1, -1)
-        unconstrained = entmax15_bisect(torch.cat((finite_logits, dustbin), dim=1), dim=1)
-        factor_weights = unconstrained[:, : self.factor_count] * active_mask.unsqueeze(0).to(finite_logits.dtype)
-        # Disallowed finite-logit mass is explicitly transferred to dustbin.
+        # Exclude forbidden factors before entmax so their semantics cannot
+        # alter normalization for an allowed edge or the dustbin. A relative
+        # finite floor keeps the bisection interval stable for sparse entmax.
+        allowed_logits = finite_logits.masked_fill(~active_mask.unsqueeze(0), float("-inf"))
+        floor = torch.maximum(allowed_logits.amax(dim=1, keepdim=True), dustbin) - 100.0
+        masked_logits = torch.where(active_mask.unsqueeze(0), finite_logits, floor)
+        unconstrained = entmax15_bisect(torch.cat((masked_logits, dustbin), dim=1), dim=1)
+        factor_weights = torch.where(
+            active_mask.unsqueeze(0),
+            unconstrained[:, : self.factor_count],
+            torch.zeros_like(unconstrained[:, : self.factor_count]),
+        )
+        # Any unused mass, including the hard-masked paths, belongs to dustbin.
         dustbin_weight = 1.0 - factor_weights.sum(dim=1)
-        return factor_weights, dustbin_weight, finite_logits
+        return factor_weights, dustbin_weight, masked_logits
 
     def forward(
         self,

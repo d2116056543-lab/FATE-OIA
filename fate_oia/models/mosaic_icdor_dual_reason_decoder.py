@@ -6,6 +6,7 @@ from typing import Any
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from .acpr_sparse_ops import entmax15_bisect
 from .mosaic_sparse_label_decoder import MOSAICSparseLabelDecoder
@@ -82,6 +83,50 @@ class MOSAICICDORLatentReasonDecoder(nn.Module):
         )
         self.classifier = nn.Linear(2 * dim, 1, bias=False)
 
+    def _masked_visual_nodes(
+        self,
+        reason_pyramid: dict[str, torch.Tensor],
+        semantic: torch.Tensor,
+        reason_factor_masks: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Verify each latent reason without cross-reason semantic leakage."""
+        decoder = self.decoder
+        high = reason_pyramid["F_hi"]
+        middle = reason_pyramid["F_mid"]
+        context = reason_pyramid["F_ctx"]
+        batch_size = high.shape[0]
+        queries = decoder.label_queries.unsqueeze(0).expand(batch_size, -1, -1) + semantic
+        context_tokens = context.flatten(2).transpose(1, 2)
+        context_nodes, _ = decoder.context_attention(queries, context_tokens, context_tokens, need_weights=False)
+        nodes = decoder.context_norm(queries + context_nodes)
+
+        high_keys = F.normalize(decoder.high_key(high).flatten(2).transpose(1, 2), dim=-1, eps=1e-6)
+        mid_keys = F.normalize(decoder.mid_key(middle).flatten(2).transpose(1, 2), dim=-1, eps=1e-6)
+        normalized_nodes = F.normalize(nodes, dim=-1, eps=1e-6)
+        high_scores = torch.einsum("bld,bnd->bln", normalized_nodes, high_keys) / math.sqrt(decoder.dim)
+        mid_scores = torch.einsum("bld,bnd->bln", normalized_nodes, mid_keys) / math.sqrt(decoder.dim)
+        high_scores = decoder._masked_scores(high_scores, reason_factor_masks, (45, 80))
+        mid_scores = decoder._masked_scores(mid_scores, reason_factor_masks, (23, 40))
+        high_values, high_indices = high_scores.topk(decoder.highres_topk, dim=-1)
+        mid_values, mid_indices = mid_scores.topk(decoder.midres_topk, dim=-1)
+        high_tokens = decoder.high_value(high).flatten(2).transpose(1, 2)
+        mid_tokens = decoder.mid_value(middle).flatten(2).transpose(1, 2)
+        gathered = torch.cat((
+            decoder._gather_tokens(high_tokens, high_indices),
+            decoder._gather_tokens(mid_tokens, mid_indices),
+        ), dim=2)
+        retrieval_attention = entmax15_bisect(torch.cat((high_values, mid_values), dim=-1), dim=-1)
+        nodes = decoder.retrieval_norm(nodes + torch.einsum("blk,blkd->bld", retrieval_attention, gathered))
+
+        reason_count = nodes.shape[1]
+        cross_reason_mask = torch.ones(reason_count, reason_count, dtype=torch.bool, device=nodes.device)
+        cross_reason_mask.fill_diagonal_(False)
+        for block in decoder.blocks:
+            attended, _ = block.attention(nodes, nodes, nodes, need_weights=False, attn_mask=cross_reason_mask)
+            nodes = block.norm_attention(nodes + attended)
+            nodes = block.norm_feed_forward(nodes + block.feed_forward(nodes))
+        return decoder.final_norm(nodes), retrieval_attention
+
     def forward(
         self,
         reason_pyramid: dict[str, torch.Tensor],
@@ -98,17 +143,28 @@ class MOSAICICDORLatentReasonDecoder(nn.Module):
         queries = self.reason_query(self.reason_queries).unsqueeze(0).expand(batch_size, -1, -1)
         finite_scores = torch.einsum("brd,bfd->brf", queries, factor_keys) / math.sqrt(dim)
         allowed = self.reason_factor_allow_mask & factor_route_enabled.view(1, -1)
+        # Hard-mask before entmax: disabled factors must not affect the
+        # allowed-factor distribution or the escape-token weight. Keep the
+        # floor relative to allowed scores so bisection remains well-scaled.
+        escape_scores = finite_scores.new_zeros(batch_size, 21, 1)
+        allowed_scores = finite_scores.masked_fill(~allowed.unsqueeze(0), float("-inf"))
+        floor = torch.maximum(allowed_scores.amax(dim=-1, keepdim=True), escape_scores) - 100.0
+        masked_scores = torch.where(allowed.unsqueeze(0), finite_scores, floor)
         unconstrained = entmax15_bisect(
-            torch.cat((finite_scores, finite_scores.new_zeros(batch_size, 21, 1)), dim=-1), dim=-1
+            torch.cat((masked_scores, escape_scores), dim=-1), dim=-1
         )
-        factor_weights = unconstrained[:, :, :factor_count] * allowed.unsqueeze(0).to(finite_scores.dtype)
+        factor_weights = torch.where(
+            allowed.unsqueeze(0),
+            unconstrained[:, :, :factor_count],
+            torch.zeros_like(unconstrained[:, :, :factor_count]),
+        )
         escape_weight = 1.0 - factor_weights.sum(dim=-1, keepdim=True)
         semantic = torch.einsum("brf,bfd->brd", factor_weights, factor_features.detach())
         semantic = self.semantic_norm(semantic + escape_weight * self.escape_tokens.unsqueeze(0))
         reason_factor_masks = torch.einsum("brf,bfhw->brhw", factor_weights, factor_soft_masks.detach())
         active = reason_factor_masks.flatten(2).amax(dim=-1) > 1e-8
-        visual = self.decoder(reason_pyramid, query_seed=semantic, highres_masks=reason_factor_masks)
-        visual_nodes = visual["label_nodes"] * active.unsqueeze(-1).to(semantic.dtype)
+        visual_nodes, visual_attention = self._masked_visual_nodes(reason_pyramid, semantic, reason_factor_masks)
+        visual_nodes = visual_nodes * active.unsqueeze(-1).to(semantic.dtype)
         latent_logits = self.classifier(torch.cat((semantic, visual_nodes), dim=-1)).squeeze(-1)
         return {
             "reason_logits_latent": latent_logits,
@@ -117,7 +173,7 @@ class MOSAICICDORLatentReasonDecoder(nn.Module):
             "reason_escape_weight": escape_weight.squeeze(-1),
             "reason_factor_masks": reason_factor_masks,
             "reason_latent_visual_nodes": visual_nodes,
-            "reason_latent_visual_attention": visual["retrieval_attention"],
+            "reason_latent_visual_attention": visual_attention,
         }
 
 
