@@ -17,6 +17,22 @@ class ICDORProfileError(RuntimeError):
     """Raised when a runtime candidate lacks a complete real measurement."""
 
 
+def wall_clock_samples_per_second(
+    batch_size: int,
+    compute_seconds: Iterable[float],
+    data_wait_seconds: Iterable[float],
+) -> float:
+    """Return end-to-end throughput, including synchronous data loading."""
+    compute = list(compute_seconds)
+    wait = list(data_wait_seconds)
+    if batch_size < 1 or not compute or len(compute) != len(wait):
+        raise ICDORProfileError("wall-clock throughput requires aligned measured steps")
+    elapsed = sum(compute) + sum(wait)
+    if not math.isfinite(elapsed) or elapsed <= 0:
+        raise ICDORProfileError("wall-clock throughput observed invalid elapsed time")
+    return batch_size * len(compute) / elapsed
+
+
 def select_runtime_candidate(records: Iterable[Mapping[str, Any]], *, max_reserved_gb: float = 43.5) -> dict[str, Any]:
     """Select only a complete, stable real measurement under the reserved-memory cap."""
     accepted: list[dict[str, Any]] = []
@@ -168,7 +184,8 @@ def measure_real_phase_d(
         last_end = end
     sorted_steps = sorted(step_times)
     p95_index = min(len(sorted_steps) - 1, math.ceil(0.95 * len(sorted_steps)) - 1)
-    total = sum(step_times)
+    compute_only_throughput = batch_size * measured_steps / max(sum(step_times), 1e-9)
+    end_to_end_throughput = wall_clock_samples_per_second(batch_size, step_times, data_wait)
     return {
         "batch_size": batch_size,
         "grad_accum": grad_accum,
@@ -176,7 +193,9 @@ def measure_real_phase_d(
         "warmup_steps": warmup_steps,
         "measured_steps": measured_steps,
         "status": "PASS",
-        "samples_per_sec": batch_size * measured_steps / max(total, 1e-9),
+        "samples_per_sec": end_to_end_throughput,
+        "compute_only_samples_per_sec": compute_only_throughput,
+        "throughput_includes_data_wait": True,
         "step_p50_ms": 1000.0 * statistics.median(step_times),
         "step_p95_ms": 1000.0 * sorted_steps[p95_index],
         "cpu_data_wait_p50_ms": 1000.0 * statistics.median(data_wait),

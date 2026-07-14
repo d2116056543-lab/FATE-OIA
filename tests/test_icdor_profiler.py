@@ -6,7 +6,15 @@ from fate_oia.engine.profile_acpr_mosaic_trust_icdor import (
     ICDORProfileError,
     profile_runtime_candidates,
     select_runtime_candidate,
+    wall_clock_samples_per_second,
 )
+
+
+def test_wall_clock_throughput_penalizes_synchronous_data_wait() -> None:
+    fast_loader = wall_clock_samples_per_second(8, [1.0, 1.0], [0.01, 0.01])
+    blocked_loader = wall_clock_samples_per_second(8, [1.0, 1.0], [0.20, 0.20])
+    assert fast_loader > blocked_loader
+    assert fast_loader == pytest.approx(16.0 / 2.02)
 
 
 def test_profiler_selects_the_fastest_complete_measurement_under_reserved_limit() -> None:
