@@ -77,7 +77,7 @@ class MOSAICMaskedTargetRereader(nn.Module):
         )
         nodes = torch.einsum("bak,bakd->bad", weights, gathered_values)
         nodes = nodes * active.unsqueeze(-1).to(nodes.dtype)
-        full_attention = scores.new_zeros(scores.shape)
+        full_attention = weights.new_zeros(scores.shape)
         full_attention.scatter_(2, top_indices, weights)
         return nodes, full_attention.reshape(batch_size, self.action_count, height, width), active
 

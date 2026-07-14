@@ -46,7 +46,9 @@ class _CategorySparseCrossLayer(nn.Module):
             2, top_indices.unsqueeze(-1).expand(-1, -1, -1, values.shape[-1])
         )
         read = torch.einsum("bqk,bqkd->bqd", sparse_weights, gathered)
-        full_attention = logits.new_zeros(logits.shape)
+        # entmax may promote to fp32 inside bf16 autocast. Scatter must inherit
+        # the source weights dtype rather than the pre-entmax logits dtype.
+        full_attention = sparse_weights.new_zeros(logits.shape)
         full_attention.scatter_(2, top_indices, sparse_weights)
         return read, full_attention
 
