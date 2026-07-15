@@ -319,6 +319,14 @@ def test_foreground_launcher_has_non_circular_gate_order_and_exact_protocol() ->
     assert "Assert-ReviewPass" not in profile_block
     assert "--config" in profile_block and "--device" in profile_block
     assert "--pilot" in pilot_block and "--epochs" in pilot_block and '"6"' in pilot_block
+    expected_pilot_limits = {
+        "--max_train_samples": '"2048"',
+        "--max_audit_samples": '"512"',
+        "--max_calib_samples": '"512"',
+        "--max_test_samples": '"512"',
+    }
+    for option, value in expected_pilot_limits.items():
+        assert option in pilot_block and value in pilot_block
     assert "--write_review_pass" in pilot_block and "pilot_gate.json" in source
     assert "--final_remediation_plan" in pilot_block and "$FinalRemediationPlan" in pilot_block
     assert "--audit_addendum" in pilot_block and "$AuditAddendum" in pilot_block

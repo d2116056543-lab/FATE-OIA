@@ -37,6 +37,7 @@ class _Grounding:
 class _AuditModel(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
+        self.grad_enabled_during_forward: list[bool] = []
         self.action_router = SimpleNamespace(
             candidate_edge_mask=torch.ones(2, 2, 2, dtype=torch.bool),
             edge_admission_mask=torch.tensor(
@@ -48,6 +49,7 @@ class _AuditModel(torch.nn.Module):
         self.action_router.edge_admission_mask = mask.detach().clone()
 
     def forward(self, images: torch.Tensor, *, factor_ablation_mode: str = "full", **_) -> dict[str, torch.Tensor | dict[str, torch.Tensor]]:
+        self.grad_enabled_during_forward.append(torch.is_grad_enabled())
         probabilities = {
             "full": [[0.95, 0.05], [0.85, 0.10], [0.10, 0.80], [0.05, 0.90]],
             "content_only": [[0.90, 0.10], [0.75, 0.15], [0.15, 0.75], [0.10, 0.85]],
@@ -118,8 +120,9 @@ class ICDORAuditCollectorsTest(unittest.TestCase):
         self.assertEqual(record["counts"]["reliable_negative"], 1)
 
     def test_factor_collector_uses_real_ablations_grounding_views_and_bootstrap(self) -> None:
+        model = _AuditModel()
         result = collect_factor_audit(
-            _AuditModel(),
+            model,
             [_batch()],
             _Grounding(),
             factor_names=("f0", "f1"),
@@ -127,6 +130,9 @@ class ICDORAuditCollectorsTest(unittest.TestCase):
             bootstrap_replicates=64,
             bootstrap_seed=17,
         )
+
+        self.assertTrue(model.grad_enabled_during_forward)
+        self.assertFalse(any(model.grad_enabled_during_forward))
 
         self.assertEqual(result["source_split"], "train_audit")
         self.assertEqual(

@@ -87,6 +87,10 @@ switch ($Mode) {
             "--runtime_selection", $runtimePath,
             "--pilot",
             "--epochs", "6",
+            "--max_train_samples", "2048",
+            "--max_audit_samples", "512",
+            "--max_calib_samples", "512",
+            "--max_test_samples", "512",
             "--seed", "20260713",
             "--device", "cuda"
         )
