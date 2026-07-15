@@ -316,6 +316,23 @@ def compute_target_transfer_metrics(inputs: TargetTransferInputs) -> dict[str, A
         for target_index, target_id in enumerate(target_ids):
             if directions[factor_index][target_index] == "none":
                 continue
+            factor_arms = None if matched_control_arms is None else matched_control_arms[factor_index]
+            controls_available = (
+                factor_arms is not None
+                and random_by_arm is not None
+                and all(int(arm.get("available_sample_count", 0)) > 0 for arm in factor_arms)
+            )
+            if not controls_available:
+                per_target.append({
+                    "factor_id": factor_id, "target_id": target_id,
+                    "direction": directions[factor_index][target_index],
+                    "available": False, "unavailable_reason": "matched_controls_unavailable",
+                    "n": 0, "tet": None, "tes": None,
+                    "tes_identity": None, "tes_spatial": None,
+                    "cca": None, "ap_delta": None, "admitted": False,
+                    "matched_control_arms": factor_arms,
+                })
+                continue
             rows = [
                 sample_index
                 for sample_index in range(sample_count)
@@ -483,6 +500,7 @@ def collect_target_transfer_metrics(
     ]
     identity_factor_types = tuple(spec["factor_type"] for spec in factor_specs)
     identity_regions = tuple(spec["region"] for spec in factor_specs)
+    identity_factor_names = tuple(spec["factor"] for spec in factor_specs)
     probability_key = "action_final_logits" if target_kind == "action" else "reason_observed_logits"
     label_key = "action" if target_kind == "action" else "reason"
     visual_evidence: list[torch.Tensor] = []
@@ -534,6 +552,7 @@ def collect_target_transfer_metrics(
                     factor=spec["factor"], factor_type=spec["factor_type"], region=spec["region"],
                     identity_factor_types=identity_factor_types,
                     identity_regions=identity_regions,
+                    identity_factor_names=identity_factor_names,
                 )
                 for arm_index, rows in enumerate(arm_rows):
                     control_records[factor_index][arm_index].extend(rows)
@@ -614,6 +633,7 @@ def collect_joint_target_transfer_metrics(
     ]
     identity_factor_types = tuple(spec["factor_type"] for spec in factor_specs)
     identity_regions = tuple(spec["region"] for spec in factor_specs)
+    identity_factor_names = tuple(spec["factor"] for spec in factor_specs)
     target_ids = tuple(f"action:{name}" for name in action_ids) + tuple(f"reason:{name}" for name in reason_ids)
     directions = tuple(
         tuple(action_directions[factor]) + tuple(reason_directions[factor])
@@ -672,6 +692,7 @@ def collect_joint_target_transfer_metrics(
                     factor=spec["factor"], factor_type=spec["factor_type"], region=spec["region"],
                     identity_factor_types=identity_factor_types,
                     identity_regions=identity_regions,
+                    identity_factor_names=identity_factor_names,
                 )
                 for arm_index, rows in enumerate(arm_rows):
                     control_records[factor_index][arm_index].extend(rows)

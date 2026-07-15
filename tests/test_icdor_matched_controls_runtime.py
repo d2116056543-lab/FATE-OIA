@@ -101,6 +101,9 @@ def test_edge_and_transfer_abstain_without_same_type_identity_control() -> None:
     )["edge_stats"]["support:signal->brake"]
     assert all(arm["available_sample_count"] == 0 for arm in edge["matched_control_arms"])
     assert all(arm["control_type"] == "unavailable_noop" for arm in edge["matched_control_arms"])
+    assert edge["available"] is False
+    assert edge["metrics"] is None
+    assert edge["bootstrap_lcb95"] is None
 
     transfer_model = _RuntimeControlModel()
     transfer = collect_joint_target_transfer_metrics(
@@ -146,7 +149,7 @@ def test_transfer_abstains_when_dense_mask_cannot_form_four_controls() -> None:
 
     assert transfer["summary"]["available_pair_count"] == 0
     assert transfer["per_target"][0]["available"] is False
-    assert transfer["per_target"][0]["unavailable_reason"] == "insufficient_matched_control_rows"
+    assert transfer["per_target"][0]["unavailable_reason"] == "matched_controls_unavailable"
     assert transfer["per_target"][0]["tes"] is None
 
 
@@ -216,6 +219,11 @@ def test_joint_transfer_batches_factor_and_control_interventions() -> None:
     assert transfer["collection_runtime"]["intervention_chunk_size"] == 4
     arm_types = [arm["control_type"] for arm in transfer["per_target"][0]["matched_control_arms"]]
     assert arm_types == ["same_type_identity", "spatial_roll", "spatial_roll", "spatial_roll"]
+    identity_arm, *spatial_arms = transfer["per_target"][0]["matched_control_arms"]
+    assert identity_arm["identity_source_factor_indices"] == [1]
+    assert identity_arm["identity_source_factor_types"] == ["point"]
+    assert identity_arm["identity_source_regions"] == ["upper_front"]
+    assert all(arm["spatial_offsets"] for arm in spatial_arms)
 
     sequential_model = TwoFactorControlModel()
     sequential = collect_joint_target_transfer_metrics(

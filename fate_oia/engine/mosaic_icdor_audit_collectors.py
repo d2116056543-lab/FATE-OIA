@@ -18,6 +18,7 @@ def build_matched_factor_controls(
     selected_factor_type: str,
     selected_region: str,
     identity_masks: torch.Tensor | None = None,
+    identity_names: Sequence[str] = (),
     identity_types: Sequence[str] = (),
     identity_regions: Sequence[str] = (),
     region_mask: torch.Tensor | None = None,
@@ -43,7 +44,7 @@ def build_matched_factor_controls(
     seen: set[tuple[str, bytes]] = set()
     occupied = selected.clone()
 
-    def add(mask: torch.Tensor, control_type: str) -> None:
+    def add(mask: torch.Tensor, control_type: str, **provenance: Any) -> None:
         nonlocal occupied
         mask = mask.bool() & eligible & ~occupied
         if int(mask.sum()) != mass:
@@ -58,6 +59,7 @@ def build_matched_factor_controls(
             "mask": mask, "mask_sum": float(mask.sum()), "overlap": float((mask & selected).sum()),
             "mass_error": abs(float(mask.sum()) - mass) / mass,
             "factor_type": selected_factor_type, "region": selected_region,
+            **provenance,
         })
 
     # Prefer genuine identity-matched controls before synthetic spatial arms so
@@ -65,7 +67,13 @@ def build_matched_factor_controls(
     if identity_masks is not None:
         if identity_masks.ndim == 4 and identity_masks.shape[1] == 1:
             identity_masks = identity_masks[:, 0]
-        if identity_masks.ndim != 3 or identity_masks.shape[1:] != selected.shape[1:] or len(identity_types) != identity_masks.shape[0] or len(identity_regions) != identity_masks.shape[0]:
+        if (
+            identity_masks.ndim != 3
+            or identity_masks.shape[1:] != selected.shape[1:]
+            or len(identity_names) != identity_masks.shape[0]
+            or len(identity_types) != identity_masks.shape[0]
+            or len(identity_regions) != identity_masks.shape[0]
+        ):
             raise ValueError("IC-DOR identity control metadata must align with [N,H,W] masks")
         for index, mask in enumerate(identity_masks):
             if identity_types[index] == selected_factor_type and identity_regions[index] == selected_region:
@@ -77,7 +85,13 @@ def build_matched_factor_controls(
                 chosen = torch.topk(flat_scores, k=mass, largest=True, sorted=False).indices
                 identity = torch.zeros_like(flat_scores, dtype=torch.bool)
                 identity[chosen] = True
-                add(identity.reshape_as(selected), "same_type_identity")
+                add(
+                    identity.reshape_as(selected), "same_type_identity",
+                    identity_source_factor_index=index,
+                    identity_source_factor_name=str(identity_names[index]),
+                    identity_source_factor_type=str(identity_types[index]),
+                    identity_source_region=str(identity_regions[index]),
+                )
                 if any(control["control_type"] == "same_type_identity" for control in controls):
                     break
     # Cyclic shifts preserve exact mass. Enumerating offsets lets irregular masks
@@ -86,7 +100,10 @@ def build_matched_factor_controls(
     for vertical in range(height):
         for horizontal in range(width):
             if vertical or horizontal:
-                add(torch.roll(selected, shifts=(vertical, horizontal), dims=(-2, -1)), "spatial_roll")
+                add(
+                    torch.roll(selected, shifts=(vertical, horizontal), dims=(-2, -1)),
+                    "spatial_roll", spatial_offset=[vertical, horizontal],
+                )
     if len(controls) < min_controls:
         raise ValueError("IC-DOR matched controls require at least four non-overlapping equal-mass arms")
     return controls
@@ -135,6 +152,7 @@ def build_batch_matched_factor_control_overrides(
     region: str,
     identity_factor_types: Sequence[str] = (),
     identity_regions: Sequence[str] = (),
+    identity_factor_names: Sequence[str] = (),
     arm_count: int = 4,
 ) -> tuple[list[torch.Tensor], list[list[dict[str, Any]]]]:
     """Build four batch-local, same-factor spatial intervention masks.
@@ -180,6 +198,7 @@ def build_batch_matched_factor_control_overrides(
                 selected_factor_type=factor_type,
                 selected_region=region,
                 identity_masks=factor_masks[sample_index],
+                identity_names=identity_factor_names,
                 identity_types=identity_factor_types,
                 identity_regions=identity_regions,
                 region_mask=region_mask,
@@ -226,6 +245,14 @@ def build_batch_matched_factor_control_overrides(
                 "control_mass": control_mass,
                 "mass_error": mass_error,
                 "overlap": 0.0,
+                **{
+                    key: control[key]
+                    for key in (
+                        "identity_source_factor_index", "identity_source_factor_name",
+                        "identity_source_factor_type", "identity_source_region", "spatial_offset",
+                    )
+                    if key in control
+                },
             })
     return overrides, arm_records
 
@@ -253,6 +280,11 @@ def summarize_matched_control_arms(arm_records: Sequence[Sequence[Mapping[str, A
                 "selected_mass_total": 0.0,
                 "control_mass_total": 0.0,
                 "unavailable_reason": str(first.get("unavailable_reason", "insufficient_matched_controls")),
+                "identity_source_factor_indices": [],
+                "identity_source_factor_names": [],
+                "identity_source_factor_types": [],
+                "identity_source_regions": [],
+                "spatial_offsets": [],
             })
             continue
         first = available[0]
@@ -265,10 +297,30 @@ def summarize_matched_control_arms(arm_records: Sequence[Sequence[Mapping[str, A
             "control_type": str(first["control_type"]),
             "sample_count": len(records),
             "available_sample_count": sum(bool(record.get("available", True)) for record in records),
-            "max_mass_error": max(float(record["mass_error"]) for record in records),
-            "max_overlap": max(float(record["overlap"]) for record in records),
-            "selected_mass_total": sum(float(record["selected_mass"]) for record in records),
-            "control_mass_total": sum(float(record["control_mass"]) for record in records),
+            "max_mass_error": max(float(record["mass_error"]) for record in available),
+            "max_overlap": max(float(record["overlap"]) for record in available),
+            "selected_mass_total": sum(float(record["selected_mass"]) for record in available),
+            "control_mass_total": sum(float(record["control_mass"]) for record in available),
+            "identity_source_factor_indices": sorted({
+                int(record["identity_source_factor_index"])
+                for record in available if "identity_source_factor_index" in record
+            }),
+            "identity_source_factor_names": sorted({
+                str(record["identity_source_factor_name"])
+                for record in available if "identity_source_factor_name" in record
+            }),
+            "identity_source_factor_types": sorted({
+                str(record["identity_source_factor_type"])
+                for record in available if "identity_source_factor_type" in record
+            }),
+            "identity_source_regions": sorted({
+                str(record["identity_source_region"])
+                for record in available if "identity_source_region" in record
+            }),
+            "spatial_offsets": sorted({
+                tuple(int(value) for value in record["spatial_offset"])
+                for record in available if "spatial_offset" in record
+            }),
         })
     return summaries
 
@@ -532,6 +584,8 @@ def collect_factor_audit(
     values = {key: torch.cat(items, dim=0) for key, items in collected.items()}
     generator = torch.Generator().manual_seed(bootstrap_seed)
     factor_stats: dict[str, dict[str, Any]] = {}
+    unknown_rows_total = 0
+    unknown_rows_in_metric_total = 0
     for column, name in enumerate(factor_names):
         target, known, weak = values["target"][:, column], values["known"][:, column], values["weak"][:, column]
         reliable_negative = known & (target <= 0.5)
@@ -559,6 +613,9 @@ def collect_factor_audit(
             metric_rows = torch.zeros_like(confirmed_positive)
             target_metric = confirmed_positive[metric_rows]
             score_full = score_prior = score_content = score_query = score_image = None
+        unknown_rows = ~known & ~weak
+        unknown_rows_total += int(unknown_rows.sum())
+        unknown_rows_in_metric_total += int((unknown_rows & metric_rows).sum())
         grounding_delta = _grounding_delta(values["full_mask"][:, column], values["geometry"][:, column], geometry_valid, generator)
         mask_difference = (values["full_mask"][:, column] - values["view_mask"][:, column]).abs()
         view_consistency = float((1.0 - mask_difference.mean()).clamp(0.0, 1.0))
@@ -594,7 +651,7 @@ def collect_factor_audit(
                 "confirmed_positive": int(confirmed_positive.sum()),
                 "reliable_negative": int(reliable_negative.sum()),
                 "weak_negative": int((weak & ~known).sum()),
-                "unknown": int((~known & ~weak).sum()),
+                "unknown": int(unknown_rows.sum()),
                 "geometry_valid": int(geometry_valid.sum()),
             },
             "scores": {
@@ -613,11 +670,20 @@ def collect_factor_audit(
             "prototype": {"effective_count": effective, "dominant_rate": dominant, "dead_count": dead},
             "bootstrap_lcb95": {key: (_quantile(samples, 0.05) if samples else None) for key, samples in replicate.items()},
         }
+    if unknown_rows_in_metric_total != 0:
+        raise RuntimeError("IC-DOR factor audit leaked unknown rows into binary metrics")
     return {
         "source_split": "train_audit",
         "row_count": int(values["target"].shape[0]),
         "factor_count": len(factor_stats),
         "factor_stats": factor_stats,
+        "audit_integrity": {
+            "collector_completed": True,
+            "exception": None,
+            "unknown_policy": "excluded_from_binary_metrics",
+            "unknown_rows_total": unknown_rows_total,
+            "unknown_rows_in_metric_total": unknown_rows_in_metric_total,
+        },
     }
 
 
@@ -742,10 +808,13 @@ def collect_edge_intervention_audit(
     ]
     identity_factor_types = tuple(spec["factor_type"] for spec in identity_specs)
     identity_regions = tuple(spec["region"] for spec in identity_specs)
+    identity_factor_names = tuple(spec["factor"] for spec in identity_specs)
+    saw_batch = False
     was_training = model.training
     model.eval()
     try:
         for batch in loader:
+            saw_batch = True
             if not isinstance(batch, Mapping):
                 raise ValueError("IC-DOR audit loader must yield mapping batches")
             splits = _split_values(batch)
@@ -773,39 +842,63 @@ def collect_edge_intervention_audit(
                     region=factor_spec["region"],
                     identity_factor_types=identity_factor_types,
                     identity_regions=identity_regions,
+                    identity_factor_names=identity_factor_names,
                 )
                 for arm_index, rows in enumerate(arm_rows):
                     control_records[key][arm_index].extend(rows)
+                common_available = torch.tensor(
+                    [
+                        all(bool(arm_rows[arm][sample].get("available")) for arm in range(4))
+                        for sample in range(images.shape[0])
+                    ],
+                    dtype=torch.bool,
+                )
                 arm_outputs = []
                 for override in overrides:
                     output = _forward(model, images, "full", {**kwargs, "factor_mask_override": override})
                     action_logits = output.get("action_final_logits", output.get("action_logits_raw"))
                     if not isinstance(action_logits, torch.Tensor) or action_logits.shape != labels.shape:
                         raise ValueError("IC-DOR edge audit forward requires action_final_logits [batch, action]")
-                    arm_outputs.append(action_logits[:, action_id].detach().float().cpu())
+                    arm_outputs.append(action_logits[:, action_id].detach().float().cpu()[common_available])
                 action_logits = on_output.get("action_final_logits", on_output.get("action_logits_raw"))
                 if not isinstance(action_logits, torch.Tensor) or action_logits.shape != labels.shape:
                     raise ValueError("IC-DOR edge audit forward requires action_final_logits [batch, action]")
-                logits[key]["on"].append(action_logits[:, action_id].detach().float().cpu())
+                if not bool(common_available.any()):
+                    continue
+                logits[key]["on"].append(action_logits[:, action_id].detach().float().cpu()[common_available])
                 setter(off.to(device=device, dtype=torch.bool))
                 output = _forward(model, images, "full", kwargs)
                 action_logits = output.get("action_final_logits", output.get("action_logits_raw"))
                 if not isinstance(action_logits, torch.Tensor) or action_logits.shape != labels.shape:
                     raise ValueError("IC-DOR edge audit forward requires action_final_logits [batch, action]")
-                logits[key]["off"].append(action_logits[:, action_id].detach().float().cpu())
+                logits[key]["off"].append(action_logits[:, action_id].detach().float().cpu()[common_available])
                 logits[key]["random"].append(torch.stack(arm_outputs, dim=0).mean(dim=0))
                 logits[key]["random_identity"].append(arm_outputs[0])
                 logits[key]["random_spatial"].append(torch.stack(arm_outputs[1:], dim=0).mean(dim=0))
-                logits[key]["labels"].append(labels[:, action_id].detach().float().cpu())
+                logits[key]["labels"].append(labels[:, action_id].detach().float().cpu()[common_available])
     finally:
         setter(base)
         model.train(was_training)
-    if not any(values["labels"] for values in logits.values()):
+    if not saw_batch:
         raise ValueError("IC-DOR edge audit loader produced no train_audit observations")
     generator = torch.Generator().manual_seed(bootstrap_seed)
     edge_stats: dict[str, dict[str, Any]] = {}
     for spec, *_ in plans:
         key = _edge_key(spec)
+        if not logits[key]["labels"]:
+            edge_stats[key] = {
+                "factor": str(spec["factor"]), "action": str(spec["action"]),
+                "direction": str(spec["direction"]), "polarity": str(spec["polarity"]),
+                "available": False,
+                "unavailable_reason": "insufficient_matched_control_rows",
+                "matched_counts": {
+                    "factor_on": 0, "factor_off": 0, "equal_mass_random": 0,
+                    "same_type_identity": 0, "spatial_roll": 0,
+                },
+                "matched_control_arms": summarize_matched_control_arms(control_records[key]),
+                "metrics": None, "bootstrap_ci95": None, "bootstrap_lcb95": None,
+            }
+            continue
         values = {name: torch.cat(rows, dim=0) for name, rows in logits[key].items()}
         metrics = _edge_metrics(
             values["on"], values["off"], values["random"], values["labels"],
@@ -837,6 +930,7 @@ def collect_edge_intervention_audit(
                 "spatial_roll": int(values["random_spatial"].numel()),
             },
             "matched_control_arms": summarize_matched_control_arms(control_records[key]),
+            "available": True,
             "metrics": metrics,
             "bootstrap_ci95": intervals,
             "bootstrap_lcb95": {name: interval["lower"] for name, interval in intervals.items()},

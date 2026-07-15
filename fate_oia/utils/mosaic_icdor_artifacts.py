@@ -189,6 +189,53 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
+def _matched_control_provenance_valid(arms: Any) -> bool:
+    if not isinstance(arms, list) or len(arms) < 4:
+        return False
+    identity = [arm for arm in arms if arm.get("control_type") == "same_type_identity"]
+    spatial = [arm for arm in arms if arm.get("control_type") == "spatial_roll"]
+    if len(identity) != 1 or len(spatial) < 3:
+        return False
+    if any(int(arm.get("available_sample_count", 0)) <= 0 for arm in arms):
+        return False
+    identity_arm = identity[0]
+    identity_names = identity_arm.get("identity_source_factor_names")
+    identity_types = identity_arm.get("identity_source_factor_types")
+    identity_regions = identity_arm.get("identity_source_regions")
+    selected_type = identity_arm.get("factor_type")
+    selected_region = identity_arm.get("region")
+    if (
+        not isinstance(identity_names, list) or not identity_names
+        or not isinstance(identity_types, list) or len(identity_types) != len(identity_names)
+        or not isinstance(identity_regions, list) or len(identity_regions) != len(identity_names)
+        or not selected_type or not selected_region
+        or any(value != selected_type for value in identity_types)
+        or any(value != selected_region for value in identity_regions)
+    ):
+        return False
+    for arm in spatial:
+        offsets = arm.get("spatial_offsets")
+        if not isinstance(offsets, list) or not offsets:
+            return False
+        if any(
+            not isinstance(offset, (list, tuple))
+            or len(offset) != 2
+            or not all(isinstance(value, int) for value in offset)
+            or tuple(offset) == (0, 0)
+            for offset in offsets
+        ):
+            return False
+        if arm.get("factor_type") != selected_type or arm.get("region") != selected_region:
+            return False
+    return all(
+        arm.get("max_mass_error") is not None
+        and float(arm["max_mass_error"]) <= 0.05
+        and arm.get("max_overlap") is not None
+        and float(arm["max_overlap"]) == 0.0
+        for arm in arms
+    )
+
+
 def validate_icdor_artifact_schema(
     output_dir: str | Path,
     *,
@@ -238,6 +285,21 @@ def validate_icdor_artifact_schema(
     edge_admission = json.loads((output / "edge_admission.json").read_text(encoding="utf-8"))
     if certificate.get("source_split") != "train_audit" or edge_admission.get("source_split") != "train_audit":
         errors.append("certificate and edge admission must be train_audit-only")
+    for name, entry in (edge_admission.get("entries") or {}).items():
+        if not isinstance(entry, dict) or entry.get("accepted") is not True:
+            continue
+        metrics = entry.get("metrics")
+        if (
+            not isinstance(metrics, dict)
+            or float(metrics.get("tes_identity_lcb95", 0.0)) <= 0.0
+            or float(metrics.get("tes_spatial_lcb95", 0.0)) <= 0.0
+        ):
+            errors.append(f"accepted edge {name} lacks positive identity/spatial intervention LCBs")
+    schedule_rows = _read_jsonl(output / "adaptive_schedule.jsonl")
+    schedule_by_epoch = {
+        int(row["epoch"]): row for row in schedule_rows
+        if isinstance(row.get("epoch"), int)
+    }
     for epoch in epochs:
         epoch_dir = output / f"epoch_{epoch:03d}"
         metrics = json.loads((epoch_dir / "metrics_summary.json").read_text(encoding="utf-8"))
@@ -251,23 +313,51 @@ def validate_icdor_artifact_schema(
         calibration_rows = _read_jsonl(epoch_dir / "calibration_stats.jsonl")
         if any(row.get("source_split") != "train_calib" for row in calibration_rows):
             errors.append(f"epoch_{epoch:03d} calibration uses a non-train_calib source")
+        reason_rows = _read_jsonl(epoch_dir / "reason_dual_observation_stats.jsonl")
+        hidden_rows = [row for row in reason_rows if row.get("audit") == "hidden_recovery"]
+        hidden_grid = {
+            (row.get("mode"), float(row.get("hide_fraction", -1.0)))
+            for row in hidden_rows
+            if row.get("source_split") == "train_audit" and row.get("evaluation_only") is True
+        }
+        expected_hidden_grid = {
+            (mode, fraction)
+            for mode in ("mcar", "mar", "mnar")
+            for fraction in (0.10, 0.30, 0.50)
+        }
+        if hidden_grid != expected_hidden_grid or len(hidden_rows) != len(expected_hidden_grid):
+            errors.append(f"epoch_{epoch:03d} hidden recovery lacks the leakage-free 10/30/50 audit grid")
         transfer = json.loads((epoch_dir / "target_transfer_summary.json").read_text(encoding="utf-8"))
-        if (
-            transfer.get("available") is not True
-            or transfer.get("source_split") != "train_audit"
-            or transfer.get("schema_version") != "mosaic_target_transfer.v1"
-            or int(transfer.get("pair_count", transfer.get("target_count", 0))) <= 0
-        ):
-            errors.append(f"epoch_{epoch:03d} target transfer is unavailable or not a real train_audit measurement")
         transfer_rows = _read_jsonl(epoch_dir / "target_transfer_stats.jsonl")
         transfer_fields = {"factor_id", "target_id", "tet", "tes", "cca", "ap_delta"}
-        if not transfer_rows or any(
-            row.get("available") is not True
-            or row.get("source_split") != "train_audit"
-            or not transfer_fields <= set(row)
-            for row in transfer_rows
-        ):
-            errors.append(f"epoch_{epoch:03d} target transfer rows are incomplete")
+        state_before = schedule_by_epoch.get(epoch, {}).get("state_before")
+        if state_before == "FOUNDATION":
+            if (
+                transfer.get("available") is not False
+                or transfer.get("source_split") != "train_audit"
+                or transfer.get("reason") != "interventions_disabled_in_foundation"
+                or len(transfer_rows) != 1
+                or transfer_rows[0].get("available") is not False
+            ):
+                errors.append(f"epoch_{epoch:03d} foundation target transfer did not abstain honestly")
+        else:
+            if (
+                transfer.get("available") is not True
+                or transfer.get("source_split") != "train_audit"
+                or transfer.get("schema_version") != "mosaic_target_transfer.v2"
+                or int(transfer.get("pair_count", transfer.get("target_count", 0))) <= 0
+            ):
+                errors.append(f"epoch_{epoch:03d} target transfer is unavailable or not a real train_audit measurement")
+            if not transfer_rows or any(
+                row.get("available") is not True
+                or row.get("source_split") != "train_audit"
+                or not transfer_fields <= set(row)
+                or row.get("tes_identity") is None
+                or row.get("tes_spatial") is None
+                or not _matched_control_provenance_valid(row.get("matched_control_arms"))
+                for row in transfer_rows
+            ):
+                errors.append(f"epoch_{epoch:03d} target transfer rows are incomplete")
         visual = json.loads((epoch_dir / "visual_audit_manifest.json").read_text(encoding="utf-8"))
         samples = visual.get("samples")
         if (

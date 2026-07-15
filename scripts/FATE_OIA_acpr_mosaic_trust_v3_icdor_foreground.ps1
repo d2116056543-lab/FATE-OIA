@@ -3,7 +3,9 @@ param(
     [ValidateSet("audit", "profile", "pilot", "full")]
     [string]$Mode = "full",
     [string]$Config = "configs\fate_oia_train_360x640_acpr_mosaic_trust_v3_icdor.yaml",
-    [string]$Python = "E:\Anaconda\envs\damo39\python.exe"
+    [string]$Python = "E:\Anaconda\envs\damo39\python.exe",
+    [string]$FinalRemediationPlan = "E:\sbw\FATE_Drive\Codex_MOSAIC_TRUST_V3_IC_DOR_Final_Remediation_20260714.md",
+    [string]$AuditAddendum = "E:\sbw\FATE_Drive\MOSAIC_TRUST_V3_IC_DOR_Final_Audit_Addendum_20260714.md"
 )
 
 Set-StrictMode -Version Latest
@@ -33,6 +35,14 @@ function Assert-ReviewPass {
     if ($RuntimePath) {
         $runtimeHash = Get-Sha256 $RuntimePath
         if ($review.runtime_selection_sha256 -ne $runtimeHash) { throw "REVIEW_PASS runtime hash mismatch" }
+    }
+    foreach ($evidenceName in @("pilot_gate", "factor_certificate", "edge_admission", "final_remediation_plan", "audit_addendum")) {
+        $property = $review.evidence_files.PSObject.Properties[$evidenceName]
+        if ($null -eq $property) { throw "REVIEW_PASS $evidenceName binding is missing" }
+        $binding = $property.Value
+        if (-not $binding.path -or -not $binding.sha256) { throw "REVIEW_PASS $evidenceName binding is incomplete" }
+        $actualHash = Get-Sha256 ([string]$binding.path)
+        if ($actualHash -ne $binding.sha256) { throw "REVIEW_PASS $evidenceName evidence hash mismatch" }
     }
     foreach ($property in $review.gates.PSObject.Properties) {
         if ($property.Value -ne "PASS") { throw "REVIEW_PASS gate $($property.Name) is not PASS" }
@@ -76,7 +86,7 @@ switch ($Mode) {
             "--output_dir", $pilotDir,
             "--runtime_selection", $runtimePath,
             "--pilot",
-            "--epochs", "4",
+            "--epochs", "6",
             "--seed", "20260713",
             "--device", "cuda"
         )
@@ -87,6 +97,8 @@ switch ($Mode) {
             "--output_dir", ".review",
             "--runtime_selection", $runtimePath,
             "--pilot_gate", $pilotGate,
+            "--final_remediation_plan", $FinalRemediationPlan,
+            "--audit_addendum", $AuditAddendum,
             "--write_review_pass",
             "--fail_closed",
             "--device", "cuda"

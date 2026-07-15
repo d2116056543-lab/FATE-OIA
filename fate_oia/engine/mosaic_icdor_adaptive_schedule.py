@@ -66,6 +66,8 @@ class ICDORAdaptiveSchedule:
         self.failure_reason: str | None = None
         self.full_train_eligible = False
         self.safe_joint_epochs = 0
+        self.best_train_audit_joint: float | None = None
+        self.safe_joint_entry_exp_map: float | None = None
         self.last_readiness: dict[str, dict[str, Any]] = {}
         self.history: list[dict[str, Any]] = []
 
@@ -89,6 +91,21 @@ class ICDORAdaptiveSchedule:
         """Track the state that actually controlled an optimizer epoch."""
         if self.state == "SAFE_JOINT":
             self.safe_joint_epochs += 1
+
+    def record_train_audit_reference(
+        self, *, joint: float, exp_map: float, entered_safe_joint: bool
+    ) -> None:
+        """Persist train-audit comparison anchors across checkpoint resume."""
+        joint_value = float(joint)
+        exp_value = float(exp_map)
+        if not self._finite(joint_value) or not self._finite(exp_value):
+            raise ValueError("train-audit reference metrics must be finite")
+        self.best_train_audit_joint = (
+            joint_value if self.best_train_audit_joint is None
+            else max(self.best_train_audit_joint, joint_value)
+        )
+        if entered_safe_joint:
+            self.safe_joint_entry_exp_map = exp_value
 
     def fail_closed(self, reason: str) -> None:
         if not reason:
@@ -153,6 +170,13 @@ class ICDORAdaptiveSchedule:
             return self._safe_ready(metrics)
         return True
 
+    @staticmethod
+    def _split_ready(metrics: dict[str, Any], expected_split: str) -> bool:
+        return (
+            metrics.get("source_split") == expected_split
+            and metrics.get("finite") is True
+        )
+
     def _transition(self) -> None:
         index = STATES.index(self.state)
         if index + 1 >= len(STATES):
@@ -189,7 +213,11 @@ class ICDORAdaptiveSchedule:
         previous = self.state
         state_epochs_before = self.state_epochs
         self.state_epochs += 1
-        ready = self._ready(train_audit_metrics)
+        ready = (
+            self._ready(train_audit_metrics)
+            and self._split_ready(readiness["train_core"], "train_core")
+            and self._split_ready(readiness["train_calib"], "train_calib")
+        )
         self.consecutive_ready = self.consecutive_ready + 1 if ready else 0
         minimum, maximum = self.LIMITS[self.state]
 
@@ -232,6 +260,8 @@ class ICDORAdaptiveSchedule:
             "failure_reason": self.failure_reason,
             "full_train_eligible": self.full_train_eligible,
             "safe_joint_epochs": self.safe_joint_epochs,
+            "best_train_audit_joint": self.best_train_audit_joint,
+            "safe_joint_entry_exp_map": self.safe_joint_entry_exp_map,
             "last_readiness": dict(self.last_readiness),
             "history": list(self.history),
         }
@@ -242,6 +272,6 @@ class ICDORAdaptiveSchedule:
         for key in (
             "state", "state_epochs", "consecutive_ready", "no_improvement_epochs",
             "failed_closed", "failure_reason", "full_train_eligible", "safe_joint_epochs",
-            "last_readiness", "history",
+            "best_train_audit_joint", "safe_joint_entry_exp_map", "last_readiness", "history",
         ):
             setattr(self, key, payload[key])

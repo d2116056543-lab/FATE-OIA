@@ -1,20 +1,27 @@
 from __future__ import annotations
 
 from pathlib import Path
+import hashlib
 
 import pytest
 import torch
 from torch import nn
 
 from fate_oia.engine.train_acpr_mosaic_trust_icdor import (
+    _certificate_readiness_metrics,
     _edge_statistics_from_audit,
+    _edge_and_branch_readiness_metrics,
+    _factor_audit_integrity_metrics,
     _factor_audit_rows,
     _build_rank_queues,
     _load_resume,
     _pending_evidence_document,
+    _pilot_semantic_validation,
     _restore_phase_trainability,
     _save_checkpoint,
     _target_transfer_directions,
+    _validate_review_evidence_bindings,
+    _write_provisional_certificate_this_epoch,
     apply_icdor_consolidation,
     apply_icdor_factor_branch_freeze,
     build_icdor_parameter_ownership,
@@ -37,6 +44,52 @@ def test_full_cli_cannot_bypass_review_pass() -> None:
     source = Path("fate_oia/engine/train_acpr_mosaic_trust_icdor.py").read_text(encoding="utf-8")
     assert "if not args.pilot and not args.require_review_pass" in source
     assert "full training requires --require_review_pass" in source
+
+
+def test_full_cli_rejects_review_pass_bound_to_a_different_split() -> None:
+    source = Path("fate_oia/engine/train_acpr_mosaic_trust_icdor.py").read_text(encoding="utf-8")
+    assert 'review_payload.get("split_sha256") != split_stats["split_sha256"]' in source
+    assert "REVIEW_PASS split hash mismatch" in source
+
+
+def test_review_pass_rehashes_ignored_pilot_evidence_before_launch(tmp_path: Path) -> None:
+    paths = {
+        name: tmp_path / file_name
+        for name, file_name in {
+            "pilot_gate": "pilot_gate.json",
+            "factor_certificate": "factor_certificate.json",
+            "edge_admission": "edge_admission.json",
+            "final_remediation_plan": "final_remediation.md",
+            "audit_addendum": "audit_addendum.md",
+        }.items()
+    }
+    for name, path in paths.items():
+        path.write_text(f'{{"artifact":"{name}"}}\n', encoding="utf-8")
+    payload = {
+        "evidence_files": {
+            name: {
+                "path": str(path),
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest().upper(),
+            }
+            for name, path in paths.items()
+        }
+    }
+    _validate_review_evidence_bindings(payload)
+
+    for name, path in paths.items():
+        original = path.read_bytes()
+        path.write_bytes(original + b"tampered")
+        with pytest.raises(RuntimeError, match=name):
+            _validate_review_evidence_bindings(payload)
+        path.write_bytes(original)
+
+
+def test_split_hash_is_checked_only_after_split_manifest_is_built() -> None:
+    source = Path("fate_oia/engine/train_acpr_mosaic_trust_icdor.py").read_text(encoding="utf-8")
+    main_index = source.index("def main")
+    loaders_index = source.index("build_icdor_loaders(", main_index)
+    split_check_index = source.index('review_payload.get("split_sha256")', main_index)
+    assert loaders_index < split_check_index
 
 
 def test_checkpoint_persists_all_rng_state_for_resume() -> None:
@@ -189,6 +242,7 @@ def test_edge_audit_adapter_preserves_real_lcb_and_ap_values() -> None:
                 "factor": "f0",
                 "action": "stop",
                 "direction": "support",
+                "available": True,
                 "metrics": {"cca": 0.75, "isolated_edge_ap": 0.81, "visual_ap": 0.80},
                 "bootstrap_lcb95": {
                     "signed_effect": 0.02, "tet": 0.03, "tes": 0.01,
@@ -264,11 +318,16 @@ def test_foreground_launcher_has_non_circular_gate_order_and_exact_protocol() ->
     full_block = source.split('"full" {', 1)[1]
     assert "Assert-ReviewPass" not in profile_block
     assert "--config" in profile_block and "--device" in profile_block
-    assert "--pilot" in pilot_block and "--epochs" in pilot_block and '"4"' in pilot_block
+    assert "--pilot" in pilot_block and "--epochs" in pilot_block and '"6"' in pilot_block
     assert "--write_review_pass" in pilot_block and "pilot_gate.json" in source
+    assert "--final_remediation_plan" in pilot_block and "$FinalRemediationPlan" in pilot_block
+    assert "--audit_addendum" in pilot_block and "$AuditAddendum" in pilot_block
     assert "Assert-ReviewPass" in full_block
     assert "--require_review_pass" in full_block
     assert "--runtime_selection" in full_block
+    for evidence_name in ("pilot_gate", "factor_certificate", "edge_admission", "final_remediation_plan", "audit_addendum"):
+        assert evidence_name in full_block or evidence_name in source[source.index("function Assert-ReviewPass"):source.index("function Invoke-ForegroundPython")]
+    assert "evidence hash mismatch" in source
 
 
 def test_rank_queues_are_constructed_on_the_requested_device() -> None:
@@ -286,6 +345,231 @@ def test_target_transfer_directions_do_not_invent_unauthorized_edges() -> None:
     assert {value for row in reason for value in row} <= {"support", "veto", "none"}
     assert any(value == "none" for row in action for value in row)
     assert any(value == "none" for row in reason for value in row)
+
+
+def test_foundation_rebuilds_provisional_certificate_until_policy_freezes_it() -> None:
+    assert _write_provisional_certificate_this_epoch(
+        write_provisional=True, freeze_certificate=False
+    ) is True
+    assert _write_provisional_certificate_this_epoch(
+        write_provisional=False, freeze_certificate=True
+    ) is False
+    assert _write_provisional_certificate_this_epoch(
+        write_provisional=False, freeze_certificate=False
+    ) is False
+
+
+def test_certificate_readiness_is_derived_from_real_tiers_and_routes() -> None:
+    ontology = {
+        "action_names": ["forward", "stop", "left", "right"],
+        "action_routes": {
+            "forward": {"support": [{"factor": "f0"}], "veto": []},
+            "stop": {"support": [{"factor": "f1"}], "veto": []},
+            "left": {"support": [{"factor": "f2"}], "veto": []},
+            "right": {"support": [{"factor": "f3"}], "veto": []},
+        },
+        "reason_routes": {
+            0: {"direct_factors": ["f0"], "latent_factors": [], "contradiction_factors": []},
+            1: {"direct_factors": [], "latent_factors": ["f4"], "contradiction_factors": []},
+            2: {"direct_factors": ["f5"], "latent_factors": [], "contradiction_factors": []},
+        },
+    }
+    certificate = {
+        "entries": {
+            "f0": {"tier": "certified"},
+            "f1": {"tier": "certified"},
+            "f2": {"tier": "abstained"},
+            "f3": {"tier": "certified"},
+            "f4": {"tier": "reason_only"},
+            "f5": {"tier": "abstained"},
+        }
+    }
+    previous = {name: row["tier"] for name, row in certificate["entries"].items()}
+    factor_stats = {
+        name: {
+            "scores": {"presence_variance": 0.1, "visibility_variance": 0.1},
+            "prototype": {"dominant_rate": 0.2},
+        }
+        for name in certificate["entries"]
+    }
+
+    metrics = _certificate_readiness_metrics(
+        certificate=certificate,
+        previous_tiers=previous,
+        factor_stats=factor_stats,
+        ontology=ontology,
+    )
+
+    assert metrics["certified_route_group_count_per_action"] == [1, 1, 0, 1]
+    assert metrics["reachable_reason_count"] == 2
+    assert metrics["certificate_tier_jaccard"] == pytest.approx(1.0)
+    assert metrics["saturation_fraction"] == pytest.approx(0.0)
+
+
+def test_certificate_readiness_does_not_treat_a_sha_as_real_eligibility() -> None:
+    ontology = {
+        "action_names": ["forward", "stop", "left", "right"],
+        "action_routes": {
+            name: {"support": [{"factor": "f0"}], "veto": []}
+            for name in ("forward", "stop", "left", "right")
+        },
+        "reason_routes": {0: {"direct_factors": ["f0"], "latent_factors": [], "contradiction_factors": []}},
+    }
+    metrics = _certificate_readiness_metrics(
+        certificate={"sha256": "PRESENT", "entries": {"f0": {"tier": "abstained"}}},
+        previous_tiers=None,
+        factor_stats={
+            "f0": {
+                "scores": {"presence_variance": 0.0, "visibility_variance": 0.0},
+                "prototype": {"dominant_rate": 1.0},
+            }
+        },
+        ontology=ontology,
+    )
+    assert metrics["certified_route_group_count_per_action"] == [0, 0, 0, 0]
+    assert metrics["reachable_reason_count"] == 0
+    assert metrics["certificate_tier_jaccard"] == 0.0
+    assert metrics["saturation_fraction"] == 1.0
+
+
+def test_shadow_readiness_uses_accepted_edge_contents_not_an_artifact_sha() -> None:
+    branch = {
+        "action_shadow_ap_delta": [0.0, 0.0, 0.0, 0.0],
+        "action_route_ap_delta": [0.0, 0.0, 0.0, 0.0],
+        "exp_map_delta_vs_visual": 0.01,
+        "factor_shuffle_degrades_reason": True,
+        "hidden_recovery_margin": 0.02,
+        "route_strength_ratio": 0.05,
+        "disallowed_route_invariance": True,
+        "train_audit_joint": 0.5,
+        "exp_map_delta_vs_entry": 0.01,
+    }
+    empty = _edge_and_branch_readiness_metrics(
+        edge_document={"sha256": "EXISTS", "entries": {}},
+        branch_metrics=branch,
+        previous_best_train_audit_joint=0.4,
+    )
+    assert empty["true_edge_count_per_action"] == [0, 0, 0, 0]
+    assert empty["tet_lcb95"] == 0.0
+    assert empty["tes_lcb95"] == 0.0
+    assert empty["cca"] == 0.0
+
+    entries = {}
+    for action in ("forward", "stop", "left", "right"):
+        entries[f"support:f0:{action}"] = {
+            "target": action,
+            "accepted": True,
+            "metrics": {
+                "tet_lcb95": 0.02,
+                "tes_lcb95": 0.01,
+                "tes_identity_lcb95": 0.008,
+                "tes_spatial_lcb95": 0.009,
+                "cca": 0.7,
+            },
+        }
+    real = _edge_and_branch_readiness_metrics(
+        edge_document={"entries": entries},
+        branch_metrics=branch,
+        previous_best_train_audit_joint=0.4,
+    )
+    assert real["true_edge_count_per_action"] == [1, 1, 1, 1]
+    assert real["tet_lcb95"] == pytest.approx(0.02)
+    assert real["tes_lcb95"] == pytest.approx(0.01)
+    assert real["cca"] == pytest.approx(0.7)
+    assert real["train_audit_improved"] is True
+
+
+def test_factor_audit_readiness_requires_collector_integrity_proof() -> None:
+    valid = _factor_audit_integrity_metrics({
+        "source_split": "train_audit",
+        "factor_stats": {"f0": {"counts": {"unknown": 3}}},
+        "audit_integrity": {
+            "collector_completed": True,
+            "exception": None,
+            "unknown_policy": "excluded_from_binary_metrics",
+            "unknown_rows_total": 3,
+            "unknown_rows_in_metric_total": 0,
+        },
+    })
+    assert valid == {
+        "factor_audit_complete": True,
+        "factor_audit_exception": False,
+        "unknown_abstained": True,
+    }
+
+    missing_proof = _factor_audit_integrity_metrics({
+        "source_split": "train_audit",
+        "factor_stats": {"f0": {"counts": {"unknown": 3}}},
+    })
+    assert missing_proof["factor_audit_complete"] is False
+    assert missing_proof["factor_audit_exception"] is True
+    assert missing_proof["unknown_abstained"] is False
+
+
+def test_pilot_gate_requires_real_state_transitions_and_accepted_edges() -> None:
+    split_readiness = {
+        "train_core": {"source_split": "train_core", "finite": True},
+        "train_calib": {"source_split": "train_calib", "finite": True},
+    }
+    foundation = {
+        "factor_audit_complete": True,
+        "factor_audit_exception": False,
+        "unknown_abstained": True,
+        "certified_route_group_count_per_action": [1, 1, 1, 1],
+        "reachable_reason_count": 15,
+        "certificate_tier_jaccard": 0.95,
+        "saturation_fraction": 0.1,
+        "diagnostics_finite": True,
+    }
+    shadow = {
+        "exp_map_delta_vs_visual": 0.0,
+        "factor_shuffle_degrades_reason": True,
+        "hidden_recovery_margin": 0.02,
+        "route_strength_ratio": 0.05,
+        "action_shadow_ap_delta": [0.0] * 4,
+        "true_edge_count_per_action": [1, 1, 0, 0],
+        "disallowed_route_invariance": True,
+    }
+    history = [
+        {"state_before": "FOUNDATION", "state_after": "FOUNDATION", "ready": True, "readiness": {**split_readiness, "train_audit": foundation}},
+        {"state_before": "FOUNDATION", "state_after": "DUAL_REASON_SHADOW", "ready": True, "readiness": {**split_readiness, "train_audit": foundation}},
+        {"state_before": "DUAL_REASON_SHADOW", "state_after": "DUAL_REASON_SHADOW", "ready": True, "readiness": {**split_readiness, "train_audit": shadow}},
+        {"state_before": "DUAL_REASON_SHADOW", "state_after": "SAFE_JOINT", "ready": True, "readiness": {**split_readiness, "train_audit": shadow}},
+        {"state_before": "SAFE_JOINT", "state_after": "SAFE_JOINT", "ready": True, "readiness": {"train_audit": {}}},
+    ]
+    schedule = {"history": history, "safe_joint_epochs": 1, "failed_closed": False}
+    certificate = {"entries": {"f0": {"tier": "certified"}}}
+    edge = {"entries": {
+        "e0": {"accepted": True, "target": "forward"},
+        "e1": {"accepted": True, "target": "stop"},
+    }}
+    result = _pilot_semantic_validation(schedule, certificate, edge)
+    assert result["pass"] is True
+    assert result["errors"] == []
+
+    bad_split_history = [dict(row) for row in history]
+    bad_split_history[1] = {
+        **bad_split_history[1],
+        "readiness": {
+            **bad_split_history[1]["readiness"],
+            "train_calib": {"source_split": "test", "finite": True},
+        },
+    }
+    bad_split = _pilot_semantic_validation(
+        {**schedule, "history": bad_split_history}, certificate, edge
+    )
+    assert bad_split["pass"] is False
+    assert "foundation_transition_lacks_split_integrity" in bad_split["errors"]
+
+    invalid = _pilot_semantic_validation(
+        {"history": [], "safe_joint_epochs": 1, "failed_closed": False},
+        {"sha256": "ONLY", "entries": {"f0": {"tier": "abstained"}}},
+        {"sha256": "ONLY", "entries": {}},
+    )
+    assert invalid["pass"] is False
+    assert "missing_foundation_to_shadow_transition" in invalid["errors"]
+    assert "no_certified_factor" in invalid["errors"]
+    assert "accepted_edges_cover_fewer_than_two_actions" in invalid["errors"]
 
 
 def test_checkpoint_roundtrip_restores_queues_and_pareto(tmp_path) -> None:

@@ -18,6 +18,14 @@ def _foundation_ready() -> dict[str, object]:
     }
 
 
+def _core_ready() -> dict[str, object]:
+    return {"source_split": "train_core", "finite": True}
+
+
+def _calib_ready() -> dict[str, object]:
+    return {"source_split": "train_calib", "finite": True}
+
+
 def test_adaptive_schedule_enforces_state_side_effects_and_two_epoch_readiness() -> None:
     module = importlib.import_module("fate_oia.engine.mosaic_icdor_adaptive_schedule")
     machine = module.ICDORAdaptiveSchedule(pilot=True)
@@ -27,12 +35,23 @@ def test_adaptive_schedule_enforces_state_side_effects_and_two_epoch_readiness()
     assert policy.action_rank_weight == 0.0 and policy.reason_rank_weight == 0.0
     assert policy.write_provisional_certificate is True
     for epoch in range(3):
-        machine.update(epoch=epoch, train_audit_metrics=_foundation_ready(), train_calib_metrics={})
+        machine.update(
+            epoch=epoch,
+            train_audit_metrics=_foundation_ready(),
+            train_calib_metrics=_calib_ready(),
+            train_core_metrics=_core_ready(),
+        )
     assert machine.state == "DUAL_REASON_SHADOW"
     assert machine.policy().freeze_factor_and_prototypes is True
     assert machine.policy().route_mode == "shadow"
     with pytest.raises(ValueError, match="test"):
-        machine.update(epoch=4, train_audit_metrics=_foundation_ready(), train_calib_metrics={}, test_metrics={})
+        machine.update(
+            epoch=4,
+            train_audit_metrics=_foundation_ready(),
+            train_calib_metrics=_calib_ready(),
+            train_core_metrics=_core_ready(),
+            test_metrics={},
+        )
 
 
 def test_adaptive_schedule_fails_closed_at_state_maximum() -> None:
@@ -41,6 +60,27 @@ def test_adaptive_schedule_fails_closed_at_state_maximum() -> None:
     bad = _foundation_ready()
     bad["factor_audit_complete"] = False
     for epoch in range(6):
-        machine.update(epoch=epoch, train_audit_metrics=bad, train_calib_metrics={})
+        machine.update(
+            epoch=epoch,
+            train_audit_metrics=bad,
+            train_calib_metrics=_calib_ready(),
+            train_core_metrics=_core_ready(),
+        )
     assert machine.failed_closed is True
     assert machine.full_train_eligible is False
+
+
+def test_adaptive_schedule_requires_finite_train_calib_for_transition() -> None:
+    module = importlib.import_module("fate_oia.engine.mosaic_icdor_adaptive_schedule")
+    machine = module.ICDORAdaptiveSchedule(pilot=True)
+    bad_calib = {"source_split": "train_calib", "finite": False}
+    for epoch in range(6):
+        machine.update(
+            epoch=epoch,
+            train_audit_metrics=_foundation_ready(),
+            train_calib_metrics=bad_calib,
+            train_core_metrics=_core_ready(),
+        )
+    assert machine.state == "FOUNDATION"
+    assert machine.failed_closed is True
+    assert machine.history[-1]["ready"] is False

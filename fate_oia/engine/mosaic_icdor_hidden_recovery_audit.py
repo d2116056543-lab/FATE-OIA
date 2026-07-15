@@ -22,6 +22,67 @@ def _ap(scores: torch.Tensor, labels: torch.Tensor) -> float | None:
     return float((ranked.cumsum(0).div(torch.arange(1, ranked.numel() + 1, device=scores.device)) * ranked).sum() / positives)
 
 
+def audit_hidden_recovery_scores(
+    posterior_scores: torch.Tensor,
+    zero_as_negative_scores: torch.Tensor,
+    observed_after_hiding: torch.Tensor,
+    hidden_positive_mask: torch.Tensor,
+    *,
+    mode: str,
+    hide_fraction: float,
+) -> dict[str, Any]:
+    """Compare recovered hidden positives against eligible observed-zero rows.
+
+    Hidden truths select the evaluation positives only. They are never passed
+    back to the posterior model or a training loss.
+    """
+    shape = posterior_scores.shape
+    if (
+        mode not in MISSINGNESS_MODES
+        or hide_fraction not in (0.10, 0.30, 0.50)
+        or posterior_scores.ndim != 2
+        or zero_as_negative_scores.shape != shape
+        or observed_after_hiding.shape != shape
+        or hidden_positive_mask.shape != shape
+    ):
+        raise ValueError("hidden recovery score audit requires aligned [B,R] tensors and a supported mode")
+    hidden = hidden_positive_mask.bool()
+    eligible_negative = (observed_after_hiding <= 0.5) & ~hidden
+    evaluation = hidden | eligible_negative
+    labels = hidden[evaluation]
+    hidden_count = int(hidden.sum())
+    negative_count = int(eligible_negative.sum())
+    if hidden_count == 0 or negative_count == 0:
+        return {
+            "mode": mode,
+            "hide_fraction": hide_fraction,
+            "evaluation_only": True,
+            "available": False,
+            "hidden_positive_count": hidden_count,
+            "eligible_negative_count": negative_count,
+            "recovery_auprc": None,
+            "zero_as_negative_auprc": None,
+            "margin": None,
+            "training_safe": True,
+        }
+    recovery = _ap(posterior_scores[evaluation].detach(), labels)
+    baseline = _ap(zero_as_negative_scores[evaluation].detach(), labels)
+    if recovery is None or baseline is None:
+        raise ValueError("hidden recovery score audit unexpectedly produced an unavailable AP")
+    return {
+        "mode": mode,
+        "hide_fraction": hide_fraction,
+        "evaluation_only": True,
+        "available": True,
+        "hidden_positive_count": hidden_count,
+        "eligible_negative_count": negative_count,
+        "recovery_auprc": recovery,
+        "zero_as_negative_auprc": baseline,
+        "margin": recovery - baseline,
+        "training_safe": True,
+    }
+
+
 def build_hidden_mask(
     observed_positive: torch.Tensor,
     *,
@@ -31,8 +92,12 @@ def build_hidden_mask(
     generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     """Create audit-only missingness masks; hidden labels never enter a loss."""
-    if mode not in MISSINGNESS_MODES or observed_positive.ndim != 2 or not 0.0 <= hide_fraction <= 1.0:
-        raise ValueError("hidden recovery audit requires a supported mode, [B,R] labels, and fraction in [0,1]")
+    if (
+        mode not in MISSINGNESS_MODES
+        or observed_positive.ndim != 2
+        or hide_fraction not in (0.10, 0.30, 0.50)
+    ):
+        raise ValueError("hidden recovery audit requires a supported mode, [B,R] labels, and planned 10/30/50 fraction")
     positive = observed_positive > 0.5
     if mode == "null":
         return torch.zeros_like(positive)
@@ -52,7 +117,7 @@ def audit_hidden_recovery(
     observed_targets: torch.Tensor,
     *,
     propensity: torch.Tensor | None = None,
-    hide_fraction: float = 0.25,
+    hide_fraction: float = 0.10,
     generator: torch.Generator | None = None,
 ) -> dict[str, Any]:
     if logits.shape != observed_targets.shape or logits.ndim != 2:

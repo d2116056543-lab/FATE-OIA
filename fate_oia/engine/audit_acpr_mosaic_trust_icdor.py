@@ -238,6 +238,17 @@ def verify_dynamic_forward_and_gradients(model: nn.Module, images: torch.Tensor)
         model.train(was_training)
 
 
+def _existing_review_validation_requested(
+    review_pass: str | None,
+    runtime_selection: str | None,
+) -> bool:
+    if review_pass is None:
+        return False
+    if runtime_selection is None:
+        raise ICDORAuditError("existing review_pass validation requires runtime_selection")
+    return True
+
+
 def protocol_hard_gate(
     review_path: str | Path,
     *,
@@ -439,6 +450,8 @@ def build_review_pass(
     pilot: Mapping[str, Any],
     *,
     runtime_sha256: str,
+    pilot_sha256: str,
+    evidence_files: Mapping[str, Mapping[str, str]],
     remediation_gates: Mapping[str, Mapping[str, Any]],
     final_remediation_plan_sha256: str,
     audit_addendum_sha256: str,
@@ -469,6 +482,41 @@ def build_review_pass(
         raise ICDORAuditError(f"pilot contains pending artifacts: {pending}")
     if pilot.get("git_head") != audit.get("git_head"):
         raise ICDORAuditError("pilot gate is not bound to the current audited HEAD")
+    if pilot.get("semantic_validation", {}).get("pass") is not True:
+        raise ICDORAuditError("pilot semantic validation is not passing")
+    split_protocol = audit.get("split_protocol")
+    split_sha256 = split_protocol.get("split_sha256") if isinstance(split_protocol, Mapping) else None
+    certificate_sha256 = pilot.get("certificate_sha256")
+    edge_admission_sha256 = pilot.get("edge_admission_sha256")
+    if not all(
+        isinstance(value, str) and bool(value)
+        for value in (split_sha256, certificate_sha256, edge_admission_sha256, pilot_sha256)
+    ):
+        raise ICDORAuditError("REVIEW_PASS pilot evidence bindings are incomplete")
+    if set(evidence_files) != {
+        "pilot_gate", "factor_certificate", "edge_admission",
+        "final_remediation_plan", "audit_addendum",
+    }:
+        raise ICDORAuditError("REVIEW_PASS evidence file bindings are incomplete")
+    if any(
+        not isinstance(binding, Mapping)
+        or not binding.get("path")
+        or not binding.get("sha256")
+        for binding in evidence_files.values()
+    ):
+        raise ICDORAuditError("REVIEW_PASS evidence file bindings are invalid")
+    expected_evidence_sha = {
+        "pilot_gate": pilot_sha256,
+        "factor_certificate": str(certificate_sha256),
+        "edge_admission": str(edge_admission_sha256),
+        "final_remediation_plan": final_remediation_plan_sha256,
+        "audit_addendum": audit_addendum_sha256,
+    }
+    if any(
+        str(evidence_files[name]["sha256"]).upper() != expected.upper()
+        for name, expected in expected_evidence_sha.items()
+    ):
+        raise ICDORAuditError("REVIEW_PASS evidence bindings are internally inconsistent")
     if not final_remediation_plan_sha256 or not audit_addendum_sha256:
         raise ICDORAuditError("final remediation plan and audit addendum hashes are required")
     failed_remediation = [
@@ -500,6 +548,11 @@ def build_review_pass(
         "contract_manifest_sha256": str(audit["contract_manifest_sha256"]),
         "resolved_config_sha256": str(audit["config_sha256"]),
         "runtime_selection_sha256": runtime_sha256,
+        "split_sha256": str(split_sha256),
+        "factor_certificate_sha256": str(certificate_sha256),
+        "edge_admission_sha256": str(edge_admission_sha256),
+        "pilot_artifact_sha256": pilot_sha256,
+        "evidence_files": {name: dict(binding) for name, binding in evidence_files.items()},
         "final_remediation_plan_sha256": final_remediation_plan_sha256,
         "audit_addendum_sha256": audit_addendum_sha256,
         "gates": gates,
@@ -623,9 +676,7 @@ def main() -> None:
             gate_path = Path(args.remediation_gate_dir) / "ICDOR_GATE_REAL_FACTOR_AUDIT_PASS.json"
             gate_path.parent.mkdir(parents=True, exist_ok=True)
             gate_path.write_text(json.dumps(gate, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    if args.review_pass or args.runtime_selection:
-        if not args.review_pass or not args.runtime_selection:
-            raise ICDORAuditError("review_pass and runtime_selection must be supplied together")
+    if _existing_review_validation_requested(args.review_pass, args.runtime_selection):
         result["review"] = protocol_hard_gate(
             args.review_pass,
             target_head=result["git_head"],
@@ -642,7 +693,31 @@ def main() -> None:
                 "write_review_pass requires runtime_selection, pilot_gate, final_remediation_plan, and audit_addendum"
             )
         runtime = json.loads(Path(args.runtime_selection).read_text(encoding="utf-8"))
-        pilot = json.loads(Path(args.pilot_gate).read_text(encoding="utf-8"))
+        pilot_path = Path(args.pilot_gate).resolve()
+        pilot = json.loads(pilot_path.read_text(encoding="utf-8"))
+        pilot_bindings = pilot.get("evidence_files")
+        if not isinstance(pilot_bindings, Mapping):
+            raise ICDORAuditError("pilot evidence file bindings are missing")
+        evidence_files: dict[str, dict[str, str]] = {
+            "pilot_gate": {"path": str(pilot_path), "sha256": sha256_file(pilot_path)},
+            "final_remediation_plan": {
+                "path": str(Path(args.final_remediation_plan).resolve()),
+                "sha256": sha256_file(args.final_remediation_plan),
+            },
+            "audit_addendum": {
+                "path": str(Path(args.audit_addendum).resolve()),
+                "sha256": sha256_file(args.audit_addendum),
+            },
+        }
+        for name in ("factor_certificate", "edge_admission"):
+            binding = pilot_bindings.get(name)
+            if not isinstance(binding, Mapping) or not binding.get("path") or not binding.get("sha256"):
+                raise ICDORAuditError(f"pilot {name} file binding is missing")
+            evidence_path = Path(str(binding["path"])).resolve()
+            actual_sha = sha256_file(evidence_path)
+            if actual_sha != str(binding["sha256"]).upper():
+                raise ICDORAuditError(f"pilot {name} file hash mismatch")
+            evidence_files[name] = {"path": str(evidence_path), "sha256": actual_sha}
         gate_dir = Path(args.remediation_gate_dir)
         remediation_gates: dict[str, Mapping[str, Any]] = {}
         for gate_name in _REQUIRED_REMEDIATION_GATES:
@@ -652,6 +727,8 @@ def main() -> None:
             remediation_gates[gate_name] = json.loads(gate_path.read_text(encoding="utf-8"))
         review = build_review_pass(
             result, runtime, pilot, runtime_sha256=sha256_file(args.runtime_selection),
+            pilot_sha256=sha256_file(args.pilot_gate),
+            evidence_files=evidence_files,
             remediation_gates=remediation_gates,
             final_remediation_plan_sha256=sha256_file(args.final_remediation_plan),
             audit_addendum_sha256=sha256_file(args.audit_addendum),

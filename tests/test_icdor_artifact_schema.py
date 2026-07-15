@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from copy import deepcopy
 from pathlib import Path
 
 import torch
@@ -11,7 +13,68 @@ from fate_oia.utils.mosaic_icdor_artifacts import (
     initialize_icdor_run_artifacts,
     validate_icdor_artifact_schema,
     write_icdor_epoch_artifacts,
+    _matched_control_provenance_valid,
 )
+
+
+def _matched_arms() -> list[dict[str, object]]:
+    common = {
+        "available_sample_count": 2,
+        "max_mass_error": 0.0,
+        "max_overlap": 0.0,
+    }
+    return [
+        {
+            **common,
+            "control_type": "same_type_identity",
+            "identity_source_factor_names": ["identity_factor"],
+            "identity_source_factor_types": ["object"],
+            "identity_source_regions": ["front"],
+            "factor_type": "object",
+            "region": "front",
+            "spatial_offsets": [],
+        },
+        *[
+            {
+                **common,
+                "control_type": "spatial_roll",
+                "identity_source_factor_names": [],
+                "identity_source_factor_types": [],
+                "identity_source_regions": [],
+                "factor_type": "object",
+                "region": "front",
+                "spatial_offsets": [[offset, offset + 1]],
+            }
+            for offset in range(3)
+        ],
+    ]
+
+
+def test_matched_control_provenance_requires_true_identity_and_nonzero_offsets() -> None:
+    valid = _matched_arms()
+    assert _matched_control_provenance_valid(valid) is True
+
+    mutations = []
+    missing_type = deepcopy(valid)
+    missing_type[0]["identity_source_factor_types"] = []
+    mutations.append(missing_type)
+    wrong_type = deepcopy(valid)
+    wrong_type[0]["identity_source_factor_types"] = ["lane"]
+    mutations.append(wrong_type)
+    wrong_region = deepcopy(valid)
+    wrong_region[0]["identity_source_regions"] = ["left"]
+    mutations.append(wrong_region)
+    zero_offset = deepcopy(valid)
+    zero_offset[1]["spatial_offsets"] = [[0, 0]]
+    mutations.append(zero_offset)
+    malformed_offset = deepcopy(valid)
+    malformed_offset[1]["spatial_offsets"] = [[1]]
+    mutations.append(malformed_offset)
+    unavailable = deepcopy(valid)
+    unavailable[0]["available_sample_count"] = 0
+    mutations.append(unavailable)
+
+    assert all(_matched_control_provenance_valid(arms) is False for arms in mutations)
 
 
 def _json_payloads() -> dict[str, dict[str, object]]:
@@ -26,7 +89,7 @@ def _json_payloads() -> dict[str, dict[str, object]]:
     }
     payloads["target_transfer_summary.json"] = {
         "available": True, "epoch": 0, "source_split": "train_audit",
-        "schema_version": "mosaic_target_transfer.v1", "target_count": 2,
+        "schema_version": "mosaic_target_transfer.v2", "target_count": 2,
     }
     payloads["visual_audit_manifest.json"] = {
         "schema": "icdor_visual_audit_v1", "source_split": "train_audit",
@@ -41,6 +104,19 @@ def _json_payloads() -> dict[str, dict[str, object]]:
 def _jsonl_payloads() -> dict[str, list[dict[str, object]]]:
     rows = {name: [{"available": True, "epoch": 0, "source_split": "test"}] for name in ICDOR_EPOCH_JSONL_FILES}
     rows["calibration_stats.jsonl"] = [{"available": True, "epoch": 0, "source_split": "train_calib"}]
+    rows["reason_dual_observation_stats.jsonl"] = [
+        {
+            "available": True,
+            "epoch": 0,
+            "source_split": "train_audit",
+            "audit": "hidden_recovery",
+            "mode": mode,
+            "hide_fraction": fraction,
+            "evaluation_only": True,
+        }
+        for mode in ("mcar", "mar", "mnar")
+        for fraction in (0.10, 0.30, 0.50)
+    ]
     rows["gradient_ownership.jsonl"] = [
         {"epoch": 0, "step": 0, "loss": "loss_action_total", "owner_group": "reason_adapter",
          "grad_norm": 0.0, "finite": True, "cosine_with_action_base": None},
@@ -50,7 +126,8 @@ def _jsonl_payloads() -> dict[str, list[dict[str, object]]]:
     rows["target_transfer_stats.jsonl"] = [{
         "available": True, "epoch": 0, "source_split": "train_audit",
         "factor_id": "f", "target_id": "a", "tet": 0.1, "tes": 0.05,
-        "cca": 0.01, "ap_delta": 0.02,
+        "tes_identity": 0.03, "tes_spatial": 0.02,
+        "cca": 0.01, "ap_delta": 0.02, "matched_control_arms": _matched_arms(),
     }]
     return rows
 
@@ -106,6 +183,14 @@ def test_artifact_writer_requires_full_icdor_schema_and_validates_it(tmp_path: P
     result = validate_icdor_artifact_schema(tmp_path, epochs=[0], strict_semantics=True)
 
     assert result["pass"], result
+
+    transfer_path = tmp_path / "epoch_000" / "target_transfer_stats.jsonl"
+    transfer = json.loads(transfer_path.read_text(encoding="utf-8"))
+    transfer["matched_control_arms"][0]["identity_source_factor_names"] = []
+    transfer_path.write_text(json.dumps(transfer) + "\n", encoding="utf-8")
+    invalid = validate_icdor_artifact_schema(tmp_path, epochs=[0], strict_semantics=True)
+    assert invalid["pass"] is False
+    assert any("target transfer rows" in error for error in invalid["semantic_errors"])
 
 
 def test_artifact_writer_rejects_missing_branch_or_test_leaked_threshold(tmp_path: Path) -> None:

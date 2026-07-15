@@ -10,10 +10,18 @@ from torch import nn
 from fate_oia.engine.audit_acpr_mosaic_trust_icdor import (
     ICDORAuditError,
     build_review_pass,
+    _existing_review_validation_requested,
     validate_real_factor_audit,
     protocol_hard_gate,
     verify_dynamic_forward_and_gradients,
 )
+
+
+def test_write_review_runtime_does_not_require_an_existing_review_pass() -> None:
+    assert _existing_review_validation_requested(None, "runtime.json") is False
+    assert _existing_review_validation_requested("review.json", "runtime.json") is True
+    with pytest.raises(ICDORAuditError, match="runtime_selection"):
+        _existing_review_validation_requested("review.json", None)
 
 
 def test_real_factor_audit_accepts_honest_abstention_and_rejects_fake_zero() -> None:
@@ -38,6 +46,16 @@ def _passing_remediation_gates(*, git_head: str = "abc"):
         "PILOT", "STRICT_ARTIFACT_VALIDATION",
     )
     return {name: {"pass": True, "gate": name, "git_head": git_head} for name in names}
+
+
+def _bound_evidence_files() -> dict[str, dict[str, str]]:
+    return {
+        "pilot_gate": {"path": "pilot_gate.json", "sha256": "PILOT"},
+        "factor_certificate": {"path": "factor_certificate.json", "sha256": "CERTIFICATE"},
+        "edge_admission": {"path": "edge_admission.json", "sha256": "EDGE"},
+        "final_remediation_plan": {"path": "final_remediation.md", "sha256": "PLAN"},
+        "audit_addendum": {"path": "audit_addendum.md", "sha256": "ADDENDUM"},
+    }
 
 
 def test_certificate_audit_checks_builder_and_tier_logic_separately() -> None:
@@ -146,13 +164,19 @@ def test_review_pass_is_fail_closed_and_binds_all_evidence() -> None:
         "git_tree": "TREE",
         "source_manifest_sha256": "SOURCES",
         "contract_manifest_sha256": "CONTRACT",
+        "split_protocol": {"split_sha256": "SPLIT"},
         "worktree_clean": True,
     }
     runtime = {"pass": True, "selected": {"status": "PASS"}}
-    pilot = {"pass": True, "artifacts_complete": True, "pending_artifacts": [], "git_head": "abc"}
+    pilot = {
+        "pass": True, "artifacts_complete": True, "pending_artifacts": [], "git_head": "abc",
+        "certificate_sha256": "CERTIFICATE", "edge_admission_sha256": "EDGE",
+        "semantic_validation": {"pass": True, "errors": []},
+    }
 
     review = build_review_pass(
-        audit, runtime, pilot, runtime_sha256="RUNTIME",
+        audit, runtime, pilot, runtime_sha256="RUNTIME", pilot_sha256="PILOT",
+        evidence_files=_bound_evidence_files(),
         remediation_gates=_passing_remediation_gates(),
         final_remediation_plan_sha256="PLAN",
         audit_addendum_sha256="ADDENDUM",
@@ -165,11 +189,26 @@ def test_review_pass_is_fail_closed_and_binds_all_evidence() -> None:
     assert review["contract_manifest_sha256"] == "CONTRACT"
     assert review["final_remediation_plan_sha256"] == "PLAN"
     assert review["audit_addendum_sha256"] == "ADDENDUM"
+    assert review["split_sha256"] == "SPLIT"
+    assert review["factor_certificate_sha256"] == "CERTIFICATE"
+    assert review["edge_admission_sha256"] == "EDGE"
+    assert review["pilot_artifact_sha256"] == "PILOT"
+    assert review["evidence_files"] == _bound_evidence_files()
+    inconsistent = _bound_evidence_files()
+    inconsistent["factor_certificate"] = {**inconsistent["factor_certificate"], "sha256": "OTHER"}
+    with pytest.raises(ICDORAuditError, match="evidence.*inconsistent"):
+        build_review_pass(
+            audit, runtime, pilot, runtime_sha256="RUNTIME", pilot_sha256="PILOT",
+            evidence_files=inconsistent,
+            remediation_gates=_passing_remediation_gates(),
+            final_remediation_plan_sha256="PLAN", audit_addendum_sha256="ADDENDUM",
+        )
     assert set(review["gates"].values()) == {"PASS"}
     broken = dict(pilot, pending_artifacts=["visual_audit_manifest.json"])
     with pytest.raises(ICDORAuditError, match="pending"):
         build_review_pass(
-            audit, runtime, broken, runtime_sha256="RUNTIME",
+            audit, runtime, broken, runtime_sha256="RUNTIME", pilot_sha256="PILOT",
+            evidence_files=_bound_evidence_files(),
             remediation_gates=_passing_remediation_gates(),
             final_remediation_plan_sha256="PLAN",
             audit_addendum_sha256="ADDENDUM",
@@ -179,7 +218,8 @@ def test_review_pass_is_fail_closed_and_binds_all_evidence() -> None:
     stale["REAL_FACTOR_AUDIT"] = {**stale["REAL_FACTOR_AUDIT"], "git_head": "stale"}
     with pytest.raises(ICDORAuditError, match="current audited HEAD"):
         build_review_pass(
-            audit, runtime, pilot, runtime_sha256="RUNTIME",
+            audit, runtime, pilot, runtime_sha256="RUNTIME", pilot_sha256="PILOT",
+            evidence_files=_bound_evidence_files(),
             remediation_gates=stale,
             final_remediation_plan_sha256="PLAN",
             audit_addendum_sha256="ADDENDUM",
@@ -187,7 +227,26 @@ def test_review_pass_is_fail_closed_and_binds_all_evidence() -> None:
 
     with pytest.raises(ICDORAuditError, match="pilot gate.*HEAD"):
         build_review_pass(
-            audit, runtime, {**pilot, "git_head": "stale"}, runtime_sha256="RUNTIME",
+            audit, runtime, {**pilot, "git_head": "stale"}, runtime_sha256="RUNTIME", pilot_sha256="PILOT",
+            evidence_files=_bound_evidence_files(),
+            remediation_gates=_passing_remediation_gates(),
+            final_remediation_plan_sha256="PLAN",
+            audit_addendum_sha256="ADDENDUM",
+        )
+
+    with pytest.raises(ICDORAuditError, match="pilot evidence bindings"):
+        build_review_pass(
+            audit, runtime, {**pilot, "certificate_sha256": None},
+            runtime_sha256="RUNTIME", pilot_sha256="PILOT", evidence_files=_bound_evidence_files(),
+            remediation_gates=_passing_remediation_gates(),
+            final_remediation_plan_sha256="PLAN",
+            audit_addendum_sha256="ADDENDUM",
+        )
+
+    with pytest.raises(ICDORAuditError, match="pilot semantic validation"):
+        build_review_pass(
+            audit, runtime, {**pilot, "semantic_validation": {"pass": False}},
+            runtime_sha256="RUNTIME", pilot_sha256="PILOT", evidence_files=_bound_evidence_files(),
             remediation_gates=_passing_remediation_gates(),
             final_remediation_plan_sha256="PLAN",
             audit_addendum_sha256="ADDENDUM",
@@ -203,16 +262,21 @@ def test_review_pass_rejects_dirty_or_unbound_source_tree() -> None:
     base = {
         "pass": True, "git_head": "abc", "git_tree": "TREE",
         "source_manifest_sha256": "SOURCES", "contract_manifest_sha256": "CONTRACT",
-        "worktree_clean": True,
+        "worktree_clean": True, "split_protocol": {"split_sha256": "SPLIT"},
         "config_sha256": "CONFIG", "functional_checks": {name: "PASS" for name in checks},
         "missing_items": [],
     }
     runtime = {"pass": True, "selected": {"status": "PASS"}}
-    pilot = {"pass": True, "artifacts_complete": True, "pending_artifacts": [], "git_head": "abc"}
+    pilot = {
+        "pass": True, "artifacts_complete": True, "pending_artifacts": [], "git_head": "abc",
+        "certificate_sha256": "CERTIFICATE", "edge_admission_sha256": "EDGE",
+        "semantic_validation": {"pass": True, "errors": []},
+    }
     for mutation in ({"worktree_clean": False}, {"git_tree": ""}, {"source_manifest_sha256": ""}, {"contract_manifest_sha256": ""}):
         with pytest.raises(ICDORAuditError, match="source tree"):
             build_review_pass(
-                dict(base, **mutation), runtime, pilot, runtime_sha256="RUNTIME",
+                dict(base, **mutation), runtime, pilot, runtime_sha256="RUNTIME", pilot_sha256="PILOT",
+                evidence_files=_bound_evidence_files(),
                 remediation_gates=_passing_remediation_gates(),
                 final_remediation_plan_sha256="PLAN",
                 audit_addendum_sha256="ADDENDUM",

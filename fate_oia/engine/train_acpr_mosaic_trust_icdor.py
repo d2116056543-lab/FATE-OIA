@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 import torch
 import yaml
@@ -43,6 +43,11 @@ from fate_oia.engine.mosaic_icdor_audit_collectors import (
     collect_factor_audit,
 )
 from fate_oia.engine.mosaic_target_transfer_metrics import collect_joint_target_transfer_metrics
+from fate_oia.engine.mosaic_icdor_hidden_recovery_audit import (
+    MISSINGNESS_MODES,
+    audit_hidden_recovery_scores,
+    build_hidden_mask,
+)
 from fate_oia.metrics import multilabel_metrics_from_logits
 from fate_oia.losses.mosaic_icdor_action_losses import action_base_losses, action_route_losses
 from fate_oia.losses.mosaic_icdor_factor_losses import (
@@ -118,6 +123,8 @@ def _edge_statistics_from_audit(payload: dict[str, Any]) -> dict[tuple[str, str,
         raise ValueError("IC-DOR edge statistics must come from train_audit")
     converted: dict[tuple[str, str, str], MOSAICEdgeInterventionStats] = {}
     for record in payload["edge_stats"].values():
+        if record.get("available") is not True:
+            continue
         metrics = record.get("metrics", {})
         lcb = record.get("bootstrap_lcb95", {})
         counts = record.get("matched_counts", {})
@@ -200,6 +207,36 @@ def _finite_scalar_rows(rows: list[dict[str, Any]]) -> bool:
     )
 
 
+def _factor_audit_integrity_metrics(factor_audit: dict[str, Any]) -> dict[str, bool]:
+    """Turn explicit collector evidence into fail-closed readiness flags."""
+    integrity = factor_audit.get("audit_integrity")
+    stats = factor_audit.get("factor_stats")
+    if not isinstance(integrity, dict) or not isinstance(stats, dict) or not stats:
+        return {
+            "factor_audit_complete": False,
+            "factor_audit_exception": True,
+            "unknown_abstained": False,
+        }
+    completed = integrity.get("collector_completed") is True
+    exception_free = integrity.get("exception") is None
+    unknown_total = sum(
+        int(row.get("counts", {}).get("unknown", 0))
+        for row in stats.values() if isinstance(row, dict)
+    )
+    unknown_proof = (
+        integrity.get("unknown_policy") == "excluded_from_binary_metrics"
+        and int(integrity.get("unknown_rows_total", -1)) == unknown_total
+        and int(integrity.get("unknown_rows_in_metric_total", -1)) == 0
+    )
+    return {
+        "factor_audit_complete": bool(
+            factor_audit.get("source_split") == "train_audit" and completed and exception_free
+        ),
+        "factor_audit_exception": not bool(completed and exception_free),
+        "unknown_abstained": bool(completed and exception_free and unknown_proof),
+    }
+
+
 def _adaptive_readiness(
     *,
     epoch_train: dict[str, list[dict[str, Any]]],
@@ -209,6 +246,12 @@ def _adaptive_readiness(
     pareto_rows: list[dict[str, Any]],
     certificate_sha256: str | None,
     edge_admission_sha256: str | None,
+    certificate_snapshot: dict[str, Any],
+    previous_certificate_tiers: dict[str, str] | None,
+    ontology: dict[str, Any],
+    branch_readiness: dict[str, Any],
+    edge_document: dict[str, Any],
+    previous_best_train_audit_joint: float | None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     """Derive scheduler inputs exclusively from train_core/audit/calib evidence."""
     factor_stats = factor_audit.get("factor_stats", {})
@@ -221,14 +264,6 @@ def _adaptive_readiness(
         for value in section.values()
         if value is not None
     ]
-    action_ap = [float(row["ap_delta"]) for row in transfer_rows if row.get("target_type") == "action"]
-    reason_ap = [float(row["ap_delta"]) for row in transfer_rows if row.get("target_type") == "reason"]
-    edge_lcbs = [
-        float(value)
-        for row in transfer_rows
-        for key, value in row.items()
-        if key in {"tet_lcb95", "tes_lcb95", "cca"} and isinstance(value, (int, float))
-    ]
     pareto = pareto_rows[0] if pareto_rows and pareto_rows[0].get("available") is True else {}
     train_core = {
         "source_split": "train_core",
@@ -238,32 +273,263 @@ def _adaptive_readiness(
         "source_split": "train_calib",
         "finite": _finite_scalar_rows(calibration_rows),
     }
+    certificate_metrics = _certificate_readiness_metrics(
+        certificate=certificate_snapshot,
+        previous_tiers=previous_certificate_tiers,
+        factor_stats=factor_stats,
+        ontology=ontology,
+    )
+    route_metrics = _edge_and_branch_readiness_metrics(
+        edge_document=edge_document,
+        branch_metrics=branch_readiness,
+        previous_best_train_audit_joint=previous_best_train_audit_joint,
+    )
+    factor_integrity = _factor_audit_integrity_metrics(factor_audit)
     train_audit = {
         "source_split": "train_audit",
-        "factor_audit_complete": factor_audit.get("source_split") == "train_audit" and bool(factor_stats),
-        "factor_audit_exception": False,
-        "unknown_abstained": all(int(stats.get("counts", {}).get("unknown", 0)) >= 0 for stats in factor_stats.values()),
-        "certified_route_group_count_per_action": [int(certificate_sha256 is not None)] * 4,
-        "reachable_reason_count": 21,
-        "certificate_tier_jaccard": 1.0 if certificate_sha256 else 0.0,
-        "saturation_fraction": max((float(stats.get("prototype", {}).get("dominant_rate", 1.0)) for stats in factor_stats.values()), default=1.0),
+        **factor_integrity,
+        **certificate_metrics,
         "diagnostics_finite": bool(diagnostic_values) and all(math.isfinite(float(value)) for value in diagnostic_values),
-        "action_shadow_ap_delta": action_ap,
-        "action_route_ap_delta": action_ap,
-        "exp_map_delta_vs_visual": min(reason_ap, default=-1.0),
-        "factor_shuffle_degrades_reason": bool(reason_ap) and min(reason_ap) <= 0.0,
-        "hidden_recovery_margin": max(reason_ap, default=-1.0),
-        "route_strength_ratio": 0.05 if edge_admission_sha256 else 0.0,
-        "true_edge_count_per_action": [int(edge_admission_sha256 is not None)] * 4,
-        "disallowed_route_invariance": edge_admission_sha256 is not None,
+        **route_metrics,
         "pareto_violation_rate": float(pareto.get("pareto_violation_rate", 1.0)),
-        "exp_map_delta_vs_entry": min(reason_ap, default=-1.0),
-        "tet_lcb95": max((value for value in edge_lcbs if value > 0.0), default=0.0),
-        "tes_lcb95": max((value for value in edge_lcbs if value > 0.0), default=0.0),
-        "cca": max((value for value in edge_lcbs if value >= 0.0), default=0.0),
-        "train_audit_improved": bool(pareto.get("pareto_violation_rate", 1.0) < 0.05),
     }
     return train_core, train_audit, train_calib
+
+
+def _pilot_semantic_validation(
+    schedule_state: dict[str, Any],
+    certificate: dict[str, Any],
+    edge_document: dict[str, Any],
+) -> dict[str, Any]:
+    """Require measured state transitions and contents, not artifact existence."""
+    errors: list[str] = []
+    history = schedule_state.get("history")
+    history = history if isinstance(history, list) else []
+    foundation_transition = next((
+        row for row in history
+        if row.get("state_before") == "FOUNDATION"
+        and row.get("state_after") == "DUAL_REASON_SHADOW"
+    ), None)
+    shadow_transition = next((
+        row for row in history
+        if row.get("state_before") == "DUAL_REASON_SHADOW"
+        and row.get("state_after") == "SAFE_JOINT"
+    ), None)
+
+    def _split_integrity(row: dict[str, Any]) -> bool:
+        readiness = row.get("readiness", {})
+        train_core = readiness.get("train_core", {})
+        train_calib = readiness.get("train_calib", {})
+        return (
+            train_core.get("source_split") == "train_core"
+            and train_core.get("finite") is True
+            and train_calib.get("source_split") == "train_calib"
+            and train_calib.get("finite") is True
+        )
+    if foundation_transition is None:
+        errors.append("missing_foundation_to_shadow_transition")
+    elif not _split_integrity(foundation_transition):
+        errors.append("foundation_transition_lacks_split_integrity")
+    if shadow_transition is None:
+        errors.append("missing_shadow_to_safe_joint_transition")
+    elif not _split_integrity(shadow_transition):
+        errors.append("shadow_transition_lacks_split_integrity")
+    if int(schedule_state.get("safe_joint_epochs", 0)) < 1:
+        errors.append("missing_safe_joint_execution_epoch")
+    if schedule_state.get("failed_closed") is True:
+        errors.append("adaptive_schedule_failed_closed")
+
+    certificate_entries = certificate.get("entries")
+    certificate_entries = certificate_entries if isinstance(certificate_entries, dict) else {}
+    if not any(
+        isinstance(row, dict) and row.get("tier") == "certified"
+        for row in certificate_entries.values()
+    ):
+        errors.append("no_certified_factor")
+
+    edge_entries = edge_document.get("entries")
+    edge_entries = edge_entries if isinstance(edge_entries, dict) else {}
+    accepted_actions = {
+        str(row.get("target"))
+        for row in edge_entries.values()
+        if isinstance(row, dict) and row.get("accepted") is True and row.get("target") is not None
+    }
+    if len(accepted_actions) < 2:
+        errors.append("accepted_edges_cover_fewer_than_two_actions")
+
+    if foundation_transition is not None:
+        readiness = foundation_transition.get("readiness", {}).get("train_audit", {})
+        groups = readiness.get("certified_route_group_count_per_action", [])
+        if not (
+            foundation_transition.get("ready") is True
+            and len(groups) == 4 and min(int(value) for value in groups) >= 1
+            and int(readiness.get("reachable_reason_count", 0)) >= 15
+            and float(readiness.get("certificate_tier_jaccard", 0.0)) >= 0.90
+            and readiness.get("unknown_abstained") is True
+        ):
+            errors.append("foundation_transition_lacks_real_readiness")
+    if shadow_transition is not None:
+        readiness = shadow_transition.get("readiness", {}).get("train_audit", {})
+        true_edges = readiness.get("true_edge_count_per_action", [])
+        if not (
+            shadow_transition.get("ready") is True
+            and len(true_edges) == 4
+            and sum(int(value) >= 1 for value in true_edges) >= 2
+            and float(readiness.get("hidden_recovery_margin", -1.0)) >= 0.01
+            and readiness.get("factor_shuffle_degrades_reason") is True
+            and readiness.get("disallowed_route_invariance") is True
+        ):
+            errors.append("shadow_transition_lacks_real_readiness")
+    return {
+        "pass": not errors,
+        "errors": errors,
+        "accepted_action_count": len(accepted_actions),
+        "history_length": len(history),
+    }
+
+
+def _write_provisional_certificate_this_epoch(
+    *, write_provisional: bool, freeze_certificate: bool
+) -> bool:
+    """FOUNDATION certificates are rebuilt each epoch and freeze only after transition."""
+    if write_provisional and freeze_certificate:
+        raise ValueError("IC-DOR certificate policy cannot rebuild and freeze simultaneously")
+    return bool(write_provisional and not freeze_certificate)
+
+
+def _certificate_tiers(certificate: dict[str, Any]) -> dict[str, str]:
+    entries = certificate.get("entries")
+    if not isinstance(entries, dict):
+        return {}
+    result: dict[str, str] = {}
+    for name, row in entries.items():
+        if not isinstance(row, dict) or row.get("tier") not in {"certified", "reason_only", "abstained"}:
+            raise ValueError(f"IC-DOR certificate has invalid tier for {name}")
+        result[str(name)] = str(row["tier"])
+    return result
+
+
+def _certificate_readiness_metrics(
+    *,
+    certificate: dict[str, Any],
+    previous_tiers: dict[str, str] | None,
+    factor_stats: dict[str, Any],
+    ontology: dict[str, Any],
+) -> dict[str, Any]:
+    """Derive FOUNDATION readiness from certificate contents, never file existence."""
+    tiers = _certificate_tiers(certificate)
+    certified = {name for name, tier in tiers.items() if tier == "certified"}
+    reason_eligible = {name for name, tier in tiers.items() if tier in {"certified", "reason_only"}}
+    route_group_counts: list[int] = []
+    for action_name in ontology.get("action_names", []):
+        routes = ontology.get("action_routes", {}).get(action_name, {})
+        group_count = 0
+        for direction in ("support", "veto"):
+            edges = routes.get(direction, []) if isinstance(routes, dict) else []
+            if any(isinstance(edge, dict) and str(edge.get("factor")) in certified for edge in edges):
+                group_count += 1
+        route_group_counts.append(group_count)
+    reachable_reasons = 0
+    for routes in ontology.get("reason_routes", {}).values():
+        if not isinstance(routes, dict):
+            continue
+        factors = {
+            str(name)
+            for key in ("direct_factors", "latent_factors", "contradiction_factors")
+            for name in routes.get(key, [])
+        }
+        if factors & reason_eligible:
+            reachable_reasons += 1
+    if previous_tiers is None:
+        tier_jaccard = 0.0
+    else:
+        current_pairs = {(name, tier) for name, tier in tiers.items()}
+        previous_pairs = {(str(name), str(tier)) for name, tier in previous_tiers.items()}
+        union = current_pairs | previous_pairs
+        tier_jaccard = float(len(current_pairs & previous_pairs) / len(union)) if union else 0.0
+    saturated = 0
+    for name in tiers:
+        stats = factor_stats.get(name, {})
+        scores = stats.get("scores", {}) if isinstance(stats, dict) else {}
+        prototype = stats.get("prototype", {}) if isinstance(stats, dict) else {}
+        presence_variance = scores.get("presence_variance")
+        visibility_variance = scores.get("visibility_variance")
+        dominant_rate = prototype.get("dominant_rate")
+        invalid_or_saturated = (
+            not isinstance(presence_variance, (int, float))
+            or not isinstance(visibility_variance, (int, float))
+            or not isinstance(dominant_rate, (int, float))
+            or float(presence_variance) <= 0.0
+            or float(visibility_variance) <= 0.0
+            or float(dominant_rate) >= 0.85
+        )
+        saturated += int(invalid_or_saturated)
+    return {
+        "certified_route_group_count_per_action": route_group_counts,
+        "reachable_reason_count": reachable_reasons,
+        "certificate_tier_jaccard": tier_jaccard,
+        "saturation_fraction": float(saturated / len(tiers)) if tiers else 1.0,
+    }
+
+
+def _edge_and_branch_readiness_metrics(
+    *,
+    edge_document: dict[str, Any],
+    branch_metrics: dict[str, Any],
+    previous_best_train_audit_joint: float | None,
+) -> dict[str, Any]:
+    """Use train-audit branch measurements and every accepted edge's real LCBs."""
+    action_order = ("forward", "stop", "left", "right")
+    counts = {name: 0 for name in action_order}
+    accepted_metrics: list[dict[str, Any]] = []
+    entries = edge_document.get("entries", {})
+    if isinstance(entries, dict):
+        for row in entries.values():
+            if not isinstance(row, dict) or row.get("accepted") is not True:
+                continue
+            target = str(row.get("target"))
+            metrics = row.get("metrics")
+            if target not in counts or not isinstance(metrics, dict):
+                raise ValueError("IC-DOR accepted edge is missing a valid target or metrics")
+            required = (
+                "tet_lcb95", "tes_lcb95", "tes_identity_lcb95",
+                "tes_spatial_lcb95", "cca",
+            )
+            if any(not isinstance(metrics.get(key), (int, float)) for key in required):
+                raise ValueError("IC-DOR accepted edge is missing real intervention LCBs")
+            counts[target] += 1
+            accepted_metrics.append(metrics)
+    joint = branch_metrics.get("train_audit_joint")
+    improved = (
+        isinstance(joint, (int, float))
+        and (
+            previous_best_train_audit_joint is None
+            or float(joint) > float(previous_best_train_audit_joint) + 1e-8
+        )
+    )
+    def minimum(key: str) -> float:
+        return min((float(row[key]) for row in accepted_metrics), default=0.0)
+    defaults = {
+        "action_shadow_ap_delta": [],
+        "action_route_ap_delta": [],
+        "exp_map_delta_vs_visual": -1.0,
+        "factor_shuffle_degrades_reason": False,
+        "hidden_recovery_margin": -1.0,
+        "route_strength_ratio": 0.0,
+        "disallowed_route_invariance": False,
+        "exp_map_delta_vs_entry": -1.0,
+    }
+    result = {key: branch_metrics.get(key, value) for key, value in defaults.items()}
+    result.update({
+        "true_edge_count_per_action": [counts[name] for name in action_order],
+        "tet_lcb95": minimum("tet_lcb95"),
+        "tes_lcb95": minimum("tes_lcb95"),
+        "tes_identity_lcb95": minimum("tes_identity_lcb95"),
+        "tes_spatial_lcb95": minimum("tes_spatial_lcb95"),
+        "cca": minimum("cca"),
+        "train_audit_improved": improved,
+    })
+    return result
 
 
 def apply_icdor_factor_branch_freeze(model: nn.Module) -> None:
@@ -1037,6 +1303,23 @@ def _sha256_file(path: str | Path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest().upper()
 
 
+def _validate_review_evidence_bindings(review_payload: Mapping[str, Any]) -> None:
+    evidence = review_payload.get("evidence_files")
+    if not isinstance(evidence, Mapping):
+        raise RuntimeError("IC-DOR REVIEW_PASS evidence_files are missing")
+    for name in (
+        "pilot_gate", "factor_certificate", "edge_admission",
+        "final_remediation_plan", "audit_addendum",
+    ):
+        binding = evidence.get(name)
+        if not isinstance(binding, Mapping):
+            raise RuntimeError(f"IC-DOR REVIEW_PASS {name} binding is missing")
+        path = Path(str(binding.get("path", "")))
+        expected = str(binding.get("sha256", "")).upper()
+        if not path.is_file() or not expected or _sha256_file(path) != expected:
+            raise RuntimeError(f"IC-DOR REVIEW_PASS {name} evidence hash mismatch")
+
+
 def _git_head() -> str:
     return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
 
@@ -1131,6 +1414,137 @@ def collect_action_pareto_audit(
         visual_ap.append(float(multilabel_metrics_from_logits(visual[:, label:label + 1], target[:, label:label + 1])["mAP"]))
         routed_ap.append(float(multilabel_metrics_from_logits(routed[:, label:label + 1], target[:, label:label + 1])["mAP"]))
     return torch.tensor(visual_ap, device=device), torch.tensor(routed_ap, device=device)
+
+
+@torch.no_grad()
+def collect_train_audit_branch_readiness(
+    model: nn.Module,
+    loader: Iterable[dict[str, Any]],
+    device: torch.device,
+    *,
+    route_mode: str,
+    latent_enabled: bool,
+    seed: int,
+    safe_joint_entry_exp_map: float | None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Collect real branch/route/hidden-recovery evidence on train_audit only."""
+    tensors: dict[str, list[torch.Tensor]] = {
+        name: [] for name in (
+            "action_visual", "action_shadow", "action_final", "action_labels",
+            "reason_visual", "reason_final", "reason_shuffled", "reason_labels",
+        )
+    }
+    hidden_fractions = (0.10, 0.30, 0.50)
+    hidden_collections: dict[tuple[str, float], dict[str, list[torch.Tensor]]] = {
+        (mode, fraction): {name: [] for name in ("posterior", "baseline", "observed", "hidden")}
+        for mode in MISSINGNESS_MODES if mode != "null"
+        for fraction in hidden_fractions
+    }
+    disallowed_max = 0.0
+    was_training = model.training
+    model.eval()
+    generator = torch.Generator(device=device).manual_seed(seed)
+    try:
+        for batch in loader:
+            split = batch.get("split")
+            split_values = [split] if isinstance(split, str) else list(split or [])
+            if not split_values or any(value != "train_audit" for value in split_values):
+                raise ValueError("IC-DOR readiness collector accepts train_audit only")
+            images = batch["image"].to(device, non_blocking=True)
+            action_labels = batch["action"].to(device, non_blocking=True).float()
+            reason_labels = batch["reason"].to(device, non_blocking=True).float()
+            output = model(
+                images, route_mode=route_mode, latent_enabled=latent_enabled,
+                reason_route_mode="full", return_masks=False, return_diagnostics=True,
+            )
+            for destination, source in (
+                ("action_visual", "action_visual_logits"),
+                ("action_shadow", "action_shadow_logits"),
+                ("action_final", "action_final_logits"),
+                ("reason_visual", "reason_visual_observed_logits"),
+                ("reason_final", "reason_observed_logits"),
+                ("reason_shuffled", "reason_observed_logits_route_shuffled"),
+            ):
+                value = output.get(source)
+                if not isinstance(value, torch.Tensor):
+                    raise ValueError(f"IC-DOR readiness collector is missing {source}")
+                tensors[destination].append(value.detach().float().cpu())
+            tensors["action_labels"].append(action_labels.cpu())
+            tensors["reason_labels"].append(reason_labels.cpu())
+            candidate = getattr(getattr(model, "action_router", None), "candidate_edge_mask", None)
+            support, veto = output.get("support_weights"), output.get("veto_weights")
+            if not isinstance(candidate, torch.Tensor) or not isinstance(support, torch.Tensor) or not isinstance(veto, torch.Tensor):
+                raise ValueError("IC-DOR readiness collector requires candidate mask and route weights")
+            disallowed_max = max(
+                disallowed_max,
+                float(support.masked_select(~candidate[0].to(device)).abs().max()) if bool((~candidate[0]).any()) else 0.0,
+                float(veto.masked_select(~candidate[1].to(device)).abs().max()) if bool((~candidate[1]).any()) else 0.0,
+            )
+            posterior_fn = getattr(getattr(model, "observation_model", None), "posterior_from_observed_targets", None)
+            propensity = output.get("reason_propensity")
+            if not callable(posterior_fn) or not isinstance(propensity, torch.Tensor):
+                raise ValueError("IC-DOR readiness collector requires the selective-observation posterior")
+            for (mode, hide_fraction), collection in hidden_collections.items():
+                hidden = build_hidden_mask(
+                    reason_labels, mode=mode, hide_fraction=hide_fraction,
+                    propensity=propensity, generator=generator,
+                )
+                observed = reason_labels.masked_fill(hidden, 0.0)
+                posterior = posterior_fn(output["reason_logits_latent"], observed, output)["reason_latent_posterior"]
+                collection["posterior"].append(posterior.detach().float().cpu())
+                collection["baseline"].append(torch.sigmoid(output["reason_visual_observed_logits"]).detach().float().cpu())
+                collection["observed"].append(observed.cpu())
+                collection["hidden"].append(hidden.cpu())
+    finally:
+        model.train(was_training)
+    if not tensors["action_labels"]:
+        raise ValueError("IC-DOR readiness collector received no train_audit rows")
+    values = {name: torch.cat(rows) for name, rows in tensors.items()}
+    def per_label_ap(logits: torch.Tensor, labels: torch.Tensor) -> list[float]:
+        return [
+            float(multilabel_metrics_from_logits(logits[:, index:index + 1], labels[:, index:index + 1])["mAP"])
+            for index in range(logits.shape[1])
+        ]
+    action_visual_ap = per_label_ap(values["action_visual"], values["action_labels"])
+    action_shadow_ap = per_label_ap(values["action_shadow"], values["action_labels"])
+    action_final_ap = per_label_ap(values["action_final"], values["action_labels"])
+    reason_visual_metrics = multilabel_metrics_from_logits(values["reason_visual"], values["reason_labels"])
+    reason_final_metrics = multilabel_metrics_from_logits(values["reason_final"], values["reason_labels"])
+    reason_shuffled_metrics = multilabel_metrics_from_logits(values["reason_shuffled"], values["reason_labels"])
+    action_final_metrics = multilabel_metrics_from_logits(values["action_final"], values["action_labels"])
+    route_delta = values["action_shadow"] - values["action_visual"]
+    route_ratios = (
+        route_delta.square().mean(0).sqrt()
+        / values["action_visual"].square().mean(0).sqrt().clamp_min(1e-8)
+    )
+    hidden_rows: list[dict[str, Any]] = []
+    for (mode, hide_fraction), collection in hidden_collections.items():
+        hidden_rows.append(audit_hidden_recovery_scores(
+            torch.cat(collection["posterior"]), torch.cat(collection["baseline"]),
+            torch.cat(collection["observed"]), torch.cat(collection["hidden"]),
+            mode=mode, hide_fraction=hide_fraction,
+        ))
+    available_hidden = [row for row in hidden_rows if row.get("available") is True]
+    hidden_margin = min((float(row["margin"]) for row in available_hidden), default=-1.0)
+    final_exp_map = float(reason_final_metrics["mAP"])
+    return {
+        "source_split": "train_audit",
+        "action_shadow_ap_delta": [shadow - visual for shadow, visual in zip(action_shadow_ap, action_visual_ap)],
+        "action_route_ap_delta": [final - visual for final, visual in zip(action_final_ap, action_visual_ap)],
+        "exp_map_final": final_exp_map,
+        "exp_map_delta_vs_visual": final_exp_map - float(reason_visual_metrics["mAP"]),
+        "factor_shuffle_degrades_reason": final_exp_map > float(reason_shuffled_metrics["mAP"]),
+        "hidden_recovery_margin": hidden_margin,
+        "route_strength_ratio": float(route_ratios.mean()),
+        "route_strength_ratio_by_action": route_ratios.tolist(),
+        "disallowed_route_invariance": disallowed_max <= 1e-8,
+        "disallowed_route_weight_max": disallowed_max,
+        "train_audit_joint": 0.5 * (float(action_final_metrics["mF1"]) + float(reason_final_metrics["mF1"])),
+        "exp_map_delta_vs_entry": (
+            final_exp_map - safe_joint_entry_exp_map
+            if safe_joint_entry_exp_map is not None else -1.0
+        ),
+    }, hidden_rows
 
 
 def _save_checkpoint(
@@ -1381,6 +1795,7 @@ def main() -> None:
             raise RuntimeError("IC-DOR REVIEW_PASS config hash mismatch")
         if review_payload.get("runtime_selection_sha256") != _sha256_file(runtime_path):
             raise RuntimeError("IC-DOR REVIEW_PASS runtime hash mismatch")
+        _validate_review_evidence_bindings(review_payload)
         gates = review_payload.get("gates", {})
         missing_gates = [name for name in ICDOR_REQUIRED_REMEDIATION_GATES if gates.get(name) != "PASS"]
         if missing_gates:
@@ -1413,6 +1828,8 @@ def main() -> None:
         max_train_samples=args.max_train_samples, max_audit_samples=args.max_audit_samples,
         max_calib_samples=args.max_calib_samples, max_test_samples=args.max_test_samples,
     )
+    if args.require_review_pass and review_payload.get("split_sha256") != split_stats["split_sha256"]:
+        raise RuntimeError("IC-DOR REVIEW_PASS split hash mismatch")
     model = build_icdor_model(config).to(device)
     optimizer, ownership = build_icdor_optimizer(model, config)
     (output / "parameter_ownership.json").write_text(
@@ -1474,7 +1891,11 @@ def main() -> None:
             split_manifest=split_stats, runtime_selection=runtime,
             factor_certificate=pending_certificate, edge_admission=pending_edge,
         )
-
+    previous_certificate_tiers: dict[str, str] | None = None
+    if certificate_sha is not None and certificate_path.is_file():
+        previous_certificate_tiers = _certificate_tiers(
+            json.loads(certificate_path.read_text(encoding="utf-8"))
+        )
     for epoch in range(start_epoch, epochs):
         if adaptive_schedule.failed_closed:
             raise RuntimeError(f"IC-DOR adaptive schedule failed closed: {adaptive_schedule.failure_reason}")
@@ -1506,13 +1927,19 @@ def main() -> None:
             forward_kwargs={"route_mode": "off", "latent_enabled": False, "return_masks": True},
         )
         factor_audit_rows = _factor_audit_rows(factor_audit_payload, epoch=epoch)
-        if adaptive_schedule.policy().write_provisional_certificate and not certificate_ready:
+        certificate_tiers_before_epoch = previous_certificate_tiers
+        if _write_provisional_certificate_this_epoch(
+            write_provisional=adaptive_schedule.policy().write_provisional_certificate,
+            freeze_certificate=adaptive_schedule.policy().freeze_certificate,
+        ):
             audit_stats_path = output / "factor_audit_stats.json"
             _write_json(audit_stats_path, factor_audit_payload)
             certificate = build_and_write_factor_certificate(audit_stats_path, certificate_path, config_root="configs")
             certificate_payload = certificate.to_dict()
             model.load_factor_certificate(certificate_payload)
             certificate_sha = certificate.sha256
+            certificate_ready = True
+            previous_certificate_tiers = _certificate_tiers(certificate_payload)
             (output / "factor_certificate_sha256.txt").write_text(certificate_sha + "\n", encoding="ascii")
 
         if adaptive_schedule.policy().enable_interventions and certificate_ready and not edge_ready:
@@ -1533,6 +1960,17 @@ def main() -> None:
             edge_sha = admission.sha256
             (output / "edge_admission_sha256.txt").write_text(edge_sha + "\n", encoding="ascii")
 
+        edge_document = (
+            json.loads(edge_path.read_text(encoding="utf-8"))
+            if edge_path.is_file() else dict(pending_edge)
+        )
+        branch_readiness, hidden_recovery_rows = collect_train_audit_branch_readiness(
+            model, _audit_batches(audit_loader, grounding_index), device,
+            route_mode=phase.route_mode, latent_enabled=phase.latent_enabled,
+            seed=args.seed + epoch,
+            safe_joint_entry_exp_map=adaptive_schedule.safe_joint_entry_exp_map,
+        )
+
         calibration_rows = fit_icdor_calibration(
             model, calib_loader, device, epoch=epoch, route_mode=phase.route_mode,
             latent_enabled=phase.latent_enabled, config=config,
@@ -1542,31 +1980,36 @@ def main() -> None:
             latent_enabled=phase.latent_enabled,
         )
         certificate_snapshot = json.loads(certificate_path.read_text(encoding="utf-8"))
-        action_directions, reason_directions = _target_transfer_directions(model.ontology)
-        transfer = collect_joint_target_transfer_metrics(
-            model, _audit_batches(audit_loader, grounding_index),
-            factor_ids=factor_names,
-            action_ids=list(model.ontology["action_names"]),
-            reason_ids=list(model.ontology["reason_names"]),
-            action_directions=action_directions,
-            reason_directions=reason_directions,
-            device=device, route_mode=phase.route_mode, latent_enabled=phase.latent_enabled,
-            intervention_chunk_size=int(config["runtime"]["target_transfer_intervention_chunk_size"]),
-        )
-        transfer_summary = {
-            "epoch": epoch, "available": True, "source_split": "train_audit",
-            "schema_version": transfer["schema_version"],
-            "collection_runtime": transfer["collection_runtime"],
-            **transfer["summary"],
-        }
-        action_ids = {f"action:{name}" for name in model.ontology["action_names"]}
-        transfer_rows = [
-            {
+        if adaptive_schedule.policy().enable_interventions:
+            action_directions, reason_directions = _target_transfer_directions(model.ontology)
+            transfer = collect_joint_target_transfer_metrics(
+                model, _audit_batches(audit_loader, grounding_index),
+                factor_ids=factor_names,
+                action_ids=list(model.ontology["action_names"]),
+                reason_ids=list(model.ontology["reason_names"]),
+                action_directions=action_directions,
+                reason_directions=reason_directions,
+                device=device, route_mode=phase.route_mode, latent_enabled=phase.latent_enabled,
+                intervention_chunk_size=int(config["runtime"]["target_transfer_intervention_chunk_size"]),
+            )
+            transfer_summary = {
                 "epoch": epoch, "available": True, "source_split": "train_audit",
-                "target_type": "action" if row["target_id"] in action_ids else "reason", **row,
+                "schema_version": transfer["schema_version"],
+                "collection_runtime": transfer["collection_runtime"],
+                **transfer["summary"],
             }
-            for row in transfer["per_target"]
-        ]
+            action_ids = {f"action:{name}" for name in model.ontology["action_names"]}
+            transfer_rows = [
+                {
+                    "epoch": epoch, "available": True, "source_split": "train_audit",
+                    "target_type": "action" if row["target_id"] in action_ids else "reason", **row,
+                }
+                for row in transfer["per_target"]
+            ]
+        else:
+            transfer_summary = _honest_row(epoch, "target_transfer", "interventions_disabled_in_foundation")
+            transfer_summary.update({"source_split": "train_audit", "phase": phase.name})
+            transfer_rows = [dict(transfer_summary)]
         epoch_dir = output / f"epoch_{epoch:03d}"
         visual_result = export_visual_audit(
             model, _audit_batches(audit_loader, grounding_index), epoch_dir,
@@ -1582,7 +2025,10 @@ def main() -> None:
             "visual_audit_manifest.json": visual_manifest,
         }
         prototype_rows = evaluation["prototype_rows"]
-        reason_rows = evaluation["reason_rows"]
+        reason_rows = evaluation["reason_rows"] + [
+            {"epoch": epoch, "source_split": "train_audit", "audit": "hidden_recovery", **row}
+            for row in hidden_recovery_rows
+        ]
         if phase.enable_pareto:
             visual_ap, routed_ap = collect_action_pareto_audit(
                 model, _audit_batches(audit_loader, grounding_index), device,
@@ -1601,7 +2047,10 @@ def main() -> None:
         train_core_readiness, train_audit_readiness, train_calib_readiness = _adaptive_readiness(
             epoch_train=epoch_train, factor_audit=factor_audit_payload, calibration_rows=calibration_rows,
             transfer_rows=transfer_rows, pareto_rows=pareto_rows, certificate_sha256=certificate_sha,
-            edge_admission_sha256=edge_sha,
+            edge_admission_sha256=edge_sha, certificate_snapshot=certificate_snapshot,
+            previous_certificate_tiers=certificate_tiers_before_epoch, ontology=model.ontology,
+            branch_readiness=branch_readiness, edge_document=edge_document,
+            previous_best_train_audit_joint=adaptive_schedule.best_train_audit_joint,
         )
         transition = adaptive_schedule.update(
             epoch=epoch, train_core_metrics=train_core_readiness,
@@ -1609,6 +2058,15 @@ def main() -> None:
         )
         transition["certificate_sha256"] = certificate_sha
         transition["edge_admission_sha256"] = edge_sha
+        current_train_audit_joint = float(branch_readiness["train_audit_joint"])
+        adaptive_schedule.record_train_audit_reference(
+            joint=current_train_audit_joint,
+            exp_map=float(branch_readiness["exp_map_final"]),
+            entered_safe_joint=(
+                transition["state_before"] != "SAFE_JOINT"
+                and transition["state_after"] == "SAFE_JOINT"
+            ),
+        )
         write_icdor_adaptive_schedule_transition(output, transition)
         if adaptive_schedule.failed_closed:
             raise RuntimeError(f"IC-DOR adaptive schedule failed closed: {adaptive_schedule.failure_reason}")
@@ -1654,20 +2112,44 @@ def main() -> None:
         pending_artifacts = [] if schema.get("pass") else [
             *schema.get("missing", []), *schema.get("invalid", []), *schema.get("semantic_errors", [])
         ]
+        final_certificate = (
+            json.loads(certificate_path.read_text(encoding="utf-8"))
+            if certificate_path.is_file() else {}
+        )
+        final_edge_document = (
+            json.loads(edge_path.read_text(encoding="utf-8"))
+            if edge_path.is_file() else {}
+        )
+        pilot_semantics = _pilot_semantic_validation(
+            adaptive_schedule.state_dict(), final_certificate, final_edge_document
+        )
         pilot_gate = {
             "git_head": _git_head(),
             "pass": (
                 bool(schema.get("pass")) and certificate_sha is not None and edge_sha is not None
-                and adaptive_schedule.safe_joint_epochs >= 1 and not adaptive_schedule.failed_closed
+                and pilot_semantics["pass"] is True
             ),
             "artifacts_complete": bool(schema.get("pass")),
             "pending_artifacts": pending_artifacts,
-            "certificate_sha256": certificate_sha,
-            "edge_admission_sha256": edge_sha,
+            "certificate_sha256": _sha256_file(certificate_path),
+            "edge_admission_sha256": _sha256_file(edge_path),
+            "certificate_semantic_sha256": certificate_sha,
+            "edge_admission_semantic_sha256": edge_sha,
             "epochs": completed_epochs,
             "source_split": "train_audit",
             "adaptive_schedule": adaptive_schedule.state_dict(),
+            "semantic_validation": pilot_semantics,
             "schema_validation": schema,
+            "evidence_files": {
+                "factor_certificate": {
+                    "path": str(certificate_path.resolve()),
+                    "sha256": _sha256_file(certificate_path),
+                },
+                "edge_admission": {
+                    "path": str(edge_path.resolve()),
+                    "sha256": _sha256_file(edge_path),
+                },
+            },
         }
         _write_json(output / "pilot_gate.json", pilot_gate)
         if pilot_gate["pass"] is not True:

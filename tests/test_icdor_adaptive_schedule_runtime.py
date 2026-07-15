@@ -8,6 +8,23 @@ import torch
 from torch import nn
 
 from fate_oia.engine.mosaic_icdor_adaptive_schedule import ICDORAdaptiveSchedule
+
+
+def test_train_audit_references_survive_checkpoint_state_roundtrip() -> None:
+    source = ICDORAdaptiveSchedule(pilot=True)
+    source.record_train_audit_reference(
+        joint=0.61, exp_map=0.42, entered_safe_joint=False
+    )
+    source.record_train_audit_reference(
+        joint=0.59, exp_map=0.43, entered_safe_joint=True
+    )
+    payload = source.state_dict()
+
+    restored = ICDORAdaptiveSchedule(pilot=True)
+    restored.load_state_dict(payload)
+
+    assert restored.best_train_audit_joint == pytest.approx(0.61)
+    assert restored.safe_joint_entry_exp_map == pytest.approx(0.43)
 from fate_oia.engine.train_acpr_mosaic_trust_icdor import (
     _adaptive_phase,
     _build_rank_queues,

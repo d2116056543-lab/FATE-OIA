@@ -57,12 +57,14 @@ class _AuditModel(torch.nn.Module):
         }[factor_ablation_mode]
         probability = torch.tensor(probabilities, device=images.device)
         masks = torch.zeros(4, 2, 8, 8, device=images.device)
-        masks[:2, 0, 0, 0] = 1.0
+        masks[:, 0, 0, 0] = 1.0
         masks[1, 0, 0, 0] = 0.0
         masks[1, 0, 0, 1] = 1.0
         masks[2:, 1, 6, 6] = 1.0
         masks[3, 1, 6, 6] = 0.0
         masks[3, 1, 6, 5] = 1.0
+        # Every selected factor needs an independent same-type identity arm.
+        masks[:, 1, 4, 4] = 1.0
         override = _.get("factor_mask_override")
         if isinstance(override, torch.Tensor):
             masks = override.to(images.device)
@@ -127,6 +129,16 @@ class ICDORAuditCollectorsTest(unittest.TestCase):
         )
 
         self.assertEqual(result["source_split"], "train_audit")
+        self.assertEqual(
+            result["audit_integrity"],
+            {
+                "collector_completed": True,
+                "exception": None,
+                "unknown_policy": "excluded_from_binary_metrics",
+                "unknown_rows_total": 0,
+                "unknown_rows_in_metric_total": 0,
+            },
+        )
         record = result["factor_stats"]["f0"]
         self.assertEqual(record["counts"]["confirmed_positive"], 2)
         self.assertGreater(record["scores"]["full"], record["scores"]["prior_only"])
@@ -139,6 +151,23 @@ class ICDORAuditCollectorsTest(unittest.TestCase):
             set(record["bootstrap_lcb95"]),
             {"full_minus_prior_only", "query_shuffle_drop", "image_shuffle_drop", "grounding_minus_random"},
         )
+
+    def test_factor_collector_proves_unknown_rows_are_excluded(self) -> None:
+        class _UnknownGrounding(_Grounding):
+            def __call__(self, records, *, device: torch.device, split: str):
+                result = super().__call__(records, device=device, split=split)
+                result["presence_known_mask"][3, 0] = 0.0
+                return result
+
+        result = collect_factor_audit(
+            _AuditModel(), [_batch()], _UnknownGrounding(),
+            factor_names=("f0", "f1"), device=torch.device("cpu"),
+            bootstrap_replicates=16, bootstrap_seed=7,
+        )
+        integrity = result["audit_integrity"]
+        self.assertEqual(integrity["unknown_rows_total"], 1)
+        self.assertEqual(integrity["unknown_rows_in_metric_total"], 0)
+        self.assertEqual(integrity["unknown_policy"], "excluded_from_binary_metrics")
 
     def test_collectors_reject_test_input_and_edge_collector_uses_matched_interventions(self) -> None:
         with self.assertRaisesRegex(ValueError, "train_audit"):
@@ -168,8 +197,12 @@ class ICDORAuditCollectorsTest(unittest.TestCase):
         })
         self.assertGreater(edge["metrics"]["tet"], edge["metrics"]["tes"])
         self.assertGreaterEqual(edge["metrics"]["tes"], 0.0)
-        self.assertEqual(edge["metrics"]["tes_identity"], 0.0)
+        self.assertGreaterEqual(edge["metrics"]["tes_identity"], 0.0)
         self.assertGreaterEqual(edge["metrics"]["tes_spatial"], 0.0)
+        identity_arm = edge["matched_control_arms"][0]
+        self.assertEqual(identity_arm["control_type"], "same_type_identity")
+        self.assertEqual(identity_arm["identity_source_factor_names"], ["f1"])
+        self.assertTrue(all(arm["spatial_offsets"] for arm in edge["matched_control_arms"][1:]))
         self.assertGreaterEqual(edge["metrics"]["ap_delta"], 0.0)
         self.assertGreaterEqual(edge["metrics"]["isolated_edge_ap"], edge["metrics"]["visual_ap"])
         self.assertEqual(
