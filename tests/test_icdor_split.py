@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 
 from fate_oia.datasets.mosaic_icdor_split import make_icdor_train_splits
+from fate_oia.engine import train_acpr_mosaic_trust_icdor as trainer
 
 
 @dataclass(frozen=True)
@@ -69,3 +71,39 @@ def test_icdor_split_rejects_non_train_metadata() -> None:
     dataset.samples[0] = _Sample("test", sample.file_name, sample.action, sample.reason)
     with pytest.raises(ValueError, match="train samples only"):
         make_icdor_train_splits(dataset, seed=20260713)
+
+
+def test_factor_aware_audit_subset_balances_real_geometry_availability(monkeypatch: pytest.MonkeyPatch) -> None:
+    dataset = _dataset(6)
+    geometry = {
+        "frame_0000.jpg": ("car", None),
+        "frame_0001.jpg": ("traffic light", None),
+        "frame_0002.jpg": (None, "drivable"),
+        "frame_0003.jpg": ("car", "drivable"),
+        "frame_0004.jpg": ("traffic light", None),
+        "frame_0005.jpg": (None, None),
+    }
+
+    class _Index:
+        def lookup(self, file_name: str) -> SimpleNamespace:
+            label_json, drivable_map = geometry[file_name]
+            return SimpleNamespace(label_json=label_json, drivable_map=drivable_map)
+
+    monkeypatch.setattr(
+        trainer,
+        "load_bdd100k_objects",
+        lambda label_json: [{"category": label_json}] if label_json else [],
+    )
+
+    selected = trainer._factor_aware_audit_subset(
+        dataset, range(6), 3, grounding_index=_Index(), seed=20260713,
+    )
+
+    assert len(selected) == 3
+    assert selected == trainer._factor_aware_audit_subset(
+        dataset, range(6), 3, grounding_index=_Index(), seed=20260713,
+    )
+    selected_names = {dataset.samples[index].file_name for index in selected}
+    assert any(geometry[name][0] == "car" for name in selected_names)
+    assert any(geometry[name][0] == "traffic light" for name in selected_names)
+    assert any(geometry[name][1] == "drivable" for name in selected_names)

@@ -760,7 +760,7 @@ def _factor_aware_audit_subset(
         return int.from_bytes(digest, "big", signed=False), index
 
     availability = [sum(values[group] for values in tags.values()) for group in range(3)]
-    targets = [min(count, max(1, round(total * limit / len(candidates)))) if total else 0 for total in availability]
+    targets = [max(1, round(total * limit / len(candidates))) if total else 0 for total in availability]
     selected: set[int] = set()
     selected_counts = [0, 0, 0]
     while len(selected) < limit:
