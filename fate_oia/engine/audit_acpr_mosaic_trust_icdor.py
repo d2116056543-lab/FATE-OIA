@@ -335,9 +335,17 @@ def source_hard_gate(worktree_root: str | Path) -> dict[str, Any]:
     if not source_path.is_file():
         raise ICDORAuditError(f"formal model source is missing: {source_path}")
     source = source_path.read_text(encoding="utf-8")
-    required = ("self.dino(images)", "self.action_adapter", "self.reason_adapter", "return_masks")
+    required = (
+        "BatchLocalDinoFieldReuse",
+        "_batch_field_reuse(images)",
+        "clear_batch_field_reuse",
+        "self.action_adapter",
+        "self.reason_adapter",
+        "return_masks",
+    )
     missing = [token for token in required if token not in source]
     forbidden = ("MOSAICSupportVetoComposer(", "MOSAICActionDecoder(", "MOSAICReasonDecoder(")
+    forbidden = forbidden + ("self.dino(images)",)
     present = [token for token in forbidden if token in source]
     if missing or present:
         raise ICDORAuditError(f"source hard gate failed; missing={missing}, forbidden={present}")
