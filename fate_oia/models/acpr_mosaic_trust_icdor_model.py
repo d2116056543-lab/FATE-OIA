@@ -9,6 +9,7 @@ from torch import nn
 
 from .mosaic_group_threshold import MOSAICGroupThresholdHead
 from .mosaic_action_route_policy import compose_final_action_logits
+from .mosaic_batch_field_reuse import BatchLocalDinoFieldReuse
 from .mosaic_continuous_credibility import ContinuousVisualCredibility
 from .mosaic_icdor_action_decoder import MOSAICICDORActionDecoder
 from .mosaic_icdor_dual_reason_decoder import (
@@ -81,6 +82,9 @@ class MOSAICTrustICDORModel(nn.Module):
             use_mock_dino=use_mock_dino,
             mock_dim=mock_dim,
         )
+        # Reuse one DINO field for same-batch branch ablations only. The
+        # trainer clears this explicitly at every batch boundary.
+        self._batch_field_reuse = BatchLocalDinoFieldReuse(self.dino)
         dim = self.dino.dim
         # Separate trainable pyramids make the gradient firewall structural,
         # not merely a detach convention over a shared visual representation.
@@ -212,6 +216,11 @@ class MOSAICTrustICDORModel(nn.Module):
         self.action_router.set_edge_admission(edge_admission_mask)
 
     @torch.no_grad()
+    def clear_batch_field_reuse(self) -> None:
+        """Prevent a field from surviving into the next input batch."""
+        self._batch_field_reuse.clear()
+
+    @torch.no_grad()
     def set_route_gate_cap(self, cap: float) -> None:
         self.action_rereader.set_gate_cap(cap)
 
@@ -244,7 +253,11 @@ class MOSAICTrustICDORModel(nn.Module):
             prior_mode = factor_ablation_mode
         # Audit interventions may reuse this batch-local field. It is never
         # persisted, never reused across samples/batches, and contains no labels.
-        field = self.dino(images) if precomputed_dino_field is None else precomputed_dino_field
+        field = (
+            self._batch_field_reuse(images)
+            if precomputed_dino_field is None
+            else precomputed_dino_field
+        )
         if not isinstance(field, Mapping) or "patch_tokens_by_layer" not in field or "grid_hw" not in field:
             raise ValueError("IC-DOR precomputed DINO field is invalid")
         field_tokens = field["patch_tokens_by_layer"]

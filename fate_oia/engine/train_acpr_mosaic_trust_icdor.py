@@ -1261,6 +1261,7 @@ def train_icdor_epoch(
     start = time.perf_counter()
     for step, cpu_batch in enumerate(loader):
         load_done = time.perf_counter()
+        model.clear_batch_field_reuse()
         first_cpu, second_cpu, _, second_metadata = build_icdor_multiview_batch(cpu_batch["image"], multiview)
         first = first_cpu.to(device, non_blocking=True)
         second = second_cpu.to(device, non_blocking=True)
@@ -1354,6 +1355,7 @@ def fit_icdor_calibration(
     reason_targets: list[torch.Tensor] = []
     with torch.no_grad():
         for batch in loader:
+            model.clear_batch_field_reuse()
             output = model(batch["image"].to(device, non_blocking=True), route_mode=route_mode, latent_enabled=latent_enabled)
             action_logits.append(output["action_logits_raw"].detach())
             reason_logits.append(output["reason_logits_raw"].detach())
@@ -1491,6 +1493,7 @@ def collect_action_pareto_audit(
     model.eval()
     try:
         for batch in loader:
+            model.clear_batch_field_reuse()
             output = model(
                 batch["image"].to(device), route_mode=route_mode,
                 latent_enabled=latent_enabled, return_masks=False,
@@ -1544,6 +1547,7 @@ def collect_train_audit_branch_readiness(
             split_values = [split] if isinstance(split, str) else list(split or [])
             if not split_values or any(value != "train_audit" for value in split_values):
                 raise ValueError("IC-DOR readiness collector accepts train_audit only")
+            model.clear_batch_field_reuse()
             images = batch["image"].to(device, non_blocking=True)
             action_labels = batch["action"].to(device, non_blocking=True).float()
             reason_labels = batch["reason"].to(device, non_blocking=True).float()
