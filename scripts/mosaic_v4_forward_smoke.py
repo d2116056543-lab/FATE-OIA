@@ -7,9 +7,14 @@ training loop. It prints stage markers so remote DINO/data stalls are visible.
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 import torch
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from fate_oia.engine.train_acpr_mosaic_trust_icdor import (
     build_icdor_loaders,
