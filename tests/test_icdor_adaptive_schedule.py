@@ -7,6 +7,8 @@ import pytest
 
 def _foundation_ready() -> dict[str, object]:
     return {
+        "continuous_credibility_available": True,
+        "observable_cV_gt_030": 6,
         "factor_audit_complete": True,
         "factor_audit_exception": False,
         "unknown_abstained": True,
@@ -31,8 +33,8 @@ def test_adaptive_schedule_enforces_state_side_effects_and_two_epoch_readiness()
     machine = module.ICDORAdaptiveSchedule(pilot=True)
     assert machine.state == "FOUNDATION"
     policy = machine.policy()
-    assert policy.route_mode == "off"
-    assert policy.action_rank_weight == 0.0 and policy.reason_rank_weight == 0.0
+    assert policy.route_mode == "shadow"
+    assert policy.action_rank_weight == 0.10 and policy.reason_rank_weight == 0.05
     assert policy.write_provisional_certificate is True
     for epoch in range(3):
         machine.update(
@@ -54,7 +56,7 @@ def test_adaptive_schedule_enforces_state_side_effects_and_two_epoch_readiness()
         )
 
 
-def test_adaptive_schedule_fails_closed_at_state_maximum() -> None:
+def test_adaptive_schedule_keeps_shadow_learning_when_certificate_is_missing() -> None:
     module = importlib.import_module("fate_oia.engine.mosaic_icdor_adaptive_schedule")
     machine = module.ICDORAdaptiveSchedule(pilot=False)
     bad = _foundation_ready()
@@ -66,8 +68,9 @@ def test_adaptive_schedule_fails_closed_at_state_maximum() -> None:
             train_calib_metrics=_calib_ready(),
             train_core_metrics=_core_ready(),
         )
-    assert machine.failed_closed is True
+    assert machine.failed_closed is False
     assert machine.full_train_eligible is False
+    assert machine.policy().route_mode == "shadow"
 
 
 def test_adaptive_schedule_requires_finite_train_calib_for_transition() -> None:
@@ -82,5 +85,6 @@ def test_adaptive_schedule_requires_finite_train_calib_for_transition() -> None:
             train_core_metrics=_core_ready(),
         )
     assert machine.state == "FOUNDATION"
-    assert machine.failed_closed is True
+    assert machine.failed_closed is False
     assert machine.history[-1]["ready"] is False
+    assert machine.policy().route_mode == "shadow"
