@@ -50,6 +50,7 @@ def build_edge_admission(
     factor_tiers: Sequence[str],
     *,
     source_split: str,
+    credibility_min: float = 0.80,
 ) -> MOSAICEdgeAdmission:
     """Freeze only audit-proven Certified factor-to-action edges."""
     if source_split not in {"audit_target", "train_audit"}:
@@ -92,7 +93,13 @@ def build_edge_admission(
                 action_visual_ap[action_id] = max(action_visual_ap[action_id], float(stats.visual_ap))
                 action_edge_ap[action_id] = max(action_edge_ap[action_id], float(stats.isolated_edge_ap))
     partial_action_ready = partial_action_admission(
-        action_credibility, action_tet, action_tes, action_cca, action_visual_ap, action_edge_ap
+        action_credibility,
+        action_tet,
+        action_tes,
+        action_cca,
+        action_visual_ap,
+        action_edge_ap,
+        credibility_min=credibility_min,
     )
     admission = torch.zeros_like(candidate)
     entries: dict[str, dict[str, Any]] = {}

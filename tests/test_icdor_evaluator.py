@@ -39,6 +39,28 @@ class _EvalModel(nn.Module):
         }
 
 
+class _FineTransportEvalModel(_EvalModel):
+    fine_transport_diagnostics = {"fine_off": True, "coarse_off": True}
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.factor_mask_modes: list[str] = []
+
+    def forward(self, images: torch.Tensor, *, factor_mask_mode: str = "configured", **kwargs: object):
+        self.factor_mask_modes.append(factor_mask_mode)
+        output = super().forward(images, **kwargs)
+        delta = {"configured": 0.0, "coarse": -0.25, "fine": 0.25}[factor_mask_mode]
+        for key in (
+            "action_visual_logits", "action_shadow_logits", "action_final_logits", "action_logits_deploy",
+        ):
+            output[key] = output[key] + delta
+        for key in (
+            "reason_visual_observed_logits", "reason_logits_latent", "reason_observed_logits", "reason_logits_deploy",
+        ):
+            output[key] = output[key] + delta
+        return output
+
+
 def test_evaluator_reports_all_icdor_action_reason_branches_without_test_mutation() -> None:
     loader = [{
         "image": torch.zeros(2, 3, 8, 8),
@@ -72,3 +94,21 @@ def test_evaluator_reports_all_icdor_action_reason_branches_without_test_mutatio
     assert all("route_to_visual_rms_ratio" in row for row in summaries)
     assert result["failure_rows"]
     assert result["failure_rows"][0]["file_name"] in {"a.jpg", "b.jpg"}
+
+
+def test_evaluator_executes_configured_fine_transport_counterfactuals() -> None:
+    loader = [{
+        "image": torch.zeros(2, 3, 8, 8),
+        "action": torch.tensor([[1, 0, 0, 0], [1, 0, 0, 0]]),
+        "reason": torch.cat((torch.ones(2, 1), torch.zeros(2, 20)), dim=1),
+        "file_name": ["a.jpg", "b.jpg"],
+        "split": ["test", "test"],
+    }]
+    model = _FineTransportEvalModel()
+    result = evaluate_icdor(model, loader, torch.device("cpu"), epoch=0, route_mode="off", latent_enabled=False)
+
+    assert {"configured", "coarse", "fine"} <= set(model.factor_mask_modes)
+    assert set(result["branch_metrics"]["fine_transport"]) == {"fine_off", "coarse_off"}
+    assert {"action", "reason"} <= set(result["branch_metrics"]["fine_transport"]["fine_off"])
+    assert result["fine_transport_rows"][0]["fine_off_available"] is True
+    assert result["fine_transport_rows"][0]["coarse_off_available"] is True

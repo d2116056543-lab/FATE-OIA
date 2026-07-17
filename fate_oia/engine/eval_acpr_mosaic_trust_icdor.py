@@ -86,6 +86,14 @@ def evaluate_icdor(
     }
     fine_transport_rows: list[dict[str, Any]] = []
     route_ownership_rows: list[dict[str, Any]] = []
+    fine_transport_diagnostics = getattr(model, "fine_transport_diagnostics", {})
+    run_fine_off = bool(getattr(fine_transport_diagnostics, "get", lambda *_: False)("fine_off", False))
+    run_coarse_off = bool(getattr(fine_transport_diagnostics, "get", lambda *_: False)("coarse_off", False))
+    fine_transport_logits: dict[str, dict[str, list[torch.Tensor]]] = {
+        name: {"action": [], "reason": []}
+        for name, enabled in (("fine_off", run_fine_off), ("coarse_off", run_coarse_off))
+        if enabled
+    }
     sample_count = 0
     for batch in loader:
         splits = batch["split"] if isinstance(batch["split"], list) else [batch["split"]]
@@ -95,6 +103,28 @@ def evaluate_icdor(
         action_labels = batch["action"].to(device, non_blocking=True)
         reason_labels = batch["reason"].to(device, non_blocking=True)
         output = model(images, route_mode=route_mode, latent_enabled=latent_enabled, return_masks=True, reason_route_mode="full", return_diagnostics=True)
+        fine_transport_outputs: dict[str, dict[str, Any]] = {}
+        if run_fine_off:
+            fine_transport_outputs["fine_off"] = model(
+                images,
+                route_mode=route_mode,
+                latent_enabled=latent_enabled,
+                return_masks=False,
+                reason_route_mode="full",
+                factor_mask_mode="coarse",
+            )
+        if run_coarse_off:
+            fine_transport_outputs["coarse_off"] = model(
+                images,
+                route_mode=route_mode,
+                latent_enabled=latent_enabled,
+                return_masks=False,
+                reason_route_mode="full",
+                factor_mask_mode="fine",
+            )
+        for name, branch_output in fine_transport_outputs.items():
+            fine_transport_logits[name]["action"].append(branch_output["action_final_logits"].detach().float().cpu())
+            fine_transport_logits[name]["reason"].append(branch_output["reason_observed_logits"].detach().float().cpu())
         output_keys = {
             "action_visual_logits.pt": "action_visual_logits",
             "action_shadow_logits.pt": "action_shadow_logits",
@@ -164,6 +194,24 @@ def evaluate_icdor(
             "anchor_separation_mean": float(measurement.get("anchor_separation_mean", 0.0)),
             "sample_attention_support_mean": float(measurement.get("sample_attention_support_mean", 0.0)),
             "typed_coordinates_present": bool(isinstance(output.get("sampling_coordinates"), torch.Tensor)),
+            "fine_off_available": run_fine_off,
+            "coarse_off_available": run_coarse_off,
+            "fine_off_action_delta_abs_mean": (
+                float((fine_transport_outputs["fine_off"]["action_final_logits"] - output["action_final_logits"]).abs().mean())
+                if "fine_off" in fine_transport_outputs else None
+            ),
+            "fine_off_reason_delta_abs_mean": (
+                float((fine_transport_outputs["fine_off"]["reason_observed_logits"] - output["reason_observed_logits"]).abs().mean())
+                if "fine_off" in fine_transport_outputs else None
+            ),
+            "coarse_off_action_delta_abs_mean": (
+                float((fine_transport_outputs["coarse_off"]["action_final_logits"] - output["action_final_logits"]).abs().mean())
+                if "coarse_off" in fine_transport_outputs else None
+            ),
+            "coarse_off_reason_delta_abs_mean": (
+                float((fine_transport_outputs["coarse_off"]["reason_observed_logits"] - output["reason_observed_logits"]).abs().mean())
+                if "coarse_off" in fine_transport_outputs else None
+            ),
         })
         mix_gate = output.get("reason_observed_mix_gate", 0.0)
         mix_gate_mean = float(mix_gate.mean()) if isinstance(mix_gate, torch.Tensor) else float(mix_gate)
@@ -242,6 +290,13 @@ def evaluate_icdor(
         "factor_route_shuffled": _metrics(reason_route_shuffled_logits, reason_labels, "Exp"),
         "threshold_off": _metrics(tensors["reason_observed_logits.pt"], reason_labels, "Exp"),
         "deploy": _metrics(tensors["reason_deploy_logits.pt"], reason_labels, "Exp"),
+    }
+    fine_transport_branches = {
+        name: {
+            "action": _metrics(torch.cat(values["action"], dim=0), action_labels, "Act"),
+            "reason": _metrics(torch.cat(values["reason"], dim=0), reason_labels, "Exp"),
+        }
+        for name, values in fine_transport_logits.items()
     }
     action_oracle_thresholds, action_oracle = tune_per_label_thresholds(tensors["action_final_logits.pt"], action_labels)
     reason_oracle_thresholds, reason_oracle = tune_per_label_thresholds(tensors["reason_observed_logits.pt"], reason_labels)
@@ -350,7 +405,12 @@ def evaluate_icdor(
     }
     return {
         "metrics_summary": metrics_summary,
-        "branch_metrics": {"available": True, "action": action_branches, "reason": reason_branches},
+        "branch_metrics": {
+            "available": True,
+            "action": action_branches,
+            "reason": reason_branches,
+            "fine_transport": fine_transport_branches,
+        },
         "per_label_metrics": per_label,
         "factor_rows": factor_rows,
         "prototype_rows": prototype_rows,

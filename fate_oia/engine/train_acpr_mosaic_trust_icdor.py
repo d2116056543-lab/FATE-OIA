@@ -642,6 +642,24 @@ def load_config(path: str | Path) -> dict[str, Any]:
             "separate_visual_pyramids": True,
             "action_set_final": False,
         },
+        "credibility": {
+            "independent_of_reason_labels": True,
+            "observable_cV_min_for_admission": 0.80,
+            "bootstrap_replicates": 1000,
+            "ema_decay": 0.90,
+            "image_only_cap": 0.10,
+            "unknown_cap": 0.0,
+            "no_reliable_negative_cap": 0.25,
+        },
+        "fine_transport": {
+            "enabled": True,
+            "point_eta": 0.70,
+            "curve_eta": 0.80,
+            "region_eta": 0.60,
+            "local_reread_offset_max": 0.08,
+            "fine_off_diagnostic": True,
+            "coarse_off_diagnostic": True,
+        },
         "training": {"epochs": 12, "no_metric_early_stop": True},
         "calibration": {
             "enabled": True,
@@ -957,6 +975,8 @@ def build_icdor_model(config: dict[str, Any], *, use_mock_dino: bool = False, mo
     reason = model_config["reason"]
     observation = config["selective_observation"]
     backbone = config["backbone"]
+    credibility = config["credibility"]
+    fine_transport = config["fine_transport"]
     return MOSAICTrustICDORModel(
         config_root=Path("configs"),
         backbone_arch=str(backbone["arch"]),
@@ -984,9 +1004,25 @@ def build_icdor_model(config: dict[str, Any], *, use_mock_dino: bool = False, mo
         gate_init=float(route["gate_init"]),
         gate_max=float(route["gate_max"]),
         pi_min=float(observation["pi_min"]),
-        pi_max=float(observation["pi_max"]),
-        observed_mix_init=float(reason["observed_mix_init"]),
-    )
+          pi_max=float(observation["pi_max"]),
+          observed_mix_init=float(reason["observed_mix_init"]),
+          credibility_independent_of_reason_labels=bool(credibility["independent_of_reason_labels"]),
+          action_credibility_min_for_admission=float(credibility["observable_cV_min_for_admission"]),
+          credibility_ema_decay=float(credibility["ema_decay"]),
+          credibility_image_only_cap=float(credibility["image_only_cap"]),
+          credibility_unknown_cap=float(credibility["unknown_cap"]),
+          credibility_no_reliable_negative_cap=float(credibility["no_reliable_negative_cap"]),
+          fine_transport_enabled=bool(fine_transport["enabled"]),
+          fine_eta_by_type={
+              "point": float(fine_transport["point_eta"]),
+              "object": float(fine_transport["point_eta"]),
+              "curve": float(fine_transport["curve_eta"]),
+              "region": float(fine_transport["region_eta"]),
+          },
+          local_reread_offset_max=float(fine_transport["local_reread_offset_max"]),
+          fine_off_diagnostic=bool(fine_transport["fine_off_diagnostic"]),
+          coarse_off_diagnostic=bool(fine_transport["coarse_off_diagnostic"]),
+      )
 
 
 def build_icdor_contradiction_mask(model: MOSAICTrustICDORModel) -> torch.Tensor:
@@ -1903,6 +1939,8 @@ def _record_resolved_config_usage(
         "optimizer": ("fate_oia/engine/train_acpr_mosaic_trust_icdor.py", "build_icdor_optimizer/_scheduler"),
         "training": ("fate_oia/engine/train_acpr_mosaic_trust_icdor.py", "train_icdor_epoch/main"),
         "calibration": ("fate_oia/engine/train_acpr_mosaic_trust_icdor.py", "fit_icdor_calibration"),
+        "credibility": ("fate_oia/engine/train_acpr_mosaic_trust_icdor.py", "build_icdor_model/refresh_model_visual_credibility"),
+        "fine_transport": ("fate_oia/engine/train_acpr_mosaic_trust_icdor.py", "build_icdor_model/evaluate_icdor"),
     }
     diagnostic_sections = {
         "experiment": ("fate_oia/engine/train_acpr_mosaic_trust_icdor.py", "load_config/run_manifest"),
@@ -2194,7 +2232,11 @@ def main() -> None:
             _write_json(output / "edge_intervention_stats.json", edge_payload)
             tiers = [json.loads(certificate_path.read_text(encoding="utf-8"))["entries"][name]["tier"] for name in factor_names]
             admission = build_edge_admission(
-                _edge_statistics_from_audit(edge_payload), model.ontology, tiers, source_split="audit_target"
+                _edge_statistics_from_audit(edge_payload),
+                model.ontology,
+                tiers,
+                source_split="audit_target",
+                credibility_min=float(model.action_credibility_min_for_admission),
             )
             edge_document = admission.to_dict()
             _write_json(edge_path, edge_document)

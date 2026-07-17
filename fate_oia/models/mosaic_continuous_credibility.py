@@ -35,6 +35,9 @@ def visual_credibility_from_measurements(
     factor_role: str = "observable",
     reliable_negative: torch.Tensor | None = None,
     source_kind: str = "grounded",
+    image_only_cap: float = 0.10,
+    unknown_cap: float = 0.0,
+    no_reliable_negative_cap: float = 0.25,
 ) -> dict[str, torch.Tensor]:
     """Combine visual-only credibility measurements with explicit safety caps."""
     values = [content_score, prior_score, query_shuffle_score, image_shuffle_score, grounding_score, stability_score, n_eff]
@@ -43,6 +46,10 @@ def visual_credibility_from_measurements(
         raise ValueError("visual credibility measurements must share one shape")
     if not all(torch.isfinite(value).all() for value in values):
         raise ValueError("visual credibility measurements must be finite")
+    if not 0.0 <= image_only_cap <= 1.0 or not 0.0 <= no_reliable_negative_cap <= 1.0:
+        raise ValueError("credibility caps must be in [0,1]")
+    if float(unknown_cap) != 0.0:
+        raise ValueError("unknown-source credibility must remain zero")
     content = content_score.clamp(0.0, 1.0)
     prior = prior_score.clamp(0.0, 1.0)
     query = query_shuffle_score.clamp(0.0, 1.0)
@@ -64,13 +71,15 @@ def visual_credibility_from_measurements(
     )
     credibility = (1.0 - torch.exp(-effective / 32.0)) * components
     if source_kind == "image_only":
-        credibility = credibility.clamp_max(0.10)
+        credibility = credibility.clamp_max(image_only_cap)
     if factor_role in {"latent", "unsupported"}:
-        credibility = credibility.clamp_max(0.25)
+        credibility = credibility.clamp_max(no_reliable_negative_cap)
     if reliable_negative is not None:
-        credibility = torch.where(reliable_negative.to(torch.bool), credibility, credibility.clamp_max(0.25))
+        credibility = torch.where(
+            reliable_negative.to(torch.bool), credibility, credibility.clamp_max(no_reliable_negative_cap)
+        )
     else:
-        credibility = credibility.clamp_max(0.25)
+        credibility = credibility.clamp_max(no_reliable_negative_cap)
     if source_kind == "unknown":
         credibility = torch.zeros_like(credibility)
     return {
@@ -107,13 +116,25 @@ class ContinuousVisualCredibility(nn.Module):
         ema_decay: float = 0.90,
         factor_roles: list[str] | tuple[str, ...] | None = None,
         source_kinds: list[str] | tuple[str, ...] | None = None,
+        image_only_cap: float = 0.10,
+        unknown_cap: float = 0.0,
+        no_reliable_negative_cap: float = 0.25,
     ) -> None:
         super().__init__()
         if factor_count <= 0 or dim <= 0:
             raise ValueError("factor_count and dim must be positive")
         self.factor_count = int(factor_count)
         self.dim = int(dim)
+        if not 0.0 <= float(ema_decay) < 1.0:
+            raise ValueError("credibility EMA decay must be in [0,1)")
+        if not 0.0 <= float(image_only_cap) <= 1.0 or not 0.0 <= float(no_reliable_negative_cap) <= 1.0:
+            raise ValueError("credibility caps must be in [0,1]")
+        if float(unknown_cap) != 0.0:
+            raise ValueError("unknown-source credibility must remain zero")
         self.ema_decay = float(ema_decay)
+        self.image_only_cap = float(image_only_cap)
+        self.unknown_cap = float(unknown_cap)
+        self.no_reliable_negative_cap = float(no_reliable_negative_cap)
         factor_roles = tuple(factor_roles or ("observable",) * factor_count)
         source_kinds = tuple(source_kinds or ("grounded",) * factor_count)
         if len(factor_roles) != factor_count or len(source_kinds) != factor_count:
@@ -121,11 +142,11 @@ class ContinuousVisualCredibility(nn.Module):
         caps = []
         for role, source_kind in zip(factor_roles, source_kinds):
             if source_kind == "unknown":
-                caps.append(0.0)
+                caps.append(self.unknown_cap)
             elif source_kind == "image_only":
-                caps.append(0.10)
+                caps.append(self.image_only_cap)
             elif role in {"latent", "unsupported"} or source_kind == "proxy":
-                caps.append(0.25)
+                caps.append(self.no_reliable_negative_cap)
             else:
                 caps.append(1.0)
         self.register_buffer("factor_credibility_cap", torch.tensor(caps, dtype=torch.float32), persistent=True)

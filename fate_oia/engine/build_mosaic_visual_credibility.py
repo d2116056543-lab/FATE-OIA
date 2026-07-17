@@ -36,6 +36,9 @@ def build_visual_credibility(
     factor_names: Sequence[str],
     factor_roles: Sequence[str],
     source_kinds: Sequence[str],
+    image_only_cap: float = 0.10,
+    unknown_cap: float = 0.0,
+    no_reliable_negative_cap: float = 0.25,
 ) -> dict[str, Any]:
     """Return the bounded per-factor CREDO visual credibility vector.
 
@@ -69,6 +72,9 @@ def build_visual_credibility(
             factor_role=str(role),
             reliable_negative=reliability,
             source_kind=str(source_kind),
+            image_only_cap=image_only_cap,
+            unknown_cap=unknown_cap,
+            no_reliable_negative_cap=no_reliable_negative_cap,
         )
         values.append(float(measurement["cV"].item()))
         for key in _MEASUREMENT_KEYS:
@@ -100,6 +106,9 @@ def refresh_model_visual_credibility(model: Any, audit_payload: Mapping[str, Any
         factor_names=names,
         factor_roles=tuple(str(factor.get("role", "observable")) for factor in factors),
         source_kinds=tuple(str(factor.get("source_kind", "grounded")) for factor in factors),
+        image_only_cap=float(credibility_module.image_only_cap),
+        unknown_cap=float(credibility_module.unknown_cap),
+        no_reliable_negative_cap=float(credibility_module.no_reliable_negative_cap),
     )
     result["credibility"] = credibility_module.update_from_audit(result["credibility"])
     return result

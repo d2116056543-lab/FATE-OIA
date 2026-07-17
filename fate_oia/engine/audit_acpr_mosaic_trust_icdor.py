@@ -30,7 +30,7 @@ _REQUIRED_FORWARD_OUTPUTS = (
 )
 
 _V4_REQUIRED_FORWARD_OUTPUTS = (
-    "cV", "cV_ema", "factor_soft_masks", "factor_coarse_masks",
+    "cV", "cV_ema", "factor_soft_masks", "factor_fine_masks", "factor_coarse_masks",
     "sampling_coordinates", "sampled_features", "sample_attention",
     "action_shadow_logits", "action_final_logits", "action_visual_logits",
     "reason_visual_logits", "reason_latent_logits", "reason_final_logits",
@@ -297,9 +297,36 @@ def verify_v4_forward_contract(model: nn.Module, images: torch.Tensor) -> dict[s
         raise ICDORAuditError("v4 shadow route changed final action before admission")
     if output["factor_soft_masks"].shape != output["factor_coarse_masks"].shape:
         raise ICDORAuditError("v4 fine/coarse evidence masks have inconsistent shape")
-    delta = (output["factor_soft_masks"] - output["factor_coarse_masks"]).abs().mean()
+    fine_output = model(
+        images, route_mode="shadow", latent_enabled=True, reason_route_mode="full",
+        return_masks=True, factor_mask_mode="fine",
+    )
+    coarse_output = model(
+        images, route_mode="shadow", latent_enabled=True, reason_route_mode="full",
+        return_masks=True, factor_mask_mode="coarse",
+    )
+    if not torch.allclose(fine_output["factor_soft_masks"], fine_output["factor_fine_masks"]):
+        raise ICDORAuditError("v4 fine transport override did not select typed fine masks")
+    if not torch.allclose(coarse_output["factor_soft_masks"], coarse_output["factor_coarse_masks"]):
+        raise ICDORAuditError("v4 coarse transport override did not select coarse masks")
+    delta = (fine_output["factor_soft_masks"] - coarse_output["factor_soft_masks"]).abs().mean()
     if not torch.isfinite(delta) or float(delta) <= 0.0:
         raise ICDORAuditError("v4 fine transport is identical to coarse transport")
+    credibility_runtime = {
+        "independent_of_reason_labels": bool(getattr(model, "credibility_independent_of_reason_labels", False)),
+        "admission_min": float(getattr(model, "action_credibility_min_for_admission", -1.0)),
+        "ema_decay": float(getattr(model.continuous_credibility, "ema_decay", -1.0)),
+        "image_only_cap": float(getattr(model.continuous_credibility, "image_only_cap", -1.0)),
+        "unknown_cap": float(getattr(model.continuous_credibility, "unknown_cap", -1.0)),
+        "no_reliable_negative_cap": float(getattr(model.continuous_credibility, "no_reliable_negative_cap", -1.0)),
+    }
+    fine_runtime = {
+        "enabled": bool(getattr(model.factor_extractor, "fine_transport_enabled", False)),
+        "eta_by_type": dict(getattr(model.factor_extractor, "fine_eta_by_type", {})),
+        "local_reread_offset_max": float(model.action_rereader.typed_rereader.max_local_offset),
+        "reason_local_reread_offset_max": float(model.reason_latent_decoder.typed_rereader.max_local_offset),
+        "diagnostics": dict(getattr(model, "fine_transport_diagnostics", {})),
+    }
     return {
         "pass": True,
         "cV_shape": list(cV.shape),
@@ -308,6 +335,8 @@ def verify_v4_forward_contract(model: nn.Module, images: torch.Tensor) -> dict[s
         "typed_coordinate_shape": list(output["sampling_coordinates"].shape),
         "fine_coarse_delta_mean": float(delta),
         "final_action_visual_equal_before_admission": True,
+        "credibility_runtime": credibility_runtime,
+        "fine_transport_runtime": fine_runtime,
     }
 
 
@@ -521,14 +550,51 @@ def functional_hard_gates(
             ("reason_labels", "observed_reason", "reason_targets", "factor_certificate_reliability"),
         ),
         "dynamic": dynamic.get("v4_contract", {}).get("cV_shape"),
+        "runtime": dynamic.get("v4_contract", {}).get("credibility_runtime"),
     }
-    if not evidence["continuous_credibility"]["config_independent_of_reason_labels"] or dynamic.get("v4_contract", {}).get("pass") is not True:
+    expected_credibility_runtime = {
+        "independent_of_reason_labels": True,
+        "admission_min": float(config["credibility"]["observable_cV_min_for_admission"]),
+        "ema_decay": float(config["credibility"]["ema_decay"]),
+        "image_only_cap": float(config["credibility"]["image_only_cap"]),
+        "unknown_cap": float(config["credibility"]["unknown_cap"]),
+        "no_reliable_negative_cap": float(config["credibility"]["no_reliable_negative_cap"]),
+    }
+    if (
+        not evidence["continuous_credibility"]["config_independent_of_reason_labels"]
+        or dynamic.get("v4_contract", {}).get("pass") is not True
+        or evidence["continuous_credibility"]["runtime"] != expected_credibility_runtime
+    ):
         raise ICDORAuditError("v4 continuous credibility contract failed")
     checks["continuous_credibility"] = "PASS"
-    evidence["fine_transport"] = _require_source_tokens(
-        root / "fate_oia" / "models" / "mosaic_typed_evidence_splat.py",
-        ("typed_evidence_splat", "eta_by_type", "max_splat_samples", "fine_mask"),
-    )
+    evidence["fine_transport"] = {
+        "source": _require_source_tokens(
+            root / "fate_oia" / "models" / "mosaic_typed_evidence_splat.py",
+            ("typed_evidence_splat", "eta_by_type", "max_splat_samples", "fine_mask"),
+        ),
+        "runtime": dynamic.get("v4_contract", {}).get("fine_transport_runtime"),
+        "evaluator": _require_source_tokens(
+            root / "fate_oia" / "engine" / "eval_acpr_mosaic_trust_icdor.py",
+            ("factor_mask_mode=\"coarse\"", "factor_mask_mode=\"fine\"", "fine_transport"),
+        ),
+    }
+    expected_fine_runtime = {
+        "enabled": bool(config["fine_transport"]["enabled"]),
+        "eta_by_type": {
+            "point": float(config["fine_transport"]["point_eta"]),
+            "object": float(config["fine_transport"]["point_eta"]),
+            "curve": float(config["fine_transport"]["curve_eta"]),
+            "region": float(config["fine_transport"]["region_eta"]),
+        },
+        "local_reread_offset_max": float(config["fine_transport"]["local_reread_offset_max"]),
+        "reason_local_reread_offset_max": float(config["fine_transport"]["local_reread_offset_max"]),
+        "diagnostics": {
+            "fine_off": bool(config["fine_transport"]["fine_off_diagnostic"]),
+            "coarse_off": bool(config["fine_transport"]["coarse_off_diagnostic"]),
+        },
+    }
+    if evidence["fine_transport"]["runtime"] != expected_fine_runtime:
+        raise ICDORAuditError("v4 fine transport config did not reach the real forward path")
     checks["fine_transport"] = "PASS"
     evidence["partial_action_admission"] = _require_source_tokens(
         root / "fate_oia" / "models" / "mosaic_action_route_policy.py",

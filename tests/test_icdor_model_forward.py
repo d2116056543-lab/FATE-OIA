@@ -5,6 +5,7 @@ from pathlib import Path
 import torch
 
 from fate_oia.models.acpr_mosaic_trust_icdor_model import MOSAICTrustICDORModel
+from fate_oia.engine.train_acpr_mosaic_trust_icdor import build_icdor_model, load_config
 
 
 def _model() -> MOSAICTrustICDORModel:
@@ -258,3 +259,46 @@ def test_batch_local_dino_reuse_is_exact_and_not_a_persistent_cache() -> None:
     assert torch.equal(direct["action_final_logits"], reused["action_final_logits"])
     assert torch.equal(direct["reason_observed_logits"], reused["reason_observed_logits"])
     assert not hasattr(model, "feature_cache")
+
+
+def test_credibility_and_fine_transport_config_change_the_real_forward_path() -> None:
+    config = load_config("configs/fate_oia_train_360x640_acpr_mosaic_trust_v3_icdor.yaml")
+    config["credibility"].update(
+        {
+            "observable_cV_min_for_admission": 0.73,
+            "ema_decay": 0.61,
+            "image_only_cap": 0.07,
+            "unknown_cap": 0.0,
+            "no_reliable_negative_cap": 0.19,
+        }
+    )
+    config["fine_transport"].update(
+        {
+            "enabled": False,
+            "point_eta": 0.41,
+            "curve_eta": 0.52,
+            "region_eta": 0.63,
+            "local_reread_offset_max": 0.04,
+            "fine_off_diagnostic": True,
+            "coarse_off_diagnostic": True,
+        }
+    )
+    model = build_icdor_model(config, use_mock_dino=True, mock_dim=32)
+
+    assert model.credibility_independent_of_reason_labels is True
+    assert model.action_credibility_min_for_admission == 0.73
+    assert model.continuous_credibility.ema_decay == 0.61
+    assert torch.isclose(model.continuous_credibility.factor_credibility_cap.max(), torch.tensor(1.0))
+    assert model.factor_extractor.fine_transport_enabled is False
+    assert model.factor_extractor.fine_eta_by_type == {
+        "point": 0.41,
+        "object": 0.41,
+        "curve": 0.52,
+        "region": 0.63,
+    }
+    assert model.action_rereader.typed_rereader.max_local_offset == 0.04
+    assert model.reason_latent_decoder.typed_rereader.max_local_offset == 0.04
+    assert model.fine_transport_diagnostics == {"fine_off": True, "coarse_off": True}
+
+    output = model(torch.randn(1, 3, 360, 640), return_masks=True)
+    assert torch.allclose(output["factor_soft_masks"], output["factor_coarse_masks"])

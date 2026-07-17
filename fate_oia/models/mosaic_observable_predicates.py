@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, Mapping
 
 import torch
 from torch import nn
@@ -238,6 +238,8 @@ class MOSAICObservablePredicateLayer(nn.Module):
         prior_scale_max: float = 0.20,
         prior_dropout: float = 0.50,
         content_temperature_init: float = 0.07,
+        fine_transport_enabled: bool = True,
+        fine_eta_by_type: Mapping[str, float] | None = None,
     ) -> None:
         super().__init__()
         factors = tuple(factors)
@@ -263,6 +265,12 @@ class MOSAICObservablePredicateLayer(nn.Module):
         self.factor_count = len(factors)
         self.dim = dim
         self.anchors_per_factor = anchors_per_factor
+        default_eta = {"point": 0.70, "object": 0.70, "curve": 0.80, "region": 0.60}
+        eta = dict(default_eta if fine_eta_by_type is None else fine_eta_by_type)
+        if set(eta) != set(default_eta) or any(not 0.0 < float(value) <= 1.0 for value in eta.values()):
+            raise ValueError("fine transport must define bounded point/object/curve/region eta values")
+        self.fine_transport_enabled = bool(fine_transport_enabled)
+        self.fine_eta_by_type = {name: float(value) for name, value in eta.items()}
         self.prototype_bank = MOSAICMultiPrototypeFactorBank(
             tuple(int(factor["num_prototypes"]) for factor in factors),
             tuple(region_priors),
@@ -468,9 +476,10 @@ class MOSAICObservablePredicateLayer(nn.Module):
         coarse_upsample = coarse_upsample / coarse_upsample.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
         splat = typed_evidence_splat(
             typed_output["sampling_coordinates"], typed_output["sampled_features"], sample_attention_typed,
-            self.factor_types, output_hw=(45, 80), coarse_hw=(12, 20),
+            self.factor_types, output_hw=(45, 80), coarse_hw=(12, 20), eta_by_type=self.fine_eta_by_type,
         )
-        soft_masks = splat["fine_mask"]
+        fine_masks = splat["fine_mask"]
+        soft_masks = fine_masks if self.fine_transport_enabled else coarse_upsample
         anchor_separation = (anchors[:, :, 0] - anchors[:, :, 1]).norm(dim=-1)
         measurement_stats = {
             **prototype_output["prototype_stats"],
@@ -478,8 +487,9 @@ class MOSAICObservablePredicateLayer(nn.Module):
             "sample_attention_support_mean": (sample_attention > 1e-5).float().sum(-1).mean().detach(),
             "fine_prototype_support": sparse_prototype_support.detach(),
             "mid_prototype_support": mid_prototype_support.detach(),
-            "fine_mask_delta_mean": (soft_masks - coarse_upsample).abs().mean().detach(),
-            "fine_mask_delta_max": (soft_masks - coarse_upsample).abs().amax().detach(),
+            "fine_mask_delta_mean": (fine_masks - coarse_upsample).abs().mean().detach(),
+            "fine_mask_delta_max": (fine_masks - coarse_upsample).abs().amax().detach(),
+            "fine_transport_enabled": torch.tensor(float(self.fine_transport_enabled), device=soft_masks.device),
         }
         return {
             "factor_features": factor_features,
@@ -491,6 +501,7 @@ class MOSAICObservablePredicateLayer(nn.Module):
             "factor_negative_evidence": negative_evidence,
             "factor_uncertainty": uncertainty,
             "factor_soft_masks": soft_masks,
+            "factor_fine_masks": fine_masks,
             "factor_coarse_masks": coarse_upsample,
             "factor_fine_features": splat["fine_features"],
             "prototype_weights": prototype_output["prototype_weights"],

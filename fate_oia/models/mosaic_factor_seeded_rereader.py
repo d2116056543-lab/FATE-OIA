@@ -8,11 +8,21 @@ from torch.nn import functional as F
 
 
 class MOSAICFactorSeededRereader(nn.Module):
-    def __init__(self, *, dim: int, target_count: int = 4, grid_hw: tuple[int, int] = (45, 80)) -> None:
+    def __init__(
+        self,
+        *,
+        dim: int,
+        target_count: int = 4,
+        grid_hw: tuple[int, int] = (45, 80),
+        max_local_offset: float = 0.08,
+    ) -> None:
         super().__init__()
         self.dim = int(dim)
         self.target_count = int(target_count)
         self.grid_hw = tuple(grid_hw)
+        if not 0.0 < float(max_local_offset) <= 0.08:
+            raise ValueError("fine rereader local offset must be in (0,0.08]")
+        self._max_local_offset = float(max_local_offset)
         self.query_proj = nn.Linear(dim, dim, bias=False)
         self.sample_proj = nn.Linear(dim, dim, bias=False)
         self.offset_raw = nn.Parameter(torch.zeros(target_count, 2))
@@ -22,7 +32,7 @@ class MOSAICFactorSeededRereader(nn.Module):
 
     @property
     def max_local_offset(self) -> float:
-        return 0.08
+        return self._max_local_offset
 
     def forward(
         self,

@@ -67,8 +67,29 @@ class MOSAICTrustICDORModel(nn.Module):
         pi_min: float = 0.20,
         pi_max: float = 0.95,
         observed_mix_init: float = 0.05,
+        credibility_independent_of_reason_labels: bool = True,
+        action_credibility_min_for_admission: float = 0.80,
+        credibility_ema_decay: float = 0.90,
+        credibility_image_only_cap: float = 0.10,
+        credibility_unknown_cap: float = 0.0,
+        credibility_no_reliable_negative_cap: float = 0.25,
+        fine_transport_enabled: bool = True,
+        fine_eta_by_type: Mapping[str, float] | None = None,
+        local_reread_offset_max: float = 0.08,
+        fine_off_diagnostic: bool = True,
+        coarse_off_diagnostic: bool = True,
     ) -> None:
         super().__init__()
+        if credibility_independent_of_reason_labels is not True:
+            raise ValueError("CREDO visual credibility must remain independent of reason labels")
+        if not 0.0 <= float(action_credibility_min_for_admission) <= 1.0:
+            raise ValueError("action credibility admission minimum must be in [0,1]")
+        self.credibility_independent_of_reason_labels = True
+        self.action_credibility_min_for_admission = float(action_credibility_min_for_admission)
+        self.fine_transport_diagnostics = {
+            "fine_off": bool(fine_off_diagnostic),
+            "coarse_off": bool(coarse_off_diagnostic),
+        }
         self.ontology = load_icdor_ontology(config_root)
         # Keep public router/decoder imports usable when the optional DINO
         # checkout is unavailable; construction still requires it as before.
@@ -114,12 +135,18 @@ class MOSAICTrustICDORModel(nn.Module):
             prior_scale_max=spatial_prior_scale_max,
             prior_dropout=spatial_prior_dropout,
             content_temperature_init=content_temperature_init,
+            fine_transport_enabled=fine_transport_enabled,
+            fine_eta_by_type=fine_eta_by_type,
         )
         self.continuous_credibility = ContinuousVisualCredibility(
             factor_count=len(self.ontology["factors"]),
             dim=dim,
             factor_roles=tuple(str(factor.get("role", "observable")) for factor in self.ontology["factors"]),
             source_kinds=tuple(str(factor.get("source_kind", "grounded")) for factor in self.ontology["factors"]),
+            ema_decay=credibility_ema_decay,
+            image_only_cap=credibility_image_only_cap,
+            unknown_cap=credibility_unknown_cap,
+            no_reliable_negative_cap=credibility_no_reliable_negative_cap,
         )
         self.action_visual_decoder = MOSAICICDORActionDecoder(
             dim=dim,
@@ -133,7 +160,11 @@ class MOSAICTrustICDORModel(nn.Module):
             factor_count=len(self.ontology["factors"]), reason_count=21, action_count=4
         )
         self.action_rereader = MOSAICMaskedTargetRereader(
-            dim=dim, topk=highres_topk, gate_init=gate_init, gate_max=gate_max
+            dim=dim,
+            topk=highres_topk,
+            gate_init=gate_init,
+            gate_max=gate_max,
+            local_reread_offset_max=local_reread_offset_max,
         )
         self.reason_visual_decoder = MOSAICICDORVisualReasonDecoder(
             dim=dim,
@@ -149,6 +180,7 @@ class MOSAICTrustICDORModel(nn.Module):
             self_attention_heads=self_attention_heads,
             highres_topk=highres_topk,
             midres_topk=midres_topk,
+            local_reread_offset_max=local_reread_offset_max,
         )
         self.observation_model = MOSAICICDORObservationHead(self.ontology, pi_min=pi_min, pi_max=pi_max)
         self.reason_observed_mixer = MOSAICICDORObservedReasonMixer(init_mix=observed_mix_init)
@@ -299,6 +331,7 @@ class MOSAICTrustICDORModel(nn.Module):
         reason_route_mode: str = "full",
         prior_mode: str = "full",
         factor_ablation_mode: str = "full",
+        factor_mask_mode: str = "configured",
         factor_intervention_keep_mask: torch.Tensor | None = None,
         factor_mask_override: torch.Tensor | None = None,
         precomputed_dino_field: Mapping[str, Any] | None = None,
@@ -307,6 +340,8 @@ class MOSAICTrustICDORModel(nn.Module):
     ) -> dict[str, torch.Tensor | dict[str, Any]]:
         if factor_ablation_mode not in {"full", "content_only", "prior_only", "query_shuffled", "image_shuffled"}:
             raise ValueError("IC-DOR factor ablation mode is invalid")
+        if factor_mask_mode not in {"configured", "fine", "coarse"}:
+            raise ValueError("IC-DOR factor mask mode must be configured, fine, or coarse")
         if route_mode == "auto":
             # Certificate state is deployment evidence only.  Learning access
             # is continuous and starts with a shadow route from epoch zero.
@@ -345,6 +380,10 @@ class MOSAICTrustICDORModel(nn.Module):
             prior_mode=prior_mode,
             query_permutation=query_permutation,
         )
+        if factor_mask_mode == "fine":
+            factor_output["factor_soft_masks"] = factor_output["factor_fine_masks"]
+        elif factor_mask_mode == "coarse":
+            factor_output["factor_soft_masks"] = factor_output["factor_coarse_masks"]
         sample_support = (factor_output["sample_attention"] > 1e-5).float().sum(dim=(-1, -2, -3))
         credibility = self.continuous_credibility(
             factor_output["factor_features"],
@@ -383,7 +422,7 @@ class MOSAICTrustICDORModel(nn.Module):
         keep_typed_features = keep_typed_attention.unsqueeze(-1)
         for key in ("factor_features",):
             factor_output[key] = factor_output[key] * keep_feature
-        for key in ("factor_soft_masks",):
+        for key in ("factor_soft_masks", "factor_fine_masks", "factor_coarse_masks"):
             factor_output[key] = factor_output[key] * keep_mask
         for key in (
             "factor_presence_prob", "factor_visibility_prob", "factor_positive_evidence", "factor_negative_evidence"
@@ -579,6 +618,8 @@ class MOSAICTrustICDORModel(nn.Module):
             "factor_ablation_mode_code": images.new_tensor({
                 "full": 0, "content_only": 1, "prior_only": 2, "query_shuffled": 3, "image_shuffled": 4
             }[factor_ablation_mode]),
+            "factor_mask_mode_code": images.new_tensor({"configured": 0, "fine": 1, "coarse": 2}[factor_mask_mode]),
+            "fine_transport_enabled": images.new_tensor(float(self.factor_extractor.fine_transport_enabled)),
             "factor_intervention_keep_mask": intervention_keep,
         }
         if random_reread_output is not None:

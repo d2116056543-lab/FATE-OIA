@@ -21,6 +21,7 @@ class MOSAICMaskedTargetRereader(nn.Module):
         topk: int = 128,
         gate_init: float = 0.02,
         gate_max: float = 0.15,
+        local_reread_offset_max: float = 0.08,
     ) -> None:
         super().__init__()
         if action_count != 4 or not 0.0 < gate_init < gate_max <= 0.25:
@@ -36,7 +37,9 @@ class MOSAICMaskedTargetRereader(nn.Module):
         self.veto_norm = nn.LayerNorm(dim)
         self.support_head = nn.Linear(dim, 1, bias=False)
         self.veto_head = nn.Linear(dim, 1, bias=False)
-        self.typed_rereader = MOSAICFactorSeededRereader(dim=dim, target_count=action_count)
+        self.typed_rereader = MOSAICFactorSeededRereader(
+            dim=dim, target_count=action_count, max_local_offset=local_reread_offset_max
+        )
         ratio = gate_init / gate_max
         initial_raw = math.log(ratio / (1.0 - ratio))
         self.support_gate_raw = nn.Parameter(torch.full((action_count,), initial_raw))

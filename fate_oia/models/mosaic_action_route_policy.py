@@ -19,9 +19,12 @@ def partial_action_admission(
     cca: torch.Tensor,
     visual_ap: torch.Tensor,
     edge_ap: torch.Tensor,
+    *,
+    credibility_min: float = 0.80,
 ) -> torch.Tensor:
     values = (credibility, tet_lcb, tes_lcb, cca, visual_ap, edge_ap)
     if any(value.shape != (4,) for value in values):
         raise ValueError("partial action admission inputs must be [4]")
-    return (credibility >= 0.80) & (tet_lcb > 0.0) & (tes_lcb > 0.0) & (cca >= 0.60) & (edge_ap >= visual_ap - 0.002)
-
+    if not 0.0 <= float(credibility_min) <= 1.0:
+        raise ValueError("action credibility admission minimum must be in [0,1]")
+    return (credibility >= float(credibility_min)) & (tet_lcb > 0.0) & (tes_lcb > 0.0) & (cca >= 0.60) & (edge_ap >= visual_ap - 0.002)

@@ -58,6 +58,7 @@ class MOSAICICDORLatentReasonDecoder(nn.Module):
         self_attention_heads: int = 4,
         highres_topk: int = 256,
         midres_topk: int = 128,
+        local_reread_offset_max: float = 0.08,
     ) -> None:
         super().__init__()
         factor_count = len(ontology["factors"])
@@ -82,7 +83,9 @@ class MOSAICICDORLatentReasonDecoder(nn.Module):
         # This is target-owned rereading of the factor layer's typed samples.
         # Its inputs are detached, preserving the CREDO firewall from latent
         # reason supervision back into visual factor measurement.
-        self.typed_rereader = MOSAICFactorSeededRereader(dim=dim, target_count=21)
+        self.typed_rereader = MOSAICFactorSeededRereader(
+            dim=dim, target_count=21, max_local_offset=local_reread_offset_max
+        )
         self.typed_transport_gain = nn.Parameter(torch.tensor(0.10))
         self.decoder = MOSAICSparseLabelDecoder(
             21,
