@@ -37,6 +37,9 @@ ICDOR_EPOCH_JSONL_FILES = (
     "calibration_stats.jsonl",
     "runtime_stats.jsonl",
     "failure_cases.jsonl",
+    "credibility_stats.jsonl",
+    "fine_transport_stats.jsonl",
+    "route_ownership.jsonl",
 )
 ICDOR_LOGIT_FILES = (
     "action_visual_logits.pt",
@@ -281,6 +284,28 @@ def validate_icdor_artifact_schema(
             errors.append(f"run_manifest.{key} must equal {expected!r}")
     if not manifest.get("git_head") or not manifest.get("pretrained_sha256"):
         errors.append("run_manifest must retain git_head and pretrained_sha256")
+    v4_run = manifest.get("credo_version") == "v4_credo"
+    split_manifest = json.loads((output / "split_manifest.json").read_text(encoding="utf-8"))
+    if v4_run:
+        all_names = split_manifest.get("file_names")
+        visual_ids = split_manifest.get("audit_visual_indices")
+        target_ids = split_manifest.get("audit_target_indices")
+        core_ids = split_manifest.get("train_core_indices")
+        calib_ids = split_manifest.get("train_calib_indices")
+        if not all(isinstance(value, list) for value in (all_names, visual_ids, target_ids, core_ids, calib_ids)):
+            errors.append("split_manifest must expose list-valued core/audit/calibration partitions")
+        else:
+            total = len(all_names)
+            expected_visual = max(1, round(total * 0.05))
+            expected_target = max(1, round(total * 0.05))
+            if len(visual_ids) != expected_visual or len(target_ids) != expected_target:
+                errors.append("split_manifest audit_visual/audit_target must each be exactly 5 percent")
+            visual_set, target_set = set(visual_ids), set(target_ids)
+            core_set, calib_set = set(core_ids), set(calib_ids)
+            if visual_set & target_set or visual_set & core_set or target_set & core_set:
+                errors.append("split_manifest audit populations must be mutually disjoint")
+            if visual_set | target_set | core_set | calib_set != set(range(total)):
+                errors.append("split_manifest partitions must cover every train sample exactly once")
     certificate = json.loads((output / "factor_certificate.json").read_text(encoding="utf-8"))
     edge_admission = json.loads((output / "edge_admission.json").read_text(encoding="utf-8"))
     if certificate.get("source_split") != "train_audit" or edge_admission.get("source_split") != "train_audit":
@@ -418,6 +443,41 @@ def validate_icdor_artifact_schema(
                 errors.append(f"epoch_{epoch:03d}/{name} is empty or non-finite")
             elif tensor.shape[0] != len(names):
                 errors.append(f"epoch_{epoch:03d}/{name} does not align with file_names")
+
+        # v4 diagnostics are semantic contracts, not merely non-empty files.
+        credibility_rows = _read_jsonl(epoch_dir / "credibility_stats.jsonl")
+        if v4_run and (not credibility_rows or any(
+            row.get("split") != "test"
+            or not isinstance(row.get("factor_id"), int)
+            or any(
+                not isinstance(row.get(field), (int, float))
+                or not torch.isfinite(torch.tensor(float(row[field])))
+                or not 0.0 <= float(row[field]) <= 1.0
+                for field in ("cV_mean", "cV_p50", "cV_p95", "cV_ema_mean", "cV_nonzero_rate")
+            )
+            for row in credibility_rows
+        )):
+            errors.append(f"epoch_{epoch:03d} credibility_stats lacks finite bounded cV rows")
+        fine_rows = _read_jsonl(epoch_dir / "fine_transport_stats.jsonl")
+        if v4_run and (not fine_rows or any(
+            row.get("split") != "test"
+            or row.get("typed_coordinates_present") is not True
+            or not all(
+                isinstance(row.get(field), (int, float))
+                and torch.isfinite(torch.tensor(float(row[field])))
+                for field in ("fine_mask_delta_mean", "fine_mask_delta_max", "anchor_separation_mean")
+            )
+            for row in fine_rows
+        ) or not any(float(row.get("fine_mask_delta_mean", 0.0)) > 1e-8 for row in fine_rows)):
+            errors.append(f"epoch_{epoch:03d} fine_transport_stats does not prove typed fine evidence differs from coarse")
+        route_rows = _read_jsonl(epoch_dir / "route_ownership.jsonl")
+        if v4_run and (not route_rows or not any(row.get("summary") == "per_action_route_effect" for row in route_rows)):
+            errors.append(f"epoch_{epoch:03d} route_ownership lacks per-action ownership diagnostics")
+        if v4_run:
+            for row in route_rows:
+                if row.get("route_mode") == "shadow" and row.get("action_final_visual_equal") is not True:
+                    errors.append(f"epoch_{epoch:03d} shadow route changed final action before admission")
+                    break
     result["semantic_errors"] = errors
     result["pass"] = result["pass"] and not errors
     return result

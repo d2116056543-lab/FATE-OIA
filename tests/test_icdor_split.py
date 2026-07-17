@@ -53,6 +53,10 @@ def test_icdor_split_is_disjoint_deterministic_and_complete() -> None:
     assert core | audit | calib == set(range(len(dataset)))
     assert len(core) == 160
     assert len(audit) == 20
+    assert len(first.audit_visual_indices) == 10
+    assert len(first.audit_target_indices) == 10
+    assert set(first.audit_visual_indices).isdisjoint(first.audit_target_indices)
+    assert set(first.audit_visual_indices) | set(first.audit_target_indices) == audit
     assert len(calib) == 20
     assert first.seed == 20260713
     assert len(first.split_sha256) == 64

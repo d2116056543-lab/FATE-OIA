@@ -10,6 +10,7 @@ from torch.nn import functional as F
 
 from .acpr_sparse_ops import entmax15_bisect
 from .mosaic_geometry_typed_attention import MOSAICGeometryTypedAttention
+from .mosaic_typed_evidence_splat import typed_evidence_splat
 
 
 class _FactorwiseLinear(nn.Module):
@@ -301,7 +302,12 @@ class MOSAICObservablePredicateLayer(nn.Module):
         prototype_features = torch.einsum("bfkt,bftd->bfkd", flat_attention, values)
         factor_features = torch.einsum("bfk,bfkd->bfd", prototype_weights, prototype_features)
         prototype_support = (flat_attention > 1e-5).float().sum(-1)
-        return factor_features, flat_attention, prototype_support
+        # The typed splat/rereader needs one attention distribution over the
+        # actual typed samples. Keep prototype diagnostics separate, and
+        # marginalize the prototype axis with the learned prototype weights
+        # before reshaping to [B,F,anchors,heads,samples].
+        sample_attention = torch.einsum("bfk,bfkt->bft", prototype_weights, flat_attention)
+        return factor_features, sample_attention, prototype_support
 
     def _factor_queries(self, prototype_weights: torch.Tensor) -> torch.Tensor:
         prototype_mask = self.prototype_bank.prototype_valid_mask.to(dtype=self.prototype_bank.prototypes.dtype)
@@ -365,6 +371,23 @@ class MOSAICObservablePredicateLayer(nn.Module):
                 middle, prototype_output["prototype_weights"]
             )
             factor_features = self.feature_fusion(sparse_features + mid_features)
+        expected_sample_count = (
+            self.typed_attention.anchors_per_factor
+            * self.typed_attention.heads
+            * self.typed_attention.max_samples
+        )
+        if sample_attention.shape != (batch_size, self.factor_count, expected_sample_count):
+            raise RuntimeError(
+                "observable predicate sample attention must be prototype-marginalized "
+                f"to [B,F,{expected_sample_count}], got {tuple(sample_attention.shape)}"
+            )
+        sample_attention_typed = sample_attention.reshape(
+            batch_size,
+            self.factor_count,
+            self.typed_attention.anchors_per_factor,
+            self.typed_attention.heads,
+            self.typed_attention.max_samples,
+        )
         presence_logits = self.presence_head(factor_features)
         visibility_logits = self.visibility_head(factor_features)
         presence_probability = torch.sigmoid(presence_logits)
@@ -375,8 +398,13 @@ class MOSAICObservablePredicateLayer(nn.Module):
             self._binary_entropy(presence_probability) + self._binary_entropy(visibility_probability)
         )
         coarse_masks = coarse_distribution.reshape(batch_size, self.factor_count, 12, 20)
-        soft_masks = F.interpolate(coarse_masks, size=(45, 80), mode="bilinear", align_corners=False)
-        soft_masks = soft_masks / soft_masks.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
+        coarse_upsample = F.interpolate(coarse_masks, size=(45, 80), mode="bilinear", align_corners=False)
+        coarse_upsample = coarse_upsample / coarse_upsample.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
+        splat = typed_evidence_splat(
+            typed_output["sampling_coordinates"], typed_output["sampled_features"], sample_attention_typed,
+            self.factor_types, output_hw=(45, 80), coarse_hw=(12, 20),
+        )
+        soft_masks = splat["fine_mask"]
         anchor_separation = (anchors[:, :, 0] - anchors[:, :, 1]).norm(dim=-1)
         measurement_stats = {
             **prototype_output["prototype_stats"],
@@ -384,6 +412,8 @@ class MOSAICObservablePredicateLayer(nn.Module):
             "sample_attention_support_mean": (sample_attention > 1e-5).float().sum(-1).mean().detach(),
             "fine_prototype_support": sparse_prototype_support.detach(),
             "mid_prototype_support": mid_prototype_support.detach(),
+            "fine_mask_delta_mean": (soft_masks - coarse_upsample).abs().mean().detach(),
+            "fine_mask_delta_max": (soft_masks - coarse_upsample).abs().amax().detach(),
         }
         return {
             "factor_features": factor_features,
@@ -395,10 +425,15 @@ class MOSAICObservablePredicateLayer(nn.Module):
             "factor_negative_evidence": negative_evidence,
             "factor_uncertainty": uncertainty,
             "factor_soft_masks": soft_masks,
+            "factor_coarse_masks": coarse_upsample,
+            "factor_fine_features": splat["fine_features"],
             "prototype_weights": prototype_output["prototype_weights"],
             "prototype_scores": prototype_output["prototype_scores"],
             "anchor_coordinates": anchors,
             "sampling_coordinates": typed_output["sampling_coordinates"],
+            "sampled_features": typed_output["sampled_features"],
+            "sample_attention": sample_attention_typed,
+            "sample_valid_mask": typed_output["sample_valid_mask"],
             "prior_scale": prototype_output["prior_scale"],
             "measurement_stats": measurement_stats,
         }

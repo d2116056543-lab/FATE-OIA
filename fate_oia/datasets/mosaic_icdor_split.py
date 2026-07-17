@@ -17,12 +17,16 @@ DEFAULT_SEED = 20260713
 class ICDORTrainSplits:
     train_core_indices: tuple[int, ...]
     train_audit_indices: tuple[int, ...]
+    audit_visual_indices: tuple[int, ...]
+    audit_target_indices: tuple[int, ...]
     train_calib_indices: tuple[int, ...]
     seed: int
     split_sha256: str
     file_names: tuple[str, ...]
     label_positive_counts: tuple[int, ...]
     audit_positive_counts: tuple[int, ...]
+    audit_visual_positive_counts: tuple[int, ...]
+    audit_target_positive_counts: tuple[int, ...]
     calib_positive_counts: tuple[int, ...]
 
 
@@ -90,14 +94,17 @@ def _select_stratified(
 
 
 def _canonical_payload(
-    file_names: list[str], labels: list[tuple[int, ...]], seed: int, core: list[int], audit: list[int], calib: list[int]
+    file_names: list[str], labels: list[tuple[int, ...]], seed: int, core: list[int], audit_visual: list[int],
+    audit_target: list[int], calib: list[int]
 ) -> bytes:
     payload = {
         "seed": seed,
         "file_names": file_names,
         "labels": labels,
         "train_core_indices": core,
-        "train_audit_indices": audit,
+        "train_audit_indices": sorted(set(audit_visual) | set(audit_target)),
+        "audit_visual_indices": audit_visual,
+        "audit_target_indices": audit_target,
         "train_calib_indices": calib,
     }
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
@@ -122,32 +129,47 @@ def make_icdor_train_splits(dataset: Any, *, seed: int = DEFAULT_SEED) -> ICDORT
     if len(set(file_names)) != len(file_names):
         raise ValueError("IC-DOR split requires unique file names")
 
-    audit_count = max(1, round(len(samples) * 0.10))
+    # Keep the two audit populations disjoint. Their union remains the
+    # legacy train_audit view consumed by existing collectors.
+    audit_visual_count = max(1, round(len(samples) * 0.05))
+    audit_target_count = max(1, round(len(samples) * 0.05))
     calib_count = max(1, round(len(samples) * 0.10))
-    if audit_count + calib_count >= len(samples):
+    if audit_visual_count + audit_target_count + calib_count >= len(samples):
         raise ValueError("IC-DOR split leaves no train_core samples")
     all_indices = set(range(len(samples)))
-    audit = _select_stratified(labels, file_names, all_indices, audit_count, seed)
-    calib = _select_stratified(labels, file_names, all_indices.difference(audit), calib_count, seed + 1)
+    audit_visual = _select_stratified(labels, file_names, all_indices, audit_visual_count, seed)
+    audit_target = _select_stratified(
+        labels, file_names, all_indices.difference(audit_visual), audit_target_count, seed + 1
+    )
+    audit = sorted(set(audit_visual) | set(audit_target))
+    calib = _select_stratified(labels, file_names, all_indices.difference(audit), calib_count, seed + 2)
     core = sorted(all_indices.difference(audit).difference(calib))
-    if set(core) & set(audit) or set(core) & set(calib) or set(audit) & set(calib):
+    if set(core) & set(audit) or set(core) & set(calib) or set(audit_visual) & set(audit_target):
         raise RuntimeError("IC-DOR split must be pairwise disjoint")
     if set(core) | set(audit) | set(calib) != all_indices:
         raise RuntimeError("IC-DOR split union must equal original train IDs")
 
     positive_counts = tuple(sum(row[label] for row in labels) for label in range(LABEL_DIM))
     audit_counts = tuple(sum(labels[index][label] for index in audit) for label in range(LABEL_DIM))
+    audit_visual_counts = tuple(sum(labels[index][label] for index in audit_visual) for label in range(LABEL_DIM))
+    audit_target_counts = tuple(sum(labels[index][label] for index in audit_target) for label in range(LABEL_DIM))
     calib_counts = tuple(sum(labels[index][label] for index in calib) for label in range(LABEL_DIM))
-    split_hash = hashlib.sha256(_canonical_payload(file_names, labels, seed, core, audit, calib)).hexdigest().upper()
+    split_hash = hashlib.sha256(
+        _canonical_payload(file_names, labels, seed, core, audit_visual, audit_target, calib)
+    ).hexdigest().upper()
     return ICDORTrainSplits(
         train_core_indices=tuple(core),
         train_audit_indices=tuple(audit),
+        audit_visual_indices=tuple(sorted(audit_visual)),
+        audit_target_indices=tuple(sorted(audit_target)),
         train_calib_indices=tuple(calib),
         seed=seed,
         split_sha256=split_hash,
         file_names=tuple(file_names),
         label_positive_counts=positive_counts,
         audit_positive_counts=audit_counts,
+        audit_visual_positive_counts=audit_visual_counts,
+        audit_target_positive_counts=audit_target_counts,
         calib_positive_counts=calib_counts,
     )
 
@@ -159,6 +181,8 @@ def write_icdor_split_manifest(result: ICDORTrainSplits, output_path: str | Path
         "file_names": list(result.file_names),
         "train_core_indices": list(result.train_core_indices),
         "train_audit_indices": list(result.train_audit_indices),
+        "audit_visual_indices": list(result.audit_visual_indices),
+        "audit_target_indices": list(result.audit_target_indices),
         "train_calib_indices": list(result.train_calib_indices),
         "labels": [
             {
@@ -167,6 +191,8 @@ def write_icdor_split_manifest(result: ICDORTrainSplits, output_path: str | Path
                 "local_index": label if label < ACTION_DIM else label - ACTION_DIM,
                 "positive_count": result.label_positive_counts[label],
                 "audit_positive_count": result.audit_positive_counts[label],
+                "audit_visual_positive_count": result.audit_visual_positive_counts[label],
+                "audit_target_positive_count": result.audit_target_positive_counts[label],
                 "calib_positive_count": result.calib_positive_counts[label],
             }
             for label in range(LABEL_DIM)

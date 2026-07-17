@@ -8,6 +8,8 @@ import torch
 from torch import nn
 
 from .mosaic_group_threshold import MOSAICGroupThresholdHead
+from .mosaic_action_route_policy import compose_final_action_logits
+from .mosaic_continuous_credibility import ContinuousVisualCredibility
 from .mosaic_icdor_action_decoder import MOSAICICDORActionDecoder
 from .mosaic_icdor_dual_reason_decoder import (
     MOSAICICDORLatentReasonDecoder,
@@ -106,6 +108,12 @@ class MOSAICTrustICDORModel(nn.Module):
             prior_scale_max=spatial_prior_scale_max,
             prior_dropout=spatial_prior_dropout,
             content_temperature_init=content_temperature_init,
+        )
+        self.continuous_credibility = ContinuousVisualCredibility(
+            factor_count=len(self.ontology["factors"]),
+            dim=dim,
+            factor_roles=tuple(str(factor.get("role", "observable")) for factor in self.ontology["factors"]),
+            source_kinds=tuple(str(factor.get("source_kind", "grounded")) for factor in self.ontology["factors"]),
         )
         self.action_visual_decoder = MOSAICICDORActionDecoder(
             dim=dim,
@@ -229,12 +237,9 @@ class MOSAICTrustICDORModel(nn.Module):
         if factor_ablation_mode not in {"full", "content_only", "prior_only", "query_shuffled", "image_shuffled"}:
             raise ValueError("IC-DOR factor ablation mode is invalid")
         if route_mode == "auto":
-            if bool(self.action_router.edge_admission_mask.any()):
-                route_mode = "admitted"
-            elif bool((self.factor_certificate_tier == _TIER_TO_ID["certified"]).any()):
-                route_mode = "shadow"
-            else:
-                route_mode = "off"
+            # Certificate state is deployment evidence only.  Learning access
+            # is continuous and starts with a shadow route from epoch zero.
+            route_mode = "admitted" if bool(self.action_router.edge_admission_mask.any()) else "shadow"
         if factor_ablation_mode in {"content_only", "prior_only"}:
             prior_mode = factor_ablation_mode
         # Audit interventions may reuse this batch-local field. It is never
@@ -256,6 +261,24 @@ class MOSAICTrustICDORModel(nn.Module):
             for key, value in factor_pyramid.items()
         }
         factor_output = self.factor_extractor(factor_input, prior_mode=prior_mode)
+        sample_support = (factor_output["sample_attention"] > 1e-5).float().sum(dim=(-1, -2, -3))
+        credibility = self.continuous_credibility(
+            factor_output["factor_features"],
+            factor_output["factor_presence_prob"],
+            factor_output["factor_uncertainty"],
+            grounding_score=(
+                sample_support
+                / float(max(1, factor_output["sample_attention"].shape[-3] * factor_output["sample_attention"].shape[-2] * factor_output["sample_attention"].shape[-1]))
+            ).clamp(0.0, 1.0),
+            sample_support=sample_support,
+        )
+        factor_output.update(credibility)
+        # Route strength uses the current visual measurement plus the previous
+        # detached EMA; this stabilizes admission without turning cV into a
+        # hard training gate or reading any reason label.
+        continuous_route_weight = (
+            0.5 * credibility["cV"] + 0.5 * credibility["cV_ema"]
+        ).detach().clamp(0.0, 1.0)
         if factor_ablation_mode == "query_shuffled":
             for key, value in tuple(factor_output.items()):
                 if isinstance(value, torch.Tensor) and value.ndim >= 2 and value.shape[1] == self.factor_certificate_tier.numel():
@@ -312,6 +335,9 @@ class MOSAICTrustICDORModel(nn.Module):
             factor_output["factor_soft_masks"],
             router_output["support_weights"],
             router_output["veto_weights"],
+            factor_output["sampling_coordinates"],
+            factor_output["sampled_features"],
+            factor_output["sample_attention"],
         )
         equal_mass_random_masks = torch.roll(
             factor_output["factor_soft_masks"],
@@ -335,25 +361,30 @@ class MOSAICTrustICDORModel(nn.Module):
             + random_reread_output["action_support_logits"]
             - random_reread_output["action_veto_logits"]
         )
-        action_final = action_shadow if route_mode == "admitted" else action_output["action_visual_logits"]
+        admitted = (
+            self.action_router.edge_admission_mask.any(dim=(0, 1))
+            if route_mode == "admitted"
+            else torch.zeros(self.action_router.action_count, dtype=torch.bool, device=images.device)
+        )
+        action_final = compose_final_action_logits(action_output["action_visual_logits"], action_shadow, admitted)
         reason_visual = self.reason_visual_decoder(reason_pyramid)
         if reason_route_mode == "full":
-            reason_reliability = self.factor_certificate_reliability
-            reason_factor_features = factor_output["factor_features"] * reason_reliability.view(1, -1, 1)
-            reason_factor_masks = factor_output["factor_soft_masks"] * reason_reliability.view(1, -1, 1, 1)
-            reason_route_enabled = self.reason_factor_route_enabled
+            reason_reliability = continuous_route_weight
+            reason_factor_features = factor_output["factor_features"] * reason_reliability.unsqueeze(-1)
+            reason_factor_masks = factor_output["factor_soft_masks"] * reason_reliability.unsqueeze(-1).unsqueeze(-1)
+            reason_route_enabled = torch.ones_like(self.reason_factor_route_enabled)
         elif reason_route_mode == "off":
-            reason_reliability = self.factor_certificate_reliability
-            reason_factor_features = factor_output["factor_features"] * reason_reliability.view(1, -1, 1)
-            reason_factor_masks = factor_output["factor_soft_masks"] * reason_reliability.view(1, -1, 1, 1)
+            reason_reliability = torch.zeros_like(continuous_route_weight)
+            reason_factor_features = factor_output["factor_features"] * 0.0
+            reason_factor_masks = factor_output["factor_soft_masks"] * 0.0
             reason_route_enabled = torch.zeros_like(self.reason_factor_route_enabled)
         elif reason_route_mode == "shuffled":
             # Preserve each target's learned route while permuting factor identity.
             # This is a real semantic-route ablation, not a repeated full metric.
-            reason_reliability = self.factor_certificate_reliability.roll(shifts=1, dims=0)
-            reason_factor_features = factor_output["factor_features"].roll(shifts=1, dims=1) * reason_reliability.view(1, -1, 1)
-            reason_factor_masks = factor_output["factor_soft_masks"].roll(shifts=1, dims=1) * reason_reliability.view(1, -1, 1, 1)
-            reason_route_enabled = self.reason_factor_route_enabled
+            reason_reliability = continuous_route_weight.roll(shifts=1, dims=1)
+            reason_factor_features = factor_output["factor_features"].roll(shifts=1, dims=1) * reason_reliability.unsqueeze(-1)
+            reason_factor_masks = factor_output["factor_soft_masks"].roll(shifts=1, dims=1) * reason_reliability.unsqueeze(-1).unsqueeze(-1)
+            reason_route_enabled = torch.ones_like(self.reason_factor_route_enabled)
         else:
             raise ValueError("IC-DOR reason_route_mode must be full, off, or shuffled")
         reason_latent = self.reason_latent_decoder(
@@ -361,11 +392,15 @@ class MOSAICTrustICDORModel(nn.Module):
             reason_factor_features,
             reason_factor_masks,
             reason_route_enabled,
+            factor_output["factor_positive_evidence"].detach(),
+            factor_output["factor_negative_evidence"].detach(),
         )
         observation = self.observation_model(
             reason_latent["reason_logits_latent"],
-            factor_output["factor_visibility_prob"],
-            factor_output["factor_uncertainty"],
+            # Observation/reason loss must not update the visual factor
+            # extractor. Factor supervision owns those measurements.
+            factor_output["factor_visibility_prob"].detach(),
+            factor_output["factor_uncertainty"].detach(),
         )
         reason_observed = self.reason_observed_mixer(
             reason_visual["reason_visual_observed_logits"],
@@ -388,12 +423,17 @@ class MOSAICTrustICDORModel(nn.Module):
             "equal_mass_random_factor_masks": equal_mass_random_masks,
             "action_final_logits": action_final,
             "action_logits_raw": action_final,
+            "action_visual_logits": action_output["action_visual_logits"],
             "reason_logits_raw": reason_observed["reason_observed_logits"],
+            "reason_visual_logits": reason_visual["reason_visual_observed_logits"],
+            "reason_latent_logits": reason_latent["reason_logits_latent"],
+            "reason_final_logits": reason_observed["reason_observed_logits"],
             "factor_certificate_tier": self.factor_certificate_tier,
             "factor_certificate_reliability": self.factor_certificate_reliability,
             "reason_factor_certificate_reliability_effective": reason_reliability,
             "reason_factor_route_enabled": self.reason_factor_route_enabled,
             "reason_factor_route_enabled_effective": reason_route_enabled,
+            "reason_continuous_credibility": continuous_route_weight,
             "dino_grid_hw": torch.tensor(field["grid_hw"], device=images.device),
             "factor_ablation_mode_code": images.new_tensor({
                 "full": 0, "content_only": 1, "prior_only": 2, "query_shuffled": 3, "image_shuffled": 4
@@ -428,14 +468,14 @@ class MOSAICTrustICDORModel(nn.Module):
             output["action_equal_mass_random_logits"] = action_matched_random
             for diagnostic_mode in ("off", "shuffled"):
                 if diagnostic_mode == "off":
-                    diagnostic_features = factor_output["factor_features"] * self.factor_certificate_reliability.view(1, -1, 1)
-                    diagnostic_masks = factor_output["factor_soft_masks"] * self.factor_certificate_reliability.view(1, -1, 1, 1)
+                    diagnostic_features = factor_output["factor_features"] * 0.0
+                    diagnostic_masks = factor_output["factor_soft_masks"] * 0.0
                     diagnostic_enabled = torch.zeros_like(self.reason_factor_route_enabled)
                 else:
-                    reliability = self.factor_certificate_reliability.roll(1, 0)
-                    diagnostic_features = factor_output["factor_features"].roll(1, 1) * reliability.view(1, -1, 1)
-                    diagnostic_masks = factor_output["factor_soft_masks"].roll(1, 1) * reliability.view(1, -1, 1, 1)
-                    diagnostic_enabled = self.reason_factor_route_enabled
+                    reliability = continuous_route_weight.roll(1, 1)
+                    diagnostic_features = factor_output["factor_features"].roll(1, 1) * reliability.unsqueeze(-1)
+                    diagnostic_masks = factor_output["factor_soft_masks"].roll(1, 1) * reliability.unsqueeze(-1).unsqueeze(-1)
+                    diagnostic_enabled = torch.ones_like(self.reason_factor_route_enabled)
                 diagnostic_latent = self.reason_latent_decoder(
                     self._detached_pyramid(reason_pyramid), diagnostic_features, diagnostic_masks, diagnostic_enabled
                 )

@@ -14,7 +14,11 @@ factors:
     mirror_of: red_light_visible
     contradicts: [green_light_visible]
     positive_reason_anchors: []
-    grounding_sources: [image_only]
+    grounding_sources: [box2d, bdd100k_attributes]
+    role: observable
+    source_kind: grounded
+    attribute_constraints: {trafficLightColor: red}
+    negative_policy: reliable_if_attribute_complete
   - name: green_light_visible
     type: point
     num_prototypes: 3
@@ -22,7 +26,11 @@ factors:
     mirror_of: green_light_visible
     contradicts: [red_light_visible]
     positive_reason_anchors: [0]
-    grounding_sources: [image_only]
+    grounding_sources: [box2d, bdd100k_attributes]
+    role: observable
+    source_kind: grounded
+    attribute_constraints: {trafficLightColor: green}
+    negative_policy: reliable_if_attribute_complete
   - name: traffic_sign_visible
     type: point
     num_prototypes: 3
@@ -45,10 +53,14 @@ factors:
     weak_regions: [front_center]
     mirror_of: front_vehicle_near
     contradicts: []
-    positive_reason_anchors: [5]
+    positive_reason_anchors: []
     # A single-frame 2D box cannot identify physical proximity reliably.
-    # Keep this Tier III candidate image-only and out of explicit action routes.
-    grounding_sources: [image_only]
+    # Keep this risk proxy out of direct reason/action ownership.
+    grounding_sources: [box2d]
+    role: latent_proxy
+    source_kind: proxy
+    attribute_constraints: {proxy: front_box_risk}
+    negative_policy: unknown_without_depth
   - name: pedestrian_front_visible
     type: object
     num_prototypes: 3
@@ -87,7 +99,7 @@ factors:
     weak_regions: [left_corridor]
     mirror_of: right_lane_marking_visible
     contradicts: []
-    positive_reason_anchors: [9, 11, 12]
+    positive_reason_anchors: [11, 12]
     grounding_sources: [lane_polyline]
   - name: right_lane_marking_visible
     type: curve
@@ -95,7 +107,7 @@ factors:
     weak_regions: [right_corridor]
     mirror_of: left_lane_marking_visible
     contradicts: []
-    positive_reason_anchors: [15, 17, 18]
+    positive_reason_anchors: [17, 18]
     grounding_sources: [lane_polyline]
   - name: left_solid_boundary_visible
     type: curve
@@ -143,7 +155,7 @@ factors:
     weak_regions: [left_corridor]
     mirror_of: right_drivable_region_visible
     contradicts: []
-    positive_reason_anchors: [9, 12]
+    positive_reason_anchors: [12]
     grounding_sources: [drivable_mask]
   - name: right_drivable_region_visible
     type: region
@@ -151,7 +163,7 @@ factors:
     weak_regions: [right_corridor]
     mirror_of: left_drivable_region_visible
     contradicts: []
-    positive_reason_anchors: [15, 18]
+    positive_reason_anchors: [18]
     grounding_sources: [drivable_mask]
   - name: center_corridor_occupied
     type: region

@@ -7,6 +7,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from .acpr_sparse_ops import entmax15_bisect
+from .mosaic_factor_seeded_rereader import MOSAICFactorSeededRereader
 
 
 class MOSAICMaskedTargetRereader(nn.Module):
@@ -35,6 +36,7 @@ class MOSAICMaskedTargetRereader(nn.Module):
         self.veto_norm = nn.LayerNorm(dim)
         self.support_head = nn.Linear(dim, 1, bias=False)
         self.veto_head = nn.Linear(dim, 1, bias=False)
+        self.typed_rereader = MOSAICFactorSeededRereader(dim=dim, target_count=action_count)
         ratio = gate_init / gate_max
         initial_raw = math.log(ratio / (1.0 - ratio))
         self.support_gate_raw = nn.Parameter(torch.full((action_count,), initial_raw))
@@ -88,6 +90,9 @@ class MOSAICMaskedTargetRereader(nn.Module):
         factor_masks: torch.Tensor,
         support_weights: torch.Tensor,
         veto_weights: torch.Tensor,
+        sampling_coordinates: torch.Tensor | None = None,
+        sampled_features: torch.Tensor | None = None,
+        sample_attention: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         high = action_pyramid.get("F_hi") if isinstance(action_pyramid, dict) else None
         if high is None or high.ndim != 4 or high.shape[1] != self.dim or tuple(high.shape[-2:]) != (45, 80):
@@ -99,6 +104,39 @@ class MOSAICMaskedTargetRereader(nn.Module):
             raise ValueError("IC-DOR rereader factor masks must be [B,F,45,80]")
         if support_weights.shape != expected_weights or veto_weights.shape != expected_weights:
             raise ValueError("IC-DOR rereader route weights must be [B,F,4]")
+        if sampling_coordinates is not None or sampled_features is not None or sample_attention is not None:
+            if sampling_coordinates is None or sampled_features is None or sample_attention is None:
+                raise ValueError("typed rereader requires coordinates, features, and attention together")
+            support_typed = self.typed_rereader(
+                high.detach(), action_queries.detach(), sampling_coordinates.detach(), sampled_features.detach(),
+                sample_attention.detach(), support_weights.detach()
+            )
+            veto_typed = self.typed_rereader(
+                high.detach(), action_queries.detach(), sampling_coordinates.detach(), sampled_features.detach(),
+                sample_attention.detach(), veto_weights.detach()
+            )
+            support_gate = (self.gate_max * torch.sigmoid(self.support_gate_raw)).clamp_max(self.active_gate_cap).view(1, -1)
+            veto_gate = (self.gate_max * torch.sigmoid(self.veto_gate_raw)).clamp_max(self.active_gate_cap).view(1, -1)
+            support_logits = support_gate * support_typed["support_logits"]
+            veto_logits = veto_gate * veto_typed["veto_logits"]
+            support_mask = torch.einsum("bfa,bfhw->bahw", support_weights.detach(), factor_masks.detach())
+            veto_mask = torch.einsum("bfa,bfhw->bahw", veto_weights.detach(), factor_masks.detach())
+            return {
+                "action_support_nodes": support_typed["target_nodes"],
+                "action_veto_nodes": veto_typed["target_nodes"],
+                "action_support_attention": support_mask,
+                "action_veto_attention": veto_mask,
+                "action_support_mask": support_mask,
+                "action_veto_mask": veto_mask,
+                "action_support_logits": support_logits,
+                "action_veto_logits": veto_logits,
+                "action_route_strength": (support_logits + veto_logits).detach(),
+                "action_support_gate": support_gate.expand(high.shape[0], -1),
+                "action_veto_gate": veto_gate.expand(high.shape[0], -1),
+                "action_route_gate_cap": self.active_gate_cap.clone(),
+                "action_typed_target_coordinates": support_typed["target_coordinates"],
+                "action_typed_local_offsets": support_typed["target_local_offsets"],
+            }
         support_mask = torch.einsum("bfa,bfhw->bahw", support_weights.detach(), factor_masks.detach())
         veto_mask = torch.einsum("bfa,bfhw->bahw", veto_weights.detach(), factor_masks.detach())
         support_nodes, support_attention, support_active = self._read(high.detach(), action_queries.detach(), support_mask, self.support_query)

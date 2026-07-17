@@ -91,6 +91,16 @@ def evaluate_icdor(
     factor_sums: dict[str, torch.Tensor] | None = None
     route_sums: dict[str, torch.Tensor] | None = None
     prototype_sums: dict[str, torch.Tensor] | None = None
+    credibility_values: list[torch.Tensor] = []
+    credibility_ema_values: list[torch.Tensor] = []
+    credibility_measurements: dict[str, list[torch.Tensor]] = {
+        key: [] for key in (
+            "cV_prior", "cV_query_shuffle_score", "cV_image_shuffle_score",
+            "cV_grounding", "cV_stability", "cV_n_eff",
+        )
+    }
+    fine_transport_rows: list[dict[str, Any]] = []
+    route_ownership_rows: list[dict[str, Any]] = []
     sample_count = 0
     for batch in loader:
         splits = batch["split"] if isinstance(batch["split"], list) else [batch["split"]]
@@ -169,6 +179,37 @@ def evaluate_icdor(
             )["reason_observed_logits"]
         collection["reason_factor_route_off"].append(off_logits.detach().float().cpu())
         collection["reason_factor_route_shuffled"].append(shuffled_logits.detach().float().cpu())
+        cV = output.get("cV")
+        cV_ema = output.get("cV_ema")
+        if isinstance(cV, torch.Tensor) and isinstance(cV_ema, torch.Tensor):
+            credibility_values.append(cV.detach().float().cpu())
+            credibility_ema_values.append(cV_ema.detach().float().cpu())
+            for key in credibility_measurements:
+                value = output.get(key)
+                if isinstance(value, torch.Tensor) and value.shape == cV.shape:
+                    credibility_measurements[key].append(value.detach().float().cpu())
+        measurement = output.get("measurement_stats", {})
+        fine_transport_rows.append({
+            "epoch": epoch,
+            "split": "test",
+            "fine_mask_delta_mean": float(measurement.get("fine_mask_delta_mean", 0.0)),
+            "fine_mask_delta_max": float(measurement.get("fine_mask_delta_max", 0.0)),
+            "anchor_separation_mean": float(measurement.get("anchor_separation_mean", 0.0)),
+            "sample_attention_support_mean": float(measurement.get("sample_attention_support_mean", 0.0)),
+            "typed_coordinates_present": bool(isinstance(output.get("sampling_coordinates"), torch.Tensor)),
+        })
+        mix_gate = output.get("reason_observed_mix_gate", 0.0)
+        mix_gate_mean = float(mix_gate.mean()) if isinstance(mix_gate, torch.Tensor) else float(mix_gate)
+        route_ownership_rows.append({
+            "epoch": epoch,
+            "split": "test",
+            "route_mode": route_mode,
+            "latent_enabled": bool(latent_enabled),
+            "action_route_gate_cap": float(output.get("action_route_gate_cap", 0.0)),
+            "action_shadow_delta_rms": float((output["action_shadow_logits"] - output["action_visual_logits"]).square().mean().sqrt()),
+            "action_final_visual_equal": bool(torch.allclose(output["action_final_logits"], output["action_visual_logits"], atol=1e-7, rtol=0.0)),
+            "reason_observed_mix_gate_mean": mix_gate_mean,
+        })
         count = images.shape[0]
         sample_count += count
         names.extend(str(name) for name in batch["file_name"])
@@ -278,6 +319,29 @@ def evaluate_icdor(
         }
         for factor_id in range(next(iter((prototype_sums or {"empty": torch.empty(0)}).values())).numel())
     ]
+    if credibility_values:
+        credibility = torch.cat(credibility_values, dim=0)
+        credibility_ema = torch.cat(credibility_ema_values, dim=0)
+        credibility_rows = [
+            {
+                "epoch": epoch,
+                "split": "test",
+                "factor_id": factor_id,
+                "cV_mean": float(credibility[:, factor_id].mean()),
+                "cV_p50": float(credibility[:, factor_id].median()),
+                "cV_p95": float(torch.quantile(credibility[:, factor_id], 0.95)),
+                "cV_ema_mean": float(credibility_ema[:, factor_id].mean()),
+                "cV_nonzero_rate": float((credibility[:, factor_id] > 1e-6).float().mean()),
+                **{
+                    f"{key}_mean": float(torch.cat(values, dim=0)[:, factor_id].mean())
+                    for key, values in credibility_measurements.items()
+                    if values
+                },
+            }
+            for factor_id in range(credibility.shape[1])
+        ]
+    else:
+        credibility_rows = [{"epoch": epoch, "split": "test", "available": False, "reason": "model_did_not_export_cV"}]
     reason_rows = [
         {
             "epoch": epoch, "split": "test", "reason_id": reason_id,
@@ -332,6 +396,9 @@ def evaluate_icdor(
         "per_label_metrics": per_label,
         "factor_rows": factor_rows,
         "prototype_rows": prototype_rows,
+        "credibility_rows": credibility_rows,
+        "fine_transport_rows": fine_transport_rows,
+        "route_ownership_rows": route_ownership_rows,
         "route_rows": route_rows,
         "reason_rows": reason_rows,
         "failure_rows": failure_rows,

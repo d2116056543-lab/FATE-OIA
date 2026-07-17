@@ -8,6 +8,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from .mosaic_reason_policy import bounded_reason_residual
+
 from .acpr_sparse_ops import entmax15_bisect
 from .mosaic_sparse_label_decoder import MOSAICSparseLabelDecoder
 
@@ -61,12 +63,16 @@ class MOSAICICDORLatentReasonDecoder(nn.Module):
         factor_index = ontology["factor_index"]
         routes = ontology["reason_routes"]
         allow = torch.zeros(21, factor_count, dtype=torch.bool)
+        absence = torch.zeros(21, factor_count, dtype=torch.bool)
         for reason_index, route in routes.items():
             for factor_name in route["latent_factors"]:
                 allow[reason_index, factor_index[factor_name]] = True
+            for factor_name in route.get("absence_factors", []):
+                absence[reason_index, factor_index[factor_name]] = True
         if not allow.any(dim=-1).all():
             raise ValueError("IC-DOR latent reason decoder requires hard factors for every reason")
         self.register_buffer("reason_factor_allow_mask", allow, persistent=True)
+        self.register_buffer("reason_factor_absence_mask", absence, persistent=True)
         self.reason_queries = nn.Parameter(torch.randn(21, dim) * 0.02)
         self.escape_tokens = nn.Parameter(torch.randn(21, dim) * 0.02)
         self.factor_key = nn.Linear(dim, dim, bias=False)
@@ -133,13 +139,26 @@ class MOSAICICDORLatentReasonDecoder(nn.Module):
         factor_features: torch.Tensor,
         factor_soft_masks: torch.Tensor,
         factor_route_enabled: torch.Tensor,
+        factor_positive_evidence: torch.Tensor | None = None,
+        factor_negative_evidence: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         batch_size, factor_count, dim = factor_features.shape
         if tuple(factor_soft_masks.shape) != (batch_size, factor_count, 45, 80):
             raise ValueError("IC-DOR latent reason decoder factor masks must be [B,F,45,80]")
         if factor_route_enabled.shape != (factor_count,) or factor_route_enabled.dtype != torch.bool:
             raise ValueError("IC-DOR latent reason decoder needs a [F] boolean certificate route mask")
-        factor_keys = self.factor_key(factor_features.detach())
+        route_features = factor_features.detach()
+        if factor_positive_evidence is not None and factor_negative_evidence is not None:
+            if factor_positive_evidence.shape != (batch_size, factor_count) or factor_negative_evidence.shape != (batch_size, factor_count):
+                raise ValueError("IC-DOR latent reason evidence must be [B,F]")
+            route_evidence = torch.where(
+                self.reason_factor_absence_mask.view(1, 21, factor_count),
+                factor_negative_evidence[:, None, :],
+                factor_positive_evidence[:, None, :],
+            )
+        else:
+            route_evidence = factor_features.new_ones(batch_size, 21, factor_count)
+        factor_keys = self.factor_key(route_features) * route_evidence.mean(1).unsqueeze(-1)
         queries = self.reason_query(self.reason_queries).unsqueeze(0).expand(batch_size, -1, -1)
         finite_scores = torch.einsum("brd,bfd->brf", queries, factor_keys) / math.sqrt(dim)
         allowed = self.reason_factor_allow_mask & factor_route_enabled.view(1, -1)
@@ -159,7 +178,7 @@ class MOSAICICDORLatentReasonDecoder(nn.Module):
             torch.zeros_like(unconstrained[:, :, :factor_count]),
         )
         escape_weight = 1.0 - factor_weights.sum(dim=-1, keepdim=True)
-        semantic = torch.einsum("brf,bfd->brd", factor_weights, factor_features.detach())
+        semantic = torch.einsum("brf,bfd->brd", factor_weights * route_evidence, route_features)
         semantic = self.semantic_norm(semantic + escape_weight * self.escape_tokens.unsqueeze(0))
         reason_factor_masks = torch.einsum("brf,bfhw->brhw", factor_weights, factor_soft_masks.detach())
         active = reason_factor_masks.flatten(2).amax(dim=-1) > 1e-8
@@ -178,14 +197,19 @@ class MOSAICICDORLatentReasonDecoder(nn.Module):
 
 
 class MOSAICICDORObservedReasonMixer(nn.Module):
-    """Mix direct observed and modeled observation logits without action access."""
+    """Use direct visual reason as primary with a bounded annotation residual."""
 
     def __init__(self, *, init_mix: float = 0.50) -> None:
         super().__init__()
         if not 0.0 < init_mix < 1.0:
-            raise ValueError("IC-DOR observed-reason mix must be in (0,1)")
-        raw = math.log(init_mix / (1.0 - init_mix))
-        self.mix_raw = nn.Parameter(torch.full((21,), raw))
+            raise ValueError("IC-DOR observed-reason init must be in (0,1)")
+        # ``init_mix`` is retained for config compatibility, but v4 never
+        # starts with a 50/50 mixer.  A small bounded residual protects the
+        # direct visual observed-reason owner from annotation noise.
+        initial_alpha = 0.05
+        raw = math.log(initial_alpha / (0.25 - initial_alpha))
+        self.alpha_raw = nn.Parameter(torch.full((21,), raw))
+        self.max_alpha = 0.25
 
     def forward(
         self,
@@ -196,10 +220,15 @@ class MOSAICICDORObservedReasonMixer(nn.Module):
     ) -> dict[str, torch.Tensor]:
         if reason_visual_observed_logits.shape != reason_observation_logits.shape or reason_visual_observed_logits.shape[-1] != 21:
             raise ValueError("IC-DOR observed-reason mixer expects matching [B,21] logits")
-        mix = torch.sigmoid(self.mix_raw).unsqueeze(0)
+        alpha = (self.max_alpha * torch.sigmoid(self.alpha_raw)).unsqueeze(0)
         observed = (
-            (1.0 - mix) * reason_visual_observed_logits + mix * reason_observation_logits
+            bounded_reason_residual(
+                reason_visual_observed_logits,
+                reason_observation_logits,
+                max_alpha=self.max_alpha,
+                alpha=alpha.squeeze(0),
+            )[0]
             if latent_enabled
             else reason_visual_observed_logits
         )
-        return {"reason_observed_logits": observed, "reason_observed_mix_gate": mix.expand_as(observed)}
+        return {"reason_observed_logits": observed, "reason_observed_mix_gate": alpha.expand_as(observed)}

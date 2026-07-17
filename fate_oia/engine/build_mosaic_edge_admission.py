@@ -7,6 +7,8 @@ from typing import Any, Mapping, Sequence
 
 import torch
 
+from fate_oia.models.mosaic_action_route_policy import partial_action_admission
+
 
 @dataclass(frozen=True)
 class MOSAICEdgeInterventionStats:
@@ -62,6 +64,35 @@ def build_edge_admission(
         for action_name, directions in ontology["action_routes"].items():
             for edge in directions[direction]:
                 candidate[direction_id, factor_index[edge["factor"]], action_index[action_name]] = True
+    # Aggregate the best train-audit evidence per action before accepting any
+    # edge. This is intentionally partial: one action may be admitted while
+    # the other actions remain in shadow, but a weak action cannot pass merely
+    # because a different action has a strong factor edge.
+    action_credibility = torch.zeros(len(action_names), dtype=torch.float32)
+    action_tet = torch.zeros(len(action_names), dtype=torch.float32)
+    action_tes = torch.zeros(len(action_names), dtype=torch.float32)
+    action_cca = torch.zeros(len(action_names), dtype=torch.float32)
+    action_visual_ap = torch.zeros(len(action_names), dtype=torch.float32)
+    action_edge_ap = torch.zeros(len(action_names), dtype=torch.float32)
+    for action_id, action_name in enumerate(action_names):
+        for direction_id, direction in enumerate(("support", "veto")):
+            for factor_id, factor_name in enumerate(factor_names):
+                if not candidate[direction_id, factor_id, action_id]:
+                    continue
+                stats = statistics.get((direction, factor_name, action_name))
+                if stats is None:
+                    continue
+                action_credibility[action_id] = max(
+                    action_credibility[action_id], float(factor_tiers[factor_id] == "certified")
+                )
+                action_tet[action_id] = max(action_tet[action_id], float(stats.tet_lcb95))
+                action_tes[action_id] = max(action_tes[action_id], float(stats.tes_lcb95))
+                action_cca[action_id] = max(action_cca[action_id], float(stats.cca))
+                action_visual_ap[action_id] = max(action_visual_ap[action_id], float(stats.visual_ap))
+                action_edge_ap[action_id] = max(action_edge_ap[action_id], float(stats.isolated_edge_ap))
+    partial_action_ready = partial_action_admission(
+        action_credibility, action_tet, action_tes, action_cca, action_visual_ap, action_edge_ap
+    )
     admission = torch.zeros_like(candidate)
     entries: dict[str, dict[str, Any]] = {}
     for direction_id, direction in enumerate(("support", "veto")):
@@ -75,6 +106,8 @@ def build_edge_admission(
                 reasons: list[str] = []
                 if factor_tiers[factor_id] != "certified":
                     reasons.append("factor_not_certified")
+                if not bool(partial_action_ready[action_id]):
+                    reasons.append("partial_action_admission_not_ready")
                 if stats is None:
                     reasons.append("missing_train_audit_intervention")
                 else:
@@ -105,6 +138,7 @@ def build_edge_admission(
                     "candidate": True,
                     "factor_tier": factor_tiers[factor_id],
                     "accepted": accepted,
+                    "partial_action_ready": bool(partial_action_ready[action_id]),
                     "reasons": reasons,
                     "metrics": asdict(stats) if stats is not None else None,
                 }

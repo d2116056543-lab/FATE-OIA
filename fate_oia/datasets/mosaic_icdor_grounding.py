@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import numpy as np
@@ -128,7 +128,12 @@ class ICDORGroundingObservationBuilder:
                 if "box2d" in sources and objects_available:
                     available = True
                     for item in objects:
-                        if isinstance(item, dict) and self._matches(name, str(item.get("category", ""))):
+                        if not isinstance(item, dict):
+                            continue
+                        attributes = parse_bdd100k_attributes(item)
+                        color_constraint = factor.get("attribute_constraints", {}).get("trafficLightColor")
+                        color_ok = color_constraint is None or attributes.get("traffic_light_color") == str(color_constraint).lower()
+                        if self._matches(name, str(item.get("category", ""))) and color_ok:
                             candidate = self._box_mask(item.get("box2d", {}), image_hw, self.grid_hw, device)
                             if candidate is not None:
                                 candidate = self._restrict_to_declared_region(candidate, factor, device)
@@ -139,6 +144,10 @@ class ICDORGroundingObservationBuilder:
                     for lane in lanes:
                         if not isinstance(lane, dict) or "lane" not in str(lane.get("category", "")).lower():
                             continue
+                        constraints = factor.get("attribute_constraints", {})
+                        if constraints.get("laneStyle") == "solid":
+                            if parse_bdd100k_attributes(lane).get("lane_style") != "solid":
+                                continue
                         vertices = []
                         for poly in lane.get("poly2d", []) or []:
                             if isinstance(poly, dict):
@@ -170,3 +179,61 @@ class ICDORGroundingObservationBuilder:
                     # Complete source but no matching item: weak negative only.
                     weak_negative_mask[row, column] = 1.0
         return {"presence_target": presence_target, "presence_known_mask": presence_known_mask, "visibility_target": visibility_target, "visibility_known_mask": visibility_known_mask, "weak_negative_mask": weak_negative_mask, "geometry_known_mask": geometry_known_mask, "geometry_masks": geometry_masks, "source_available": source_available}
+
+
+def parse_bdd100k_attributes(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize BDD100K attributes without inventing missing semantics."""
+    raw = row.get("attributes", {}) if isinstance(row, Mapping) else {}
+    raw = raw if isinstance(raw, Mapping) else {}
+
+    def _text(name: str) -> str | None:
+        value = raw.get(name, row.get(name) if isinstance(row, Mapping) else None)
+        return str(value).lower() if value not in (None, "", "unknown") else None
+
+    def _bool(name: str) -> bool | None:
+        value = raw.get(name, row.get(name) if isinstance(row, Mapping) else None)
+        if value is None:
+            return None
+        if isinstance(value, str):
+            if value.lower() in {"true", "1", "yes"}:
+                return True
+            if value.lower() in {"false", "0", "no"}:
+                return False
+            return None
+        return bool(value)
+
+    return {
+        "traffic_light_color": _text("trafficLightColor"),
+        "lane_direction": _text("laneDirection"),
+        "lane_style": _text("laneStyle"),
+        "lane_types": raw.get("laneTypes"),
+        "area_type": _text("areaType"),
+        "occluded": _bool("occluded"),
+        "truncated": _bool("truncated"),
+        "source_attributes_complete": all(
+            raw.get(name) is not None for name in ("occluded", "truncated")
+        ),
+    }
+
+
+def corridor_occupancy_observation(
+    boxes: Sequence[tuple[float, float, float, float]],
+    *,
+    corridor: tuple[float, float, float, float],
+) -> dict[str, Any]:
+    """Return occupancy with a reliable negative only when source is complete."""
+    cx0, cy0, cx1, cy1 = corridor
+    occupied = False
+    for x0, y0, x1, y1 in boxes:
+        overlap_x = max(0.0, min(cx1, x1) - max(cx0, x0))
+        overlap_y = max(0.0, min(cy1, y1) - max(cy0, y0))
+        corridor_area = max((cx1 - cx0) * (cy1 - cy0), 1e-6)
+        if overlap_x * overlap_y / corridor_area >= 0.05:
+            occupied = True
+            break
+    return {
+        "presence": 1.0 if occupied else 0.0,
+        "reliable_negative": not occupied,
+        "source_complete": True,
+        "overlap_threshold": 0.05,
+    }

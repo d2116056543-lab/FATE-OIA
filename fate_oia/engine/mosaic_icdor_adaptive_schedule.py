@@ -25,10 +25,12 @@ class ICDORStatePolicy:
     decoder_router_lr_scale: float = 1.0
     route_cap_mutable: bool = True
     allow_new_losses: bool = True
+    pu_enabled: bool = True
 
 
 POLICIES = {
-    "FOUNDATION": ICDORStatePolicy("off", 0.0, 0.0, write_provisional_certificate=True),
+    # Regime A: all learning routes are active, but action shadow is not final.
+    "FOUNDATION": ICDORStatePolicy("shadow", 0.10, 0.05, write_provisional_certificate=True),
     "DUAL_REASON_SHADOW": ICDORStatePolicy(
         "shadow", 0.0, 0.0, freeze_factor_and_prototypes=True, freeze_certificate=True,
         enable_interventions=True, enable_hidden_audit=True,
@@ -47,7 +49,7 @@ POLICIES = {
 
 
 class ICDORAdaptiveSchedule:
-    """Fail-closed train-audit/train-calib state machine; test metrics are forbidden."""
+    """Continuous-access train-audit/train-calib state machine; test is forbidden."""
 
     LIMITS = {
         "FOUNDATION": (3, 6),
@@ -70,6 +72,8 @@ class ICDORAdaptiveSchedule:
         self.safe_joint_entry_exp_map: float | None = None
         self.last_readiness: dict[str, dict[str, Any]] = {}
         self.history: list[dict[str, Any]] = []
+        self.pu_enabled = True
+        self.pu_disable_reason: str | None = None
 
     def policy(self) -> ICDORStatePolicy:
         return POLICIES[self.state]
@@ -80,12 +84,17 @@ class ICDORAdaptiveSchedule:
         return ICDORPhase(
             name=f"adaptive_{self.state.lower()}",
             route_mode=policy.route_mode,
-            latent_enabled=self.state != "FOUNDATION",
-            enable_factor_losses=self.state == "FOUNDATION",
+            latent_enabled=True,
+            enable_factor_losses=True,
             enable_posterior_ranking=policy.reason_rank_weight > 0.0,
             enable_pareto=policy.enable_pareto,
             freeze_factor_branch=policy.freeze_factor_and_prototypes,
+            pu_enabled=self.pu_enabled,
         )
+
+    def set_pu_enabled(self, enabled: bool, *, reason: str | None = None) -> None:
+        self.pu_enabled = bool(enabled)
+        self.pu_disable_reason = None if enabled else (reason or "disabled_by_policy")
 
     def record_epoch_execution(self) -> None:
         """Track the state that actually controlled an optimizer epoch."""
@@ -122,15 +131,10 @@ class ICDORAdaptiveSchedule:
         return number == number and abs(number) != float("inf")
 
     def _foundation_ready(self, metrics: dict[str, Any]) -> bool:
-        groups = metrics.get("certified_route_group_count_per_action", [])
+        cV_count = int(metrics.get("observable_cV_gt_030", 0))
         return (
-            metrics.get("factor_audit_complete") is True
-            and metrics.get("factor_audit_exception") is False
-            and metrics.get("unknown_abstained") is True
-            and len(groups) == 4 and min(groups) >= 1
-            and int(metrics.get("reachable_reason_count", 0)) >= 15
-            and float(metrics.get("certificate_tier_jaccard", 0.0)) >= 0.90
-            and float(metrics.get("saturation_fraction", 1.0)) <= 0.20
+            metrics.get("continuous_credibility_available") is True
+            and cV_count >= 6
             and metrics.get("diagnostics_finite") is True
         )
 
@@ -232,9 +236,8 @@ class ICDORAdaptiveSchedule:
         elif self.state_epochs >= minimum and self.consecutive_ready >= 2:
             self._transition()
 
-        if self.state == previous and self.state_epochs >= maximum and not ready:
-            self.failed_closed = True
-            self.failure_reason = f"{self.state.lower()}_readiness_not_met_by_max_epoch"
+        # Missing audit evidence may delay a transition, but never removes
+        # learning access.  Discrete certificates are only used by admission.
         row = {
             "epoch": int(epoch),
             "state_before": previous,
@@ -264,6 +267,8 @@ class ICDORAdaptiveSchedule:
             "safe_joint_entry_exp_map": self.safe_joint_entry_exp_map,
             "last_readiness": dict(self.last_readiness),
             "history": list(self.history),
+            "pu_enabled": self.pu_enabled,
+            "pu_disable_reason": self.pu_disable_reason,
         }
 
     def load_state_dict(self, payload: dict[str, Any]) -> None:
@@ -275,3 +280,5 @@ class ICDORAdaptiveSchedule:
             "best_train_audit_joint", "safe_joint_entry_exp_map", "last_readiness", "history",
         ):
             setattr(self, key, payload[key])
+        self.pu_enabled = bool(payload.get("pu_enabled", True))
+        self.pu_disable_reason = payload.get("pu_disable_reason")

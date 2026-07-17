@@ -1,13 +1,13 @@
 {
-  "source_branch": "acpr_mosaic_ad_v1_direct_image",
-  "source_head": "fceb4d3883b07bc9be2f818ab3f1c7e7e9107400",
-  "source_remote": "github/acpr_mosaic_ad_v1_direct_image",
-  "target_branch": "acpr_mosaic_trust_v3_icdor_direct_image",
-  "target_worktree": "E:\\sbw\\FATE_Drive\\fate_oia_acpr_mosaic_trust_v3_icdor_worktree",
+  "source_branch": "acpr_mosaic_trust_v3_icdor_direct_image",
+  "source_head": "ce05e6235ffa8c8998e055941fcad2a91922a0b7",
+  "source_remote": "github/acpr_mosaic_trust_v3_icdor_direct_image",
+  "target_branch": "acpr_mosaic_trust_v4_credo_direct_image",
+  "target_worktree": "E:\\sbw\\FATE_Drive\\fate_oia_acpr_mosaic_trust_v4_credo_worktree",
   "source_worktree_clean": true,
   "created_at": "2026-07-13T15:05:04+08:00",
   "upstream_verified": true,
   "remote_alias_refinement": "Plan origin upstream check maps to github/acpr_mosaic_ad_v1_direct_image because origin is the SNNA remote on this host.",
-  "plan_sha256": "298AF9DD5D2AA2203DCF0A74D24792149D99752B08B1FE6898D360491159A806",
-  "audit_skill_sha256": "1323CBDB756ADEE3C92D85295C7D21F1893E632BA5921C6B8CEA95C94672ADFC"
+  "plan_sha256": "ECF6E74C9CD02B86AAAFB939E977B49847DFA9B21387AA9CF1EE1C847D23D5C6",
+  "audit_skill_sha256": "8E6C09D6AA77E84A41F2892C385191ACB1DF094AAC9DAD9AD7D1336C1547B741"
 }

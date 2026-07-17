@@ -692,7 +692,7 @@ def load_mosaic_schema_bundle(config_root: str | Path) -> dict[str, Any]:
 # IC-DOR deliberately uses an ontology that is separate from the legacy
 # decision-state bundle.  The legacy bundle contains state-to-action semantics;
 # this loader accepts only observable factors and target-owned candidate routes.
-_ICDOR_FACTOR_FIELDS = {
+_ICDOR_REQUIRED_FACTOR_FIELDS = {
     "name",
     "type",
     "num_prototypes",
@@ -702,6 +702,9 @@ _ICDOR_FACTOR_FIELDS = {
     "positive_reason_anchors",
     "grounding_sources",
 }
+_ICDOR_OPTIONAL_FACTOR_FIELDS = {
+    "role", "visual_sources", "attribute_constraints", "negative_policy", "source_kind", "observable",
+}
 _ICDOR_REASON_ROUTE_FIELDS = {
     "group",
     "direct_factors",
@@ -709,7 +712,10 @@ _ICDOR_REASON_ROUTE_FIELDS = {
     "contradiction_factors",
     "escape_allowed",
 }
-_ICDOR_ALLOWED_GROUNDING_SOURCES = {"box2d", "lane_polyline", "drivable_mask", "image_only"}
+_ICDOR_OPTIONAL_REASON_ROUTE_FIELDS = {"absence_factors", "semantic_kind"}
+_ICDOR_ALLOWED_GROUNDING_SOURCES = {
+    "box2d", "lane_polyline", "drivable_mask", "bdd100k_attributes", "corridor_overlap", "image_only"
+}
 _ICDOR_FORBIDDEN_FACTOR_NAMES = {
     "no_left_lane",
     "no_right_lane",
@@ -770,8 +776,16 @@ def load_icdor_ontology(config_root: str | Path) -> dict[str, Any]:
         raise ValueError("IC-DOR requires a non-trivial observable factor inventory")
     factor_names: list[str] = []
     for factor in factors:
-        if not isinstance(factor, dict) or set(factor) != _ICDOR_FACTOR_FIELDS:
-            raise ValueError("IC-DOR factor candidates must use the exact observable-factor schema")
+        if not isinstance(factor, dict) or not _ICDOR_REQUIRED_FACTOR_FIELDS <= set(factor):
+            raise ValueError("IC-DOR factor candidates must use the complete observable-factor schema")
+        if set(factor) - (_ICDOR_REQUIRED_FACTOR_FIELDS | _ICDOR_OPTIONAL_FACTOR_FIELDS):
+            raise ValueError("IC-DOR factor candidates contain unknown fields")
+        factor.setdefault("role", "observable")
+        factor.setdefault("visual_sources", list(factor["grounding_sources"]))
+        factor.setdefault("attribute_constraints", {})
+        factor.setdefault("negative_policy", "unknown_if_source_incomplete")
+        factor.setdefault("source_kind", "grounded" if "image_only" not in factor["grounding_sources"] else "image_only")
+        factor.setdefault("observable", factor["role"] == "observable")
         name = factor["name"]
         if not isinstance(name, str) or not name or name in _ICDOR_FORBIDDEN_FACTOR_NAMES or "state" in name:
             raise ValueError(f"IC-DOR factor {name!r} is not an observable atomic factor")
@@ -835,12 +849,17 @@ def load_icdor_ontology(config_root: str | Path) -> dict[str, Any]:
     if set(reason_routes) != set(range(21)):
         raise ValueError("IC-DOR reason routes must cover exactly the 21 official reason labels")
     for reason_id, route in reason_routes.items():
-        if not isinstance(route, dict) or set(route) != _ICDOR_REASON_ROUTE_FIELDS:
+        if not isinstance(route, dict) or not _ICDOR_REASON_ROUTE_FIELDS <= set(route):
             raise ValueError(f"IC-DOR reason route {reason_id} has an invalid schema")
+        if set(route) - (_ICDOR_REASON_ROUTE_FIELDS | _ICDOR_OPTIONAL_REASON_ROUTE_FIELDS):
+            raise ValueError(f"IC-DOR reason route {reason_id} has unknown fields")
+        route.setdefault("absence_factors", [])
+        route.setdefault("semantic_kind", "observable_or_latent")
         if not isinstance(route["group"], str) or not route["group"]:
             raise ValueError(f"IC-DOR reason route {reason_id} requires a semantic group")
         for field in ("direct_factors", "latent_factors", "contradiction_factors"):
             route[field] = _icdor_name_list(route[field], field=field, factor_names=factor_name_set)
+        route["absence_factors"] = _icdor_name_list(route["absence_factors"], field="absence_factors", factor_names=factor_name_set)
         if type(route["escape_allowed"]) is not bool:
             raise ValueError(f"IC-DOR reason route {reason_id} escape_allowed must be boolean")
         if any("state" in name for name in route["latent_factors"]):

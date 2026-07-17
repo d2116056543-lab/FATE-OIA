@@ -29,6 +29,13 @@ _REQUIRED_FORWARD_OUTPUTS = (
     "reason_propensity",
 )
 
+_V4_REQUIRED_FORWARD_OUTPUTS = (
+    "cV", "cV_ema", "factor_soft_masks", "factor_coarse_masks",
+    "sampling_coordinates", "sampled_features", "sample_attention",
+    "action_shadow_logits", "action_final_logits", "action_visual_logits",
+    "reason_visual_logits", "reason_latent_logits", "reason_final_logits",
+)
+
 _REQUIRED_FUNCTIONAL_CHECKS = (
     "direct_image",
     "factor_certificate",
@@ -41,6 +48,12 @@ _REQUIRED_FUNCTIONAL_CHECKS = (
     "resume_integrity",
     "visual_audit",
     "foreground_launcher",
+    "continuous_credibility",
+    "fine_transport",
+    "partial_action_admission",
+    "regime_schedule",
+    "artifact_schema_v4",
+    "batch_field_reuse",
 )
 
 _REQUIRED_REMEDIATION_GATES = (
@@ -238,6 +251,39 @@ def verify_dynamic_forward_and_gradients(model: nn.Module, images: torch.Tensor)
         model.train(was_training)
 
 
+@torch.no_grad()
+def verify_v4_forward_contract(model: nn.Module, images: torch.Tensor) -> dict[str, Any]:
+    """Validate v4-only outputs and deployment/learning separation on real forward."""
+    output = model(
+        images, route_mode="shadow", latent_enabled=True, reason_route_mode="full",
+        return_masks=True, return_diagnostics=True,
+    )
+    missing = [key for key in _V4_REQUIRED_FORWARD_OUTPUTS if not isinstance(output.get(key), torch.Tensor)]
+    if missing:
+        raise ICDORAuditError(f"v4 forward contract is missing outputs: {missing}")
+    cV = output["cV"]
+    if cV.ndim != 2 or cV.shape[0] != images.shape[0] or not torch.isfinite(cV).all():
+        raise ICDORAuditError("v4 continuous credibility is not finite [B,F]")
+    if output["sampling_coordinates"].ndim != 6 or output["sampled_features"].ndim != 6:
+        raise ICDORAuditError("v4 typed fine evidence tensors have invalid rank")
+    if output["sample_attention"].shape != output["sampling_coordinates"].shape[:-1]:
+        raise ICDORAuditError("v4 typed attention does not align with coordinates")
+    if not torch.allclose(output["action_final_logits"], output["action_visual_logits"], atol=1e-7, rtol=0.0):
+        raise ICDORAuditError("v4 shadow route changed final action before admission")
+    if output["factor_soft_masks"].shape != output["factor_coarse_masks"].shape:
+        raise ICDORAuditError("v4 fine/coarse evidence masks have inconsistent shape")
+    delta = (output["factor_soft_masks"] - output["factor_coarse_masks"]).abs().mean()
+    if not torch.isfinite(delta) or float(delta) <= 0.0:
+        raise ICDORAuditError("v4 fine transport is identical to coarse transport")
+    return {
+        "pass": True,
+        "cV_shape": list(cV.shape),
+        "typed_coordinate_shape": list(output["sampling_coordinates"].shape),
+        "fine_coarse_delta_mean": float(delta),
+        "final_action_visual_equal_before_admission": True,
+    }
+
+
 def _existing_review_validation_requested(
     review_pass: str | None,
     runtime_selection: str | None,
@@ -313,7 +359,10 @@ def verify_source_manifest(root: Path) -> dict[str, Any]:
     skill = root / ".codex" / "skills" / "acpr-mosaic-trust-v3-icdor-implementation-audit" / "SKILL.md"
     if not skill.is_file() or sha256_file(skill) != payload["audit_skill_sha256"]:
         raise ICDORAuditError("IC-DOR audit skill hash drifted from source manifest")
-    if payload.get("target_branch") != "acpr_mosaic_trust_v3_icdor_direct_image":
+    if payload.get("target_branch") not in {
+        "acpr_mosaic_trust_v3_icdor_direct_image",
+        "acpr_mosaic_trust_v4_credo_direct_image",
+    }:
         raise ICDORAuditError("IC-DOR source manifest target branch is invalid")
     return {"pass": True, "path": str(path), **payload}
 
@@ -410,6 +459,37 @@ def functional_hard_gates(
         root / "scripts" / "FATE_OIA_acpr_mosaic_trust_v3_icdor_foreground.ps1",
         ("Invoke-ForegroundPython", "--require_review_pass", "--runtime_selection", "--write_review_pass"),
         ("Start-Process", "Start-Job", "nohup", "scheduled task"),
+    )
+    evidence["continuous_credibility"] = {
+        "config_independent_of_reason_labels": config.get("credibility", {}).get("independent_of_reason_labels") is True,
+        "source": _require_source_tokens(
+            root / "fate_oia" / "models" / "mosaic_continuous_credibility.py",
+            ("visual_credibility_from_measurements", "update_credibility_ema", "factor_credibility_cap"),
+            ("reason_labels", "observed_reason", "reason_targets", "factor_certificate_reliability"),
+        ),
+        "dynamic": dynamic.get("v4_contract", {}).get("cV_shape"),
+    }
+    if not evidence["continuous_credibility"]["config_independent_of_reason_labels"] or dynamic.get("v4_contract", {}).get("pass") is not True:
+        raise ICDORAuditError("v4 continuous credibility contract failed")
+    evidence["fine_transport"] = _require_source_tokens(
+        root / "fate_oia" / "models" / "mosaic_typed_evidence_splat.py",
+        ("typed_evidence_splat", "eta_by_type", "max_splat_samples", "fine_mask"),
+    )
+    evidence["partial_action_admission"] = _require_source_tokens(
+        root / "fate_oia" / "models" / "mosaic_action_route_policy.py",
+        ("partial_action_admission", "compose_final_action_logits"),
+    )
+    evidence["regime_schedule"] = _require_source_tokens(
+        root / "fate_oia" / "engine" / "mosaic_icdor_adaptive_schedule.py",
+        ("FOUNDATION", "DUAL_REASON_SHADOW", "SAFE_JOINT", "CONSOLIDATION", "pu_enabled"),
+    )
+    evidence["artifact_schema_v4"] = _require_source_tokens(
+        root / "fate_oia" / "utils" / "mosaic_icdor_artifacts.py",
+        ("credibility_stats.jsonl", "fine_transport_stats.jsonl", "route_ownership.jsonl"),
+    )
+    evidence["batch_field_reuse"] = _require_source_tokens(
+        root / "fate_oia" / "models" / "mosaic_batch_field_reuse.py",
+        ("BatchLocalDinoFieldReuse", "no cross-batch persistence"),
     )
     return ({name: "PASS" for name in _REQUIRED_FUNCTIONAL_CHECKS}, evidence)
 
@@ -623,6 +703,7 @@ def main() -> None:
     model = build_icdor_model(config).to(device)
     ownership, _ = build_icdor_parameter_ownership(model)
     dynamic = verify_dynamic_forward_and_gradients(model, images.to(device))
+    dynamic["v4_contract"] = verify_v4_forward_contract(model, images.to(device))
     functional, functional_evidence = functional_hard_gates(root, config, dynamic)
     clean = _worktree_clean(root)
     contract_manifest = root / ".review" / "icdor_source_manifest.json"

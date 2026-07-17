@@ -158,7 +158,9 @@ def test_review_pass_is_fail_closed_and_binds_all_evidence() -> None:
         "functional_checks": {name: "PASS" for name in (
             "direct_image", "factor_certificate", "edge_admission", "action_firewall",
             "reason_firewall", "selective_observation", "calibration", "artifact_schema",
-            "resume_integrity", "visual_audit", "foreground_launcher",
+            "resume_integrity", "visual_audit", "foreground_launcher", "continuous_credibility",
+            "fine_transport", "partial_action_admission", "regime_schedule", "artifact_schema_v4",
+            "batch_field_reuse",
         )},
         "missing_items": [],
         "git_tree": "TREE",
@@ -257,7 +259,9 @@ def test_review_pass_rejects_dirty_or_unbound_source_tree() -> None:
     checks = (
         "direct_image", "factor_certificate", "edge_admission", "action_firewall",
         "reason_firewall", "selective_observation", "calibration", "artifact_schema",
-        "resume_integrity", "visual_audit", "foreground_launcher",
+        "resume_integrity", "visual_audit", "foreground_launcher", "continuous_credibility",
+        "fine_transport", "partial_action_admission", "regime_schedule", "artifact_schema_v4",
+        "batch_field_reuse",
     )
     base = {
         "pass": True, "git_head": "abc", "git_tree": "TREE",

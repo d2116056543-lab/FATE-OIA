@@ -103,6 +103,47 @@ ICDOR_REQUIRED_REMEDIATION_GATES = (
 )
 
 
+def resolve_icdor_policy_weights(policy: Mapping[str, float] | None = None) -> dict[str, float]:
+    """Resolve route/loss policy once so scheduler decisions affect training."""
+    defaults = {
+        "action_visual": 1.0,
+        # The old cross-image queue rank is retained only as a diagnostic;
+        # v4 uses the same-image selected-vs-random matched control instead.
+        "action_rank": 0.0,
+        "action_shadow": 0.50,
+        "reason_visual_observed": 1.0,
+        "reason_observation": 0.20,
+        "reason_posterior_rank": 0.0,
+        "factor_presence": 1.0,
+    }
+    if policy is not None:
+        defaults.update({str(key): float(value) for key, value in policy.items()})
+    return defaults
+
+
+def clip_icdor_owner_gradients(
+    owner_parameters: Mapping[str, Iterable[nn.Parameter]],
+    clip_limits: Mapping[str, float],
+) -> dict[str, float]:
+    """Clip each owner independently and return pre-clip norms."""
+    norms: dict[str, float] = {}
+    for owner, parameters in owner_parameters.items():
+        parameters = [parameter for parameter in parameters if parameter.grad is not None]
+        if not parameters:
+            norms[owner] = 0.0
+            continue
+        norm = torch.linalg.vector_norm(torch.stack([parameter.grad.detach().norm() for parameter in parameters]))
+        norms[owner] = float(norm.detach().cpu())
+        limit = float(clip_limits.get(owner, 1.0))
+        if limit <= 0.0:
+            raise ValueError("IC-DOR owner gradient clip limits must be positive")
+        scale = min(1.0, limit / float(norm.detach().cpu().clamp_min(1e-12)))
+        if scale < 1.0:
+            for parameter in parameters:
+                parameter.grad.mul_(scale)
+    return norms
+
+
 def _pending_evidence_document(artifact: str, *, build_epoch: int) -> dict[str, Any]:
     """Persist an honest pre-collection state without fabricating audit evidence."""
     if artifact not in {"factor_certificate", "edge_admission"} or build_epoch < 0:
@@ -189,7 +230,7 @@ def apply_icdor_consolidation(
 
 def apply_icdor_route_gate_schedule(model: nn.Module, phase: ICDORPhase) -> float:
     """Keep route capacity coupled to adaptive state, never a wall-clock epoch."""
-    cap = {"off": 0.02, "shadow": 0.05, "admitted": 0.08}[phase.route_mode]
+    cap = {"off": 0.02, "shadow": 0.05, "admitted": 0.05}[phase.route_mode]
     model.set_route_gate_cap(cap)
     return cap
 
@@ -716,9 +757,13 @@ def build_icdor_loaders(
         "split_seed": seed,
         "train_core_count": len(core),
         "train_audit_count": len(audit),
+        "audit_visual_count": len(split.audit_visual_indices),
+        "audit_target_count": len(split.audit_target_indices),
         "train_calib_count": len(calib),
         "test_count": len(test_indices),
         "train_audit_positive_counts": list(split.audit_positive_counts),
+        "audit_visual_positive_counts": list(split.audit_visual_positive_counts),
+        "audit_target_positive_counts": list(split.audit_target_positive_counts),
         "train_calib_positive_counts": list(split.calib_positive_counts),
     }
     return (
@@ -738,6 +783,7 @@ def _owner_for_name(name: str) -> tuple[str, tuple[str, ...]] | None:
         ("reason_visual_pyramid.", "visual_pyramid", ("reason_observed",)),
         ("factor_adapter.", "factor_adapter", ("factor",)),
         ("factor_extractor.prototype_bank.", "factor_prototypes", ("factor",)),
+        ("continuous_credibility.", "factor_extractor", ("factor",)),
         ("factor_extractor.", "factor_extractor", ("factor",)),
         ("action_adapter.", "action_adapter", ("action_base",)),
         ("action_visual_decoder.", "action_visual_decoder", ("action_base",)),
@@ -923,7 +969,10 @@ def compute_icdor_training_losses(
     reason_targets = batch["reason"]
     sample_ids = batch["file_name"]
     losses: dict[str, torch.Tensor] = {}
-    loss_config = (config or {}) .get("loss", {})
+    loss_config = (config or {}).get("loss", {})
+    policy = resolve_icdor_policy_weights(
+        loss_config.get("policy") if isinstance(loss_config.get("policy"), Mapping) else None
+    )
     action_config = loss_config.get("action", {})
     route_config = loss_config.get("action_route", {})
     factor_config = loss_config.get("factor", {})
@@ -943,7 +992,7 @@ def compute_icdor_training_losses(
     )
     losses.update(base)
     losses["loss_action_cross_sample_rank"] = action_rank
-    action_total = base["loss_action_base_total"] + float(action_config.get("rank_weight", 0.10)) * action_rank
+    action_total = policy["action_visual"] * base["loss_action_base_total"] + policy["action_rank"] * action_rank
     if phase.route_mode != "off":
         pareto_penalty = pareto.route_penalty(
             output["action_visual_logits"], output["action_shadow_logits"], action_targets
@@ -958,7 +1007,7 @@ def compute_icdor_training_losses(
             pareto_penalty=pareto_penalty,
             matched_random_logits=output["action_matched_random_logits"],
             route_strength_target=float(config["model"]["action_route"]["route_strength_target"]) if config else 0.05,
-            shadow_asl_weight=float(route_config.get("shadow_asl_weight", 1.0)),
+            shadow_asl_weight=float(route_config.get("shadow_asl_weight", policy["action_shadow"])),
             pareto_weight=float(route_config.get("pareto_weight", 1.0)),
             sparsity_weight=float(route_config.get("sparsity_weight", 0.02)),
             dustbin_weight=float(route_config.get("dustbin_weight", 0.01)),
@@ -1024,16 +1073,16 @@ def compute_icdor_training_losses(
     )
     losses.update(observed)
     reason_total = (
-        float(reason_config.get("visual_observed_asl_weight", 0.50)) * observed["loss_reason_visual_observed_asl"]
+        policy["reason_visual_observed"] * observed["loss_reason_visual_observed_asl"]
         if not phase.latent_enabled else
-        float(reason_config.get("visual_observed_asl_weight", 0.50)) * observed["loss_reason_visual_observed_asl"]
+        policy["reason_visual_observed"] * observed["loss_reason_visual_observed_asl"]
         + float(reason_config.get("observed_asl_weight", 1.0)) * observed["loss_reason_observed_asl"]
     )
     posterior = model.observation_model.posterior_from_observed_targets(
         output["reason_logits_latent"], observed_targets, output
     )["reason_latent_posterior"]
     losses["reason_latent_posterior_mean"] = posterior.mean()
-    if phase.latent_enabled:
+    if phase.latent_enabled and phase.pu_enabled:
         factor_support = torch.einsum(
             "brf,bf->br", output["reason_factor_router_weights"], output["factor_positive_evidence"].detach()
         )
@@ -1046,7 +1095,7 @@ def compute_icdor_training_losses(
         )
         losses.update(selective)
         reason_total = reason_total + (
-            float(reason_config.get("observation_nll_weight", 0.30)) * selective["loss_reason_observation_nll"]
+            policy["reason_observation"] * selective["loss_reason_observation_nll"]
             + float(reason_config.get("posterior_bce_weight", 0.30)) * selective["loss_reason_posterior_bce"]
             + float(reason_config.get("posterior_rank_weight", 0.08)) * selective["loss_reason_posterior_rank"]
             + float(reason_config.get("factor_latent_consistency_weight", 0.05)) * selective["loss_reason_factor_latent_consistency"]
@@ -1057,10 +1106,12 @@ def compute_icdor_training_losses(
             output["reason_logits_latent"], posterior, sample_ids, reason_queue
         )
         losses["loss_reason_cross_sample_rank"] = reason_rank
-        if phase.enable_posterior_ranking:
-            reason_total = reason_total + float(reason_config.get("posterior_rank_weight", 0.08)) * reason_rank
+        if phase.enable_posterior_ranking and float(reason_rank_stats["pair_weight_sum"]) > 0.0:
+            reason_total = reason_total + policy["reason_posterior_rank"] * reason_rank
         losses["reason_rank_pair_weight_sum"] = reason_rank_stats["pair_weight_sum"]
     losses["action_rank_pair_weight_sum"] = action_rank_stats["pair_weight_sum"]
+    losses.setdefault("loss_reason_cross_sample_rank", output["reason_logits_latent"].sum() * 0.0)
+    losses.setdefault("reason_rank_pair_weight_sum", output["reason_logits_latent"].sum() * 0.0)
     losses["loss_action_total"] = action_total
     losses["loss_factor_weighted_total"] = factor_total
     losses["loss_reason_total"] = reason_total
@@ -1140,6 +1191,22 @@ def _parameter_group_gradient_audit(
     return rows
 
 
+def assert_icdor_gradient_firewall(rows: list[dict[str, Any]], *, tolerance: float = 1e-7) -> None:
+    """Reject cross-owner gradients that violate the v4 ownership contract."""
+    forbidden = {
+        "loss_action_total": {"reason_adapter", "reason_visual_decoder", "reason_latent_decoder", "reason_observed_mixer", "observation_model"},
+        "loss_reason_total": {"visual_pyramid", "action_adapter", "action_visual_decoder", "action_router_rereader", "factor_extractor", "factor_prototypes"},
+    }
+    for row in rows:
+        if row.get("loss") not in forbidden or row.get("owner_group") not in forbidden[row["loss"]]:
+            continue
+        value = float(row.get("grad_norm", 0.0))
+        if value > tolerance:
+            raise RuntimeError(
+                f"IC-DOR gradient firewall violation: {row['loss']} reached {row['owner_group']} with norm {value:.3e}"
+            )
+
+
 def train_icdor_epoch(
     model: MOSAICTrustICDORModel,
     loader: DataLoader,
@@ -1169,6 +1236,28 @@ def train_icdor_epoch(
     generator = torch.Generator(device=device).manual_seed(int(config["data"]["split_seed"]) + epoch)
     action_queue_pending = MOSAICAccumulationQueueBuffer()
     reason_queue_pending = MOSAICAccumulationQueueBuffer()
+    parameter_by_name = dict(model.named_parameters())
+    owner_parameters: dict[str, list[nn.Parameter]] = {}
+    for entry in ownership:
+        parameter = parameter_by_name.get(str(entry["full_name"]))
+        if parameter is not None:
+            owner_parameters.setdefault(str(entry["owner_group"]), []).append(parameter)
+    owner_clip_limits = {
+        "visual_pyramid": 1.0,
+        "action_visual_decoder": 1.0,
+        "reason_visual_decoder": 1.0,
+        "factor_adapter": 0.5,
+        "factor_extractor": 0.5,
+        "factor_prototypes": 0.5,
+        "action_adapter": 1.0,
+        "action_router_rereader": 0.5,
+        "reason_adapter": 1.0,
+        "reason_latent_decoder": 0.5,
+        "reason_observed_mixer": 0.5,
+        "observation_model": 0.5,
+        "threshold_head": 1.0,
+    }
+    owner_clip_limits.update({str(k): float(v) for k, v in config["optimizer"].get("owner_clip", {}).items()})
     start = time.perf_counter()
     for step, cpu_batch in enumerate(loader):
         load_done = time.perf_counter()
@@ -1211,11 +1300,14 @@ def train_icdor_epoch(
             action_queue_pending.add(output["action_visual_logits"], batch["action"], batch["file_name"])
             reason_queue_pending.add(output["reason_logits_latent"], posterior, batch["file_name"])
         if step % int(config["training"]["print_every"]) == 0:
-            gradient_rows.extend(_parameter_group_gradient_audit(losses, ownership, model, epoch=epoch, step=step))
+            audit_rows = _parameter_group_gradient_audit(losses, ownership, model, epoch=epoch, step=step)
+            assert_icdor_gradient_firewall(audit_rows)
+            gradient_rows.extend(audit_rows)
         scaled_loss.backward()
         update = (step + 1) % gradient_accumulation_steps == 0 or step + 1 == len(loader)
         grad_norm = 0.0
         if update:
+            owner_norms = clip_icdor_owner_gradients(owner_parameters, owner_clip_limits)
             grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), float(config["optimizer"]["grad_clip"])).detach().cpu())
             optimizer.step()
             if scheduler is not None:
@@ -1224,6 +1316,8 @@ def train_icdor_epoch(
             reason_queue_pending.flush_after_optimizer_step(reason_queue, optimizer_step_succeeded=True)
             optimizer.zero_grad(set_to_none=True)
         row = {"epoch": epoch, "step": step, "phase": phase.name, "update": update, "grad_norm": grad_norm}
+        if update:
+            row["owner_grad_norms"] = owner_norms
         row.update({name: float(value.detach().float().cpu()) for name, value in losses.items() if value.numel() == 1})
         rows.append(row)
         runtime_rows.append({
@@ -1863,6 +1957,7 @@ def main() -> None:
     pretrained = Path(config["backbone"]["pretrained_weights"])
     manifest = {
         "command_line": [sys.executable, *sys.argv], "git_head": _git_head(),
+        "credo_version": "v4_credo",
         "direct_image": True, "feature_cache": False, "token_compression": "none",
         "best_selection_split": "test", "best_selection_metric": "deploy_fixed_joint",
         "pretrained_weights": str(pretrained), "pretrained_sha256": _sha256_file(pretrained),
@@ -2082,6 +2177,9 @@ def main() -> None:
             "calibration_stats.jsonl": calibration_rows,
             "runtime_stats.jsonl": epoch_train["runtime_rows"],
             "failure_cases.jsonl": evaluation["failure_rows"],
+            "credibility_stats.jsonl": evaluation["credibility_rows"],
+            "fine_transport_stats.jsonl": evaluation["fine_transport_rows"],
+            "route_ownership.jsonl": evaluation["route_ownership_rows"],
         }
         write_icdor_epoch_artifacts(
             output, epoch=epoch, json_payloads=json_payloads, jsonl_payloads=jsonl_payloads,

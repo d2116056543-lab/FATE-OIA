@@ -63,8 +63,10 @@ class MOSAICTargetSparseRouter(nn.Module):
         self.edge_admission_mask.copy_(edge_admission_mask & self.candidate_edge_mask)
 
     def _active_edge_mask(self, route_mode: str) -> torch.Tensor:
-        certified = (self.certificate_tier == _TIER_TO_ID["certified"]).view(1, self.factor_count, 1)
-        candidate = self.candidate_edge_mask & certified
+        # Certificate/admission is a deployment gate, not a learning gate.
+        # Shadow routing must expose the factor path before certification;
+        # otherwise the all-abstained state creates a zero-gradient deadlock.
+        candidate = self.candidate_edge_mask
         if route_mode == "off":
             return torch.zeros_like(candidate)
         if route_mode == "shadow":
