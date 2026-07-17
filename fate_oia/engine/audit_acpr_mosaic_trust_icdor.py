@@ -392,7 +392,11 @@ def functional_hard_gates(
         "feature_cache": config["backbone"].get("feature_cache"),
         "token_compression": config["backbone"].get("token_compression"),
         "dynamic_input_sensitivity": dynamic["input_sensitivity"],
-        "source": _require_source_tokens(model_path, ("self.dino(images)",)),
+        "source": _require_source_tokens(
+            model_path,
+            ("BatchLocalDinoFieldReuse", "_batch_field_reuse(images)", "clear_batch_field_reuse"),
+            forbidden=("self.dino(images)",),
+        ),
     }
     if not evidence["direct_image"]["config"] or evidence["direct_image"]["feature_cache"] is not False or evidence["direct_image"]["token_compression"] != "none":
         raise ICDORAuditError("direct-image/no-cache/no-compression config gate failed")
