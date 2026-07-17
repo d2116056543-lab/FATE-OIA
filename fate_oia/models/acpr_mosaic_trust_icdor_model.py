@@ -341,6 +341,7 @@ class MOSAICTrustICDORModel(nn.Module):
             factor_output["factor_negative_evidence"],
             action_output["action_queries"],
             route_mode=route_mode,
+            factor_credibility=credibility["cV"],
         )
         reread_output = self.action_rereader(
             action_pyramid,
@@ -459,6 +460,7 @@ class MOSAICTrustICDORModel(nn.Module):
                 factor_output["factor_positive_evidence"].roll(1, 1),
                 factor_output["factor_negative_evidence"].roll(1, 1),
                 action_output["action_queries"], route_mode=route_mode,
+                factor_credibility=credibility["cV"].roll(1, 1),
             )
             shuffled_read = self.action_rereader(
                 action_pyramid, action_output["action_queries"],

@@ -108,3 +108,23 @@ def test_icdor_router_uses_edge_polarity_instead_of_direction_as_polarity() -> N
     assert output["active_edge_polarity_mask"][0, 1, factor_id, action_id]
     assert not output["active_edge_polarity_mask"][0, 0, factor_id, action_id]
     assert torch.allclose(output["support_route_evidence"][0, factor_id, action_id], negative[0, factor_id])
+
+
+def test_icdor_router_uses_continuous_credibility_before_admission() -> None:
+    ontology = load_icdor_ontology(Path("configs"))
+    router = MOSAICTargetSparseRouter(ontology, dim=32)
+    factor_count = router.factor_count
+    features = torch.randn(1, factor_count, 32)
+    positive = torch.full((1, factor_count), 0.8)
+    negative = torch.full((1, factor_count), 0.2)
+    queries = torch.randn(1, 4, 32)
+    high = router(
+        features, positive, negative, queries, route_mode="shadow",
+        factor_credibility=torch.ones(1, factor_count),
+    )
+    low = router(
+        features, positive, negative, queries, route_mode="shadow",
+        factor_credibility=torch.full((1, factor_count), 0.01),
+    )
+    assert float(low["support_weights"].sum()) < float(high["support_weights"].sum())
+    assert float(low["veto_weights"].sum()) < float(high["veto_weights"].sum())

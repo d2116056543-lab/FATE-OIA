@@ -79,6 +79,7 @@ class MOSAICTargetSparseRouter(nn.Module):
         self,
         factor_scores: torch.Tensor,
         evidence: torch.Tensor,
+        credibility: torch.Tensor | None,
         direction_index: int,
         active_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -86,6 +87,8 @@ class MOSAICTargetSparseRouter(nn.Module):
         if evidence_by_edge.shape != factor_scores.shape:
             raise ValueError("IC-DOR route evidence must be [B,F] or [B,F,A]")
         finite_logits = factor_scores + evidence_by_edge.clamp_min(1e-8).log()
+        if credibility is not None:
+            finite_logits = finite_logits + credibility.detach().clamp_min(1e-8).log().unsqueeze(-1)
         finite_logits = finite_logits + self.direction_bias[direction_index].view(1, 1, -1)
         dustbin = self.dustbin_logit[direction_index].view(1, 1, -1).expand(finite_logits.shape[0], -1, -1)
         # Exclude forbidden factors before entmax so their semantics cannot
@@ -112,11 +115,14 @@ class MOSAICTargetSparseRouter(nn.Module):
         action_queries: torch.Tensor,
         *,
         route_mode: str,
+        factor_credibility: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         if factor_features.ndim != 3 or factor_features.shape[1] != self.factor_count:
             raise ValueError("IC-DOR router factor_features must be [B,F,D]")
         if factor_positive_evidence.shape != factor_features.shape[:2] or factor_negative_evidence.shape != factor_features.shape[:2]:
             raise ValueError("IC-DOR router evidence must be [B,F]")
+        if factor_credibility is not None and factor_credibility.shape != factor_features.shape[:2]:
+            raise ValueError("IC-DOR router credibility must be [B,F]")
         if action_queries.shape != (factor_features.shape[0], self.action_count, factor_features.shape[-1]):
             raise ValueError("IC-DOR router action_queries must be [B,4,D]")
         factors = self.factor_proj(factor_features.detach())
@@ -133,10 +139,10 @@ class MOSAICTargetSparseRouter(nn.Module):
             + polarity[1, 1].unsqueeze(0) * factor_negative_evidence.detach().unsqueeze(-1)
         )
         support, support_dustbin, support_logits = self._route_one_direction(
-            factor_scores, support_evidence, 0, active[0]
+            factor_scores, support_evidence, factor_credibility, 0, active[0]
         )
         veto, veto_dustbin, veto_logits = self._route_one_direction(
-            factor_scores, veto_evidence, 1, active[1]
+            factor_scores, veto_evidence, factor_credibility, 1, active[1]
         )
         return {
             "support_weights": support,
