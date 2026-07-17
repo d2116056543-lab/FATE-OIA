@@ -4,7 +4,7 @@ reason_routes:
   2: {group: other, direct_factors: [center_drivable_region_visible], latent_factors: [center_drivable_region_visible], contradiction_factors: [center_corridor_occupied], escape_allowed: true}
   3: {group: traffic_control, direct_factors: [traffic_light_visible], latent_factors: [traffic_light_visible], contradiction_factors: [], escape_allowed: false}
   4: {group: traffic_control, direct_factors: [traffic_sign_visible], latent_factors: [traffic_sign_visible], contradiction_factors: [], escape_allowed: false}
-  5: {group: obstacle, direct_factors: [front_vehicle_visible], latent_factors: [front_vehicle_visible, front_vehicle_near], semantic_kind: visual_plus_latent_proxy, contradiction_factors: [], escape_allowed: false}
+  5: {group: obstacle, direct_factors: [front_vehicle_visible], latent_factors: [front_vehicle_visible, front_vehicle_risk_proxy], semantic_kind: visual_plus_latent_proxy, contradiction_factors: [], escape_allowed: false}
   6: {group: obstacle, direct_factors: [pedestrian_front_visible], latent_factors: [pedestrian_front_visible], contradiction_factors: [], escape_allowed: false}
   7: {group: obstacle, direct_factors: [rider_front_visible], latent_factors: [rider_front_visible], contradiction_factors: [], escape_allowed: false}
   8: {group: obstacle, direct_factors: [center_corridor_occupied], latent_factors: [center_corridor_occupied, left_obstacle_visible, right_obstacle_visible], contradiction_factors: [], escape_allowed: true}

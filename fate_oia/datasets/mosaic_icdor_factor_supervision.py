@@ -47,12 +47,15 @@ def build_factor_supervision(
     factors: Sequence[Mapping[str, Any]],
     *,
     split: str,
+    allow_reason_anchors: bool = True,
 ) -> dict[str, torch.Tensor]:
-    """Compose geometry, observed-positive reason, and weak-negative factor evidence.
+    """Compose geometry, optional observed-positive anchors, and weak negatives.
 
-    Reason targets are positive-only evidence. A zero reason label remains unknown
-    and cannot create a factor negative. Geometry wins whenever it co-occurs with
-    an anchor, preserving its full supervision weight.
+    ``allow_reason_anchors`` exists only for legacy experiments. CREDO main
+    training sets it to false: visual-factor measurement then consumes only
+    image/geometry observations, while reasons remain target-side supervision.
+    A zero reason label always remains unknown and cannot create a factor
+    negative. Geometry wins whenever it co-occurs with an enabled anchor.
     """
     presence_target = _evidence_mask(observations, "presence_target")
     presence_known_mask = _evidence_mask(observations, "presence_known_mask")
@@ -62,6 +65,8 @@ def build_factor_supervision(
         raise ValueError("reason targets must be [B,R]")
     if not isinstance(split, str) or not split:
         raise ValueError("split must be a non-empty string")
+    if not isinstance(allow_reason_anchors, bool):
+        raise ValueError("allow_reason_anchors must be a boolean")
     if len(factors) != presence_target.shape[1] or reason_targets.shape[0] != presence_target.shape[0]:
         raise ValueError("factor supervision batch or factor dimensions do not match")
     if any(value.shape != presence_target.shape for value in (presence_known_mask, geometry_known_mask, weak_negative_mask)):
@@ -69,7 +74,7 @@ def build_factor_supervision(
 
     geometry_positive_mask = (geometry_known_mask > 0) & (presence_target > 0)
     anchors = _anchor_matrix(factors, reason_targets.shape[1], reason_targets.device)
-    if split in _ANCHOR_SPLITS:
+    if allow_reason_anchors and split in _ANCHOR_SPLITS:
         positive_anchor_mask = ((reason_targets > 0)[:, None, :] & anchors[None, :, :]).any(dim=-1)
     else:
         positive_anchor_mask = torch.zeros_like(geometry_positive_mask)

@@ -34,6 +34,8 @@ _V4_REQUIRED_FORWARD_OUTPUTS = (
     "sampling_coordinates", "sampled_features", "sample_attention",
     "action_shadow_logits", "action_final_logits", "action_visual_logits",
     "reason_visual_logits", "reason_latent_logits", "reason_final_logits",
+    "semantic_compatibility", "reason_semantic_compatibility_effective",
+    "action_target_utility", "action_target_utility_effective", "target_utility_initialized",
 )
 
 _REQUIRED_FUNCTIONAL_CHECKS = (
@@ -53,6 +55,7 @@ _REQUIRED_FUNCTIONAL_CHECKS = (
     "partial_action_admission",
     "regime_schedule",
     "artifact_schema_v4",
+    "target_utility",
     "batch_field_reuse",
 )
 
@@ -68,10 +71,13 @@ def sha256_file(path: str | Path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest().upper()
 
 
-def validate_real_factor_audit(payload: Mapping[str, Any], *, expected_rows: int, expected_factors: int) -> dict[str, Any]:
-    """Validate real train-audit output without treating abstention as failure."""
+def validate_real_factor_audit(
+    payload: Mapping[str, Any], *, expected_rows: int, expected_factors: int,
+    expected_source: str = "audit_visual",
+) -> dict[str, Any]:
+    """Validate image-only audit output without treating abstention as failure."""
     stats = payload.get("factor_stats")
-    if payload.get("source_split") != "train_audit" or payload.get("row_count") != expected_rows:
+    if payload.get("source_split") != expected_source or payload.get("row_count") != expected_rows:
         raise ICDORAuditError("real factor audit row/split contract failed")
     if not isinstance(stats, Mapping) or len(stats) != expected_factors or payload.get("factor_count") != expected_factors:
         raise ICDORAuditError("real factor audit did not emit one record per factor")
@@ -93,7 +99,7 @@ def validate_real_factor_audit(payload: Mapping[str, Any], *, expected_rows: int
     return {
         "pass": True,
         "gate": "REAL_FACTOR_AUDIT",
-        "source_split": "train_audit",
+        "source_split": expected_source,
         "row_count": expected_rows,
         "factor_count": expected_factors,
         "evaluation_mode_counts": mode_counts,
@@ -264,6 +270,25 @@ def verify_v4_forward_contract(model: nn.Module, images: torch.Tensor) -> dict[s
     cV = output["cV"]
     if cV.ndim != 2 or cV.shape[0] != images.shape[0] or not torch.isfinite(cV).all():
         raise ICDORAuditError("v4 continuous credibility is not finite [B,F]")
+    factor_count = cV.shape[1]
+    semantic = output["semantic_compatibility"]
+    semantic_effective = output["reason_semantic_compatibility_effective"]
+    action_utility = output["action_target_utility"]
+    action_utility_effective = output["action_target_utility_effective"]
+    if semantic.shape != (21, factor_count) or semantic_effective.shape != semantic.shape:
+        raise ICDORAuditError("v4 semantic compatibility is not [21,F]")
+    if action_utility.shape != (factor_count, 4):
+        raise ICDORAuditError("v4 action target utility is not [F,4]")
+    if action_utility_effective.shape != (images.shape[0], factor_count, 4):
+        raise ICDORAuditError("v4 action target utility consumer is not [B,F,4]")
+    if not all(torch.isfinite(value).all() for value in (
+        semantic, semantic_effective, action_utility, action_utility_effective,
+    )):
+        raise ICDORAuditError("v4 target utility tensors are not finite")
+    if not torch.equal(semantic, semantic_effective):
+        raise ICDORAuditError("v4 reason decoder did not consume the audited semantic compatibility state")
+    if not torch.equal(action_utility_effective, action_utility.unsqueeze(0).expand_as(action_utility_effective)):
+        raise ICDORAuditError("v4 action router did not consume the audited target utility state")
     if output["sampling_coordinates"].ndim != 6 or output["sampled_features"].ndim != 6:
         raise ICDORAuditError("v4 typed fine evidence tensors have invalid rank")
     if output["sample_attention"].shape != output["sampling_coordinates"].shape[:-1]:
@@ -278,6 +303,8 @@ def verify_v4_forward_contract(model: nn.Module, images: torch.Tensor) -> dict[s
     return {
         "pass": True,
         "cV_shape": list(cV.shape),
+        "semantic_compatibility_shape": list(semantic.shape),
+        "action_target_utility_shape": list(action_utility.shape),
         "typed_coordinate_shape": list(output["sampling_coordinates"].shape),
         "fine_coarse_delta_mean": float(delta),
         "final_action_visual_equal_before_admission": True,
@@ -395,6 +422,7 @@ def functional_hard_gates(
     model_path = root / "fate_oia" / "models" / "acpr_mosaic_trust_icdor_model.py"
     trainer_path = root / "fate_oia" / "engine" / "train_acpr_mosaic_trust_icdor.py"
     evidence: dict[str, Any] = {}
+    checks: dict[str, str] = {}
     evidence["direct_image"] = {
         "config": config["experiment"].get("direct_image") is True,
         "feature_cache": config["backbone"].get("feature_cache"),
@@ -408,23 +436,26 @@ def functional_hard_gates(
     }
     if not evidence["direct_image"]["config"] or evidence["direct_image"]["feature_cache"] is not False or evidence["direct_image"]["token_compression"] != "none":
         raise ICDORAuditError("direct-image/no-cache/no-compression config gate failed")
+    checks["direct_image"] = "PASS"
     evidence["factor_certificate"] = {
         "builder": _require_source_tokens(
             root / "fate_oia" / "engine" / "build_mosaic_factor_certificate.py",
-            ("build_factor_certificate", "source_split", "train_audit", "write_json"),
+            ("build_factor_certificate", "source_split", "audit_visual", "write_json"),
         ),
         "certificate_logic": _require_source_tokens(
             root / "fate_oia" / "models" / "mosaic_factor_certificate.py",
             ("bootstrap_lcb95", "reason_only", "certified", "abstained", "effective_count"),
         ),
     }
+    checks["factor_certificate"] = "PASS"
     evidence["edge_admission"] = _require_source_tokens(
         root / "fate_oia" / "engine" / "build_mosaic_edge_admission.py",
         (
-            "source_split", "train_audit", "signed_effect_lcb95", "tes_lcb95",
+            "source_split", "audit_target", "signed_effect_lcb95", "tes_lcb95",
             "tes_identity_lcb95", "tes_spatial_lcb95", "isolated_edge_ap",
         ),
     )
+    checks["edge_admission"] = "PASS"
     evidence["action_firewall"] = {
         "cross_gradient": dynamic["gradient_firewall"]["reason_to_action_adapter"],
         "action_information_firewall_pass": dynamic["action_information_firewall_pass"],
@@ -439,10 +470,15 @@ def functional_hard_gates(
     }
     if any(float(value) != 0.0 for value in dynamic["gradient_firewall"].values()):
         raise ICDORAuditError("dynamic action/reason gradient firewall failed")
+    if dynamic["action_information_firewall_pass"] is not True or dynamic["test_forward_no_annotation_leakage"] is not True:
+        raise ICDORAuditError("dynamic action information firewall failed")
+    checks["action_firewall"] = "PASS"
+    checks["reason_firewall"] = "PASS"
     evidence["selective_observation"] = _require_source_tokens(
         root / "fate_oia" / "models" / "mosaic_icdor_observation_head.py",
         ("def posterior_from_observed_targets", "factor_visibility.detach()", "reason_logits_latent.detach()", "pi_min", "pi_max"),
     )
+    checks["selective_observation"] = "PASS"
     evidence["calibration"] = {
         "config": {
             "train_calib_only": config["calibration"].get("train_calib_only"),
@@ -455,23 +491,28 @@ def functional_hard_gates(
         "train_calib_only": True, "deploy_equation": "raw_minus_theta", "test_oracle_diagnostic_only": True
     }:
         raise ICDORAuditError("train-calib-only calibration gate failed")
+    checks["calibration"] = "PASS"
     evidence["artifact_schema"] = _require_source_tokens(
         root / "fate_oia" / "utils" / "mosaic_icdor_artifacts.py",
-        ("target_transfer_summary.json", "visual_audit_manifest.json", "gradient_ownership.jsonl", "strict_semantics"),
+        ("visual_credibility.json", "semantic_compatibility.json", "target_utility.json", "gradient_ownership.jsonl", "strict_semantics"),
     )
+    checks["artifact_schema"] = "PASS"
     evidence["resume_integrity"] = _require_source_tokens(
         trainer_path,
         ("certificate_sha256", "edge_admission_sha256", "action_queue.state_dict()", "reason_queue.state_dict()", "pareto.state_dict()"),
     )
+    checks["resume_integrity"] = "PASS"
     evidence["visual_audit"] = _require_source_tokens(
         root / "fate_oia" / "engine" / "export_mosaic_trust_visual_audit.py",
-        ("train_audit", "fixed_sample_ids", "matched_random_factor_mask_files", "action_support_mask"),
+        ("audit_visual", "fixed_sample_ids", "matched_random_factor_mask_files", "action_support_mask"),
     )
+    checks["visual_audit"] = "PASS"
     evidence["foreground_launcher"] = _require_source_tokens(
         root / "scripts" / "FATE_OIA_acpr_mosaic_trust_v3_icdor_foreground.ps1",
         ("Invoke-ForegroundPython", "--require_review_pass", "--runtime_selection", "--write_review_pass"),
         ("Start-Process", "Start-Job", "nohup", "scheduled task"),
     )
+    checks["foreground_launcher"] = "PASS"
     evidence["continuous_credibility"] = {
         "config_independent_of_reason_labels": config.get("credibility", {}).get("independent_of_reason_labels") is True,
         "source": _require_source_tokens(
@@ -483,27 +524,54 @@ def functional_hard_gates(
     }
     if not evidence["continuous_credibility"]["config_independent_of_reason_labels"] or dynamic.get("v4_contract", {}).get("pass") is not True:
         raise ICDORAuditError("v4 continuous credibility contract failed")
+    checks["continuous_credibility"] = "PASS"
     evidence["fine_transport"] = _require_source_tokens(
         root / "fate_oia" / "models" / "mosaic_typed_evidence_splat.py",
         ("typed_evidence_splat", "eta_by_type", "max_splat_samples", "fine_mask"),
     )
+    checks["fine_transport"] = "PASS"
     evidence["partial_action_admission"] = _require_source_tokens(
         root / "fate_oia" / "models" / "mosaic_action_route_policy.py",
         ("partial_action_admission", "compose_final_action_logits"),
     )
+    checks["partial_action_admission"] = "PASS"
     evidence["regime_schedule"] = _require_source_tokens(
         root / "fate_oia" / "engine" / "mosaic_icdor_adaptive_schedule.py",
         ("FOUNDATION", "DUAL_REASON_SHADOW", "SAFE_JOINT", "CONSOLIDATION", "pu_enabled"),
     )
+    checks["regime_schedule"] = "PASS"
     evidence["artifact_schema_v4"] = _require_source_tokens(
         root / "fate_oia" / "utils" / "mosaic_icdor_artifacts.py",
-        ("credibility_stats.jsonl", "fine_transport_stats.jsonl", "route_ownership.jsonl"),
+        (
+            "credibility_stats.jsonl", "fine_transport_stats.jsonl", "route_ownership.jsonl",
+            "semantic_compatibility.json", "target_utility.json",
+        ),
     )
+    evidence["target_utility"] = {
+        "builder": _require_source_tokens(
+            root / "fate_oia" / "engine" / "build_mosaic_target_utility.py",
+            ("audit_target", "semantic_compatibility", "action_target_utility"),
+        ),
+        "state": _require_source_tokens(
+            root / "fate_oia" / "models" / "mosaic_target_utility.py",
+            ("update_from_audit", "semantic_compatibility", "action_target_utility"),
+        ),
+        "model": _require_source_tokens(
+            model_path,
+            ("self.target_utility", "factor_target_utility", "semantic_compatibility"),
+        ),
+    }
+    checks["target_utility"] = "PASS"
+    checks["artifact_schema_v4"] = "PASS"
     evidence["batch_field_reuse"] = _require_source_tokens(
         root / "fate_oia" / "models" / "mosaic_batch_field_reuse.py",
         ("BatchLocalDinoFieldReuse", "no cross-batch persistence"),
     )
-    return ({name: "PASS" for name in _REQUIRED_FUNCTIONAL_CHECKS}, evidence)
+    checks["batch_field_reuse"] = "PASS"
+    missing_checks = [name for name in _REQUIRED_FUNCTIONAL_CHECKS if checks.get(name) != "PASS"]
+    if missing_checks:
+        raise ICDORAuditError(f"functional checks lack explicit evidence: {missing_checks}")
+    return checks, evidence
 
 
 def _git_head(root: Path) -> str:
@@ -548,7 +616,14 @@ def build_review_pass(
     final_remediation_plan_sha256: str,
     audit_addendum_sha256: str,
 ) -> dict[str, Any]:
-    """Build a hash-bound REVIEW_PASS only from complete, non-pending evidence."""
+    """Build a hash-bound learning-access pass without granting deployment admission.
+
+    CREDO deliberately separates the proof required to start learning from the
+    stronger proof required to let a routed action replace its visual baseline.
+    A pilot may therefore earn this pass while the certificate and edge files
+    are still explicitly ``pending``.  The model's per-action admission mask
+    remains the only mechanism that can change final action logits.
+    """
     if audit.get("pass") is not True or audit.get("missing_items"):
         raise ICDORAuditError("implementation audit is not complete")
     if (
@@ -655,6 +730,9 @@ def build_review_pass(
         "hidden_recovery_no_label_leakage": True,
         "matched_controls_pass": True,
         "adaptive_schedule_pass": True,
+        "review_scope": "learning_access_preflight",
+        "deployment_admission_ready": bool(pilot.get("deployment_admission_ready", False)),
+        "final_deployment_claim_allowed": bool(pilot.get("deployment_admission_ready", False)),
         "unused_config_keys": [],
         "audit_sha256": hashlib.sha256(
             json.dumps(dict(audit), sort_keys=True).encode("utf-8")
@@ -703,12 +781,14 @@ def main() -> None:
     from fate_oia.engine.mosaic_icdor_audit_collectors import collect_factor_audit
     config = load_config(config_path)
     requested_audit_rows = max(args.max_audit_samples, args.real_factor_audit_rows)
-    _, audit_loader, _, _, split_stats = build_icdor_loaders(
+    grounding_index = BDD100KGroundingIndex(config["data"]["bdd100k_root"])
+    _, audit_visual_loader, _, _, _, split_stats = build_icdor_loaders(
         config, Path(args.output_dir) / "dynamic_data", batch_size=args.audit_batch_size, num_workers=args.num_workers,
         max_train_samples=1, max_audit_samples=requested_audit_rows,
         max_calib_samples=1, max_test_samples=1,
+        visual_grounding_index=grounding_index,
     )
-    first_batch = next(iter(audit_loader))
+    first_batch = next(iter(audit_visual_loader))
     images = first_batch.get("image")
     if not isinstance(images, torch.Tensor):
         raise ICDORAuditError("real train_audit loader did not return image tensors")
@@ -741,18 +821,19 @@ def main() -> None:
     output = Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
     if args.real_factor_audit_rows:
-        grounding_index = BDD100KGroundingIndex(config["data"]["bdd100k_root"])
         grounding_builder = ICDORGroundingObservationBuilder(model.ontology["factors"])
         real_factor_audit = collect_factor_audit(
             model,
-            _audit_batches(audit_loader, grounding_index),
+            _audit_batches(audit_visual_loader, grounding_index, source_split="audit_visual"),
             grounding_builder,
             factor_names=[str(item["name"]) for item in model.ontology["factors"]],
-            factor_definitions=model.ontology["factors"],
             device=device,
             bootstrap_replicates=args.real_factor_audit_bootstrap,
             bootstrap_seed=20260713,
             forward_kwargs={"route_mode": "off", "latent_enabled": False, "return_masks": True},
+            # cV is an image/geometry audit. Passing factor definitions would
+            # activate the legacy reason-anchor path inside the collector.
+            source_split="audit_visual",
         )
         real_factor_path = output / "real_factor_audit_512.json"
         real_factor_path.write_text(json.dumps(real_factor_audit, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -760,6 +841,7 @@ def main() -> None:
             real_factor_audit,
             expected_rows=args.real_factor_audit_rows,
             expected_factors=len(model.ontology["factors"]),
+            expected_source="audit_visual",
         )
         gate["artifact"] = str(real_factor_path.resolve())
         gate["artifact_sha256"] = sha256_file(real_factor_path)

@@ -93,6 +93,17 @@ def _select_stratified(
     return sorted(selected)
 
 
+def _select_label_free(
+    file_names: list[str], candidates: set[int], count: int, seed: int
+) -> list[int]:
+    """Select audit_visual without action/reason metadata influencing cV."""
+    if count <= 0 or count > len(candidates):
+        raise ValueError("IC-DOR label-free selection count is invalid")
+    return sorted(
+        sorted(candidates, key=lambda index: (_stable_rank(seed, file_names[index]), file_names[index]))[:count]
+    )
+
+
 def _canonical_payload(
     file_names: list[str], labels: list[tuple[int, ...]], seed: int, core: list[int], audit_visual: list[int],
     audit_target: list[int], calib: list[int]
@@ -137,7 +148,11 @@ def make_icdor_train_splits(dataset: Any, *, seed: int = DEFAULT_SEED) -> ICDORT
     if audit_visual_count + audit_target_count + calib_count >= len(samples):
         raise ValueError("IC-DOR split leaves no train_core samples")
     all_indices = set(range(len(samples)))
-    audit_visual = _select_stratified(labels, file_names, all_indices, audit_visual_count, seed)
+    # audit_visual estimates image/geometry observability only. Its membership
+    # must not use the BDD-OIA reason vector that CREDO explicitly forbids from
+    # the visual-credibility path. audit_target remains label-stratified for
+    # target-utility measurements, where observed labels are permitted.
+    audit_visual = _select_label_free(file_names, all_indices, audit_visual_count, seed)
     audit_target = _select_stratified(
         labels, file_names, all_indices.difference(audit_visual), audit_target_count, seed + 1
     )

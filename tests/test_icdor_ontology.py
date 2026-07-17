@@ -50,8 +50,12 @@ def test_icdor_ontology_exposes_only_factor_routes_for_latent_reasons() -> None:
             "latent_factors",
             "contradiction_factors",
             "escape_allowed",
+            "absence_factors",
+            "semantic_kind",
         }
         assert set(route["direct_factors"]).issubset(ontology["factor_index"])
         assert set(route["latent_factors"]).issubset(ontology["factor_index"])
         assert set(route["contradiction_factors"]).issubset(ontology["factor_index"])
+        assert set(route["absence_factors"]).issubset(ontology["factor_index"])
+        assert route["semantic_kind"] in {"observable_or_latent", "visual_plus_latent_proxy", "absence_observable"}
         assert all("state" not in factor for factor in route["latent_factors"])

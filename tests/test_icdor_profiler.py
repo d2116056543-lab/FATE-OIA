@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from fate_oia.engine.profile_acpr_mosaic_trust_icdor import (
@@ -65,4 +67,11 @@ def test_profiler_executes_every_configured_candidate_and_worker() -> None:
     assert payload["pass"] is True
     assert payload["selected"]["batch_size"] == 6
     assert payload["selected"]["num_workers"] == 4
+
+
+def test_real_profiler_reuses_one_grounding_index_and_unpacks_every_loader_split() -> None:
+    source = Path("fate_oia/engine/profile_acpr_mosaic_trust_icdor.py").read_text(encoding="utf-8")
+    assert "grounding_index = BDD100KGroundingIndex" in source
+    assert "loader, _, _, _, _, _ = build_icdor_loaders(" in source
+    assert "visual_grounding_index=grounding_index" in source
 

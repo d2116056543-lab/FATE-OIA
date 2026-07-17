@@ -30,7 +30,10 @@ class ICDORStatePolicy:
 
 POLICIES = {
     # Regime A: all learning routes are active, but action shadow is not final.
-    "FOUNDATION": ICDORStatePolicy("shadow", 0.10, 0.05, write_provisional_certificate=True),
+    # Continuous visual credibility grants learning access. A discrete
+    # certificate is a deployment claim and is therefore never built merely
+    # to unlock FOUNDATION or shadow learning.
+    "FOUNDATION": ICDORStatePolicy("shadow", 0.10, 0.05),
     "DUAL_REASON_SHADOW": ICDORStatePolicy(
         "shadow", 0.0, 0.0, freeze_factor_and_prototypes=True, freeze_certificate=True,
         enable_interventions=True, enable_hidden_audit=True,

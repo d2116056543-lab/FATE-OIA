@@ -485,6 +485,7 @@ def collect_target_transfer_metrics(
     device: torch.device,
     route_mode: str,
     latent_enabled: bool,
+    source_split: str = "train_audit",
 ) -> dict[str, Any]:
     """Run full, selected-factor deletion, and matched random deletion forwards.
 
@@ -493,6 +494,8 @@ def collect_target_transfer_metrics(
     """
     if target_kind not in {"action", "reason"}:
         raise ValueError("target transfer target_kind must be action or reason")
+    if source_split not in {"audit_target", "train_audit"}:
+        raise ValueError("target transfer source must be audit_target")
     factor_count, target_count = len(factor_ids), len(target_ids)
     factor_specs = [
         factor_control_spec(model, factor_name=str(name), factor_index=index)
@@ -517,8 +520,8 @@ def collect_target_transfer_metrics(
         for batch in loader:
             splits = batch.get("split")
             split_values = [splits] if isinstance(splits, str) else list(splits or [])
-            if not split_values or any(value != "train_audit" for value in split_values):
-                raise ValueError("target transfer collector accepts train_audit only")
+            if not split_values or any(value != source_split for value in split_values):
+                raise ValueError(f"target transfer collector accepts {source_split} only")
             images = batch["image"].to(device)
             target = batch[label_key].to(device).float()
             if target.shape != (images.shape[0], target_count):
@@ -582,7 +585,7 @@ def collect_target_transfer_metrics(
     finally:
         model.train(was_training)
     if not labels:
-        raise ValueError("target transfer collector received no train_audit rows")
+        raise ValueError(f"target transfer collector received no {source_split} rows")
     evidence = torch.cat(visual_evidence)
     label = torch.cat(labels)
     selected = torch.cat(full_probability)
@@ -590,7 +593,7 @@ def collect_target_transfer_metrics(
     random_deleted = torch.cat(random_deleted_probability)
     sample_count = label.shape[0]
     availability = torch.cat(matched_control_availability, dim=0)
-    return compute_target_transfer_metrics(TargetTransferInputs(
+    result = compute_target_transfer_metrics(TargetTransferInputs(
         factor_ids=factor_ids,
         target_ids=target_ids,
         directions=directions,
@@ -605,6 +608,8 @@ def collect_target_transfer_metrics(
         deleted_target_prob=deleted,
         matched_control_arms=[summarize_matched_control_arms(arms) for arms in control_records],
     ))
+    result["source_split"] = source_split
+    return result
 
 
 @torch.no_grad()
@@ -621,10 +626,13 @@ def collect_joint_target_transfer_metrics(
     route_mode: str,
     latent_enabled: bool,
     intervention_chunk_size: int = 4,
+    source_split: str = "train_audit",
 ) -> dict[str, Any]:
     """Collect action and reason transfer in one intervention sweep."""
     if intervention_chunk_size <= 0:
         raise ValueError("intervention_chunk_size must be positive")
+    if source_split not in {"audit_target", "train_audit"}:
+        raise ValueError("joint target transfer source must be audit_target")
     started_at = perf_counter()
     factor_count = len(factor_ids)
     factor_specs = [
@@ -656,8 +664,8 @@ def collect_joint_target_transfer_metrics(
             audit_batch_count += 1
             splits = batch.get("split")
             split_values = [splits] if isinstance(splits, str) else list(splits or [])
-            if not split_values or any(value != "train_audit" for value in split_values):
-                raise ValueError("target transfer collector accepts train_audit only")
+            if not split_values or any(value != source_split for value in split_values):
+                raise ValueError(f"target transfer collector accepts {source_split} only")
             images = batch["image"].to(device)
             audit_field = model.dino(images) if hasattr(model, "dino") else None
             field_kwargs = {"precomputed_dino_field": audit_field} if audit_field is not None else {}
@@ -739,7 +747,7 @@ def collect_joint_target_transfer_metrics(
     finally:
         model.train(was_training)
     if not labels:
-        raise ValueError("joint target transfer collector received no train_audit rows")
+        raise ValueError(f"joint target transfer collector received no {source_split} rows")
     label = torch.cat(labels)
     sample_count = label.shape[0]
     availability = torch.cat(matched_control_availability, dim=0)
@@ -765,4 +773,5 @@ def collect_joint_target_transfer_metrics(
         "intervention_forward_calls": intervention_forward_calls,
         "sequential_intervention_forward_calls": audit_batch_count * factor_count * 5,
     }
+    result["source_split"] = source_split
     return result

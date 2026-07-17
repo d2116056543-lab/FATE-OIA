@@ -325,11 +325,11 @@ def summarize_matched_control_arms(arm_records: Sequence[Sequence[Mapping[str, A
     return summaries
 
 
-def _split_values(batch: Mapping[str, Any]) -> list[str]:
+def _split_values(batch: Mapping[str, Any], *, expected_split: str = "train_audit") -> list[str]:
     split = batch.get("split")
     values = [split] if isinstance(split, str) else list(split) if isinstance(split, Sequence) else []
-    if not values or any(value != "train_audit" for value in values):
-        raise ValueError("IC-DOR audit collectors accept train_audit batches only")
+    if not values or any(value != expected_split for value in values):
+        raise ValueError(f"IC-DOR audit collectors accept {expected_split} batches only")
     return values
 
 
@@ -496,6 +496,7 @@ def collect_factor_audit(
     bootstrap_replicates: int = 1000,
     bootstrap_seed: int = 0,
     forward_kwargs: Mapping[str, Any] | None = None,
+    source_split: str = "train_audit",
 ) -> dict[str, Any]:
     """Collect certificate-ready IC-DOR factor statistics from train_audit only.
 
@@ -506,12 +507,17 @@ def collect_factor_audit(
         raise ValueError("IC-DOR factor audit requires unique factor names")
     if bootstrap_replicates < 1:
         raise ValueError("IC-DOR factor audit requires positive bootstrap_replicates")
+    if source_split not in {"train_audit", "audit_visual"}:
+        raise ValueError("IC-DOR factor audit source split is invalid")
+    if source_split == "audit_visual" and factor_definitions is not None:
+        raise ValueError("audit_visual credibility must not use reason-anchor factor supervision")
     kwargs = dict(forward_kwargs or {})
     factor_count = len(factor_names)
     collected: dict[str, list[torch.Tensor]] = {
         "target": [], "known": [], "weak": [], "geometry_known": [], "geometry": [],
         "full": [], "content_only": [], "prior_only": [], "query_shuffled": [], "image_shuffled": [],
         "full_mask": [], "view_mask": [], "mirror_mask": [], "visibility": [], "prototype_weights": [],
+        "view_consistency": [], "mirror_consistency": [],
     }
     was_training = model.training
     model.eval()
@@ -519,7 +525,7 @@ def collect_factor_audit(
         for batch in loader:
             if not isinstance(batch, Mapping):
                 raise ValueError("IC-DOR audit loader must yield mapping batches")
-            splits = _split_values(batch)
+            splits = _split_values(batch, expected_split=source_split)
             images = _images(batch, device)
             if len(splits) != images.shape[0]:
                 raise ValueError("IC-DOR audit split rows must align with images")
@@ -575,6 +581,11 @@ def collect_factor_audit(
                     dims=(-1,),
                 )
             )
+            full_mask = collected["full_mask"][-1]
+            view_mask = collected["view_mask"][-1]
+            mirror_mask = collected["mirror_mask"][-1]
+            collected["view_consistency"].append((1.0 - (full_mask - view_mask).abs().mean(dim=(-2, -1))).clamp(0.0, 1.0))
+            collected["mirror_consistency"].append((1.0 - (full_mask - mirror_mask).abs().mean(dim=(-2, -1))).clamp(0.0, 1.0))
             collected["visibility"].append(_tensor(full, "factor_visibility_prob", rows=images.shape[0], columns=factor_count))
             collected["prototype_weights"].append(_tensor(full, "prototype_weights", rows=images.shape[0], columns=factor_count))
     finally:
@@ -624,6 +635,7 @@ def collect_factor_audit(
         effective, dominant, dead = _prototype_stats(values["prototype_weights"][:, column])
         replicate: dict[str, list[float]] = {
             "full_minus_prior_only": [], "query_shuffle_drop": [], "image_shuffle_drop": [], "grounding_minus_random": [],
+            "stability": [],
         }
         metric_indices = torch.nonzero(metric_rows, as_tuple=False).flatten()
         for _ in range(bootstrap_replicates):
@@ -639,6 +651,8 @@ def collect_factor_audit(
                 replicate["image_shuffle_drop"].append(
                     _average_precision(full[sample], confirmed_positive[sample]) - _average_precision(image[sample], confirmed_positive[sample])
                 )
+                stability = torch.minimum(values["view_consistency"][sample, column], values["mirror_consistency"][sample, column])
+                replicate["stability"].append(float((stability > 0.75).float().mean()))
             geometry_sample = torch.nonzero(geometry_valid, as_tuple=False).flatten()
             if geometry_sample.numel() >= 2:
                 draw = geometry_sample.index_select(0, torch.randint(geometry_sample.numel(), (geometry_sample.numel(),), generator=generator))
@@ -669,11 +683,15 @@ def collect_factor_audit(
             },
             "prototype": {"effective_count": effective, "dominant_rate": dominant, "dead_count": dead},
             "bootstrap_lcb95": {key: (_quantile(samples, 0.05) if samples else None) for key, samples in replicate.items()},
+            "bootstrap_positive_rate": {
+                key: (float(torch.tensor(samples, dtype=torch.float32).gt(0.0).float().mean()) if samples else 0.0)
+                for key, samples in replicate.items()
+            },
         }
     if unknown_rows_in_metric_total != 0:
         raise RuntimeError("IC-DOR factor audit leaked unknown rows into binary metrics")
     return {
-        "source_split": "train_audit",
+        "source_split": source_split,
         "row_count": int(values["target"].shape[0]),
         "factor_count": len(factor_stats),
         "factor_stats": factor_stats,
@@ -757,10 +775,18 @@ def collect_edge_intervention_audit(
     bootstrap_replicates: int = 1000,
     bootstrap_seed: int = 0,
     forward_kwargs: Mapping[str, Any] | None = None,
+    source_split: str = "train_audit",
 ) -> dict[str, Any]:
-    """Run matched on/off/equal-mass-random edge interventions on train_audit."""
+    """Run matched on/off/equal-mass-random edge interventions on audit targets.
+
+    ``audit_target`` is disjoint from ``audit_visual``: it may use target
+    labels to measure utility but cannot update visual credibility.
+    ``train_audit`` remains readable solely for historical v3 artifacts.
+    """
     if not edge_specs or bootstrap_replicates < 1:
         raise ValueError("IC-DOR edge audit requires edges and positive bootstrap_replicates")
+    if source_split not in {"audit_target", "train_audit"}:
+        raise ValueError("IC-DOR edge audit source must be audit_target")
     router = getattr(model, "action_router", None)
     candidate = getattr(router, "candidate_edge_mask", None)
     current = getattr(router, "edge_admission_mask", None)
@@ -817,7 +843,7 @@ def collect_edge_intervention_audit(
             saw_batch = True
             if not isinstance(batch, Mapping):
                 raise ValueError("IC-DOR audit loader must yield mapping batches")
-            splits = _split_values(batch)
+            splits = _split_values(batch, expected_split=source_split)
             images = _images(batch, device)
             labels = batch.get("action")
             if not isinstance(labels, torch.Tensor) or labels.ndim != 2 or labels.shape != (images.shape[0], len(action_names)):
@@ -880,7 +906,7 @@ def collect_edge_intervention_audit(
         setter(base)
         model.train(was_training)
     if not saw_batch:
-        raise ValueError("IC-DOR edge audit loader produced no train_audit observations")
+        raise ValueError(f"IC-DOR edge audit loader produced no {source_split} observations")
     generator = torch.Generator().manual_seed(bootstrap_seed)
     edge_stats: dict[str, dict[str, Any]] = {}
     for spec, *_ in plans:
@@ -935,4 +961,4 @@ def collect_edge_intervention_audit(
             "bootstrap_ci95": intervals,
             "bootstrap_lcb95": {name: interval["lower"] for name, interval in intervals.items()},
         }
-    return {"source_split": "train_audit", "edge_stats": edge_stats}
+    return {"source_split": source_split, "edge_stats": edge_stats}

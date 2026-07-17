@@ -32,10 +32,14 @@ def test_real_factor_audit_accepts_honest_abstention_and_rejects_fake_zero() -> 
             "unknown": {"evaluation_mode": "unavailable", "metric_available": False, "presence_auprc": None, "certificate_ceiling": "Abstained"},
         },
     }
-    assert validate_real_factor_audit(payload, expected_rows=512, expected_factors=2)["pass"] is True
+    assert validate_real_factor_audit(
+        payload, expected_rows=512, expected_factors=2, expected_source="train_audit"
+    )["pass"] is True
     payload["factor_stats"]["unknown"]["presence_auprc"] = 0.0
     with pytest.raises(ICDORAuditError, match="forged"):
-        validate_real_factor_audit(payload, expected_rows=512, expected_factors=2)
+        validate_real_factor_audit(
+            payload, expected_rows=512, expected_factors=2, expected_source="train_audit"
+        )
 
 
 def _passing_remediation_gates(*, git_head: str = "abc"):
@@ -65,9 +69,26 @@ def test_certificate_audit_checks_builder_and_tier_logic_separately() -> None:
     assert '"models" / "mosaic_factor_certificate.py"' in source
 
 
+def test_functional_audit_cannot_blanket_pass_without_per_check_evidence() -> None:
+    source = Path("fate_oia/engine/audit_acpr_mosaic_trust_icdor.py").read_text(encoding="utf-8")
+    assert 'return ({name: "PASS" for name in _REQUIRED_FUNCTIONAL_CHECKS}' not in source
+    assert 'checks["direct_image"] = "PASS"' in source
+    assert 'checks["artifact_schema_v4"] = "PASS"' in source
+    assert "functional checks lack explicit evidence" in source
+
+
 def test_real_factor_gate_writer_binds_the_audited_git_head() -> None:
     source = Path("fate_oia/engine/audit_acpr_mosaic_trust_icdor.py").read_text(encoding="utf-8")
     assert 'gate["git_head"] = result["git_head"]' in source
+
+
+def test_dynamic_visual_credibility_audit_cannot_use_reason_anchor_definitions() -> None:
+    source = Path("fate_oia/engine/audit_acpr_mosaic_trust_icdor.py").read_text(encoding="utf-8")
+    dynamic_call = source.split("if args.real_factor_audit_rows:", 1)[1].split(
+        "real_factor_path", 1
+    )[0]
+    assert 'source_split="audit_visual"' in dynamic_call
+    assert "factor_definitions=" not in dynamic_call
 
 
 class _RealForwardModel(nn.Module):
@@ -159,7 +180,7 @@ def test_review_pass_is_fail_closed_and_binds_all_evidence() -> None:
             "direct_image", "factor_certificate", "edge_admission", "action_firewall",
             "reason_firewall", "selective_observation", "calibration", "artifact_schema",
             "resume_integrity", "visual_audit", "foreground_launcher", "continuous_credibility",
-            "fine_transport", "partial_action_admission", "regime_schedule", "artifact_schema_v4",
+            "fine_transport", "partial_action_admission", "regime_schedule", "artifact_schema_v4", "target_utility",
             "batch_field_reuse",
         )},
         "missing_items": [],
@@ -174,6 +195,7 @@ def test_review_pass_is_fail_closed_and_binds_all_evidence() -> None:
         "pass": True, "artifacts_complete": True, "pending_artifacts": [], "git_head": "abc",
         "certificate_sha256": "CERTIFICATE", "edge_admission_sha256": "EDGE",
         "semantic_validation": {"pass": True, "errors": []},
+        "deployment_admission_ready": True,
     }
 
     review = build_review_pass(
@@ -253,6 +275,39 @@ def test_review_pass_is_fail_closed_and_binds_all_evidence() -> None:
             final_remediation_plan_sha256="PLAN",
             audit_addendum_sha256="ADDENDUM",
         )
+
+
+def test_learning_access_review_does_not_claim_or_require_deployment_admission() -> None:
+    audit = {
+        "pass": True, "git_head": "abc", "git_tree": "TREE",
+        "source_manifest_sha256": "SOURCES", "contract_manifest_sha256": "CONTRACT",
+        "worktree_clean": True, "split_protocol": {"split_sha256": "SPLIT"},
+        "config_sha256": "CONFIG",
+        "functional_checks": {name: "PASS" for name in (
+            "direct_image", "factor_certificate", "edge_admission", "action_firewall",
+            "reason_firewall", "selective_observation", "calibration", "artifact_schema",
+            "resume_integrity", "visual_audit", "foreground_launcher", "continuous_credibility",
+            "fine_transport", "partial_action_admission", "regime_schedule", "artifact_schema_v4",
+            "target_utility", "batch_field_reuse",
+        )},
+        "missing_items": [],
+    }
+    pilot = {
+        "pass": True, "artifacts_complete": True, "pending_artifacts": [], "git_head": "abc",
+        "certificate_sha256": "CERTIFICATE", "edge_admission_sha256": "EDGE",
+        "semantic_validation": {"pass": True, "errors": []},
+        "deployment_admission_ready": False,
+    }
+    review = build_review_pass(
+        audit, {"pass": True, "selected": {"status": "PASS"}}, pilot,
+        runtime_sha256="RUNTIME", pilot_sha256="PILOT", evidence_files=_bound_evidence_files(),
+        remediation_gates=_passing_remediation_gates(),
+        final_remediation_plan_sha256="PLAN", audit_addendum_sha256="ADDENDUM",
+    )
+    assert review["status"] == "PASS"
+    assert review["review_scope"] == "learning_access_preflight"
+    assert review["deployment_admission_ready"] is False
+    assert review["final_deployment_claim_allowed"] is False
 
 
 def test_review_pass_rejects_dirty_or_unbound_source_tree() -> None:

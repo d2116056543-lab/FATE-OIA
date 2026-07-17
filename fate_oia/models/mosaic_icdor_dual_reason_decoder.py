@@ -11,6 +11,7 @@ from torch.nn import functional as F
 from .mosaic_reason_policy import bounded_reason_residual
 
 from .acpr_sparse_ops import entmax15_bisect
+from .mosaic_factor_seeded_rereader import MOSAICFactorSeededRereader
 from .mosaic_sparse_label_decoder import MOSAICSparseLabelDecoder
 
 
@@ -78,6 +79,11 @@ class MOSAICICDORLatentReasonDecoder(nn.Module):
         self.factor_key = nn.Linear(dim, dim, bias=False)
         self.reason_query = nn.Linear(dim, dim, bias=False)
         self.semantic_norm = nn.LayerNorm(dim)
+        # This is target-owned rereading of the factor layer's typed samples.
+        # Its inputs are detached, preserving the CREDO firewall from latent
+        # reason supervision back into visual factor measurement.
+        self.typed_rereader = MOSAICFactorSeededRereader(dim=dim, target_count=21)
+        self.typed_transport_gain = nn.Parameter(torch.tensor(0.10))
         self.decoder = MOSAICSparseLabelDecoder(
             21,
             dim=dim,
@@ -141,6 +147,10 @@ class MOSAICICDORLatentReasonDecoder(nn.Module):
         factor_route_enabled: torch.Tensor,
         factor_positive_evidence: torch.Tensor | None = None,
         factor_negative_evidence: torch.Tensor | None = None,
+        sampling_coordinates: torch.Tensor | None = None,
+        sampled_features: torch.Tensor | None = None,
+        sample_attention: torch.Tensor | None = None,
+        factor_semantic_compatibility: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         batch_size, factor_count, dim = factor_features.shape
         if tuple(factor_soft_masks.shape) != (batch_size, factor_count, 45, 80):
@@ -161,6 +171,13 @@ class MOSAICICDORLatentReasonDecoder(nn.Module):
         factor_keys = self.factor_key(route_features) * route_evidence.mean(1).unsqueeze(-1)
         queries = self.reason_query(self.reason_queries).unsqueeze(0).expand(batch_size, -1, -1)
         finite_scores = torch.einsum("brd,bfd->brf", queries, factor_keys) / math.sqrt(dim)
+        if factor_semantic_compatibility is not None:
+            if factor_semantic_compatibility.shape != (21, factor_count):
+                raise ValueError("IC-DOR semantic compatibility must be [21,F]")
+            # cS is a prior audit state for the reason semantic path only.
+            # A floor preserves latent-route learning access before a target
+            # relationship has enough intervention evidence to be trusted.
+            finite_scores = finite_scores + factor_semantic_compatibility.detach().clamp_min(0.10).log().unsqueeze(0)
         allowed = self.reason_factor_allow_mask & factor_route_enabled.view(1, -1)
         # Hard-mask before entmax: disabled factors must not affect the
         # allowed-factor distribution or the escape-token weight. Keep the
@@ -179,7 +196,24 @@ class MOSAICICDORLatentReasonDecoder(nn.Module):
         )
         escape_weight = 1.0 - factor_weights.sum(dim=-1, keepdim=True)
         semantic = torch.einsum("brf,bfd->brd", factor_weights * route_evidence, route_features)
-        semantic = self.semantic_norm(semantic + escape_weight * self.escape_tokens.unsqueeze(0))
+        typed_nodes = torch.zeros_like(semantic)
+        if sampling_coordinates is not None or sampled_features is not None or sample_attention is not None:
+            if sampling_coordinates is None or sampled_features is None or sample_attention is None:
+                raise ValueError("IC-DOR typed reason transport requires coordinates, features, and attention together")
+            typed = self.typed_rereader(
+                reason_pyramid["F_hi"].detach(),
+                queries.detach(),
+                sampling_coordinates.detach(),
+                sampled_features.detach(),
+                sample_attention.detach(),
+                factor_weights.transpose(1, 2).detach(),
+            )
+            typed_active = factor_weights.sum(dim=-1, keepdim=True).detach()
+            typed_nodes = typed["target_nodes"] * typed_active
+        typed_gain = self.typed_transport_gain.clamp(0.0, 0.25)
+        semantic = self.semantic_norm(
+            semantic + escape_weight * self.escape_tokens.unsqueeze(0) + typed_gain * typed_nodes
+        )
         reason_factor_masks = torch.einsum("brf,bfhw->brhw", factor_weights, factor_soft_masks.detach())
         active = reason_factor_masks.flatten(2).amax(dim=-1) > 1e-8
         visual_nodes, visual_attention = self._masked_visual_nodes(reason_pyramid, semantic, reason_factor_masks)
@@ -193,20 +227,26 @@ class MOSAICICDORLatentReasonDecoder(nn.Module):
             "reason_factor_masks": reason_factor_masks,
             "reason_latent_visual_nodes": visual_nodes,
             "reason_latent_visual_attention": visual_attention,
+            "reason_typed_transport_nodes": typed_nodes,
+            "reason_typed_transport_gain": typed_gain.detach(),
+            "reason_semantic_compatibility_effective": (
+                torch.ones(21, factor_count, device=semantic.device, dtype=semantic.dtype)
+                if factor_semantic_compatibility is None else factor_semantic_compatibility.detach()
+            ),
         }
 
 
 class MOSAICICDORObservedReasonMixer(nn.Module):
     """Use direct visual reason as primary with a bounded annotation residual."""
 
-    def __init__(self, *, init_mix: float = 0.50) -> None:
+    def __init__(self, *, init_mix: float = 0.05) -> None:
         super().__init__()
-        if not 0.0 < init_mix < 1.0:
-            raise ValueError("IC-DOR observed-reason init must be in (0,1)")
-        # ``init_mix`` is retained for config compatibility, but v4 never
-        # starts with a 50/50 mixer.  A small bounded residual protects the
-        # direct visual observed-reason owner from annotation noise.
-        initial_alpha = 0.05
+        if not 0.0 < init_mix < 0.25:
+            raise ValueError("IC-DOR observed-reason residual init must be in (0,0.25)")
+        # The direct visual reason path remains primary. Unlike the previous
+        # compatibility shim, the resolved config now controls the initial
+        # bounded residual exactly, so run artifacts can reproduce it.
+        initial_alpha = float(init_mix)
         raw = math.log(initial_alpha / (0.25 - initial_alpha))
         self.alpha_raw = nn.Parameter(torch.full((21,), raw))
         self.max_alpha = 0.25

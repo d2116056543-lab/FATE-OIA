@@ -155,8 +155,13 @@ class ICDORAuditCollectorsTest(unittest.TestCase):
         self.assertGreater(record["prototype"]["effective_count"], 1.0)
         self.assertEqual(
             set(record["bootstrap_lcb95"]),
-            {"full_minus_prior_only", "query_shuffle_drop", "image_shuffle_drop", "grounding_minus_random"},
+            {"full_minus_prior_only", "query_shuffle_drop", "image_shuffle_drop", "grounding_minus_random", "stability"},
         )
+        self.assertEqual(
+            set(record["bootstrap_positive_rate"]),
+            {"full_minus_prior_only", "query_shuffle_drop", "image_shuffle_drop", "grounding_minus_random", "stability"},
+        )
+        self.assertTrue(all(0.0 <= value <= 1.0 for value in record["bootstrap_positive_rate"].values()))
 
     def test_factor_collector_proves_unknown_rows_are_excluded(self) -> None:
         class _UnknownGrounding(_Grounding):

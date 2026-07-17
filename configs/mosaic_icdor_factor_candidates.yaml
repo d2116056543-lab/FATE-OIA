@@ -47,11 +47,11 @@ factors:
     contradicts: []
     positive_reason_anchors: [1, 5, 14, 20]
     grounding_sources: [box2d]
-  - name: front_vehicle_near
+  - name: front_vehicle_risk_proxy
     type: object
     num_prototypes: 3
     weak_regions: [front_center]
-    mirror_of: front_vehicle_near
+    mirror_of: front_vehicle_risk_proxy
     contradicts: []
     positive_reason_anchors: []
     # A single-frame 2D box cannot identify physical proximity reliably.

@@ -29,11 +29,12 @@ class MOSAICEdgeAdmission:
     edge_admission_mask: torch.Tensor
     entries: dict[str, dict[str, Any]]
     sha256: str
+    source_split: str = "audit_target"
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "version": "icdor_v3",
-            "source_split": "train_audit",
+            "source_split": self.source_split,
             "entries": self.entries,
             "sha256": self.sha256,
         }
@@ -51,8 +52,8 @@ def build_edge_admission(
     source_split: str,
 ) -> MOSAICEdgeAdmission:
     """Freeze only audit-proven Certified factor-to-action edges."""
-    if source_split != "train_audit":
-        raise ValueError("IC-DOR edge admission may only read train_audit interventions")
+    if source_split not in {"audit_target", "train_audit"}:
+        raise ValueError("IC-DOR edge admission may only read an independent target audit")
     factor_names = [factor["name"] for factor in ontology["factors"]]
     action_names = list(ontology["action_names"])
     if len(factor_tiers) != len(factor_names) or any(tier not in {"certified", "reason_only", "abstained"} for tier in factor_tiers):
@@ -64,7 +65,7 @@ def build_edge_admission(
         for action_name, directions in ontology["action_routes"].items():
             for edge in directions[direction]:
                 candidate[direction_id, factor_index[edge["factor"]], action_index[action_name]] = True
-    # Aggregate the best train-audit evidence per action before accepting any
+    # Aggregate independent target-audit evidence per action before accepting any
     # edge. This is intentionally partial: one action may be admitted while
     # the other actions remain in shadow, but a weak action cannot pass merely
     # because a different action has a strong factor edge.
@@ -109,7 +110,7 @@ def build_edge_admission(
                 if not bool(partial_action_ready[action_id]):
                     reasons.append("partial_action_admission_not_ready")
                 if stats is None:
-                    reasons.append("missing_train_audit_intervention")
+                    reasons.append("missing_target_audit_intervention")
                 else:
                     if stats.valid_samples < 64:
                         reasons.append("insufficient_valid_interventions")
@@ -144,4 +145,9 @@ def build_edge_admission(
                 }
     unsigned = {"version": "icdor_v3", "source_split": source_split, "entries": entries}
     digest = hashlib.sha256(json.dumps(unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest().upper()
-    return MOSAICEdgeAdmission(edge_admission_mask=admission, entries=entries, sha256=digest)
+    return MOSAICEdgeAdmission(
+        edge_admission_mask=admission,
+        entries=entries,
+        sha256=digest,
+        source_split=source_split,
+    )

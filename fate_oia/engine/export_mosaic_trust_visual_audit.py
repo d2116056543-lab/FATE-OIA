@@ -43,10 +43,13 @@ def export_visual_audit(
     *,
     device: torch.device,
     max_samples: int = 16,
+    source_split: str = "train_audit",
 ) -> dict[str, Any]:
     """Persist only tensors returned by an actual IC-DOR forward with masks enabled."""
     if type(max_samples) is not int or max_samples <= 0:
         raise ICDORVisualExportError("visual export max_samples must be positive")
+    if source_split not in {"train_audit", "audit_visual"}:
+        raise ICDORVisualExportError("visual export source must be a visual audit split")
     root = Path(output_dir)
     mask_dir = root / "masks"
     mask_dir.mkdir(parents=True, exist_ok=True)
@@ -62,8 +65,8 @@ def export_visual_audit(
                 raise ICDORVisualExportError("visual export batch must contain image, file_name, and split lists")
             if len(names) != images.shape[0] or len(splits) != images.shape[0]:
                 raise ICDORVisualExportError("visual export metadata does not match image batch")
-            if any(split != "train_audit" for split in splits):
-                raise ICDORVisualExportError("visual export only accepts train_audit batches")
+            if any(split != source_split for split in splits):
+                raise ICDORVisualExportError(f"visual export only accepts {source_split} batches")
             output = model(
                 images.to(device, non_blocking=True),
                 route_mode="admitted",
@@ -95,7 +98,7 @@ def export_visual_audit(
                 samples.append({
                     "sample_id": sample_id,
                     "file_name": str(file_name),
-                    "split": "train_audit",
+                    "split": source_split,
                     "action_final_logits": evidence["action_final_logits"][index].tolist(),
                     "reason_observed_logits": evidence["reason_observed_logits"][index].tolist(),
                     "support_weights": evidence["support_weights"][index].tolist(),
@@ -116,11 +119,11 @@ def export_visual_audit(
     finally:
         model.train(was_training)
     if not samples:
-        raise ICDORVisualExportError("visual export received no train_audit samples")
+        raise ICDORVisualExportError(f"visual export received no {source_split} samples")
     manifest = {
         "schema": "icdor_visual_audit_v1",
-        "source_split": "train_audit",
-        "selection": "deterministic_first_rows_from_frozen_train_audit_split",
+        "source_split": source_split,
+        "selection": f"deterministic_first_rows_from_frozen_{source_split}_split",
         "fixed_sample_ids": [sample["file_name"] for sample in samples],
         "sample_count": len(samples),
         "matched_random_control": "same_factor_equal_mass_spatial_roll",
@@ -135,7 +138,7 @@ def main() -> None:
     parser.add_argument("--manifest_only", action="store_true")
     parser.parse_args()
     raise ICDORVisualExportError(
-        "CLI export requires an explicit model and train_audit loader from the formal trainer; it never fabricates fallback logits or masks."
+        "CLI export requires an explicit model and visual-audit loader from the formal trainer; it never fabricates fallback logits or masks."
     )
 
 

@@ -234,6 +234,7 @@ def main() -> None:
         build_icdor_optimizer,
         load_config,
     )
+    from fate_oia.datasets.bdd100k_grounding import BDD100KGroundingIndex
     config = load_config(args.config)
     device = torch.device(args.device)
     if device.type != "cuda" or not torch.cuda.is_available():
@@ -243,14 +244,16 @@ def main() -> None:
     warmup = int(config["runtime"]["warmup_profile_steps"])
     measured = int(config["runtime"]["timed_profile_steps"])
     profile_root = Path(args.output).resolve().parent / "runtime_profile_data"
+    grounding_index = BDD100KGroundingIndex(config["data"]["bdd100k_root"])
 
     def measure(candidate: dict[str, Any], workers: int) -> Mapping[str, Any]:
         batch_size = int(candidate["batch_size"])
         grad_accum = int(candidate["grad_accum"])
-        loader, _, _, _, _ = build_icdor_loaders(
+        loader, _, _, _, _, _ = build_icdor_loaders(
             config, profile_root / f"b{batch_size}_a{grad_accum}_w{workers}",
             batch_size=batch_size, num_workers=workers,
             max_audit_samples=1, max_calib_samples=1, max_test_samples=1,
+            visual_grounding_index=grounding_index,
         )
         model = build_icdor_model(config).to(device)
         optimizer, _ = build_icdor_optimizer(model, config)

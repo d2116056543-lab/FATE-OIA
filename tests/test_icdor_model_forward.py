@@ -64,6 +64,13 @@ def test_icdor_model_admitted_route_is_action_visual_reread_not_factor_logit_del
         outputs["factor_soft_masks"].sum((-2, -1)),
         atol=1e-5,
     )
+    # Selected and matched-random arms must both use typed re-reading. A
+    # coarse fallback makes a deletion comparison scientifically invalid.
+    assert outputs["action_matched_random_typed_target_coordinates"].shape == (1, 4, 2)
+    assert not torch.allclose(
+        outputs["sampling_coordinates"],
+        outputs["action_matched_random_sampling_coordinates"],
+    )
 
 
 def test_icdor_model_exposes_frozen_certificate_reliability_without_a_per_image_tier_head() -> None:
@@ -80,10 +87,48 @@ def test_icdor_model_exposes_frozen_certificate_reliability_without_a_per_image_
     assert not any("tier" in name or "reliability" in name for name, _ in model.named_parameters())
 
 
+def test_model_routes_with_previous_audit_visual_credibility() -> None:
+    model = _model().eval()
+    factor_count = len(model.ontology["factors"])
+    previous_epoch = torch.linspace(0.05, 0.95, factor_count)
+    model.continuous_credibility.update_from_audit(previous_epoch)
+
+    with torch.no_grad():
+        outputs = model(torch.randn(1, 3, 360, 640), route_mode="shadow", latent_enabled=True)
+
+    expected = model.continuous_credibility.ema_cV.view(1, -1)
+    assert torch.equal(outputs["cV"], expected)
+    assert torch.equal(outputs["reason_continuous_credibility"], expected)
+
+
+def test_model_consumes_disjoint_audit_target_state_in_action_and_reason_routes() -> None:
+    model = _model().eval()
+    factor_count = len(model.ontology["factors"])
+    model.set_factor_certificate_tiers(["reason_only"] * factor_count)
+    model.continuous_credibility.update_from_audit(torch.full((factor_count,), 0.4))
+    image = torch.randn(1, 3, 360, 640)
+    with torch.no_grad():
+        before = model(image, route_mode="shadow", latent_enabled=True)
+
+    semantic = torch.full((21, factor_count), 0.10)
+    semantic[:, 0] = 1.0
+    action = torch.full((factor_count, 4), 0.10)
+    action[0] = 1.0
+    model.target_utility.update_from_audit(semantic, action, source_split="audit_target")
+    with torch.no_grad():
+        after = model(image, route_mode="shadow", latent_enabled=True)
+
+    assert torch.equal(after["semantic_compatibility"], semantic)
+    assert torch.equal(after["action_target_utility"], action)
+    assert torch.equal(after["action_target_utility_effective"], action.unsqueeze(0))
+    assert torch.equal(after["reason_semantic_compatibility_effective"], semantic)
+    assert not torch.allclose(before["reason_factor_router_weights"], after["reason_factor_router_weights"])
+
+
 def test_model_loads_only_a_complete_train_audit_certificate() -> None:
     model = _model()
     certificate = {
-        "source_split": "train_audit",
+        "source_split": "audit_visual",
         "sha256": "AB" * 32,
         "entries": {
             factor["name"]: {"tier": "certified", "reliability": 1.0}
@@ -98,7 +143,7 @@ def test_model_loads_only_a_complete_train_audit_certificate() -> None:
     try:
         model.load_factor_certificate(certificate)
     except ValueError as error:
-        assert "train_audit" in str(error)
+        assert "audit_visual" in str(error)
     else:
         raise AssertionError("test-derived certificate must be rejected")
 
@@ -137,18 +182,19 @@ def test_factor_ablation_modes_execute_real_distinct_forwards() -> None:
         image = model(images, return_masks=True, factor_ablation_mode="image_shuffled")
     assert not torch.allclose(full["factor_presence_prob"], content["factor_presence_prob"])
     assert not torch.allclose(full["factor_presence_prob"], prior["factor_presence_prob"])
-    assert torch.equal(query["factor_presence_prob"], full["factor_presence_prob"].roll(1, 1))
+    assert not torch.equal(query["factor_presence_prob"], full["factor_presence_prob"].roll(1, 1))
     assert not torch.allclose(full["factor_presence_prob"], image["factor_presence_prob"])
 
 
-def test_auto_route_is_fail_closed_then_uses_frozen_admission() -> None:
+def test_auto_route_uses_safe_shadow_before_frozen_admission() -> None:
     model = _model()
     images = torch.randn(1, 3, 360, 640)
-    off = model(images)
-    assert off["route_mode_code"].item() == 0
-    model.set_factor_certificate_tiers(["certified"] * len(model.ontology["factors"]))
     shadow = model(images)
     assert shadow["route_mode_code"].item() == 1
+    assert torch.allclose(shadow["action_final_logits"], shadow["action_visual_logits"])
+    model.set_factor_certificate_tiers(["certified"] * len(model.ontology["factors"]))
+    still_shadow = model(images)
+    assert still_shadow["route_mode_code"].item() == 1
     model.set_edge_admission(model.action_router.candidate_edge_mask)
     admitted = model(images)
     assert admitted["route_mode_code"].item() == 2
@@ -157,6 +203,12 @@ def test_auto_route_is_fail_closed_then_uses_frozen_admission() -> None:
 def test_reason_diagnostics_reuse_one_visual_forward_and_export_real_ablations() -> None:
     model = _model().eval()
     model.set_factor_certificate_tiers(["certified"] * len(model.ontology["factors"]))
+    # Production routes consume the preceding audit_visual result.  Seed a
+    # nonzero audited state here so this test exercises real interventions,
+    # rather than the intentionally safe zero-credibility bootstrap route.
+    model.continuous_credibility.update_from_audit(
+        torch.full((len(model.ontology["factors"]),), 0.4)
+    )
     with torch.no_grad():
         output = model(torch.randn(2, 3, 360, 640), latent_enabled=True, return_diagnostics=True)
     assert output["reason_observed_logits_route_off"].shape == (2, 21)
@@ -184,13 +236,15 @@ def test_factor_deletion_intervention_is_real_and_label_free() -> None:
             images,
             route_mode="admitted",
             latent_enabled=True,
-            return_masks=False,
+            return_masks=True,
             factor_intervention_keep_mask=keep,
         )
 
     assert torch.equal(deleted["factor_intervention_keep_mask"], keep)
     assert torch.all(deleted["factor_positive_evidence"][:, 0] == 0)
     assert torch.all(deleted["factor_visibility_prob"][:, 0] == 0)
+    # A deleted factor must not survive through the fine typed rereader.
+    assert torch.all(deleted["sample_attention"][:, 0] == 0)
     assert not torch.allclose(full["reason_observed_logits"], deleted["reason_observed_logits"])
 
 

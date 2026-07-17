@@ -114,8 +114,13 @@ class MOSAICMultiPrototypeFactorBank(nn.Module):
         weighted_scores = torch.where(valid, prototype_scores + log_weights, torch.full_like(prototype_scores, -torch.inf))
         return torch.logsumexp(weighted_scores, dim=2)
 
-    def _prototype_weights(self, context: torch.Tensor, prior_mode: str) -> torch.Tensor:
-        valid = self.prototype_valid_mask.unsqueeze(0)
+    def _prototype_weights(
+        self,
+        context: torch.Tensor,
+        prior_mode: str,
+        prototype_valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        valid = prototype_valid_mask.unsqueeze(0)
         if prior_mode == "prior_only":
             weights = valid.expand(context.shape[0], -1, -1).to(dtype=context.dtype)
             return weights / weights.sum(-1, keepdim=True)
@@ -127,22 +132,33 @@ class MOSAICMultiPrototypeFactorBank(nn.Module):
         weights = entmax15_bisect(router_logits, dim=-1) * valid.to(dtype=router_logits.dtype)
         return weights / weights.sum(-1, keepdim=True).clamp_min(1e-12)
 
-    def _prototype_diagnostics(self, weights: torch.Tensor) -> dict[str, torch.Tensor]:
+    def _prototype_diagnostics(
+        self,
+        weights: torch.Tensor,
+        prototypes: torch.Tensor,
+        prototype_valid_mask: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
         occupancy = weights.mean(dim=0)
         entropy = -(weights.clamp_min(1e-12).log() * weights).sum(-1).mean(0)
-        normalized_prototypes = F.normalize(self.prototypes, dim=-1, eps=1e-6)
+        normalized_prototypes = F.normalize(prototypes, dim=-1, eps=1e-6)
         pairwise = torch.einsum("fkd,fjd->fkj", normalized_prototypes, normalized_prototypes)
-        valid_pairs = self.prototype_valid_mask[:, :, None] & self.prototype_valid_mask[:, None, :]
+        valid_pairs = prototype_valid_mask[:, :, None] & prototype_valid_mask[:, None, :]
         pairwise = torch.where(valid_pairs, pairwise, torch.zeros_like(pairwise))
         return {
             "prototype_occupancy": occupancy.detach(),
             "prototype_effective_count": entropy.exp().detach(),
             "prototype_pairwise_cosine": pairwise.detach(),
             "dominant_prototype_rate": (weights.max(-1).values > 0.85).float().mean(0).detach(),
-            "dead_prototype_count": ((occupancy < 1e-4) & self.prototype_valid_mask).sum(-1).detach(),
+            "dead_prototype_count": ((occupancy < 1e-4) & prototype_valid_mask).sum(-1).detach(),
         }
 
-    def forward(self, context: torch.Tensor, *, prior_mode: str = "full") -> dict[str, Any]:
+    def forward(
+        self,
+        context: torch.Tensor,
+        *,
+        prior_mode: str = "full",
+        query_permutation: torch.Tensor | None = None,
+    ) -> dict[str, Any]:
         if prior_mode not in {"full", "content_only", "prior_only"}:
             raise ValueError("prior_mode must be full, content_only, or prior_only")
         if context.ndim != 4 or tuple(context.shape[1:]) != (self.dim, 12, 20):
@@ -150,17 +166,32 @@ class MOSAICMultiPrototypeFactorBank(nn.Module):
         if not context.is_floating_point():
             raise ValueError("prototype bank requires floating-point context")
 
-        compute_context = context.to(dtype=self.prototypes.dtype)
-        weights = self._prototype_weights(compute_context, prior_mode)
+        if query_permutation is None:
+            query_index = torch.arange(self.factor_count, device=context.device)
+        else:
+            query_index = query_permutation.to(device=context.device, dtype=torch.long)
+            if query_index.shape != (self.factor_count,) or not torch.equal(
+                torch.sort(query_index).values,
+                torch.arange(self.factor_count, device=context.device),
+            ):
+                raise ValueError("query_permutation must be a factor permutation")
+        # Shuffle only query/content semantics. The output factor keeps its
+        # spatial prior, so this is an actual semantic intervention rather
+        # than a post-hoc relabeling of predictions.
+        prototypes = self.prototypes.index_select(0, query_index)
+        valid_mask = self.prototype_valid_mask.index_select(0, query_index)
+        temperatures = self.content_temperature.index_select(0, query_index)
+        compute_context = context.to(dtype=prototypes.dtype)
+        weights = self._prototype_weights(compute_context, prior_mode, valid_mask)
         if prior_mode == "prior_only":
             content_scores = compute_context.new_zeros(
                 compute_context.shape[0], self.factor_count, self.max_prototypes, 12, 20
             )
         else:
             keys = F.normalize(self.key_proj(compute_context), dim=1, eps=1e-6)
-            prototypes = F.normalize(self.prototypes, dim=-1, eps=1e-6)
-            content_scores = torch.einsum("fkd,bdhw->bfkhw", prototypes, keys)
-            content_scores = content_scores / self.content_temperature.view(1, -1, 1, 1, 1)
+            normalized_prototypes = F.normalize(prototypes, dim=-1, eps=1e-6)
+            content_scores = torch.einsum("fkd,bdhw->bfkhw", normalized_prototypes, keys)
+            content_scores = content_scores / temperatures.view(1, -1, 1, 1, 1)
 
         if prior_mode == "content_only":
             prior = compute_context.new_zeros(compute_context.shape[0], self.factor_count, 1, 12, 20)
@@ -176,17 +207,19 @@ class MOSAICMultiPrototypeFactorBank(nn.Module):
 
         scores = content_scores + prior
         visible_scores = torch.where(
-            self.prototype_valid_mask.view(1, self.factor_count, self.max_prototypes, 1, 1),
+            valid_mask.view(1, self.factor_count, self.max_prototypes, 1, 1),
             scores,
             torch.zeros_like(scores),
         )
-        coarse_scores = self.aggregate_prototype_scores(scores, weights, self.prototype_valid_mask)
+        coarse_scores = self.aggregate_prototype_scores(scores, weights, valid_mask)
         return {
             "prototype_scores": visible_scores,
             "prototype_weights": weights,
             "coarse_scores": coarse_scores,
             "prior_scale": self.prior_scale,
-            "prototype_stats": self._prototype_diagnostics(weights),
+            "prototype_stats": self._prototype_diagnostics(weights, prototypes, valid_mask),
+            "prototype_queries": prototypes,
+            "prototype_valid_mask": valid_mask,
         }
 
 
@@ -287,13 +320,15 @@ class MOSAICObservablePredicateLayer(nn.Module):
         self,
         sampled_features: torch.Tensor,
         prototype_weights: torch.Tensor,
+        prototype_queries: torch.Tensor,
+        prototype_valid_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         sampled_features = sampled_features.to(dtype=self.sample_key_proj.weight.dtype)
         sample_keys = F.normalize(self.sample_key_proj(sampled_features), dim=-1, eps=1e-6)
-        prototype_queries = F.normalize(self.prototype_bank.prototypes, dim=-1, eps=1e-6)
-        sample_logits = torch.einsum("bfmhsd,fkd->bfkmhs", sample_keys, prototype_queries)
+        normalized_queries = F.normalize(prototype_queries, dim=-1, eps=1e-6)
+        sample_logits = torch.einsum("bfmhsd,fkd->bfkmhs", sample_keys, normalized_queries)
         sample_valid = self.typed_attention.sample_valid_mask.view(1, self.factor_count, 1, 1, 1, -1)
-        prototype_valid = self.prototype_bank.prototype_valid_mask.view(
+        prototype_valid = prototype_valid_mask.view(
             1, self.factor_count, self.prototype_bank.max_prototypes, 1, 1, 1
         )
         sample_logits = sample_logits.masked_fill(~(sample_valid & prototype_valid), -1e4)
@@ -309,20 +344,31 @@ class MOSAICObservablePredicateLayer(nn.Module):
         sample_attention = torch.einsum("bfk,bfkt->bft", prototype_weights, flat_attention)
         return factor_features, sample_attention, prototype_support
 
-    def _factor_queries(self, prototype_weights: torch.Tensor) -> torch.Tensor:
-        prototype_mask = self.prototype_bank.prototype_valid_mask.to(dtype=self.prototype_bank.prototypes.dtype)
+    def _factor_queries(
+        self,
+        prototype_weights: torch.Tensor,
+        prototype_queries: torch.Tensor,
+        prototype_valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        prototype_mask = prototype_valid_mask.to(dtype=prototype_queries.dtype)
         return torch.einsum(
             "bfk,fkd->bfd",
-            prototype_weights.to(dtype=self.prototype_bank.prototypes.dtype),
-            self.prototype_bank.prototypes * prototype_mask.unsqueeze(-1),
+            prototype_weights.to(dtype=prototype_queries.dtype),
+            prototype_queries * prototype_mask.unsqueeze(-1),
         )
 
-    def _read_mid_features(self, middle: torch.Tensor, prototype_weights: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _read_mid_features(
+        self,
+        middle: torch.Tensor,
+        prototype_weights: torch.Tensor,
+        prototype_queries: torch.Tensor,
+        prototype_valid_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         middle = middle.to(dtype=self.mid_key_proj.weight.dtype)
         keys = F.normalize(self.mid_key_proj(middle).flatten(2).transpose(1, 2), dim=-1, eps=1e-6)
-        queries = F.normalize(self.prototype_bank.prototypes, dim=-1, eps=1e-6)
+        queries = F.normalize(prototype_queries, dim=-1, eps=1e-6)
         scores = torch.einsum("fkd,bnd->bfkn", queries, keys)
-        scores = scores.masked_fill(~self.prototype_bank.prototype_valid_mask.view(1, self.factor_count, -1, 1), -1e4)
+        scores = scores.masked_fill(~prototype_valid_mask.view(1, self.factor_count, -1, 1), -1e4)
         attention = entmax15_bisect(scores, dim=-1)
         values = self.mid_value_proj(middle).flatten(2).transpose(1, 2)
         prototype_features = torch.einsum("bfkn,bnd->bfkd", attention, values)
@@ -333,7 +379,13 @@ class MOSAICObservablePredicateLayer(nn.Module):
         probability = probability.clamp(1e-6, 1.0 - 1e-6)
         return -(probability * probability.log() + (1.0 - probability) * (1.0 - probability).log()) / math.log(2.0)
 
-    def forward(self, pyramid: dict[str, torch.Tensor], *, prior_mode: str = "full") -> dict[str, Any]:
+    def forward(
+        self,
+        pyramid: dict[str, torch.Tensor],
+        *,
+        prior_mode: str = "full",
+        query_permutation: torch.Tensor | None = None,
+    ) -> dict[str, Any]:
         if not isinstance(pyramid, dict) or not {"F_hi", "F_mid", "F_ctx"} <= set(pyramid):
             raise ValueError("observable predicate layer requires F_hi/F_mid/F_ctx")
         high, middle, context = pyramid["F_hi"], pyramid["F_mid"], pyramid["F_ctx"]
@@ -345,11 +397,19 @@ class MOSAICObservablePredicateLayer(nn.Module):
         ):
             raise ValueError("observable predicate pyramid has invalid scale shapes")
 
-        prototype_output = self.prototype_bank(context, prior_mode=prior_mode)
+        prototype_output = self.prototype_bank(
+            context,
+            prior_mode=prior_mode,
+            query_permutation=query_permutation,
+        )
         anchors, coarse_distribution = self._soft_anchors(prototype_output["coarse_scores"])
         sampling_high = torch.zeros_like(high) if prior_mode == "prior_only" else high
         typed_output = self.typed_attention(sampling_high, anchors)
-        factor_queries = self._factor_queries(prototype_output["prototype_weights"])
+        factor_queries = self._factor_queries(
+            prototype_output["prototype_weights"],
+            prototype_output["prototype_queries"],
+            prototype_output["prototype_valid_mask"],
+        )
         if prior_mode == "prior_only":
             factor_features = factor_queries
             sample_attention = factor_queries.new_zeros(
@@ -365,10 +425,16 @@ class MOSAICObservablePredicateLayer(nn.Module):
             mid_prototype_support = sparse_prototype_support.clone()
         else:
             sparse_features, sample_attention, sparse_prototype_support = self._read_sparse_samples(
-                typed_output["sampled_features"], prototype_output["prototype_weights"]
+                typed_output["sampled_features"],
+                prototype_output["prototype_weights"],
+                prototype_output["prototype_queries"],
+                prototype_output["prototype_valid_mask"],
             )
             mid_features, mid_prototype_support = self._read_mid_features(
-                middle, prototype_output["prototype_weights"]
+                middle,
+                prototype_output["prototype_weights"],
+                prototype_output["prototype_queries"],
+                prototype_output["prototype_valid_mask"],
             )
             factor_features = self.feature_fusion(sparse_features + mid_features)
         expected_sample_count = (

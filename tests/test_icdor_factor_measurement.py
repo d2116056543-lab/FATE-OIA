@@ -68,3 +68,24 @@ def test_icdor_invisible_factor_has_near_zero_present_and_absent_evidence() -> N
     outputs = layer(_pyramid(batch_size=1, dim=32))
     assert float(outputs["factor_positive_evidence"].max()) < 1e-6
     assert float(outputs["factor_negative_evidence"].max()) < 1e-6
+
+
+def test_query_shuffle_remeasures_with_permuted_factor_queries() -> None:
+    torch.manual_seed(7)
+    ontology = load_icdor_ontology(Path("configs"))
+    layer = MOSAICObservablePredicateLayer(
+        ontology["factors"],
+        dim=32,
+        point_samples=4,
+        curve_samples=16,
+        region_samples=12,
+    ).eval()
+    pyramid = _pyramid(batch_size=2, dim=32)
+    permutation = torch.roll(torch.arange(len(ontology["factors"])), shifts=1)
+
+    with torch.no_grad():
+        full = layer(pyramid)
+        shuffled = layer(pyramid, query_permutation=permutation)
+
+    assert not torch.allclose(full["factor_presence_prob"], shuffled["factor_presence_prob"])
+    assert not torch.equal(shuffled["factor_presence_prob"], full["factor_presence_prob"].roll(1, 1))

@@ -46,20 +46,6 @@ def _flip_counts(base: torch.Tensor, final: torch.Tensor, labels: torch.Tensor) 
     return rows
 
 
-def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> float | None:
-    selected = values[mask]
-    return float(selected.mean()) if selected.numel() else None
-
-
-def _synthetic_hidden_ap(posterior: torch.Tensor, hidden: torch.Tensor, observed: torch.Tensor) -> float | None:
-    keep = hidden | (observed <= 0.5)
-    target = hidden[keep].float()
-    if not keep.any() or not target.any() or bool(target.all()):
-        return None
-    logits = torch.logit(posterior[keep].clamp(1e-6, 1 - 1e-6)).unsqueeze(1)
-    return float(multilabel_metrics_from_logits(logits, target.unsqueeze(1))["mAP"])
-
-
 def _cat(collection: dict[str, list[torch.Tensor]]) -> dict[str, torch.Tensor]:
     return {name: torch.cat(values, dim=0) for name, values in collection.items()}
 
@@ -85,8 +71,7 @@ def evaluate_icdor(
         "action_factor_off": [], "action_factor_shuffled": [], "action_wrong_target": [],
         "action_equal_mass_random": [],
         "reason_factor_route_off": [], "reason_factor_route_shuffled": [],
-        "reason_propensity": [], "reason_posterior_q": [], "synthetic_hidden_mask": [],
-        "synthetic_hidden_posterior": [],
+        "reason_propensity": [],
     }
     factor_sums: dict[str, torch.Tensor] | None = None
     route_sums: dict[str, torch.Tensor] | None = None
@@ -128,25 +113,7 @@ def evaluate_icdor(
         propensity = output.get("reason_propensity")
         if not isinstance(propensity, torch.Tensor):
             propensity = torch.full_like(reason_labels, 0.5)
-        posterior_fn = getattr(getattr(model, "observation_model", None), "posterior_from_observed_targets", None)
-        if callable(posterior_fn):
-            posterior = posterior_fn(output["reason_logits_latent"], reason_labels, output)["reason_latent_posterior"]
-            row_ids = torch.arange(sample_count, sample_count + images.shape[0], device=device).unsqueeze(1)
-            label_ids = torch.arange(reason_labels.shape[1], device=device).unsqueeze(0)
-            hidden_mask = (reason_labels > 0.5) & (((row_ids + label_ids) % 5) == 0)
-            hidden_targets = reason_labels.clone()
-            hidden_targets[hidden_mask] = 0.0
-            hidden_posterior = posterior_fn(
-                output["reason_logits_latent"], hidden_targets, output
-            )["reason_latent_posterior"]
-        else:
-            posterior = torch.sigmoid(output["reason_logits_latent"])
-            hidden_mask = torch.zeros_like(reason_labels, dtype=torch.bool)
-            hidden_posterior = posterior
         collection["reason_propensity"].append(propensity.detach().float().cpu())
-        collection["reason_posterior_q"].append(posterior.detach().float().cpu())
-        collection["synthetic_hidden_mask"].append(hidden_mask.detach().cpu())
-        collection["synthetic_hidden_posterior"].append(hidden_posterior.detach().float().cpu())
         collection["action_support_logits"].append(output["action_support_logits"].detach().float().cpu())
         collection["action_veto_logits"].append(output["action_veto_logits"].detach().float().cpu())
         for collection_key, output_key in (
@@ -355,22 +322,13 @@ def evaluate_icdor(
             "propensity_min": float(tensors["reason_propensity"][:, reason_id].min()),
             "propensity_max": float(tensors["reason_propensity"][:, reason_id].max()),
             "propensity_bound_saturation_rate": float(((tensors["reason_propensity"][:, reason_id] <= 0.201) | (tensors["reason_propensity"][:, reason_id] >= 0.949)).float().mean()),
-            "posterior_q_observed_zero_mean": _masked_mean(
-                tensors["reason_posterior_q"][:, reason_id], reason_labels[:, reason_id] <= 0.5
-            ),
-            "synthetic_hidden_positive_auprc": _synthetic_hidden_ap(
-                tensors["synthetic_hidden_posterior"][:, reason_id],
-                tensors["synthetic_hidden_mask"][:, reason_id].bool(),
-                reason_labels[:, reason_id],
-            ),
+            # Test labels are only used for reporting metrics.  Synthetic
+            # hidden-positive recovery needs observed targets and therefore is
+            # isolated to audit_target, never constructed inside test eval.
+            "posterior_q_observed_zero_available": False,
+            "synthetic_hidden_positive_auprc_available": False,
             "top_q_observed_zero_manual_precision_available": False,
-            "top_q_observed_zero_cases": [
-                {"file_name": names[int(index)], "q": float(tensors["reason_posterior_q"][index, reason_id])}
-                for index in torch.argsort(
-                    tensors["reason_posterior_q"][:, reason_id].masked_fill(reason_labels[:, reason_id] > 0.5, -1.0),
-                    descending=True,
-                )[: min(200, int((reason_labels[:, reason_id] <= 0.5).sum()))]
-            ],
+            "top_q_observed_zero_cases": [],
         }
         for reason_id in range(reason_labels.shape[1])
     ]

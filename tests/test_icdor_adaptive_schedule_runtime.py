@@ -54,7 +54,9 @@ class _ResumeModel(nn.Module):
 
 def test_runtime_phase_comes_from_adaptive_state_not_epoch() -> None:
     schedule = ICDORAdaptiveSchedule(pilot=False)
-    assert _adaptive_phase(schedule).route_mode == "off"
+    # CREDO grants shadow-learning access from FOUNDATION. Discrete evidence
+    # admission only controls the final action route.
+    assert _adaptive_phase(schedule).route_mode == "shadow"
 
     schedule.state = "DUAL_REASON_SHADOW"
     assert _adaptive_phase(schedule).route_mode == "shadow"

@@ -80,6 +80,7 @@ class MOSAICTargetSparseRouter(nn.Module):
         factor_scores: torch.Tensor,
         evidence: torch.Tensor,
         credibility: torch.Tensor | None,
+        target_utility: torch.Tensor | None,
         direction_index: int,
         active_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -89,6 +90,11 @@ class MOSAICTargetSparseRouter(nn.Module):
         finite_logits = factor_scores + evidence_by_edge.clamp_min(1e-8).log()
         if credibility is not None:
             finite_logits = finite_logits + credibility.detach().clamp_min(1e-8).log().unsqueeze(-1)
+        if target_utility is not None:
+            # ``u`` is audit-derived target utility. Keep a small shadow
+            # learning floor so an inconclusive early audit cannot recreate
+            # the cold-start deadlock; final use remains edge-admission gated.
+            finite_logits = finite_logits + target_utility.detach().clamp_min(0.10).log()
         finite_logits = finite_logits + self.direction_bias[direction_index].view(1, 1, -1)
         dustbin = self.dustbin_logit[direction_index].view(1, 1, -1).expand(finite_logits.shape[0], -1, -1)
         # Exclude forbidden factors before entmax so their semantics cannot
@@ -116,6 +122,7 @@ class MOSAICTargetSparseRouter(nn.Module):
         *,
         route_mode: str,
         factor_credibility: torch.Tensor | None = None,
+        factor_target_utility: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         if factor_features.ndim != 3 or factor_features.shape[1] != self.factor_count:
             raise ValueError("IC-DOR router factor_features must be [B,F,D]")
@@ -123,6 +130,11 @@ class MOSAICTargetSparseRouter(nn.Module):
             raise ValueError("IC-DOR router evidence must be [B,F]")
         if factor_credibility is not None and factor_credibility.shape != factor_features.shape[:2]:
             raise ValueError("IC-DOR router credibility must be [B,F]")
+        if factor_target_utility is not None:
+            if factor_target_utility.shape == (self.factor_count, self.action_count):
+                factor_target_utility = factor_target_utility.unsqueeze(0).expand(factor_features.shape[0], -1, -1)
+            if factor_target_utility.shape != (factor_features.shape[0], self.factor_count, self.action_count):
+                raise ValueError("IC-DOR router target utility must be [F,4] or [B,F,4]")
         if action_queries.shape != (factor_features.shape[0], self.action_count, factor_features.shape[-1]):
             raise ValueError("IC-DOR router action_queries must be [B,4,D]")
         factors = self.factor_proj(factor_features.detach())
@@ -139,10 +151,10 @@ class MOSAICTargetSparseRouter(nn.Module):
             + polarity[1, 1].unsqueeze(0) * factor_negative_evidence.detach().unsqueeze(-1)
         )
         support, support_dustbin, support_logits = self._route_one_direction(
-            factor_scores, support_evidence, factor_credibility, 0, active[0]
+            factor_scores, support_evidence, factor_credibility, factor_target_utility, 0, active[0]
         )
         veto, veto_dustbin, veto_logits = self._route_one_direction(
-            factor_scores, veto_evidence, factor_credibility, 1, active[1]
+            factor_scores, veto_evidence, factor_credibility, factor_target_utility, 1, active[1]
         )
         return {
             "support_weights": support,
@@ -155,5 +167,9 @@ class MOSAICTargetSparseRouter(nn.Module):
             "active_edge_polarity_mask": polarity,
             "support_route_evidence": support_evidence,
             "veto_route_evidence": veto_evidence,
+            "action_target_utility_effective": (
+                torch.ones_like(factor_scores)
+                if factor_target_utility is None else factor_target_utility.detach()
+            ),
             "route_mode_code": factor_scores.new_tensor({"off": 0, "shadow": 1, "admitted": 2}[route_mode]),
         }

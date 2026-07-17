@@ -6,6 +6,7 @@ from typing import Any, Mapping, Sequence
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from .mosaic_group_threshold import MOSAICGroupThresholdHead
 from .mosaic_action_route_policy import compose_final_action_logits
@@ -23,6 +24,7 @@ from .mosaic_masked_target_rereader import MOSAICMaskedTargetRereader
 from .mosaic_native_semantics import load_icdor_ontology
 from .mosaic_observable_predicates import MOSAICObservablePredicateLayer
 from .mosaic_target_sparse_router import MOSAICTargetSparseRouter, _TIER_TO_ID
+from .mosaic_target_utility import MOSAICAuditTargetUtility
 from .mosaic_visual_pyramid import MOSAICVisualPyramid
 
 
@@ -64,7 +66,7 @@ class MOSAICTrustICDORModel(nn.Module):
         gate_max: float = 0.15,
         pi_min: float = 0.20,
         pi_max: float = 0.95,
-        observed_mix_init: float = 0.50,
+        observed_mix_init: float = 0.05,
     ) -> None:
         super().__init__()
         self.ontology = load_icdor_ontology(config_root)
@@ -127,6 +129,9 @@ class MOSAICTrustICDORModel(nn.Module):
             midres_topk=midres_topk,
         )
         self.action_router = MOSAICTargetSparseRouter(self.ontology, dim=dim)
+        self.target_utility = MOSAICAuditTargetUtility(
+            factor_count=len(self.ontology["factors"]), reason_count=21, action_count=4
+        )
         self.action_rereader = MOSAICMaskedTargetRereader(
             dim=dim, topk=highres_topk, gate_init=gate_init, gate_max=gate_max
         )
@@ -163,6 +168,63 @@ class MOSAICTrustICDORModel(nn.Module):
         """Keep latent-reason supervision out of the direct visual-reason lane."""
         return {key: value.detach() for key, value in pyramid.items()}
 
+    @staticmethod
+    def _typed_mask_values(
+        factor_masks: torch.Tensor, sampling_coordinates: torch.Tensor
+    ) -> torch.Tensor:
+        """Sample the active factor mask at every typed evidence coordinate."""
+        if factor_masks.ndim != 4 or sampling_coordinates.ndim != 6:
+            raise ValueError("IC-DOR typed mask sampling requires [B,F,H,W] and [B,F,A,H,S,2]")
+        batch_size, factor_count, height, width = factor_masks.shape
+        if sampling_coordinates.shape[:2] != (batch_size, factor_count):
+            raise ValueError("IC-DOR typed coordinates do not match factor masks")
+        sample_shape = sampling_coordinates.shape[2:-1]
+        flat_count = int(torch.tensor(sample_shape).prod().item())
+        grid = sampling_coordinates.reshape(batch_size * factor_count, flat_count, 1, 2)
+        sampled = F.grid_sample(
+            factor_masks.reshape(batch_size * factor_count, 1, height, width),
+            grid,
+            mode="bilinear",
+            align_corners=False,
+        )
+        return sampled.reshape(batch_size, factor_count, *sample_shape).clamp_min(0.0)
+
+    @staticmethod
+    def _resample_typed_features(
+        feature_map: torch.Tensor, sampling_coordinates: torch.Tensor
+    ) -> torch.Tensor:
+        """Re-read a factor's typed samples after a spatial control changes it."""
+        if feature_map.ndim != 4 or sampling_coordinates.ndim != 6:
+            raise ValueError("IC-DOR typed feature sampling requires [B,D,H,W] and [B,F,A,H,S,2]")
+        batch_size, dim, height, width = feature_map.shape
+        if sampling_coordinates.shape[0] != batch_size:
+            raise ValueError("IC-DOR typed coordinates do not match the feature map batch")
+        factor_count = sampling_coordinates.shape[1]
+        sample_shape = sampling_coordinates.shape[2:-1]
+        flat_count = int(torch.tensor(sample_shape).prod().item())
+        grid = sampling_coordinates.reshape(batch_size * factor_count, flat_count, 1, 2)
+        repeated_map = feature_map.unsqueeze(1).expand(-1, factor_count, -1, -1, -1)
+        sampled = F.grid_sample(
+            repeated_map.reshape(batch_size * factor_count, dim, height, width),
+            grid,
+            mode="bilinear",
+            align_corners=False,
+        )
+        return sampled.squeeze(-1).transpose(1, 2).reshape(
+            batch_size, factor_count, *sample_shape, dim
+        )
+
+    @staticmethod
+    def _rolled_typed_coordinates(
+        sampling_coordinates: torch.Tensor, *, height: int, width: int
+    ) -> torch.Tensor:
+        """Match the same cyclic spatial roll used by the equal-mass control mask."""
+        shift_y, shift_x = height // 3, width // 3
+        offset = sampling_coordinates.new_tensor((2.0 * shift_x / width, 2.0 * shift_y / height))
+        # ``torch.roll`` is cyclic, so the coordinate control must wrap rather
+        # than clamp at an image boundary and accidentally change mask mass.
+        return torch.remainder(sampling_coordinates + offset + 1.0, 2.0) - 1.0
+
     @torch.no_grad()
     def set_factor_certificate_tiers(self, tiers: Sequence[str], *, certificate_sha256: str | None = None) -> None:
         if len(tiers) != self.factor_certificate_tier.numel() or any(tier not in _TIER_TO_ID for tier in tiers):
@@ -189,8 +251,8 @@ class MOSAICTrustICDORModel(nn.Module):
     @torch.no_grad()
     def load_factor_certificate(self, certificate: Mapping[str, Any]) -> None:
         """Load one immutable audit certificate and reject test-derived or incomplete state."""
-        if certificate.get("source_split") != "train_audit":
-            raise ValueError("IC-DOR only accepts factor certificates derived from train_audit")
+        if certificate.get("source_split") != "audit_visual":
+            raise ValueError("CREDO only accepts factor certificates derived from audit_visual")
         entries = certificate.get("entries")
         digest = certificate.get("sha256")
         if not isinstance(entries, Mapping) or not isinstance(digest, str) or len(digest) != 64:
@@ -273,7 +335,16 @@ class MOSAICTrustICDORModel(nn.Module):
             key: value.roll(shifts=1, dims=0) if factor_ablation_mode == "image_shuffled" else value
             for key, value in factor_pyramid.items()
         }
-        factor_output = self.factor_extractor(factor_input, prior_mode=prior_mode)
+        query_permutation = (
+            torch.roll(torch.arange(self.factor_certificate_tier.numel(), device=images.device), shifts=1)
+            if factor_ablation_mode == "query_shuffled"
+            else None
+        )
+        factor_output = self.factor_extractor(
+            factor_input,
+            prior_mode=prior_mode,
+            query_permutation=query_permutation,
+        )
         sample_support = (factor_output["sample_attention"] > 1e-5).float().sum(dim=(-1, -2, -3))
         credibility = self.continuous_credibility(
             factor_output["factor_features"],
@@ -285,17 +356,19 @@ class MOSAICTrustICDORModel(nn.Module):
             ).clamp(0.0, 1.0),
             sample_support=sample_support,
         )
+        # Only the completed audit_visual pass may update or provide routing
+        # credibility. Per-batch measurements remain diagnostics, never a
+        # same-epoch self-certification signal.
+        stored_credibility = self.continuous_credibility.ema_cV.to(
+            device=images.device,
+            dtype=factor_output["factor_features"].dtype,
+        ).view(1, -1).expand(images.shape[0], -1)
+        credibility["cV_batch_measurement"] = credibility["cV"]
+        credibility["cV"] = stored_credibility
+        credibility["cV_ema"] = stored_credibility
         factor_output.update(credibility)
-        # Route strength uses the current visual measurement plus the previous
-        # detached EMA; this stabilizes admission without turning cV into a
-        # hard training gate or reading any reason label.
-        continuous_route_weight = (
-            0.5 * credibility["cV"] + 0.5 * credibility["cV_ema"]
-        ).detach().clamp(0.0, 1.0)
-        if factor_ablation_mode == "query_shuffled":
-            for key, value in tuple(factor_output.items()):
-                if isinstance(value, torch.Tensor) and value.ndim >= 2 and value.shape[1] == self.factor_certificate_tier.numel():
-                    factor_output[key] = value.roll(shifts=1, dims=1)
+        continuous_route_weight = stored_credibility.detach().clamp(0.0, 1.0)
+        target_utility_state = self.target_utility()
         if factor_intervention_keep_mask is None:
             intervention_keep = images.new_ones(images.shape[0], self.factor_certificate_tier.numel())
         else:
@@ -306,6 +379,8 @@ class MOSAICTrustICDORModel(nn.Module):
                 raise ValueError("IC-DOR factor intervention keep mask must be finite in [0,1]")
         keep_feature = intervention_keep.unsqueeze(-1)
         keep_mask = intervention_keep.unsqueeze(-1).unsqueeze(-1)
+        keep_typed_attention = intervention_keep.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        keep_typed_features = keep_typed_attention.unsqueeze(-1)
         for key in ("factor_features",):
             factor_output[key] = factor_output[key] * keep_feature
         for key in ("factor_soft_masks",):
@@ -314,6 +389,11 @@ class MOSAICTrustICDORModel(nn.Module):
             "factor_presence_prob", "factor_visibility_prob", "factor_positive_evidence", "factor_negative_evidence"
         ):
             factor_output[key] = factor_output[key] * intervention_keep
+        # Deletion must clear the direct typed-sample path as well as the
+        # coarse mask. Otherwise an intervened factor can still reach an
+        # action/reason target through stale sampled features.
+        factor_output["sample_attention"] = factor_output["sample_attention"] * keep_typed_attention
+        factor_output["sampled_features"] = factor_output["sampled_features"] * keep_typed_features
         factor_output["factor_uncertainty"] = (
             factor_output["factor_uncertainty"] * intervention_keep + (1.0 - intervention_keep)
         )
@@ -334,6 +414,14 @@ class MOSAICTrustICDORModel(nn.Module):
             factor_output["factor_soft_masks"] = factor_mask_override.to(
                 device=images.device, dtype=factor_output["factor_soft_masks"].dtype
             )
+        # A coarse mask override/deletion is not a real intervention unless it
+        # also masks the typed path. The target rereaders otherwise retain
+        # stale local samples even after a factor was removed from its mask.
+        typed_mask_values = self._typed_mask_values(
+            factor_output["factor_soft_masks"], factor_output["sampling_coordinates"]
+        )
+        factor_output["sample_attention"] = factor_output["sample_attention"] * typed_mask_values
+        factor_output["sampled_features"] = factor_output["sampled_features"] * typed_mask_values.unsqueeze(-1)
         action_output = self.action_visual_decoder(action_pyramid)
         router_output = self.action_router(
             factor_output["factor_features"],
@@ -342,6 +430,7 @@ class MOSAICTrustICDORModel(nn.Module):
             action_output["action_queries"],
             route_mode=route_mode,
             factor_credibility=credibility["cV"],
+            factor_target_utility=target_utility_state["action_target_utility"],
         )
         reread_output = self.action_rereader(
             action_pyramid,
@@ -358,12 +447,26 @@ class MOSAICTrustICDORModel(nn.Module):
             shifts=(factor_output["factor_soft_masks"].shape[-2] // 3, factor_output["factor_soft_masks"].shape[-1] // 3),
             dims=(-2, -1),
         )
+        random_sampling_coordinates = self._rolled_typed_coordinates(
+            factor_output["sampling_coordinates"],
+            height=equal_mass_random_masks.shape[-2],
+            width=equal_mass_random_masks.shape[-1],
+        )
+        random_sample_attention = self._typed_mask_values(
+            equal_mass_random_masks, random_sampling_coordinates
+        )
+        random_sampled_features = self._resample_typed_features(
+            factor_pyramid["F_hi"], random_sampling_coordinates
+        ) * random_sample_attention.unsqueeze(-1)
         random_reread_output = None if route_mode == "off" else self.action_rereader(
             action_pyramid,
             action_output["action_queries"],
             equal_mass_random_masks,
             router_output["support_weights"],
             router_output["veto_weights"],
+            random_sampling_coordinates,
+            random_sampled_features,
+            random_sample_attention,
         )
         action_shadow = (
             action_output["action_visual_logits"]
@@ -387,11 +490,21 @@ class MOSAICTrustICDORModel(nn.Module):
             reason_factor_features = factor_output["factor_features"] * reason_reliability.unsqueeze(-1)
             reason_factor_masks = factor_output["factor_soft_masks"] * reason_reliability.unsqueeze(-1).unsqueeze(-1)
             reason_route_enabled = torch.ones_like(self.reason_factor_route_enabled)
+            reason_positive_evidence = factor_output["factor_positive_evidence"]
+            reason_negative_evidence = factor_output["factor_negative_evidence"]
+            reason_sampling_coordinates = factor_output["sampling_coordinates"]
+            reason_sampled_features = factor_output["sampled_features"]
+            reason_sample_attention = factor_output["sample_attention"]
         elif reason_route_mode == "off":
             reason_reliability = torch.zeros_like(continuous_route_weight)
             reason_factor_features = factor_output["factor_features"] * 0.0
             reason_factor_masks = factor_output["factor_soft_masks"] * 0.0
             reason_route_enabled = torch.zeros_like(self.reason_factor_route_enabled)
+            reason_positive_evidence = factor_output["factor_positive_evidence"] * 0.0
+            reason_negative_evidence = factor_output["factor_negative_evidence"] * 0.0
+            reason_sampling_coordinates = factor_output["sampling_coordinates"]
+            reason_sampled_features = factor_output["sampled_features"] * 0.0
+            reason_sample_attention = factor_output["sample_attention"] * 0.0
         elif reason_route_mode == "shuffled":
             # Preserve each target's learned route while permuting factor identity.
             # This is a real semantic-route ablation, not a repeated full metric.
@@ -399,6 +512,11 @@ class MOSAICTrustICDORModel(nn.Module):
             reason_factor_features = factor_output["factor_features"].roll(shifts=1, dims=1) * reason_reliability.unsqueeze(-1)
             reason_factor_masks = factor_output["factor_soft_masks"].roll(shifts=1, dims=1) * reason_reliability.unsqueeze(-1).unsqueeze(-1)
             reason_route_enabled = torch.ones_like(self.reason_factor_route_enabled)
+            reason_positive_evidence = factor_output["factor_positive_evidence"].roll(shifts=1, dims=1)
+            reason_negative_evidence = factor_output["factor_negative_evidence"].roll(shifts=1, dims=1)
+            reason_sampling_coordinates = factor_output["sampling_coordinates"].roll(shifts=1, dims=1)
+            reason_sampled_features = factor_output["sampled_features"].roll(shifts=1, dims=1)
+            reason_sample_attention = factor_output["sample_attention"].roll(shifts=1, dims=1)
         else:
             raise ValueError("IC-DOR reason_route_mode must be full, off, or shuffled")
         reason_latent = self.reason_latent_decoder(
@@ -406,8 +524,12 @@ class MOSAICTrustICDORModel(nn.Module):
             reason_factor_features,
             reason_factor_masks,
             reason_route_enabled,
-            factor_output["factor_positive_evidence"].detach(),
-            factor_output["factor_negative_evidence"].detach(),
+            reason_positive_evidence.detach(),
+            reason_negative_evidence.detach(),
+            reason_sampling_coordinates,
+            reason_sampled_features,
+            reason_sample_attention,
+            target_utility_state["semantic_compatibility"],
         )
         observation = self.observation_model(
             reason_latent["reason_logits_latent"],
@@ -435,6 +557,8 @@ class MOSAICTrustICDORModel(nn.Module):
             "action_shadow_logits": action_shadow,
             "action_matched_random_logits": action_matched_random,
             "equal_mass_random_factor_masks": equal_mass_random_masks,
+            "action_matched_random_sampling_coordinates": random_sampling_coordinates,
+            "action_typed_sample_attention_effective": factor_output["sample_attention"],
             "action_final_logits": action_final,
             "action_logits_raw": action_final,
             "action_visual_logits": action_output["action_visual_logits"],
@@ -448,12 +572,19 @@ class MOSAICTrustICDORModel(nn.Module):
             "reason_factor_route_enabled": self.reason_factor_route_enabled,
             "reason_factor_route_enabled_effective": reason_route_enabled,
             "reason_continuous_credibility": continuous_route_weight,
+            "semantic_compatibility": target_utility_state["semantic_compatibility"],
+            "action_target_utility": target_utility_state["action_target_utility"],
+            "target_utility_initialized": target_utility_state["target_utility_initialized"],
             "dino_grid_hw": torch.tensor(field["grid_hw"], device=images.device),
             "factor_ablation_mode_code": images.new_tensor({
                 "full": 0, "content_only": 1, "prior_only": 2, "query_shuffled": 3, "image_shuffled": 4
             }[factor_ablation_mode]),
             "factor_intervention_keep_mask": intervention_keep,
         }
+        if random_reread_output is not None:
+            output["action_matched_random_typed_target_coordinates"] = random_reread_output[
+                "action_typed_target_coordinates"
+            ]
         if return_diagnostics:
             shuffled_router = self.action_router(
                 factor_output["factor_features"].roll(1, 1),
@@ -461,15 +592,21 @@ class MOSAICTrustICDORModel(nn.Module):
                 factor_output["factor_negative_evidence"].roll(1, 1),
                 action_output["action_queries"], route_mode=route_mode,
                 factor_credibility=credibility["cV"].roll(1, 1),
+                factor_target_utility=target_utility_state["action_target_utility"].roll(1, 0),
             )
             shuffled_read = self.action_rereader(
                 action_pyramid, action_output["action_queries"],
                 factor_output["factor_soft_masks"].roll(1, 1),
                 shuffled_router["support_weights"], shuffled_router["veto_weights"],
+                factor_output["sampling_coordinates"].roll(1, 1),
+                factor_output["sampled_features"].roll(1, 1),
+                factor_output["sample_attention"].roll(1, 1),
             )
             wrong_target_read = self.action_rereader(
                 action_pyramid, action_output["action_queries"], factor_output["factor_soft_masks"],
                 router_output["support_weights"].roll(1, 2), router_output["veto_weights"].roll(1, 2),
+                factor_output["sampling_coordinates"], factor_output["sampled_features"],
+                factor_output["sample_attention"],
             )
             output["action_factor_off_logits"] = action_output["action_visual_logits"]
             output["action_factor_shuffled_logits"] = (
@@ -486,13 +623,32 @@ class MOSAICTrustICDORModel(nn.Module):
                     diagnostic_features = factor_output["factor_features"] * 0.0
                     diagnostic_masks = factor_output["factor_soft_masks"] * 0.0
                     diagnostic_enabled = torch.zeros_like(self.reason_factor_route_enabled)
+                    diagnostic_positive = factor_output["factor_positive_evidence"] * 0.0
+                    diagnostic_negative = factor_output["factor_negative_evidence"] * 0.0
+                    diagnostic_coordinates = factor_output["sampling_coordinates"]
+                    diagnostic_features_typed = factor_output["sampled_features"] * 0.0
+                    diagnostic_attention_typed = factor_output["sample_attention"] * 0.0
                 else:
                     reliability = continuous_route_weight.roll(1, 1)
                     diagnostic_features = factor_output["factor_features"].roll(1, 1) * reliability.unsqueeze(-1)
                     diagnostic_masks = factor_output["factor_soft_masks"].roll(1, 1) * reliability.unsqueeze(-1).unsqueeze(-1)
                     diagnostic_enabled = torch.ones_like(self.reason_factor_route_enabled)
+                    diagnostic_positive = factor_output["factor_positive_evidence"].roll(1, 1)
+                    diagnostic_negative = factor_output["factor_negative_evidence"].roll(1, 1)
+                    diagnostic_coordinates = factor_output["sampling_coordinates"].roll(1, 1)
+                    diagnostic_features_typed = factor_output["sampled_features"].roll(1, 1)
+                    diagnostic_attention_typed = factor_output["sample_attention"].roll(1, 1)
                 diagnostic_latent = self.reason_latent_decoder(
-                    self._detached_pyramid(reason_pyramid), diagnostic_features, diagnostic_masks, diagnostic_enabled
+                    self._detached_pyramid(reason_pyramid),
+                    diagnostic_features,
+                    diagnostic_masks,
+                    diagnostic_enabled,
+                    diagnostic_positive.detach(),
+                    diagnostic_negative.detach(),
+                    diagnostic_coordinates,
+                    diagnostic_features_typed,
+                    diagnostic_attention_typed,
+                    target_utility_state["semantic_compatibility"],
                 )
                 diagnostic_observation = self.observation_model(
                     diagnostic_latent["reason_logits_latent"], factor_output["factor_visibility_prob"], factor_output["factor_uncertainty"]

@@ -62,7 +62,10 @@ def test_evaluator_reports_all_icdor_action_reason_branches_without_test_mutatio
     assert len(result["prototype_rows"]) == 24
     assert len(result["reason_rows"]) == 21
     assert "propensity_mean" in result["reason_rows"][0]
+    assert result["reason_rows"][0]["posterior_q_observed_zero_available"] is False
+    assert result["reason_rows"][0]["synthetic_hidden_positive_auprc_available"] is False
     assert result["reason_rows"][0]["top_q_observed_zero_manual_precision_available"] is False
+    assert not any("synthetic_hidden" in key for key in result["logits"])
     assert result["route_rows"][0]["action_id"] == 0
     summaries = [row for row in result["route_rows"] if row.get("summary") == "per_action_route_effect"]
     assert len(summaries) == 4

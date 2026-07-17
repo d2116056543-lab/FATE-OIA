@@ -50,10 +50,19 @@ def visual_credibility_from_measurements(
     grounding = grounding_score.clamp(0.0, 1.0)
     stability = stability_score.clamp(0.0, 1.0)
     effective = n_eff.clamp_min(0.0)
-    # Content and image intervention are primary; prior is only a supporting
-    # measurement and cannot by itself certify a factor.
-    credibility = (0.30 * content + 0.20 * query + 0.25 * image + 0.15 * grounding + 0.10 * stability)
-    credibility = credibility * (effective / (effective + 8.0)).clamp(0.0, 1.0)
+    # CREDO requires agreement between independent visual interventions.  A
+    # weighted geometric mean prevents a strong content score from certifying
+    # a factor when query/image shuffles or grounded localization show no
+    # causal effect. ``prior`` is exported for diagnosis but never certifies a
+    # factor by itself.
+    components = (
+        (content + 1e-6).pow(0.30)
+        * (query + 1e-6).pow(0.20)
+        * (image + 1e-6).pow(0.25)
+        * (grounding + 1e-6).pow(0.15)
+        * (stability + 1e-6).pow(0.10)
+    )
+    credibility = (1.0 - torch.exp(-effective / 32.0)) * components
     if source_kind == "image_only":
         credibility = credibility.clamp_max(0.10)
     if factor_role in {"latent", "unsupported"}:
@@ -120,10 +129,30 @@ class ContinuousVisualCredibility(nn.Module):
             else:
                 caps.append(1.0)
         self.register_buffer("factor_credibility_cap", torch.tensor(caps, dtype=torch.float32), persistent=True)
-        self.content_probe = nn.Linear(dim, 1)
-        nn.init.zeros_(self.content_probe.bias)
         self.register_buffer("ema_cV", torch.zeros(factor_count), persistent=True)
         self.register_buffer("ema_initialized", torch.tensor(False), persistent=True)
+
+    @torch.no_grad()
+    def update_from_audit(self, current: torch.Tensor) -> torch.Tensor:
+        """Commit one detached ``audit_visual`` credibility vector.
+
+        Training forwards intentionally cannot call this method: the route for
+        epoch ``e`` must consume the credibility completed at epoch ``e-1``.
+        """
+        if current.shape != (self.factor_count,):
+            raise ValueError("audit credibility must be [factor_count]")
+        if not torch.isfinite(current).all():
+            raise ValueError("audit credibility must be finite")
+        capped = current.detach().to(device=self.ema_cV.device, dtype=self.ema_cV.dtype)
+        capped = capped.clamp(0.0, 1.0) * self.factor_credibility_cap
+        updated = update_credibility_ema(
+            self.ema_cV if bool(self.ema_initialized) else None,
+            capped,
+            self.ema_decay,
+        )
+        self.ema_cV.copy_(updated)
+        self.ema_initialized.fill_(True)
+        return self.ema_cV.detach().clone()
 
     def forward(
         self,
@@ -138,7 +167,11 @@ class ContinuousVisualCredibility(nn.Module):
             raise ValueError("factor_features must be [B,F,D]")
         if presence_prob.shape != uncertainty.shape or presence_prob.shape != factor_features.shape[:2]:
             raise ValueError("credibility probabilities must be [B,F]")
-        content = torch.sigmoid(self.content_probe(factor_features).squeeze(-1))
+        # Per-batch values are diagnostics only. cV consumed by the model is
+        # the detached audit_visual EMA, so this diagnostic must not introduce
+        # an untrained probe parameter into the optimizer.
+        content_norm = factor_features.detach().square().mean(dim=-1).sqrt()
+        content = (content_norm / (1.0 + content_norm)).clamp(0.0, 1.0)
         uncertainty = uncertainty.clamp(0.0, 1.0)
         confidence = (1.0 - uncertainty) * (0.5 + 0.5 * presence_prob.detach().clamp(0.0, 1.0))
         grounding = torch.ones_like(content) if grounding_score is None else grounding_score.to(content).clamp(0.0, 1.0)
@@ -160,14 +193,8 @@ class ContinuousVisualCredibility(nn.Module):
             + 0.15 * stability
         ).clamp(0.0, 1.0)
         current = current * self.factor_credibility_cap.view(1, -1).to(current)
-        # The EMA is a detached diagnostic prior; it never becomes a hard gate.
-        batch_mean = current.detach().mean(0)
-        if self.training:
-            updated = update_credibility_ema(
-                self.ema_cV if bool(self.ema_initialized) else None, batch_mean, self.ema_decay
-            )
-            self.ema_cV.copy_(updated)
-            self.ema_initialized.fill_(True)
+        # A batch may expose diagnostics, but only the independent
+        # ``audit_visual`` collector is allowed to update ``ema_cV``.
         return {
             "cV": current,
             "cV_ema": self.ema_cV.view(1, -1).expand_as(current),

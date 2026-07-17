@@ -136,6 +136,8 @@ loss:
     strength_weight: 0.02
     intervention_weight: 0.05
   factor:
+    # CREDO: factor measurements learn from image/geometry observations only.
+    allow_reason_anchors: false
     presence_weight: 1.00
     visibility_weight: 1.00
     geometry_mask_weight: 0.10

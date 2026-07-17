@@ -74,19 +74,24 @@ def test_grounding_keeps_left_right_and_center_geometry_in_their_declared_corrid
     assert result["geometry_masks"][0, 5, :, :4].sum() == 0
 
 
-def test_unidentifiable_near_and_indicator_factors_have_no_geometry_supervision_or_action_edge() -> None:
+def test_unidentifiable_cues_are_latent_or_image_only_and_never_action_edges() -> None:
     config_root = Path(__file__).resolve().parents[1] / "configs"
     with (config_root / "mosaic_icdor_factor_candidates.yaml").open("r", encoding="utf-8") as handle:
         factors = {entry["name"]: entry for entry in yaml.safe_load(handle)["factors"]}
     with (config_root / "mosaic_icdor_action_routes.yaml").open("r", encoding="utf-8") as handle:
         action_routes = yaml.safe_load(handle)["action_routes"]
 
+    proxy = factors["front_vehicle_risk_proxy"]
+    assert proxy["role"] == "latent_proxy"
+    assert proxy["source_kind"] == "proxy"
+    assert proxy["grounding_sources"] == ["box2d"]
+
     prohibited = {
-        "front_vehicle_near",
+        "front_vehicle_risk_proxy",
         "front_vehicle_left_indicator_visible",
         "front_vehicle_right_indicator_visible",
     }
-    assert all(factors[name]["grounding_sources"] == ["image_only"] for name in prohibited)
+    assert all(factors[name]["grounding_sources"] == ["image_only"] for name in prohibited - {"front_vehicle_risk_proxy"})
     route_factors = {
         edge["factor"]
         for route in action_routes.values()

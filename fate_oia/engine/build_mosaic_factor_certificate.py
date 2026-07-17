@@ -19,8 +19,8 @@ def _read_audit_payload(path: str | Path) -> tuple[str, Mapping[str, Mapping[str
         raise ValueError("IC-DOR factor audit payload must be a mapping")
     source_split = payload.get("source_split")
     factor_stats = payload.get("factor_stats")
-    if source_split != "train_audit":
-        raise ValueError("IC-DOR factor certificate builder only accepts train_audit payloads")
+    if source_split not in {"train_audit", "audit_visual"}:
+        raise ValueError("IC-DOR factor certificate builder only accepts train_audit or audit_visual payloads")
     if not isinstance(factor_stats, Mapping) or not factor_stats:
         raise ValueError("IC-DOR factor audit payload requires non-empty factor_stats")
     if any(not isinstance(name, str) or not isinstance(stats, Mapping) for name, stats in factor_stats.items()):
@@ -34,7 +34,7 @@ def build_and_write_factor_certificate(
     *,
     config_root: str | Path,
 ) -> MOSAICFactorCertificate:
-    """Build the immutable certificate only from persisted train-audit statistics."""
+    """Build the immutable certificate only from persisted independent audit statistics."""
     source_split, factor_stats = _read_audit_payload(audit_stats_path)
     ontology = load_icdor_ontology(Path(config_root))
     expected_names = {str(factor["name"]) for factor in ontology["factors"]}

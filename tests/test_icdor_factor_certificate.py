@@ -130,6 +130,6 @@ def test_certificate_builder_refuses_non_audit_payload_and_persists_a_frozen_dig
     try:
         build_and_write_factor_certificate(input_path, output_path, config_root=Path("configs"))
     except ValueError as error:
-        assert "train_audit" in str(error)
+        assert "train_audit or audit_visual" in str(error)
     else:
         raise AssertionError("certificate builder must reject non-audit inputs")

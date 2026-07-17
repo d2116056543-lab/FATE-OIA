@@ -35,7 +35,9 @@ def test_adaptive_schedule_enforces_state_side_effects_and_two_epoch_readiness()
     policy = machine.policy()
     assert policy.route_mode == "shadow"
     assert policy.action_rank_weight == 0.10 and policy.reason_rank_weight == 0.05
-    assert policy.write_provisional_certificate is True
+    # CREDO allows continuous evidence learning before a final certificate is
+    # built; a provisional certificate must never become a training entrance.
+    assert policy.write_provisional_certificate is False
     for epoch in range(3):
         machine.update(
             epoch=epoch,

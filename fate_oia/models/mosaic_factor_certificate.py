@@ -151,8 +151,8 @@ def build_factor_certificate(
     *,
     source_split: str,
 ) -> MOSAICFactorCertificate:
-    if source_split != "train_audit":
-        raise ValueError("IC-DOR factor certificates may only be built from train_audit")
+    if source_split not in {"train_audit", "audit_visual"}:
+        raise ValueError("IC-DOR factor certificates may only be built from an audit split")
     if not isinstance(certificate_rules, Mapping) or certificate_rules.get("version") != "icdor_v3":
         raise ValueError("IC-DOR factor certificate rules must be the validated icdor_v3 rules")
     certified = certificate_rules.get("certified")

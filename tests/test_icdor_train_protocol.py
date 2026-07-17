@@ -92,6 +92,15 @@ def test_split_hash_is_checked_only_after_split_manifest_is_built() -> None:
     assert loaders_index < split_check_index
 
 
+def test_credo_trainer_uses_disjoint_visual_and_target_audit_loaders() -> None:
+    source = Path("fate_oia/engine/train_acpr_mosaic_trust_icdor.py").read_text(encoding="utf-8")
+
+    assert "audit_visual_loader" in source
+    assert "audit_target_loader" in source
+    assert 'source_split="audit_visual"' in source
+    assert "refresh_model_visual_credibility" in source
+
+
 def test_checkpoint_persists_all_rng_state_for_resume() -> None:
     source = Path("fate_oia/engine/train_acpr_mosaic_trust_icdor.py").read_text(encoding="utf-8")
     for token in ("python_rng_state", "torch_rng_state", "cuda_rng_state_all"):
@@ -260,9 +269,9 @@ def test_edge_audit_adapter_preserves_real_lcb_and_ap_values() -> None:
     assert record.visual_ap == pytest.approx(0.80)
 
 
-def test_factor_rows_preserve_train_audit_counts_scores_and_bootstrap() -> None:
+def test_factor_rows_preserve_audit_visual_counts_scores_and_bootstrap() -> None:
     payload = {
-        "source_split": "train_audit",
+        "source_split": "audit_visual",
         "factor_stats": {
             "traffic_light_visible": {
                 "counts": {"confirmed_positive": 12, "reliable_negative": 20, "weak_negative": 3, "unknown": 5},
@@ -273,7 +282,7 @@ def test_factor_rows_preserve_train_audit_counts_scores_and_bootstrap() -> None:
         },
     }
     rows = _factor_audit_rows(payload, epoch=3)
-    assert rows[0]["source_split"] == "train_audit"
+    assert rows[0]["source_split"] == "audit_visual"
     assert rows[0]["counts"]["confirmed_positive"] == 12
     assert rows[0]["prototype"]["effective_count"] == pytest.approx(2.1)
 
@@ -530,6 +539,9 @@ def test_pilot_gate_requires_real_state_transitions_and_accepted_edges() -> None
         "diagnostics_finite": True,
     }
     shadow = {
+        "source_split": "train_audit",
+        "continuous_credibility_available": True,
+        "observable_cV_gt_030": 6,
         "exp_map_delta_vs_visual": 0.0,
         "factor_shuffle_degrades_reason": True,
         "hidden_recovery_margin": 0.02,
@@ -537,6 +549,7 @@ def test_pilot_gate_requires_real_state_transitions_and_accepted_edges() -> None
         "action_shadow_ap_delta": [0.0] * 4,
         "true_edge_count_per_action": [1, 1, 0, 0],
         "disallowed_route_invariance": True,
+        "diagnostics_finite": True,
     }
     history = [
         {"state_before": "FOUNDATION", "state_after": "FOUNDATION", "ready": True, "readiness": {**split_readiness, "train_audit": foundation}},
@@ -576,8 +589,44 @@ def test_pilot_gate_requires_real_state_transitions_and_accepted_edges() -> None
     )
     assert invalid["pass"] is False
     assert "missing_foundation_to_shadow_transition" in invalid["errors"]
-    assert "no_certified_factor" in invalid["errors"]
-    assert "accepted_edges_cover_fewer_than_two_actions" in invalid["errors"]
+    assert "missing_or_invalid_shadow_learning_access" in invalid["errors"]
+
+
+def test_credo_pilot_validates_learning_access_without_final_admission() -> None:
+    """The pilot must not demand a certificate before it can learn evidence."""
+    split_readiness = {
+        "train_core": {"source_split": "train_core", "finite": True},
+        "train_calib": {"source_split": "train_calib", "finite": True},
+    }
+    learning = {
+        "source_split": "train_audit",
+        "continuous_credibility_available": True,
+        "observable_cV_gt_030": 6,
+        "diagnostics_finite": True,
+        "route_strength_ratio": 0.03,
+        "factor_shuffle_degrades_reason": True,
+        "hidden_recovery_margin": 0.02,
+        "action_shadow_ap_delta": [0.0, 0.0, -0.001, 0.0],
+        "disallowed_route_invariance": True,
+    }
+    schedule = {
+        "history": [{
+            "state_before": "FOUNDATION",
+            "state_after": "DUAL_REASON_SHADOW",
+            "ready": True,
+            "readiness": {**split_readiness, "train_audit": learning},
+        }],
+        "safe_joint_epochs": 0,
+        "failed_closed": False,
+    }
+    result = _pilot_semantic_validation(
+        schedule,
+        {"entries": {"f0": {"tier": "abstained"}}},
+        {"entries": {}},
+    )
+
+    assert result["pass"] is True
+    assert result["deployment_admission_ready"] is False
 
 
 def test_checkpoint_roundtrip_restores_queues_and_pareto(tmp_path) -> None:

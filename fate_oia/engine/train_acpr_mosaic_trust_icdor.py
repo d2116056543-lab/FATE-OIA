@@ -18,7 +18,7 @@ from torch import nn
 from torch.utils.data import DataLoader, Subset
 
 from fate_oia.datasets.bdd_oia_multitask import BDDOIAMultiTaskDataset
-from fate_oia.datasets.bdd100k_grounding import BDD100KGroundingIndex
+from fate_oia.datasets.bdd100k_grounding import BDD100KGroundingIndex, load_bdd100k_objects
 from fate_oia.datasets.mosaic_icdor_grounding import ICDORGroundingObservationBuilder
 from fate_oia.datasets.mosaic_icdor_factor_supervision import build_factor_supervision
 from fate_oia.datasets.mosaic_multiview import MOSAICWeakMultiView
@@ -36,6 +36,8 @@ from fate_oia.engine.build_mosaic_edge_admission import (
     build_edge_admission,
 )
 from fate_oia.engine.build_mosaic_factor_certificate import build_and_write_factor_certificate
+from fate_oia.engine.build_mosaic_visual_credibility import refresh_model_visual_credibility
+from fate_oia.engine.build_mosaic_target_utility import build_target_utility
 from fate_oia.engine.eval_acpr_mosaic_trust_icdor import evaluate_icdor
 from fate_oia.engine.export_mosaic_trust_visual_audit import export_visual_audit
 from fate_oia.engine.mosaic_icdor_audit_collectors import (
@@ -160,8 +162,8 @@ def _pending_evidence_document(artifact: str, *, build_epoch: int) -> dict[str, 
 
 def _edge_statistics_from_audit(payload: dict[str, Any]) -> dict[tuple[str, str, str], MOSAICEdgeInterventionStats]:
     """Translate persisted collector output without substituting missing metrics."""
-    if payload.get("source_split") != "train_audit" or not isinstance(payload.get("edge_stats"), dict):
-        raise ValueError("IC-DOR edge statistics must come from train_audit")
+    if payload.get("source_split") not in {"audit_target", "train_audit"} or not isinstance(payload.get("edge_stats"), dict):
+        raise ValueError("IC-DOR edge statistics must come from an independent target audit")
     converted: dict[tuple[str, str, str], MOSAICEdgeInterventionStats] = {}
     for record in payload["edge_stats"].values():
         if record.get("available") is not True:
@@ -190,13 +192,13 @@ def _edge_statistics_from_audit(payload: dict[str, Any]) -> dict[tuple[str, str,
 
 
 def _factor_audit_rows(payload: dict[str, Any], *, epoch: int) -> list[dict[str, Any]]:
-    if payload.get("source_split") != "train_audit" or not isinstance(payload.get("factor_stats"), dict):
-        raise ValueError("IC-DOR per-epoch factor diagnostics must come from train_audit")
+    if payload.get("source_split") != "audit_visual" or not isinstance(payload.get("factor_stats"), dict):
+        raise ValueError("CREDO per-epoch factor diagnostics must come from audit_visual")
     rows = []
     for factor_name, stats in payload["factor_stats"].items():
         if not isinstance(stats, dict) or not {"counts", "scores", "prototype", "bootstrap_lcb95"} <= set(stats):
             raise ValueError(f"IC-DOR factor diagnostic is incomplete for {factor_name}")
-        rows.append({"epoch": epoch, "source_split": "train_audit", "factor_name": factor_name, **stats})
+        rows.append({"epoch": epoch, "source_split": "audit_visual", "factor_name": factor_name, **stats})
     if not rows:
         raise ValueError("IC-DOR factor audit produced no factor rows")
     return rows
@@ -271,7 +273,7 @@ def _factor_audit_integrity_metrics(factor_audit: dict[str, Any]) -> dict[str, b
     )
     return {
         "factor_audit_complete": bool(
-            factor_audit.get("source_split") == "train_audit" and completed and exception_free
+            factor_audit.get("source_split") in {"audit_visual", "train_audit"} and completed and exception_free
         ),
         "factor_audit_exception": not bool(completed and exception_free),
         "unknown_abstained": bool(completed and exception_free and unknown_proof),
@@ -294,7 +296,17 @@ def _adaptive_readiness(
     edge_document: dict[str, Any],
     previous_best_train_audit_joint: float | None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-    """Derive scheduler inputs exclusively from train_core/audit/calib evidence."""
+    """Derive scheduler inputs from explicitly separated audit evidence.
+
+    The historical schedule key remains ``train_audit`` for checkpoint
+    compatibility, but it is an aggregate document only: visual credibility
+    must come from ``audit_visual`` and label-dependent target utility must
+    come from ``audit_target``.
+    """
+    if factor_audit.get("source_split") != "audit_visual":
+        raise ValueError("CREDO readiness requires audit_visual factor evidence")
+    if branch_readiness.get("source_split") != "audit_target":
+        raise ValueError("CREDO readiness requires audit_target branch evidence")
     factor_stats = factor_audit.get("factor_stats", {})
     diagnostic_values = [
         value
@@ -328,6 +340,8 @@ def _adaptive_readiness(
     factor_integrity = _factor_audit_integrity_metrics(factor_audit)
     train_audit = {
         "source_split": "train_audit",
+        "audit_visual_source_split": "audit_visual",
+        "audit_target_source_split": "audit_target",
         **factor_integrity,
         **certificate_metrics,
         "diagnostics_finite": bool(diagnostic_values) and all(math.isfinite(float(value)) for value in diagnostic_values),
@@ -342,7 +356,7 @@ def _pilot_semantic_validation(
     certificate: dict[str, Any],
     edge_document: dict[str, Any],
 ) -> dict[str, Any]:
-    """Require measured state transitions and contents, not artifact existence."""
+    """Validate pilot learning access separately from final deployment admission."""
     errors: list[str] = []
     history = schedule_state.get("history")
     history = history if isinstance(history, list) else []
@@ -351,11 +365,10 @@ def _pilot_semantic_validation(
         if row.get("state_before") == "FOUNDATION"
         and row.get("state_after") == "DUAL_REASON_SHADOW"
     ), None)
-    shadow_transition = next((
+    shadow_rows = [
         row for row in history
-        if row.get("state_before") == "DUAL_REASON_SHADOW"
-        and row.get("state_after") == "SAFE_JOINT"
-    ), None)
+        if row.get("state_after") in {"DUAL_REASON_SHADOW", "SAFE_JOINT", "CONSOLIDATION"}
+    ]
 
     def _split_integrity(row: dict[str, Any]) -> bool:
         readiness = row.get("readiness", {})
@@ -371,60 +384,47 @@ def _pilot_semantic_validation(
         errors.append("missing_foundation_to_shadow_transition")
     elif not _split_integrity(foundation_transition):
         errors.append("foundation_transition_lacks_split_integrity")
-    if shadow_transition is None:
-        errors.append("missing_shadow_to_safe_joint_transition")
-    elif not _split_integrity(shadow_transition):
-        errors.append("shadow_transition_lacks_split_integrity")
-    if int(schedule_state.get("safe_joint_epochs", 0)) < 1:
-        errors.append("missing_safe_joint_execution_epoch")
     if schedule_state.get("failed_closed") is True:
         errors.append("adaptive_schedule_failed_closed")
-
-    certificate_entries = certificate.get("entries")
-    certificate_entries = certificate_entries if isinstance(certificate_entries, dict) else {}
-    if not any(
-        isinstance(row, dict) and row.get("tier") == "certified"
-        for row in certificate_entries.values()
-    ):
-        errors.append("no_certified_factor")
+    learning_row = next((
+        row for row in reversed(shadow_rows)
+        if isinstance(row.get("readiness", {}).get("train_audit"), dict)
+        and row["readiness"]["train_audit"].get("source_split") == "train_audit"
+    ), None)
+    if learning_row is None or not _split_integrity(learning_row):
+        errors.append("missing_or_invalid_shadow_learning_access")
+    else:
+        readiness = learning_row.get("readiness", {}).get("train_audit", {})
+        action_delta = readiness.get("action_shadow_ap_delta", [])
+        action_nonregression = sum(float(value) >= -0.002 for value in action_delta) >= 2
+        route_strength = float(readiness.get("route_strength_ratio", -1.0))
+        if not (
+            readiness.get("continuous_credibility_available") is True
+            and int(readiness.get("observable_cV_gt_030", 0)) >= 6
+            and readiness.get("diagnostics_finite") is True
+            and 0.005 <= route_strength <= 0.10
+            and readiness.get("factor_shuffle_degrades_reason") is True
+            and action_nonregression
+            and readiness.get("disallowed_route_invariance") is True
+        ):
+            errors.append("shadow_learning_access_metrics_are_incomplete")
 
     edge_entries = edge_document.get("entries")
     edge_entries = edge_entries if isinstance(edge_entries, dict) else {}
     accepted_actions = {
-        str(row.get("target"))
-        for row in edge_entries.values()
+        str(row.get("target")) for row in edge_entries.values()
         if isinstance(row, dict) and row.get("accepted") is True and row.get("target") is not None
     }
-    if len(accepted_actions) < 2:
-        errors.append("accepted_edges_cover_fewer_than_two_actions")
-
-    if foundation_transition is not None:
-        readiness = foundation_transition.get("readiness", {}).get("train_audit", {})
-        groups = readiness.get("certified_route_group_count_per_action", [])
-        if not (
-            foundation_transition.get("ready") is True
-            and len(groups) == 4 and min(int(value) for value in groups) >= 1
-            and int(readiness.get("reachable_reason_count", 0)) >= 15
-            and float(readiness.get("certificate_tier_jaccard", 0.0)) >= 0.90
-            and readiness.get("unknown_abstained") is True
-        ):
-            errors.append("foundation_transition_lacks_real_readiness")
-    if shadow_transition is not None:
-        readiness = shadow_transition.get("readiness", {}).get("train_audit", {})
-        true_edges = readiness.get("true_edge_count_per_action", [])
-        if not (
-            shadow_transition.get("ready") is True
-            and len(true_edges) == 4
-            and sum(int(value) >= 1 for value in true_edges) >= 2
-            and float(readiness.get("hidden_recovery_margin", -1.0)) >= 0.01
-            and readiness.get("factor_shuffle_degrades_reason") is True
-            and readiness.get("disallowed_route_invariance") is True
-        ):
-            errors.append("shadow_transition_lacks_real_readiness")
+    certificate_entries = certificate.get("entries")
+    certificate_entries = certificate_entries if isinstance(certificate_entries, dict) else {}
+    deployment_admission_ready = bool(accepted_actions) and any(
+        isinstance(row, dict) and row.get("tier") == "certified" for row in certificate_entries.values()
+    )
     return {
         "pass": not errors,
         "errors": errors,
         "accepted_action_count": len(accepted_actions),
+        "deployment_admission_ready": deployment_admission_ready,
         "history_length": len(history),
     }
 
@@ -432,7 +432,7 @@ def _pilot_semantic_validation(
 def _write_provisional_certificate_this_epoch(
     *, write_provisional: bool, freeze_certificate: bool
 ) -> bool:
-    """FOUNDATION certificates are rebuilt each epoch and freeze only after transition."""
+    """Legacy helper retained for config compatibility; CREDO never calls it in pilot."""
     if write_provisional and freeze_certificate:
         raise ValueError("IC-DOR certificate policy cannot rebuild and freeze simultaneously")
     return bool(write_provisional and not freeze_certificate)
@@ -718,6 +718,73 @@ def _subset_indices(indices: Iterable[int], limit: int | None) -> list[int]:
     return ordered[:limit]
 
 
+def _factor_aware_audit_subset(
+    dataset: BDDOIAMultiTaskDataset,
+    indices: Iterable[int],
+    limit: int | None,
+    *,
+    grounding_index: BDD100KGroundingIndex,
+    seed: int,
+) -> list[int]:
+    """Geometry-only, deterministic pilot subset balancing observable factor families."""
+    candidates = list(indices)
+    if limit is None or limit >= len(candidates):
+        return candidates
+    if type(limit) is not int or limit <= 0:
+        raise ValueError("IC-DOR factor-aware audit limit must be a positive integer")
+
+    object_tokens = ("car", "truck", "bus", "person", "pedestrian", "rider", "bike", "motor")
+    traffic_tokens = ("traffic light", "traffic sign", "sign", "light")
+    tags: dict[int, tuple[bool, bool, bool]] = {}
+    for index in candidates:
+        sample = dataset.samples[index]
+        file_name = sample["file_name"] if isinstance(sample, dict) else sample.file_name
+        paths = grounding_index.lookup(str(file_name))
+        categories: list[str] = []
+        if paths.label_json:
+            for item in load_bdd100k_objects(paths.label_json):
+                category = item.get("category") or item.get("label") or item.get("name")
+                if isinstance(category, str):
+                    categories.append(category.lower())
+        joined = " ".join(categories)
+        tags[index] = (
+            any(token in joined for token in object_tokens),
+            any(token in joined for token in traffic_tokens),
+            paths.drivable_map is not None,
+        )
+
+    def rank(index: int) -> tuple[int, int]:
+        sample = dataset.samples[index]
+        file_name = sample["file_name"] if isinstance(sample, dict) else sample.file_name
+        digest = hashlib.sha256(f"{seed}:{file_name}".encode("utf-8")).digest()
+        return int.from_bytes(digest, "big", signed=False), index
+
+    availability = [sum(values[group] for values in tags.values()) for group in range(3)]
+    targets = [min(count, max(1, round(total * limit / len(candidates)))) if total else 0 for total in availability]
+    selected: set[int] = set()
+    selected_counts = [0, 0, 0]
+    while len(selected) < limit:
+        deficits = [max(targets[group] - selected_counts[group], 0) for group in range(3)]
+        group = max(range(3), key=lambda item: (deficits[item], -item))
+        if deficits[group] <= 0:
+            break
+        pool = sorted((index for index in candidates if tags[index][group] and index not in selected), key=rank)
+        if not pool:
+            targets[group] = selected_counts[group]
+            continue
+        chosen = pool[0]
+        selected.add(chosen)
+        for item, value in enumerate(tags[chosen]):
+            selected_counts[item] += int(value)
+    for index in sorted(candidates, key=rank):
+        if len(selected) >= limit:
+            break
+        selected.add(index)
+    if len(selected) != limit:
+        raise RuntimeError("IC-DOR factor-aware audit sampler returned the wrong subset size")
+    return sorted(selected)
+
+
 def build_icdor_loaders(
     config: dict[str, Any],
     output_dir: str | Path,
@@ -728,8 +795,9 @@ def build_icdor_loaders(
     max_audit_samples: int | None = None,
     max_calib_samples: int | None = None,
     max_test_samples: int | None = None,
-) -> tuple[DataLoader, DataLoader, DataLoader, DataLoader, dict[str, Any]]:
-    """Build the only permitted core/audit/calib/test split topology."""
+    visual_grounding_index: BDD100KGroundingIndex | None = None,
+) -> tuple[DataLoader, DataLoader, DataLoader, DataLoader, DataLoader, dict[str, Any]]:
+    """Build core, disjoint visual/target audit, calib, and test loaders."""
     data = config["data"]
     transform = AspectRatioLetterboxTransform(
         data["image_height"], data["image_width"], patch_size=data["patch_size"], normalize=True
@@ -746,19 +814,36 @@ def build_icdor_loaders(
     split_dir = Path(output_dir) / "split"
     write_icdor_split_manifest(split, split_dir / "icdor_split_manifest.json")
     core = _subset_indices(split.train_core_indices, max_train_samples)
-    audit = _subset_indices(split.train_audit_indices, max_audit_samples)
+    # cV uses only image/BDD100K geometry observations. Never use reason
+    # labels to select this pilot population.
+    # Reuse the caller's immutable BDD100K index when subsequent epoch-end
+    # audits need the same data. Rebuilding it here used to add a second full
+    # JSON scan before the first DINO forward.
+    visual_grounding = visual_grounding_index or BDD100KGroundingIndex(data["bdd100k_root"])
+    audit_visual = _factor_aware_audit_subset(
+        train, split.audit_visual_indices, max_audit_samples,
+        grounding_index=visual_grounding, seed=int(data["split_seed"]),
+    )
+    audit_target = _subset_indices(split.audit_target_indices, max_audit_samples)
     calib = _subset_indices(split.train_calib_indices, max_calib_samples)
     test_indices = _subset_indices(range(len(test)), max_test_samples)
-    if not set(core).isdisjoint(audit) or not set(core).isdisjoint(calib) or not set(audit).isdisjoint(calib):
-        raise RuntimeError("IC-DOR train_core/train_audit/train_calib must remain disjoint")
+    if (
+        not set(core).isdisjoint(audit_visual)
+        or not set(core).isdisjoint(audit_target)
+        or not set(core).isdisjoint(calib)
+        or not set(audit_visual).isdisjoint(audit_target)
+        or not set(audit_visual).isdisjoint(calib)
+        or not set(audit_target).isdisjoint(calib)
+    ):
+        raise RuntimeError("IC-DOR train_core/audit_visual/audit_target/train_calib must remain disjoint")
     seed = int(data["split_seed"])
     stats = {
         "split_sha256": split.split_sha256,
         "split_seed": seed,
         "train_core_count": len(core),
-        "train_audit_count": len(audit),
-        "audit_visual_count": len(split.audit_visual_indices),
-        "audit_target_count": len(split.audit_target_indices),
+        "train_audit_count": len(audit_visual) + len(audit_target),
+        "audit_visual_count": len(audit_visual),
+        "audit_target_count": len(audit_target),
         "train_calib_count": len(calib),
         "test_count": len(test_indices),
         "train_audit_positive_counts": list(split.audit_positive_counts),
@@ -769,7 +854,8 @@ def build_icdor_loaders(
     return (
         _loader(Subset(train, core), batch_size=batch_size, shuffle=True, num_workers=num_workers, config=config,
                 generator=torch.Generator().manual_seed(seed)),
-        _loader(Subset(train, audit), batch_size=batch_size, shuffle=False, num_workers=num_workers, config=config),
+        _loader(Subset(train, audit_visual), batch_size=batch_size, shuffle=False, num_workers=num_workers, config=config),
+        _loader(Subset(train, audit_target), batch_size=batch_size, shuffle=False, num_workers=num_workers, config=config),
         _loader(Subset(train, calib), batch_size=batch_size, shuffle=False, num_workers=num_workers, config=config),
         _loader(Subset(test, test_indices), batch_size=batch_size, shuffle=False, num_workers=num_workers, config=config),
         stats,
@@ -1022,7 +1108,13 @@ def compute_icdor_training_losses(
         if not isinstance(split_values, list) or not split_values or len(set(split_values)) != 1:
             raise ValueError("IC-DOR factor supervision requires a homogeneous declared split")
         supervision = build_factor_supervision(
-            observations, reason_targets, model.ontology["factors"], split=str(split_values[0])
+            observations,
+            reason_targets,
+            model.ontology["factors"],
+            split=str(split_values[0]),
+            # Reasons are target-side observations, not visual factor labels.
+            # Legacy anchor behavior stays opt-in for reproducibility only.
+            allow_reason_anchors=bool(factor_config.get("allow_reason_anchors", False)),
         )
         factor = factor_presence_visibility_losses(
             output["factor_presence_logits"], output["factor_visibility_logits"],
@@ -1426,9 +1518,25 @@ def _write_json(path: str | Path, payload: Any) -> None:
     target.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def _visual_credibility_payload(result: Mapping[str, Any], *, epoch: int) -> dict[str, Any]:
+    credibility = result.get("credibility")
+    if not isinstance(credibility, torch.Tensor):
+        raise ValueError("visual credibility refresh must return a tensor")
+    return {
+        "epoch": int(epoch),
+        "source_split": result.get("source_split"),
+        "reason_labels_used": result.get("reason_labels_used"),
+        "factor_names": result.get("factor_names"),
+        "credibility": credibility.detach().float().cpu().tolist(),
+        "components": result.get("components"),
+    }
+
+
 def _audit_batches(
     loader: DataLoader,
     grounding_index: BDD100KGroundingIndex,
+    *,
+    source_split: str = "train_audit",
 ) -> Iterable[dict[str, Any]]:
     """Decorate disjoint audit rows with registered views and raw grounding records."""
     for batch in loader:
@@ -1438,7 +1546,7 @@ def _audit_batches(
         photometric = images * 0.97 + images.mean(dim=(-2, -1), keepdim=True) * 0.03
         yield {
             **batch,
-            "split": ["train_audit"] * images.shape[0],
+            "split": [source_split] * images.shape[0],
             "grounding_records": _grounding_records(grounding_index, list(batch["file_name"])),
             "audit_views": torch.stack((images, photometric), dim=1),
             "audit_mirror_view": torch.flip(images, dims=(-1,)),
@@ -1486,13 +1594,20 @@ def collect_action_pareto_audit(
     *,
     route_mode: str,
     latent_enabled: bool,
+    source_split: str = "audit_target",
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Measure visual and routed per-action AP on train_audit only."""
+    """Measure visual and routed per-action AP on the target audit split."""
+    if source_split not in {"audit_target", "train_audit"}:
+        raise ValueError("Pareto audit source must be audit_target")
     visual_rows, routed_rows, labels = [], [], []
     was_training = model.training
     model.eval()
     try:
         for batch in loader:
+            split = batch.get("split")
+            split_values = [split] if isinstance(split, str) else list(split or [])
+            if not split_values or any(value != source_split for value in split_values):
+                raise ValueError(f"Pareto audit accepts {source_split} rows only")
             model.clear_batch_field_reuse()
             output = model(
                 batch["image"].to(device), route_mode=route_mode,
@@ -1504,7 +1619,7 @@ def collect_action_pareto_audit(
     finally:
         model.train(was_training)
     if not labels:
-        raise RuntimeError("Pareto audit received no train_audit rows")
+        raise RuntimeError(f"Pareto audit received no {source_split} rows")
     visual, routed, target = map(torch.cat, (visual_rows, routed_rows, labels))
     visual_ap, routed_ap = [], []
     for label in range(4):
@@ -1523,8 +1638,11 @@ def collect_train_audit_branch_readiness(
     latent_enabled: bool,
     seed: int,
     safe_joint_entry_exp_map: float | None,
+    source_split: str = "audit_target",
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Collect real branch/route/hidden-recovery evidence on train_audit only."""
+    """Collect target utility/hidden-recovery evidence on the target audit split."""
+    if source_split not in {"audit_target", "train_audit"}:
+        raise ValueError("IC-DOR branch readiness source must be audit_target")
     tensors: dict[str, list[torch.Tensor]] = {
         name: [] for name in (
             "action_visual", "action_shadow", "action_final", "action_labels",
@@ -1545,8 +1663,8 @@ def collect_train_audit_branch_readiness(
         for batch in loader:
             split = batch.get("split")
             split_values = [split] if isinstance(split, str) else list(split or [])
-            if not split_values or any(value != "train_audit" for value in split_values):
-                raise ValueError("IC-DOR readiness collector accepts train_audit only")
+            if not split_values or any(value != source_split for value in split_values):
+                raise ValueError(f"IC-DOR readiness collector accepts {source_split} only")
             model.clear_batch_field_reuse()
             images = batch["image"].to(device, non_blocking=True)
             action_labels = batch["action"].to(device, non_blocking=True).float()
@@ -1596,7 +1714,7 @@ def collect_train_audit_branch_readiness(
     finally:
         model.train(was_training)
     if not tensors["action_labels"]:
-        raise ValueError("IC-DOR readiness collector received no train_audit rows")
+        raise ValueError(f"IC-DOR readiness collector received no {source_split} rows")
     values = {name: torch.cat(rows) for name, rows in tensors.items()}
     def per_label_ap(logits: torch.Tensor, labels: torch.Tensor) -> list[float]:
         return [
@@ -1626,7 +1744,7 @@ def collect_train_audit_branch_readiness(
     hidden_margin = min((float(row["margin"]) for row in available_hidden), default=-1.0)
     final_exp_map = float(reason_final_metrics["mAP"])
     return {
-        "source_split": "train_audit",
+        "source_split": source_split,
         "action_shadow_ap_delta": [shadow - visual for shadow, visual in zip(action_shadow_ap, action_visual_ap)],
         "action_route_ap_delta": [final - visual for final, visual in zip(action_final_ap, action_visual_ap)],
         "exp_map_final": final_exp_map,
@@ -1921,10 +2039,12 @@ def main() -> None:
         ):
             raise RuntimeError("IC-DOR REVIEW_PASS contract source manifest mismatch")
 
-    train_loader, audit_loader, calib_loader, test_loader, split_stats = build_icdor_loaders(
+    grounding_index = BDD100KGroundingIndex(config["data"]["bdd100k_root"])
+    train_loader, audit_visual_loader, audit_target_loader, calib_loader, test_loader, split_stats = build_icdor_loaders(
         config, output, batch_size=batch_size, num_workers=args.num_workers,
         max_train_samples=args.max_train_samples, max_audit_samples=args.max_audit_samples,
         max_calib_samples=args.max_calib_samples, max_test_samples=args.max_test_samples,
+        visual_grounding_index=grounding_index,
     )
     if args.require_review_pass and review_payload.get("split_sha256") != split_stats["split_sha256"]:
         raise RuntimeError("IC-DOR REVIEW_PASS split hash mismatch")
@@ -1946,7 +2066,6 @@ def main() -> None:
     mirror_pairs = {name: name.replace("left", "right") for name in factor_names if "left" in name and name.replace("left", "right") in factor_names}
     mirror_pairs.update({value: key for key, value in tuple(mirror_pairs.items())})
     multiview = MOSAICWeakMultiView(factor_names, mirror_pairs=mirror_pairs, seed=args.seed)
-    grounding_index = BDD100KGroundingIndex(config["data"]["bdd100k_root"])
     grounding_builder = ICDORGroundingObservationBuilder(model.ontology["factors"])
     pareto = MOSAICActionParetoAdmission()
     action_queue, reason_queue = _build_rank_queues(
@@ -1995,6 +2114,22 @@ def main() -> None:
         previous_certificate_tiers = _certificate_tiers(
             json.loads(certificate_path.read_text(encoding="utf-8"))
         )
+    # Bootstrap epoch 0 from the independent visual audit. Later refreshes
+    # occur only after an epoch, so every training forward reads a detached
+    # credibility state from the preceding audit pass.
+    bootstrap_visual_audit = collect_factor_audit(
+        model,
+        _audit_batches(audit_visual_loader, grounding_index, source_split="audit_visual"),
+        grounding_builder,
+        factor_names=factor_names,
+        device=device,
+        bootstrap_replicates=int(config["credibility"]["bootstrap_replicates"]),
+        bootstrap_seed=args.seed,
+        forward_kwargs={"route_mode": "off", "latent_enabled": False, "return_masks": True},
+        source_split="audit_visual",
+    )
+    bootstrap_credibility = refresh_model_visual_credibility(model, bootstrap_visual_audit)
+    _write_json(output / "visual_credibility_bootstrap.json", _visual_credibility_payload(bootstrap_credibility, epoch=-1))
     for epoch in range(start_epoch, epochs):
         if adaptive_schedule.failed_closed:
             raise RuntimeError(f"IC-DOR adaptive schedule failed closed: {adaptive_schedule.failure_reason}")
@@ -2016,15 +2151,22 @@ def main() -> None:
             row["action_route_gate_cap"] = route_gate_cap
 
         factor_audit_payload = collect_factor_audit(
-            model, _audit_batches(audit_loader, grounding_index), grounding_builder,
-            factor_names=factor_names, factor_definitions=model.ontology["factors"], device=device,
+            model,
+            _audit_batches(audit_visual_loader, grounding_index, source_split="audit_visual"),
+            grounding_builder,
+            factor_names=factor_names,
+            device=device,
             bootstrap_replicates=(
                 int(config["factor_certificate"]["bootstrap_replicates"])
                 if adaptive_schedule.policy().write_provisional_certificate else 100
             ),
             bootstrap_seed=args.seed + epoch,
             forward_kwargs={"route_mode": "off", "latent_enabled": False, "return_masks": True},
+            source_split="audit_visual",
         )
+        visual_credibility = refresh_model_visual_credibility(model, factor_audit_payload)
+        visual_credibility_payload = _visual_credibility_payload(visual_credibility, epoch=epoch)
+        epoch_dir = output / f"epoch_{epoch:03d}"
         factor_audit_rows = _factor_audit_rows(factor_audit_payload, epoch=epoch)
         certificate_tiers_before_epoch = previous_certificate_tiers
         if _write_provisional_certificate_this_epoch(
@@ -2043,15 +2185,16 @@ def main() -> None:
 
         if adaptive_schedule.policy().enable_interventions and certificate_ready and not edge_ready:
             edge_payload = collect_edge_intervention_audit(
-                model, _audit_batches(audit_loader, grounding_index), factor_names=factor_names,
+                model, _audit_batches(audit_target_loader, grounding_index, source_split="audit_target"), factor_names=factor_names,
                 action_names=list(model.ontology["action_names"]), edge_specs=_candidate_edge_specs(model.ontology),
                 device=device, bootstrap_replicates=1000, bootstrap_seed=args.seed,
                 forward_kwargs={"route_mode": "admitted", "latent_enabled": True, "return_masks": False},
+                source_split="audit_target",
             )
             _write_json(output / "edge_intervention_stats.json", edge_payload)
             tiers = [json.loads(certificate_path.read_text(encoding="utf-8"))["entries"][name]["tier"] for name in factor_names]
             admission = build_edge_admission(
-                _edge_statistics_from_audit(edge_payload), model.ontology, tiers, source_split="train_audit"
+                _edge_statistics_from_audit(edge_payload), model.ontology, tiers, source_split="audit_target"
             )
             edge_document = admission.to_dict()
             _write_json(edge_path, edge_document)
@@ -2064,10 +2207,11 @@ def main() -> None:
             if edge_path.is_file() else dict(pending_edge)
         )
         branch_readiness, hidden_recovery_rows = collect_train_audit_branch_readiness(
-            model, _audit_batches(audit_loader, grounding_index), device,
+            model, _audit_batches(audit_target_loader, grounding_index, source_split="audit_target"), device,
             route_mode=phase.route_mode, latent_enabled=phase.latent_enabled,
             seed=args.seed + epoch,
             safe_joint_entry_exp_map=adaptive_schedule.safe_joint_entry_exp_map,
+            source_split="audit_target",
         )
 
         calibration_rows = fit_icdor_calibration(
@@ -2078,11 +2222,14 @@ def main() -> None:
             model, test_loader, device, epoch=epoch, route_mode=phase.route_mode,
             latent_enabled=phase.latent_enabled,
         )
-        certificate_snapshot = json.loads(certificate_path.read_text(encoding="utf-8"))
+        certificate_snapshot = (
+            json.loads(certificate_path.read_text(encoding="utf-8"))
+            if certificate_path.is_file() else dict(pending_certificate)
+        )
         if adaptive_schedule.policy().enable_interventions:
             action_directions, reason_directions = _target_transfer_directions(model.ontology)
             transfer = collect_joint_target_transfer_metrics(
-                model, _audit_batches(audit_loader, grounding_index),
+                model, _audit_batches(audit_target_loader, grounding_index, source_split="audit_target"),
                 factor_ids=factor_names,
                 action_ids=list(model.ontology["action_names"]),
                 reason_ids=list(model.ontology["reason_names"]),
@@ -2090,9 +2237,10 @@ def main() -> None:
                 reason_directions=reason_directions,
                 device=device, route_mode=phase.route_mode, latent_enabled=phase.latent_enabled,
                 intervention_chunk_size=int(config["runtime"]["target_transfer_intervention_chunk_size"]),
+                source_split="audit_target",
             )
             transfer_summary = {
-                "epoch": epoch, "available": True, "source_split": "train_audit",
+                "epoch": epoch, "available": True, "source_split": "audit_target",
                 "schema_version": transfer["schema_version"],
                 "collection_runtime": transfer["collection_runtime"],
                 **transfer["summary"],
@@ -2100,19 +2248,51 @@ def main() -> None:
             action_ids = {f"action:{name}" for name in model.ontology["action_names"]}
             transfer_rows = [
                 {
-                    "epoch": epoch, "available": True, "source_split": "train_audit",
+                    "epoch": epoch, "available": True, "source_split": "audit_target",
                     "target_type": "action" if row["target_id"] in action_ids else "reason", **row,
                 }
                 for row in transfer["per_target"]
             ]
+            target_utility_state = build_target_utility(
+                {"source_split": "audit_target", "per_target": transfer["per_target"]},
+                model.ontology,
+            )
+            model.target_utility.update_from_audit(
+                torch.tensor(
+                    target_utility_state["semantic_compatibility"], device=device, dtype=torch.float32
+                ),
+                torch.tensor(
+                    target_utility_state["action_target_utility"], device=device, dtype=torch.float32
+                ),
+                source_split="audit_target",
+            )
+            semantic_compatibility_payload = {
+                "schema_version": "mosaic_semantic_compatibility.v1",
+                "epoch": epoch, "available": True, "source_split": "audit_target",
+                "semantic_compatibility": target_utility_state["semantic_compatibility"],
+                "per_target": target_utility_state["per_target"],
+            }
+            target_utility_payload = {
+                "schema_version": "mosaic_target_utility.v1",
+                "epoch": epoch, "available": True, "source_split": "audit_target",
+                "action_target_utility": target_utility_state["action_target_utility"],
+                "per_target": target_utility_state["per_target"],
+            }
         else:
             transfer_summary = _honest_row(epoch, "target_transfer", "interventions_disabled_in_foundation")
-            transfer_summary.update({"source_split": "train_audit", "phase": phase.name})
+            transfer_summary.update({"source_split": "audit_target", "phase": phase.name})
             transfer_rows = [dict(transfer_summary)]
+            semantic_compatibility_payload = {
+                "epoch": epoch,
+                "available": False,
+                "source_split": "audit_target",
+                "unavailable_reason": "target_intervention_is_inactive_for_this_phase",
+            }
+            target_utility_payload = dict(semantic_compatibility_payload)
         epoch_dir = output / f"epoch_{epoch:03d}"
         visual_result = export_visual_audit(
-            model, _audit_batches(audit_loader, grounding_index), epoch_dir,
-            device=device, max_samples=16,
+            model, _audit_batches(audit_visual_loader, grounding_index, source_split="audit_visual"), epoch_dir,
+            device=device, max_samples=16, source_split="audit_visual",
         )
         visual_manifest = json.loads(Path(visual_result["manifest"]).read_text(encoding="utf-8"))
         json_payloads = {
@@ -2121,21 +2301,25 @@ def main() -> None:
             "per_label_metrics.json": evaluation["per_label_metrics"],
             "factor_certificate_snapshot.json": certificate_snapshot,
             "target_transfer_summary.json": transfer_summary,
+            "visual_credibility.json": visual_credibility_payload,
+            "semantic_compatibility.json": semantic_compatibility_payload,
+            "target_utility.json": target_utility_payload,
             "visual_audit_manifest.json": visual_manifest,
         }
         prototype_rows = evaluation["prototype_rows"]
         reason_rows = evaluation["reason_rows"] + [
-            {"epoch": epoch, "source_split": "train_audit", "audit": "hidden_recovery", **row}
+            {"epoch": epoch, "source_split": "audit_target", "audit": "hidden_recovery", **row}
             for row in hidden_recovery_rows
         ]
         if phase.enable_pareto:
             visual_ap, routed_ap = collect_action_pareto_audit(
-                model, _audit_batches(audit_loader, grounding_index), device,
+                model, _audit_batches(audit_target_loader, grounding_index, source_split="audit_target"), device,
                 route_mode=phase.route_mode, latent_enabled=phase.latent_enabled,
+                source_split="audit_target",
             )
             pareto_update = pareto.update_from_audit(visual_ap, routed_ap)
             pareto_rows = [{
-                "epoch": epoch, "available": True, "source_split": "train_audit",
+                "epoch": epoch, "available": True, "source_split": "audit_target",
                 "visual_ap": visual_ap.detach().cpu().tolist(),
                 "routed_ap": routed_ap.detach().cpu().tolist(),
                 "dual_variables": pareto.dual_variables.detach().cpu().tolist(),
@@ -2205,8 +2389,6 @@ def main() -> None:
         print("icdor_epoch " + json.dumps(evaluation["metrics_summary"], sort_keys=True), flush=True)
 
     if args.pilot:
-        if adaptive_schedule.safe_joint_epochs < 1:
-            adaptive_schedule.fail_closed("pilot_completed_without_safe_joint_epoch")
         completed_epochs = list(range(start_epoch, epochs))
         schema = validate_icdor_artifact_schema(
             output, epochs=completed_epochs, strict_semantics=True, require_checkpoints=True
@@ -2228,8 +2410,7 @@ def main() -> None:
         pilot_gate = {
             "git_head": _git_head(),
             "pass": (
-                bool(schema.get("pass")) and certificate_sha is not None and edge_sha is not None
-                and pilot_semantics["pass"] is True
+                bool(schema.get("pass")) and pilot_semantics["pass"] is True
             ),
             "artifacts_complete": bool(schema.get("pass")),
             "pending_artifacts": pending_artifacts,
@@ -2239,6 +2420,8 @@ def main() -> None:
             "edge_admission_semantic_sha256": edge_sha,
             "epochs": completed_epochs,
             "source_split": "train_audit",
+            "learning_access_validated": pilot_semantics["pass"] is True,
+            "deployment_admission_ready": pilot_semantics["deployment_admission_ready"],
             "adaptive_schedule": adaptive_schedule.state_dict(),
             "semantic_validation": pilot_semantics,
             "schema_validation": schema,

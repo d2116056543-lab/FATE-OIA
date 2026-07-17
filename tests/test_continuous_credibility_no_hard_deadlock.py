@@ -10,3 +10,7 @@ def test_continuous_credibility_is_available_without_certificate():
     assert torch.isfinite(output["cV"]).all()
     assert output["cV"].max() > 0
 
+
+def test_continuous_credibility_has_no_untrained_batch_probe_parameters() -> None:
+    module = ContinuousVisualCredibility(factor_count=3, dim=8)
+    assert list(module.named_parameters()) == []
