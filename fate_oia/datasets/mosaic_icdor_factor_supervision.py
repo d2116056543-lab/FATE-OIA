@@ -43,7 +43,7 @@ def _anchor_matrix(factors: Sequence[Mapping[str, Any]], reason_count: int, devi
 
 def build_factor_supervision(
     observations: Mapping[str, torch.Tensor],
-    reason_targets: torch.Tensor,
+    reason_targets: torch.Tensor | None,
     factors: Sequence[Mapping[str, Any]],
     *,
     split: str,
@@ -61,20 +61,24 @@ def build_factor_supervision(
     presence_known_mask = _evidence_mask(observations, "presence_known_mask")
     geometry_known_mask = _evidence_mask(observations, "geometry_known_mask")
     weak_negative_mask = _evidence_mask(observations, "weak_negative_mask")
-    if not isinstance(reason_targets, torch.Tensor) or reason_targets.ndim != 2:
-        raise ValueError("reason targets must be [B,R]")
     if not isinstance(split, str) or not split:
         raise ValueError("split must be a non-empty string")
     if not isinstance(allow_reason_anchors, bool):
         raise ValueError("allow_reason_anchors must be a boolean")
-    if len(factors) != presence_target.shape[1] or reason_targets.shape[0] != presence_target.shape[0]:
+    if len(factors) != presence_target.shape[1]:
         raise ValueError("factor supervision batch or factor dimensions do not match")
+    if allow_reason_anchors:
+        if not isinstance(reason_targets, torch.Tensor) or reason_targets.ndim != 2:
+            raise ValueError("reason targets must be [B,R] when reason anchors are enabled")
+        if reason_targets.shape[0] != presence_target.shape[0]:
+            raise ValueError("factor supervision batch or factor dimensions do not match")
     if any(value.shape != presence_target.shape for value in (presence_known_mask, geometry_known_mask, weak_negative_mask)):
         raise ValueError("factor observation tensors must share [B,F] shape")
 
     geometry_positive_mask = (geometry_known_mask > 0) & (presence_target > 0)
-    anchors = _anchor_matrix(factors, reason_targets.shape[1], reason_targets.device)
     if allow_reason_anchors and split in _ANCHOR_SPLITS:
+        assert isinstance(reason_targets, torch.Tensor)
+        anchors = _anchor_matrix(factors, reason_targets.shape[1], reason_targets.device)
         positive_anchor_mask = ((reason_targets > 0)[:, None, :] & anchors[None, :, :]).any(dim=-1)
     else:
         positive_anchor_mask = torch.zeros_like(geometry_positive_mask)

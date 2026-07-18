@@ -49,10 +49,12 @@ class MOSAICWeakMultiViewTests(unittest.TestCase):
             seed=3,
         )
         output = transform(torch.zeros(3, 3, 5))
-        metadata = output["metadata"][0]
+        # View zero is deliberately canonical. The weak companion view is
+        # the one that receives the optional horizontal flip.
+        metadata = output["metadata"][1]
         self.assertTrue(metadata["horizontal_flip"])
         self.assertEqual(metadata["factor_permutation"], (1, 0, 2))
-        self.assertTrue(torch.equal(output["images"][0], torch.zeros(3, 3, 5).flip(-1)))
+        self.assertTrue(torch.equal(output["images"][1], torch.zeros(3, 3, 5).flip(-1)))
 
         base_masks = torch.zeros(3, 3, 5)
         base_masks[0, 1, 0] = 1.0
@@ -93,7 +95,7 @@ class MOSAICWeakMultiViewTests(unittest.TestCase):
             seed=5,
         )
 
-        metadata = transform(torch.zeros(3, 2, 4))["metadata"][0]
+        metadata = transform(torch.zeros(3, 2, 4))["metadata"][1]
 
         self.assertEqual(metadata["factor_permutation"], (1, 0, 2))
 
@@ -112,7 +114,7 @@ class MOSAICWeakMultiViewTests(unittest.TestCase):
 
     def test_factor_values_restore_left_right_ontology_after_flip(self) -> None:
         transform = MOSAICWeakMultiView(FACTOR_NAMES, flip_probability=1.0, seed=1)
-        metadata = transform(torch.zeros(3, 2, 4))["metadata"][0]
+        metadata = transform(torch.zeros(3, 2, 4))["metadata"][1]
         canonical = torch.tensor([1.0, 2.0, 3.0])
         view = canonical.index_select(0, torch.tensor(metadata["factor_permutation"]))
         self.assertTrue(torch.equal(transform.invert_factor_values(view, metadata), canonical))

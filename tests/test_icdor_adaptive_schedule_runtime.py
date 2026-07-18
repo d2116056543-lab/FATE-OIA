@@ -74,7 +74,7 @@ def test_runtime_checkpoint_restores_adaptive_state_and_evidence_hashes(tmp_path
     model = _ResumeModel()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
-    action_queue, reason_queue = _build_rank_queues(capacity=8, device=torch.device("cpu"))
+    action_queue, reason_queue, observed_reason_queue = _build_rank_queues(capacity=8, device=torch.device("cpu"))
     pareto = MOSAICActionParetoAdmission()
     schedule = ICDORAdaptiveSchedule(pilot=True)
     schedule.state = "SAFE_JOINT"
@@ -87,7 +87,8 @@ def test_runtime_checkpoint_restores_adaptive_state_and_evidence_hashes(tmp_path
     _save_checkpoint(
         path, model=model, optimizer=optimizer, scheduler=scheduler, epoch=5, best_joint=0.5,
         certificate_sha256="CERT", edge_admission_sha256="EDGE", config_sha256="CONFIG",
-        split_sha256="SPLIT", action_queue=action_queue, reason_queue=reason_queue, pareto=pareto,
+        split_sha256="SPLIT", action_queue=action_queue, reason_queue=reason_queue,
+        observed_reason_queue=observed_reason_queue, pareto=pareto,
         adaptive_schedule=schedule,
     )
     schedule.state = "FOUNDATION"
@@ -97,7 +98,8 @@ def test_runtime_checkpoint_restores_adaptive_state_and_evidence_hashes(tmp_path
         path, model=model, optimizer=optimizer, scheduler=scheduler,
         certificate_path=tmp_path / "certificate.json", edge_path=tmp_path / "edge.json",
         config_sha256="CONFIG", split_sha256="SPLIT", action_queue=action_queue,
-        reason_queue=reason_queue, pareto=pareto, adaptive_schedule=schedule,
+        reason_queue=reason_queue, observed_reason_queue=observed_reason_queue,
+        pareto=pareto, adaptive_schedule=schedule,
     )
 
     assert result == (6, 0.5, "CERT", "EDGE")

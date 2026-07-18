@@ -10,11 +10,32 @@ from fate_oia.utils.mosaic_icdor_artifacts import (
     ICDOR_EPOCH_JSON_FILES,
     ICDOR_EPOCH_JSONL_FILES,
     ICDOR_LOGIT_FILES,
+    _gradient_firewall_rows_valid,
     initialize_icdor_run_artifacts,
     validate_icdor_artifact_schema,
     write_icdor_epoch_artifacts,
     _matched_control_provenance_valid,
 )
+
+
+def test_gradient_firewall_schema_requires_all_credo_owner_boundaries() -> None:
+    rows = []
+    for loss, owners in {
+        "loss_action_total": {
+            "factor_visual_pyramid", "factor_adapter", "factor_extractor", "factor_prototypes",
+            "reason_visual_pyramid", "reason_adapter", "reason_visual_decoder",
+            "reason_latent_decoder", "reason_observed_mixer", "observation_model",
+        },
+        "loss_reason_total": {
+            "factor_visual_pyramid", "factor_adapter", "factor_extractor", "factor_prototypes",
+            "action_visual_pyramid", "action_adapter", "action_visual_decoder", "action_router_rereader",
+        },
+    }.items():
+        rows.extend({"loss": loss, "owner_group": owner, "grad_norm": 0.0, "finite": True} for owner in owners)
+
+    assert _gradient_firewall_rows_valid(rows) is True
+    rows[-1]["grad_norm"] = 1e-6
+    assert _gradient_firewall_rows_valid(rows) is False
 
 
 def _matched_arms() -> list[dict[str, object]]:
@@ -86,6 +107,32 @@ def _json_payloads() -> dict[str, dict[str, object]]:
         "raw": {"Act_mF1": 0.5, "Exp_mF1": 0.4},
         "deploy_fixed": {"Act_mF1": 0.5, "Exp_mF1": 0.4},
         "test_oracle_diagnostic": {"Act_mF1": 0.6, "Exp_mF1": 0.5},
+    }
+    payloads["mechanism_summary.json"] = {
+        "schema_version": "mosaic_icdor_mechanism_summary.v2",
+        "epoch": 0,
+        "available": True,
+        "missing_evidence": [],
+        "continuous_credibility": {"available": True},
+        "fine_transport": {"available": True},
+        "reason_transport": {"available": True},
+        "action_shadow": {"available": True},
+        "pu": {"available": True},
+        "target_effectiveness": {"available": True},
+        "gradient_firewall": {"available": True},
+        "interpretation": {
+            "learning_access": "continuous_credibility_and_shadow_routes",
+            "deployment_admission": "edge_audit_only",
+            "certificate_role": "final_reporting_only",
+        },
+    }
+    payloads["factor_audit.json"] = {
+        "source_split": "audit_visual",
+        "factor_stats": {
+            "road": {
+                "counts": {}, "scores": {}, "prototype": {}, "bootstrap_lcb95": {},
+            },
+        },
     }
     payloads["target_transfer_summary.json"] = {
         "available": True, "epoch": 0, "source_split": "train_audit",

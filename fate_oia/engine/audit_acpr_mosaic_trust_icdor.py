@@ -18,6 +18,8 @@ class ICDORAuditError(RuntimeError):
 
 _REQUIRED_FORWARD_OUTPUTS = (
     "action_final_logits",
+    "action_visual_logits",
+    "action_shadow_logits",
     "reason_observed_logits",
     "factor_soft_masks",
     "support_weights",
@@ -31,6 +33,7 @@ _REQUIRED_FORWARD_OUTPUTS = (
 
 _V4_REQUIRED_FORWARD_OUTPUTS = (
     "cV", "cV_ema", "factor_soft_masks", "factor_fine_masks", "factor_coarse_masks",
+    "cV_route_effective",
     "sampling_coordinates", "sampled_features", "sample_attention",
     "action_shadow_logits", "action_final_logits", "action_visual_logits",
     "reason_visual_logits", "reason_latent_logits", "reason_final_logits",
@@ -57,6 +60,7 @@ _REQUIRED_FUNCTIONAL_CHECKS = (
     "artifact_schema_v4",
     "target_utility",
     "batch_field_reuse",
+    "credo_learning_deployment",
 )
 
 _REQUIRED_REMEDIATION_GATES = (
@@ -189,13 +193,16 @@ def verify_dynamic_forward_and_gradients(model: nn.Module, images: torch.Tensor)
     was_training = model.training
     model.train()
     try:
+        # Shadow is the CREDO learning route. Audit it directly so a model
+        # cannot pass by exposing only a final visual-safe forward while the
+        # target router itself remains disconnected.
         first = model(
-            images, route_mode="admitted", latent_enabled=True, reason_route_mode="full",
+            images, route_mode="shadow", latent_enabled=True, reason_route_mode="full",
             return_masks=True, return_diagnostics=True,
         )
         second = model(
             images + torch.full_like(images, 0.137),
-            route_mode="admitted",
+            route_mode="shadow",
             latent_enabled=True,
             reason_route_mode="full",
             return_masks=True,
@@ -214,6 +221,7 @@ def verify_dynamic_forward_and_gradients(model: nn.Module, images: torch.Tensor)
         if any(value <= 0.0 for value in sensitivity.values()):
             raise ICDORAuditError(f"dynamic forward is input-insensitive: {sensitivity}")
         action_parameters = _lane_parameters(model, "action_adapter.")
+        route_parameters = _lane_parameters_many(model, ("action_router.", "action_rereader."))
         reason_parameters = _lane_parameters_many(model, (
             "reason_adapter.", "reason_visual_decoder.", "reason_latent_decoder.",
             "reason_observed_mixer.", "observation_model.",
@@ -222,12 +230,23 @@ def verify_dynamic_forward_and_gradients(model: nn.Module, images: torch.Tensor)
             first_tensors["action_final_logits"], action_parameters, reason_parameters, retain_graph=True
         )
         reason_owned, reason_cross = _joint_lane_gradients(
-            first_tensors["reason_observed_logits"], reason_parameters, action_parameters, retain_graph=False
+            first_tensors["reason_observed_logits"], reason_parameters, action_parameters, retain_graph=True
         )
-        gradients = {"action_adapter": action_owned, "reason_adapter": reason_owned}
+        shadow_owned, shadow_cross = _joint_lane_gradients(
+            first_tensors["action_shadow_logits"], route_parameters, action_parameters, retain_graph=False
+        )
+        gradients = {
+            "action_adapter": action_owned,
+            "reason_adapter": reason_owned,
+            "action_router_rereader": shadow_owned,
+        }
         if any(value < 1e-8 for value in gradients.values()):
             raise ICDORAuditError(f"dynamic gradient path is inactive: {gradients}")
-        firewall = {"reason_to_action_adapter": reason_cross, "action_to_reason_adapter": action_cross}
+        firewall = {
+            "reason_to_action_adapter": reason_cross,
+            "action_to_reason_adapter": action_cross,
+            "shadow_to_action_adapter": shadow_cross,
+        }
         if any(value != 0.0 for value in firewall.values()):
             raise ICDORAuditError(f"dynamic gradient firewall is violated: {firewall}")
         forbidden_annotation_parameters = {
@@ -244,7 +263,7 @@ def verify_dynamic_forward_and_gradients(model: nn.Module, images: torch.Tensor)
             "input_sensitivity": sensitivity,
             "gradient_sum_abs": gradients,
             "gradient_firewall": firewall,
-            "action_information_firewall_pass": reason_cross == 0.0,
+            "action_information_firewall_pass": reason_cross == 0.0 and shadow_cross == 0.0,
             "test_forward_no_annotation_leakage": not annotation_parameters,
             "information_boundary_contract": {
                 "action_forbidden": "reason labels/logits/propensity",
@@ -270,6 +289,9 @@ def verify_v4_forward_contract(model: nn.Module, images: torch.Tensor) -> dict[s
     cV = output["cV"]
     if cV.ndim != 2 or cV.shape[0] != images.shape[0] or not torch.isfinite(cV).all():
         raise ICDORAuditError("v4 continuous credibility is not finite [B,F]")
+    route_cV = output["cV_route_effective"]
+    if route_cV.shape != cV.shape or not torch.isfinite(route_cV).all() or bool((route_cV < cV).any()):
+        raise ICDORAuditError("v4 effective route credibility does not preserve continuous cV")
     factor_count = cV.shape[1]
     semantic = output["semantic_compatibility"]
     semantic_effective = output["reason_semantic_compatibility_effective"]
@@ -319,6 +341,7 @@ def verify_v4_forward_contract(model: nn.Module, images: torch.Tensor) -> dict[s
         "image_only_cap": float(getattr(model.continuous_credibility, "image_only_cap", -1.0)),
         "unknown_cap": float(getattr(model.continuous_credibility, "unknown_cap", -1.0)),
         "no_reliable_negative_cap": float(getattr(model.continuous_credibility, "no_reliable_negative_cap", -1.0)),
+        "shadow_credibility_floor": float(getattr(model, "shadow_credibility_floor", -1.0)),
     }
     fine_runtime = {
         "enabled": bool(getattr(model.factor_extractor, "fine_transport_enabled", False)),
@@ -330,6 +353,7 @@ def verify_v4_forward_contract(model: nn.Module, images: torch.Tensor) -> dict[s
     return {
         "pass": True,
         "cV_shape": list(cV.shape),
+        "cV_route_effective_shape": list(route_cV.shape),
         "semantic_compatibility_shape": list(semantic.shape),
         "action_target_utility_shape": list(action_utility.shape),
         "typed_coordinate_shape": list(output["sampling_coordinates"].shape),
@@ -546,7 +570,7 @@ def functional_hard_gates(
         "config_independent_of_reason_labels": config.get("credibility", {}).get("independent_of_reason_labels") is True,
         "source": _require_source_tokens(
             root / "fate_oia" / "models" / "mosaic_continuous_credibility.py",
-            ("visual_credibility_from_measurements", "update_credibility_ema", "factor_credibility_cap"),
+            ("visual_credibility_from_measurements", "update_credibility_ema", "factor_credibility_cap", "absence_polarity"),
             ("reason_labels", "observed_reason", "reason_targets", "factor_certificate_reliability"),
         ),
         "dynamic": dynamic.get("v4_contract", {}).get("cV_shape"),
@@ -559,6 +583,7 @@ def functional_hard_gates(
         "image_only_cap": float(config["credibility"]["image_only_cap"]),
         "unknown_cap": float(config["credibility"]["unknown_cap"]),
         "no_reliable_negative_cap": float(config["credibility"]["no_reliable_negative_cap"]),
+        "shadow_credibility_floor": float(config["model"]["action_route"]["shadow_credibility_floor"]),
     }
     if (
         not evidence["continuous_credibility"]["config_independent_of_reason_labels"]
@@ -575,7 +600,10 @@ def functional_hard_gates(
         "runtime": dynamic.get("v4_contract", {}).get("fine_transport_runtime"),
         "evaluator": _require_source_tokens(
             root / "fate_oia" / "engine" / "eval_acpr_mosaic_trust_icdor.py",
-            ("factor_mask_mode=\"coarse\"", "factor_mask_mode=\"fine\"", "fine_transport"),
+            (
+                "factor_mask_mode=\"coarse\"", "factor_mask_mode=\"fine\"", "fine_transport",
+                "fine_off_action_shadow_delta_abs_mean", "fine_off_reason_latent_delta_abs_mean",
+            ),
         ),
     }
     expected_fine_runtime = {
@@ -610,7 +638,8 @@ def functional_hard_gates(
         root / "fate_oia" / "utils" / "mosaic_icdor_artifacts.py",
         (
             "credibility_stats.jsonl", "fine_transport_stats.jsonl", "route_ownership.jsonl",
-            "semantic_compatibility.json", "target_utility.json",
+            "semantic_compatibility.json", "target_utility.json", "factor_audit.json",
+            "validate_icdor_pilot_mechanism", "no_lane_absence_polarity",
         ),
     )
     evidence["target_utility"] = {
@@ -634,6 +663,41 @@ def functional_hard_gates(
         ("BatchLocalDinoFieldReuse", "no cross-batch persistence"),
     )
     checks["batch_field_reuse"] = "PASS"
+    credo_model = _require_source_tokens(
+        model_path,
+        (
+            'action_output["action_visual_logits"].detach()',
+            "compose_final_action_logits",
+            "continuous_route_weight",
+            "reason_route_enabled = torch.ones_like",
+        ),
+    )
+    credo_trainer = _require_source_tokens(
+        trainer_path,
+        (
+            "build_icdor_mechanism_summary(", "build_factor_supervision(", "observations,\n            None,",
+            "validate_icdor_pilot_mechanism", "factor_audit.json", "hidden_recovery_margin_nonpositive",
+        ),
+        ("model.load_factor_certificate(", "clip_grad_norm_("),
+    )
+    credo_rereader = _require_source_tokens(
+        root / "fate_oia" / "models" / "mosaic_masked_target_rereader.py",
+        ("sample_attention.detach(), support_weights", "sample_attention.detach(), veto_weights"),
+        ("support_weights.detach()", "veto_weights.detach()"),
+    )
+    evidence["credo_learning_deployment"] = {
+        "model": credo_model,
+        "trainer": credo_trainer,
+        "rereader": credo_rereader,
+        "shadow_route_gradient": dynamic["gradient_sum_abs"]["action_router_rereader"],
+        "shadow_to_direct_action_gradient": dynamic["gradient_firewall"]["shadow_to_action_adapter"],
+    }
+    if (
+        float(evidence["credo_learning_deployment"]["shadow_route_gradient"]) < 1e-8
+        or float(evidence["credo_learning_deployment"]["shadow_to_direct_action_gradient"]) != 0.0
+    ):
+        raise ICDORAuditError("CREDO shadow learning/deployment separation is not active")
+    checks["credo_learning_deployment"] = "PASS"
     missing_checks = [name for name in _REQUIRED_FUNCTIONAL_CHECKS if checks.get(name) != "PASS"]
     if missing_checks:
         raise ICDORAuditError(f"functional checks lack explicit evidence: {missing_checks}")

@@ -4,6 +4,7 @@ import torch
 from torch.nn import functional as F
 
 from fate_oia.losses.mosaic_icdor_factor_losses import (
+    factor_selective_contrastive_loss,
     factor_presence_visibility_losses,
     factor_prototype_regularization,
     factor_view_consistency_loss,
@@ -112,10 +113,21 @@ def test_icdor_weak_negative_is_weighted_and_unknown_remains_ignored() -> None:
     unknown = torch.zeros_like(logits, dtype=torch.bool)
     weak = torch.tensor([[1, 0]], dtype=torch.bool)
     losses = factor_presence_visibility_losses(logits, logits.clone(), zeros, zeros, unknown, unknown, weak)
-    losses["loss_factor_total"].backward()
+    # Weak-negative observations remain auditable but are not one of the
+    # CREDO factor-total loss components.
+    losses["loss_factor_weak_negative"].backward()
     assert losses["loss_factor_weak_negative"] > 0
     assert logits.grad[0, 0] > 0
     assert logits.grad[0, 1] == 0
+
+
+def test_icdor_factor_total_excludes_plan_external_weak_negative_term() -> None:
+    logits = torch.full((1, 2), 2.0, requires_grad=True)
+    zeros = torch.zeros_like(logits)
+    unknown = torch.zeros_like(logits, dtype=torch.bool)
+    weak = torch.tensor([[1, 0]], dtype=torch.bool)
+    losses = factor_presence_visibility_losses(logits, logits.clone(), zeros, zeros, unknown, unknown, weak)
+    assert losses["loss_factor_total"].item() == 0.0
 
 
 def test_icdor_multiview_and_prototype_losses_are_real_and_finite() -> None:
@@ -130,3 +142,24 @@ def test_icdor_multiview_and_prototype_losses_are_real_and_finite() -> None:
     regularization = factor_prototype_regularization(weights, prototypes, valid, torch.full((3,), 0.1))
     assert all(torch.isfinite(value) for value in regularization.values())
     assert regularization["loss_factor_prototype_occupancy"] > 0
+
+
+def test_icdor_factor_selective_contrastive_uses_only_grounded_positive_and_reliable_negative() -> None:
+    features = torch.tensor(
+        [
+            [[1.0, 0.0]],
+            [[1.0, 0.0]],
+            [[1.0, 0.0]],
+            [[-1.0, 0.0]],
+        ],
+        requires_grad=True,
+    )
+    positive = torch.tensor([[1], [1], [0], [0]], dtype=torch.bool)
+    reliable_negative = torch.tensor([[0], [0], [1], [1]], dtype=torch.bool)
+    separated = factor_selective_contrastive_loss(features, positive, reliable_negative)
+    collapsed = factor_selective_contrastive_loss(features[:3], positive[:3], reliable_negative[:3])
+
+    assert torch.isfinite(separated)
+    assert separated < collapsed
+    separated.backward()
+    assert features.grad is not None and torch.isfinite(features.grad).all()

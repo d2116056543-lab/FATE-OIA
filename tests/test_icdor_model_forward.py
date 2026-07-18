@@ -4,6 +4,7 @@ from pathlib import Path
 
 import torch
 
+from fate_oia.losses.mosaic_icdor_action_losses import action_route_losses
 from fate_oia.models.acpr_mosaic_trust_icdor_model import MOSAICTrustICDORModel
 from fate_oia.engine.train_acpr_mosaic_trust_icdor import build_icdor_model, load_config
 
@@ -71,6 +72,49 @@ def test_icdor_model_admitted_route_is_action_visual_reread_not_factor_logit_del
     assert not torch.allclose(
         outputs["sampling_coordinates"],
         outputs["action_matched_random_sampling_coordinates"],
+    )
+
+
+def test_action_shadow_gradient_cannot_update_the_direct_action_visual_owner() -> None:
+    """CREDO defines shadow logits as stopgrad(visual) plus the route delta."""
+    model = _model()
+    factor_count = len(model.ontology["factors"])
+    model.continuous_credibility.update_from_audit(torch.full((factor_count,), 0.4))
+    outputs = model(torch.randn(1, 3, 360, 640), route_mode="shadow", latent_enabled=True)
+    model.zero_grad(set_to_none=True)
+    outputs["action_shadow_logits"].sum().backward()
+
+    assert all(parameter.grad is None for parameter in model.action_visual_decoder.parameters())
+    assert any(
+        parameter.grad is not None and torch.count_nonzero(parameter.grad) > 0
+        for parameter in model.action_router.parameters()
+    )
+
+
+def test_matched_random_route_loss_cannot_update_direct_action_visual_owner() -> None:
+    """Matched controls train the route owner without bypassing CREDO's action firewall."""
+    model = _model()
+    factor_count = len(model.ontology["factors"])
+    model.continuous_credibility.update_from_audit(torch.full((factor_count,), 0.4))
+    outputs = model(torch.randn(2, 3, 360, 640), route_mode="shadow", latent_enabled=True)
+    route = action_route_losses(
+        outputs["action_visual_logits"],
+        outputs["action_support_logits"],
+        outputs["action_veto_logits"],
+        torch.tensor([[1.0, 0.0, 1.0, 0.0], [0.0, 1.0, 0.0, 1.0]]),
+        support_dustbin=outputs["support_dustbin"],
+        veto_dustbin=outputs["veto_dustbin"],
+        pareto_penalty=outputs["action_shadow_logits"].sum() * 0.0,
+        matched_random_logits=outputs["action_matched_random_logits"],
+        intervention_weight=0.10,
+    )
+    model.zero_grad(set_to_none=True)
+    route["loss_action_route_total"].backward()
+
+    assert all(parameter.grad is None for parameter in model.action_visual_decoder.parameters())
+    assert any(
+        parameter.grad is not None and torch.count_nonzero(parameter.grad) > 0
+        for parameter in model.action_router.parameters()
     )
 
 

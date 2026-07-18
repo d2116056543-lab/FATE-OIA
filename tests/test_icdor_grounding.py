@@ -82,7 +82,7 @@ def test_unidentifiable_cues_are_latent_or_image_only_and_never_action_edges() -
         action_routes = yaml.safe_load(handle)["action_routes"]
 
     proxy = factors["front_vehicle_risk_proxy"]
-    assert proxy["role"] == "latent_proxy"
+    assert proxy["role"] == "latent_only"
     assert proxy["source_kind"] == "proxy"
     assert proxy["grounding_sources"] == ["box2d"]
 

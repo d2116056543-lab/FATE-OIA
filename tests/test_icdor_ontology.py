@@ -21,6 +21,18 @@ def test_icdor_ontology_has_complete_observable_factors_and_target_routes() -> N
         assert factor["mirror_of"] in ontology["factor_index"]
         assert factor["name"] not in {"no_left_lane", "left_turn_allowed"}
         assert "state" not in factor["name"]
+        assert factor["role"] in {"observable", "reason_only", "latent_only"}
+        assert factor["source_kind"] in {"grounded", "image_only", "proxy"}
+        assert factor["visual_sources"] == factor["grounding_sources"]
+        assert factor["negative_policy"] in {
+            "reliable_if_source_complete",
+            "reliable_if_attribute_complete",
+            "unknown_without_depth",
+            "unknown_without_direct_visual_evidence",
+        }
+        assert set(factor["target_candidates"]) == {"actions", "reasons"}
+        assert set(factor["target_candidates"]["actions"]).issubset(ontology["action_index"])
+        assert set(factor["target_candidates"]["reasons"]).issubset(set(range(21)))
 
     for action_name, directions in ontology["action_routes"].items():
         assert action_name in ontology["action_index"]
@@ -59,3 +71,16 @@ def test_icdor_ontology_exposes_only_factor_routes_for_latent_reasons() -> None:
         assert set(route["absence_factors"]).issubset(ontology["factor_index"])
         assert route["semantic_kind"] in {"observable_or_latent", "visual_plus_latent_proxy", "absence_observable"}
         assert all("state" not in factor for factor in route["latent_factors"])
+
+
+def test_icdor_ontology_cross_checks_factor_target_candidates_against_runtime_routes() -> None:
+    ontology = load_icdor_ontology(Path("configs"))
+    factors = {factor["name"]: factor for factor in ontology["factors"]}
+    for action_name, directions in ontology["action_routes"].items():
+        for edges in directions.values():
+            for edge in edges:
+                assert action_name in factors[edge["factor"]]["target_candidates"]["actions"]
+    for reason_index, route in ontology["reason_routes"].items():
+        for field in ("direct_factors", "latent_factors", "contradiction_factors", "absence_factors"):
+            for factor_name in route[field]:
+                assert reason_index in factors[factor_name]["target_candidates"]["reasons"]

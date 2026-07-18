@@ -20,8 +20,10 @@ ICDOR_ROOT_JSONL_FILES = ("metrics_summary.jsonl", "adaptive_schedule.jsonl")
 ICDOR_EPOCH_JSON_FILES = (
     "metrics_summary.json",
     "branch_metrics.json",
+    "mechanism_summary.json",
     "per_label_metrics.json",
     "factor_certificate_snapshot.json",
+    "factor_audit.json",
     "visual_credibility.json",
     "target_transfer_summary.json",
     "semantic_compatibility.json",
@@ -54,9 +56,108 @@ ICDOR_LOGIT_FILES = (
     "reason_observation_model_prob.pt",
     "reason_observed_logits.pt",
     "reason_deploy_logits.pt",
+    "action_factor_off_logits.pt",
+    "action_factor_shuffled_logits.pt",
+    "action_wrong_target_logits.pt",
+    "action_equal_mass_random_logits.pt",
+    "reason_factor_route_off_logits.pt",
+    "reason_factor_route_shuffled_logits.pt",
     "action_labels.pt",
     "reason_labels.pt",
 )
+
+# CREDO assigns the three visual lanes to separate objectives.  These pairs
+# must be present in every gradient audit and exactly zero, not merely absent.
+ICDOR_REQUIRED_ZERO_GRADIENTS = {
+    "loss_action_total": frozenset({
+        "factor_visual_pyramid", "factor_adapter", "factor_extractor", "factor_prototypes",
+        "reason_visual_pyramid", "reason_adapter", "reason_visual_decoder",
+        "reason_latent_decoder", "reason_observed_mixer", "observation_model",
+    }),
+    "loss_reason_total": frozenset({
+        "factor_visual_pyramid", "factor_adapter", "factor_extractor", "factor_prototypes",
+        "action_visual_pyramid", "action_adapter", "action_visual_decoder", "action_router_rereader",
+    }),
+}
+
+
+def _gradient_firewall_rows_valid(rows: list[dict[str, Any]], *, tolerance: float = 1e-7) -> bool:
+    """Check that the persisted audit proves every CREDO cross-owner block."""
+    observed: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in rows:
+        key = (str(row.get("loss")), str(row.get("owner_group")))
+        observed.setdefault(key, []).append(row)
+    for loss, owners in ICDOR_REQUIRED_ZERO_GRADIENTS.items():
+        for owner in owners:
+            candidates = observed.get((loss, owner), [])
+            if not candidates:
+                return False
+            for candidate in candidates:
+                try:
+                    norm = float(candidate["grad_norm"])
+                except (KeyError, TypeError, ValueError):
+                    return False
+                if candidate.get("finite") is not True or not torch.isfinite(torch.tensor(norm)) or abs(norm) > tolerance:
+                    return False
+    return True
+
+
+def _mechanism_summary_valid(payload: Any) -> bool:
+    """Validate the smoke-facing CREDO evidence summary is interpretable."""
+    if not isinstance(payload, dict):
+        return False
+    required = {
+        "schema_version", "epoch", "available", "missing_evidence",
+        "continuous_credibility", "fine_transport", "reason_transport",
+        "action_shadow", "pu", "target_effectiveness", "gradient_firewall",
+        "interpretation",
+    }
+    if not required <= set(payload) or payload.get("schema_version") != "mosaic_icdor_mechanism_summary.v2":
+        return False
+    if not isinstance(payload.get("available"), bool) or not isinstance(payload.get("missing_evidence"), list):
+        return False
+    for section in (
+        "continuous_credibility", "fine_transport", "reason_transport", "action_shadow",
+        "pu", "target_effectiveness", "gradient_firewall",
+    ):
+        value = payload.get(section)
+        if not isinstance(value, dict) or not isinstance(value.get("available"), bool):
+            return False
+    def _finite_number(section: dict[str, Any], key: str) -> bool:
+        value = section.get(key)
+        return isinstance(value, (int, float)) and bool(torch.isfinite(torch.tensor(float(value))))
+    credibility = payload["continuous_credibility"]
+    fine = payload["fine_transport"]
+    reason = payload["reason_transport"]
+    action = payload["action_shadow"]
+    pu = payload["pu"]
+    if not isinstance(credibility.get("content_beats_prior_factor_count"), int):
+        return False
+    if not all(_finite_number(fine, key) for key in (
+        "fine_mask_delta_mean", "fine_off_action_shadow_delta_abs_mean",
+        "fine_off_reason_latent_delta_abs_mean",
+    )):
+        return False
+    if not all(_finite_number(reason, key) for key in (
+        "route_off_logit_delta_abs_mean", "shuffle_logit_delta_abs_mean",
+        "visual_exp_map", "final_exp_map",
+    )):
+        return False
+    no_lane = reason.get("no_lane_absence_polarity")
+    if not isinstance(no_lane, dict) or no_lane.get("available") is not True or no_lane.get("contract") != "observability_times_absence":
+        return False
+    if not all(_finite_number(action, key) for key in ("route_to_visual_rms_ratio_mean", "final_act_map")):
+        return False
+    if action.get("final_visual_exact") is not True:
+        return False
+    if not isinstance(pu.get("schedule_enabled"), bool) or not isinstance(payload["gradient_firewall"].get("pass"), bool):
+        return False
+    interpretation = payload.get("interpretation")
+    return interpretation == {
+        "learning_access": "continuous_credibility_and_shadow_routes",
+        "deployment_admission": "edge_audit_only",
+        "certificate_role": "final_reporting_only",
+    }
 
 
 def _safe(value: Any) -> Any:
@@ -88,6 +189,292 @@ def _append_jsonl(path: Path, row: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(_safe(row), sort_keys=True) + "\n")
+
+
+def _nested_metric(branches: dict[str, Any], group: str, branch: str, metric: str) -> float | None:
+    value = branches.get(group, {})
+    value = value.get(branch, {}) if isinstance(value, dict) else {}
+    candidate = value.get(metric) if isinstance(value, dict) else None
+    return float(candidate) if isinstance(candidate, (int, float)) else None
+
+
+def build_icdor_mechanism_summary(
+    *,
+    epoch: int,
+    visual_credibility: dict[str, Any],
+    branch_metrics: dict[str, Any],
+    route_rows: list[dict[str, Any]],
+    factor_rows: list[dict[str, Any]],
+    factor_audit: dict[str, Any],
+    fine_transport_rows: list[dict[str, Any]],
+    route_ownership_rows: list[dict[str, Any]],
+    reason_rows: list[dict[str, Any]],
+    hidden_recovery_rows: list[dict[str, Any]],
+    target_transfer_rows: list[dict[str, Any]],
+    gradient_rows: list[dict[str, Any]],
+    edge_admission: dict[str, Any],
+    pu_enabled: bool,
+) -> dict[str, Any]:
+    """Summarize observable CREDO mechanism evidence without making an admission decision."""
+    missing: list[str] = []
+    if not isinstance(branch_metrics.get("action"), dict) or not isinstance(branch_metrics.get("reason"), dict):
+        missing.append("branch_metrics")
+    if not route_rows:
+        missing.append("action_route_stats")
+    if not factor_rows:
+        missing.append("factor_stats")
+    if factor_audit.get("source_split") != "audit_visual" or not isinstance(factor_audit.get("factor_stats"), dict):
+        missing.append("factor_audit")
+    if not fine_transport_rows:
+        missing.append("fine_transport_stats")
+    if not gradient_rows:
+        missing.append("gradient_ownership")
+    if not route_ownership_rows:
+        missing.append("route_ownership")
+    if not reason_rows:
+        missing.append("reason_transport_rows")
+
+    credibility = visual_credibility.get("credibility", [])
+    if isinstance(credibility, torch.Tensor):
+        credibility = credibility.detach().float().cpu().tolist()
+    credibility_values = [float(value) for value in credibility if isinstance(value, (int, float))]
+    per_action = [row for row in route_rows if row.get("summary") == "per_action_route_effect"]
+    ratios = [float(row["route_to_visual_rms_ratio"]) for row in per_action if isinstance(row.get("route_to_visual_rms_ratio"), (int, float))]
+    directions = [float(row["delta_gt_direction_agreement"]) for row in per_action if isinstance(row.get("delta_gt_direction_agreement"), (int, float))]
+    support_nonzero = sum(float(row.get("support_delta_rms", 0.0)) > 1e-8 for row in per_action)
+    veto_nonzero = sum(float(row.get("veto_delta_rms", 0.0)) > 1e-8 for row in per_action)
+    route_credibility = [
+        float(row["route_credibility_effective_mean"])
+        for row in per_action
+        if isinstance(row.get("route_credibility_effective_mean"), (int, float))
+    ]
+    fine_deltas = [float(row["fine_mask_delta_mean"]) for row in fine_transport_rows if isinstance(row.get("fine_mask_delta_mean"), (int, float))]
+    fine_separation = [float(row["anchor_separation_mean"]) for row in fine_transport_rows if isinstance(row.get("anchor_separation_mean"), (int, float))]
+    fine_action_shadow = [
+        float(row["fine_off_action_shadow_delta_abs_mean"])
+        for row in fine_transport_rows
+        if isinstance(row.get("fine_off_action_shadow_delta_abs_mean"), (int, float))
+    ]
+    fine_reason_latent = [
+        float(row["fine_off_reason_latent_delta_abs_mean"])
+        for row in fine_transport_rows
+        if isinstance(row.get("fine_off_reason_latent_delta_abs_mean"), (int, float))
+    ]
+    coarse_action_shadow = [
+        float(row["coarse_off_action_shadow_delta_abs_mean"])
+        for row in fine_transport_rows
+        if isinstance(row.get("coarse_off_action_shadow_delta_abs_mean"), (int, float))
+    ]
+    coarse_reason_latent = [
+        float(row["coarse_off_reason_latent_delta_abs_mean"])
+        for row in fine_transport_rows
+        if isinstance(row.get("coarse_off_reason_latent_delta_abs_mean"), (int, float))
+    ]
+    hidden_margins = [float(row["margin"]) for row in hidden_recovery_rows if row.get("available") is True and isinstance(row.get("margin"), (int, float))]
+    transfer = [row for row in target_transfer_rows if row.get("available") is True]
+    accepted = [row for row in (edge_admission.get("entries") or {}).values() if isinstance(row, dict) and row.get("accepted") is True]
+    factor_stats = factor_audit.get("factor_stats", {})
+    content_beats_prior = sum(
+        isinstance(stats, dict)
+        and isinstance(stats.get("scores"), dict)
+        and isinstance(stats["scores"].get("content_only"), (int, float))
+        and isinstance(stats["scores"].get("prior_only"), (int, float))
+        and float(stats["scores"]["content_only"]) > float(stats["scores"]["prior_only"])
+        for stats in factor_stats.values()
+    )
+    final_visual_exact = bool(route_ownership_rows) and all(
+        row.get("action_final_visual_equal") is True for row in route_ownership_rows
+    )
+    route_off_logit_deltas = [
+        float(row["factor_route_effect_abs_mean"])
+        for row in reason_rows
+        if isinstance(row.get("factor_route_effect_abs_mean"), (int, float))
+    ]
+    shuffle_logit_deltas = [
+        float(row["factor_shuffle_effect_abs_mean"])
+        for row in reason_rows
+        if isinstance(row.get("factor_shuffle_effect_abs_mean"), (int, float))
+    ]
+    no_lane_rows = [
+        row for row in reason_rows
+        if int(row.get("reason_id", -1)) in {9, 15}
+    ]
+    no_lane_absence_mass = [
+        float(row["absence_factor_mass_mean"])
+        for row in no_lane_rows
+        if isinstance(row.get("absence_factor_mass_mean"), (int, float))
+    ]
+    no_lane_negative_evidence = [
+        float(row["absence_negative_evidence_mean"])
+        for row in no_lane_rows
+        if isinstance(row.get("absence_negative_evidence_mean"), (int, float))
+    ]
+
+    visual_reason = _nested_metric(branch_metrics, "reason", "visual_observed", "Exp_mAP")
+    final_reason = _nested_metric(branch_metrics, "reason", "final_observed", "Exp_mAP")
+    route_off_reason = _nested_metric(branch_metrics, "reason", "factor_route_off", "Exp_mAP")
+    shuffled_reason = _nested_metric(branch_metrics, "reason", "factor_route_shuffled", "Exp_mAP")
+    visual_action = _nested_metric(branch_metrics, "action", "visual", "Act_mAP")
+    shadow_action = _nested_metric(branch_metrics, "action", "shadow", "Act_mAP")
+    final_action = _nested_metric(branch_metrics, "action", "final", "Act_mAP")
+
+    return {
+        "schema_version": "mosaic_icdor_mechanism_summary.v2",
+        "epoch": int(epoch),
+        "available": not missing,
+        "missing_evidence": missing,
+        "continuous_credibility": {
+            "available": bool(credibility_values),
+            "nonzero_factor_count": sum(value > 1e-8 for value in credibility_values),
+            "observable_cV_gt_030_count": sum(value > 0.30 for value in credibility_values),
+            "content_beats_prior_factor_count": int(content_beats_prior),
+            "mean": float(sum(credibility_values) / len(credibility_values)) if credibility_values else None,
+            "mean_abs_delta": visual_credibility.get("mean_abs_cV_delta"),
+        },
+        "fine_transport": {
+            "available": bool(fine_deltas),
+            "fine_mask_delta_mean": float(sum(fine_deltas) / len(fine_deltas)) if fine_deltas else None,
+            "anchor_separation_mean": float(sum(fine_separation) / len(fine_separation)) if fine_separation else None,
+            "fine_off_action_shadow_delta_abs_mean": float(sum(fine_action_shadow) / len(fine_action_shadow)) if fine_action_shadow else None,
+            "fine_off_reason_latent_delta_abs_mean": float(sum(fine_reason_latent) / len(fine_reason_latent)) if fine_reason_latent else None,
+            "coarse_off_action_shadow_delta_abs_mean": float(sum(coarse_action_shadow) / len(coarse_action_shadow)) if coarse_action_shadow else None,
+            "coarse_off_reason_latent_delta_abs_mean": float(sum(coarse_reason_latent) / len(coarse_reason_latent)) if coarse_reason_latent else None,
+        },
+        "reason_transport": {
+            "available": all(value is not None for value in (visual_reason, final_reason, route_off_reason, shuffled_reason)),
+            "visual_exp_map": visual_reason,
+            "final_exp_map": final_reason,
+            "route_off_delta_exp_map": (final_reason - route_off_reason) if final_reason is not None and route_off_reason is not None else None,
+            "shuffle_delta_exp_map": (final_reason - shuffled_reason) if final_reason is not None and shuffled_reason is not None else None,
+            "route_off_logit_delta_abs_mean": float(sum(route_off_logit_deltas) / len(route_off_logit_deltas)) if route_off_logit_deltas else None,
+            "shuffle_logit_delta_abs_mean": float(sum(shuffle_logit_deltas) / len(shuffle_logit_deltas)) if shuffle_logit_deltas else None,
+            "no_lane_absence_polarity": {
+                "available": len(no_lane_absence_mass) == 2 and len(no_lane_negative_evidence) == 2,
+                "contract": "observability_times_absence",
+                "absence_factor_mass_mean": float(sum(no_lane_absence_mass) / len(no_lane_absence_mass)) if no_lane_absence_mass else None,
+                "negative_evidence_mean": float(sum(no_lane_negative_evidence) / len(no_lane_negative_evidence)) if no_lane_negative_evidence else None,
+            },
+        },
+        "action_shadow": {
+            "available": bool(ratios) and visual_action is not None and shadow_action is not None and final_action is not None,
+            "visual_act_map": visual_action,
+            "shadow_act_map": shadow_action,
+            "final_act_map": final_action,
+            "final_visual_exact": final_visual_exact,
+            "shadow_minus_visual_act_map": (shadow_action - visual_action) if shadow_action is not None and visual_action is not None else None,
+            "route_to_visual_rms_ratio_mean": float(sum(ratios) / len(ratios)) if ratios else None,
+            "delta_gt_direction_agreement_mean": float(sum(directions) / len(directions)) if directions else None,
+            "support_nonzero_action_count": support_nonzero,
+            "veto_nonzero_action_count": veto_nonzero,
+            "route_credibility_effective_mean": float(sum(route_credibility) / len(route_credibility)) if route_credibility else None,
+        },
+        "pu": {
+            "available": bool(hidden_margins),
+            "hidden_recovery_margin_min": min(hidden_margins) if hidden_margins else None,
+            "enabled_by_margin": bool(hidden_margins) and min(hidden_margins) > 0.0,
+            "schedule_enabled": bool(pu_enabled),
+        },
+        "target_effectiveness": {
+            "available": bool(transfer),
+            "tet_mean": float(sum(float(row.get("tet", 0.0)) for row in transfer) / len(transfer)) if transfer else None,
+            "tes_mean": float(sum(float(row.get("tes", 0.0)) for row in transfer) / len(transfer)) if transfer else None,
+            "cca_mean": float(sum(float(row.get("cca", 0.0)) for row in transfer) / len(transfer)) if transfer else None,
+            "accepted_edge_count": len(accepted),
+        },
+        "gradient_firewall": {
+            "available": bool(gradient_rows),
+            "pass": _gradient_firewall_rows_valid(gradient_rows),
+        },
+        "interpretation": {
+            "learning_access": "continuous_credibility_and_shadow_routes",
+            "deployment_admission": "edge_audit_only",
+            "certificate_role": "final_reporting_only",
+        },
+    }
+
+
+def validate_icdor_pilot_mechanism(summaries: list[dict[str, Any]]) -> dict[str, Any]:
+    """Validate CREDO learning access without demanding deployment admission.
+
+    The 6-epoch pilot exists to prove that visual factor measurement, latent
+    reason transport, and the shadow action route learn useful signals while
+    final action remains exactly visual. It must not require an edge or a
+    certificate, which are deployment/reporting decisions made later.
+    """
+    errors: list[str] = []
+    ordered = sorted((row for row in summaries if isinstance(row, dict)), key=lambda row: int(row.get("epoch", -1)))
+    if len(ordered) < 2:
+        errors.append("pilot_requires_at_least_two_epoch_summaries")
+        return {"pass": False, "errors": errors, "epoch_count": len(ordered)}
+    if any(row.get("available") is not True for row in ordered):
+        errors.append("mechanism_summary_has_missing_evidence")
+    if any(row.get("gradient_firewall", {}).get("pass") is not True for row in ordered):
+        errors.append("gradient_firewall_failed")
+    if any(row.get("action_shadow", {}).get("final_visual_exact") is not True for row in ordered):
+        errors.append("final_action_is_not_exactly_visual_during_pilot")
+
+    later = ordered[1:]
+    if not any(float(row.get("action_shadow", {}).get("route_to_visual_rms_ratio_mean") or 0.0) >= 0.005 for row in later):
+        errors.append("shadow_route_never_reaches_minimum_effect")
+    if not any(
+        float(row.get("reason_transport", {}).get("route_off_logit_delta_abs_mean") or 0.0) > 1e-8
+        and float(row.get("reason_transport", {}).get("shuffle_logit_delta_abs_mean") or 0.0) > 1e-8
+        for row in later
+    ):
+        errors.append("reason_full_off_shuffle_do_not_differ")
+    if any(
+        row.get("reason_transport", {}).get("no_lane_absence_polarity", {}).get("available") is not True
+        or row.get("reason_transport", {}).get("no_lane_absence_polarity", {}).get("contract") != "observability_times_absence"
+        for row in later
+    ):
+        errors.append("no_lane_absence_polarity_diagnostic_is_missing")
+    if not any(
+        float(row.get("fine_transport", {}).get("fine_off_action_shadow_delta_abs_mean") or 0.0) > 1e-8
+        and float(row.get("fine_transport", {}).get("fine_off_reason_latent_delta_abs_mean") or 0.0) > 1e-8
+        for row in later
+    ):
+        errors.append("fine_coordinate_shuffle_does_not_affect_shadow_or_latent_reason")
+    if not any(
+        int(row.get("action_shadow", {}).get("support_nonzero_action_count") or 0) >= 1
+        and int(row.get("action_shadow", {}).get("veto_nonzero_action_count") or 0) >= 1
+        for row in later
+    ):
+        errors.append("support_or_veto_route_is_inactive")
+
+    initial_action = ordered[0].get("action_shadow", {}).get("final_act_map")
+    final_action = ordered[-1].get("action_shadow", {}).get("final_act_map")
+    if not isinstance(initial_action, (int, float)) or not isinstance(final_action, (int, float)) or float(final_action) <= float(initial_action):
+        errors.append("raw_action_map_did_not_improve_over_epoch_zero")
+    final_reason = ordered[-1].get("reason_transport", {}).get("final_exp_map")
+    visual_reason = ordered[-1].get("reason_transport", {}).get("visual_exp_map")
+    if not isinstance(final_reason, (int, float)) or not isinstance(visual_reason, (int, float)) or float(final_reason) < float(visual_reason) - 0.005:
+        errors.append("final_reason_regressed_vs_visual")
+    initial_reason = ordered[0].get("reason_transport", {}).get("final_exp_map")
+    if not isinstance(initial_reason, (int, float)) or not isinstance(final_reason, (int, float)) or float(final_reason) <= float(initial_reason):
+        errors.append("raw_reason_map_did_not_improve_over_epoch_zero")
+    initial_content = int(ordered[0].get("continuous_credibility", {}).get("content_beats_prior_factor_count") or 0)
+    final_content = int(ordered[-1].get("continuous_credibility", {}).get("content_beats_prior_factor_count") or 0)
+    if final_content <= initial_content:
+        errors.append("content_only_factor_quality_did_not_grow")
+    for row in later:
+        pu = row.get("pu", {})
+        if pu.get("available") is not True:
+            errors.append("pu_margin_is_unavailable")
+            break
+        if bool(pu.get("enabled_by_margin")) != bool(pu.get("schedule_enabled")):
+            errors.append("pu_margin_does_not_control_only_pu_route")
+            break
+    return {
+        "pass": not errors,
+        "errors": errors,
+        "epoch_count": len(ordered),
+        "initial_action_map": initial_action,
+        "final_action_map": final_action,
+        "initial_reason_map": initial_reason,
+        "final_reason_map": final_reason,
+        "initial_content_beats_prior_factor_count": initial_content,
+        "final_content_beats_prior_factor_count": final_content,
+    }
 
 
 def initialize_icdor_run_artifacts(
@@ -346,10 +733,41 @@ def validate_icdor_artifact_schema(
         branch = json.loads((epoch_dir / "branch_metrics.json").read_text(encoding="utf-8"))
         if branch.get("available") is not True:
             errors.append(f"epoch_{epoch:03d} branch metrics are unavailable")
+        mechanism = json.loads((epoch_dir / "mechanism_summary.json").read_text(encoding="utf-8"))
+        if v4_run and not _mechanism_summary_valid(mechanism):
+            errors.append(f"epoch_{epoch:03d} mechanism summary is incomplete or changes CREDO semantics")
         calibration_rows = _read_jsonl(epoch_dir / "calibration_stats.jsonl")
         if any(row.get("source_split") != "train_calib" for row in calibration_rows):
             errors.append(f"epoch_{epoch:03d} calibration uses a non-train_calib source")
         reason_rows = _read_jsonl(epoch_dir / "reason_dual_observation_stats.jsonl")
+        if v4_run:
+            test_reason_rows = [
+                row for row in reason_rows
+                if row.get("split") == "test" and isinstance(row.get("reason_id"), int)
+            ]
+            reason_fields = {
+                "residual_alpha_mean", "escape_weight_mean", "allowed_factor_mass_mean",
+                "disallowed_factor_mass_mean", "reason_factor_mask_area_mean",
+                "reason_factor_mask_entropy", "semantic_compatibility_mean",
+                "absence_factor_mass_mean", "absence_negative_evidence_mean",
+            }
+            if (
+                len(test_reason_rows) != 21
+                or any(not reason_fields <= set(row) for row in test_reason_rows)
+                or any(
+                    not all(
+                        isinstance(row.get(field), (int, float))
+                        and torch.isfinite(torch.tensor(float(row[field])))
+                        for field in reason_fields
+                    )
+                    or not 0.0 <= float(row["residual_alpha_mean"]) <= 0.25
+                    or not 0.0 <= float(row["escape_weight_mean"]) <= 1.0
+                    or not 0.0 <= float(row["allowed_factor_mass_mean"]) <= 1.0
+                    or not 0.0 <= float(row["disallowed_factor_mass_mean"]) <= 1e-6
+                    for row in test_reason_rows
+                )
+            ):
+                errors.append(f"epoch_{epoch:03d} reason route diagnostics are incomplete or violate ownership")
         hidden_rows = [row for row in reason_rows if row.get("audit") == "hidden_recovery"]
         hidden_grid = {
             (row.get("mode"), float(row.get("hide_fraction", -1.0)))
@@ -400,6 +818,20 @@ def validate_icdor_artifact_schema(
             or not isinstance(visual_credibility.get("credibility"), list)
         ):
             errors.append(f"epoch_{epoch:03d} visual credibility lacks audit_visual provenance")
+        factor_audit = json.loads((epoch_dir / "factor_audit.json").read_text(encoding="utf-8"))
+        if v4_run:
+            factor_stats = factor_audit.get("factor_stats")
+            required_factor_sections = {"counts", "scores", "prototype", "bootstrap_lcb95"}
+            if (
+                factor_audit.get("source_split") != "audit_visual"
+                or not isinstance(factor_stats, dict)
+                or not factor_stats
+                or any(
+                    not isinstance(stats, dict) or not required_factor_sections <= set(stats)
+                    for stats in factor_stats.values()
+                )
+            ):
+                errors.append(f"epoch_{epoch:03d} factor audit lacks source-count and content/prior evidence")
         semantic = json.loads((epoch_dir / "semantic_compatibility.json").read_text(encoding="utf-8"))
         utility = json.loads((epoch_dir / "target_utility.json").read_text(encoding="utf-8"))
         if v4_run and state_before != "FOUNDATION":
@@ -451,16 +883,10 @@ def validate_icdor_artifact_schema(
                         break
         gradient_rows = _read_jsonl(epoch_dir / "gradient_ownership.jsonl")
         required_gradient_fields = {"epoch", "step", "loss", "owner_group", "grad_norm", "finite"}
-        firewall_pairs = {
-            ("loss_action_total", "reason_adapter"),
-            ("loss_reason_total", "action_adapter"),
-        }
-        observed_pairs = {(row.get("loss"), row.get("owner_group")) for row in gradient_rows}
         if (
             not gradient_rows
             or any(not required_gradient_fields <= set(row) or row.get("finite") is not True for row in gradient_rows)
-            or not firewall_pairs <= observed_pairs
-            or any(float(row["grad_norm"]) != 0.0 for row in gradient_rows if (row.get("loss"), row.get("owner_group")) in firewall_pairs)
+            or (v4_run and not _gradient_firewall_rows_valid(gradient_rows))
         ):
             errors.append(f"epoch_{epoch:03d} gradient ownership audit is incomplete")
         names = json.loads((epoch_dir / "logits" / "file_names.json").read_text(encoding="utf-8"))
@@ -482,7 +908,10 @@ def validate_icdor_artifact_schema(
                 not isinstance(row.get(field), (int, float))
                 or not torch.isfinite(torch.tensor(float(row[field])))
                 or not 0.0 <= float(row[field]) <= 1.0
-                for field in ("cV_mean", "cV_p50", "cV_p95", "cV_ema_mean", "cV_nonzero_rate")
+                for field in (
+                    "cV_mean", "cV_p50", "cV_p95", "cV_ema_mean",
+                    "cV_nonzero_rate", "cV_route_effective_mean",
+                )
             )
             for row in credibility_rows
         )):
@@ -494,7 +923,11 @@ def validate_icdor_artifact_schema(
             or not all(
                 isinstance(row.get(field), (int, float))
                 and torch.isfinite(torch.tensor(float(row[field])))
-                for field in ("fine_mask_delta_mean", "fine_mask_delta_max", "anchor_separation_mean")
+                for field in (
+                    "fine_mask_delta_mean", "fine_mask_delta_max", "anchor_separation_mean",
+                    "fine_off_action_shadow_delta_abs_mean", "fine_off_reason_latent_delta_abs_mean",
+                    "coarse_off_action_shadow_delta_abs_mean", "coarse_off_reason_latent_delta_abs_mean",
+                )
             )
             for row in fine_rows
         ) or not any(float(row.get("fine_mask_delta_mean", 0.0)) > 1e-8 for row in fine_rows)):

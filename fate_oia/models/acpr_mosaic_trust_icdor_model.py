@@ -64,6 +64,8 @@ class MOSAICTrustICDORModel(nn.Module):
         content_temperature_init: float = 0.07,
         gate_init: float = 0.02,
         gate_max: float = 0.15,
+        shadow_credibility_floor: float = 0.05,
+        router_dustbin_init: float = -4.0,
         pi_min: float = 0.20,
         pi_max: float = 0.95,
         observed_mix_init: float = 0.05,
@@ -84,8 +86,11 @@ class MOSAICTrustICDORModel(nn.Module):
             raise ValueError("CREDO visual credibility must remain independent of reason labels")
         if not 0.0 <= float(action_credibility_min_for_admission) <= 1.0:
             raise ValueError("action credibility admission minimum must be in [0,1]")
+        if not 0.0 < float(shadow_credibility_floor) <= 0.10:
+            raise ValueError("CREDO shadow credibility floor must be in (0, 0.10]")
         self.credibility_independent_of_reason_labels = True
         self.action_credibility_min_for_admission = float(action_credibility_min_for_admission)
+        self.shadow_credibility_floor = float(shadow_credibility_floor)
         self.fine_transport_diagnostics = {
             "fine_off": bool(fine_off_diagnostic),
             "coarse_off": bool(coarse_off_diagnostic),
@@ -155,7 +160,9 @@ class MOSAICTrustICDORModel(nn.Module):
             highres_topk=highres_topk,
             midres_topk=midres_topk,
         )
-        self.action_router = MOSAICTargetSparseRouter(self.ontology, dim=dim)
+        self.action_router = MOSAICTargetSparseRouter(
+            self.ontology, dim=dim, dustbin_init=router_dustbin_init
+        )
         self.target_utility = MOSAICAuditTargetUtility(
             factor_count=len(self.ontology["factors"]), reason_count=21, action_count=4
         )
@@ -406,7 +413,13 @@ class MOSAICTrustICDORModel(nn.Module):
         credibility["cV"] = stored_credibility
         credibility["cV_ema"] = stored_credibility
         factor_output.update(credibility)
+        # cV from the preceding audit controls relative route strength. The
+        # small documented floor is learning access only: it keeps every
+        # shadow route trainable at epoch zero while final action remains
+        # visual-only until independent edge admission.
         continuous_route_weight = stored_credibility.detach().clamp(0.0, 1.0)
+        route_credibility = continuous_route_weight.clamp_min(self.shadow_credibility_floor)
+        factor_output["cV_route_effective"] = route_credibility
         target_utility_state = self.target_utility()
         if factor_intervention_keep_mask is None:
             intervention_keep = images.new_ones(images.shape[0], self.factor_certificate_tier.numel())
@@ -461,33 +474,42 @@ class MOSAICTrustICDORModel(nn.Module):
         )
         factor_output["sample_attention"] = factor_output["sample_attention"] * typed_mask_values
         factor_output["sampled_features"] = factor_output["sampled_features"] * typed_mask_values.unsqueeze(-1)
+        # Factor measurement has its own objective. Action shadow may read
+        # its evidence, but must not update the factor visual lane.
+        action_factor_features = factor_output["factor_features"].detach()
+        action_positive_evidence = factor_output["factor_positive_evidence"].detach()
+        action_negative_evidence = factor_output["factor_negative_evidence"].detach()
+        action_factor_masks = factor_output["factor_soft_masks"].detach()
+        action_sampling_coordinates = factor_output["sampling_coordinates"].detach()
+        action_sampled_features = factor_output["sampled_features"].detach()
+        action_sample_attention = factor_output["sample_attention"].detach()
         action_output = self.action_visual_decoder(action_pyramid)
         router_output = self.action_router(
-            factor_output["factor_features"],
-            factor_output["factor_positive_evidence"],
-            factor_output["factor_negative_evidence"],
+            action_factor_features,
+            action_positive_evidence,
+            action_negative_evidence,
             action_output["action_queries"],
             route_mode=route_mode,
-            factor_credibility=credibility["cV"],
+            factor_credibility=route_credibility,
             factor_target_utility=target_utility_state["action_target_utility"],
         )
         reread_output = self.action_rereader(
             action_pyramid,
             action_output["action_queries"],
-            factor_output["factor_soft_masks"],
+            action_factor_masks,
             router_output["support_weights"],
             router_output["veto_weights"],
-            factor_output["sampling_coordinates"],
-            factor_output["sampled_features"],
-            factor_output["sample_attention"],
+            action_sampling_coordinates,
+            action_sampled_features,
+            action_sample_attention,
         )
         equal_mass_random_masks = torch.roll(
-            factor_output["factor_soft_masks"],
-            shifts=(factor_output["factor_soft_masks"].shape[-2] // 3, factor_output["factor_soft_masks"].shape[-1] // 3),
+            action_factor_masks,
+            shifts=(action_factor_masks.shape[-2] // 3, action_factor_masks.shape[-1] // 3),
             dims=(-2, -1),
         )
         random_sampling_coordinates = self._rolled_typed_coordinates(
-            factor_output["sampling_coordinates"],
+            action_sampling_coordinates,
             height=equal_mass_random_masks.shape[-2],
             width=equal_mass_random_masks.shape[-1],
         )
@@ -495,7 +517,7 @@ class MOSAICTrustICDORModel(nn.Module):
             equal_mass_random_masks, random_sampling_coordinates
         )
         random_sampled_features = self._resample_typed_features(
-            factor_pyramid["F_hi"], random_sampling_coordinates
+            factor_pyramid["F_hi"].detach(), random_sampling_coordinates
         ) * random_sample_attention.unsqueeze(-1)
         random_reread_output = None if route_mode == "off" else self.action_rereader(
             action_pyramid,
@@ -508,12 +530,15 @@ class MOSAICTrustICDORModel(nn.Module):
             random_sample_attention,
         )
         action_shadow = (
-            action_output["action_visual_logits"]
+            action_output["action_visual_logits"].detach()
             + reread_output["action_support_logits"]
             - reread_output["action_veto_logits"]
         )
-        action_matched_random = action_output["action_visual_logits"] if random_reread_output is None else (
-            action_output["action_visual_logits"]
+        # The same-image random control is a shadow-route objective. Anchor
+        # it to a stopped visual baseline so its loss cannot update the direct
+        # visual action owner through the matched-control branch.
+        action_matched_random = action_output["action_visual_logits"].detach() if random_reread_output is None else (
+            action_output["action_visual_logits"].detach()
             + random_reread_output["action_support_logits"]
             - random_reread_output["action_veto_logits"]
         )
@@ -525,7 +550,7 @@ class MOSAICTrustICDORModel(nn.Module):
         action_final = compose_final_action_logits(action_output["action_visual_logits"], action_shadow, admitted)
         reason_visual = self.reason_visual_decoder(reason_pyramid)
         if reason_route_mode == "full":
-            reason_reliability = continuous_route_weight
+            reason_reliability = route_credibility
             reason_factor_features = factor_output["factor_features"] * reason_reliability.unsqueeze(-1)
             reason_factor_masks = factor_output["factor_soft_masks"] * reason_reliability.unsqueeze(-1).unsqueeze(-1)
             reason_route_enabled = torch.ones_like(self.reason_factor_route_enabled)

@@ -7,6 +7,12 @@ factors:
     contradicts: []
     positive_reason_anchors: [3]
     grounding_sources: [box2d]
+    role: observable
+    visual_sources: [box2d]
+    attribute_constraints: {}
+    negative_policy: reliable_if_source_complete
+    source_kind: grounded
+    target_candidates: {actions: [], reasons: [0, 3, 13, 19]}
   - name: red_light_visible
     type: point
     num_prototypes: 3
@@ -19,6 +25,8 @@ factors:
     source_kind: grounded
     attribute_constraints: {trafficLightColor: red}
     negative_policy: reliable_if_attribute_complete
+    visual_sources: [box2d, bdd100k_attributes]
+    target_candidates: {actions: [stop], reasons: [0, 13, 19]}
   - name: green_light_visible
     type: point
     num_prototypes: 3
@@ -31,6 +39,8 @@ factors:
     source_kind: grounded
     attribute_constraints: {trafficLightColor: green}
     negative_policy: reliable_if_attribute_complete
+    visual_sources: [box2d, bdd100k_attributes]
+    target_candidates: {actions: [], reasons: [0]}
   - name: traffic_sign_visible
     type: point
     num_prototypes: 3
@@ -39,6 +49,12 @@ factors:
     contradicts: []
     positive_reason_anchors: [4]
     grounding_sources: [box2d]
+    role: observable
+    visual_sources: [box2d]
+    attribute_constraints: {}
+    negative_policy: reliable_if_source_complete
+    source_kind: grounded
+    target_candidates: {actions: [], reasons: [4]}
   - name: front_vehicle_visible
     type: object
     num_prototypes: 4
@@ -47,6 +63,12 @@ factors:
     contradicts: []
     positive_reason_anchors: [1, 5, 14, 20]
     grounding_sources: [box2d]
+    role: observable
+    visual_sources: [box2d]
+    attribute_constraints: {}
+    negative_policy: reliable_if_source_complete
+    source_kind: grounded
+    target_candidates: {actions: [], reasons: [1, 5, 14, 20]}
   - name: front_vehicle_risk_proxy
     type: object
     num_prototypes: 3
@@ -57,10 +79,12 @@ factors:
     # A single-frame 2D box cannot identify physical proximity reliably.
     # Keep this risk proxy out of direct reason/action ownership.
     grounding_sources: [box2d]
-    role: latent_proxy
+    role: latent_only
     source_kind: proxy
     attribute_constraints: {proxy: front_box_risk}
     negative_policy: unknown_without_depth
+    visual_sources: [box2d]
+    target_candidates: {actions: [], reasons: [5]}
   - name: pedestrian_front_visible
     type: object
     num_prototypes: 3
@@ -69,6 +93,12 @@ factors:
     contradicts: []
     positive_reason_anchors: [6]
     grounding_sources: [box2d]
+    role: observable
+    visual_sources: [box2d]
+    attribute_constraints: {}
+    negative_policy: reliable_if_source_complete
+    source_kind: grounded
+    target_candidates: {actions: [], reasons: [6]}
   - name: rider_front_visible
     type: object
     num_prototypes: 3
@@ -77,6 +107,12 @@ factors:
     contradicts: []
     positive_reason_anchors: [7]
     grounding_sources: [box2d]
+    role: observable
+    visual_sources: [box2d]
+    attribute_constraints: {}
+    negative_policy: reliable_if_source_complete
+    source_kind: grounded
+    target_candidates: {actions: [], reasons: [7]}
   - name: left_obstacle_visible
     type: object
     num_prototypes: 3
@@ -85,6 +121,12 @@ factors:
     contradicts: []
     positive_reason_anchors: [10]
     grounding_sources: [box2d]
+    role: observable
+    visual_sources: [box2d]
+    attribute_constraints: {}
+    negative_policy: reliable_if_source_complete
+    source_kind: grounded
+    target_candidates: {actions: [], reasons: [8, 10]}
   - name: right_obstacle_visible
     type: object
     num_prototypes: 3
@@ -93,6 +135,12 @@ factors:
     contradicts: []
     positive_reason_anchors: [16]
     grounding_sources: [box2d]
+    role: observable
+    visual_sources: [box2d]
+    attribute_constraints: {}
+    negative_policy: reliable_if_source_complete
+    source_kind: grounded
+    target_candidates: {actions: [], reasons: [8, 16]}
   - name: left_lane_marking_visible
     type: curve
     num_prototypes: 3
@@ -101,6 +149,12 @@ factors:
     contradicts: []
     positive_reason_anchors: [11, 12]
     grounding_sources: [lane_polyline]
+    role: observable
+    visual_sources: [lane_polyline]
+    attribute_constraints: {}
+    negative_policy: reliable_if_source_complete
+    source_kind: grounded
+    target_candidates: {actions: [], reasons: [9, 11, 12]}
   - name: right_lane_marking_visible
     type: curve
     num_prototypes: 3
@@ -109,6 +163,12 @@ factors:
     contradicts: []
     positive_reason_anchors: [17, 18]
     grounding_sources: [lane_polyline]
+    role: observable
+    visual_sources: [lane_polyline]
+    attribute_constraints: {}
+    negative_policy: reliable_if_source_complete
+    source_kind: grounded
+    target_candidates: {actions: [], reasons: [15, 17, 18]}
   - name: left_solid_boundary_visible
     type: curve
     num_prototypes: 3
@@ -117,6 +177,12 @@ factors:
     contradicts: []
     positive_reason_anchors: [11]
     grounding_sources: [lane_polyline]
+    role: observable
+    visual_sources: [lane_polyline]
+    attribute_constraints: {laneStyle: solid}
+    negative_policy: reliable_if_attribute_complete
+    source_kind: grounded
+    target_candidates: {actions: [left], reasons: [9, 11]}
   - name: right_solid_boundary_visible
     type: curve
     num_prototypes: 3
@@ -125,6 +191,12 @@ factors:
     contradicts: []
     positive_reason_anchors: [17]
     grounding_sources: [lane_polyline]
+    role: observable
+    visual_sources: [lane_polyline]
+    attribute_constraints: {laneStyle: solid}
+    negative_policy: reliable_if_attribute_complete
+    source_kind: grounded
+    target_candidates: {actions: [right], reasons: [15, 17]}
   - name: left_turn_marking_visible
     type: curve
     num_prototypes: 3
@@ -133,6 +205,12 @@ factors:
     contradicts: []
     positive_reason_anchors: [12]
     grounding_sources: [lane_polyline]
+    role: observable
+    visual_sources: [lane_polyline]
+    attribute_constraints: {laneDirection: left}
+    negative_policy: reliable_if_attribute_complete
+    source_kind: grounded
+    target_candidates: {actions: [left], reasons: [12]}
   - name: right_turn_marking_visible
     type: curve
     num_prototypes: 3
@@ -141,6 +219,12 @@ factors:
     contradicts: []
     positive_reason_anchors: [18]
     grounding_sources: [lane_polyline]
+    role: observable
+    visual_sources: [lane_polyline]
+    attribute_constraints: {laneDirection: right}
+    negative_policy: reliable_if_attribute_complete
+    source_kind: grounded
+    target_candidates: {actions: [right], reasons: [18]}
   - name: center_drivable_region_visible
     type: region
     num_prototypes: 3
@@ -149,6 +233,12 @@ factors:
     contradicts: []
     positive_reason_anchors: [2]
     grounding_sources: [drivable_mask]
+    role: observable
+    visual_sources: [drivable_mask]
+    attribute_constraints: {areaType: direct}
+    negative_policy: reliable_if_source_complete
+    source_kind: grounded
+    target_candidates: {actions: [forward], reasons: [2]}
   - name: left_drivable_region_visible
     type: region
     num_prototypes: 3
@@ -157,6 +247,12 @@ factors:
     contradicts: []
     positive_reason_anchors: [12]
     grounding_sources: [drivable_mask]
+    role: observable
+    visual_sources: [drivable_mask]
+    attribute_constraints: {areaType: direct}
+    negative_policy: reliable_if_source_complete
+    source_kind: grounded
+    target_candidates: {actions: [left], reasons: [9, 12]}
   - name: right_drivable_region_visible
     type: region
     num_prototypes: 3
@@ -165,6 +261,12 @@ factors:
     contradicts: []
     positive_reason_anchors: [18]
     grounding_sources: [drivable_mask]
+    role: observable
+    visual_sources: [drivable_mask]
+    attribute_constraints: {areaType: direct}
+    negative_policy: reliable_if_source_complete
+    source_kind: grounded
+    target_candidates: {actions: [right], reasons: [15, 18]}
   - name: center_corridor_occupied
     type: region
     num_prototypes: 4
@@ -173,6 +275,12 @@ factors:
     contradicts: []
     positive_reason_anchors: [8]
     grounding_sources: [box2d]
+    role: observable
+    visual_sources: [box2d]
+    attribute_constraints: {}
+    negative_policy: reliable_if_source_complete
+    source_kind: grounded
+    target_candidates: {actions: [forward, stop], reasons: [2, 8]}
   - name: left_corridor_occupied
     type: region
     num_prototypes: 3
@@ -181,6 +289,12 @@ factors:
     contradicts: []
     positive_reason_anchors: [10]
     grounding_sources: [box2d]
+    role: observable
+    visual_sources: [box2d]
+    attribute_constraints: {}
+    negative_policy: reliable_if_source_complete
+    source_kind: grounded
+    target_candidates: {actions: [left], reasons: [10]}
   - name: right_corridor_occupied
     type: region
     num_prototypes: 3
@@ -189,6 +303,12 @@ factors:
     contradicts: []
     positive_reason_anchors: [16]
     grounding_sources: [box2d]
+    role: observable
+    visual_sources: [box2d]
+    attribute_constraints: {}
+    negative_policy: reliable_if_source_complete
+    source_kind: grounded
+    target_candidates: {actions: [right], reasons: [16]}
   - name: front_vehicle_left_indicator_visible
     type: object
     num_prototypes: 3
@@ -197,6 +317,12 @@ factors:
     contradicts: [front_vehicle_right_indicator_visible]
     positive_reason_anchors: [14]
     grounding_sources: [image_only]
+    role: latent_only
+    visual_sources: [image_only]
+    attribute_constraints: {}
+    negative_policy: unknown_without_direct_visual_evidence
+    source_kind: image_only
+    target_candidates: {actions: [], reasons: [14, 20]}
   - name: front_vehicle_right_indicator_visible
     type: object
     num_prototypes: 3
@@ -205,3 +331,9 @@ factors:
     contradicts: [front_vehicle_left_indicator_visible]
     positive_reason_anchors: [20]
     grounding_sources: [image_only]
+    role: latent_only
+    visual_sources: [image_only]
+    attribute_constraints: {}
+    negative_policy: unknown_without_direct_visual_evidence
+    source_kind: image_only
+    target_candidates: {actions: [], reasons: [14, 20]}

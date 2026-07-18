@@ -12,6 +12,7 @@ from fate_oia.models.mosaic_icdor_dual_reason_decoder import (
 )
 from fate_oia.models.mosaic_icdor_observation_head import MOSAICICDORObservationHead
 from fate_oia.models.mosaic_native_semantics import load_icdor_ontology
+from fate_oia.losses.mosaic_icdor_reason_losses import reason_observed_losses
 
 
 def _pyramid(batch_size: int, dim: int) -> dict[str, torch.Tensor]:
@@ -66,3 +67,29 @@ def test_icdor_dual_reason_paths_and_observation_posterior_are_separated() -> No
     assert posterior["reason_latent_posterior"].requires_grad is False
     assert torch.all((posterior["reason_latent_posterior"] >= 0) & (posterior["reason_latent_posterior"] <= 1))
     assert "observed_reason_targets" not in inspect.signature(observation.forward).parameters
+
+
+def test_direct_observed_reason_asl_is_balanced_within_each_label() -> None:
+    """Duplicating known negatives must not dilute a rare observed positive."""
+    logits = torch.zeros(2, 21)
+    logits[1, 0] = 2.0
+    targets = torch.zeros(2, 21)
+    targets[0, 0] = 1.0
+    valid = torch.zeros(2, 21, dtype=torch.bool)
+    valid[:, 0] = True
+    base = reason_observed_losses(logits, logits, targets, observed_valid_mask=valid)
+
+    duplicated_logits = torch.cat((logits[:1], logits[1:].repeat(4, 1)), dim=0)
+    duplicated_targets = torch.cat((targets[:1], targets[1:].repeat(4, 1)), dim=0)
+    duplicated_valid = torch.cat((valid[:1], valid[1:].repeat(4, 1)), dim=0)
+    duplicated = reason_observed_losses(
+        duplicated_logits,
+        duplicated_logits,
+        duplicated_targets,
+        observed_valid_mask=duplicated_valid,
+    )
+
+    assert torch.allclose(
+        base["loss_reason_visual_observed_asl"],
+        duplicated["loss_reason_visual_observed_asl"],
+    )

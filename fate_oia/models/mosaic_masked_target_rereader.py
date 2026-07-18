@@ -112,18 +112,20 @@ class MOSAICMaskedTargetRereader(nn.Module):
                 raise ValueError("typed rereader requires coordinates, features, and attention together")
             support_typed = self.typed_rereader(
                 high.detach(), action_queries.detach(), sampling_coordinates.detach(), sampled_features.detach(),
-                sample_attention.detach(), support_weights.detach()
+                # Route weights belong to the action-route owner. Keep them
+                # differentiable while all factor-owned visual inputs stay detached.
+                sample_attention.detach(), support_weights
             )
             veto_typed = self.typed_rereader(
                 high.detach(), action_queries.detach(), sampling_coordinates.detach(), sampled_features.detach(),
-                sample_attention.detach(), veto_weights.detach()
+                sample_attention.detach(), veto_weights
             )
             support_gate = (self.gate_max * torch.sigmoid(self.support_gate_raw)).clamp_max(self.active_gate_cap).view(1, -1)
             veto_gate = (self.gate_max * torch.sigmoid(self.veto_gate_raw)).clamp_max(self.active_gate_cap).view(1, -1)
             support_logits = support_gate * support_typed["support_logits"]
             veto_logits = veto_gate * veto_typed["veto_logits"]
-            support_mask = torch.einsum("bfa,bfhw->bahw", support_weights.detach(), factor_masks.detach())
-            veto_mask = torch.einsum("bfa,bfhw->bahw", veto_weights.detach(), factor_masks.detach())
+            support_mask = torch.einsum("bfa,bfhw->bahw", support_weights, factor_masks.detach())
+            veto_mask = torch.einsum("bfa,bfhw->bahw", veto_weights, factor_masks.detach())
             return {
                 "action_support_nodes": support_typed["target_nodes"],
                 "action_veto_nodes": veto_typed["target_nodes"],
@@ -140,8 +142,8 @@ class MOSAICMaskedTargetRereader(nn.Module):
                 "action_typed_target_coordinates": support_typed["target_coordinates"],
                 "action_typed_local_offsets": support_typed["target_local_offsets"],
             }
-        support_mask = torch.einsum("bfa,bfhw->bahw", support_weights.detach(), factor_masks.detach())
-        veto_mask = torch.einsum("bfa,bfhw->bahw", veto_weights.detach(), factor_masks.detach())
+        support_mask = torch.einsum("bfa,bfhw->bahw", support_weights, factor_masks.detach())
+        veto_mask = torch.einsum("bfa,bfhw->bahw", veto_weights, factor_masks.detach())
         support_nodes, support_attention, support_active = self._read(high.detach(), action_queries.detach(), support_mask, self.support_query)
         veto_nodes, veto_attention, veto_active = self._read(high.detach(), action_queries.detach(), veto_mask, self.veto_query)
         support_gate = (self.gate_max * torch.sigmoid(self.support_gate_raw)).clamp_max(self.active_gate_cap).view(1, -1)

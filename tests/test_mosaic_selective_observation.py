@@ -93,6 +93,8 @@ def test_observed_positive_posterior_is_exactly_one_and_posterior_is_detached() 
     )
     assert torch.equal(output["reason_latent_posterior"][labels.bool()], torch.ones_like(labels[labels.bool()]))
     assert output["reason_latent_posterior"].requires_grad is False
+    assert output["reason_latent_posterior_live"].requires_grad is True
+    assert torch.allclose(output["reason_latent_posterior_live"].detach(), output["reason_latent_posterior"])
 
 
 def test_reason_labels_never_change_propensity_features() -> None:

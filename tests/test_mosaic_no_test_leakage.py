@@ -55,7 +55,7 @@ def _loader():
 
 def test_formal_forward_accepts_no_labels_geometry_or_threshold_metadata() -> None:
     parameters = inspect.signature(MOSAICADModel.forward).parameters
-    assert list(parameters) == ["self", "images", "prior_mode", "return_masks"]
+    assert list(parameters) == ["self", "images", "prior_mode", "return_masks", "return_intermediates"]
     forbidden = {"action", "reason", "labels", "geometry", "threshold", "metadata"}
     assert not forbidden & set(parameters)
 

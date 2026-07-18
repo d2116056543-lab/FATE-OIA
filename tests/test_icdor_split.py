@@ -107,3 +107,36 @@ def test_factor_aware_audit_subset_balances_real_geometry_availability(monkeypat
     assert any(geometry[name][0] == "car" for name in selected_names)
     assert any(geometry[name][0] == "traffic light" for name in selected_names)
     assert any(geometry[name][1] == "drivable" for name in selected_names)
+
+
+def test_factor_aware_subset_is_not_filename_order_truncation(monkeypatch: pytest.MonkeyPatch) -> None:
+    dataset = _dataset(8)
+    geometry = {
+        "frame_0000.jpg": (None, None),
+        "frame_0001.jpg": (None, None),
+        "frame_0002.jpg": (None, None),
+        "frame_0003.jpg": (None, None),
+        "frame_0004.jpg": ("car", None),
+        "frame_0005.jpg": ("traffic light", None),
+        "frame_0006.jpg": (None, "drivable"),
+        "frame_0007.jpg": ("car", "drivable"),
+    }
+
+    class _Index:
+        def lookup(self, file_name: str) -> SimpleNamespace:
+            label_json, drivable_map = geometry[file_name]
+            return SimpleNamespace(label_json=label_json, drivable_map=drivable_map)
+
+    monkeypatch.setattr(
+        trainer,
+        "load_bdd100k_objects",
+        lambda label_json: [{"category": label_json}] if label_json else [],
+    )
+    selected = trainer._factor_aware_audit_subset(
+        dataset, range(8), 4, grounding_index=_Index(), seed=20260713,
+    )
+    assert set(selected) != set(range(4))
+    selected_names = {dataset.samples[index].file_name for index in selected}
+    assert any(geometry[name][0] == "car" for name in selected_names)
+    assert any(geometry[name][0] == "traffic light" for name in selected_names)
+    assert any(geometry[name][1] == "drivable" for name in selected_names)

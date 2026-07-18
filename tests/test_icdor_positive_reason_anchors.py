@@ -67,3 +67,21 @@ def test_visual_factor_supervision_can_disable_reason_label_anchors() -> None:
     assert not result["positive_anchor_mask"].any()
     assert not result["supervision_mask"].any()
 
+
+def test_visual_factor_supervision_accepts_no_reason_tensor_when_anchors_are_disabled() -> None:
+    """CREDO visual-factor learning must not even receive observed reason labels."""
+    module = importlib.import_module("fate_oia.datasets.mosaic_icdor_factor_supervision")
+    observations = {key: torch.zeros(1, 1) for key in (
+        "presence_target", "presence_known_mask", "geometry_known_mask", "weak_negative_mask"
+    )}
+
+    result = module.build_factor_supervision(
+        observations,
+        None,
+        ({"name": "traffic_control", "positive_reason_anchors": [3], "grounding_source": "box2d"},),
+        split="train_core",
+        allow_reason_anchors=False,
+    )
+
+    assert not result["positive_anchor_mask"].any()
+

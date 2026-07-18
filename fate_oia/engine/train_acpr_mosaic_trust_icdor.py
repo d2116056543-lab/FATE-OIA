@@ -55,6 +55,7 @@ from fate_oia.losses.mosaic_icdor_action_losses import action_base_losses, actio
 from fate_oia.losses.mosaic_icdor_factor_losses import (
     factor_contradiction_consistency_loss,
     factor_positive_anchor_loss,
+    factor_selective_contrastive_loss,
     factor_geometry_alignment_loss,
     factor_presence_visibility_losses,
     factor_prototype_regularization,
@@ -67,14 +68,18 @@ from fate_oia.losses.mosaic_icdor_reason_losses import (
 )
 from fate_oia.losses.mosaic_posterior_ranking import (
     action_cross_image_ranking_loss,
+    observed_reason_cross_image_ranking_loss,
     posterior_weighted_reason_ranking_loss,
 )
 from fate_oia.models.acpr_mosaic_trust_icdor_model import MOSAICTrustICDORModel
 from fate_oia.optim.mosaic_action_pareto_admission import MOSAICActionParetoAdmission
 from fate_oia.optim.mosaic_soft_rank_queue import MOSAICAccumulationQueueBuffer, MOSAICSoftRankQueue
 from fate_oia.utils.mosaic_icdor_artifacts import (
+    ICDOR_REQUIRED_ZERO_GRADIENTS,
+    build_icdor_mechanism_summary,
     initialize_icdor_run_artifacts,
     validate_icdor_artifact_schema,
+    validate_icdor_pilot_mechanism,
     write_icdor_adaptive_schedule_transition,
     write_icdor_epoch_artifacts,
 )
@@ -111,13 +116,12 @@ def resolve_icdor_policy_weights(policy: Mapping[str, float] | None = None) -> d
     """Resolve route/loss policy once so scheduler decisions affect training."""
     defaults = {
         "action_visual": 1.0,
-        # The old cross-image queue rank is retained only as a diagnostic;
-        # v4 uses the same-image selected-vs-random matched control instead.
-        "action_rank": 0.0,
+        "action_rank": 0.10,
         "action_shadow": 0.50,
         "reason_visual_observed": 1.0,
+        "reason_observed_rank": 0.05,
         "reason_observation": 0.20,
-        "reason_posterior_rank": 0.0,
+        "reason_posterior_rank": 0.05,
         "factor_presence": 1.0,
     }
     if policy is not None:
@@ -148,9 +152,11 @@ def clip_icdor_owner_gradients(
     return norms
 
 
-def _pending_evidence_document(artifact: str, *, build_epoch: int) -> dict[str, Any]:
+def _pending_evidence_document(artifact: str, *, build_epoch: int | None) -> dict[str, Any]:
     """Persist an honest pre-collection state without fabricating audit evidence."""
-    if artifact not in {"factor_certificate", "edge_admission"} or build_epoch < 0:
+    if artifact not in {"factor_certificate", "edge_admission"} or (
+        build_epoch is not None and build_epoch < 0
+    ):
         raise ValueError("IC-DOR pending evidence document is invalid")
     return {
         "artifact": artifact,
@@ -158,7 +164,10 @@ def _pending_evidence_document(artifact: str, *, build_epoch: int) -> dict[str, 
         "available": False,
         "source_split": None,
         "build_epoch": build_epoch,
-        "reason": "scheduled_train_audit_collection_not_completed",
+        "reason": (
+            "adaptive_audit_transition_not_completed"
+            if build_epoch is None else "scheduled_train_audit_collection_not_completed"
+        ),
     }
 
 
@@ -297,6 +306,7 @@ def _adaptive_readiness(
     branch_readiness: dict[str, Any],
     edge_document: dict[str, Any],
     previous_best_train_audit_joint: float | None,
+    mean_abs_cV_delta: float,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     """Derive scheduler inputs from explicitly separated audit evidence.
 
@@ -348,6 +358,7 @@ def _adaptive_readiness(
         **certificate_metrics,
         "diagnostics_finite": bool(diagnostic_values) and all(math.isfinite(float(value)) for value in diagnostic_values),
         **route_metrics,
+        "mean_abs_cV_delta": float(mean_abs_cV_delta),
         "pareto_violation_rate": float(pareto.get("pareto_violation_rate", 1.0)),
     }
     return train_core, train_audit, train_calib
@@ -357,20 +368,13 @@ def _pilot_semantic_validation(
     schedule_state: dict[str, Any],
     certificate: dict[str, Any],
     edge_document: dict[str, Any],
+    *,
+    mechanism_summaries: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Validate pilot learning access separately from final deployment admission."""
     errors: list[str] = []
     history = schedule_state.get("history")
     history = history if isinstance(history, list) else []
-    foundation_transition = next((
-        row for row in history
-        if row.get("state_before") == "FOUNDATION"
-        and row.get("state_after") == "DUAL_REASON_SHADOW"
-    ), None)
-    shadow_rows = [
-        row for row in history
-        if row.get("state_after") in {"DUAL_REASON_SHADOW", "SAFE_JOINT", "CONSOLIDATION"}
-    ]
 
     def _split_integrity(row: dict[str, Any]) -> bool:
         readiness = row.get("readiness", {})
@@ -382,34 +386,15 @@ def _pilot_semantic_validation(
             and train_calib.get("source_split") == "train_calib"
             and train_calib.get("finite") is True
         )
-    if foundation_transition is None:
-        errors.append("missing_foundation_to_shadow_transition")
-    elif not _split_integrity(foundation_transition):
-        errors.append("foundation_transition_lacks_split_integrity")
     if schedule_state.get("failed_closed") is True:
         errors.append("adaptive_schedule_failed_closed")
-    learning_row = next((
-        row for row in reversed(shadow_rows)
-        if isinstance(row.get("readiness", {}).get("train_audit"), dict)
-        and row["readiness"]["train_audit"].get("source_split") == "train_audit"
-    ), None)
-    if learning_row is None or not _split_integrity(learning_row):
-        errors.append("missing_or_invalid_shadow_learning_access")
-    else:
-        readiness = learning_row.get("readiness", {}).get("train_audit", {})
-        action_delta = readiness.get("action_shadow_ap_delta", [])
-        action_nonregression = sum(float(value) >= -0.002 for value in action_delta) >= 2
-        route_strength = float(readiness.get("route_strength_ratio", -1.0))
-        if not (
-            readiness.get("continuous_credibility_available") is True
-            and int(readiness.get("observable_cV_gt_030", 0)) >= 6
-            and readiness.get("diagnostics_finite") is True
-            and 0.005 <= route_strength <= 0.10
-            and readiness.get("factor_shuffle_degrades_reason") is True
-            and action_nonregression
-            and readiness.get("disallowed_route_invariance") is True
-        ):
-            errors.append("shadow_learning_access_metrics_are_incomplete")
+    if not any(isinstance(row, dict) and _split_integrity(row) for row in history):
+        errors.append("missing_pilot_split_integrity")
+    # FOUNDATION already enables latent reason and shadow action learning.
+    # A pilot must prove these routes work, not force an edge/certificate
+    # admission transition before the independent intervention audit exists.
+    mechanism = validate_icdor_pilot_mechanism(mechanism_summaries or [])
+    errors.extend(str(error) for error in mechanism["errors"])
 
     edge_entries = edge_document.get("entries")
     edge_entries = edge_entries if isinstance(edge_entries, dict) else {}
@@ -428,6 +413,7 @@ def _pilot_semantic_validation(
         "accepted_action_count": len(accepted_actions),
         "deployment_admission_ready": deployment_admission_ready,
         "history_length": len(history),
+        "mechanism_validation": mechanism,
     }
 
 
@@ -833,13 +819,19 @@ def build_icdor_loaders(
     split: ICDORTrainSplits = make_icdor_train_splits(train, seed=int(data["split_seed"]))
     split_dir = Path(output_dir) / "split"
     write_icdor_split_manifest(split, split_dir / "icdor_split_manifest.json")
-    core = _subset_indices(split.train_core_indices, max_train_samples)
     # cV uses only image/BDD100K geometry observations. Never use reason
     # labels to select this pilot population.
     # Reuse the caller's immutable BDD100K index when subsequent epoch-end
     # audits need the same data. Rebuilding it here used to add a second full
     # JSON scan before the first DINO forward.
     visual_grounding = visual_grounding_index or BDD100KGroundingIndex(data["bdd100k_root"])
+    # The pilot must not become a filename-order experiment.  Reuse the same
+    # geometry-only factor-aware selector for train_core and audit_visual;
+    # action/reason labels never influence visual credibility sampling.
+    core = _factor_aware_audit_subset(
+        train, split.train_core_indices, max_train_samples,
+        grounding_index=visual_grounding, seed=int(data["split_seed"]) - 1,
+    )
     audit_visual = _factor_aware_audit_subset(
         train, split.audit_visual_indices, max_audit_samples,
         grounding_index=visual_grounding, seed=int(data["split_seed"]),
@@ -861,6 +853,7 @@ def build_icdor_loaders(
         "split_sha256": split.split_sha256,
         "split_seed": seed,
         "train_core_count": len(core),
+        "train_core_factor_aware": max_train_samples is not None and max_train_samples < len(split.train_core_indices),
         "train_audit_count": len(audit_visual) + len(audit_target),
         "audit_visual_count": len(audit_visual),
         "audit_target_count": len(audit_target),
@@ -1005,6 +998,8 @@ def build_icdor_model(config: dict[str, Any], *, use_mock_dino: bool = False, mo
         content_temperature_init=float(measurement["content_temperature_init"]),
         gate_init=float(route["gate_init"]),
         gate_max=float(route["gate_max"]),
+        shadow_credibility_floor=float(route.get("shadow_credibility_floor", 0.05)),
+        router_dustbin_init=float(route.get("router_dustbin_init", -4.0)),
         pi_min=float(observation["pi_min"]),
           pi_max=float(observation["pi_max"]),
           observed_mix_init=float(reason["observed_mix_init"]),
@@ -1085,6 +1080,7 @@ def compute_icdor_training_losses(
     pareto: MOSAICActionParetoAdmission,
     action_queue: MOSAICSoftRankQueue,
     reason_queue: MOSAICSoftRankQueue,
+    observed_reason_queue: MOSAICSoftRankQueue,
     *,
     hidden_mask: torch.Tensor,
     config: dict[str, Any] | None = None,
@@ -1147,7 +1143,7 @@ def compute_icdor_training_losses(
             raise ValueError("IC-DOR factor supervision requires a homogeneous declared split")
         supervision = build_factor_supervision(
             observations,
-            reason_targets,
+            None,
             model.ontology["factors"],
             split=str(split_values[0]),
             # Reasons are target-side observations, not visual factor labels.
@@ -1176,16 +1172,21 @@ def compute_icdor_training_losses(
             output["factor_presence_prob"], build_icdor_contradiction_mask(model).to(output["factor_presence_prob"].device)
         )
         anchor = factor_positive_anchor_loss(output["factor_presence_logits"], supervision)
+        selective_contrastive = factor_selective_contrastive_loss(
+            output["factor_features"],
+            supervision["geometry_positive_mask"],
+            supervision["reliable_negative_mask"],
+        )
         losses.update(factor)
         losses.update(view)
         losses.update(prototype)
         losses["loss_factor_geometry"] = geometry
         losses["loss_factor_contradiction"] = contradiction
         losses["loss_factor_positive_anchor"] = anchor
+        losses["loss_factor_selective_contrastive"] = selective_contrastive
         factor_total = (
-            float(factor_config.get("presence_weight", 1.0)) * factor["loss_factor_presence"]
+            policy["factor_presence"] * float(factor_config.get("presence_weight", 1.0)) * factor["loss_factor_presence"]
             + float(factor_config.get("visibility_weight", 1.0)) * factor["loss_factor_visibility"]
-            + 0.05 * factor["loss_factor_weak_negative"]
             + float(factor_config.get("geometry_mask_weight", 0.10)) * geometry
             + float(factor_config.get("view_consistency_weight", 0.05)) * view["loss_factor_view_probability"]
             + float(factor_config.get("flip_equivariance_weight", 0.05)) * view["loss_factor_flip_equivariance"]
@@ -1194,6 +1195,7 @@ def compute_icdor_training_losses(
             + float(factor_config.get("prior_scale_weight", 0.01)) * prototype["loss_factor_prior_scale"]
             + float(factor_config.get("contradiction_weight", 0.02)) * contradiction
             + float(factor_config.get("positive_anchor_weight", 1.0)) * anchor
+            + float(factor_config.get("selective_contrastive_weight", 0.05)) * selective_contrastive
         )
     observed_targets = reason_targets.masked_fill(hidden_mask, 0.0)
     observed_valid_mask = ~hidden_mask
@@ -1202,12 +1204,20 @@ def compute_icdor_training_losses(
         observed_valid_mask=observed_valid_mask,
     )
     losses.update(observed)
+    observed_reason_rank, observed_reason_rank_stats = observed_reason_cross_image_ranking_loss(
+        output["reason_visual_observed_logits"], observed_targets, observed_valid_mask,
+        sample_ids, observed_reason_queue,
+    )
+    losses["loss_reason_observed_cross_sample_rank"] = observed_reason_rank
+    losses["reason_observed_rank_pair_weight_sum"] = observed_reason_rank_stats["pair_weight_sum"]
     reason_total = (
         policy["reason_visual_observed"] * observed["loss_reason_visual_observed_asl"]
         if not phase.latent_enabled else
         policy["reason_visual_observed"] * observed["loss_reason_visual_observed_asl"]
         + float(reason_config.get("observed_asl_weight", 1.0)) * observed["loss_reason_observed_asl"]
     )
+    if float(observed_reason_rank_stats["pair_weight_sum"]) > 0.0:
+        reason_total = reason_total + policy["reason_observed_rank"] * observed_reason_rank
     posterior = model.observation_model.posterior_from_observed_targets(
         output["reason_logits_latent"], observed_targets, output
     )["reason_latent_posterior"]
@@ -1324,16 +1334,7 @@ def _parameter_group_gradient_audit(
 
 def assert_icdor_gradient_firewall(rows: list[dict[str, Any]], *, tolerance: float = 1e-7) -> None:
     """Reject cross-owner gradients that violate the v4 ownership contract."""
-    forbidden = {
-        "loss_action_total": {
-            "reason_visual_pyramid", "reason_adapter", "reason_visual_decoder",
-            "reason_latent_decoder", "reason_observed_mixer", "observation_model",
-        },
-        "loss_reason_total": {
-            "factor_visual_pyramid", "action_visual_pyramid", "action_adapter",
-            "action_visual_decoder", "action_router_rereader", "factor_extractor", "factor_prototypes",
-        },
-    }
+    forbidden = ICDOR_REQUIRED_ZERO_GRADIENTS
     for row in rows:
         if row.get("loss") not in forbidden or row.get("owner_group") not in forbidden[row["loss"]]:
             continue
@@ -1360,6 +1361,7 @@ def train_icdor_epoch(
     pareto: MOSAICActionParetoAdmission,
     action_queue: MOSAICSoftRankQueue,
     reason_queue: MOSAICSoftRankQueue,
+    observed_reason_queue: MOSAICSoftRankQueue,
     gradient_accumulation_steps: int,
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
@@ -1373,6 +1375,7 @@ def train_icdor_epoch(
     generator = torch.Generator(device=device).manual_seed(int(config["data"]["split_seed"]) + epoch)
     action_queue_pending = MOSAICAccumulationQueueBuffer()
     reason_queue_pending = MOSAICAccumulationQueueBuffer()
+    observed_reason_queue_pending = MOSAICAccumulationQueueBuffer()
     parameter_by_name = dict(model.named_parameters())
     owner_parameters: dict[str, list[nn.Parameter]] = {}
     for entry in ownership:
@@ -1430,6 +1433,7 @@ def train_icdor_epoch(
             )
             losses = compute_icdor_training_losses(
                 model, output, restored, batch, observations, phase, pareto, action_queue, reason_queue,
+                observed_reason_queue,
                 hidden_mask=hidden, config=config,
             )
             scaled_loss = losses["loss_total"] / gradient_accumulation_steps
@@ -1439,6 +1443,11 @@ def train_icdor_epoch(
             )["reason_latent_posterior"]
             action_queue_pending.add(output["action_visual_logits"], batch["action"], batch["file_name"])
             reason_queue_pending.add(output["reason_logits_latent"], posterior, batch["file_name"])
+            observed_reason_queue_pending.add(
+                output["reason_visual_observed_logits"],
+                batch["reason"].masked_fill(hidden, float("nan")),
+                batch["file_name"],
+            )
         if step % int(config["training"]["print_every"]) == 0:
             audit_rows = _parameter_group_gradient_audit(losses, ownership, model, epoch=epoch, step=step)
             assert_icdor_gradient_firewall(audit_rows)
@@ -1448,12 +1457,15 @@ def train_icdor_epoch(
         grad_norm = 0.0
         if update:
             owner_norms = clip_icdor_owner_gradients(owner_parameters, owner_clip_limits)
-            grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), float(config["optimizer"]["grad_clip"])).detach().cpu())
+            # CREDO deliberately stops here: a subsequent global clip would
+            # re-couple independent owners after their branch-specific caps.
+            grad_norm = math.sqrt(sum(norm * norm for norm in owner_norms.values()))
             optimizer.step()
             if scheduler is not None:
                 scheduler.step()
             action_queue_pending.flush_after_optimizer_step(action_queue, optimizer_step_succeeded=True)
             reason_queue_pending.flush_after_optimizer_step(reason_queue, optimizer_step_succeeded=True)
+            observed_reason_queue_pending.flush_after_optimizer_step(observed_reason_queue, optimizer_step_succeeded=True)
             optimizer.zero_grad(set_to_none=True)
         row = {"epoch": epoch, "step": step, "phase": phase.name, "update": update, "grad_norm": grad_norm}
         if update:
@@ -1576,6 +1588,7 @@ def _visual_credibility_payload(result: Mapping[str, Any], *, epoch: int) -> dic
         "factor_names": result.get("factor_names"),
         "credibility": credibility.detach().float().cpu().tolist(),
         "components": result.get("components"),
+        "mean_abs_cV_delta": result.get("mean_abs_cV_delta"),
     }
 
 
@@ -1693,7 +1706,7 @@ def collect_train_audit_branch_readiness(
     tensors: dict[str, list[torch.Tensor]] = {
         name: [] for name in (
             "action_visual", "action_shadow", "action_final", "action_labels",
-            "reason_visual", "reason_final", "reason_shuffled", "reason_labels",
+            "reason_visual", "reason_final", "reason_shuffled", "reason_labels", "reason_router_weights",
         )
     }
     hidden_fractions = (0.10, 0.30, 0.50)
@@ -1734,6 +1747,10 @@ def collect_train_audit_branch_readiness(
                 tensors[destination].append(value.detach().float().cpu())
             tensors["action_labels"].append(action_labels.cpu())
             tensors["reason_labels"].append(reason_labels.cpu())
+            router_weights = output.get("reason_factor_router_weights")
+            if not isinstance(router_weights, torch.Tensor):
+                raise ValueError("IC-DOR readiness collector requires reason factor-router weights")
+            tensors["reason_router_weights"].append(router_weights.detach().float().cpu())
             candidate = getattr(getattr(model, "action_router", None), "candidate_edge_mask", None)
             support, veto = output.get("support_weights"), output.get("veto_weights")
             if not isinstance(candidate, torch.Tensor) or not isinstance(support, torch.Tensor) or not isinstance(veto, torch.Tensor):
@@ -1794,6 +1811,12 @@ def collect_train_audit_branch_readiness(
         "source_split": source_split,
         "action_shadow_ap_delta": [shadow - visual for shadow, visual in zip(action_shadow_ap, action_visual_ap)],
         "action_route_ap_delta": [final - visual for final, visual in zip(action_final_ap, action_visual_ap)],
+        "direct_action_map": float(sum(action_visual_ap) / len(action_visual_ap)),
+        "direct_reason_map": float(reason_visual_metrics["mAP"]),
+        "final_action_visual_exact": bool(torch.equal(values["action_final"], values["action_visual"])),
+        "nonzero_semantic_reason_count": int(
+            (values["reason_router_weights"].abs().sum(dim=(0, 2)) > 1e-8).sum().item()
+        ),
         "exp_map_final": final_exp_map,
         "exp_map_delta_vs_visual": final_exp_map - float(reason_visual_metrics["mAP"]),
         "factor_shuffle_degrades_reason": final_exp_map > float(reason_shuffled_metrics["mAP"]),
@@ -1824,6 +1847,7 @@ def _save_checkpoint(
     split_sha256: str,
     action_queue: MOSAICSoftRankQueue,
     reason_queue: MOSAICSoftRankQueue,
+    observed_reason_queue: MOSAICSoftRankQueue,
     pareto: MOSAICActionParetoAdmission,
     adaptive_schedule: ICDORAdaptiveSchedule | None = None,
 ) -> None:
@@ -1839,6 +1863,7 @@ def _save_checkpoint(
         "split_sha256": split_sha256,
         "action_queue": action_queue.state_dict(),
         "reason_queue": reason_queue.state_dict(),
+        "observed_reason_queue": observed_reason_queue.state_dict(),
         "pareto": pareto.state_dict(),
         "adaptive_schedule": adaptive_schedule.state_dict() if adaptive_schedule is not None else None,
         "python_rng_state": random.getstate(),
@@ -1859,6 +1884,7 @@ def _load_resume(
     split_sha256: str,
     action_queue: MOSAICSoftRankQueue,
     reason_queue: MOSAICSoftRankQueue,
+    observed_reason_queue: MOSAICSoftRankQueue,
     pareto: MOSAICActionParetoAdmission,
     adaptive_schedule: ICDORAdaptiveSchedule | None = None,
 ) -> tuple[int, float, str | None, str | None]:
@@ -1871,7 +1897,6 @@ def _load_resume(
         certificate = json.loads(certificate_path.read_text(encoding="utf-8"))
         if certificate.get("sha256") != certificate_sha:
             raise RuntimeError("IC-DOR resume certificate hash mismatch")
-        model.load_factor_certificate(certificate)
     if edge_sha:
         edge = json.loads(edge_path.read_text(encoding="utf-8"))
         if edge.get("sha256") != edge_sha:
@@ -1889,11 +1914,12 @@ def _load_resume(
     model.load_state_dict(payload["model"])
     optimizer.load_state_dict(payload["optimizer"])
     scheduler.load_state_dict(payload["scheduler"])
-    for key in ("action_queue", "reason_queue", "pareto"):
+    for key in ("action_queue", "reason_queue", "observed_reason_queue", "pareto"):
         if key not in payload:
             raise RuntimeError(f"IC-DOR resume is missing {key} state")
     action_queue.load_state_dict(payload["action_queue"])
     reason_queue.load_state_dict(payload["reason_queue"])
+    observed_reason_queue.load_state_dict(payload["observed_reason_queue"])
     pareto.load_state_dict(payload["pareto"])
     if adaptive_schedule is not None:
         schedule_payload = payload.get("adaptive_schedule")
@@ -1990,9 +2016,12 @@ def _record_resolved_config_usage(
     return payload
 
 
-def _build_rank_queues(*, capacity: int, device: torch.device) -> tuple[MOSAICSoftRankQueue, MOSAICSoftRankQueue]:
+def _build_rank_queues(
+    *, capacity: int, device: torch.device,
+) -> tuple[MOSAICSoftRankQueue, MOSAICSoftRankQueue, MOSAICSoftRankQueue]:
     return (
         MOSAICSoftRankQueue(4, capacity=capacity).to(device),
+        MOSAICSoftRankQueue(21, capacity=capacity).to(device),
         MOSAICSoftRankQueue(21, capacity=capacity).to(device),
     )
 
@@ -2117,15 +2146,18 @@ def main() -> None:
     multiview = MOSAICWeakMultiView(factor_names, mirror_pairs=mirror_pairs, seed=args.seed)
     grounding_builder = ICDORGroundingObservationBuilder(model.ontology["factors"])
     pareto = MOSAICActionParetoAdmission()
-    action_queue, reason_queue = _build_rank_queues(
+    action_queue, reason_queue, observed_reason_queue = _build_rank_queues(
         capacity=int(config["selective_observation"]["posterior_queue_size"]), device=device
     )
     adaptive_schedule = ICDORAdaptiveSchedule(pilot=args.pilot)
 
     certificate_path = output / "factor_certificate.json"
     edge_path = output / "edge_admission.json"
-    pending_certificate = _pending_evidence_document("factor_certificate", build_epoch=int(config["factor_certificate"]["build_epoch"]))
-    pending_edge = _pending_evidence_document("edge_admission", build_epoch=int(config["edge_admission"]["build_epoch"]))
+    # CREDO does not place either document on a calendar. Certificate is a
+    # reporting artifact and edge admission is triggered by the adaptive
+    # shadow-audit state, never by a fixed epoch.
+    pending_certificate = _pending_evidence_document("factor_certificate", build_epoch=None)
+    pending_edge = _pending_evidence_document("edge_admission", build_epoch=None)
     pretrained = Path(config["backbone"]["pretrained_weights"])
     manifest = {
         "command_line": [sys.executable, *sys.argv], "git_head": _git_head(),
@@ -2149,7 +2181,8 @@ def main() -> None:
             args.resume, model=model, optimizer=optimizer, scheduler=scheduler,
             certificate_path=certificate_path, edge_path=edge_path,
             config_sha256=manifest["config_sha256"], split_sha256=split_stats["split_sha256"],
-            action_queue=action_queue, reason_queue=reason_queue, pareto=pareto,
+            action_queue=action_queue, reason_queue=reason_queue,
+            observed_reason_queue=observed_reason_queue, pareto=pareto,
             adaptive_schedule=adaptive_schedule,
         )
     else:
@@ -2194,6 +2227,7 @@ def main() -> None:
             model, train_loader, optimizer, device, epoch=epoch, phase=phase, config=config,
             ownership=ownership, grounding_builder=grounding_builder, grounding_index=grounding_index,
             multiview=multiview, pareto=pareto, action_queue=action_queue, reason_queue=reason_queue,
+            observed_reason_queue=observed_reason_queue,
             gradient_accumulation_steps=grad_accum, scheduler=scheduler,
         )
         for row in epoch_train["runtime_rows"]:
@@ -2213,7 +2247,10 @@ def main() -> None:
             forward_kwargs={"route_mode": "off", "latent_enabled": False, "return_masks": True},
             source_split="audit_visual",
         )
+        previous_cV = model.continuous_credibility.ema_cV.detach().clone()
         visual_credibility = refresh_model_visual_credibility(model, factor_audit_payload)
+        mean_abs_cV_delta = float((visual_credibility["credibility"] - previous_cV).abs().mean().cpu())
+        visual_credibility["mean_abs_cV_delta"] = mean_abs_cV_delta
         visual_credibility_payload = _visual_credibility_payload(visual_credibility, epoch=epoch)
         epoch_dir = output / f"epoch_{epoch:03d}"
         factor_audit_rows = _factor_audit_rows(factor_audit_payload, epoch=epoch)
@@ -2226,26 +2263,30 @@ def main() -> None:
             _write_json(audit_stats_path, factor_audit_payload)
             certificate = build_and_write_factor_certificate(audit_stats_path, certificate_path, config_root="configs")
             certificate_payload = certificate.to_dict()
-            model.load_factor_certificate(certificate_payload)
             certificate_sha = certificate.sha256
             certificate_ready = True
             previous_certificate_tiers = _certificate_tiers(certificate_payload)
             (output / "factor_certificate_sha256.txt").write_text(certificate_sha + "\n", encoding="ascii")
 
-        if adaptive_schedule.policy().enable_interventions and certificate_ready and not edge_ready:
+        refresh_every = int(config["edge_admission"]["audit_refresh_epochs"])
+        should_refresh_edge = (
+            adaptive_schedule.policy().enable_interventions
+            and not adaptive_schedule.policy().freeze_edge_admission
+            and (not edge_ready or adaptive_schedule.state_epochs % refresh_every == 0)
+        )
+        if should_refresh_edge:
             edge_payload = collect_edge_intervention_audit(
                 model, _audit_batches(audit_target_loader, grounding_index, source_split="audit_target"), factor_names=factor_names,
                 action_names=list(model.ontology["action_names"]), edge_specs=_candidate_edge_specs(model.ontology),
                 device=device, bootstrap_replicates=1000, bootstrap_seed=args.seed,
-                forward_kwargs={"route_mode": "admitted", "latent_enabled": True, "return_masks": False},
+                forward_kwargs={"route_mode": "shadow", "latent_enabled": True, "return_masks": False},
                 source_split="audit_target",
             )
             _write_json(output / "edge_intervention_stats.json", edge_payload)
-            tiers = [json.loads(certificate_path.read_text(encoding="utf-8"))["entries"][name]["tier"] for name in factor_names]
             admission = build_edge_admission(
                 _edge_statistics_from_audit(edge_payload),
                 model.ontology,
-                tiers,
+                visual_credibility["credibility"].detach().cpu().tolist(),
                 source_split="audit_target",
                 credibility_min=float(model.action_credibility_min_for_admission),
             )
@@ -2351,8 +2392,25 @@ def main() -> None:
         json_payloads = {
             "metrics_summary.json": evaluation["metrics_summary"],
             "branch_metrics.json": evaluation["branch_metrics"],
+            "mechanism_summary.json": build_icdor_mechanism_summary(
+                epoch=epoch,
+                visual_credibility=visual_credibility_payload,
+                branch_metrics=evaluation["branch_metrics"],
+                route_rows=evaluation["route_rows"],
+                factor_rows=evaluation["factor_rows"],
+                factor_audit=factor_audit_payload,
+                fine_transport_rows=evaluation["fine_transport_rows"],
+                route_ownership_rows=evaluation["route_ownership_rows"],
+                reason_rows=evaluation["reason_rows"],
+                hidden_recovery_rows=hidden_recovery_rows,
+                target_transfer_rows=transfer_rows,
+                gradient_rows=epoch_train["gradient_rows"],
+                edge_admission=edge_document,
+                pu_enabled=adaptive_schedule.pu_enabled,
+            ),
             "per_label_metrics.json": evaluation["per_label_metrics"],
             "factor_certificate_snapshot.json": certificate_snapshot,
+            "factor_audit.json": factor_audit_payload,
             "target_transfer_summary.json": transfer_summary,
             "visual_credibility.json": visual_credibility_payload,
             "semantic_compatibility.json": semantic_compatibility_payload,
@@ -2387,7 +2445,14 @@ def main() -> None:
             previous_certificate_tiers=certificate_tiers_before_epoch, ontology=model.ontology,
             branch_readiness=branch_readiness, edge_document=edge_document,
             previous_best_train_audit_joint=adaptive_schedule.best_train_audit_joint,
+            mean_abs_cV_delta=mean_abs_cV_delta,
         )
+        # A failed hidden-positive margin invalidates only the PU recovery
+        # objective. Factor measurements, latent reason transport, and the
+        # action shadow route remain active for the next epoch.
+        hidden_margin = float(train_audit_readiness.get("hidden_recovery_margin", -1.0))
+        if adaptive_schedule.pu_enabled and hidden_margin <= 0.0:
+            adaptive_schedule.set_pu_enabled(False, reason="hidden_recovery_margin_nonpositive")
         transition = adaptive_schedule.update(
             epoch=epoch, train_core_metrics=train_core_readiness,
             train_audit_metrics=train_audit_readiness, train_calib_metrics=train_calib_readiness,
@@ -2432,7 +2497,8 @@ def main() -> None:
             best_joint=max(best_joint, joint), certificate_sha256=certificate_sha,
             edge_admission_sha256=edge_sha, config_sha256=manifest["config_sha256"],
             split_sha256=split_stats["split_sha256"],
-            action_queue=action_queue, reason_queue=reason_queue, pareto=pareto,
+            action_queue=action_queue, reason_queue=reason_queue,
+            observed_reason_queue=observed_reason_queue, pareto=pareto,
             adaptive_schedule=adaptive_schedule,
         )
         _save_checkpoint(output / "checkpoint_latest.pth", **checkpoint_args)
@@ -2457,8 +2523,13 @@ def main() -> None:
             json.loads(edge_path.read_text(encoding="utf-8"))
             if edge_path.is_file() else {}
         )
+        mechanism_summaries = [
+            json.loads((output / f"epoch_{epoch:03d}" / "mechanism_summary.json").read_text(encoding="utf-8"))
+            for epoch in completed_epochs
+        ]
         pilot_semantics = _pilot_semantic_validation(
-            adaptive_schedule.state_dict(), final_certificate, final_edge_document
+            adaptive_schedule.state_dict(), final_certificate, final_edge_document,
+            mechanism_summaries=mechanism_summaries,
         )
         pilot_gate = {
             "git_head": _git_head(),

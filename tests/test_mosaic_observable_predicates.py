@@ -45,14 +45,16 @@ def test_observable_layer_returns_complete_semantically_exact_outputs() -> None:
         "prior_scale",
         "measurement_stats",
     }
-    assert set(output) == expected_keys
+    # Fine transport augments the legacy observable-factor payload; it does
+    # not remove any formal factor measurement output.
+    assert expected_keys <= set(output)
     assert output["factor_features"].shape == (2, 4, 8)
     assert output["factor_presence_logits"].shape == (2, 4)
     assert output["factor_visibility_logits"].shape == (2, 4)
     assert output["factor_soft_masks"].shape == (2, 4, 45, 80)
     assert output["prototype_weights"].shape == (2, 4, 4)
     assert output["anchor_coordinates"].shape == (2, 4, 2, 2)
-    assert output["sampling_coordinates"].shape == (2, 4, 2, 4, 12, 2)
+    assert output["sampling_coordinates"].shape == (2, 4, 2, 4, 16, 2)
     visibility = output["factor_visibility_prob"]
     presence = output["factor_presence_prob"]
     assert torch.allclose(output["factor_positive_evidence"], visibility * presence)

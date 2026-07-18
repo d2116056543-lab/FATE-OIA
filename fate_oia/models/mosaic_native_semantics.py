@@ -651,7 +651,11 @@ def load_mosaic_schema_bundle(config_root: str | Path) -> dict[str, Any]:
     reasons = _require_document(reasons_doc, "reasons", dict, "mosaic_reason_observation.yaml")
     source_path = config_root.parent / _EXPECTED_REASON_SOURCE_FILE
     source_bytes = source_path.read_bytes()
-    source_hash = hashlib.sha256(source_bytes).hexdigest().upper()
+    # The audited source hash is defined over canonical LF bytes. Git may
+    # materialize the same YAML with CRLF on Windows; hashing raw checkout
+    # bytes would reject an otherwise identical official mapping.
+    canonical_source_bytes = source_bytes.replace(b"\r\n", b"\n")
+    source_hash = hashlib.sha256(canonical_source_bytes).hexdigest().upper()
     if source_hash != labels["reason_semantics"]["source_sha256"]:
         raise ValueError("reason semantic source hash does not match mosaic_label_schema.yaml")
     source_doc = yaml.load(source_bytes.decode("utf-8"), Loader=_UniqueKeyLoader)
@@ -701,10 +705,14 @@ _ICDOR_REQUIRED_FACTOR_FIELDS = {
     "contradicts",
     "positive_reason_anchors",
     "grounding_sources",
+    "role",
+    "visual_sources",
+    "attribute_constraints",
+    "negative_policy",
+    "source_kind",
+    "target_candidates",
 }
-_ICDOR_OPTIONAL_FACTOR_FIELDS = {
-    "role", "visual_sources", "attribute_constraints", "negative_policy", "source_kind", "observable",
-}
+_ICDOR_OPTIONAL_FACTOR_FIELDS = {"observable"}
 _ICDOR_REASON_ROUTE_FIELDS = {
     "group",
     "direct_factors",
@@ -780,11 +788,6 @@ def load_icdor_ontology(config_root: str | Path) -> dict[str, Any]:
             raise ValueError("IC-DOR factor candidates must use the complete observable-factor schema")
         if set(factor) - (_ICDOR_REQUIRED_FACTOR_FIELDS | _ICDOR_OPTIONAL_FACTOR_FIELDS):
             raise ValueError("IC-DOR factor candidates contain unknown fields")
-        factor.setdefault("role", "observable")
-        factor.setdefault("visual_sources", list(factor["grounding_sources"]))
-        factor.setdefault("attribute_constraints", {})
-        factor.setdefault("negative_policy", "unknown_if_source_incomplete")
-        factor.setdefault("source_kind", "grounded" if "image_only" not in factor["grounding_sources"] else "image_only")
         factor.setdefault("observable", factor["role"] == "observable")
         name = factor["name"]
         if not isinstance(name, str) or not name or name in _ICDOR_FORBIDDEN_FACTOR_NAMES or "state" in name:
@@ -810,6 +813,40 @@ def load_icdor_ontology(config_root: str | Path) -> dict[str, Any]:
             raise ValueError(f"IC-DOR factor {name} requires declared grounding sources")
         if not set(factor["grounding_sources"]) <= _ICDOR_ALLOWED_GROUNDING_SOURCES:
             raise ValueError(f"IC-DOR factor {name} has an invalid grounding source")
+        if (
+            not isinstance(factor["visual_sources"], list)
+            or factor["visual_sources"] != factor["grounding_sources"]
+        ):
+            raise ValueError(f"IC-DOR factor {name} visual_sources must exactly match grounding_sources")
+        if factor["role"] not in {"observable", "reason_only", "latent_only"}:
+            raise ValueError(f"IC-DOR factor {name} has an invalid CREDO role")
+        if factor["source_kind"] not in {"grounded", "image_only", "proxy"}:
+            raise ValueError(f"IC-DOR factor {name} has an invalid source kind")
+        if not isinstance(factor["attribute_constraints"], dict):
+            raise ValueError(f"IC-DOR factor {name} attribute_constraints must be a mapping")
+        if factor["negative_policy"] not in {
+            "reliable_if_source_complete",
+            "reliable_if_attribute_complete",
+            "unknown_if_source_incomplete",
+            "unknown_without_depth",
+            "unknown_without_direct_visual_evidence",
+        }:
+            raise ValueError(f"IC-DOR factor {name} has an invalid negative policy")
+        candidates = factor["target_candidates"]
+        if not isinstance(candidates, dict) or set(candidates) != {"actions", "reasons"}:
+            raise ValueError(f"IC-DOR factor {name} requires action/reason target candidates")
+        if (
+            not isinstance(candidates["actions"], list)
+            or any(action not in action_names for action in candidates["actions"])
+            or len(set(candidates["actions"])) != len(candidates["actions"])
+        ):
+            raise ValueError(f"IC-DOR factor {name} has invalid action target candidates")
+        if (
+            not isinstance(candidates["reasons"], list)
+            or any(type(reason) is not int or reason not in range(21) for reason in candidates["reasons"])
+            or len(set(candidates["reasons"])) != len(candidates["reasons"])
+        ):
+            raise ValueError(f"IC-DOR factor {name} has invalid reason target candidates")
         factor_names.append(name)
     _require_unique_values(factor_names, "IC-DOR factor names must be unique")
     factor_name_set = set(factor_names)
@@ -841,6 +878,8 @@ def load_icdor_ontology(config_root: str | Path) -> dict[str, Any]:
                 polarity = edge["polarity"]
                 if factor_name not in factor_name_set or polarity not in {"present", "absent"}:
                     raise ValueError("IC-DOR action route uses an unknown factor or polarity")
+                if action_name not in by_factor[factor_name]["target_candidates"]["actions"]:
+                    raise ValueError("IC-DOR action route is not declared by the factor target candidates")
                 normalized_edges.append({"factor": factor_name, "polarity": polarity})
             normalized_action_routes[action_name][direction] = normalized_edges
 
@@ -860,6 +899,10 @@ def load_icdor_ontology(config_root: str | Path) -> dict[str, Any]:
         for field in ("direct_factors", "latent_factors", "contradiction_factors"):
             route[field] = _icdor_name_list(route[field], field=field, factor_names=factor_name_set)
         route["absence_factors"] = _icdor_name_list(route["absence_factors"], field="absence_factors", factor_names=factor_name_set)
+        for field in ("direct_factors", "latent_factors", "contradiction_factors", "absence_factors"):
+            for factor_name in route[field]:
+                if reason_id not in by_factor[factor_name]["target_candidates"]["reasons"]:
+                    raise ValueError("IC-DOR reason route is not declared by the factor target candidates")
         if type(route["escape_allowed"]) is not bool:
             raise ValueError(f"IC-DOR reason route {reason_id} escape_allowed must be boolean")
         if any("state" in name for name in route["latent_factors"]):

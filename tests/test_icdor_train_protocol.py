@@ -231,6 +231,7 @@ def test_formal_loss_surface_calls_factor_action_reason_and_preserves_firewalls(
     losses = compute_icdor_training_losses(
         model, output, second, batch, observations, phase,
         MOSAICActionParetoAdmission(), MOSAICSoftRankQueue(4, capacity=8), MOSAICSoftRankQueue(21, capacity=8),
+        MOSAICSoftRankQueue(21, capacity=8),
         hidden_mask=torch.zeros(2, 21, dtype=torch.bool),
     )
     assert torch.isfinite(losses["loss_total"])
@@ -248,17 +249,24 @@ def test_formal_loss_surface_calls_factor_action_reason_and_preserves_firewalls(
     assert any(parameter.grad is not None for parameter in model.factor_adapter.parameters())
 
 
+def test_training_protocol_keeps_observed_and_posterior_reason_ranking_distinct() -> None:
+    source = Path("fate_oia/engine/train_acpr_mosaic_trust_icdor.py").read_text(encoding="utf-8")
+    assert "observed_reason_cross_image_ranking_loss(" in source
+    assert "posterior_weighted_reason_ranking_loss(" in source
+    assert "observed_reason_queue_pending" in source
+
+
 def test_pending_evidence_is_explicit_and_never_claims_train_audit_completion() -> None:
-    factor = _pending_evidence_document("factor_certificate", build_epoch=4)
-    edge = _pending_evidence_document("edge_admission", build_epoch=6)
+    factor = _pending_evidence_document("factor_certificate", build_epoch=None)
+    edge = _pending_evidence_document("edge_admission", build_epoch=None)
 
     assert factor == {
         "artifact": "factor_certificate",
         "status": "pending",
         "available": False,
         "source_split": None,
-        "build_epoch": 4,
-        "reason": "scheduled_train_audit_collection_not_completed",
+        "build_epoch": None,
+        "reason": "adaptive_audit_transition_not_completed",
     }
     assert edge["source_split"] is None
     assert edge["available"] is False
@@ -369,10 +377,11 @@ def test_foreground_launcher_has_non_circular_gate_order_and_exact_protocol() ->
 
 
 def test_rank_queues_are_constructed_on_the_requested_device() -> None:
-    action, reason = _build_rank_queues(capacity=17, device=torch.device("cpu"))
-    assert action.capacity == 17 and reason.capacity == 17
+    action, reason, observed_reason = _build_rank_queues(capacity=17, device=torch.device("cpu"))
+    assert action.capacity == 17 and reason.capacity == 17 and observed_reason.capacity == 17
     assert action.logit_buffer.device.type == "cpu"
     assert reason.logit_buffer.device.type == "cpu"
+    assert observed_reason.logit_buffer.device.type == "cpu"
 
 
 def test_target_transfer_directions_do_not_invent_unauthorized_edges() -> None:
@@ -544,7 +553,7 @@ def test_factor_audit_readiness_requires_collector_integrity_proof() -> None:
     assert missing_proof["unknown_abstained"] is False
 
 
-def test_pilot_gate_requires_real_state_transitions_and_accepted_edges() -> None:
+def test_pilot_gate_rejects_schedule_history_without_mechanism_evidence() -> None:
     split_readiness = {
         "train_core": {"source_split": "train_core", "finite": True},
         "train_calib": {"source_split": "train_calib", "finite": True},
@@ -586,8 +595,8 @@ def test_pilot_gate_requires_real_state_transitions_and_accepted_edges() -> None
         "e1": {"accepted": True, "target": "stop"},
     }}
     result = _pilot_semantic_validation(schedule, certificate, edge)
-    assert result["pass"] is True
-    assert result["errors"] == []
+    assert result["pass"] is False
+    assert "pilot_requires_at_least_two_epoch_summaries" in result["errors"]
 
     bad_split_history = [dict(row) for row in history]
     bad_split_history[1] = {
@@ -601,7 +610,7 @@ def test_pilot_gate_requires_real_state_transitions_and_accepted_edges() -> None
         {**schedule, "history": bad_split_history}, certificate, edge
     )
     assert bad_split["pass"] is False
-    assert "foundation_transition_lacks_split_integrity" in bad_split["errors"]
+    assert "pilot_requires_at_least_two_epoch_summaries" in bad_split["errors"]
 
     invalid = _pilot_semantic_validation(
         {"history": [], "safe_joint_epochs": 1, "failed_closed": False},
@@ -609,8 +618,8 @@ def test_pilot_gate_requires_real_state_transitions_and_accepted_edges() -> None
         {"sha256": "ONLY", "entries": {}},
     )
     assert invalid["pass"] is False
-    assert "missing_foundation_to_shadow_transition" in invalid["errors"]
-    assert "missing_or_invalid_shadow_learning_access" in invalid["errors"]
+    assert "missing_pilot_split_integrity" in invalid["errors"]
+    assert "pilot_requires_at_least_two_epoch_summaries" in invalid["errors"]
 
 
 def test_credo_pilot_validates_learning_access_without_final_admission() -> None:
@@ -644,39 +653,108 @@ def test_credo_pilot_validates_learning_access_without_final_admission() -> None
         schedule,
         {"entries": {"f0": {"tier": "abstained"}}},
         {"entries": {}},
+        mechanism_summaries=[{
+            "epoch": 0,
+            "available": True,
+            "continuous_credibility": {"available": True, "content_beats_prior_factor_count": 1},
+            "fine_transport": {
+                "available": True,
+                "fine_off_action_shadow_delta_abs_mean": 0.02,
+                "fine_off_reason_latent_delta_abs_mean": 0.02,
+            },
+            "reason_transport": {
+                "available": True,
+                "route_off_logit_delta_abs_mean": 0.02,
+                "shuffle_logit_delta_abs_mean": 0.02,
+                "visual_exp_map": 0.30,
+                "final_exp_map": 0.30,
+                "no_lane_absence_polarity": {"available": True, "contract": "observability_times_absence"},
+            },
+            "action_shadow": {
+                "available": True,
+                "final_visual_exact": True,
+                "route_to_visual_rms_ratio_mean": 0.03,
+                "support_nonzero_action_count": 1,
+                "veto_nonzero_action_count": 1,
+                "final_act_map": 0.60,
+            },
+            "pu": {"available": True, "enabled_by_margin": True, "schedule_enabled": True},
+            "gradient_firewall": {"available": True, "pass": True},
+        }, {
+            "epoch": 1,
+            "available": True,
+            "continuous_credibility": {"available": True, "content_beats_prior_factor_count": 2},
+            "fine_transport": {
+                "available": True,
+                "fine_off_action_shadow_delta_abs_mean": 0.02,
+                "fine_off_reason_latent_delta_abs_mean": 0.02,
+            },
+            "reason_transport": {
+                "available": True,
+                "route_off_logit_delta_abs_mean": 0.02,
+                "shuffle_logit_delta_abs_mean": 0.02,
+                "visual_exp_map": 0.30,
+                "final_exp_map": 0.301,
+                "no_lane_absence_polarity": {"available": True, "contract": "observability_times_absence"},
+            },
+            "action_shadow": {
+                "available": True,
+                "final_visual_exact": True,
+                "route_to_visual_rms_ratio_mean": 0.03,
+                "support_nonzero_action_count": 1,
+                "veto_nonzero_action_count": 1,
+                "final_act_map": 0.61,
+            },
+            "pu": {"available": True, "enabled_by_margin": True, "schedule_enabled": True},
+            "gradient_firewall": {"available": True, "pass": True},
+        }],
     )
 
     assert result["pass"] is True
     assert result["deployment_admission_ready"] is False
 
 
+def test_credo_training_never_reinjects_a_reporting_certificate_into_model_routes() -> None:
+    """A discrete certificate is final reporting evidence, not a training input."""
+    source = (
+        Path(__file__).parents[1]
+        / "fate_oia"
+        / "engine"
+        / "train_acpr_mosaic_trust_icdor.py"
+    ).read_text(encoding="utf-8")
+
+    assert "model.load_factor_certificate(" not in source
+
+
 def test_checkpoint_roundtrip_restores_queues_and_pareto(tmp_path) -> None:
     model = nn.Linear(2, 2)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
-    action, reason = _build_rank_queues(capacity=8, device=torch.device("cpu"))
+    action, reason, observed_reason = _build_rank_queues(capacity=8, device=torch.device("cpu"))
     pareto = MOSAICActionParetoAdmission()
     action.enqueue(torch.ones(1, 4), torch.ones(1, 4), ["sample"])
     reason.enqueue(torch.ones(1, 21), torch.ones(1, 21), ["sample"])
+    observed_reason.enqueue(torch.ones(1, 21), torch.ones(1, 21), ["sample"])
     pareto.dual_variables.fill_(0.25)
     path = tmp_path / "checkpoint.pth"
     _save_checkpoint(
         path, model=model, optimizer=optimizer, scheduler=scheduler, epoch=2,
         best_joint=0.5, certificate_sha256=None, edge_admission_sha256=None,
         config_sha256="CONFIG", split_sha256="SPLIT", action_queue=action,
-        reason_queue=reason, pareto=pareto,
+        reason_queue=reason, observed_reason_queue=observed_reason, pareto=pareto,
     )
     action._count.zero_(); action._count_value = 0
     reason._count.zero_(); reason._count_value = 0
+    observed_reason._count.zero_(); observed_reason._count_value = 0
     pareto.dual_variables.zero_()
     result = _load_resume(
         path, model=model, optimizer=optimizer, scheduler=scheduler,
         certificate_path=tmp_path / "certificate.json", edge_path=tmp_path / "edge.json",
         config_sha256="CONFIG", split_sha256="SPLIT", action_queue=action,
-        reason_queue=reason, pareto=pareto,
+        reason_queue=reason, observed_reason_queue=observed_reason, pareto=pareto,
     )
     assert result[:2] == (3, 0.5)
-    assert action.count == 1 and reason.count == 1
+    assert action.count == 1 and reason.count == 1 and observed_reason.count == 1
     assert pareto.dual_variables.tolist() == pytest.approx([0.25] * 4)
 
 

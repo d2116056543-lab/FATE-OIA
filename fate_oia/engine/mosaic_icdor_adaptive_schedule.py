@@ -13,6 +13,7 @@ class ICDORStatePolicy:
     route_mode: str
     action_rank_weight: float
     reason_rank_weight: float
+    reason_observed_rank_weight: float
     write_provisional_certificate: bool = False
     freeze_factor_and_prototypes: bool = False
     freeze_certificate: bool = False
@@ -33,18 +34,18 @@ POLICIES = {
     # Continuous visual credibility grants learning access. A discrete
     # certificate is a deployment claim and is therefore never built merely
     # to unlock FOUNDATION or shadow learning.
-    "FOUNDATION": ICDORStatePolicy("shadow", 0.10, 0.05),
+    "FOUNDATION": ICDORStatePolicy("shadow", 0.10, 0.05, 0.05),
     "DUAL_REASON_SHADOW": ICDORStatePolicy(
-        "shadow", 0.0, 0.0, freeze_factor_and_prototypes=True, freeze_certificate=True,
+        "shadow", 0.10, 0.05, 0.05, freeze_factor_and_prototypes=True, freeze_certificate=True,
         enable_interventions=True, enable_hidden_audit=True,
     ),
     "SAFE_JOINT": ICDORStatePolicy(
-        "admitted", 1.0, 1.0, freeze_factor_and_prototypes=True, freeze_certificate=True,
+        "admitted", 0.10, 0.05, 0.05, freeze_factor_and_prototypes=True, freeze_certificate=True,
         freeze_edge_admission=True, enable_interventions=True, enable_hidden_audit=True,
         enable_pareto=True, route_is_final=True,
     ),
     "CONSOLIDATION": ICDORStatePolicy(
-        "admitted", 1.0, 1.0, freeze_factor_and_prototypes=True, freeze_certificate=True,
+        "admitted", 0.10, 0.05, 0.05, freeze_factor_and_prototypes=True, freeze_certificate=True,
         freeze_edge_admission=True, freeze_propensity=True, enable_pareto=True, route_is_final=True,
         decoder_router_lr_scale=0.2, route_cap_mutable=False, allow_new_losses=False,
     ),
@@ -55,10 +56,10 @@ class ICDORAdaptiveSchedule:
     """Continuous-access train-audit/train-calib state machine; test is forbidden."""
 
     LIMITS = {
-        "FOUNDATION": (3, 6),
+        "FOUNDATION": (4, 8),
         "DUAL_REASON_SHADOW": (2, 5),
         "SAFE_JOINT": (4, 8),
-        "CONSOLIDATION": (1, 2),
+        "CONSOLIDATION": (2, 3),
     }
 
     def __init__(self, *, pilot: bool) -> None:
@@ -139,6 +140,12 @@ class ICDORAdaptiveSchedule:
             metrics.get("continuous_credibility_available") is True
             and cV_count >= 6
             and metrics.get("diagnostics_finite") is True
+            and metrics.get("direct_action_map_stable_or_improving") is True
+            and metrics.get("direct_reason_map_stable_or_improving") is True
+            and float(metrics.get("mean_abs_cV_delta", float("inf"))) < 0.05
+            and int(metrics.get("nonzero_semantic_reason_count", 0)) >= 10
+            and 0.005 <= float(metrics.get("route_strength_ratio", -1.0)) <= 0.10
+            and metrics.get("final_action_visual_exact") is True
         )
 
     def _shadow_ready(self, metrics: dict[str, Any]) -> bool:
@@ -205,6 +212,7 @@ class ICDORAdaptiveSchedule:
     ) -> dict[str, Any]:
         if test_metrics is not None:
             raise ValueError("test metrics are forbidden in the adaptive schedule")
+        previous_train_audit = self.last_readiness.get("train_audit", {})
         readiness = {
             "train_core": dict(train_core_metrics or {}),
             "train_audit": dict(train_audit_metrics),
@@ -214,6 +222,19 @@ class ICDORAdaptiveSchedule:
             source_split = metrics.get("source_split")
             if source_split is not None and source_split != split:
                 raise ValueError(f"adaptive schedule {split} readiness has invalid source {source_split!r}")
+        current_audit = readiness["train_audit"]
+        for metric_name, stable_name in (
+            ("direct_action_map", "direct_action_map_stable_or_improving"),
+            ("direct_reason_map", "direct_reason_map_stable_or_improving"),
+        ):
+            current = current_audit.get(metric_name)
+            previous = previous_train_audit.get(metric_name)
+            if not self._finite(current):
+                current_audit[stable_name] = False
+            elif not self._finite(previous):
+                current_audit[stable_name] = True
+            else:
+                current_audit[stable_name] = float(current) >= float(previous) - 0.002
         self.last_readiness = readiness
         if self.failed_closed:
             return self.state_dict()
@@ -251,6 +272,8 @@ class ICDORAdaptiveSchedule:
             "failed_closed": self.failed_closed,
             "readiness": readiness,
             "policy": asdict(self.policy()),
+            "pu_enabled": self.pu_enabled,
+            "pu_disable_reason": self.pu_disable_reason,
         }
         self.history.append(row)
         return row

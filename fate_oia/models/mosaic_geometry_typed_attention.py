@@ -41,9 +41,9 @@ class MOSAICGeometryTypedAttention(nn.Module):
             if type(value) is not int or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
         if anchors_per_factor != 2 or heads != 4 or region_samples != 12:
-            raise ValueError("MOSAIC typed attention requires M=2, H=4, and a 3x4 region grid")
+            raise ValueError("MOSAIC typed attention fixed sampling contract requires M=2, H=4, and a 3x4 region grid")
         if (point_samples, curve_samples) not in {(4, 16), (8, 12)}:
-            raise ValueError("MOSAIC typed attention supports IC-DOR 4/16 or legacy 8/12 sampling")
+            raise ValueError("MOSAIC typed attention fixed sampling contract supports IC-DOR 4/16 or legacy 8/12 sampling")
 
         self.factor_types = factor_types
         self.dim = dim
@@ -85,9 +85,13 @@ class MOSAICGeometryTypedAttention(nn.Module):
             torch.linspace(-1.0, 1.0, curve_samples).view(1, curve_samples, 1),
             persistent=True,
         )
+        # Sampling still has four heads. The curve encoder uses the largest
+        # compatible divisor so diagnostic/smoke dimensions such as D=6 do
+        # not make a valid geometric path unconstructable.
+        self.curve_encoder_heads = math.gcd(dim, heads)
         curve_encoder_layer = nn.TransformerEncoderLayer(
             d_model=dim,
-            nhead=heads,
+            nhead=self.curve_encoder_heads,
             dim_feedforward=2 * dim,
             dropout=0.05,
             activation="gelu",
@@ -181,7 +185,10 @@ class MOSAICGeometryTypedAttention(nn.Module):
             raise ValueError("curve sequence encoder received an invalid sample count")
         sequence = sampled_features.reshape(batch_size * factor_count * anchors * heads, samples, dim)
         sequence = sequence + self.curve_arc_length_position.to(dtype=sequence.dtype, device=sequence.device)
-        encoded = self.curve_sequence_encoder(sequence)
+        # The transformer parameters remain fp32 even when the DINO field is
+        # bf16; sampling already uses fp32, so encode in fp32 and restore the
+        # caller's dtype for the rest of the factor path.
+        encoded = self.curve_sequence_encoder(sequence.float()).to(dtype=sampled_features.dtype)
         return encoded.reshape(batch_size, factor_count, anchors, heads, samples, dim)
 
     def forward(self, feature_map: torch.Tensor, anchor_coordinates: torch.Tensor) -> dict[str, torch.Tensor]:

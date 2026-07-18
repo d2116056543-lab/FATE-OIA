@@ -71,13 +71,17 @@ def evaluate_icdor(
         "action_factor_off": [], "action_factor_shuffled": [], "action_wrong_target": [],
         "action_equal_mass_random": [],
         "reason_factor_route_off": [], "reason_factor_route_shuffled": [],
-        "reason_propensity": [],
+        "reason_propensity": [], "reason_observed_mix_gate": [], "reason_escape_weight": [],
+        "reason_factor_router_weights": [], "reason_factor_masks": [],
+        "factor_negative_evidence": [],
     }
     factor_sums: dict[str, torch.Tensor] | None = None
     route_sums: dict[str, torch.Tensor] | None = None
     prototype_sums: dict[str, torch.Tensor] | None = None
     credibility_values: list[torch.Tensor] = []
     credibility_ema_values: list[torch.Tensor] = []
+    route_credibility_values: list[torch.Tensor] = []
+    semantic_compatibility_values: list[torch.Tensor] = []
     credibility_measurements: dict[str, list[torch.Tensor]] = {
         key: [] for key in (
             "cV_prior", "cV_query_shuffle_score", "cV_image_shuffle_score",
@@ -144,6 +148,28 @@ def evaluate_icdor(
         if not isinstance(propensity, torch.Tensor):
             propensity = torch.full_like(reason_labels, 0.5)
         collection["reason_propensity"].append(propensity.detach().float().cpu())
+        factor_count = int(output["factor_presence_prob"].shape[1])
+        mix_gate = output.get("reason_observed_mix_gate")
+        if not isinstance(mix_gate, torch.Tensor) or mix_gate.shape != reason_labels.shape:
+            mix_gate = torch.zeros_like(reason_labels)
+        collection["reason_observed_mix_gate"].append(mix_gate.detach().float().cpu())
+        escape_weight = output.get("reason_escape_weight")
+        if not isinstance(escape_weight, torch.Tensor) or escape_weight.shape != reason_labels.shape:
+            escape_weight = torch.zeros_like(reason_labels)
+        collection["reason_escape_weight"].append(escape_weight.detach().float().cpu())
+        router_weights = output.get("reason_factor_router_weights")
+        if not isinstance(router_weights, torch.Tensor) or router_weights.shape != (images.shape[0], 21, factor_count):
+            router_weights = torch.zeros(images.shape[0], 21, factor_count, device=images.device)
+        collection["reason_factor_router_weights"].append(router_weights.detach().float().cpu())
+        reason_factor_masks = output.get("reason_factor_masks")
+        if not isinstance(reason_factor_masks, torch.Tensor) or reason_factor_masks.ndim != 4 or reason_factor_masks.shape[:2] != (images.shape[0], 21):
+            reason_factor_masks = torch.zeros(images.shape[0], 21, 1, 1, device=images.device)
+        collection["reason_factor_masks"].append(reason_factor_masks.detach().float().cpu())
+        collection["factor_negative_evidence"].append(output["factor_negative_evidence"].detach().float().cpu())
+        semantic_compatibility = output.get("reason_semantic_compatibility_effective")
+        if not isinstance(semantic_compatibility, torch.Tensor) or semantic_compatibility.shape != (21, factor_count):
+            semantic_compatibility = torch.zeros(21, factor_count, device=images.device)
+        semantic_compatibility_values.append(semantic_compatibility.detach().float().cpu())
         collection["action_support_logits"].append(output["action_support_logits"].detach().float().cpu())
         collection["action_veto_logits"].append(output["action_veto_logits"].detach().float().cpu())
         for collection_key, output_key in (
@@ -178,9 +204,12 @@ def evaluate_icdor(
         collection["reason_factor_route_shuffled"].append(shuffled_logits.detach().float().cpu())
         cV = output.get("cV")
         cV_ema = output.get("cV_ema")
+        cV_route_effective = output.get("cV_route_effective")
         if isinstance(cV, torch.Tensor) and isinstance(cV_ema, torch.Tensor):
             credibility_values.append(cV.detach().float().cpu())
             credibility_ema_values.append(cV_ema.detach().float().cpu())
+            if isinstance(cV_route_effective, torch.Tensor) and cV_route_effective.shape == cV.shape:
+                route_credibility_values.append(cV_route_effective.detach().float().cpu())
             for key in credibility_measurements:
                 value = output.get(key)
                 if isinstance(value, torch.Tensor) and value.shape == cV.shape:
@@ -200,16 +229,35 @@ def evaluate_icdor(
                 float((fine_transport_outputs["fine_off"]["action_final_logits"] - output["action_final_logits"]).abs().mean())
                 if "fine_off" in fine_transport_outputs else None
             ),
+            # FOUNDATION intentionally keeps final action exactly visual.
+            # Fine-coordinate efficacy must therefore be measured on the
+            # shadow route, not on the final deployment output.
+            "fine_off_action_shadow_delta_abs_mean": (
+                float((fine_transport_outputs["fine_off"]["action_shadow_logits"] - output["action_shadow_logits"]).abs().mean())
+                if "fine_off" in fine_transport_outputs else None
+            ),
             "fine_off_reason_delta_abs_mean": (
                 float((fine_transport_outputs["fine_off"]["reason_observed_logits"] - output["reason_observed_logits"]).abs().mean())
+                if "fine_off" in fine_transport_outputs else None
+            ),
+            "fine_off_reason_latent_delta_abs_mean": (
+                float((fine_transport_outputs["fine_off"]["reason_logits_latent"] - output["reason_logits_latent"]).abs().mean())
                 if "fine_off" in fine_transport_outputs else None
             ),
             "coarse_off_action_delta_abs_mean": (
                 float((fine_transport_outputs["coarse_off"]["action_final_logits"] - output["action_final_logits"]).abs().mean())
                 if "coarse_off" in fine_transport_outputs else None
             ),
+            "coarse_off_action_shadow_delta_abs_mean": (
+                float((fine_transport_outputs["coarse_off"]["action_shadow_logits"] - output["action_shadow_logits"]).abs().mean())
+                if "coarse_off" in fine_transport_outputs else None
+            ),
             "coarse_off_reason_delta_abs_mean": (
                 float((fine_transport_outputs["coarse_off"]["reason_observed_logits"] - output["reason_observed_logits"]).abs().mean())
+                if "coarse_off" in fine_transport_outputs else None
+            ),
+            "coarse_off_reason_latent_delta_abs_mean": (
+                float((fine_transport_outputs["coarse_off"]["reason_logits_latent"] - output["reason_logits_latent"]).abs().mean())
                 if "coarse_off" in fine_transport_outputs else None
             ),
         })
@@ -260,12 +308,20 @@ def evaluate_icdor(
     action_labels = tensors["action_labels.pt"]
     reason_labels = tensors["reason_labels.pt"]
     action_visual = tensors["action_visual_logits.pt"]
-    action_support_only = action_visual + tensors.pop("action_support_logits")
-    action_veto_only = action_visual - tensors.pop("action_veto_logits")
+    # Keep the component deltas for the per-action route-effect artifact as
+    # well as the isolated branch metrics below.
+    action_support_logits = tensors.pop("action_support_logits")
+    action_veto_logits = tensors.pop("action_veto_logits")
+    action_support_only = action_visual + action_support_logits
+    action_veto_only = action_visual - action_veto_logits
     action_factor_off = tensors.pop("action_factor_off")
     action_factor_shuffled = tensors.pop("action_factor_shuffled")
     action_wrong_target = tensors.pop("action_wrong_target")
     action_equal_mass_random = tensors.pop("action_equal_mass_random")
+    tensors["action_factor_off_logits.pt"] = action_factor_off
+    tensors["action_factor_shuffled_logits.pt"] = action_factor_shuffled
+    tensors["action_wrong_target_logits.pt"] = action_wrong_target
+    tensors["action_equal_mass_random_logits.pt"] = action_equal_mass_random
     action_branches = {
         "visual": _metrics(action_visual, action_labels, "Act"),
         "shadow": _metrics(tensors["action_shadow_logits.pt"], action_labels, "Act"),
@@ -281,6 +337,8 @@ def evaluate_icdor(
     }
     reason_route_off_logits = tensors.pop("reason_factor_route_off")
     reason_route_shuffled_logits = tensors.pop("reason_factor_route_shuffled")
+    tensors["reason_factor_route_off_logits.pt"] = reason_route_off_logits
+    tensors["reason_factor_route_shuffled_logits.pt"] = reason_route_shuffled_logits
     reason_branches = {
         "visual_observed": _metrics(tensors["reason_visual_observed_logits.pt"], reason_labels, "Exp"),
         "latent_semantic": _metrics(tensors["reason_latent_logits.pt"], reason_labels, "Exp"),
@@ -319,6 +377,10 @@ def evaluate_icdor(
         for action_id in range((route_sums or {"support": torch.empty(0, 0)})["support"].shape[1])
     ]
     route_delta = tensors["action_shadow_logits.pt"] - action_visual
+    route_credibility_mean = (
+        float(torch.cat(route_credibility_values, dim=0).mean())
+        if route_credibility_values else None
+    )
     for action_id in range(4):
         visual_rms = action_visual[:, action_id].square().mean().sqrt().clamp_min(1e-8)
         delta = route_delta[:, action_id]
@@ -330,6 +392,9 @@ def evaluate_icdor(
             "visual_logit_rms": float(visual_rms),
             "route_to_visual_rms_ratio": float(delta.square().mean().sqrt() / visual_rms),
             "delta_gt_direction_agreement": float(((delta * desired_sign) > 0).float().mean()),
+            "support_delta_rms": float(action_support_logits[:, action_id].square().mean().sqrt()),
+            "veto_delta_rms": float(action_veto_logits[:, action_id].square().mean().sqrt()),
+            "route_credibility_effective_mean": route_credibility_mean,
             "factor_shuffle_delta_abs_mean": float((tensors["action_shadow_logits.pt"][:, action_id] - action_factor_shuffled[:, action_id]).abs().mean()),
             "wrong_target_delta_abs_mean": float((tensors["action_shadow_logits.pt"][:, action_id] - action_wrong_target[:, action_id]).abs().mean()),
             "selected_minus_equal_random_abs_mean": float((tensors["action_shadow_logits.pt"][:, action_id] - action_equal_mass_random[:, action_id]).abs().mean()),
@@ -344,6 +409,7 @@ def evaluate_icdor(
     if credibility_values:
         credibility = torch.cat(credibility_values, dim=0)
         credibility_ema = torch.cat(credibility_ema_values, dim=0)
+        credibility_route = torch.cat(route_credibility_values, dim=0) if route_credibility_values else credibility
         credibility_rows = [
             {
                 "epoch": epoch,
@@ -354,6 +420,7 @@ def evaluate_icdor(
                 "cV_p95": float(torch.quantile(credibility[:, factor_id], 0.95)),
                 "cV_ema_mean": float(credibility_ema[:, factor_id].mean()),
                 "cV_nonzero_rate": float((credibility[:, factor_id] > 1e-6).float().mean()),
+                "cV_route_effective_mean": float(credibility_route[:, factor_id].mean()),
                 **{
                     f"{key}_mean": float(torch.cat(values, dim=0)[:, factor_id].mean())
                     for key, values in credibility_measurements.items()
@@ -364,6 +431,30 @@ def evaluate_icdor(
         ]
     else:
         credibility_rows = [{"epoch": epoch, "split": "test", "available": False, "reason": "model_did_not_export_cV"}]
+    reason_mix_gate = tensors.pop("reason_observed_mix_gate")
+    reason_escape_weight = tensors.pop("reason_escape_weight")
+    reason_router_weights = tensors.pop("reason_factor_router_weights")
+    reason_factor_masks = tensors.pop("reason_factor_masks")
+    factor_negative_evidence = tensors.pop("factor_negative_evidence")
+    semantic_compatibility = (
+        torch.stack(semantic_compatibility_values).mean(dim=0)
+        if semantic_compatibility_values else torch.zeros(21, reason_router_weights.shape[-1])
+    )
+    latent_decoder = getattr(model, "reason_latent_decoder", None)
+    allowed_mask = getattr(latent_decoder, "reason_factor_allow_mask", None)
+    if not isinstance(allowed_mask, torch.Tensor) or allowed_mask.shape != semantic_compatibility.shape:
+        allowed_mask = torch.ones_like(semantic_compatibility, dtype=torch.bool)
+    else:
+        allowed_mask = allowed_mask.detach().cpu().to(torch.bool)
+    absence_mask = getattr(latent_decoder, "reason_factor_absence_mask", None)
+    if not isinstance(absence_mask, torch.Tensor) or absence_mask.shape != semantic_compatibility.shape:
+        absence_mask = torch.zeros_like(semantic_compatibility, dtype=torch.bool)
+    else:
+        absence_mask = absence_mask.detach().cpu().to(torch.bool)
+    mask_flat = reason_factor_masks.flatten(2).clamp_min(0.0)
+    mask_probability = mask_flat / mask_flat.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+    mask_entropy = -(mask_probability * mask_probability.clamp_min(1e-8).log()).sum(dim=-1)
+    allowed = allowed_mask.unsqueeze(0).to(reason_router_weights)
     reason_rows = [
         {
             "epoch": epoch, "split": "test", "reason_id": reason_id,
@@ -373,6 +464,18 @@ def evaluate_icdor(
             "final_probability_mean": float(torch.sigmoid(tensors["reason_observed_logits.pt"][:, reason_id]).mean()),
             "factor_route_effect_abs_mean": float((tensors["reason_observed_logits.pt"][:, reason_id] - reason_route_off_logits[:, reason_id]).abs().mean()),
             "factor_shuffle_effect_abs_mean": float((tensors["reason_observed_logits.pt"][:, reason_id] - reason_route_shuffled_logits[:, reason_id]).abs().mean()),
+            "residual_alpha_mean": float(reason_mix_gate[:, reason_id].mean()),
+            "escape_weight_mean": float(reason_escape_weight[:, reason_id].mean()),
+            "allowed_factor_mass_mean": float((reason_router_weights[:, reason_id] * allowed[:, reason_id]).sum(dim=-1).mean()),
+            "disallowed_factor_mass_mean": float((reason_router_weights[:, reason_id] * (1.0 - allowed[:, reason_id])).sum(dim=-1).mean()),
+            "reason_factor_mask_area_mean": float((reason_factor_masks[:, reason_id] > 1e-6).float().mean()),
+            "reason_factor_mask_entropy": float(mask_entropy[:, reason_id].mean()),
+            "semantic_compatibility_mean": float((reason_router_weights[:, reason_id] * semantic_compatibility[reason_id].unsqueeze(0)).sum(dim=-1).mean()),
+            "absence_factor_mass_mean": float((reason_router_weights[:, reason_id] * absence_mask[reason_id].unsqueeze(0)).sum(dim=-1).mean()),
+            "absence_negative_evidence_mean": float(
+                (factor_negative_evidence * absence_mask[reason_id].unsqueeze(0)).sum(dim=-1).mean()
+                / max(int(absence_mask[reason_id].sum()), 1)
+            ),
             "propensity_mean": float(tensors["reason_propensity"][:, reason_id].mean()),
             "propensity_min": float(tensors["reason_propensity"][:, reason_id].min()),
             "propensity_max": float(tensors["reason_propensity"][:, reason_id].max()),

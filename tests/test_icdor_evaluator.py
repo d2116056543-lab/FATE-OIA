@@ -80,10 +80,20 @@ def test_evaluator_reports_all_icdor_action_reason_branches_without_test_mutatio
     } <= set(result["branch_metrics"]["action"])
     assert {"visual_observed", "latent_semantic", "observation_model", "final_observed", "factor_route_off", "factor_route_shuffled", "threshold_off", "deploy"} <= set(result["branch_metrics"]["reason"])
     assert result["logits"]["action_final_logits.pt"].shape == (2, 4)
+    assert {
+        "action_factor_off_logits.pt", "action_factor_shuffled_logits.pt",
+        "action_wrong_target_logits.pt", "action_equal_mass_random_logits.pt",
+        "reason_factor_route_off_logits.pt", "reason_factor_route_shuffled_logits.pt",
+    } <= set(result["logits"])
     assert result["file_names"] == ["a.jpg", "b.jpg"]
     assert len(result["prototype_rows"]) == 24
     assert len(result["reason_rows"]) == 21
-    assert "propensity_mean" in result["reason_rows"][0]
+    assert {
+        "propensity_mean", "residual_alpha_mean", "escape_weight_mean",
+        "allowed_factor_mass_mean", "disallowed_factor_mass_mean",
+        "reason_factor_mask_area_mean", "reason_factor_mask_entropy",
+        "semantic_compatibility_mean", "absence_factor_mass_mean", "absence_negative_evidence_mean",
+    } <= set(result["reason_rows"][0])
     assert result["reason_rows"][0]["posterior_q_observed_zero_available"] is False
     assert result["reason_rows"][0]["synthetic_hidden_positive_auprc_available"] is False
     assert result["reason_rows"][0]["top_q_observed_zero_manual_precision_available"] is False
@@ -91,7 +101,11 @@ def test_evaluator_reports_all_icdor_action_reason_branches_without_test_mutatio
     assert result["route_rows"][0]["action_id"] == 0
     summaries = [row for row in result["route_rows"] if row.get("summary") == "per_action_route_effect"]
     assert len(summaries) == 4
-    assert all("route_to_visual_rms_ratio" in row for row in summaries)
+    assert all(
+        {"route_to_visual_rms_ratio", "support_delta_rms", "veto_delta_rms", "route_credibility_effective_mean"}
+        <= set(row)
+        for row in summaries
+    )
     assert result["failure_rows"]
     assert result["failure_rows"][0]["file_name"] in {"a.jpg", "b.jpg"}
 
@@ -112,3 +126,5 @@ def test_evaluator_executes_configured_fine_transport_counterfactuals() -> None:
     assert {"action", "reason"} <= set(result["branch_metrics"]["fine_transport"]["fine_off"])
     assert result["fine_transport_rows"][0]["fine_off_available"] is True
     assert result["fine_transport_rows"][0]["coarse_off_available"] is True
+    assert result["fine_transport_rows"][0]["fine_off_action_shadow_delta_abs_mean"] > 0.0
+    assert result["fine_transport_rows"][0]["fine_off_reason_latent_delta_abs_mean"] > 0.0

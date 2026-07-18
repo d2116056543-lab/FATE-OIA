@@ -72,7 +72,7 @@ def visual_credibility_from_measurements(
     credibility = (1.0 - torch.exp(-effective / 32.0)) * components
     if source_kind == "image_only":
         credibility = credibility.clamp_max(image_only_cap)
-    if factor_role in {"latent", "unsupported"}:
+    if factor_role in {"latent", "latent_only", "unsupported"}:
         credibility = credibility.clamp_max(no_reliable_negative_cap)
     if reliable_negative is not None:
         credibility = torch.where(
@@ -145,7 +145,7 @@ class ContinuousVisualCredibility(nn.Module):
                 caps.append(self.unknown_cap)
             elif source_kind == "image_only":
                 caps.append(self.image_only_cap)
-            elif role in {"latent", "unsupported"} or source_kind == "proxy":
+            elif role in {"latent", "latent_only", "unsupported"} or source_kind == "proxy":
                 caps.append(self.no_reliable_negative_cap)
             else:
                 caps.append(1.0)

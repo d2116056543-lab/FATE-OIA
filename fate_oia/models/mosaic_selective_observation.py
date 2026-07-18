@@ -172,8 +172,18 @@ class MOSAICSelectiveObservationModel(nn.Module):
         epsilon = observation_output["reason_false_positive_rate"].detach().clamp(1e-7, 1.0 - 1e-7)
         if epsilon.ndim == 1:
             epsilon = epsilon.unsqueeze(0)
-        log_hidden_positive = F.logsigmoid(reason_logits_latent.detach()) + torch.log1p(-propensity)
-        log_true_negative = F.logsigmoid(-reason_logits_latent.detach()) + torch.log1p(-epsilon)
-        posterior_zero = torch.exp(log_hidden_positive - torch.logaddexp(log_hidden_positive, log_true_negative))
-        posterior = torch.where(observed_reason_targets > 0.5, torch.ones_like(posterior_zero), posterior_zero)
-        return {"reason_latent_posterior": posterior.detach()}
+        def posterior_for(logits: torch.Tensor) -> torch.Tensor:
+            log_hidden_positive = F.logsigmoid(logits) + torch.log1p(-propensity)
+            log_true_negative = F.logsigmoid(-logits) + torch.log1p(-epsilon)
+            posterior_zero = torch.exp(log_hidden_positive - torch.logaddexp(log_hidden_positive, log_true_negative))
+            return torch.where(observed_reason_targets > 0.5, torch.ones_like(posterior_zero), posterior_zero)
+
+        # The detached posterior is the PU ranking target. The live version is
+        # used only by the training-only hidden-positive recovery term; both
+        # share stop-gradient propensity/false-positive parameters, so labels
+        # cannot enter the inference observation route.
+        posterior_live = posterior_for(reason_logits_latent)
+        return {
+            "reason_latent_posterior": posterior_live.detach(),
+            "reason_latent_posterior_live": posterior_live,
+        }

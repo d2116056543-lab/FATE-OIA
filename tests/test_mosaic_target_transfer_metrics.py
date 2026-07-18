@@ -12,6 +12,38 @@ from torch import nn
 
 
 def _support_kwargs() -> dict[str, object]:
+    control_arms = (
+        {
+            "control_type": "same_type_identity",
+            "available_sample_count": 4,
+            "max_mass_error": 0.0,
+            "max_overlap": 0.0,
+        },
+        {
+            "control_type": "spatial_roll",
+            "available_sample_count": 4,
+            "max_mass_error": 0.0,
+            "max_overlap": 0.0,
+        },
+        {
+            "control_type": "score_shuffle",
+            "available_sample_count": 4,
+            "max_mass_error": 0.0,
+            "max_overlap": 0.0,
+        },
+        {
+            "control_type": "image_shuffle",
+            "available_sample_count": 4,
+            "max_mass_error": 0.0,
+            "max_overlap": 0.0,
+        },
+    )
+    random_by_arm = (
+        (((0.55,), (0.55,), (0.55,), (0.55,)),),
+        (((0.50,), (0.50,), (0.50,), (0.50,)),),
+        (((0.50,), (0.50,), (0.50,), (0.50,)),),
+        (((0.35,), (0.35,), (0.35,), (0.35,)),),
+    )
     return {
         "factor_ids": ("pedestrian",),
         "target_ids": ("brake",),
@@ -24,6 +56,8 @@ def _support_kwargs() -> dict[str, object]:
         "selected_target_prob": (((0.9,),), ((0.2,),), ((0.8,),), ((0.1,),)),
         "matched_random_target_prob": (((0.55,),), ((0.5,),), ((0.5,),), ((0.35,),)),
         "deleted_target_prob": (((0.5,),), ((0.6,),), ((0.4,),), ((0.3,),)),
+        "matched_control_arms": (control_arms,),
+        "matched_random_target_prob_by_arm": random_by_arm,
     }
 
 
@@ -42,7 +76,9 @@ def test_target_transfer_uses_real_selected_random_and_deletion_counterfactuals(
     assert edge["signed_effect"] == pytest.approx(0.4)
     assert edge["tet"] == pytest.approx(0.4)
     assert edge["tes"] == pytest.approx(0.075)
-    assert edge["cca"] == pytest.approx(0.35)
+    # CCA is the fraction of ontology-correct signed interventions, not the
+    # old effect-magnitude surrogate.
+    assert edge["cca"] == pytest.approx(1.0)
     assert edge["ap_delta"] == pytest.approx(5.0 / 12.0)
     assert result["summary"]["pair_count"] == 1
     assert result["summary"]["mean_tes"] == pytest.approx(0.075)
@@ -75,13 +111,15 @@ def test_target_transfer_fails_closed_when_random_masks_are_not_matched() -> Non
         compute_target_transfer_metrics(inputs)
 
 
-def test_target_transfer_fails_closed_when_ap_has_no_real_negative_examples() -> None:
+def test_target_transfer_records_unavailable_when_ap_has_no_real_negative_examples() -> None:
     kwargs = _support_kwargs()
     kwargs["target_labels"] = ((1.0,), (1.0,), (1.0,), (1.0,))
     inputs = TargetTransferInputs(**kwargs)
 
-    with pytest.raises(ValueError, match="positive and negative"):
-        compute_target_transfer_metrics(inputs)
+    result = compute_target_transfer_metrics(inputs)
+    edge = result["per_target"][0]
+    assert edge["available"] is False
+    assert edge["unavailable_reason"] == "target_one_class_on_matched_control_rows"
 
 
 def test_target_transfer_skips_non_candidate_factor_target_pairs() -> None:
@@ -100,6 +138,7 @@ def test_joint_collector_uses_one_real_deletion_sweep_for_action_and_reason() ->
             base = images[:, 0, 0, 0]
             return {
                 "factor_presence_prob": torch.full((images.shape[0], 2), 0.8, device=images.device),
+                "factor_soft_masks": torch.ones(images.shape[0], 2, 2, 2, device=images.device),
                 "action_final_logits": (base + 1.5 * keep[:, 0]).unsqueeze(1),
                 "reason_observed_logits": (base - 1.5 * keep[:, 1]).unsqueeze(1),
             }

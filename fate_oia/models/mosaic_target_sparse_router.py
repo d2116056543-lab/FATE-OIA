@@ -15,7 +15,13 @@ _TIER_TO_ID = {"abstained": 0, "reason_only": 1, "certified": 2}
 class MOSAICTargetSparseRouter(nn.Module):
     """Target-owned sparse factor router with finite logits and a dustbin."""
 
-    def __init__(self, ontology: dict[str, Any], *, dim: int = 384) -> None:
+    def __init__(
+        self,
+        ontology: dict[str, Any],
+        *,
+        dim: int = 384,
+        dustbin_init: float = -4.0,
+    ) -> None:
         super().__init__()
         self.factor_names = tuple(factor["name"] for factor in ontology["factors"])
         self.action_names = tuple(ontology["action_names"])
@@ -48,7 +54,10 @@ class MOSAICTargetSparseRouter(nn.Module):
         self.factor_proj = nn.Linear(dim, dim, bias=False)
         self.target_proj = nn.Linear(dim, dim, bias=False)
         self.direction_bias = nn.Parameter(torch.zeros(2, self.action_count))
-        self.dustbin_logit = nn.Parameter(torch.zeros(2, self.action_count))
+        # Shadow learning starts before an audit has accumulated useful cV.
+        # A conservative low dustbin prior prevents sparse entmax from
+        # assigning all initial mass to dustbin and starving the route owner.
+        self.dustbin_logit = nn.Parameter(torch.full((2, self.action_count), float(dustbin_init)))
 
     @torch.no_grad()
     def set_certificate_tiers(self, tiers: Sequence[str]) -> None:

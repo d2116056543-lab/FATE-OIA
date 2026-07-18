@@ -47,18 +47,27 @@ def _edge_key(direction: str, factor_name: str, action_name: str) -> str:
 def build_edge_admission(
     statistics: Mapping[tuple[str, str, str], MOSAICEdgeInterventionStats],
     ontology: Mapping[str, Any],
-    factor_tiers: Sequence[str],
+    factor_credibility: Sequence[float],
     *,
     source_split: str,
     credibility_min: float = 0.80,
 ) -> MOSAICEdgeAdmission:
-    """Freeze only audit-proven Certified factor-to-action edges."""
+    """Admit only independent-audit-proven factor-to-action edges.
+
+    A discrete factor certificate is a reporting artifact. It cannot be a
+    precondition for target-specific action admission because that recreates
+    CREDO's cold-start loop. The detached audit_visual cV vector is the sole
+    factor-level admission evidence used here.
+    """
     if source_split not in {"audit_target", "train_audit"}:
         raise ValueError("IC-DOR edge admission may only read an independent target audit")
     factor_names = [factor["name"] for factor in ontology["factors"]]
     action_names = list(ontology["action_names"])
-    if len(factor_tiers) != len(factor_names) or any(tier not in {"certified", "reason_only", "abstained"} for tier in factor_tiers):
-        raise ValueError("IC-DOR edge admission factor tiers do not match the factor ontology")
+    if len(factor_credibility) != len(factor_names):
+        raise ValueError("IC-DOR edge admission credibility does not match the factor ontology")
+    credibility = torch.tensor(factor_credibility, dtype=torch.float32)
+    if not torch.isfinite(credibility).all() or bool(((credibility < 0.0) | (credibility > 1.0)).any()):
+        raise ValueError("IC-DOR edge admission credibility must be finite in [0,1]")
     factor_index = ontology["factor_index"]
     action_index = ontology["action_index"]
     candidate = torch.zeros(2, len(factor_names), len(action_names), dtype=torch.bool)
@@ -84,9 +93,7 @@ def build_edge_admission(
                 stats = statistics.get((direction, factor_name, action_name))
                 if stats is None:
                     continue
-                action_credibility[action_id] = max(
-                    action_credibility[action_id], float(factor_tiers[factor_id] == "certified")
-                )
+                action_credibility[action_id] = max(action_credibility[action_id], credibility[factor_id])
                 action_tet[action_id] = max(action_tet[action_id], float(stats.tet_lcb95))
                 action_tes[action_id] = max(action_tes[action_id], float(stats.tes_lcb95))
                 action_cca[action_id] = max(action_cca[action_id], float(stats.cca))
@@ -112,8 +119,6 @@ def build_edge_admission(
                 stats = statistics.get(key)
                 accepted = False
                 reasons: list[str] = []
-                if factor_tiers[factor_id] != "certified":
-                    reasons.append("factor_not_certified")
                 if not bool(partial_action_ready[action_id]):
                     reasons.append("partial_action_admission_not_ready")
                 if stats is None:
@@ -144,7 +149,7 @@ def build_edge_admission(
                     "factor": factor_name,
                     "target": action_name,
                     "candidate": True,
-                    "factor_tier": factor_tiers[factor_id],
+                    "factor_credibility": float(credibility[factor_id]),
                     "accepted": accepted,
                     "partial_action_ready": bool(partial_action_ready[action_id]),
                     "reasons": reasons,

@@ -74,6 +74,10 @@ def test_functional_audit_cannot_blanket_pass_without_per_check_evidence() -> No
     assert 'return ({name: "PASS" for name in _REQUIRED_FUNCTIONAL_CHECKS}' not in source
     assert 'checks["direct_image"] = "PASS"' in source
     assert 'checks["artifact_schema_v4"] = "PASS"' in source
+    assert 'checks["credo_learning_deployment"] = "PASS"' in source
+    assert '"factor_audit.json"' in source
+    assert '"no_lane_absence_polarity"' in source
+    assert '"clip_grad_norm_("' in source
     assert "functional checks lack explicit evidence" in source
 
 
@@ -95,15 +99,19 @@ class _RealForwardModel(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.action_adapter = nn.Conv2d(3, 1, kernel_size=1, bias=False)
+        self.action_router = nn.Conv2d(3, 1, kernel_size=1, bias=False)
         self.reason_adapter = nn.Conv2d(3, 1, kernel_size=1, bias=False)
 
     def forward(self, images: torch.Tensor, *, return_masks: bool, **_: object) -> dict[str, torch.Tensor]:
         assert return_masks is True
         action_map = self.action_adapter(images)
+        route_map = self.action_router(images)
         reason_map = self.reason_adapter(images)
         factor_masks = torch.sigmoid(torch.cat((action_map, reason_map), dim=1))
         return {
             "action_final_logits": action_map.mean((2, 3)),
+            "action_visual_logits": action_map.mean((2, 3)),
+            "action_shadow_logits": action_map.detach().mean((2, 3)) + route_map.mean((2, 3)),
             "action_factor_off_logits": action_map.mean((2, 3)),
             "action_factor_shuffled_logits": action_map.mean((2, 3)) + 0.01,
             "action_wrong_target_logits": action_map.mean((2, 3)) - 0.01,
@@ -125,8 +133,10 @@ def test_dynamic_audit_uses_real_forwards_and_lane_gradients() -> None:
     assert result["input_sensitivity"]["action_final_logits"] > 0.0
     assert result["gradient_sum_abs"]["action_adapter"] > 0.0
     assert result["gradient_sum_abs"]["reason_adapter"] > 0.0
+    assert result["gradient_sum_abs"]["action_router_rereader"] > 0.0
     assert result["gradient_firewall"]["reason_to_action_adapter"] == 0.0
     assert result["gradient_firewall"]["action_to_reason_adapter"] == 0.0
+    assert result["gradient_firewall"]["shadow_to_action_adapter"] == 0.0
 
 
 def test_dynamic_audit_fails_closed_when_a_required_real_output_is_missing() -> None:
@@ -181,7 +191,7 @@ def test_review_pass_is_fail_closed_and_binds_all_evidence() -> None:
             "reason_firewall", "selective_observation", "calibration", "artifact_schema",
             "resume_integrity", "visual_audit", "foreground_launcher", "continuous_credibility",
             "fine_transport", "partial_action_admission", "regime_schedule", "artifact_schema_v4", "target_utility",
-            "batch_field_reuse",
+            "batch_field_reuse", "credo_learning_deployment",
         )},
         "missing_items": [],
         "git_tree": "TREE",
@@ -288,7 +298,7 @@ def test_learning_access_review_does_not_claim_or_require_deployment_admission()
             "reason_firewall", "selective_observation", "calibration", "artifact_schema",
             "resume_integrity", "visual_audit", "foreground_launcher", "continuous_credibility",
             "fine_transport", "partial_action_admission", "regime_schedule", "artifact_schema_v4",
-            "target_utility", "batch_field_reuse",
+            "target_utility", "batch_field_reuse", "credo_learning_deployment",
         )},
         "missing_items": [],
     }
@@ -316,7 +326,7 @@ def test_review_pass_rejects_dirty_or_unbound_source_tree() -> None:
         "reason_firewall", "selective_observation", "calibration", "artifact_schema",
         "resume_integrity", "visual_audit", "foreground_launcher", "continuous_credibility",
         "fine_transport", "partial_action_admission", "regime_schedule", "artifact_schema_v4",
-        "batch_field_reuse",
+        "batch_field_reuse", "credo_learning_deployment",
     )
     base = {
         "pass": True, "git_head": "abc", "git_tree": "TREE",

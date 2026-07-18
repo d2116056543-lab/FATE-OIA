@@ -35,6 +35,39 @@ def factor_positive_anchor_loss(
     return (F.softplus(-factor_presence_logits) * weights).sum() / denominator
 
 
+def factor_selective_contrastive_loss(
+    factor_features: torch.Tensor,
+    positive_mask: torch.Tensor,
+    reliable_negative_mask: torch.Tensor,
+    *,
+    negative_margin: float = 0.10,
+) -> torch.Tensor:
+    """Separate each factor's grounded positives from reliable negatives.
+
+    The reduction is factor-balanced: a frequent object factor cannot drown
+    out a sparse lane or traffic-control factor. Unknown and weak-negative
+    observations are deliberately excluded from this visual-only objective.
+    """
+    if factor_features.ndim != 3 or positive_mask.shape != factor_features.shape[:2] or reliable_negative_mask.shape != factor_features.shape[:2]:
+        raise ValueError("IC-DOR selective contrastive loss expects [B,F,D] features and [B,F] masks")
+    if positive_mask.dtype != torch.bool or reliable_negative_mask.dtype != torch.bool:
+        raise ValueError("IC-DOR selective contrastive masks must be boolean")
+    if not 0.0 <= float(negative_margin) < 1.0:
+        raise ValueError("IC-DOR selective contrastive margin must be in [0,1)")
+    normalized = F.normalize(factor_features, dim=-1, eps=1e-6)
+    losses: list[torch.Tensor] = []
+    for factor_id in range(normalized.shape[1]):
+        positives = normalized[positive_mask[:, factor_id], factor_id]
+        negatives = normalized[reliable_negative_mask[:, factor_id], factor_id]
+        if positives.numel() == 0 or negatives.numel() == 0:
+            continue
+        prototype = F.normalize(positives.mean(dim=0, keepdim=True), dim=-1, eps=1e-6)
+        positive_compactness = (1.0 - (positives * prototype).sum(dim=-1)).mean()
+        negative_separation = F.relu((negatives * prototype).sum(dim=-1) - float(negative_margin)).mean()
+        losses.append(positive_compactness + negative_separation)
+    return torch.stack(losses).mean() if losses else factor_features.sum() * 0.0
+
+
 def factor_presence_visibility_losses(
     factor_presence_logits: torch.Tensor,
     factor_visibility_logits: torch.Tensor,
@@ -43,7 +76,6 @@ def factor_presence_visibility_losses(
     presence_known_mask: torch.Tensor,
     visibility_known_mask: torch.Tensor,
     weak_negative_mask: torch.Tensor | None = None,
-    weak_negative_weight: float = 0.05,
 ) -> dict[str, torch.Tensor]:
     """Supervise only observed/geometry-known factor states; unknown is ignored."""
     loss_presence = _masked_bce(factor_presence_logits, presence_targets, presence_known_mask)
@@ -51,7 +83,7 @@ def factor_presence_visibility_losses(
     if weak_negative_mask is None:
         loss_weak_negative = factor_presence_logits.sum() * 0.0
     else:
-        if weak_negative_mask.shape != factor_presence_logits.shape or not 0.0 <= weak_negative_weight <= 1.0:
+        if weak_negative_mask.shape != factor_presence_logits.shape:
             raise ValueError("IC-DOR weak-negative supervision is invalid")
         weak = weak_negative_mask.to(dtype=factor_presence_logits.dtype)
         raw = F.softplus(factor_presence_logits)
@@ -60,7 +92,11 @@ def factor_presence_visibility_losses(
         "loss_factor_presence": loss_presence,
         "loss_factor_visibility": loss_visibility,
         "loss_factor_weak_negative": loss_weak_negative,
-        "loss_factor_total": loss_presence + loss_visibility + weak_negative_weight * loss_weak_negative,
+        # The exact CREDO factor objective is assembled by the trainer as
+        # presence + visibility + geometry + selected contrast + view/flip +
+        # prototype. Keep weak negatives visible for audit without silently
+        # adding a plan-external optimisation term to this aggregate.
+        "loss_factor_total": loss_presence + loss_visibility,
     }
 
 

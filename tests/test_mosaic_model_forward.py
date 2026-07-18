@@ -69,7 +69,7 @@ def test_reason_decoder_mutation_cannot_change_action_logits() -> None:
 
 def test_forward_signature_physically_excludes_labels_geometry_and_training_metadata() -> None:
     signature = inspect.signature(MOSAICADModel.forward)
-    assert list(signature.parameters) == ["self", "images", "prior_mode", "return_masks"]
+    assert list(signature.parameters) == ["self", "images", "prior_mode", "return_masks", "return_intermediates"]
     model = _model()
     with pytest.raises(TypeError):
         model(torch.randn(1, 3, 360, 640), reason_labels=torch.zeros(1, 21))

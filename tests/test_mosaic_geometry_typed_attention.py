@@ -30,14 +30,15 @@ def test_typed_attention_vectorizes_one_grid_sample_call_per_geometry_group(monk
     assert len(calls) == 3
     assert all(input_shape == (2, 8, 45, 80) for input_shape, _ in calls)
     assert sorted(grid_shape[1] for _, grid_shape in calls) == [8, 8, 16]
-    assert output["sampled_features"].shape == (2, 4, 2, 4, 12, 8)
-    assert output["sampling_coordinates"].shape == (2, 4, 2, 4, 12, 2)
-    assert output["sample_valid_mask"].shape == (4, 12)
-    assert output["sample_valid_mask"][0].sum() == 8
-    assert output["sample_valid_mask"][1].sum() == 8
-    assert output["sample_valid_mask"][2].sum() == 12
+    # V4's fine transport uses IC-DOR's 4/16/12 budget by default.
+    assert output["sampled_features"].shape == (2, 4, 2, 4, 16, 8)
+    assert output["sampling_coordinates"].shape == (2, 4, 2, 4, 16, 2)
+    assert output["sample_valid_mask"].shape == (4, 16)
+    assert output["sample_valid_mask"][0].sum() == 4
+    assert output["sample_valid_mask"][1].sum() == 4
+    assert output["sample_valid_mask"][2].sum() == 16
     assert output["sample_valid_mask"][3].sum() == 12
-    assert torch.count_nonzero(output["sampled_features"][:, :2, :, :, 8:]) == 0
+    assert torch.count_nonzero(output["sampled_features"][:, :2, :, :, 4:]) == 0
 
 
 def test_typed_attention_coordinates_and_all_geometry_parameters_receive_gradients() -> None:
@@ -74,7 +75,7 @@ def test_point_curve_and_region_sampling_are_geometrically_distinct() -> None:
     output = module(torch.randn(1, 4, 45, 80), torch.zeros(1, 3, 2, 2))
     coordinates = output["sampling_coordinates"][0]
 
-    point = coordinates[0, :, :, :8]
+    point = coordinates[0, :, :, :4]
     curve = coordinates[1]
     region = coordinates[2]
     assert point.std(dim=-2).mean() > 0

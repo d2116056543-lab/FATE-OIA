@@ -27,6 +27,29 @@ def _asymmetric_values(logits: torch.Tensor, targets: torch.Tensor) -> torch.Ten
     return -(positive + negative)
 
 
+def _per_label_balanced_asl(
+    values: torch.Tensor,
+    targets: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Balance known positives and negatives independently for each reason."""
+    if values.shape != targets.shape or values.shape != valid_mask.shape:
+        raise ValueError("per-label IC-DOR ASL requires matching value, target, and valid tensors")
+    label_losses: list[torch.Tensor] = []
+    for reason_id in range(values.shape[1]):
+        valid = valid_mask[:, reason_id]
+        positive = valid & (targets[:, reason_id] > 0.5)
+        negative = valid & ~positive
+        class_terms: list[torch.Tensor] = []
+        if bool(positive.any()):
+            class_terms.append(values[positive, reason_id].mean())
+        if bool(negative.any()):
+            class_terms.append(values[negative, reason_id].mean())
+        if class_terms:
+            label_losses.append(torch.stack(class_terms).mean())
+    return torch.stack(label_losses).mean() if label_losses else values.sum() * 0.0
+
+
 def build_synthetic_hidden_positive_mask(
     observed_reason_targets: torch.Tensor,
     *,
@@ -62,8 +85,8 @@ def reason_observed_losses(
     if valid.shape != observed_reason_targets.shape or valid.dtype != torch.bool:
         raise ValueError("IC-DOR observed reason valid mask must be bool [B,21]")
     targets = observed_reason_targets.to(dtype=reason_observed_logits.dtype)
-    visual = _masked_mean(_asymmetric_values(reason_visual_observed_logits, targets), valid)
-    observed = _masked_mean(_asymmetric_values(reason_observed_logits, targets), valid)
+    visual = _per_label_balanced_asl(_asymmetric_values(reason_visual_observed_logits, targets), targets, valid)
+    observed = _per_label_balanced_asl(_asymmetric_values(reason_observed_logits, targets), targets, valid)
     return {
         "loss_reason_visual_observed_asl": visual,
         "loss_reason_observed_asl": observed,
