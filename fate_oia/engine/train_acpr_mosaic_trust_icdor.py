@@ -1217,6 +1217,7 @@ def compute_icdor_training_losses(
         selective = selective_observation_losses(
             output["reason_logits_latent"], observed_targets,
             output["reason_observation_prob"], posterior,
+            reason_observation_logits=output["reason_observation_logits"],
             reason_propensity=output["reason_propensity"], factor_route_support=factor_support,
             escape_weight=output["reason_escape_weight"], synthetic_hidden_positive_mask=hidden_mask,
             observed_valid_mask=observed_valid_mask,

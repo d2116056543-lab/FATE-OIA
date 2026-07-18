@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+from torch.nn import functional as F
 
 from fate_oia.losses.mosaic_icdor_factor_losses import (
     factor_presence_visibility_losses,
@@ -49,6 +50,30 @@ def test_icdor_reason_posterior_losses_and_ring_queue_are_detached() -> None:
     queue.enqueue(torch.randn(6, 21), torch.rand(6, 21), torch.arange(6, 12))
     assert queue.size == 8
     assert queue.write_index == 2
+
+
+def test_icdor_selective_observation_uses_logits_for_autocast_safe_nll() -> None:
+    """The trainer must preserve the observation logits emitted by the model."""
+    latent = torch.randn(2, 21, requires_grad=True)
+    observation_logits = torch.randn(2, 21, requires_grad=True)
+    observed = torch.randint(0, 2, (2, 21), dtype=torch.float32)
+    losses = selective_observation_losses(
+        latent,
+        observed,
+        torch.sigmoid(observation_logits),
+        torch.full((2, 21), 0.5),
+        reason_observation_logits=observation_logits,
+        reason_propensity=torch.full((2, 21), 0.5),
+        factor_route_support=torch.full((2, 21), 0.5),
+        escape_weight=torch.zeros((2, 21)),
+    )
+    assert torch.allclose(
+        losses["loss_reason_observation_nll"],
+        F.binary_cross_entropy_with_logits(observation_logits, observed),
+    )
+    losses["loss_reason_selective_total"].backward()
+    assert observation_logits.grad is not None
+    assert torch.isfinite(observation_logits.grad).all()
 
 
 def test_icdor_synthetic_hidden_recovery_really_hides_observed_positives() -> None:

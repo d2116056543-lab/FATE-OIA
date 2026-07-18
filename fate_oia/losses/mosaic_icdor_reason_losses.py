@@ -92,6 +92,7 @@ def selective_observation_losses(
     observed_reason_targets: torch.Tensor,
     reason_observation_probability: torch.Tensor,
     posterior: torch.Tensor,
+    reason_observation_logits: torch.Tensor | None = None,
     *,
     reason_propensity: torch.Tensor,
     factor_route_support: torch.Tensor,
@@ -102,15 +103,24 @@ def selective_observation_losses(
     shapes = [observed_reason_targets, reason_observation_probability, posterior, reason_propensity, factor_route_support, escape_weight]
     if reason_logits_latent.ndim != 2 or reason_logits_latent.shape[-1] != 21 or any(value.shape != reason_logits_latent.shape for value in shapes):
         raise ValueError("IC-DOR selective observation losses require matching [B,21] tensors")
+    if reason_observation_logits is not None and reason_observation_logits.shape != reason_logits_latent.shape:
+        raise ValueError("IC-DOR observation logits must match latent reason logits [B,21]")
     valid = torch.ones_like(observed_reason_targets, dtype=torch.bool) if observed_valid_mask is None else observed_valid_mask
     if valid.shape != reason_logits_latent.shape or valid.dtype != torch.bool:
         raise ValueError("IC-DOR selective observation valid mask must be bool [B,21]")
     target = observed_reason_targets.to(dtype=reason_logits_latent.dtype)
     observation_probability = reason_observation_probability.clamp(1e-6, 1.0 - 1e-6)
+    # BCE on probabilities is unsafe under bf16 autocast. Prefer the model's
+    # native observation logits; retain a float logit fallback for old callers.
+    observation_logits = (
+        reason_observation_logits
+        if reason_observation_logits is not None
+        else torch.logit(observation_probability.float())
+    )
     # Kept for call-site compatibility only. Hidden labels are audit targets, never training loss targets.
     if synthetic_hidden_positive_mask is not None and (synthetic_hidden_positive_mask.shape != reason_logits_latent.shape or synthetic_hidden_positive_mask.dtype != torch.bool):
         raise ValueError("IC-DOR synthetic hidden-positive mask must be bool [B,21]")
-    loss_nll = _masked_mean(F.binary_cross_entropy(observation_probability, target, reduction="none"), valid)
+    loss_nll = _masked_mean(F.binary_cross_entropy_with_logits(observation_logits, target, reduction="none"), valid)
     loss_posterior = _masked_mean(F.binary_cross_entropy_with_logits(reason_logits_latent, posterior.detach(), reduction="none"), valid)
     loss_rank = _posterior_rank_loss(reason_logits_latent, posterior, valid)
     loss_factor_consistency = _masked_mean((torch.sigmoid(reason_logits_latent) - factor_route_support.detach()).square(), valid)
