@@ -238,7 +238,7 @@ def test_certificate_freeze_disables_only_the_factor_branch() -> None:
     assert all(parameter.requires_grad for parameter in model.reason_adapter.parameters())
 
 
-def test_formal_loss_surface_calls_factor_action_reason_and_preserves_firewalls() -> None:
+def test_formal_loss_surface_calls_factor_action_reason_and_preserves_firewalls(monkeypatch: pytest.MonkeyPatch) -> None:
     config = load_config(Path(__file__).parents[1] / "configs" / "fate_oia_train_360x640_acpr_mosaic_trust_v3_icdor.yaml")
     model = build_icdor_model(config, use_mock_dino=True, mock_dim=32)
     model.train()
@@ -269,6 +269,15 @@ def test_formal_loss_surface_calls_factor_action_reason_and_preserves_firewalls(
     )
     assert torch.isfinite(losses["loss_total"])
     ownership, _ = build_icdor_parameter_ownership(model)
+    original_grad = torch.autograd.grad
+    grad_calls = 0
+
+    def counted_grad(*args: object, **kwargs: object) -> tuple[torch.Tensor | None, ...]:
+        nonlocal grad_calls
+        grad_calls += 1
+        return original_grad(*args, **kwargs)
+
+    monkeypatch.setattr(torch.autograd, "grad", counted_grad)
     gradient_rows = _parameter_group_gradient_audit(
         losses,
         ownership,
@@ -276,6 +285,9 @@ def test_formal_loss_surface_calls_factor_action_reason_and_preserves_firewalls(
         epoch=0,
         step=0,
     )
+    # One reverse-mode pass per audited loss. Repeating it for every owner
+    # group makes the first live batch prohibitively expensive.
+    assert grad_calls == 3
     assert_icdor_gradient_firewall(gradient_rows)
     losses["loss_total"].backward()
     assert any(parameter.grad is not None for parameter in model.action_adapter.parameters())

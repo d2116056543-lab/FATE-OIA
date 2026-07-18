@@ -1434,33 +1434,56 @@ def _parameter_group_gradient_audit(
     step: int,
 ) -> list[dict[str, Any]]:
     named = dict(model.named_parameters())
-    groups: dict[str, list[nn.Parameter]] = {}
+    audited: list[tuple[str, str, nn.Parameter]] = []
     for entry in ownership:
         parameter = named[entry["full_name"]]
         if parameter.requires_grad:
-            groups.setdefault(entry["owner_group"], []).append(parameter)
+            audited.append((str(entry["full_name"]), str(entry["owner_group"]), parameter))
+    if not audited:
+        raise RuntimeError("IC-DOR gradient audit found no trainable owned parameters")
+
+    parameters = tuple(parameter for _, _, parameter in audited)
+    owner_names = tuple(sorted({owner_group for _, owner_group, _ in audited}))
     rows: list[dict[str, Any]] = []
-    action_vectors: dict[str, torch.Tensor] = {}
+    action_gradients: dict[str, torch.Tensor] = {}
+    action_norm_sq: dict[str, torch.Tensor] = {}
     for loss_name in ("loss_action_total", "loss_factor_weighted_total", "loss_reason_total"):
         loss = losses[loss_name]
-        for group_name, parameters in groups.items():
-            gradients = torch.autograd.grad(loss, parameters, retain_graph=True, allow_unused=True)
-            flat = torch.cat([gradient.detach().flatten() for gradient in gradients if gradient is not None], dim=0) if any(
-                gradient is not None for gradient in gradients
-            ) else loss.new_zeros(1)
-            norm = flat.norm()
+        # A single reverse-mode pass over all owned parameters is equivalent to
+        # one pass per owner group, while avoiding tens of redundant backwards
+        # through the two-view dense-token graph at the first live batch.
+        gradients = torch.autograd.grad(loss, parameters, retain_graph=True, allow_unused=True)
+        if len(gradients) != len(audited):
+            raise RuntimeError("IC-DOR gradient audit returned an unexpected parameter gradient count")
+        norm_sq_by_owner = {owner_name: loss.new_zeros(()) for owner_name in owner_names}
+        dot_by_owner = {owner_name: loss.new_zeros(()) for owner_name in owner_names}
+        for (parameter_name, owner_name, _), gradient in zip(audited, gradients):
+            if gradient is None:
+                continue
+            gradient_float = gradient.detach().float()
+            norm_sq_by_owner[owner_name] = norm_sq_by_owner[owner_name] + gradient_float.square().sum()
+            if loss_name == "loss_action_total":
+                action_gradients[parameter_name] = gradient_float
+            else:
+                action_gradient = action_gradients.get(parameter_name)
+                if action_gradient is not None:
+                    dot_by_owner[owner_name] = dot_by_owner[owner_name] + (gradient_float * action_gradient).sum()
+
+        for group_name in owner_names:
+            norm_sq = norm_sq_by_owner[group_name]
+            norm = norm_sq.sqrt()
             row = {
                 "epoch": epoch, "step": step, "loss": loss_name, "owner_group": group_name,
                 "grad_norm": float(norm.cpu()), "finite": bool(torch.isfinite(norm)),
             }
             if loss_name == "loss_action_total":
-                action_vectors[group_name] = flat
+                action_norm_sq[group_name] = norm_sq
                 row["cosine_with_action_base"] = 1.0 if norm > 0 else None
             else:
-                action = action_vectors.get(group_name)
+                action_sq = action_norm_sq.get(group_name)
                 row["cosine_with_action_base"] = (
-                    float(torch.nn.functional.cosine_similarity(flat, action, dim=0).cpu())
-                    if action is not None and flat.numel() == action.numel() and flat.norm() > 0 and action.norm() > 0 else None
+                    float((dot_by_owner[group_name] / (norm_sq * action_sq).sqrt()).cpu())
+                    if action_sq is not None and norm_sq > 0 and action_sq > 0 else None
                 )
             rows.append(row)
     return rows
