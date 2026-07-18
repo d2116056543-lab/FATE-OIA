@@ -385,7 +385,7 @@ def evaluate_icdor(
         visual_rms = action_visual[:, action_id].square().mean().sqrt().clamp_min(1e-8)
         delta = route_delta[:, action_id]
         desired_sign = action_labels[:, action_id] * 2.0 - 1.0
-        route_rows.append({
+        route_effect = {
             "epoch": epoch, "split": "test", "factor_id": -1, "action_id": action_id,
             "summary": "per_action_route_effect",
             "route_delta_rms": float(delta.square().mean().sqrt()),
@@ -398,6 +398,17 @@ def evaluate_icdor(
             "factor_shuffle_delta_abs_mean": float((tensors["action_shadow_logits.pt"][:, action_id] - action_factor_shuffled[:, action_id]).abs().mean()),
             "wrong_target_delta_abs_mean": float((tensors["action_shadow_logits.pt"][:, action_id] - action_wrong_target[:, action_id]).abs().mean()),
             "selected_minus_equal_random_abs_mean": float((tensors["action_shadow_logits.pt"][:, action_id] - action_equal_mass_random[:, action_id]).abs().mean()),
+        }
+        route_rows.append(route_effect)
+        route_ownership_rows.append({
+            **route_effect,
+            "route_mode": route_mode,
+            "latent_enabled": bool(latent_enabled),
+            "action_route_gate_cap": float(output.get("action_route_gate_cap", 0.0)),
+            "action_final_visual_equal": bool(torch.allclose(
+                tensors["action_final_logits.pt"][:, action_id], action_visual[:, action_id],
+                atol=1e-7, rtol=0.0,
+            )),
         })
     prototype_rows = [
         {

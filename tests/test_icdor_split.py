@@ -65,6 +65,18 @@ def test_icdor_split_is_disjoint_deterministic_and_complete() -> None:
     assert len(first.label_positive_counts) == 25
 
 
+def test_v4_run_manifest_exposes_full_list_valued_partitions() -> None:
+    split = make_icdor_train_splits(_dataset(), seed=20260713)
+
+    manifest = trainer._icdor_full_split_manifest_fields(split)
+
+    assert manifest["file_names"] == list(split.file_names)
+    assert manifest["train_core_indices"] == list(split.train_core_indices)
+    assert manifest["audit_visual_indices"] == list(split.audit_visual_indices)
+    assert manifest["audit_target_indices"] == list(split.audit_target_indices)
+    assert manifest["train_calib_indices"] == list(split.train_calib_indices)
+
+
 def test_icdor_split_rejects_non_train_metadata() -> None:
     dataset = _dataset()
     sample = dataset.samples[0]

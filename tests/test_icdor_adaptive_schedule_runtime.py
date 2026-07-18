@@ -28,6 +28,7 @@ def test_train_audit_references_survive_checkpoint_state_roundtrip() -> None:
 from fate_oia.engine.train_acpr_mosaic_trust_icdor import (
     _adaptive_phase,
     _build_rank_queues,
+    _load_model_state_with_legacy_frozen_dino_compat,
     _load_resume,
     _save_checkpoint,
 )
@@ -50,6 +51,25 @@ class _ResumeModel(nn.Module):
 
     def set_edge_admission(self, mask: torch.Tensor) -> None:
         self.action_router.edge_admission_mask.copy_(mask)
+
+
+def test_legacy_frozen_dino_vproj_checkpoint_keys_are_the_only_ignored_keys() -> None:
+    model = _ResumeModel()
+    legacy = dict(model.state_dict())
+    legacy["dino.backbone.blocks.0.attn.vproj.weight"] = torch.zeros(2, 2)
+    legacy["dino.backbone.blocks.0.attn.vproj.bias"] = torch.zeros(2)
+
+    ignored = _load_model_state_with_legacy_frozen_dino_compat(model, legacy)
+
+    assert ignored == [
+        "dino.backbone.blocks.0.attn.vproj.bias",
+        "dino.backbone.blocks.0.attn.vproj.weight",
+    ]
+
+    invalid = dict(legacy)
+    invalid["label_trunk.unexpected.weight"] = torch.zeros(2, 2)
+    with pytest.raises(RuntimeError, match="unexpected checkpoint keys"):
+        _load_model_state_with_legacy_frozen_dino_compat(model, invalid)
 
 
 def test_runtime_phase_comes_from_adaptive_state_not_epoch() -> None:

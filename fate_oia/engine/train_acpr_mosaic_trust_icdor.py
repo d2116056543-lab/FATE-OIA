@@ -6,6 +6,7 @@ import json
 import math
 import os
 import random
+import re
 import subprocess
 import sys
 import time
@@ -791,6 +792,17 @@ def _factor_aware_audit_subset(
     return sorted(selected)
 
 
+def _icdor_full_split_manifest_fields(split: ICDORTrainSplits) -> dict[str, list[int] | list[str]]:
+    """Preserve immutable full partitions even when a pilot caps loader samples."""
+    return {
+        "file_names": list(split.file_names),
+        "train_core_indices": list(split.train_core_indices),
+        "audit_visual_indices": list(split.audit_visual_indices),
+        "audit_target_indices": list(split.audit_target_indices),
+        "train_calib_indices": list(split.train_calib_indices),
+    }
+
+
 def build_icdor_loaders(
     config: dict[str, Any],
     output_dir: str | Path,
@@ -863,6 +875,7 @@ def build_icdor_loaders(
         "audit_visual_positive_counts": list(split.audit_visual_positive_counts),
         "audit_target_positive_counts": list(split.audit_target_positive_counts),
         "train_calib_positive_counts": list(split.calib_positive_counts),
+        **_icdor_full_split_manifest_fields(split),
     }
     return (
         _loader(Subset(train, core), batch_size=batch_size, shuffle=True, num_workers=num_workers, config=config,
@@ -1872,6 +1885,28 @@ def _save_checkpoint(
     }, path)
 
 
+_LEGACY_FROZEN_DINO_VPROJ_KEY = re.compile(
+    r"^dino\.backbone\.blocks\.\d+\.attn\.vproj\.(?:weight|bias)$"
+)
+
+
+def _load_model_state_with_legacy_frozen_dino_compat(
+    model: nn.Module,
+    checkpoint_state: Mapping[str, torch.Tensor],
+) -> list[str]:
+    """Restore all trainable state strictly while accepting a retired frozen DINO key."""
+    result = model.load_state_dict(checkpoint_state, strict=False)
+    ignored = sorted(result.unexpected_keys)
+    disallowed = [key for key in ignored if not _LEGACY_FROZEN_DINO_VPROJ_KEY.fullmatch(key)]
+    if result.missing_keys or disallowed:
+        raise RuntimeError(
+            "IC-DOR resume model-state mismatch: "
+            f"missing checkpoint keys={sorted(result.missing_keys)}, "
+            f"unexpected checkpoint keys={disallowed}"
+        )
+    return ignored
+
+
 def _load_resume(
     path: str | Path,
     *,
@@ -1911,7 +1946,7 @@ def _load_resume(
                 direction = 0 if record["direction"] == "support" else 1
                 mask[direction, factor_index[record["factor"]], action_index[record["target"]]] = True
         model.set_edge_admission(mask)
-    model.load_state_dict(payload["model"])
+    _load_model_state_with_legacy_frozen_dino_compat(model, payload["model"])
     optimizer.load_state_dict(payload["optimizer"])
     scheduler.load_state_dict(payload["scheduler"])
     for key in ("action_queue", "reason_queue", "observed_reason_queue", "pareto"):

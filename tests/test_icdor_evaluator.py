@@ -106,6 +106,13 @@ def test_evaluator_reports_all_icdor_action_reason_branches_without_test_mutatio
         <= set(row)
         for row in summaries
     )
+    ownership_summaries = [
+        row for row in result["route_ownership_rows"]
+        if row.get("summary") == "per_action_route_effect"
+    ]
+    assert len(ownership_summaries) == 4
+    assert {row["action_id"] for row in ownership_summaries} == {0, 1, 2, 3}
+    assert all(row["action_final_visual_equal"] is True for row in ownership_summaries)
     assert result["failure_rows"]
     assert result["failure_rows"][0]["file_name"] in {"a.jpg", "b.jpg"}
 
