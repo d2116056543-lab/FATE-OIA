@@ -16,6 +16,7 @@ from fate_oia.engine.train_acpr_mosaic_trust_icdor import (
     _factor_audit_rows,
     _build_rank_queues,
     _load_resume,
+    _load_warm_start_model_only,
     _pending_evidence_document,
     _pilot_semantic_validation,
     _restore_phase_trainability,
@@ -46,6 +47,38 @@ def test_full_cli_cannot_bypass_review_pass() -> None:
     source = Path("fate_oia/engine/train_acpr_mosaic_trust_icdor.py").read_text(encoding="utf-8")
     assert "if not args.pilot and not args.require_review_pass" in source
     assert "full training requires --require_review_pass" in source
+
+
+def test_pilot_epoch_limit_is_checked_before_loader_and_model_initialization() -> None:
+    source = Path("fate_oia/engine/train_acpr_mosaic_trust_icdor.py").read_text(encoding="utf-8")
+    main_index = source.index("def main")
+    limit_index = source.index("IC-DOR pilot is limited to six epochs", main_index)
+    loader_index = source.index("build_icdor_loaders(", main_index)
+    model_index = source.index("build_icdor_model(config)", main_index)
+    assert limit_index < loader_index < model_index
+
+
+def test_model_only_warm_start_restores_weights_without_reusing_optimizer_or_epoch(tmp_path: Path) -> None:
+    source = nn.Linear(3, 2)
+    target = nn.Linear(3, 2)
+    checkpoint = tmp_path / "warm_start.pth"
+    torch.save(
+        {
+            "model": source.state_dict(),
+            "config_sha256": "cfg",
+            "split_sha256": "split",
+            "epoch": 5,
+        },
+        checkpoint,
+    )
+
+    details = _load_warm_start_model_only(
+        checkpoint, model=target, config_sha256="cfg", split_sha256="split"
+    )
+    assert details["source_epoch"] == 5
+    assert details["ignored_legacy_frozen_dino_keys"] == []
+    for actual, expected in zip(target.parameters(), source.parameters()):
+        assert torch.equal(actual, expected)
 
 
 def test_full_cli_rejects_review_pass_bound_to_a_different_split() -> None:

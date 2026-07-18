@@ -2028,6 +2028,37 @@ def _load_model_state_with_legacy_frozen_dino_compat(
     return ignored
 
 
+def _load_warm_start_model_only(
+    path: str | Path,
+    *,
+    model: nn.Module,
+    config_sha256: str,
+    split_sha256: str,
+) -> dict[str, Any]:
+    """Load a compatible model snapshot without inheriting run state.
+
+    A diagnostic warm start may reuse learned weights, but it must begin a new
+    optimizer/scheduler/adaptive-schedule run and must never masquerade as a
+    resume of the source pilot.
+    """
+    checkpoint_path = Path(path)
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if payload.get("config_sha256") != config_sha256 or payload.get("split_sha256") != split_sha256:
+        raise RuntimeError("IC-DOR warm start config/split hash mismatch")
+    state = payload.get("model")
+    if not isinstance(state, Mapping):
+        raise RuntimeError("IC-DOR warm start is missing model state")
+    ignored = _load_model_state_with_legacy_frozen_dino_compat(model, state)
+    return {
+        "path": str(checkpoint_path.resolve()),
+        "source_epoch": int(payload.get("epoch", -1)),
+        "ignored_legacy_frozen_dino_keys": ignored,
+        "optimizer_restored": False,
+        "scheduler_restored": False,
+        "adaptive_schedule_restored": False,
+    }
+
+
 def _load_resume(
     path: str | Path,
     *,
@@ -2196,6 +2227,7 @@ def main() -> None:
     parser.add_argument("--require_review_pass", action="store_true")
     parser.add_argument("--pilot", action="store_true")
     parser.add_argument("--resume")
+    parser.add_argument("--warm_start_model_checkpoint")
     parser.add_argument("--max_train_samples", type=int)
     parser.add_argument("--max_audit_samples", type=int)
     parser.add_argument("--max_calib_samples", type=int)
@@ -2204,6 +2236,12 @@ def main() -> None:
     args = parser.parse_args()
     if not args.pilot and not args.require_review_pass:
         raise RuntimeError("IC-DOR full training requires --require_review_pass")
+    if args.resume and args.warm_start_model_checkpoint:
+        raise RuntimeError("IC-DOR --resume and --warm_start_model_checkpoint are mutually exclusive")
+    # Reject invalid pilot requests before scanning BDD100K, constructing DINO,
+    # or allocating GPU memory.
+    if args.pilot and args.epochs is not None and args.epochs > 6:
+        raise RuntimeError("IC-DOR pilot is limited to six epochs")
 
     config_path = Path(args.config).resolve()
     config = load_config(config_path)
@@ -2288,8 +2326,6 @@ def main() -> None:
         json.dumps({"parameters": ownership}, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     epochs = int(args.epochs or (6 if args.pilot else config["training"]["epochs"]))
-    if args.pilot and epochs > 6:
-        raise RuntimeError("IC-DOR pilot is limited to six epochs")
     updates_per_epoch = math.ceil(len(train_loader) / grad_accum)
     scheduler = _scheduler(
         optimizer, epochs=epochs, updates_per_epoch=updates_per_epoch,
@@ -2342,6 +2378,13 @@ def main() -> None:
             adaptive_schedule=adaptive_schedule,
         )
     else:
+        if args.warm_start_model_checkpoint:
+            manifest["warm_start_model_only"] = _load_warm_start_model_only(
+                args.warm_start_model_checkpoint,
+                model=model,
+                config_sha256=manifest["config_sha256"],
+                split_sha256=split_stats["split_sha256"],
+            )
         initialize_icdor_run_artifacts(
             output, manifest=manifest, config=config, source_manifest=source_manifest,
             split_manifest=split_stats, runtime_selection=runtime,
