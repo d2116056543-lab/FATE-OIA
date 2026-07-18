@@ -168,7 +168,9 @@ optimizer:
   warmup_epochs: 1
   min_lr_ratio: 0.05
   lr:
-    visual_pyramid: 1.0e-4
+    factor_visual_pyramid: 1.0e-4
+    action_visual_pyramid: 1.0e-4
+    reason_visual_pyramid: 1.0e-4
     factor_adapter: 1.5e-4
     factor_extractor: 2.0e-4
     factor_prototypes: 1.0e-4
@@ -182,7 +184,9 @@ optimizer:
     observation_model: 1.0e-4
     threshold_head: 5.0e-4
   owner_clip:
-    visual_pyramid: 1.0
+    factor_visual_pyramid: 0.5
+    action_visual_pyramid: 1.0
+    reason_visual_pyramid: 1.0
     factor_adapter: 0.5
     factor_extractor: 0.5
     factor_prototypes: 0.5

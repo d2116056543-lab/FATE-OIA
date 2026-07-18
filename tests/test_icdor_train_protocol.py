@@ -8,6 +8,7 @@ import torch
 from torch import nn
 
 from fate_oia.engine.train_acpr_mosaic_trust_icdor import (
+    _parameter_group_gradient_audit,
     _certificate_readiness_metrics,
     _edge_statistics_from_audit,
     _edge_and_branch_readiness_metrics,
@@ -22,6 +23,7 @@ from fate_oia.engine.train_acpr_mosaic_trust_icdor import (
     _target_transfer_directions,
     _validate_review_evidence_bindings,
     _write_provisional_certificate_this_epoch,
+    assert_icdor_gradient_firewall,
     apply_icdor_consolidation,
     apply_icdor_factor_branch_freeze,
     build_icdor_parameter_ownership,
@@ -148,7 +150,9 @@ def test_parameter_ownership_is_unique_and_has_three_independent_lanes() -> None
     ownership, groups = build_icdor_parameter_ownership(_ProtocolModel())
 
     assert set(groups) == {
-        "visual_pyramid",
+        "factor_visual_pyramid",
+        "action_visual_pyramid",
+        "reason_visual_pyramid",
         "factor_adapter",
         "factor_extractor",
         "factor_prototypes",
@@ -167,8 +171,16 @@ def test_parameter_ownership_is_unique_and_has_three_independent_lanes() -> None
     assert any(name.startswith("factor_visual_pyramid") for name in names)
     assert any(name.startswith("action_visual_pyramid") for name in names)
     assert any(name.startswith("reason_visual_pyramid") for name in names)
+    assert "visual_pyramid" not in groups
     assert all(entry["allowed_losses"] for entry in ownership)
     assert {entry["owner_group"] for entry in ownership} == set(groups)
+    factor_entries = [entry for entry in ownership if entry["owner_group"] == "factor_visual_pyramid"]
+    action_entries = [entry for entry in ownership if entry["owner_group"] == "action_visual_pyramid"]
+    reason_entries = [entry for entry in ownership if entry["owner_group"] == "reason_visual_pyramid"]
+    assert factor_entries and action_entries and reason_entries
+    assert all(entry["allowed_losses"] == ["factor"] for entry in factor_entries)
+    assert all(entry["allowed_losses"] == ["action_base"] for entry in action_entries)
+    assert all(entry["allowed_losses"] == ["reason_observed"] for entry in reason_entries)
     reason_adapter_entries = [entry for entry in ownership if entry["owner_group"] == "reason_adapter"]
     assert reason_adapter_entries
     assert all(entry["allowed_losses"] == ["reason_observed"] for entry in reason_adapter_entries)
@@ -222,6 +234,15 @@ def test_formal_loss_surface_calls_factor_action_reason_and_preserves_firewalls(
         hidden_mask=torch.zeros(2, 21, dtype=torch.bool),
     )
     assert torch.isfinite(losses["loss_total"])
+    ownership, _ = build_icdor_parameter_ownership(model)
+    gradient_rows = _parameter_group_gradient_audit(
+        losses,
+        ownership,
+        model,
+        epoch=0,
+        step=0,
+    )
+    assert_icdor_gradient_firewall(gradient_rows)
     losses["loss_total"].backward()
     assert any(parameter.grad is not None for parameter in model.action_adapter.parameters())
     assert any(parameter.grad is not None for parameter in model.factor_adapter.parameters())

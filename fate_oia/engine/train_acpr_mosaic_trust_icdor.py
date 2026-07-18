@@ -82,7 +82,9 @@ from fate_oia.utils.mosaic_config_usage import ConfigUsageTracker, resolve_icdor
 
 
 ICDOR_OWNER_GROUPS = (
-    "visual_pyramid",
+    "factor_visual_pyramid",
+    "action_visual_pyramid",
+    "reason_visual_pyramid",
     "factor_adapter",
     "factor_extractor",
     "factor_prototypes",
@@ -882,9 +884,9 @@ def build_icdor_loaders(
 
 def _owner_for_name(name: str) -> tuple[str, tuple[str, ...]] | None:
     mapping: tuple[tuple[str, str, tuple[str, ...]], ...] = (
-        ("factor_visual_pyramid.", "visual_pyramid", ("factor",)),
-        ("action_visual_pyramid.", "visual_pyramid", ("action_base",)),
-        ("reason_visual_pyramid.", "visual_pyramid", ("reason_observed",)),
+        ("factor_visual_pyramid.", "factor_visual_pyramid", ("factor",)),
+        ("action_visual_pyramid.", "action_visual_pyramid", ("action_base",)),
+        ("reason_visual_pyramid.", "reason_visual_pyramid", ("reason_observed",)),
         ("factor_adapter.", "factor_adapter", ("factor",)),
         ("factor_extractor.prototype_bank.", "factor_prototypes", ("factor",)),
         ("continuous_credibility.", "factor_extractor", ("factor",)),
@@ -1323,8 +1325,14 @@ def _parameter_group_gradient_audit(
 def assert_icdor_gradient_firewall(rows: list[dict[str, Any]], *, tolerance: float = 1e-7) -> None:
     """Reject cross-owner gradients that violate the v4 ownership contract."""
     forbidden = {
-        "loss_action_total": {"reason_adapter", "reason_visual_decoder", "reason_latent_decoder", "reason_observed_mixer", "observation_model"},
-        "loss_reason_total": {"visual_pyramid", "action_adapter", "action_visual_decoder", "action_router_rereader", "factor_extractor", "factor_prototypes"},
+        "loss_action_total": {
+            "reason_visual_pyramid", "reason_adapter", "reason_visual_decoder",
+            "reason_latent_decoder", "reason_observed_mixer", "observation_model",
+        },
+        "loss_reason_total": {
+            "factor_visual_pyramid", "action_visual_pyramid", "action_adapter",
+            "action_visual_decoder", "action_router_rereader", "factor_extractor", "factor_prototypes",
+        },
     }
     for row in rows:
         if row.get("loss") not in forbidden or row.get("owner_group") not in forbidden[row["loss"]]:
@@ -1372,7 +1380,9 @@ def train_icdor_epoch(
         if parameter is not None:
             owner_parameters.setdefault(str(entry["owner_group"]), []).append(parameter)
     owner_clip_limits = {
-        "visual_pyramid": 1.0,
+        "factor_visual_pyramid": 0.5,
+        "action_visual_pyramid": 1.0,
+        "reason_visual_pyramid": 1.0,
         "action_visual_decoder": 1.0,
         "reason_visual_decoder": 1.0,
         "factor_adapter": 0.5,
