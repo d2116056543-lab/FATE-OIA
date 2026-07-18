@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from fate_oia.datasets.mosaic_icdor_split import make_icdor_train_splits
 from fate_oia.engine import train_acpr_mosaic_trust_icdor as trainer
@@ -152,3 +153,30 @@ def test_factor_aware_subset_is_not_filename_order_truncation(monkeypatch: pytes
     assert any(geometry[name][0] == "car" for name in selected_names)
     assert any(geometry[name][0] == "traffic light" for name in selected_names)
     assert any(geometry[name][1] == "drivable" for name in selected_names)
+
+
+def test_factor_balanced_subset_keeps_observable_positive_and_reliable_negative_coverage() -> None:
+    indices = list(range(8))
+    names = [f"frame_{index:04d}.jpg" for index in indices]
+    positive = torch.tensor([
+        [1, 0], [1, 0], [0, 1], [0, 1],
+        [0, 0], [0, 0], [0, 0], [0, 0],
+    ], dtype=torch.bool)
+    reliable_negative = torch.tensor([
+        [0, 0], [0, 0], [0, 0], [0, 0],
+        [1, 0], [1, 0], [0, 1], [0, 1],
+    ], dtype=torch.bool)
+    selected = trainer._balanced_factor_indices(
+        indices, names, positive, reliable_negative, limit=4, seed=20260713,
+    )
+    rows = torch.tensor(selected)
+    assert positive.index_select(0, rows).any(dim=0).tolist() == [True, True]
+    assert reliable_negative.index_select(0, rows).any(dim=0).tolist() == [True, True]
+
+
+def test_core_hash_sampler_is_deterministic_and_not_filename_order_truncation() -> None:
+    dataset = _dataset(12)
+    first = trainer._hash_sample_dataset_indices(dataset, range(12), 4, seed=20260713)
+    second = trainer._hash_sample_dataset_indices(dataset, range(12), 4, seed=20260713)
+    assert first == second
+    assert set(first) != {0, 1, 2, 3}

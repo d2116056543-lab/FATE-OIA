@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 import torch
 import yaml
@@ -73,6 +73,7 @@ from fate_oia.losses.mosaic_posterior_ranking import (
     posterior_weighted_reason_ranking_loss,
 )
 from fate_oia.models.acpr_mosaic_trust_icdor_model import MOSAICTrustICDORModel
+from fate_oia.models.mosaic_native_semantics import load_icdor_ontology
 from fate_oia.optim.mosaic_action_pareto_admission import MOSAICActionParetoAdmission
 from fate_oia.optim.mosaic_soft_rank_queue import MOSAICAccumulationQueueBuffer, MOSAICSoftRankQueue
 from fate_oia.utils.mosaic_icdor_artifacts import (
@@ -725,6 +726,101 @@ def _subset_indices(indices: Iterable[int], limit: int | None) -> list[int]:
     return ordered[:limit]
 
 
+def _hash_sample_dataset_indices(
+    dataset: BDDOIAMultiTaskDataset,
+    indices: Iterable[int],
+    limit: int | None,
+    *,
+    seed: int,
+) -> list[int]:
+    """Select a representative deterministic core sample without label access."""
+    candidates = list(indices)
+    if limit is None or limit >= len(candidates):
+        return candidates
+    if type(limit) is not int or limit <= 0:
+        raise ValueError("IC-DOR hash sample limit must be a positive integer")
+
+    def rank(index: int) -> tuple[int, str, int]:
+        sample = dataset.samples[index]
+        file_name = str(sample["file_name"] if isinstance(sample, dict) else sample.file_name)
+        digest = hashlib.sha256(f"{seed}:{file_name}".encode("utf-8")).digest()
+        return int.from_bytes(digest, "big", signed=False), file_name, index
+
+    return sorted(sorted(candidates, key=rank)[:limit])
+
+
+def _balanced_factor_indices(
+    indices: Sequence[int],
+    file_names: Sequence[str],
+    positive: torch.Tensor,
+    reliable_negative: torch.Tensor,
+    *,
+    limit: int,
+    seed: int,
+) -> list[int]:
+    """Select a label-free visual audit subset with factor polarity coverage.
+
+    The caller supplies only BDD100K-derived factor observations.  This keeps
+    the credibility split independent of BDD-OIA action/reason labels while
+    preventing a positive-only pilot population from making every cV estimate
+    structurally zero.
+    """
+    if type(limit) is not int or limit <= 0 or limit > len(indices):
+        raise ValueError("IC-DOR factor-balanced subset limit is invalid")
+    if len(file_names) != len(indices):
+        raise ValueError("IC-DOR factor-balanced subset file names do not match indices")
+    if positive.ndim != 2 or reliable_negative.shape != positive.shape or positive.shape[0] != len(indices):
+        raise ValueError("IC-DOR factor-balanced subset requires matching [N,F] observations")
+    positive = positive.to(dtype=torch.bool, device="cpu")
+    reliable_negative = reliable_negative.to(dtype=torch.bool, device="cpu")
+    factor_count = positive.shape[1]
+    if factor_count <= 0:
+        raise ValueError("IC-DOR factor-balanced subset requires at least one factor")
+
+    def rank(row: int) -> tuple[int, str, int]:
+        name = str(file_names[row])
+        digest = hashlib.sha256(f"{seed}:{name}".encode("utf-8")).digest()
+        return int.from_bytes(digest, "big", signed=False), name, int(indices[row])
+
+    per_polarity = max(1, min(32, limit // max(2 * factor_count, 1)))
+    positive_available = positive.sum(dim=0)
+    negative_available = reliable_negative.sum(dim=0)
+    positive_targets = torch.minimum(positive_available, torch.full_like(positive_available, per_polarity))
+    negative_targets = torch.minimum(negative_available, torch.full_like(negative_available, per_polarity))
+    positive_selected = torch.zeros(factor_count, dtype=torch.long)
+    negative_selected = torch.zeros(factor_count, dtype=torch.long)
+    selected_rows: set[int] = set()
+
+    while len(selected_rows) < limit:
+        remaining = [row for row in range(len(indices)) if row not in selected_rows]
+        if not remaining:
+            break
+        positive_deficit = (positive_targets - positive_selected).clamp_min(0)
+        negative_deficit = (negative_targets - negative_selected).clamp_min(0)
+        if not bool(positive_deficit.any() or negative_deficit.any()):
+            break
+        best_score = -1
+        best_row: int | None = None
+        for row in remaining:
+            score = int((positive[row].to(torch.long) * positive_deficit).sum())
+            score += int((reliable_negative[row].to(torch.long) * negative_deficit).sum())
+            if score > best_score or (score == best_score and best_row is not None and rank(row) < rank(best_row)):
+                best_score, best_row = score, row
+        if best_row is None or best_score <= 0:
+            break
+        selected_rows.add(best_row)
+        positive_selected += positive[best_row].to(torch.long)
+        negative_selected += reliable_negative[best_row].to(torch.long)
+
+    for row in sorted((row for row in range(len(indices)) if row not in selected_rows), key=rank):
+        if len(selected_rows) >= limit:
+            break
+        selected_rows.add(row)
+    if len(selected_rows) != limit:
+        raise RuntimeError("IC-DOR factor-balanced sampler returned the wrong subset size")
+    return sorted(int(indices[row]) for row in selected_rows)
+
+
 def _factor_aware_audit_subset(
     dataset: BDDOIAMultiTaskDataset,
     indices: Iterable[int],
@@ -732,6 +828,7 @@ def _factor_aware_audit_subset(
     *,
     grounding_index: BDD100KGroundingIndex,
     seed: int,
+    factors: Sequence[dict[str, Any]] | None = None,
 ) -> list[int]:
     """Geometry-only, deterministic pilot subset balancing observable factor families."""
     candidates = list(indices)
@@ -739,6 +836,29 @@ def _factor_aware_audit_subset(
         return candidates
     if type(limit) is not int or limit <= 0:
         raise ValueError("IC-DOR factor-aware audit limit must be a positive integer")
+
+    if factors is not None:
+        # This path is strictly image/BDD100K based: no BDD-OIA action or
+        # reason target is read while choosing the visual-credibility subset.
+        names = [
+            str(dataset.samples[index]["file_name"] if isinstance(dataset.samples[index], dict) else dataset.samples[index].file_name)
+            for index in candidates
+        ]
+        observations = ICDORGroundingObservationBuilder(factors)(
+            _grounding_records(grounding_index, names), device=torch.device("cpu"), split="train"
+        )
+        supervision = build_factor_supervision(
+            observations, reason_targets=None, factors=factors,
+            split="train", allow_reason_anchors=False,
+        )
+        return _balanced_factor_indices(
+            candidates,
+            names,
+            supervision["geometry_positive_mask"],
+            supervision["reliable_negative_mask"],
+            limit=limit,
+            seed=seed,
+        )
 
     object_tokens = ("car", "truck", "bus", "person", "pedestrian", "rider", "bike", "motor")
     traffic_tokens = ("traffic light", "traffic sign", "sign", "light")
@@ -837,16 +957,16 @@ def build_icdor_loaders(
     # audits need the same data. Rebuilding it here used to add a second full
     # JSON scan before the first DINO forward.
     visual_grounding = visual_grounding_index or BDD100KGroundingIndex(data["bdd100k_root"])
-    # The pilot must not become a filename-order experiment.  Reuse the same
-    # geometry-only factor-aware selector for train_core and audit_visual;
-    # action/reason labels never influence visual credibility sampling.
-    core = _factor_aware_audit_subset(
-        train, split.train_core_indices, max_train_samples,
-        grounding_index=visual_grounding, seed=int(data["split_seed"]) - 1,
+    factors = load_icdor_ontology(Path("configs"))["factors"]
+    # The core clip needs representative images, not an expensive source scan
+    # over every training record. The independent audit_visual population is
+    # where factor-positive/reliable-negative balance is mandatory for cV.
+    core = _hash_sample_dataset_indices(
+        train, split.train_core_indices, max_train_samples, seed=int(data["split_seed"]) - 1,
     )
     audit_visual = _factor_aware_audit_subset(
         train, split.audit_visual_indices, max_audit_samples,
-        grounding_index=visual_grounding, seed=int(data["split_seed"]),
+        grounding_index=visual_grounding, seed=int(data["split_seed"]), factors=factors,
     )
     audit_target = _subset_indices(split.audit_target_indices, max_audit_samples)
     calib = _subset_indices(split.train_calib_indices, max_calib_samples)
@@ -865,7 +985,8 @@ def build_icdor_loaders(
         "split_sha256": split.split_sha256,
         "split_seed": seed,
         "train_core_count": len(core),
-        "train_core_factor_aware": max_train_samples is not None and max_train_samples < len(split.train_core_indices),
+        "train_core_sampling": "deterministic_filename_hash",
+        "audit_visual_sampling": "factor_positive_reliable_negative_balanced",
         "train_audit_count": len(audit_visual) + len(audit_target),
         "audit_visual_count": len(audit_visual),
         "audit_target_count": len(audit_target),

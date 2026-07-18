@@ -35,6 +35,77 @@ def test_grounding_marks_only_available_geometry_and_keeps_missing_sources_unkno
     assert result["presence_known_mask"][0, 1] == 0
 
 
+def test_grounding_honors_declared_negative_policy_and_keeps_unidentifiable_cues_unknown() -> None:
+    factors = [
+        {
+            "name": "traffic_light_visible",
+            "type": "point",
+            "grounding_sources": ["box2d"],
+            "negative_policy": "reliable_if_source_complete",
+        },
+        {
+            "name": "front_vehicle_risk_proxy",
+            "type": "object",
+            "grounding_sources": ["box2d"],
+            "negative_policy": "unknown_without_depth",
+        },
+    ]
+    result = ICDORGroundingObservationBuilder(factors, grid_hw=(4, 8))(
+        [{"image_size": [100, 200], "objects": []}],
+        device=torch.device("cpu"),
+        split="train",
+    )
+
+    # A complete object source can certify that an observable traffic light is
+    # absent. A depth-free risk proxy must remain unobserved instead.
+    assert result["presence_known_mask"][0].tolist() == [1.0, 0.0]
+    assert result["weak_negative_mask"][0].tolist() == [0.0, 0.0]
+
+
+def test_grounding_matches_colored_traffic_lights_and_requires_complete_attributes_for_negative() -> None:
+    factors = [
+        {
+            "name": "red_light_visible",
+            "type": "point",
+            "grounding_sources": ["box2d", "bdd100k_attributes"],
+            "attribute_constraints": {"trafficLightColor": "red"},
+            "negative_policy": "reliable_if_attribute_complete",
+        },
+        {
+            "name": "green_light_visible",
+            "type": "point",
+            "grounding_sources": ["box2d", "bdd100k_attributes"],
+            "attribute_constraints": {"trafficLightColor": "green"},
+            "negative_policy": "reliable_if_attribute_complete",
+        },
+    ]
+    builder = ICDORGroundingObservationBuilder(factors, grid_hw=(4, 8))
+    red = {
+        "image_size": [100, 200],
+        "objects": [{
+            "category": "traffic light",
+            "box2d": {"x1": 70, "y1": 10, "x2": 100, "y2": 40},
+            "attributes": {"trafficLightColor": "red"},
+        }],
+    }
+    incomplete = {
+        "image_size": [100, 200],
+        "objects": [{
+            "category": "traffic light",
+            "box2d": {"x1": 70, "y1": 10, "x2": 100, "y2": 40},
+            "attributes": {},
+        }],
+    }
+
+    red_result = builder([red], device=torch.device("cpu"), split="train")
+    assert red_result["presence_target"][0].tolist() == [1.0, 0.0]
+    assert red_result["presence_known_mask"][0].tolist() == [1.0, 1.0]
+
+    incomplete_result = builder([incomplete], device=torch.device("cpu"), split="train")
+    assert incomplete_result["presence_known_mask"][0].tolist() == [0.0, 0.0]
+    assert incomplete_result["weak_negative_mask"][0].tolist() == [1.0, 1.0]
+
+
 def test_grounding_rejects_test_split_and_reason_labels_are_not_an_input() -> None:
     builder = ICDORGroundingObservationBuilder([{"name": "traffic_light_visible", "type": "point", "grounding_sources": ["box2d"]}])
     try:

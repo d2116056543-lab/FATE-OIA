@@ -16,6 +16,11 @@ class ICDORGroundingObservationBuilder:
     hard negative. Geometry is supervision/audit only, never a test forward input.
     """
 
+    _RELIABLE_SOURCE_POLICY = "reliable_if_source_complete"
+    _RELIABLE_ATTRIBUTE_POLICY = "reliable_if_attribute_complete"
+    _UNKNOWN_POLICIES = frozenset(("unknown_without_depth", "unknown_without_direct_visual_evidence"))
+    _DEFAULT_POLICY = "weak_if_source_complete"
+
     def __init__(self, factors: Sequence[dict[str, Any]], *, grid_hw: tuple[int, int] = (45, 80)) -> None:
         if not factors or any(not {"name", "type", "grounding_sources"} <= set(item) for item in factors):
             raise ValueError("IC-DOR grounding factors require name/type/grounding_sources")
@@ -41,7 +46,7 @@ class ICDORGroundingObservationBuilder:
     @staticmethod
     def _matches(name: str, category: str) -> bool:
         value = category.lower().replace("_", " ")
-        if "traffic_light" in name:
+        if "traffic_light" in name or name in {"red_light_visible", "green_light_visible"}:
             return "traffic light" in value
         if "traffic_sign" in name:
             return "traffic sign" in value or value.strip() == "sign"
@@ -52,6 +57,37 @@ class ICDORGroundingObservationBuilder:
         if "vehicle" in name or "occupied" in name or "obstacle" in name:
             return any(token in value for token in ("car", "truck", "bus", "train", "motorcycle", "pedestrian", "person", "rider", "bicycle"))
         return False
+
+    @classmethod
+    def _negative_policy(cls, factor: Mapping[str, Any]) -> str:
+        policy = str(factor.get("negative_policy", cls._DEFAULT_POLICY))
+        valid = {cls._RELIABLE_SOURCE_POLICY, cls._RELIABLE_ATTRIBUTE_POLICY, *cls._UNKNOWN_POLICIES, cls._DEFAULT_POLICY}
+        if policy not in valid:
+            raise ValueError(f"unsupported IC-DOR negative policy: {policy}")
+        return policy
+
+    @staticmethod
+    def _constraint_match(attributes: Mapping[str, Any], constraints: Mapping[str, Any]) -> tuple[bool, bool]:
+        """Return ``(matches, complete)`` without inventing missing attributes."""
+        keys = {
+            "trafficLightColor": "traffic_light_color",
+            "laneStyle": "lane_style",
+            "laneDirection": "lane_direction",
+            "areaType": "area_type",
+        }
+        complete = True
+        for name, expected in constraints.items():
+            if name == "proxy":
+                continue
+            key = keys.get(str(name))
+            if key is None:
+                raise ValueError(f"unsupported IC-DOR attribute constraint: {name}")
+            actual = attributes.get(key)
+            if actual is None:
+                return False, False
+            if str(actual).lower() != str(expected).lower():
+                return False, complete
+        return True, complete
 
     @staticmethod
     def _region_mask(region: str | None, grid_hw: tuple[int, int], device: torch.device) -> torch.Tensor:
@@ -123,17 +159,29 @@ class ICDORGroundingObservationBuilder:
             for column, factor in enumerate(self.factors):
                 name, kind = str(factor["name"]), str(factor["type"])
                 sources = set(factor["grounding_sources"])
+                policy = self._negative_policy(factor)
+                constraints = factor.get("attribute_constraints", {})
+                if not isinstance(constraints, Mapping):
+                    raise ValueError("IC-DOR factor attribute_constraints must be a mapping")
                 positive_mask: torch.Tensor | None = None
                 available = False
+                attribute_complete = True
                 if "box2d" in sources and objects_available:
                     available = True
                     for item in objects:
                         if not isinstance(item, dict):
                             continue
                         attributes = parse_bdd100k_attributes(item)
-                        color_constraint = factor.get("attribute_constraints", {}).get("trafficLightColor")
-                        color_ok = color_constraint is None or attributes.get("traffic_light_color") == str(color_constraint).lower()
-                        if self._matches(name, str(item.get("category", ""))) and color_ok:
+                        if self._matches(name, str(item.get("category", ""))):
+                            attributes_match, complete = self._constraint_match(attributes, constraints)
+                            attribute_complete = attribute_complete and complete
+                            # Occluded/truncated traffic-control boxes cannot
+                            # certify either presence or a reliable absence.
+                            if "light" in name and (attributes.get("occluded") is True or attributes.get("truncated") is True):
+                                attribute_complete = False
+                                continue
+                            if not attributes_match:
+                                continue
                             candidate = self._box_mask(item.get("box2d", {}), image_hw, self.grid_hw, device)
                             if candidate is not None:
                                 candidate = self._restrict_to_declared_region(candidate, factor, device)
@@ -144,10 +192,10 @@ class ICDORGroundingObservationBuilder:
                     for lane in lanes:
                         if not isinstance(lane, dict) or "lane" not in str(lane.get("category", "")).lower():
                             continue
-                        constraints = factor.get("attribute_constraints", {})
-                        if constraints.get("laneStyle") == "solid":
-                            if parse_bdd100k_attributes(lane).get("lane_style") != "solid":
-                                continue
+                        attributes_match, complete = self._constraint_match(parse_bdd100k_attributes(lane), constraints)
+                        attribute_complete = attribute_complete and complete
+                        if not attributes_match:
+                            continue
                         vertices = []
                         for poly in lane.get("poly2d", []) or []:
                             if isinstance(poly, dict):
@@ -165,6 +213,12 @@ class ICDORGroundingObservationBuilder:
                                     positive_mask = candidate if positive_mask is None else torch.maximum(positive_mask, candidate)
                 elif "drivable_mask" in sources and drivable_available and drivable is not None:
                     available = True
+                    attributes_match, complete = self._constraint_match(
+                        {"area_type": "direct"}, constraints
+                    )
+                    attribute_complete = attribute_complete and complete
+                    if not attributes_match:
+                        continue
                     candidate = self._restrict_to_declared_region(drivable, factor, device)
                     positive_mask = candidate if bool(candidate.any()) else None
                 source_available[row, column] = available
@@ -176,8 +230,15 @@ class ICDORGroundingObservationBuilder:
                     geometry_known_mask[row, column] = 1.0
                     geometry_masks[row, column] = positive_mask
                 elif available:
-                    # Complete source but no matching item: weak negative only.
-                    weak_negative_mask[row, column] = 1.0
+                    # The ontology, not a generic default, decides whether a
+                    # complete source certifies absence. Unsupported proxies
+                    # remain unknown rather than becoming fabricated negatives.
+                    if policy == self._RELIABLE_SOURCE_POLICY or (
+                        policy == self._RELIABLE_ATTRIBUTE_POLICY and attribute_complete
+                    ):
+                        presence_known_mask[row, column] = 1.0
+                    elif policy not in self._UNKNOWN_POLICIES:
+                        weak_negative_mask[row, column] = 1.0
         return {"presence_target": presence_target, "presence_known_mask": presence_known_mask, "visibility_target": visibility_target, "visibility_known_mask": visibility_known_mask, "weak_negative_mask": weak_negative_mask, "geometry_known_mask": geometry_known_mask, "geometry_masks": geometry_masks, "source_available": source_available}
 
 

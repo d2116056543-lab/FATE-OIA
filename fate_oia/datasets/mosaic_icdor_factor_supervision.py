@@ -13,7 +13,8 @@ _UNKNOWN = 0
 _GEOMETRY_POSITIVE = 1
 _REASON_ANCHOR_POSITIVE = 2
 _GEOMETRY_AND_REASON_POSITIVE = 3
-_WEAK_NEGATIVE = 4
+_RELIABLE_NEGATIVE = 4
+_WEAK_NEGATIVE = 5
 
 
 def _evidence_mask(observations: Mapping[str, torch.Tensor], key: str) -> torch.Tensor:
@@ -105,7 +106,7 @@ def build_factor_supervision(
     positive_anchor_weight[geometry_positive_mask] = 1.0
 
     supervision_code = torch.full_like(presence_target, _UNKNOWN, dtype=torch.long)
-    supervision_code[reliable_negative_mask] = _WEAK_NEGATIVE
+    supervision_code[reliable_negative_mask] = _RELIABLE_NEGATIVE
     supervision_code[weak_negative_mask] = _WEAK_NEGATIVE
     supervision_code[positive_anchor_mask] = _REASON_ANCHOR_POSITIVE
     supervision_code[geometry_positive_mask] = _GEOMETRY_POSITIVE
