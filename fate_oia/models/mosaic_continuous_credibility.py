@@ -1,4 +1,4 @@
-"""Continuous, label-independent visual credibility for MOSAIC-TRUST v4.
+"""Availability-aware visual credibility for MOSAIC-TRUST V5 CREDO-MAP.
 
 This module deliberately does not accept reason/action targets.  It is a
 visual measurement of whether a factor has stable, grounded evidence.  The
@@ -38,8 +38,13 @@ def visual_credibility_from_measurements(
     image_only_cap: float = 0.10,
     unknown_cap: float = 0.0,
     no_reliable_negative_cap: float = 0.25,
+    component_availability: dict[str, torch.Tensor] | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Combine visual-only credibility measurements with explicit safety caps."""
+    """Combine audit effects without treating missing measurements as zero.
+
+    ``cV`` is an access score, not a calibrated admission probability.  Edge
+    admission remains a separate independent bootstrap/LCB decision.
+    """
     values = [content_score, prior_score, query_shuffle_score, image_shuffle_score, grounding_score, stability_score, n_eff]
     shape = content_score.shape
     if any(value.shape != shape for value in values):
@@ -57,19 +62,29 @@ def visual_credibility_from_measurements(
     grounding = grounding_score.clamp(0.0, 1.0)
     stability = stability_score.clamp(0.0, 1.0)
     effective = n_eff.clamp_min(0.0)
-    # CREDO requires agreement between independent visual interventions.  A
-    # weighted geometric mean prevents a strong content score from certifying
-    # a factor when query/image shuffles or grounded localization show no
-    # causal effect. ``prior`` is exported for diagnosis but never certifies a
-    # factor by itself.
-    components = (
-        (content + 1e-6).pow(0.30)
-        * (query + 1e-6).pow(0.20)
-        * (image + 1e-6).pow(0.25)
-        * (grounding + 1e-6).pow(0.15)
-        * (stability + 1e-6).pow(0.10)
-    )
-    credibility = (1.0 - torch.exp(-effective / 32.0)) * components
+    availability = component_availability or {}
+    def _available(name: str) -> torch.Tensor:
+        value = availability.get(name)
+        if value is None:
+            return torch.ones_like(content, dtype=torch.bool)
+        if value.shape != content.shape:
+            raise ValueError(f"credibility availability for {name} has an invalid shape")
+        return value.to(dtype=torch.bool)
+
+    def _available_weighted(values: list[torch.Tensor], weights: list[float], names: list[str]) -> torch.Tensor:
+        mask = torch.stack([_available(name).to(dtype=content.dtype) for name in names], dim=0)
+        stacked = torch.stack(values, dim=0)
+        weight = torch.tensor(weights, dtype=content.dtype, device=content.device).view(-1, *([1] * content.ndim))
+        denominator = (weight * mask).sum(dim=0)
+        return (stacked * weight * mask).sum(dim=0) / denominator.clamp_min(1e-8)
+
+    # Identity is supported by content/query/image interventions; geometry is
+    # supported by grounded alignment/stability. Unavailable components are
+    # excluded from their own denominator rather than inserted as fake zeros.
+    identity = _available_weighted([content, query, image], [0.40, 0.30, 0.30], ["content", "query", "image"])
+    geometry = _available_weighted([grounding, stability], [0.75, 0.25], ["grounding", "stability"])
+    support = 1.0 - torch.exp(-effective / 32.0)
+    credibility = support * (0.70 * identity + 0.30 * geometry)
     if source_kind == "image_only":
         credibility = credibility.clamp_max(image_only_cap)
     if factor_role in {"latent", "latent_only", "unsupported"}:
@@ -91,6 +106,11 @@ def visual_credibility_from_measurements(
         "credibility_grounding": grounding,
         "credibility_stability": stability,
         "credibility_n_eff": effective,
+        "credibility_identity_effect": identity,
+        "credibility_geometry_effect": geometry,
+        "credibility_component_availability": torch.stack(
+            [_available(name).to(dtype=content.dtype) for name in ("content", "query", "image", "grounding", "stability")], dim=-1
+        ),
     }
 
 
@@ -228,4 +248,7 @@ class ContinuousVisualCredibility(nn.Module):
             "cV_query_shuffle_score": query_shuffle,
             "cV_image_shuffle_score": image_shuffle,
             "cV_stability": stability,
+            "cV_component_availability": torch.ones(
+                (*current.shape, 5), device=current.device, dtype=current.dtype
+            ),
         }

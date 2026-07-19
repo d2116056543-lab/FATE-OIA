@@ -31,14 +31,16 @@ _REQUIRED_FORWARD_OUTPUTS = (
     "reason_propensity",
 )
 
-_V4_REQUIRED_FORWARD_OUTPUTS = (
+_V5_REQUIRED_FORWARD_OUTPUTS = (
     "cV", "cV_ema", "factor_soft_masks", "factor_fine_masks", "factor_coarse_masks",
-    "cV_route_effective",
+    "cV_route_effective", "cV_action_shadow_training_access", "cV_reason_training_access",
+    "cV_component_availability",
     "sampling_coordinates", "sampled_features", "sample_attention",
     "action_shadow_logits", "action_final_logits", "action_visual_logits",
     "reason_visual_logits", "reason_latent_logits", "reason_final_logits",
     "semantic_compatibility", "reason_semantic_compatibility_effective",
     "action_target_utility", "action_target_utility_effective", "target_utility_initialized",
+    "support_route_mass", "veto_route_mass", "route_distribution", "topk_factor_ids",
 )
 
 _REQUIRED_FUNCTIONAL_CHECKS = (
@@ -53,14 +55,18 @@ _REQUIRED_FUNCTIONAL_CHECKS = (
     "resume_integrity",
     "visual_audit",
     "foreground_launcher",
-    "continuous_credibility",
-    "fine_transport",
+    "factor_semantic_contract",
+    "factor_audit_aligned_loss_chain",
+    "labelwise_pu",
+    "v5_credibility",
+    "mass_preserving_transport",
     "partial_action_admission",
-    "regime_schedule",
-    "artifact_schema_v4",
+    "v5_schedule",
+    "artifact_schema_v5",
     "target_utility",
+    "v5_target_utility_cadence",
     "batch_field_reuse",
-    "credo_learning_deployment",
+    "credo_map_learning_deployment",
 )
 
 _REQUIRED_REMEDIATION_GATES = (
@@ -277,48 +283,61 @@ def verify_dynamic_forward_and_gradients(model: nn.Module, images: torch.Tensor)
 
 
 @torch.no_grad()
-def verify_v4_forward_contract(model: nn.Module, images: torch.Tensor) -> dict[str, Any]:
-    """Validate v4-only outputs and deployment/learning separation on real forward."""
+def verify_v5_forward_contract(model: nn.Module, images: torch.Tensor) -> dict[str, Any]:
+    """Validate V5 CREDO-MAP transport and access/admission separation."""
     output = model(
         images, route_mode="shadow", latent_enabled=True, reason_route_mode="full",
         return_masks=True, return_diagnostics=True,
     )
-    missing = [key for key in _V4_REQUIRED_FORWARD_OUTPUTS if not isinstance(output.get(key), torch.Tensor)]
+    missing = [key for key in _V5_REQUIRED_FORWARD_OUTPUTS if not isinstance(output.get(key), torch.Tensor)]
     if missing:
-        raise ICDORAuditError(f"v4 forward contract is missing outputs: {missing}")
+        raise ICDORAuditError(f"v5 forward contract is missing outputs: {missing}")
     cV = output["cV"]
     if cV.ndim != 2 or cV.shape[0] != images.shape[0] or not torch.isfinite(cV).all():
-        raise ICDORAuditError("v4 continuous credibility is not finite [B,F]")
+        raise ICDORAuditError("v5 continuous credibility is not finite [B,F]")
     route_cV = output["cV_route_effective"]
-    if route_cV.shape != cV.shape or not torch.isfinite(route_cV).all() or bool((route_cV < cV).any()):
-        raise ICDORAuditError("v4 effective route credibility does not preserve continuous cV")
+    if route_cV.shape != cV.shape or not torch.isfinite(route_cV).all() or not torch.equal(route_cV, cV):
+        raise ICDORAuditError("v5 route mass source must preserve raw continuous credibility")
+    action_access = output["cV_action_shadow_training_access"]
+    reason_access = output["cV_reason_training_access"]
+    expected_action_access = float(getattr(model, "action_shadow_credibility_floor")) + (
+        1.0 - float(getattr(model, "action_shadow_credibility_floor"))
+    ) * cV
+    expected_reason_access = float(getattr(model, "reason_semantic_credibility_floor")) + (
+        1.0 - float(getattr(model, "reason_semantic_credibility_floor"))
+    ) * cV
+    if not torch.allclose(action_access, expected_action_access) or not torch.allclose(reason_access, expected_reason_access):
+        raise ICDORAuditError("v5 training-access floors are not derived from raw cV")
+    availability = output["cV_component_availability"]
+    if availability.shape != (*cV.shape, 5) or not torch.isfinite(availability).all():
+        raise ICDORAuditError("v5 credibility availability is not [B,F,5]")
     factor_count = cV.shape[1]
     semantic = output["semantic_compatibility"]
     semantic_effective = output["reason_semantic_compatibility_effective"]
     action_utility = output["action_target_utility"]
     action_utility_effective = output["action_target_utility_effective"]
     if semantic.shape != (21, factor_count) or semantic_effective.shape != semantic.shape:
-        raise ICDORAuditError("v4 semantic compatibility is not [21,F]")
+        raise ICDORAuditError("v5 semantic compatibility is not [21,F]")
     if action_utility.shape != (factor_count, 4):
-        raise ICDORAuditError("v4 action target utility is not [F,4]")
+        raise ICDORAuditError("v5 action target utility is not [F,4]")
     if action_utility_effective.shape != (images.shape[0], factor_count, 4):
-        raise ICDORAuditError("v4 action target utility consumer is not [B,F,4]")
+        raise ICDORAuditError("v5 action target utility consumer is not [B,F,4]")
     if not all(torch.isfinite(value).all() for value in (
         semantic, semantic_effective, action_utility, action_utility_effective,
     )):
-        raise ICDORAuditError("v4 target utility tensors are not finite")
+        raise ICDORAuditError("v5 target utility tensors are not finite")
     if not torch.equal(semantic, semantic_effective):
-        raise ICDORAuditError("v4 reason decoder did not consume the audited semantic compatibility state")
+        raise ICDORAuditError("v5 reason decoder did not consume the audited semantic compatibility state")
     if not torch.equal(action_utility_effective, action_utility.unsqueeze(0).expand_as(action_utility_effective)):
-        raise ICDORAuditError("v4 action router did not consume the audited target utility state")
+        raise ICDORAuditError("v5 action router did not consume the audited target utility state")
     if output["sampling_coordinates"].ndim != 6 or output["sampled_features"].ndim != 6:
-        raise ICDORAuditError("v4 typed fine evidence tensors have invalid rank")
+        raise ICDORAuditError("v5 typed fine evidence tensors have invalid rank")
     if output["sample_attention"].shape != output["sampling_coordinates"].shape[:-1]:
-        raise ICDORAuditError("v4 typed attention does not align with coordinates")
+        raise ICDORAuditError("v5 typed attention does not align with coordinates")
     if not torch.allclose(output["action_final_logits"], output["action_visual_logits"], atol=1e-7, rtol=0.0):
-        raise ICDORAuditError("v4 shadow route changed final action before admission")
+        raise ICDORAuditError("v5 shadow route changed final action before admission")
     if output["factor_soft_masks"].shape != output["factor_coarse_masks"].shape:
-        raise ICDORAuditError("v4 fine/coarse evidence masks have inconsistent shape")
+        raise ICDORAuditError("v5 fine/coarse evidence masks have inconsistent shape")
     fine_output = model(
         images, route_mode="shadow", latent_enabled=True, reason_route_mode="full",
         return_masks=True, factor_mask_mode="fine",
@@ -328,20 +347,23 @@ def verify_v4_forward_contract(model: nn.Module, images: torch.Tensor) -> dict[s
         return_masks=True, factor_mask_mode="coarse",
     )
     if not torch.allclose(fine_output["factor_soft_masks"], fine_output["factor_fine_masks"]):
-        raise ICDORAuditError("v4 fine transport override did not select typed fine masks")
+        raise ICDORAuditError("v5 fine transport override did not select typed fine masks")
     if not torch.allclose(coarse_output["factor_soft_masks"], coarse_output["factor_coarse_masks"]):
-        raise ICDORAuditError("v4 coarse transport override did not select coarse masks")
+        raise ICDORAuditError("v5 coarse transport override did not select coarse masks")
     delta = (fine_output["factor_soft_masks"] - coarse_output["factor_soft_masks"]).abs().mean()
     if not torch.isfinite(delta) or float(delta) <= 0.0:
-        raise ICDORAuditError("v4 fine transport is identical to coarse transport")
+        raise ICDORAuditError("v5 fine transport is identical to coarse transport")
     credibility_runtime = {
         "independent_of_reason_labels": bool(getattr(model, "credibility_independent_of_reason_labels", False)),
-        "admission_min": float(getattr(model, "action_credibility_min_for_admission", -1.0)),
+        # V5 has no scalar cV deployment threshold; final admission is
+        # determined per edge from the independent target audit.
+        "no_global_cv_admission": True,
         "ema_decay": float(getattr(model.continuous_credibility, "ema_decay", -1.0)),
         "image_only_cap": float(getattr(model.continuous_credibility, "image_only_cap", -1.0)),
         "unknown_cap": float(getattr(model.continuous_credibility, "unknown_cap", -1.0)),
         "no_reliable_negative_cap": float(getattr(model.continuous_credibility, "no_reliable_negative_cap", -1.0)),
-        "shadow_credibility_floor": float(getattr(model, "shadow_credibility_floor", -1.0)),
+        "action_shadow_training_floor": float(getattr(model, "action_shadow_credibility_floor", -1.0)),
+        "reason_semantic_training_floor": float(getattr(model, "reason_semantic_credibility_floor", -1.0)),
     }
     fine_runtime = {
         "enabled": bool(getattr(model.factor_extractor, "fine_transport_enabled", False)),
@@ -354,6 +376,7 @@ def verify_v4_forward_contract(model: nn.Module, images: torch.Tensor) -> dict[s
         "pass": True,
         "cV_shape": list(cV.shape),
         "cV_route_effective_shape": list(route_cV.shape),
+        "cV_component_availability_shape": list(availability.shape),
         "semantic_compatibility_shape": list(semantic.shape),
         "action_target_utility_shape": list(action_utility.shape),
         "typed_coordinate_shape": list(output["sampling_coordinates"].shape),
@@ -447,9 +470,12 @@ def verify_source_manifest(root: Path) -> dict[str, Any]:
     skill = root / ".codex" / "skills" / "acpr-mosaic-trust-v3-icdor-implementation-audit" / "SKILL.md"
     if not skill.is_file() or sha256_file(skill) != payload["audit_skill_sha256"]:
         raise ICDORAuditError("IC-DOR audit skill hash drifted from source manifest")
+    if payload.get("target_branch") != _git_branch(root):
+        raise ICDORAuditError("manifest target branch does not match current branch")
     if payload.get("target_branch") not in {
         "acpr_mosaic_trust_v3_icdor_direct_image",
         "acpr_mosaic_trust_v4_credo_direct_image",
+        "acpr_mosaic_trust_v5_credo_map_direct_image",
     }:
         raise ICDORAuditError("IC-DOR source manifest target branch is invalid")
     return {"pass": True, "path": str(path), **payload}
@@ -476,6 +502,35 @@ def functional_hard_gates(
     trainer_path = root / "fate_oia" / "engine" / "train_acpr_mosaic_trust_icdor.py"
     evidence: dict[str, Any] = {}
     checks: dict[str, str] = {}
+    # Reuse the formal ontology parser rather than duplicating a weaker YAML
+    # check here.  This verifies that V5 factor semantics, candidate edges,
+    # BDD lane vocabulary, observability and action/reason eligibility agree.
+    from fate_oia.models.mosaic_native_semantics import load_icdor_ontology
+
+    ontology = load_icdor_ontology(root / "configs")
+    factors = tuple(ontology["factors"])
+    if any(
+        "turn_marking" in str(item["name"]) and bool(item["action_eligible"])
+        for item in factors
+    ):
+        raise ICDORAuditError("V5 turn-marking factors must never be action eligible")
+    evidence["factor_semantic_contract"] = {
+        "factor_count": len(factors),
+        "action_eligible_count": sum(bool(item["action_eligible"]) for item in factors),
+        "reason_eligible_count": sum(bool(item["reason_eligible"]) for item in factors),
+        "ontology_parser": _require_source_tokens(
+            root / "fate_oia" / "models" / "mosaic_native_semantics.py",
+            (
+                "visual_role", "source_attributes", "presence_polarity", "observability_policy",
+                "action_eligible", "reason_eligible", "geometry_loss_type",
+            ),
+        ),
+        "grounding_lane_vocabulary": _require_source_tokens(
+            root / "fate_oia" / "datasets" / "mosaic_icdor_grounding.py",
+            ("laneDirection", '"parallel", "vertical"', "reliable absence"),
+        ),
+    }
+    checks["factor_semantic_contract"] = "PASS"
     evidence["direct_image"] = {
         "config": config["experiment"].get("direct_image") is True,
         "feature_cache": config["backbone"].get("feature_cache"),
@@ -532,6 +587,42 @@ def functional_hard_gates(
         ("def posterior_from_observed_targets", "factor_visibility.detach()", "reason_logits_latent.detach()", "pi_min", "pi_max"),
     )
     checks["selective_observation"] = "PASS"
+    evidence["labelwise_pu"] = {
+        "loss": _require_source_tokens(
+            root / "fate_oia" / "losses" / "mosaic_icdor_reason_losses.py",
+            ("latent_reason_core_loss", "build_per_label_pu_gate", "pu_gate"),
+        ),
+        "trainer": _require_source_tokens(
+            trainer_path,
+            (
+                "latent_reason_core_loss(", "pu_gate=model.reason_pu_gate",
+                "label_gate=model.reason_pu_gate", "model.update_reason_pu_gate(per_label_pu_gate)",
+            ),
+        ),
+    }
+    checks["labelwise_pu"] = "PASS"
+    evidence["factor_audit_aligned_loss_chain"] = {
+        "losses": _require_source_tokens(
+            root / "fate_oia" / "losses" / "mosaic_icdor_factor_losses.py",
+            (
+                "factor_balanced_presence_loss", "factor_object_region_dice_loss",
+                "factor_curve_distance_loss", "factor_query_identity_loss",
+                "factor_image_identity_loss", "factor_prior_gap_loss", "factor_matched_grounding_loss",
+            ),
+        ),
+        "trainer": _require_source_tokens(
+            trainer_path,
+            (
+                "geometry_loss_type", "factor_queries", "factor_prior_presence_logits",
+                "factor_query_identity_loss(", "factor_image_identity_loss(", "factor_prior_gap_loss(",
+            ),
+        ),
+        "model": _require_source_tokens(
+            model_path,
+            ("factor_prior_presence_logits", "prior_mode=\"prior_only\""),
+        ),
+    }
+    checks["factor_audit_aligned_loss_chain"] = "PASS"
     evidence["calibration"] = {
         "config": {
             "train_calib_only": config["calibration"].get("train_calib_only"),
@@ -566,38 +657,53 @@ def functional_hard_gates(
         ("Start-Process", "Start-Job", "nohup", "scheduled task"),
     )
     checks["foreground_launcher"] = "PASS"
-    evidence["continuous_credibility"] = {
+    evidence["v5_credibility"] = {
         "config_independent_of_reason_labels": config.get("credibility", {}).get("independent_of_reason_labels") is True,
         "source": _require_source_tokens(
             root / "fate_oia" / "models" / "mosaic_continuous_credibility.py",
-            ("visual_credibility_from_measurements", "update_credibility_ema", "factor_credibility_cap", "absence_polarity"),
+            (
+                "visual_credibility_from_measurements", "update_credibility_ema",
+                "factor_credibility_cap", "absence_polarity", "component_availability",
+            ),
             ("reason_labels", "observed_reason", "reason_targets", "factor_certificate_reliability"),
         ),
-        "dynamic": dynamic.get("v4_contract", {}).get("cV_shape"),
-        "runtime": dynamic.get("v4_contract", {}).get("credibility_runtime"),
+        "dynamic": dynamic.get("v5_contract", {}).get("cV_shape"),
+        "runtime": dynamic.get("v5_contract", {}).get("credibility_runtime"),
     }
     expected_credibility_runtime = {
         "independent_of_reason_labels": True,
-        "admission_min": float(config["credibility"]["observable_cV_min_for_admission"]),
+        "no_global_cv_admission": True,
         "ema_decay": float(config["credibility"]["ema_decay"]),
         "image_only_cap": float(config["credibility"]["image_only_cap"]),
         "unknown_cap": float(config["credibility"]["unknown_cap"]),
         "no_reliable_negative_cap": float(config["credibility"]["no_reliable_negative_cap"]),
-        "shadow_credibility_floor": float(config["model"]["action_route"]["shadow_credibility_floor"]),
+        "action_shadow_training_floor": float(config["model"]["action_route"]["action_shadow_credibility_floor"]),
+        "reason_semantic_training_floor": float(config["model"]["action_route"]["reason_semantic_credibility_floor"]),
     }
     if (
-        not evidence["continuous_credibility"]["config_independent_of_reason_labels"]
-        or dynamic.get("v4_contract", {}).get("pass") is not True
-        or evidence["continuous_credibility"]["runtime"] != expected_credibility_runtime
+        not evidence["v5_credibility"]["config_independent_of_reason_labels"]
+        or dynamic.get("v5_contract", {}).get("pass") is not True
+        or evidence["v5_credibility"]["runtime"] != expected_credibility_runtime
     ):
-        raise ICDORAuditError("v4 continuous credibility contract failed")
-    checks["continuous_credibility"] = "PASS"
-    evidence["fine_transport"] = {
+        raise ICDORAuditError("v5 continuous credibility contract failed")
+    checks["v5_credibility"] = "PASS"
+    evidence["mass_preserving_transport"] = {
         "source": _require_source_tokens(
+            root / "fate_oia" / "models" / "mosaic_target_sparse_router.py",
+            (
+                "route_distribution", "route_mass", "factor_weights = route_distribution * route_mass",
+                "topk_factor_ids", "zero_mass_mask",
+            ),
+        ),
+        "reason_route": _require_source_tokens(
+            root / "fate_oia" / "models" / "mosaic_icdor_dual_reason_decoder.py",
+            ("factor_weights = route_distribution * route_mass", "reason_observed_route_mass"),
+        ),
+        "typed_splat": _require_source_tokens(
             root / "fate_oia" / "models" / "mosaic_typed_evidence_splat.py",
             ("typed_evidence_splat", "eta_by_type", "max_splat_samples", "fine_mask"),
         ),
-        "runtime": dynamic.get("v4_contract", {}).get("fine_transport_runtime"),
+        "runtime": dynamic.get("v5_contract", {}).get("fine_transport_runtime"),
         "evaluator": _require_source_tokens(
             root / "fate_oia" / "engine" / "eval_acpr_mosaic_trust_icdor.py",
             (
@@ -621,20 +727,20 @@ def functional_hard_gates(
             "coarse_off": bool(config["fine_transport"]["coarse_off_diagnostic"]),
         },
     }
-    if evidence["fine_transport"]["runtime"] != expected_fine_runtime:
-        raise ICDORAuditError("v4 fine transport config did not reach the real forward path")
-    checks["fine_transport"] = "PASS"
+    if evidence["mass_preserving_transport"]["runtime"] != expected_fine_runtime:
+        raise ICDORAuditError("v5 fine transport config did not reach the real forward path")
+    checks["mass_preserving_transport"] = "PASS"
     evidence["partial_action_admission"] = _require_source_tokens(
         root / "fate_oia" / "models" / "mosaic_action_route_policy.py",
         ("partial_action_admission", "compose_final_action_logits"),
     )
     checks["partial_action_admission"] = "PASS"
-    evidence["regime_schedule"] = _require_source_tokens(
+    evidence["v5_schedule"] = _require_source_tokens(
         root / "fate_oia" / "engine" / "mosaic_icdor_adaptive_schedule.py",
-        ("FOUNDATION", "DUAL_REASON_SHADOW", "SAFE_JOINT", "CONSOLIDATION", "pu_enabled"),
+        ("JOINT_SHADOW", "ADMISSION_CONSOLIDATION", "pu_enabled", "online_target_probe_due", "full_target_audit_due"),
     )
-    checks["regime_schedule"] = "PASS"
-    evidence["artifact_schema_v4"] = _require_source_tokens(
+    checks["v5_schedule"] = "PASS"
+    evidence["artifact_schema_v5"] = _require_source_tokens(
         root / "fate_oia" / "utils" / "mosaic_icdor_artifacts.py",
         (
             "credibility_stats.jsonl", "fine_transport_stats.jsonl", "route_ownership.jsonl",
@@ -657,7 +763,16 @@ def functional_hard_gates(
         ),
     }
     checks["target_utility"] = "PASS"
-    checks["artifact_schema_v4"] = "PASS"
+    evidence["v5_target_utility_cadence"] = _require_source_tokens(
+        trainer_path,
+        (
+            "online_target_probe_due(epoch=epoch)",
+            "full_target_audit_due(epoch=epoch, every_epochs=refresh_every)",
+            '"audit_level": "online"', '"audit_level": "full"',
+        ),
+    )
+    checks["v5_target_utility_cadence"] = "PASS"
+    checks["artifact_schema_v5"] = "PASS"
     evidence["batch_field_reuse"] = _require_source_tokens(
         root / "fate_oia" / "models" / "mosaic_batch_field_reuse.py",
         ("BatchLocalDinoFieldReuse", "no cross-batch persistence"),
@@ -675,7 +790,8 @@ def functional_hard_gates(
     credo_trainer = _require_source_tokens(
         trainer_path,
         (
-            "build_icdor_mechanism_summary(", "build_factor_supervision(", "observations,\n            None,",
+            "build_icdor_mechanism_summary(", "build_factor_supervision(", "latent_reason_core_loss(",
+            "pu_gate=model.reason_pu_gate", "label_gate=model.reason_pu_gate",
             "validate_icdor_pilot_mechanism", "factor_audit.json", "hidden_recovery_margin_nonpositive",
         ),
         ("model.load_factor_certificate(", "clip_grad_norm_("),
@@ -685,7 +801,7 @@ def functional_hard_gates(
         ("sample_attention.detach(), support_weights", "sample_attention.detach(), veto_weights"),
         ("support_weights.detach()", "veto_weights.detach()"),
     )
-    evidence["credo_learning_deployment"] = {
+    evidence["credo_map_learning_deployment"] = {
         "model": credo_model,
         "trainer": credo_trainer,
         "rereader": credo_rereader,
@@ -693,11 +809,11 @@ def functional_hard_gates(
         "shadow_to_direct_action_gradient": dynamic["gradient_firewall"]["shadow_to_action_adapter"],
     }
     if (
-        float(evidence["credo_learning_deployment"]["shadow_route_gradient"]) < 1e-8
-        or float(evidence["credo_learning_deployment"]["shadow_to_direct_action_gradient"]) != 0.0
+        float(evidence["credo_map_learning_deployment"]["shadow_route_gradient"]) < 1e-8
+        or float(evidence["credo_map_learning_deployment"]["shadow_to_direct_action_gradient"]) != 0.0
     ):
         raise ICDORAuditError("CREDO shadow learning/deployment separation is not active")
-    checks["credo_learning_deployment"] = "PASS"
+    checks["credo_map_learning_deployment"] = "PASS"
     missing_checks = [name for name in _REQUIRED_FUNCTIONAL_CHECKS if checks.get(name) != "PASS"]
     if missing_checks:
         raise ICDORAuditError(f"functional checks lack explicit evidence: {missing_checks}")
@@ -709,6 +825,16 @@ def _git_head(root: Path) -> str:
         ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True
     )
     return result.stdout.strip()
+
+
+def _git_branch(root: Path) -> str:
+    result = subprocess.run(
+        ["git", "branch", "--show-current"], cwd=root, check=True, capture_output=True, text=True
+    )
+    branch = result.stdout.strip()
+    if not branch:
+        raise ICDORAuditError("audit requires a named git branch, not detached HEAD")
+    return branch
 
 
 def _git_tree(root: Path) -> str:
@@ -925,7 +1051,7 @@ def main() -> None:
     model = build_icdor_model(config).to(device)
     ownership, _ = build_icdor_parameter_ownership(model)
     dynamic = verify_dynamic_forward_and_gradients(model, images.to(device))
-    dynamic["v4_contract"] = verify_v4_forward_contract(model, images.to(device))
+    dynamic["v5_contract"] = verify_v5_forward_contract(model, images.to(device))
     functional, functional_evidence = functional_hard_gates(root, config, dynamic)
     clean = _worktree_clean(root)
     contract_manifest = root / ".review" / "icdor_source_manifest.json"
@@ -1038,7 +1164,7 @@ def main() -> None:
             final_remediation_plan_sha256=sha256_file(args.final_remediation_plan),
             audit_addendum_sha256=sha256_file(args.audit_addendum),
         )
-        review_path = output / "acpr_mosaic_trust_v3_icdor_REVIEW_PASS.json"
+        review_path = output / "acpr_mosaic_trust_v5_credo_map_REVIEW_PASS.json"
         review_path.write_text(json.dumps(review, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps(result, indent=2, sort_keys=True))
 

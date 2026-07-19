@@ -14,6 +14,7 @@ from fate_oia.engine.audit_acpr_mosaic_trust_icdor import (
     validate_real_factor_audit,
     protocol_hard_gate,
     verify_dynamic_forward_and_gradients,
+    _REQUIRED_FUNCTIONAL_CHECKS,
 )
 
 
@@ -73,8 +74,10 @@ def test_functional_audit_cannot_blanket_pass_without_per_check_evidence() -> No
     source = Path("fate_oia/engine/audit_acpr_mosaic_trust_icdor.py").read_text(encoding="utf-8")
     assert 'return ({name: "PASS" for name in _REQUIRED_FUNCTIONAL_CHECKS}' not in source
     assert 'checks["direct_image"] = "PASS"' in source
-    assert 'checks["artifact_schema_v4"] = "PASS"' in source
-    assert 'checks["credo_learning_deployment"] = "PASS"' in source
+    assert 'checks["artifact_schema_v5"] = "PASS"' in source
+    assert 'checks["credo_map_learning_deployment"] = "PASS"' in source
+    assert 'checks["factor_audit_aligned_loss_chain"] = "PASS"' in source
+    assert 'checks["v5_target_utility_cadence"] = "PASS"' in source
     assert '"factor_audit.json"' in source
     assert '"no_lane_absence_polarity"' in source
     assert '"clip_grad_norm_("' in source
@@ -186,13 +189,7 @@ def test_review_pass_is_fail_closed_and_binds_all_evidence() -> None:
         "config_sha256": "CONFIG",
         "source": {"pass": True},
         "dynamic_forward": {"pass": True},
-        "functional_checks": {name: "PASS" for name in (
-            "direct_image", "factor_certificate", "edge_admission", "action_firewall",
-            "reason_firewall", "selective_observation", "calibration", "artifact_schema",
-            "resume_integrity", "visual_audit", "foreground_launcher", "continuous_credibility",
-            "fine_transport", "partial_action_admission", "regime_schedule", "artifact_schema_v4", "target_utility",
-            "batch_field_reuse", "credo_learning_deployment",
-        )},
+        "functional_checks": {name: "PASS" for name in _REQUIRED_FUNCTIONAL_CHECKS},
         "missing_items": [],
         "git_tree": "TREE",
         "source_manifest_sha256": "SOURCES",
@@ -293,13 +290,7 @@ def test_learning_access_review_does_not_claim_or_require_deployment_admission()
         "source_manifest_sha256": "SOURCES", "contract_manifest_sha256": "CONTRACT",
         "worktree_clean": True, "split_protocol": {"split_sha256": "SPLIT"},
         "config_sha256": "CONFIG",
-        "functional_checks": {name: "PASS" for name in (
-            "direct_image", "factor_certificate", "edge_admission", "action_firewall",
-            "reason_firewall", "selective_observation", "calibration", "artifact_schema",
-            "resume_integrity", "visual_audit", "foreground_launcher", "continuous_credibility",
-            "fine_transport", "partial_action_admission", "regime_schedule", "artifact_schema_v4",
-            "target_utility", "batch_field_reuse", "credo_learning_deployment",
-        )},
+        "functional_checks": {name: "PASS" for name in _REQUIRED_FUNCTIONAL_CHECKS},
         "missing_items": [],
     }
     pilot = {
@@ -321,13 +312,7 @@ def test_learning_access_review_does_not_claim_or_require_deployment_admission()
 
 
 def test_review_pass_rejects_dirty_or_unbound_source_tree() -> None:
-    checks = (
-        "direct_image", "factor_certificate", "edge_admission", "action_firewall",
-        "reason_firewall", "selective_observation", "calibration", "artifact_schema",
-        "resume_integrity", "visual_audit", "foreground_launcher", "continuous_credibility",
-        "fine_transport", "partial_action_admission", "regime_schedule", "artifact_schema_v4",
-        "batch_field_reuse", "credo_learning_deployment",
-    )
+    checks = _REQUIRED_FUNCTIONAL_CHECKS
     base = {
         "pass": True, "git_head": "abc", "git_tree": "TREE",
         "source_manifest_sha256": "SOURCES", "contract_manifest_sha256": "CONTRACT",

@@ -35,7 +35,7 @@ def test_resolved_config_usage_tracks_all_five_yaml_sources_and_rejects_unused_k
 
 
 def test_credibility_and_fine_transport_config_leaves_are_runtime_consumed(tmp_path: Path) -> None:
-    """CREDO v4 values must reach runtime code, not only the YAML manifest."""
+    """CREDO-MAP values must reach runtime code, not only the YAML manifest."""
     module = importlib.import_module("fate_oia.utils.mosaic_config_usage")
     sources = (
         Path("configs/fate_oia_train_360x640_acpr_mosaic_trust_v3_icdor.yaml"),
@@ -55,12 +55,13 @@ def test_credibility_and_fine_transport_config_leaves_are_runtime_consumed(tmp_p
     prefix = "fate_oia_train_360x640_acpr_mosaic_trust_v3_icdor.yaml."
     expected = (
         "credibility.independent_of_reason_labels",
-        "credibility.observable_cV_min_for_admission",
         "credibility.bootstrap_replicates",
         "credibility.ema_decay",
         "credibility.image_only_cap",
         "credibility.unknown_cap",
         "credibility.no_reliable_negative_cap",
+        "model.action_route.action_shadow_credibility_floor",
+        "model.action_route.reason_semantic_credibility_floor",
         "fine_transport.enabled",
         "fine_transport.point_eta",
         "fine_transport.curve_eta",

@@ -48,6 +48,38 @@ def audit_hidden_recovery_scores(
         raise ValueError("hidden recovery score audit requires aligned [B,R] tensors and a supported mode")
     hidden = hidden_positive_mask.bool()
     eligible_negative = (observed_after_hiding <= 0.5) & ~hidden
+    per_label: list[dict[str, Any]] = []
+    for reason_id in range(shape[1]):
+        label_hidden = hidden[:, reason_id]
+        label_negative = eligible_negative[:, reason_id]
+        label_evaluation = label_hidden | label_negative
+        label_hidden_count = int(label_hidden.sum())
+        label_negative_count = int(label_negative.sum())
+        if label_hidden_count == 0 or label_negative_count == 0:
+            per_label.append({
+                "reason_id": reason_id,
+                "available": False,
+                "hidden_positive_count": label_hidden_count,
+                "eligible_negative_count": label_negative_count,
+                "recovery_auprc": None,
+                "zero_as_negative_auprc": None,
+                "margin": None,
+            })
+            continue
+        label_truth = label_hidden[label_evaluation]
+        label_recovery = _ap(posterior_scores[:, reason_id][label_evaluation].detach(), label_truth)
+        label_baseline = _ap(zero_as_negative_scores[:, reason_id][label_evaluation].detach(), label_truth)
+        if label_recovery is None or label_baseline is None:
+            raise ValueError("hidden recovery label audit unexpectedly produced an unavailable AP")
+        per_label.append({
+            "reason_id": reason_id,
+            "available": True,
+            "hidden_positive_count": label_hidden_count,
+            "eligible_negative_count": label_negative_count,
+            "recovery_auprc": label_recovery,
+            "zero_as_negative_auprc": label_baseline,
+            "margin": label_recovery - label_baseline,
+        })
     evaluation = hidden | eligible_negative
     labels = hidden[evaluation]
     hidden_count = int(hidden.sum())
@@ -63,6 +95,7 @@ def audit_hidden_recovery_scores(
             "recovery_auprc": None,
             "zero_as_negative_auprc": None,
             "margin": None,
+            "per_label": per_label,
             "training_safe": True,
         }
     recovery = _ap(posterior_scores[evaluation].detach(), labels)
@@ -79,6 +112,7 @@ def audit_hidden_recovery_scores(
         "recovery_auprc": recovery,
         "zero_as_negative_auprc": baseline,
         "margin": recovery - baseline,
+        "per_label": per_label,
         "training_safe": True,
     }
 

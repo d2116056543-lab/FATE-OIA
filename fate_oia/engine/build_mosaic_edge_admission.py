@@ -50,14 +50,13 @@ def build_edge_admission(
     factor_credibility: Sequence[float],
     *,
     source_split: str,
-    credibility_min: float = 0.80,
 ) -> MOSAICEdgeAdmission:
     """Admit only independent-audit-proven factor-to-action edges.
 
-    A discrete factor certificate is a reporting artifact. It cannot be a
-    precondition for target-specific action admission because that recreates
-    CREDO's cold-start loop. The detached audit_visual cV vector is the sole
-    factor-level admission evidence used here.
+    A discrete factor certificate and continuous cV are reporting diagnostics.
+    Neither is a precondition for target-specific action admission: applying a
+    global cV cutoff recreates CREDO-MAP's cold-start loop.  Admission is based
+    on this action's independently measured TET/TES/CCA/AP evidence.
     """
     if source_split not in {"audit_target", "train_audit"}:
         raise ValueError("IC-DOR edge admission may only read an independent target audit")
@@ -75,11 +74,9 @@ def build_edge_admission(
         for action_name, directions in ontology["action_routes"].items():
             for edge in directions[direction]:
                 candidate[direction_id, factor_index[edge["factor"]], action_index[action_name]] = True
-    # Aggregate independent target-audit evidence per action before accepting any
-    # edge. This is intentionally partial: one action may be admitted while
-    # the other actions remain in shadow, but a weak action cannot pass merely
-    # because a different action has a strong factor edge.
-    action_credibility = torch.zeros(len(action_names), dtype=torch.float32)
+    # Aggregate independent target-audit evidence per action before accepting
+    # any edge. This is intentionally partial: one action may be admitted
+    # while another remains in shadow.
     action_tet = torch.zeros(len(action_names), dtype=torch.float32)
     action_tes = torch.zeros(len(action_names), dtype=torch.float32)
     action_cca = torch.zeros(len(action_names), dtype=torch.float32)
@@ -93,20 +90,17 @@ def build_edge_admission(
                 stats = statistics.get((direction, factor_name, action_name))
                 if stats is None:
                     continue
-                action_credibility[action_id] = max(action_credibility[action_id], credibility[factor_id])
                 action_tet[action_id] = max(action_tet[action_id], float(stats.tet_lcb95))
                 action_tes[action_id] = max(action_tes[action_id], float(stats.tes_lcb95))
                 action_cca[action_id] = max(action_cca[action_id], float(stats.cca))
                 action_visual_ap[action_id] = max(action_visual_ap[action_id], float(stats.visual_ap))
                 action_edge_ap[action_id] = max(action_edge_ap[action_id], float(stats.isolated_edge_ap))
     partial_action_ready = partial_action_admission(
-        action_credibility,
         action_tet,
         action_tes,
         action_cca,
         action_visual_ap,
         action_edge_ap,
-        credibility_min=credibility_min,
     )
     admission = torch.zeros_like(candidate)
     entries: dict[str, dict[str, Any]] = {}

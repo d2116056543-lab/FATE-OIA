@@ -493,6 +493,7 @@ class MOSAICObservablePredicateLayer(nn.Module):
         }
         return {
             "factor_features": factor_features,
+            "factor_queries": factor_queries,
             "factor_presence_logits": presence_logits,
             "factor_presence_prob": presence_probability,
             "factor_visibility_logits": visibility_logits,

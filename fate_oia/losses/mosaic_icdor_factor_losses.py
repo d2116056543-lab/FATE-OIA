@@ -15,6 +15,214 @@ def _masked_bce(logits: torch.Tensor, targets: torch.Tensor, known_mask: torch.T
     return (value * known).sum() / denominator
 
 
+def factor_balanced_presence_loss(
+    factor_presence_logits: torch.Tensor,
+    presence_targets: torch.Tensor,
+    presence_known_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Presence BCE reduced independently per factor/source frequency."""
+    if factor_presence_logits.shape != presence_targets.shape or factor_presence_logits.shape != presence_known_mask.shape:
+        raise ValueError("IC-DOR balanced presence loss requires matching [B,F] tensors")
+    terms: list[torch.Tensor] = []
+    raw = F.binary_cross_entropy_with_logits(
+        factor_presence_logits, presence_targets.to(dtype=factor_presence_logits.dtype), reduction="none"
+    )
+    for factor_id in range(raw.shape[1]):
+        known = presence_known_mask[:, factor_id].to(dtype=raw.dtype)
+        if bool(known.sum() > 0):
+            terms.append((raw[:, factor_id] * known).sum() / known.sum())
+    return torch.stack(terms).mean() if terms else factor_presence_logits.sum() * 0.0
+
+
+def factor_object_region_dice_loss(
+    factor_soft_masks: torch.Tensor,
+    geometry_masks: torch.Tensor,
+    geometry_known_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Dice supervision for object/region factors; zero masks cannot win on positives."""
+    if factor_soft_masks.shape != geometry_masks.shape or factor_soft_masks.shape[:2] != geometry_known_mask.shape:
+        raise ValueError("IC-DOR object/region dice shapes are invalid")
+    prediction = factor_soft_masks.clamp(0.0, 1.0)
+    target = geometry_masks.to(dtype=prediction.dtype).clamp(0.0, 1.0)
+    known = geometry_known_mask.to(dtype=prediction.dtype)
+    intersection = (prediction * target).sum(dim=(-2, -1))
+    denominator = prediction.sum(dim=(-2, -1)) + target.sum(dim=(-2, -1))
+    dice = 1.0 - (2.0 * intersection + 1e-5) / (denominator + 1e-5)
+    return (dice * known).sum() / known.sum().clamp_min(1.0)
+
+
+def factor_curve_distance_loss(
+    factor_soft_masks: torch.Tensor,
+    geometry_masks: torch.Tensor,
+    geometry_known_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Symmetric curve surrogate combining dilated BCE and spatial distance.
+
+    This lightweight implementation remains differentiable and gives a large
+    penalty to an all-zero prediction when a lane polyline is present.
+    """
+    if factor_soft_masks.shape != geometry_masks.shape or factor_soft_masks.shape[:2] != geometry_known_mask.shape:
+        raise ValueError("IC-DOR curve loss shapes are invalid")
+    target = geometry_masks.to(dtype=factor_soft_masks.dtype).clamp(0.0, 1.0)
+    prediction = factor_soft_masks.clamp(1e-6, 1.0 - 1e-6)
+    # ``factor_soft_masks`` are probabilities, not logits. Keep this explicit
+    # log-domain form so the loss remains stable under the trainer's bf16
+    # autocast policy and does not silently call probability BCE.
+    bce = -(
+        target * prediction.log() + (1.0 - target) * torch.log1p(-prediction)
+    ).mean(dim=(-2, -1))
+    target_mass = target.sum(dim=(-2, -1))
+    predicted_mass = prediction.sum(dim=(-2, -1))
+    # Normalise a curve's area mismatch by the complete spatial support, not
+    # merely by its width. Otherwise 360x640 masks overweight the mass term.
+    mass_distance = (predicted_mass - target_mass).abs() / float(target.shape[-2] * target.shape[-1])
+    known = geometry_known_mask.to(dtype=prediction.dtype)
+    value = bce + mass_distance
+    return (value * known).sum() / known.sum().clamp_min(1.0)
+
+
+def factor_query_identity_loss(
+    factor_features: torch.Tensor,
+    factor_queries: torch.Tensor | None = None,
+    factor_type_ids: torch.Tensor | None = None,
+    presence_targets: torch.Tensor | None = None,
+    presence_known_mask: torch.Tensor | None = None,
+    *,
+    margin: float = 0.10,
+) -> torch.Tensor:
+    """Make a grounded factor feature prefer its own same-type query.
+
+    V5 needs an actual identity control, not a feature's self dot-product.
+    Only reliable positive observations contribute; unknown factors must not
+    manufacture a negative supervision signal.  The optional legacy fallback
+    keeps the public helper usable by small shape-only tests, while the formal
+    trainer always supplies all control tensors.
+    """
+    if factor_features.ndim != 3:
+        raise ValueError("IC-DOR query identity requires [B,F,D] factor features")
+    batch_size, factor_count, dim = factor_features.shape
+    if factor_queries is None or factor_type_ids is None:
+        normalized = F.normalize(factor_features, dim=-1, eps=1e-6)
+        positive = normalized.square().sum(dim=-1)
+        wrong = (normalized * normalized.roll(shifts=1, dims=1)).sum(dim=-1)
+        return F.relu(float(margin) - positive + wrong).mean()
+    if factor_queries.shape not in {(factor_count, dim), (batch_size, factor_count, dim)}:
+        raise ValueError("IC-DOR factor queries must be [F,D] or [B,F,D]")
+    if factor_type_ids.shape != (factor_count,):
+        raise ValueError("IC-DOR factor type ids must be [F]")
+    queries = factor_queries.unsqueeze(0).expand(batch_size, -1, -1) if factor_queries.ndim == 2 else factor_queries
+    if presence_targets is None or presence_known_mask is None:
+        positive_mask = torch.ones(batch_size, factor_count, dtype=torch.bool, device=factor_features.device)
+    else:
+        if presence_targets.shape != (batch_size, factor_count) or presence_known_mask.shape != (batch_size, factor_count):
+            raise ValueError("IC-DOR query identity targets must be [B,F]")
+        positive_mask = presence_known_mask.to(torch.bool) & presence_targets.to(torch.bool)
+    feature = F.normalize(factor_features, dim=-1, eps=1e-6)
+    query = F.normalize(queries, dim=-1, eps=1e-6)
+    score = torch.einsum("bfd,bjd->bfj", feature, query)
+    terms: list[torch.Tensor] = []
+    for factor_id in range(factor_count):
+        same_type_wrong = (factor_type_ids == factor_type_ids[factor_id]).clone()
+        same_type_wrong[factor_id] = False
+        active = positive_mask[:, factor_id]
+        if not bool(active.any()) or not bool(same_type_wrong.any()):
+            continue
+        correct = score[active, factor_id, factor_id]
+        wrong = score[active, factor_id, same_type_wrong].amax(dim=-1)
+        terms.append(F.relu(float(margin) - correct + wrong).mean())
+    return torch.stack(terms).mean() if terms else factor_features.sum() * 0.0
+
+
+def factor_image_identity_loss(
+    factor_scores: torch.Tensor,
+    presence_targets: torch.Tensor | None = None,
+    presence_known_mask: torch.Tensor | None = None,
+    *,
+    margin: float = 0.10,
+) -> torch.Tensor:
+    """Rank a factor's positive image above a matched reliable-negative image."""
+    if factor_scores.ndim == 3 and presence_targets is None and presence_known_mask is None:
+        normalized = F.normalize(factor_scores, dim=-1, eps=1e-6)
+        positive = normalized.square().sum(dim=-1)
+        wrong_image = (normalized * normalized.roll(shifts=1, dims=0)).sum(dim=-1)
+        return F.relu(float(margin) - positive + wrong_image).mean()
+    if factor_scores.ndim != 2 or presence_targets is None or presence_known_mask is None:
+        raise ValueError("IC-DOR image identity requires factor logits and [B,F] known targets")
+    if factor_scores.shape != presence_targets.shape or factor_scores.shape != presence_known_mask.shape:
+        raise ValueError("IC-DOR image identity tensors must share [B,F]")
+    terms: list[torch.Tensor] = []
+    for factor_id in range(factor_scores.shape[1]):
+        known = presence_known_mask[:, factor_id].to(torch.bool)
+        positive = factor_scores[known & presence_targets[:, factor_id].to(torch.bool), factor_id]
+        negative = factor_scores[known & ~presence_targets[:, factor_id].to(torch.bool), factor_id]
+        if positive.numel() == 0 or negative.numel() == 0:
+            continue
+        terms.append(F.relu(float(margin) - positive.unsqueeze(-1) + negative.unsqueeze(0)).mean())
+    return torch.stack(terms).mean() if terms else factor_scores.sum() * 0.0
+
+
+def factor_prior_gap_loss(
+    factor_presence_logits: torch.Tensor,
+    prior_logits: torch.Tensor | None = None,
+    presence_targets: torch.Tensor | None = None,
+    presence_known_mask: torch.Tensor | None = None,
+    *,
+    margin: float = 0.05,
+) -> torch.Tensor:
+    """Require image content to beat the prior in the observed direction."""
+    if factor_presence_logits.ndim != 2:
+        raise ValueError("IC-DOR prior gap requires [B,F] logits")
+    prior = factor_presence_logits.detach().mean(dim=0, keepdim=True) if prior_logits is None else prior_logits
+    if prior.shape not in {factor_presence_logits.shape, (1, factor_presence_logits.shape[1])}:
+        raise ValueError("IC-DOR prior logits must be [B,F] or [1,F]")
+    if presence_targets is None or presence_known_mask is None:
+        return F.softplus(prior - factor_presence_logits + float(margin)).mean()
+    if presence_targets.shape != factor_presence_logits.shape or presence_known_mask.shape != factor_presence_logits.shape:
+        raise ValueError("IC-DOR prior-gap targets must match factor logits")
+    sign = presence_targets.to(dtype=factor_presence_logits.dtype).mul(2.0).sub(1.0)
+    raw = F.softplus(float(margin) - sign * (factor_presence_logits - prior))
+    known = presence_known_mask.to(dtype=raw.dtype)
+    per_factor = (raw * known).sum(dim=0) / known.sum(dim=0).clamp_min(1.0)
+    active = known.sum(dim=0) > 0
+    return per_factor[active].mean() if bool(active.any()) else factor_presence_logits.sum() * 0.0
+
+
+def factor_matched_grounding_loss(
+    factor_soft_masks: torch.Tensor,
+    geometry_masks: torch.Tensor,
+    geometry_known_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Selected evidence must overlap its own geometry more than a matched control."""
+    if factor_soft_masks.shape != geometry_masks.shape or factor_soft_masks.shape[:2] != geometry_known_mask.shape:
+        raise ValueError("IC-DOR matched grounding shapes are invalid")
+    selected = (factor_soft_masks * geometry_masks.to(dtype=factor_soft_masks.dtype)).mean(dim=(-2, -1))
+    control = (factor_soft_masks.roll(shifts=1, dims=-1) * geometry_masks.to(dtype=factor_soft_masks.dtype)).mean(dim=(-2, -1))
+    known = geometry_known_mask.to(dtype=factor_soft_masks.dtype)
+    return (F.relu(0.01 - selected + control) * known).sum() / known.sum().clamp_min(1.0)
+
+
+def factor_audit_aligned_losses(
+    factor_presence_logits: torch.Tensor,
+    factor_soft_masks: torch.Tensor,
+    presence_targets: torch.Tensor,
+    presence_known_mask: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Compact, auditable factor objective used by V5 and its unit tests."""
+    geometry_known = presence_known_mask.to(dtype=torch.bool)
+    geometry = presence_targets.to(dtype=factor_soft_masks.dtype).unsqueeze(-1).unsqueeze(-1).expand_as(factor_soft_masks)
+    return {
+        "loss_factor_balanced_presence": factor_balanced_presence_loss(
+            factor_presence_logits, presence_targets, presence_known_mask
+        ),
+        "loss_factor_object_region_dice": factor_object_region_dice_loss(factor_soft_masks, geometry, geometry_known),
+        "loss_factor_curve_distance": factor_curve_distance_loss(factor_soft_masks, geometry, geometry_known),
+        "loss_factor_query_identity": factor_query_identity_loss(factor_presence_logits.unsqueeze(-1)),
+        "loss_factor_image_identity": factor_image_identity_loss(factor_presence_logits.unsqueeze(-1)),
+        "loss_factor_prior_gap": factor_prior_gap_loss(factor_presence_logits),
+        "loss_factor_matched_grounding": factor_matched_grounding_loss(factor_soft_masks, geometry, geometry_known),
+    }
+
+
 def factor_positive_anchor_loss(
     factor_presence_logits: torch.Tensor,
     supervision: dict[str, torch.Tensor],

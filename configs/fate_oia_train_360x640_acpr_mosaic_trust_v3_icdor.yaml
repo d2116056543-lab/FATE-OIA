@@ -66,20 +66,17 @@ model:
   action_route:
     gate_init: 0.02
     gate_max: 0.05
-    # Bootstrap learning access only. Final action still needs independent edge admission.
-    shadow_credibility_floor: 0.05
+    # CREDO-MAP learning access only; neither field is an admission threshold.
+    action_shadow_credibility_floor: 0.05
+    reason_semantic_credibility_floor: 0.15
     router_dustbin_init: -4.0
     shadow_until_edge_admission: true
-    route_strength_target: 0.05
-    route_strength_min: 0.02
-    route_strength_max: 0.15
   reason:
     escape_token_penalty: 0.01
     observed_mix_init: 0.05
 
 credibility:
   independent_of_reason_labels: true
-  observable_cV_min_for_admission: 0.80
   bootstrap_replicates: 1000
   ema_decay: 0.90
   image_only_cap: 0.10
@@ -134,25 +131,23 @@ loss:
     pareto_weight: 1.00
     sparsity_weight: 0.02
     dustbin_weight: 0.01
-    strength_weight: 0.02
     intervention_weight: 0.10
   factor:
-    # CREDO: factor measurements learn from image/geometry observations only.
-    allow_reason_anchors: false
-    presence_weight: 1.00
+    # V5: each term is aligned to a separately exported factor audit.
+    balanced_presence_weight: 1.00
     visibility_weight: 0.50
-    geometry_mask_weight: 0.10
-    view_consistency_weight: 0.015
-    flip_equivariance_weight: 0.015
-    prototype_occupancy_weight: 0.005
-    prototype_repulsion_weight: 0.005
-    prior_scale_weight: 0.00
-    contradiction_weight: 0.00
-    positive_anchor_weight: 0.00
-    selective_contrastive_weight: 0.05
+    geometry_weight: 0.15
+    query_identity_weight: 0.10
+    image_identity_weight: 0.10
+    prior_gap_weight: 0.05
+    matched_grounding_weight: 0.05
+    view_weight: 0.03
+    prototype_weight: 0.01
   reason:
     visual_observed_asl_weight: 1.00
-    observed_asl_weight: 0.00
+    observed_asl_weight: 0.50
+    latent_core_weight: 0.30
+    latent_weak_negative_weight: 0.15
     observation_nll_weight: 0.20
     posterior_bce_weight: 0.00
     posterior_rank_weight: 0.00
@@ -211,7 +206,7 @@ training:
     - {batch_size: 5, grad_accum: 6, effective_batch: 30}
     - {batch_size: 4, grad_accum: 8, effective_batch: 32}
   max_reserved_vram_gb: 43.5
-  regime_schedule: [discovery_shadow, safe_partial_admission, consolidation]
+  regime_schedule: [JOINT_SHADOW, ADMISSION_CONSOLIDATION]
   shadow_active_epoch: 0
   final_action_visual_until_admission: true
   no_hard_certificate_training_gate: true
@@ -255,3 +250,5 @@ runtime:
   timed_profile_steps: 100
   dataloader_stability_minutes: 15
   target_transfer_intervention_chunk_size: 4
+  # Epoch-zero online utility is bounded; bootstrap-quality target audit is every two epochs.
+  online_target_probe_max_samples: 256

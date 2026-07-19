@@ -9,6 +9,33 @@ from PIL import Image
 from torch.nn import functional as F
 
 
+def is_supported_lane_direction(value: Any) -> bool:
+    """BDD100K lanes use only ``parallel`` or ``vertical`` direction labels."""
+    return str(value).lower() in {"parallel", "vertical"}
+
+
+def reliable_absence_observation(*, source_complete: bool, region_visible: bool, no_footpoint: bool) -> dict[str, float | bool]:
+    """Encode a real negative observation, not an unknown missing source."""
+    known = bool(source_complete and region_visible and no_footpoint)
+    return {"presence": 0.0, "observability": 1.0 if known else 0.0, "known": known}
+
+
+def object_corridor_overlap(
+    box: Mapping[str, Any], *, corridor: tuple[float, float, float, float]
+) -> float:
+    """Footprint/box corridor overlap used for explicit occupancy predicates."""
+    try:
+        x1, y1, x2, y2 = (float(box[key]) for key in ("x1", "y1", "x2", "y2"))
+    except (KeyError, TypeError, ValueError):
+        return 0.0
+    cx1, cy1, cx2, cy2 = corridor
+    foot_x, foot_y = (x1 + x2) * 0.5, y2
+    footprint = 1.0 if cx1 <= foot_x <= cx2 and cy1 <= foot_y <= cy2 else 0.0
+    intersection = max(0.0, min(cx2, x2) - max(cx1, x1)) * max(0.0, min(cy2, y2) - max(cy1, y1))
+    box_area = max((x2 - x1) * (y2 - y1), 1e-6)
+    return max(footprint, intersection / box_area)
+
+
 class ICDORGroundingObservationBuilder:
     """Train-only BDD100K observations with explicit unknown/weak-negative states.
 
@@ -60,7 +87,7 @@ class ICDORGroundingObservationBuilder:
 
     @classmethod
     def _negative_policy(cls, factor: Mapping[str, Any]) -> str:
-        policy = str(factor.get("negative_policy", cls._DEFAULT_POLICY))
+        policy = str(factor.get("observability_policy", factor.get("negative_policy", cls._DEFAULT_POLICY)))
         valid = {cls._RELIABLE_SOURCE_POLICY, cls._RELIABLE_ATTRIBUTE_POLICY, *cls._UNKNOWN_POLICIES, cls._DEFAULT_POLICY}
         if policy not in valid:
             raise ValueError(f"unsupported IC-DOR negative policy: {policy}")
@@ -160,9 +187,9 @@ class ICDORGroundingObservationBuilder:
                 name, kind = str(factor["name"]), str(factor["type"])
                 sources = set(factor["grounding_sources"])
                 policy = self._negative_policy(factor)
-                constraints = factor.get("attribute_constraints", {})
+                constraints = factor.get("source_attributes", factor.get("attribute_constraints", {}))
                 if not isinstance(constraints, Mapping):
-                    raise ValueError("IC-DOR factor attribute_constraints must be a mapping")
+                    raise ValueError("IC-DOR factor source_attributes must be a mapping")
                 positive_mask: torch.Tensor | None = None
                 available = False
                 attribute_complete = True
@@ -182,7 +209,23 @@ class ICDORGroundingObservationBuilder:
                                 continue
                             if not attributes_match:
                                 continue
-                            candidate = self._box_mask(item.get("box2d", {}), image_hw, self.grid_hw, device)
+                            box = item.get("box2d", {})
+                            if ("occupied" in name or "obstacle" in name) and isinstance(box, Mapping):
+                                regions = factor.get("weak_regions", [])
+                                region = str(regions[0]) if isinstance(regions, (list, tuple)) and regions else "front_center"
+                                region_mask = self._region_mask(region, self.grid_hw, device)
+                                ys, xs = torch.nonzero(region_mask > 0, as_tuple=True)
+                                if not ys.numel():
+                                    continue
+                                corridor = (
+                                    float(xs.min()) / self.grid_hw[1] * image_hw[1],
+                                    float(ys.min()) / self.grid_hw[0] * image_hw[0],
+                                    float(xs.max() + 1) / self.grid_hw[1] * image_hw[1],
+                                    float(ys.max() + 1) / self.grid_hw[0] * image_hw[0],
+                                )
+                                if object_corridor_overlap(box, corridor=corridor) < 0.10:
+                                    continue
+                            candidate = self._box_mask(box, image_hw, self.grid_hw, device)
                             if candidate is not None:
                                 candidate = self._restrict_to_declared_region(candidate, factor, device)
                                 if bool(candidate.any()):
@@ -192,7 +235,13 @@ class ICDORGroundingObservationBuilder:
                     for lane in lanes:
                         if not isinstance(lane, dict) or "lane" not in str(lane.get("category", "")).lower():
                             continue
-                        attributes_match, complete = self._constraint_match(parse_bdd100k_attributes(lane), constraints)
+                        attributes = parse_bdd100k_attributes(lane)
+                        lane_types = attributes.get("lane_types")
+                        if attributes.get("lane_direction") != "parallel" or (
+                            isinstance(lane_types, (list, tuple)) and any(str(value).lower() == "crosswalk" for value in lane_types)
+                        ):
+                            continue
+                        attributes_match, complete = self._constraint_match(attributes, constraints)
                         attribute_complete = attribute_complete and complete
                         if not attributes_match:
                             continue
@@ -237,6 +286,12 @@ class ICDORGroundingObservationBuilder:
                         policy == self._RELIABLE_ATTRIBUTE_POLICY and attribute_complete
                     ):
                         presence_known_mask[row, column] = 1.0
+                        # Reliable absence is evidence about both state and
+                        # observability: p=0, v=1.  Leaving visibility unknown
+                        # made no-lane/no-obstacle predicates impossible to
+                        # learn despite complete BDD100K coverage.
+                        visibility_target[row, column] = 1.0
+                        visibility_known_mask[row, column] = 1.0
                     elif policy not in self._UNKNOWN_POLICIES:
                         weak_negative_mask[row, column] = 1.0
         return {"presence_target": presence_target, "presence_known_mask": presence_known_mask, "visibility_target": visibility_target, "visibility_known_mask": visibility_known_mask, "weak_negative_mask": weak_negative_mask, "geometry_known_mask": geometry_known_mask, "geometry_masks": geometry_masks, "source_available": source_available}

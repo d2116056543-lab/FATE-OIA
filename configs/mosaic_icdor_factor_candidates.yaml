@@ -13,6 +13,13 @@ factors:
     negative_policy: reliable_if_source_complete
     source_kind: grounded
     target_candidates: {actions: [], reasons: [0, 3, 13, 19]}
+    visual_role: observable
+    source_attributes: {}
+    presence_polarity: present
+    observability_policy: reliable_if_source_complete
+    action_eligible: false
+    reason_eligible: true
+    geometry_loss_type: object_region_dice
   - name: red_light_visible
     type: point
     num_prototypes: 3
@@ -27,6 +34,13 @@ factors:
     negative_policy: reliable_if_attribute_complete
     visual_sources: [box2d, bdd100k_attributes]
     target_candidates: {actions: [stop], reasons: [0, 13, 19]}
+    visual_role: observable
+    source_attributes: {trafficLightColor: red}
+    presence_polarity: present
+    observability_policy: reliable_if_attribute_complete
+    action_eligible: true
+    reason_eligible: true
+    geometry_loss_type: object_region_dice
   - name: green_light_visible
     type: point
     num_prototypes: 3
@@ -41,6 +55,13 @@ factors:
     negative_policy: reliable_if_attribute_complete
     visual_sources: [box2d, bdd100k_attributes]
     target_candidates: {actions: [], reasons: [0]}
+    visual_role: observable
+    source_attributes: {trafficLightColor: green}
+    presence_polarity: present
+    observability_policy: reliable_if_attribute_complete
+    action_eligible: false
+    reason_eligible: true
+    geometry_loss_type: object_region_dice
   - name: traffic_sign_visible
     type: point
     num_prototypes: 3
@@ -55,6 +76,13 @@ factors:
     negative_policy: reliable_if_source_complete
     source_kind: grounded
     target_candidates: {actions: [], reasons: [4]}
+    visual_role: observable
+    source_attributes: {}
+    presence_polarity: present
+    observability_policy: reliable_if_source_complete
+    action_eligible: false
+    reason_eligible: true
+    geometry_loss_type: object_region_dice
   - name: front_vehicle_visible
     type: object
     num_prototypes: 4
@@ -69,6 +97,13 @@ factors:
     negative_policy: reliable_if_source_complete
     source_kind: grounded
     target_candidates: {actions: [], reasons: [1, 5, 14, 20]}
+    visual_role: observable
+    source_attributes: {}
+    presence_polarity: present
+    observability_policy: reliable_if_source_complete
+    action_eligible: false
+    reason_eligible: true
+    geometry_loss_type: object_region_dice
   - name: front_vehicle_risk_proxy
     type: object
     num_prototypes: 3
@@ -85,6 +120,13 @@ factors:
     negative_policy: unknown_without_depth
     visual_sources: [box2d]
     target_candidates: {actions: [], reasons: [5]}
+    visual_role: latent_only
+    source_attributes: {proxy: front_box_risk}
+    presence_polarity: present
+    observability_policy: unknown_without_depth
+    action_eligible: false
+    reason_eligible: true
+    geometry_loss_type: object_region_dice
   - name: pedestrian_front_visible
     type: object
     num_prototypes: 3
@@ -99,6 +141,13 @@ factors:
     negative_policy: reliable_if_source_complete
     source_kind: grounded
     target_candidates: {actions: [], reasons: [6]}
+    visual_role: observable
+    source_attributes: {}
+    presence_polarity: present
+    observability_policy: reliable_if_source_complete
+    action_eligible: false
+    reason_eligible: true
+    geometry_loss_type: object_region_dice
   - name: rider_front_visible
     type: object
     num_prototypes: 3
@@ -113,6 +162,13 @@ factors:
     negative_policy: reliable_if_source_complete
     source_kind: grounded
     target_candidates: {actions: [], reasons: [7]}
+    visual_role: observable
+    source_attributes: {}
+    presence_polarity: present
+    observability_policy: reliable_if_source_complete
+    action_eligible: false
+    reason_eligible: true
+    geometry_loss_type: object_region_dice
   - name: left_obstacle_visible
     type: object
     num_prototypes: 3
@@ -127,6 +183,13 @@ factors:
     negative_policy: reliable_if_source_complete
     source_kind: grounded
     target_candidates: {actions: [], reasons: [8, 10]}
+    visual_role: observable
+    source_attributes: {}
+    presence_polarity: present
+    observability_policy: reliable_if_source_complete
+    action_eligible: false
+    reason_eligible: true
+    geometry_loss_type: object_region_dice
   - name: right_obstacle_visible
     type: object
     num_prototypes: 3
@@ -141,6 +204,13 @@ factors:
     negative_policy: reliable_if_source_complete
     source_kind: grounded
     target_candidates: {actions: [], reasons: [8, 16]}
+    visual_role: observable
+    source_attributes: {}
+    presence_polarity: present
+    observability_policy: reliable_if_source_complete
+    action_eligible: false
+    reason_eligible: true
+    geometry_loss_type: object_region_dice
   - name: left_lane_marking_visible
     type: curve
     num_prototypes: 3
@@ -155,6 +225,13 @@ factors:
     negative_policy: reliable_if_source_complete
     source_kind: grounded
     target_candidates: {actions: [], reasons: [9, 11, 12]}
+    visual_role: observable
+    source_attributes: {}
+    presence_polarity: present
+    observability_policy: reliable_if_source_complete
+    action_eligible: false
+    reason_eligible: true
+    geometry_loss_type: curve_distance
   - name: right_lane_marking_visible
     type: curve
     num_prototypes: 3
@@ -169,6 +246,13 @@ factors:
     negative_policy: reliable_if_source_complete
     source_kind: grounded
     target_candidates: {actions: [], reasons: [15, 17, 18]}
+    visual_role: observable
+    source_attributes: {}
+    presence_polarity: present
+    observability_policy: reliable_if_source_complete
+    action_eligible: false
+    reason_eligible: true
+    geometry_loss_type: curve_distance
   - name: left_solid_boundary_visible
     type: curve
     num_prototypes: 3
@@ -183,6 +267,13 @@ factors:
     negative_policy: reliable_if_attribute_complete
     source_kind: grounded
     target_candidates: {actions: [left], reasons: [9, 11]}
+    visual_role: observable
+    source_attributes: {laneStyle: solid}
+    presence_polarity: present
+    observability_policy: reliable_if_attribute_complete
+    action_eligible: true
+    reason_eligible: true
+    geometry_loss_type: curve_distance
   - name: right_solid_boundary_visible
     type: curve
     num_prototypes: 3
@@ -197,6 +288,13 @@ factors:
     negative_policy: reliable_if_attribute_complete
     source_kind: grounded
     target_candidates: {actions: [right], reasons: [15, 17]}
+    visual_role: observable
+    source_attributes: {laneStyle: solid}
+    presence_polarity: present
+    observability_policy: reliable_if_attribute_complete
+    action_eligible: true
+    reason_eligible: true
+    geometry_loss_type: curve_distance
   - name: left_turn_marking_visible
     type: curve
     num_prototypes: 3
@@ -204,13 +302,22 @@ factors:
     mirror_of: right_turn_marking_visible
     contradicts: []
     positive_reason_anchors: [12]
-    grounding_sources: [lane_polyline]
-    role: observable
-    visual_sources: [lane_polyline]
-    attribute_constraints: {laneDirection: left}
-    negative_policy: reliable_if_attribute_complete
-    source_kind: grounded
-    target_candidates: {actions: [left], reasons: [12]}
+    # BDD100K has no left/right turn-marking annotation. Retain only as a
+    # latent/direct-reason cue; it is never visual-certified or action-owned.
+    grounding_sources: [image_only]
+    role: latent_only
+    visual_sources: [image_only]
+    attribute_constraints: {}
+    negative_policy: unknown_without_direct_visual_evidence
+    source_kind: image_only
+    target_candidates: {actions: [], reasons: [12]}
+    visual_role: latent_only
+    source_attributes: {}
+    presence_polarity: present
+    observability_policy: unknown_without_direct_visual_evidence
+    action_eligible: false
+    reason_eligible: true
+    geometry_loss_type: curve_distance
   - name: right_turn_marking_visible
     type: curve
     num_prototypes: 3
@@ -218,13 +325,21 @@ factors:
     mirror_of: left_turn_marking_visible
     contradicts: []
     positive_reason_anchors: [18]
-    grounding_sources: [lane_polyline]
-    role: observable
-    visual_sources: [lane_polyline]
-    attribute_constraints: {laneDirection: right}
-    negative_policy: reliable_if_attribute_complete
-    source_kind: grounded
-    target_candidates: {actions: [right], reasons: [18]}
+    # See the symmetric left factor: do not invent unsupported laneDirection.
+    grounding_sources: [image_only]
+    role: latent_only
+    visual_sources: [image_only]
+    attribute_constraints: {}
+    negative_policy: unknown_without_direct_visual_evidence
+    source_kind: image_only
+    target_candidates: {actions: [], reasons: [18]}
+    visual_role: latent_only
+    source_attributes: {}
+    presence_polarity: present
+    observability_policy: unknown_without_direct_visual_evidence
+    action_eligible: false
+    reason_eligible: true
+    geometry_loss_type: curve_distance
   - name: center_drivable_region_visible
     type: region
     num_prototypes: 3
@@ -239,6 +354,13 @@ factors:
     negative_policy: reliable_if_source_complete
     source_kind: grounded
     target_candidates: {actions: [forward], reasons: [2]}
+    visual_role: observable
+    source_attributes: {areaType: direct}
+    presence_polarity: present
+    observability_policy: reliable_if_source_complete
+    action_eligible: true
+    reason_eligible: true
+    geometry_loss_type: object_region_dice
   - name: left_drivable_region_visible
     type: region
     num_prototypes: 3
@@ -253,6 +375,13 @@ factors:
     negative_policy: reliable_if_source_complete
     source_kind: grounded
     target_candidates: {actions: [left], reasons: [9, 12]}
+    visual_role: observable
+    source_attributes: {areaType: direct}
+    presence_polarity: present
+    observability_policy: reliable_if_source_complete
+    action_eligible: true
+    reason_eligible: true
+    geometry_loss_type: object_region_dice
   - name: right_drivable_region_visible
     type: region
     num_prototypes: 3
@@ -267,6 +396,13 @@ factors:
     negative_policy: reliable_if_source_complete
     source_kind: grounded
     target_candidates: {actions: [right], reasons: [15, 18]}
+    visual_role: observable
+    source_attributes: {areaType: direct}
+    presence_polarity: present
+    observability_policy: reliable_if_source_complete
+    action_eligible: true
+    reason_eligible: true
+    geometry_loss_type: object_region_dice
   - name: center_corridor_occupied
     type: region
     num_prototypes: 4
@@ -281,6 +417,13 @@ factors:
     negative_policy: reliable_if_source_complete
     source_kind: grounded
     target_candidates: {actions: [forward, stop], reasons: [2, 8]}
+    visual_role: observable
+    source_attributes: {}
+    presence_polarity: present
+    observability_policy: reliable_if_source_complete
+    action_eligible: true
+    reason_eligible: true
+    geometry_loss_type: object_region_dice
   - name: left_corridor_occupied
     type: region
     num_prototypes: 3
@@ -295,6 +438,13 @@ factors:
     negative_policy: reliable_if_source_complete
     source_kind: grounded
     target_candidates: {actions: [left], reasons: [10]}
+    visual_role: observable
+    source_attributes: {}
+    presence_polarity: present
+    observability_policy: reliable_if_source_complete
+    action_eligible: true
+    reason_eligible: true
+    geometry_loss_type: object_region_dice
   - name: right_corridor_occupied
     type: region
     num_prototypes: 3
@@ -309,6 +459,13 @@ factors:
     negative_policy: reliable_if_source_complete
     source_kind: grounded
     target_candidates: {actions: [right], reasons: [16]}
+    visual_role: observable
+    source_attributes: {}
+    presence_polarity: present
+    observability_policy: reliable_if_source_complete
+    action_eligible: true
+    reason_eligible: true
+    geometry_loss_type: object_region_dice
   - name: front_vehicle_left_indicator_visible
     type: object
     num_prototypes: 3
@@ -323,6 +480,13 @@ factors:
     negative_policy: unknown_without_direct_visual_evidence
     source_kind: image_only
     target_candidates: {actions: [], reasons: [14, 20]}
+    visual_role: latent_only
+    source_attributes: {}
+    presence_polarity: present
+    observability_policy: unknown_without_direct_visual_evidence
+    action_eligible: false
+    reason_eligible: true
+    geometry_loss_type: object_region_dice
   - name: front_vehicle_right_indicator_visible
     type: object
     num_prototypes: 3
@@ -337,3 +501,10 @@ factors:
     negative_policy: unknown_without_direct_visual_evidence
     source_kind: image_only
     target_candidates: {actions: [], reasons: [14, 20]}
+    visual_role: latent_only
+    source_attributes: {}
+    presence_polarity: present
+    observability_policy: unknown_without_direct_visual_evidence
+    action_eligible: false
+    reason_eligible: true
+    geometry_loss_type: object_region_dice

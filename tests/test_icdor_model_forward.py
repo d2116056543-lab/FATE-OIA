@@ -307,9 +307,14 @@ def test_batch_local_dino_reuse_is_exact_and_not_a_persistent_cache() -> None:
 
 def test_credibility_and_fine_transport_config_change_the_real_forward_path() -> None:
     config = load_config("configs/fate_oia_train_360x640_acpr_mosaic_trust_v3_icdor.yaml")
+    config["model"]["action_route"].update(
+        {
+            "action_shadow_credibility_floor": 0.07,
+            "reason_semantic_credibility_floor": 0.19,
+        }
+    )
     config["credibility"].update(
         {
-            "observable_cV_min_for_admission": 0.73,
             "ema_decay": 0.61,
             "image_only_cap": 0.07,
             "unknown_cap": 0.0,
@@ -330,7 +335,8 @@ def test_credibility_and_fine_transport_config_change_the_real_forward_path() ->
     model = build_icdor_model(config, use_mock_dino=True, mock_dim=32)
 
     assert model.credibility_independent_of_reason_labels is True
-    assert model.action_credibility_min_for_admission == 0.73
+    assert model.action_shadow_credibility_floor == 0.07
+    assert model.reason_semantic_credibility_floor == 0.19
     assert model.continuous_credibility.ema_decay == 0.61
     assert torch.isclose(model.continuous_credibility.factor_credibility_cap.max(), torch.tensor(1.0))
     assert model.factor_extractor.fine_transport_enabled is False

@@ -64,13 +64,13 @@ class MOSAICTrustICDORModel(nn.Module):
         content_temperature_init: float = 0.07,
         gate_init: float = 0.02,
         gate_max: float = 0.15,
-        shadow_credibility_floor: float = 0.05,
+        action_shadow_credibility_floor: float = 0.05,
+        reason_semantic_credibility_floor: float = 0.15,
         router_dustbin_init: float = -4.0,
         pi_min: float = 0.20,
         pi_max: float = 0.95,
         observed_mix_init: float = 0.05,
         credibility_independent_of_reason_labels: bool = True,
-        action_credibility_min_for_admission: float = 0.80,
         credibility_ema_decay: float = 0.90,
         credibility_image_only_cap: float = 0.10,
         credibility_unknown_cap: float = 0.0,
@@ -84,13 +84,13 @@ class MOSAICTrustICDORModel(nn.Module):
         super().__init__()
         if credibility_independent_of_reason_labels is not True:
             raise ValueError("CREDO visual credibility must remain independent of reason labels")
-        if not 0.0 <= float(action_credibility_min_for_admission) <= 1.0:
-            raise ValueError("action credibility admission minimum must be in [0,1]")
-        if not 0.0 < float(shadow_credibility_floor) <= 0.10:
-            raise ValueError("CREDO shadow credibility floor must be in (0, 0.10]")
+        if not 0.0 <= float(action_shadow_credibility_floor) <= 1.0:
+            raise ValueError("CREDO action shadow training-access floor must be in [0, 1]")
+        if not 0.0 <= float(reason_semantic_credibility_floor) <= 1.0:
+            raise ValueError("CREDO reason semantic training-access floor must be in [0, 1]")
         self.credibility_independent_of_reason_labels = True
-        self.action_credibility_min_for_admission = float(action_credibility_min_for_admission)
-        self.shadow_credibility_floor = float(shadow_credibility_floor)
+        self.action_shadow_credibility_floor = float(action_shadow_credibility_floor)
+        self.reason_semantic_credibility_floor = float(reason_semantic_credibility_floor)
         self.fine_transport_diagnostics = {
             "fine_off": bool(fine_off_diagnostic),
             "coarse_off": bool(coarse_off_diagnostic),
@@ -196,7 +196,17 @@ class MOSAICTrustICDORModel(nn.Module):
         self.register_buffer("factor_certificate_tier", torch.zeros(factor_count, dtype=torch.long), persistent=True)
         self.register_buffer("factor_certificate_reliability", torch.zeros(factor_count), persistent=True)
         self.register_buffer("reason_factor_route_enabled", torch.zeros(factor_count, dtype=torch.bool), persistent=True)
+        # PU recovery is admitted independently per reason. The latent core
+        # remains trained even while every entry here is false.
+        self.register_buffer("reason_pu_gate", torch.zeros(21, dtype=torch.bool), persistent=True)
         self.register_buffer("certificate_sha256_bytes", torch.zeros(32, dtype=torch.uint8), persistent=True)
+
+    @torch.no_grad()
+    def update_reason_pu_gate(self, gate: torch.Tensor) -> None:
+        """Install the train-audit-derived per-label PU admission gate."""
+        if gate.shape != (21,) or gate.dtype != torch.bool:
+            raise ValueError("IC-DOR reason PU gate must be bool [21]")
+        self.reason_pu_gate.copy_(gate.to(device=self.reason_pu_gate.device))
 
     @staticmethod
     def _features(pyramid: dict[str, torch.Tensor | tuple[int, int]]) -> dict[str, torch.Tensor]:
@@ -387,6 +397,12 @@ class MOSAICTrustICDORModel(nn.Module):
             prior_mode=prior_mode,
             query_permutation=query_permutation,
         )
+        # The V5 prior-gap objective compares the visual measurement against
+        # the extractor's own no-image branch while reusing this batch's DINO
+        # field and pyramid. It never becomes an action/reason input.
+        if return_diagnostics:
+            prior_factor_output = self.factor_extractor(factor_pyramid, prior_mode="prior_only")
+            factor_output["factor_prior_presence_logits"] = prior_factor_output["factor_presence_logits"]
         if factor_mask_mode == "fine":
             factor_output["factor_soft_masks"] = factor_output["factor_fine_masks"]
         elif factor_mask_mode == "coarse":
@@ -413,13 +429,20 @@ class MOSAICTrustICDORModel(nn.Module):
         credibility["cV"] = stored_credibility
         credibility["cV_ema"] = stored_credibility
         factor_output.update(credibility)
-        # cV from the preceding audit controls relative route strength. The
-        # small documented floor is learning access only: it keeps every
-        # shadow route trainable at epoch zero while final action remains
-        # visual-only until independent edge admission.
+        # Training access and deployment admission are deliberately distinct.
+        # These floors are only a learning-access interpolation prescribed by
+        # CREDO-MAP. They never enter the final-edge admission predicate, and
+        # raw cV remains exported unchanged for audit/calibration.
         continuous_route_weight = stored_credibility.detach().clamp(0.0, 1.0)
-        route_credibility = continuous_route_weight.clamp_min(self.shadow_credibility_floor)
-        factor_output["cV_route_effective"] = route_credibility
+        action_route_train_access = self.action_shadow_credibility_floor + (
+            1.0 - self.action_shadow_credibility_floor
+        ) * continuous_route_weight
+        reason_route_train_access = self.reason_semantic_credibility_floor + (
+            1.0 - self.reason_semantic_credibility_floor
+        ) * continuous_route_weight
+        factor_output["cV_route_effective"] = continuous_route_weight
+        factor_output["cV_action_shadow_training_access"] = action_route_train_access
+        factor_output["cV_reason_training_access"] = reason_route_train_access
         target_utility_state = self.target_utility()
         if factor_intervention_keep_mask is None:
             intervention_keep = images.new_ones(images.shape[0], self.factor_certificate_tier.numel())
@@ -490,7 +513,7 @@ class MOSAICTrustICDORModel(nn.Module):
             action_negative_evidence,
             action_output["action_queries"],
             route_mode=route_mode,
-            factor_credibility=route_credibility,
+            factor_credibility=action_route_train_access,
             factor_target_utility=target_utility_state["action_target_utility"],
         )
         reread_output = self.action_rereader(
@@ -550,15 +573,15 @@ class MOSAICTrustICDORModel(nn.Module):
         action_final = compose_final_action_logits(action_output["action_visual_logits"], action_shadow, admitted)
         reason_visual = self.reason_visual_decoder(reason_pyramid)
         if reason_route_mode == "full":
-            reason_reliability = route_credibility
+            reason_reliability = reason_route_train_access
             reason_factor_features = factor_output["factor_features"] * reason_reliability.unsqueeze(-1)
             reason_factor_masks = factor_output["factor_soft_masks"] * reason_reliability.unsqueeze(-1).unsqueeze(-1)
             reason_route_enabled = torch.ones_like(self.reason_factor_route_enabled)
-            reason_positive_evidence = factor_output["factor_positive_evidence"]
-            reason_negative_evidence = factor_output["factor_negative_evidence"]
+            reason_positive_evidence = factor_output["factor_positive_evidence"] * reason_reliability
+            reason_negative_evidence = factor_output["factor_negative_evidence"] * reason_reliability
             reason_sampling_coordinates = factor_output["sampling_coordinates"]
-            reason_sampled_features = factor_output["sampled_features"]
-            reason_sample_attention = factor_output["sample_attention"]
+            reason_sampled_features = factor_output["sampled_features"] * reason_reliability.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+            reason_sample_attention = factor_output["sample_attention"] * reason_reliability.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
         elif reason_route_mode == "off":
             reason_reliability = torch.zeros_like(continuous_route_weight)
             reason_factor_features = factor_output["factor_features"] * 0.0
@@ -606,6 +629,7 @@ class MOSAICTrustICDORModel(nn.Module):
             reason_visual["reason_visual_observed_logits"],
             observation["reason_observation_logits"],
             latent_enabled=latent_enabled,
+            route_mass=reason_latent["reason_route_mass"],
         )
         threshold = self.threshold_head(action_final, reason_observed["reason_observed_logits"])
         output: dict[str, torch.Tensor | dict[str, Any]] = {
@@ -634,6 +658,7 @@ class MOSAICTrustICDORModel(nn.Module):
             "factor_certificate_reliability": self.factor_certificate_reliability,
             "reason_factor_certificate_reliability_effective": reason_reliability,
             "reason_factor_route_enabled": self.reason_factor_route_enabled,
+            "reason_pu_gate": self.reason_pu_gate,
             "reason_factor_route_enabled_effective": reason_route_enabled,
             "reason_continuous_credibility": continuous_route_weight,
             "semantic_compatibility": target_utility_state["semantic_compatibility"],
@@ -657,7 +682,9 @@ class MOSAICTrustICDORModel(nn.Module):
                 factor_output["factor_positive_evidence"].roll(1, 1),
                 factor_output["factor_negative_evidence"].roll(1, 1),
                 action_output["action_queries"], route_mode=route_mode,
-                factor_credibility=credibility["cV"].roll(1, 1),
+                # Keep the shuffled control on the same V5 learning-access
+                # scale as the live action router. Raw cV is audit-only.
+                factor_credibility=action_route_train_access.roll(1, 1),
                 factor_target_utility=target_utility_state["action_target_utility"].roll(1, 0),
             )
             shuffled_read = self.action_rereader(
@@ -721,7 +748,7 @@ class MOSAICTrustICDORModel(nn.Module):
                 )
                 diagnostic_observed = self.reason_observed_mixer(
                     reason_visual["reason_visual_observed_logits"], diagnostic_observation["reason_observation_logits"],
-                    latent_enabled=latent_enabled,
+                    latent_enabled=latent_enabled, route_mass=diagnostic_latent["reason_route_mass"],
                 )
                 output[f"reason_observed_logits_route_{diagnostic_mode}"] = diagnostic_observed["reason_observed_logits"]
         if not return_masks:

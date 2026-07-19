@@ -5,7 +5,7 @@ import importlib
 import pytest
 
 
-def _foundation_ready() -> dict[str, object]:
+def _v5_ready() -> dict[str, object]:
     return {
         "continuous_credibility_available": True,
         "observable_cV_gt_030": 6,
@@ -36,51 +36,50 @@ def _calib_ready() -> dict[str, object]:
     return {"source_split": "train_calib", "finite": True}
 
 
-def test_adaptive_schedule_enforces_state_side_effects_and_two_epoch_readiness() -> None:
+def test_v5_schedule_starts_joint_shadow_and_promotes_only_after_eight_ready_epochs() -> None:
     module = importlib.import_module("fate_oia.engine.mosaic_icdor_adaptive_schedule")
     machine = module.ICDORAdaptiveSchedule(pilot=True)
-    assert machine.state == "FOUNDATION"
-    assert machine.LIMITS["FOUNDATION"] == (4, 8)
-    assert machine.LIMITS["CONSOLIDATION"] == (2, 3)
+    assert machine.state == "JOINT_SHADOW"
+    assert machine.LIMITS["JOINT_SHADOW"] == (8, 12)
+    assert machine.LIMITS["ADMISSION_CONSOLIDATION"] == (2, 2)
     policy = machine.policy()
     assert policy.route_mode == "shadow"
     assert policy.action_rank_weight == 0.10 and policy.reason_rank_weight == 0.05
-    # CREDO allows continuous evidence learning before a final certificate is
-    # built; a provisional certificate must never become a training entrance.
-    assert policy.write_provisional_certificate is False
-    for epoch in range(3):
+    assert machine.online_target_probe_due(epoch=0) is True
+    assert machine.full_target_audit_due(epoch=0) is True
+    for epoch in range(7):
         machine.update(
             epoch=epoch,
-            train_audit_metrics=_foundation_ready(),
+            train_audit_metrics=_v5_ready(),
             train_calib_metrics=_calib_ready(),
             train_core_metrics=_core_ready(),
         )
-    assert machine.state == "FOUNDATION"
+    assert machine.state == "JOINT_SHADOW"
     machine.update(
-        epoch=3,
-        train_audit_metrics=_foundation_ready(),
+        epoch=7,
+        train_audit_metrics=_v5_ready(),
         train_calib_metrics=_calib_ready(),
         train_core_metrics=_core_ready(),
     )
-    assert machine.state == "DUAL_REASON_SHADOW"
-    assert machine.policy().freeze_factor_and_prototypes is True
-    assert machine.policy().route_mode == "shadow"
+    assert machine.state == "ADMISSION_CONSOLIDATION"
+    assert machine.policy().freeze_certificate is True
+    assert machine.policy().route_mode == "admitted"
     with pytest.raises(ValueError, match="test"):
         machine.update(
             epoch=4,
-            train_audit_metrics=_foundation_ready(),
+                train_audit_metrics=_v5_ready(),
             train_calib_metrics=_calib_ready(),
             train_core_metrics=_core_ready(),
             test_metrics={},
         )
 
 
-def test_adaptive_schedule_keeps_shadow_learning_when_certificate_is_missing() -> None:
+def test_v5_schedule_does_not_block_learning_or_admission_on_a_global_certificate() -> None:
     module = importlib.import_module("fate_oia.engine.mosaic_icdor_adaptive_schedule")
     machine = module.ICDORAdaptiveSchedule(pilot=False)
-    bad = _foundation_ready()
+    bad = _v5_ready()
     bad["factor_audit_complete"] = False
-    for epoch in range(6):
+    for epoch in range(8):
         machine.update(
             epoch=epoch,
             train_audit_metrics=bad,
@@ -88,38 +87,37 @@ def test_adaptive_schedule_keeps_shadow_learning_when_certificate_is_missing() -
             train_core_metrics=_core_ready(),
         )
     assert machine.failed_closed is False
-    assert machine.full_train_eligible is False
-    assert machine.policy().route_mode == "shadow"
+    assert machine.state == "ADMISSION_CONSOLIDATION"
+    assert machine.policy().route_mode == "admitted"
 
 
-def test_adaptive_schedule_requires_finite_train_calib_for_transition() -> None:
+def test_v5_schedule_requires_finite_train_calib_before_route_admission() -> None:
     module = importlib.import_module("fate_oia.engine.mosaic_icdor_adaptive_schedule")
     machine = module.ICDORAdaptiveSchedule(pilot=True)
     bad_calib = {"source_split": "train_calib", "finite": False}
-    for epoch in range(6):
+    for epoch in range(8):
         machine.update(
             epoch=epoch,
-            train_audit_metrics=_foundation_ready(),
+            train_audit_metrics=_v5_ready(),
             train_calib_metrics=bad_calib,
             train_core_metrics=_core_ready(),
         )
-    assert machine.state == "FOUNDATION"
+    assert machine.state == "JOINT_SHADOW"
     assert machine.failed_closed is False
     assert machine.history[-1]["ready"] is False
     assert machine.policy().route_mode == "shadow"
 
 
-def test_foundation_cannot_transition_without_direct_path_stability_or_semantic_reachability() -> None:
+def test_v5_shadow_cannot_transition_without_exact_visual_action_contract() -> None:
     module = importlib.import_module("fate_oia.engine.mosaic_icdor_adaptive_schedule")
     machine = module.ICDORAdaptiveSchedule(pilot=True)
-    incomplete = _foundation_ready()
-    incomplete.pop("direct_reason_map")
-    incomplete["nonzero_semantic_reason_count"] = 9
-    for epoch in range(6):
+    incomplete = _v5_ready()
+    incomplete["final_action_visual_exact"] = False
+    for epoch in range(8):
         machine.update(
             epoch=epoch,
             train_audit_metrics=incomplete,
             train_calib_metrics=_calib_ready(),
             train_core_metrics=_core_ready(),
         )
-    assert machine.state == "FOUNDATION"
+    assert machine.state == "JOINT_SHADOW"

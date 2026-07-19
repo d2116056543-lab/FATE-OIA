@@ -13,18 +13,20 @@ def compose_final_action_logits(
 
 
 def partial_action_admission(
-    credibility: torch.Tensor,
     tet_lcb: torch.Tensor,
     tes_lcb: torch.Tensor,
     cca: torch.Tensor,
     visual_ap: torch.Tensor,
     edge_ap: torch.Tensor,
-    *,
-    credibility_min: float = 0.80,
 ) -> torch.Tensor:
-    values = (credibility, tet_lcb, tes_lcb, cca, visual_ap, edge_ap)
+    """Admit an action only from its independently measured edge effects.
+
+    Continuous visual credibility is an uncalibrated diagnostic score.  It is
+    intentionally excluded here: using one absolute cV threshold reintroduces
+    the CREDO-MAP cold start that target-effect interventions are meant to
+    remove.
+    """
+    values = (tet_lcb, tes_lcb, cca, visual_ap, edge_ap)
     if any(value.shape != (4,) for value in values):
         raise ValueError("partial action admission inputs must be [4]")
-    if not 0.0 <= float(credibility_min) <= 1.0:
-        raise ValueError("action credibility admission minimum must be in [0,1]")
-    return (credibility >= float(credibility_min)) & (tet_lcb > 0.0) & (tes_lcb > 0.0) & (cca >= 0.60) & (edge_ap >= visual_ap - 0.002)
+    return (tet_lcb > 0.0) & (tes_lcb > 0.0) & (cca >= 0.60) & (edge_ap >= visual_ap - 0.002)

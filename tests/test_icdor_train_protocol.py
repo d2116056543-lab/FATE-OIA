@@ -243,7 +243,7 @@ def test_formal_loss_surface_calls_factor_action_reason_and_preserves_firewalls(
     model = build_icdor_model(config, use_mock_dino=True, mock_dim=32)
     model.train()
     images = torch.randn(2, 3, 360, 640)
-    output = model(images, route_mode="off", latent_enabled=False, return_masks=True)
+    output = model(images, route_mode="off", latent_enabled=False, return_masks=True, return_diagnostics=True)
     second = {key: output[key] for key in ("factor_presence_prob", "factor_visibility_prob", "factor_soft_masks")}
     factor_count = len(model.ontology["factors"])
     observations = {

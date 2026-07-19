@@ -711,6 +711,13 @@ _ICDOR_REQUIRED_FACTOR_FIELDS = {
     "negative_policy",
     "source_kind",
     "target_candidates",
+    "visual_role",
+    "source_attributes",
+    "presence_polarity",
+    "observability_policy",
+    "action_eligible",
+    "reason_eligible",
+    "geometry_loss_type",
 }
 _ICDOR_OPTIONAL_FACTOR_FIELDS = {"observable"}
 _ICDOR_REASON_ROUTE_FIELDS = {
@@ -820,10 +827,19 @@ def load_icdor_ontology(config_root: str | Path) -> dict[str, Any]:
             raise ValueError(f"IC-DOR factor {name} visual_sources must exactly match grounding_sources")
         if factor["role"] not in {"observable", "reason_only", "latent_only"}:
             raise ValueError(f"IC-DOR factor {name} has an invalid CREDO role")
+        if factor["visual_role"] != factor["role"]:
+            raise ValueError(f"IC-DOR factor {name} visual_role must match its declared role")
         if factor["source_kind"] not in {"grounded", "image_only", "proxy"}:
             raise ValueError(f"IC-DOR factor {name} has an invalid source kind")
         if not isinstance(factor["attribute_constraints"], dict):
             raise ValueError(f"IC-DOR factor {name} attribute_constraints must be a mapping")
+        if (
+            not isinstance(factor["source_attributes"], dict)
+            or factor["source_attributes"] != factor["attribute_constraints"]
+        ):
+            raise ValueError(f"IC-DOR factor {name} source_attributes must exactly declare the grounding attributes")
+        if factor["presence_polarity"] != "present":
+            raise ValueError(f"IC-DOR factor {name} must declare positive factor presence explicitly")
         if factor["negative_policy"] not in {
             "reliable_if_source_complete",
             "reliable_if_attribute_complete",
@@ -832,6 +848,11 @@ def load_icdor_ontology(config_root: str | Path) -> dict[str, Any]:
             "unknown_without_direct_visual_evidence",
         }:
             raise ValueError(f"IC-DOR factor {name} has an invalid negative policy")
+        if factor["observability_policy"] != factor["negative_policy"]:
+            raise ValueError(f"IC-DOR factor {name} observability_policy must match negative_policy")
+        expected_geometry = "curve_distance" if factor["type"] == "curve" else "object_region_dice"
+        if factor["geometry_loss_type"] != expected_geometry:
+            raise ValueError(f"IC-DOR factor {name} geometry_loss_type does not match factor type")
         candidates = factor["target_candidates"]
         if not isinstance(candidates, dict) or set(candidates) != {"actions", "reasons"}:
             raise ValueError(f"IC-DOR factor {name} requires action/reason target candidates")
@@ -847,6 +868,16 @@ def load_icdor_ontology(config_root: str | Path) -> dict[str, Any]:
             or len(set(candidates["reasons"])) != len(candidates["reasons"])
         ):
             raise ValueError(f"IC-DOR factor {name} has invalid reason target candidates")
+        expected_action_eligible = (
+            bool(candidates["actions"])
+            and factor["role"] == "observable"
+            and factor["source_kind"] == "grounded"
+        )
+        if type(factor["action_eligible"]) is not bool or factor["action_eligible"] is not expected_action_eligible:
+            raise ValueError(f"IC-DOR factor {name} action_eligible does not match its grounding boundary")
+        expected_reason_eligible = bool(candidates["reasons"])
+        if type(factor["reason_eligible"]) is not bool or factor["reason_eligible"] is not expected_reason_eligible:
+            raise ValueError(f"IC-DOR factor {name} reason_eligible does not match its declared reason targets")
         factor_names.append(name)
     _require_unique_values(factor_names, "IC-DOR factor names must be unique")
     factor_name_set = set(factor_names)
@@ -880,6 +911,8 @@ def load_icdor_ontology(config_root: str | Path) -> dict[str, Any]:
                     raise ValueError("IC-DOR action route uses an unknown factor or polarity")
                 if action_name not in by_factor[factor_name]["target_candidates"]["actions"]:
                     raise ValueError("IC-DOR action route is not declared by the factor target candidates")
+                if by_factor[factor_name]["action_eligible"] is not True:
+                    raise ValueError("IC-DOR action route cannot use a non-eligible factor")
                 normalized_edges.append({"factor": factor_name, "polarity": polarity})
             normalized_action_routes[action_name][direction] = normalized_edges
 
@@ -903,6 +936,8 @@ def load_icdor_ontology(config_root: str | Path) -> dict[str, Any]:
             for factor_name in route[field]:
                 if reason_id not in by_factor[factor_name]["target_candidates"]["reasons"]:
                     raise ValueError("IC-DOR reason route is not declared by the factor target candidates")
+                if by_factor[factor_name]["reason_eligible"] is not True:
+                    raise ValueError("IC-DOR reason route cannot use a non-eligible factor")
         if type(route["escape_allowed"]) is not bool:
             raise ValueError(f"IC-DOR reason route {reason_id} escape_allowed must be boolean")
         if any("state" in name for name in route["latent_factors"]):

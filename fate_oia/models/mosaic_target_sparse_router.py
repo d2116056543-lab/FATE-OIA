@@ -92,7 +92,7 @@ class MOSAICTargetSparseRouter(nn.Module):
         target_utility: torch.Tensor | None,
         direction_index: int,
         active_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> dict[str, torch.Tensor]:
         evidence_by_edge = evidence.unsqueeze(-1) if evidence.ndim == 2 else evidence
         if evidence_by_edge.shape != factor_scores.shape:
             raise ValueError("IC-DOR route evidence must be [B,F] or [B,F,A]")
@@ -113,14 +113,46 @@ class MOSAICTargetSparseRouter(nn.Module):
         floor = torch.maximum(allowed_logits.amax(dim=1, keepdim=True), dustbin) - 100.0
         masked_logits = torch.where(active_mask.unsqueeze(0), finite_logits, floor)
         unconstrained = entmax15_bisect(torch.cat((masked_logits, dustbin), dim=1), dim=1)
-        factor_weights = torch.where(
+        relative = torch.where(
             active_mask.unsqueeze(0),
             unconstrained[:, : self.factor_count],
             torch.zeros_like(unconstrained[:, : self.factor_count]),
         )
-        # Any unused mass, including the hard-masked paths, belongs to dustbin.
-        dustbin_weight = 1.0 - factor_weights.sum(dim=1)
-        return factor_weights, dustbin_weight, masked_logits
+        # CREDO-MAP keeps two different objects: ``pi`` describes which factor
+        # owns an already available route, while ``m`` is the absolute visual
+        # evidence mass.  The old implementation exposed only ``relative``;
+        # normalising it in a rereader let zero-credibility routes create a
+        # generic target head through the query and centre sample.
+        raw_mass = relative.sum(dim=1)
+        has_visual_evidence = (
+            (evidence_by_edge.clamp_min(0.0) * active_mask.unsqueeze(0).to(evidence_by_edge.dtype))
+            .sum(dim=1)
+            > 1e-8
+        )
+        route_mass = raw_mass * has_visual_evidence.to(raw_mass.dtype)
+        route_distribution = relative / raw_mass.unsqueeze(1).clamp_min(1e-8)
+        route_distribution = route_distribution * has_visual_evidence.unsqueeze(1).to(route_distribution.dtype)
+        factor_weights = route_distribution * route_mass.unsqueeze(1)
+        # Preserve the exact invariant needed by downstream action/reason
+        # transport: no factor evidence means no correction, not a centre
+        # sample with a learned query bias.
+        zero_mass = ~has_visual_evidence
+        topk = min(2, self.factor_count)
+        _, topk_ids = route_distribution.transpose(1, 2).topk(topk, dim=-1)
+        topk_ids = torch.where(
+            zero_mass.unsqueeze(-1),
+            torch.full_like(topk_ids, -1),
+            topk_ids,
+        )
+        return {
+            "weights": factor_weights,
+            "distribution": route_distribution,
+            "mass": route_mass,
+            "dustbin": 1.0 - route_mass,
+            "masked_logits": masked_logits,
+            "topk_factor_ids": topk_ids,
+            "zero_mass_mask": zero_mass,
+        }
 
     def forward(
         self,
@@ -159,19 +191,31 @@ class MOSAICTargetSparseRouter(nn.Module):
             polarity[1, 0].unsqueeze(0) * factor_positive_evidence.detach().unsqueeze(-1)
             + polarity[1, 1].unsqueeze(0) * factor_negative_evidence.detach().unsqueeze(-1)
         )
-        support, support_dustbin, support_logits = self._route_one_direction(
+        support = self._route_one_direction(
             factor_scores, support_evidence, factor_credibility, factor_target_utility, 0, active[0]
         )
-        veto, veto_dustbin, veto_logits = self._route_one_direction(
+        veto = self._route_one_direction(
             factor_scores, veto_evidence, factor_credibility, factor_target_utility, 1, active[1]
         )
         return {
-            "support_weights": support,
-            "veto_weights": veto,
-            "support_dustbin": support_dustbin,
-            "veto_dustbin": veto_dustbin,
-            "support_route_logits": support_logits,
-            "veto_route_logits": veto_logits,
+            "support_weights": support["weights"],
+            "veto_weights": veto["weights"],
+            "support_route_distribution": support["distribution"],
+            "veto_route_distribution": veto["distribution"],
+            "support_route_mass": support["mass"],
+            "veto_route_mass": veto["mass"],
+            "support_dustbin": support["dustbin"],
+            "veto_dustbin": veto["dustbin"],
+            "support_route_logits": support["masked_logits"],
+            "veto_route_logits": veto["masked_logits"],
+            "support_topk_factor_ids": support["topk_factor_ids"],
+            "veto_topk_factor_ids": veto["topk_factor_ids"],
+            "support_zero_mass_mask": support["zero_mass_mask"],
+            "veto_zero_mass_mask": veto["zero_mass_mask"],
+            "route_distribution": torch.stack((support["distribution"], veto["distribution"]), dim=1),
+            "route_mass": torch.stack((support["mass"], veto["mass"]), dim=1),
+            "topk_factor_ids": torch.stack((support["topk_factor_ids"], veto["topk_factor_ids"]), dim=1),
+            "zero_mass_mask": torch.stack((support["zero_mass_mask"], veto["zero_mass_mask"]), dim=1),
             "active_edge_mask": active,
             "active_edge_polarity_mask": polarity,
             "support_route_evidence": support_evidence,

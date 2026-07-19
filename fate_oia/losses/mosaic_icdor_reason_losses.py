@@ -94,6 +94,42 @@ def reason_observed_losses(
     }
 
 
+def latent_reason_core_loss(
+    reason_logits_latent: torch.Tensor,
+    observed_reason_targets: torch.Tensor,
+    *,
+    pu_enabled: bool,
+    observed_valid_mask: torch.Tensor | None = None,
+    weak_negative_weight: float = 0.15,
+) -> torch.Tensor:
+    """Train the latent semantic route even when PU recovery is unavailable.
+
+    A zero BDD-OIA annotation remains a weak negative for this semantic core;
+    the optional PU branch may subsequently recover missing positives per
+    label, but a global failed hidden-label diagnostic must never silence this
+    owner entirely.
+    """
+    if reason_logits_latent.shape != observed_reason_targets.shape or reason_logits_latent.shape[-1] != 21:
+        raise ValueError("IC-DOR latent core loss requires matching [B,21] tensors")
+    valid = torch.ones_like(observed_reason_targets, dtype=torch.bool) if observed_valid_mask is None else observed_valid_mask
+    if valid.shape != observed_reason_targets.shape or valid.dtype != torch.bool:
+        raise ValueError("IC-DOR latent core valid mask must be bool [B,21]")
+    targets = observed_reason_targets.to(dtype=reason_logits_latent.dtype)
+    positive = targets * F.softplus(-reason_logits_latent)
+    negative = (1.0 - targets) * float(weak_negative_weight) * F.softplus(reason_logits_latent)
+    # The result deliberately does not depend on ``pu_enabled``.  Keep the
+    # argument in the public contract so artifacts can explicitly prove this.
+    del pu_enabled
+    return _per_label_balanced_asl(positive + negative, targets, valid)
+
+
+def build_per_label_pu_gate(hidden_recovery_margin: torch.Tensor, *, minimum_margin: float = 0.0) -> torch.Tensor:
+    """Admit PU recovery independently for each reason label."""
+    if hidden_recovery_margin.ndim != 1 or hidden_recovery_margin.numel() != 21:
+        raise ValueError("IC-DOR PU gate requires a [21] hidden-recovery margin")
+    return torch.isfinite(hidden_recovery_margin) & (hidden_recovery_margin > float(minimum_margin))
+
+
 def _posterior_rank_loss(logits: torch.Tensor, posterior: torch.Tensor, valid_mask: torch.Tensor, *, margin: float = 0.10) -> torch.Tensor:
     weights_positive = posterior.detach()
     weights_negative = 1.0 - posterior.detach()
@@ -122,6 +158,7 @@ def selective_observation_losses(
     escape_weight: torch.Tensor,
     synthetic_hidden_positive_mask: torch.Tensor | None = None,
     observed_valid_mask: torch.Tensor | None = None,
+    pu_gate: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     shapes = [observed_reason_targets, reason_observation_probability, posterior, reason_propensity, factor_route_support, escape_weight]
     if reason_logits_latent.ndim != 2 or reason_logits_latent.shape[-1] != 21 or any(value.shape != reason_logits_latent.shape for value in shapes):
@@ -131,6 +168,12 @@ def selective_observation_losses(
     valid = torch.ones_like(observed_reason_targets, dtype=torch.bool) if observed_valid_mask is None else observed_valid_mask
     if valid.shape != reason_logits_latent.shape or valid.dtype != torch.bool:
         raise ValueError("IC-DOR selective observation valid mask must be bool [B,21]")
+    if pu_gate is None:
+        pu_valid = valid
+    else:
+        if pu_gate.shape != (21,) or pu_gate.dtype != torch.bool:
+            raise ValueError("IC-DOR PU gate must be bool [21]")
+        pu_valid = valid & pu_gate.view(1, -1)
     target = observed_reason_targets.to(dtype=reason_logits_latent.dtype)
     observation_probability = reason_observation_probability.clamp(1e-6, 1.0 - 1e-6)
     # BCE on probabilities is unsafe under bf16 autocast. Prefer the model's
@@ -143,12 +186,15 @@ def selective_observation_losses(
     # Kept for call-site compatibility only. Hidden labels are audit targets, never training loss targets.
     if synthetic_hidden_positive_mask is not None and (synthetic_hidden_positive_mask.shape != reason_logits_latent.shape or synthetic_hidden_positive_mask.dtype != torch.bool):
         raise ValueError("IC-DOR synthetic hidden-positive mask must be bool [B,21]")
+    # Observation NLL trains the annotated branch, not hidden-positive recovery.
+    # A failed PU audit may disable posterior recovery per label, but must never
+    # erase supervision for labels that are actually observed in this batch.
     loss_nll = _masked_mean(F.binary_cross_entropy_with_logits(observation_logits, target, reduction="none"), valid)
-    loss_posterior = _masked_mean(F.binary_cross_entropy_with_logits(reason_logits_latent, posterior.detach(), reduction="none"), valid)
-    loss_rank = _posterior_rank_loss(reason_logits_latent, posterior, valid)
+    loss_posterior = _masked_mean(F.binary_cross_entropy_with_logits(reason_logits_latent, posterior.detach(), reduction="none"), pu_valid)
+    loss_rank = _posterior_rank_loss(reason_logits_latent, posterior, pu_valid)
     loss_factor_consistency = _masked_mean((torch.sigmoid(reason_logits_latent) - factor_route_support.detach()).square(), valid)
     loss_escape = _masked_mean(escape_weight, valid)
-    loss_propensity = _masked_mean((reason_propensity - 0.50).square(), valid)
+    loss_propensity = _masked_mean((reason_propensity - 0.50).square(), pu_valid)
     total = (
         0.30 * loss_nll
         + 0.30 * loss_posterior
@@ -165,4 +211,5 @@ def selective_observation_losses(
         "loss_reason_escape": loss_escape,
         "loss_reason_propensity": loss_propensity,
         "loss_reason_selective_total": total,
+        "pu_active_label_count": pu_valid.any(dim=0).to(dtype=reason_logits_latent.dtype).sum(),
     }

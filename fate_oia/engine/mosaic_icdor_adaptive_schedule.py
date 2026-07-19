@@ -5,7 +5,7 @@ from typing import Any
 
 from fate_oia.engine.mosaic_icdor_schedule import ICDORPhase
 
-STATES = ("FOUNDATION", "DUAL_REASON_SHADOW", "SAFE_JOINT", "CONSOLIDATION")
+STATES = ("JOINT_SHADOW", "ADMISSION_CONSOLIDATION")
 
 
 @dataclass(frozen=True)
@@ -30,24 +30,22 @@ class ICDORStatePolicy:
 
 
 POLICIES = {
-    # Regime A: all learning routes are active, but action shadow is not final.
-    # Continuous visual credibility grants learning access. A discrete
-    # certificate is a deployment claim and is therefore never built merely
-    # to unlock FOUNDATION or shadow learning.
-    "FOUNDATION": ICDORStatePolicy("shadow", 0.10, 0.05, 0.05),
-    "DUAL_REASON_SHADOW": ICDORStatePolicy(
-        "shadow", 0.10, 0.05, 0.05, freeze_factor_and_prototypes=True, freeze_certificate=True,
+    # V5 trains every representation owner from epoch zero.  Action remains
+    # visual-only in this regime, while shadow routes receive cheap target
+    # utility interventions every epoch and full audits every second epoch.
+    "JOINT_SHADOW": ICDORStatePolicy(
+        "shadow", 0.10, 0.05, 0.05,
         enable_interventions=True, enable_hidden_audit=True,
     ),
-    "SAFE_JOINT": ICDORStatePolicy(
-        "admitted", 0.10, 0.05, 0.05, freeze_factor_and_prototypes=True, freeze_certificate=True,
-        freeze_edge_admission=True, enable_interventions=True, enable_hidden_audit=True,
-        enable_pareto=True, route_is_final=True,
-    ),
-    "CONSOLIDATION": ICDORStatePolicy(
-        "admitted", 0.10, 0.05, 0.05, freeze_factor_and_prototypes=True, freeze_certificate=True,
-        freeze_edge_admission=True, freeze_propensity=True, enable_pareto=True, route_is_final=True,
-        decoder_router_lr_scale=0.2, route_cap_mutable=False, allow_new_losses=False,
+    # Deployment is an edge-level decision after representation learning; a
+    # failed edge leaves only that action visual-only rather than blocking all
+    # four actions behind a global factor credibility threshold.
+    "ADMISSION_CONSOLIDATION": ICDORStatePolicy(
+        "admitted", 0.10, 0.05, 0.05,
+        freeze_certificate=True, freeze_edge_admission=True, freeze_propensity=True,
+        enable_interventions=True, enable_hidden_audit=True, enable_pareto=True,
+        route_is_final=True, decoder_router_lr_scale=0.2, route_cap_mutable=False,
+        allow_new_losses=False,
     ),
 }
 
@@ -55,16 +53,11 @@ POLICIES = {
 class ICDORAdaptiveSchedule:
     """Continuous-access train-audit/train-calib state machine; test is forbidden."""
 
-    LIMITS = {
-        "FOUNDATION": (4, 8),
-        "DUAL_REASON_SHADOW": (2, 5),
-        "SAFE_JOINT": (4, 8),
-        "CONSOLIDATION": (2, 3),
-    }
+    LIMITS = {"JOINT_SHADOW": (8, 12), "ADMISSION_CONSOLIDATION": (2, 2)}
 
     def __init__(self, *, pilot: bool) -> None:
         self.pilot = bool(pilot)
-        self.state = "FOUNDATION"
+        self.state = "JOINT_SHADOW"
         self.state_epochs = 0
         self.consecutive_ready = 0
         self.no_improvement_epochs = 0
@@ -76,11 +69,26 @@ class ICDORAdaptiveSchedule:
         self.safe_joint_entry_exp_map: float | None = None
         self.last_readiness: dict[str, dict[str, Any]] = {}
         self.history: list[dict[str, Any]] = []
+        # PU is now a label-wise enhancement selected by posterior diagnostics.
+        # Preserve fields for checkpoint compatibility, but never use one
+        # global margin to disable latent semantic learning.
         self.pu_enabled = True
         self.pu_disable_reason: str | None = None
 
     def policy(self) -> ICDORStatePolicy:
         return POLICIES[self.state]
+
+    def online_target_probe_due(self, *, epoch: int) -> bool:
+        """Run the bounded target-utility probe from the first epoch onward."""
+        if epoch < 0:
+            raise ValueError("epoch must be non-negative")
+        return self.policy().enable_interventions
+
+    def full_target_audit_due(self, *, epoch: int, every_epochs: int = 2) -> bool:
+        """Run bootstrap-quality target interventions on a fixed two-epoch cadence."""
+        if epoch < 0 or every_epochs <= 0:
+            raise ValueError("epoch must be non-negative and every_epochs positive")
+        return self.policy().enable_interventions and epoch % every_epochs == 0
 
     def phase(self) -> ICDORPhase:
         """Translate the current adaptive state into the trainer's loss firewall."""
@@ -93,16 +101,18 @@ class ICDORAdaptiveSchedule:
             enable_posterior_ranking=policy.reason_rank_weight > 0.0,
             enable_pareto=policy.enable_pareto,
             freeze_factor_branch=policy.freeze_factor_and_prototypes,
-            pu_enabled=self.pu_enabled,
+            pu_enabled=True,
         )
 
     def set_pu_enabled(self, enabled: bool, *, reason: str | None = None) -> None:
-        self.pu_enabled = bool(enabled)
-        self.pu_disable_reason = None if enabled else (reason or "disabled_by_policy")
+        # V5 intentionally ignores global PU closure. Store only a diagnostic
+        # note; ``phase()`` still enables the latent core and per-label gate.
+        self.pu_enabled = True
+        self.pu_disable_reason = None if enabled else (reason or "labelwise_gate_required")
 
     def record_epoch_execution(self) -> None:
         """Track the state that actually controlled an optimizer epoch."""
-        if self.state == "SAFE_JOINT":
+        if self.state == "ADMISSION_CONSOLIDATION":
             self.safe_joint_epochs += 1
 
     def record_train_audit_reference(
@@ -134,55 +144,11 @@ class ICDORAdaptiveSchedule:
             return False
         return number == number and abs(number) != float("inf")
 
-    def _foundation_ready(self, metrics: dict[str, Any]) -> bool:
-        cV_count = int(metrics.get("observable_cV_gt_030", 0))
-        return (
-            metrics.get("continuous_credibility_available") is True
-            and cV_count >= 6
-            and metrics.get("diagnostics_finite") is True
-            and metrics.get("direct_action_map_stable_or_improving") is True
-            and metrics.get("direct_reason_map_stable_or_improving") is True
-            and float(metrics.get("mean_abs_cV_delta", float("inf"))) < 0.05
-            and int(metrics.get("nonzero_semantic_reason_count", 0)) >= 10
-            and 0.005 <= float(metrics.get("route_strength_ratio", -1.0)) <= 0.10
-            and metrics.get("final_action_visual_exact") is True
-        )
-
-    def _shadow_ready(self, metrics: dict[str, Any]) -> bool:
-        action_ap = metrics.get("action_shadow_ap_delta", [])
-        true_edges = metrics.get("true_edge_count_per_action", [])
-        minimum_actions = 2 if self.pilot else 3
-        hidden_margin = 0.01 if self.pilot else 0.02
-        return (
-            float(metrics.get("exp_map_delta_vs_visual", -1.0)) >= -0.005
-            and metrics.get("factor_shuffle_degrades_reason") is True
-            and float(metrics.get("hidden_recovery_margin", -1.0)) >= hidden_margin
-            and 0.01 <= float(metrics.get("route_strength_ratio", -1.0)) <= 0.15
-            and sum(float(value) >= -0.002 for value in action_ap) >= minimum_actions
-            and len(true_edges) == 4 and sum(int(value) >= 1 for value in true_edges) >= minimum_actions
-            and metrics.get("disallowed_route_invariance") is True
-        )
-
-    def _safe_ready(self, metrics: dict[str, Any]) -> bool:
-        action_ap = metrics.get("action_route_ap_delta", [])
-        return (
-            len(action_ap) == 4 and min(float(value) for value in action_ap) >= -0.002
-            and 0.02 <= float(metrics.get("route_strength_ratio", -1.0)) <= 0.15
-            and float(metrics.get("pareto_violation_rate", 1.0)) < 0.05
-            and float(metrics.get("exp_map_delta_vs_entry", -1.0)) >= 0.0
-            and float(metrics.get("tet_lcb95", 0.0)) > 0.0
-            and float(metrics.get("tes_lcb95", 0.0)) > 0.0
-            and float(metrics.get("cca", 0.0)) >= 0.60
-        )
-
     def _ready(self, metrics: dict[str, Any]) -> bool:
-        if self.state == "FOUNDATION":
-            return self._foundation_ready(metrics)
-        if self.state == "DUAL_REASON_SHADOW":
-            return self._shadow_ready(metrics)
-        if self.state == "SAFE_JOINT":
-            return self._safe_ready(metrics)
-        return True
+        # No cV-count or global-PU opening gate remains.  Transition only
+        # after a representation audit has produced finite edge evidence; the
+        # admission builder itself decides each action independently.
+        return metrics.get("diagnostics_finite") is True and metrics.get("final_action_visual_exact") is True
 
     @staticmethod
     def _split_ready(metrics: dict[str, Any], expected_split: str) -> bool:
@@ -249,15 +215,10 @@ class ICDORAdaptiveSchedule:
         self.consecutive_ready = self.consecutive_ready + 1 if ready else 0
         minimum, maximum = self.LIMITS[self.state]
 
-        if self.state == "SAFE_JOINT":
-            improved = bool(train_audit_metrics.get("train_audit_improved", False))
-            self.no_improvement_epochs = 0 if improved else self.no_improvement_epochs + 1
-            if self.state_epochs >= minimum and self.no_improvement_epochs >= 2:
-                self._transition()
-        elif self.state == "CONSOLIDATION":
+        if self.state == "ADMISSION_CONSOLIDATION":
             if self.state_epochs >= minimum:
                 self.full_train_eligible = True
-        elif self.state_epochs >= minimum and self.consecutive_ready >= 2:
+        elif self.state_epochs >= minimum and ready:
             self._transition()
 
         # Missing audit evidence may delay a transition, but never removes

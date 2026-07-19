@@ -133,7 +133,11 @@ def test_grounding_keeps_left_right_and_center_geometry_in_their_declared_corrid
         {
             "image_size": [100, 200],
             "objects": [{"category": "car", "box2d": {"x1": 150, "y1": 55, "x2": 190, "y2": 95}}],
-            "lanes": [{"category": "lane", "poly2d": [{"vertices": [[170, 20], [175, 90]]}]}],
+            "lanes": [{
+                "category": "lane",
+                "attributes": {"laneDirection": "parallel"},
+                "poly2d": [{"vertices": [[170, 20], [175, 90]]}],
+            }],
             "drivable_mask": right_only,
         },
     ], device=torch.device("cpu"), split="train")

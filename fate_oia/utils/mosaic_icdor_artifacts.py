@@ -501,7 +501,7 @@ def initialize_icdor_run_artifacts(
     _write_json(output / "factor_certificate.json", factor_certificate)
     _write_json(output / "edge_admission.json", edge_admission)
     _append_jsonl(output / "adaptive_schedule.jsonl", {
-        "event": "initialized", "state_after": "FOUNDATION", "state_epochs_after": 0,
+        "event": "initialized", "state_after": "JOINT_SHADOW", "state_epochs_after": 0,
         "source_splits": ["train_core", "audit_visual", "audit_target", "train_calib"],
     })
     return output
@@ -674,9 +674,9 @@ def validate_icdor_artifact_schema(
             errors.append(f"run_manifest.{key} must equal {expected!r}")
     if not manifest.get("git_head") or not manifest.get("pretrained_sha256"):
         errors.append("run_manifest must retain git_head and pretrained_sha256")
-    v4_run = manifest.get("credo_version") == "v4_credo"
+    v5_run = manifest.get("credo_version") == "v5_credo_map"
     split_manifest = json.loads((output / "split_manifest.json").read_text(encoding="utf-8"))
-    if v4_run:
+    if v5_run:
         all_names = split_manifest.get("file_names")
         visual_ids = split_manifest.get("audit_visual_indices")
         target_ids = split_manifest.get("audit_target_indices")
@@ -699,13 +699,13 @@ def validate_icdor_artifact_schema(
     certificate = json.loads((output / "factor_certificate.json").read_text(encoding="utf-8"))
     edge_admission = json.loads((output / "edge_admission.json").read_text(encoding="utf-8"))
     pilot_run = manifest.get("pilot") is True
-    expected_certificate_source = "audit_visual" if v4_run else "train_audit"
-    expected_edge_source = "audit_target" if v4_run else "train_audit"
+    expected_certificate_source = "audit_visual"
+    expected_edge_source = "audit_target"
     certificate_pending = certificate.get("status") == "pending"
     edge_pending = edge_admission.get("status") == "pending"
     if (
-        (not (v4_run and pilot_run and certificate_pending) and certificate.get("source_split") != expected_certificate_source)
-        or (not (v4_run and pilot_run and edge_pending) and edge_admission.get("source_split") != expected_edge_source)
+        (not (v5_run and pilot_run and certificate_pending) and certificate.get("source_split") != expected_certificate_source)
+        or (not (v5_run and pilot_run and edge_pending) and edge_admission.get("source_split") != expected_edge_source)
     ):
         errors.append("certificate/edge admission provenance does not match the run version")
     for name, entry in (edge_admission.get("entries") or {}).items():
@@ -734,13 +734,13 @@ def validate_icdor_artifact_schema(
         if branch.get("available") is not True:
             errors.append(f"epoch_{epoch:03d} branch metrics are unavailable")
         mechanism = json.loads((epoch_dir / "mechanism_summary.json").read_text(encoding="utf-8"))
-        if v4_run and not _mechanism_summary_valid(mechanism):
+        if v5_run and not _mechanism_summary_valid(mechanism):
             errors.append(f"epoch_{epoch:03d} mechanism summary is incomplete or changes CREDO semantics")
         calibration_rows = _read_jsonl(epoch_dir / "calibration_stats.jsonl")
         if any(row.get("source_split") != "train_calib" for row in calibration_rows):
             errors.append(f"epoch_{epoch:03d} calibration uses a non-train_calib source")
         reason_rows = _read_jsonl(epoch_dir / "reason_dual_observation_stats.jsonl")
-        if v4_run:
+        if v5_run:
             test_reason_rows = [
                 row for row in reason_rows
                 if row.get("split") == "test" and isinstance(row.get("reason_id"), int)
@@ -772,7 +772,7 @@ def validate_icdor_artifact_schema(
         hidden_grid = {
             (row.get("mode"), float(row.get("hide_fraction", -1.0)))
             for row in hidden_rows
-            if row.get("source_split") == ("audit_target" if v4_run else "train_audit") and row.get("evaluation_only") is True
+            if row.get("source_split") == "audit_target" and row.get("evaluation_only") is True
         }
         expected_hidden_grid = {
             (mode, fraction)
@@ -785,41 +785,37 @@ def validate_icdor_artifact_schema(
         transfer_rows = _read_jsonl(epoch_dir / "target_transfer_stats.jsonl")
         transfer_fields = {"factor_id", "target_id", "tet", "tes", "cca", "ap_delta"}
         state_before = schedule_by_epoch.get(epoch, {}).get("state_before")
-        if state_before == "FOUNDATION":
-            if (
-                transfer.get("available") is not False
-                or transfer.get("source_split") != ("audit_target" if v4_run else "train_audit")
-                or transfer.get("reason") != "interventions_disabled_in_foundation"
-                or len(transfer_rows) != 1
-                or transfer_rows[0].get("available") is not False
-            ):
-                errors.append(f"epoch_{epoch:03d} foundation target transfer did not abstain honestly")
-        else:
-            if (
-                transfer.get("available") is not True
-                or transfer.get("source_split") != ("audit_target" if v4_run else "train_audit")
-                or transfer.get("schema_version") != "mosaic_target_transfer.v2"
-                or int(transfer.get("pair_count", transfer.get("target_count", 0))) <= 0
-            ):
-                errors.append(f"epoch_{epoch:03d} target transfer is unavailable or not a real train_audit measurement")
-            if not transfer_rows or any(
-                row.get("available") is not True
-                or row.get("source_split") != ("audit_target" if v4_run else "train_audit")
-                or not transfer_fields <= set(row)
-                or row.get("tes_identity") is None
-                or row.get("tes_spatial") is None
-                or not _matched_control_provenance_valid(row.get("matched_control_arms"))
-                for row in transfer_rows
-            ):
-                errors.append(f"epoch_{epoch:03d} target transfer rows are incomplete")
+        if state_before not in {"JOINT_SHADOW", "ADMISSION_CONSOLIDATION"}:
+            errors.append(f"epoch_{epoch:03d} has an invalid V5 schedule state")
+        # V5 runs an online target probe from epoch zero. A full audit is an
+        # additional cadence, never a reason to emit a fake unavailable row.
+        if (
+            transfer.get("available") is not True
+            or transfer.get("source_split") != "audit_target"
+            or transfer.get("schema_version") != "mosaic_target_transfer.v2"
+            or int(transfer.get("pair_count", transfer.get("target_count", 0))) <= 0
+            or transfer.get("audit_level") not in {"online", "full"}
+        ):
+            errors.append(f"epoch_{epoch:03d} V5 online target transfer is unavailable or lacks audit provenance")
+        if not transfer_rows or any(
+            row.get("available") is not True
+            or row.get("source_split") != "audit_target"
+            or row.get("audit_level") not in {"online", "full"}
+            or not transfer_fields <= set(row)
+            or row.get("tes_identity") is None
+            or row.get("tes_spatial") is None
+            or not _matched_control_provenance_valid(row.get("matched_control_arms"))
+            for row in transfer_rows
+        ):
+            errors.append(f"epoch_{epoch:03d} V5 target transfer rows are incomplete")
         visual_credibility = json.loads((epoch_dir / "visual_credibility.json").read_text(encoding="utf-8"))
-        if v4_run and (
+        if v5_run and (
             visual_credibility.get("source_split") != "audit_visual"
             or not isinstance(visual_credibility.get("credibility"), list)
         ):
             errors.append(f"epoch_{epoch:03d} visual credibility lacks audit_visual provenance")
         factor_audit = json.loads((epoch_dir / "factor_audit.json").read_text(encoding="utf-8"))
-        if v4_run:
+        if v5_run:
             factor_stats = factor_audit.get("factor_stats")
             required_factor_sections = {"counts", "scores", "prototype", "bootstrap_lcb95"}
             if (
@@ -834,12 +830,14 @@ def validate_icdor_artifact_schema(
                 errors.append(f"epoch_{epoch:03d} factor audit lacks source-count and content/prior evidence")
         semantic = json.loads((epoch_dir / "semantic_compatibility.json").read_text(encoding="utf-8"))
         utility = json.loads((epoch_dir / "target_utility.json").read_text(encoding="utf-8"))
-        if v4_run and state_before != "FOUNDATION":
+        if v5_run:
             if (
                 semantic.get("source_split") != "audit_target"
                 or utility.get("source_split") != "audit_target"
                 or semantic.get("available") is not True
                 or utility.get("available") is not True
+                or semantic.get("audit_level") not in {"online", "full"}
+                or utility.get("audit_level") not in {"online", "full"}
                 or not isinstance(semantic.get("semantic_compatibility"), list)
                 or not isinstance(utility.get("action_target_utility"), list)
             ):
@@ -847,7 +845,7 @@ def validate_icdor_artifact_schema(
         visual = json.loads((epoch_dir / "visual_audit_manifest.json").read_text(encoding="utf-8"))
         samples = visual.get("samples")
         if (
-            visual.get("source_split") != ("audit_visual" if v4_run else "train_audit")
+            visual.get("source_split") != "audit_visual"
             or visual.get("matched_random_control") != "same_factor_equal_mass_spatial_roll"
             or int(visual.get("sample_count", 0)) <= 0
             or not isinstance(samples, list)
@@ -886,7 +884,7 @@ def validate_icdor_artifact_schema(
         if (
             not gradient_rows
             or any(not required_gradient_fields <= set(row) or row.get("finite") is not True for row in gradient_rows)
-            or (v4_run and not _gradient_firewall_rows_valid(gradient_rows))
+            or (v5_run and not _gradient_firewall_rows_valid(gradient_rows))
         ):
             errors.append(f"epoch_{epoch:03d} gradient ownership audit is incomplete")
         names = json.loads((epoch_dir / "logits" / "file_names.json").read_text(encoding="utf-8"))
@@ -899,9 +897,9 @@ def validate_icdor_artifact_schema(
             elif tensor.shape[0] != len(names):
                 errors.append(f"epoch_{epoch:03d}/{name} does not align with file_names")
 
-        # v4 diagnostics are semantic contracts, not merely non-empty files.
+        # V5 diagnostics are semantic contracts, not merely non-empty files.
         credibility_rows = _read_jsonl(epoch_dir / "credibility_stats.jsonl")
-        if v4_run and (not credibility_rows or any(
+        if v5_run and (not credibility_rows or any(
             row.get("split") != "test"
             or not isinstance(row.get("factor_id"), int)
             or any(
@@ -917,7 +915,7 @@ def validate_icdor_artifact_schema(
         )):
             errors.append(f"epoch_{epoch:03d} credibility_stats lacks finite bounded cV rows")
         fine_rows = _read_jsonl(epoch_dir / "fine_transport_stats.jsonl")
-        if v4_run and (not fine_rows or any(
+        if v5_run and (not fine_rows or any(
             row.get("split") != "test"
             or row.get("typed_coordinates_present") is not True
             or not all(
@@ -933,9 +931,9 @@ def validate_icdor_artifact_schema(
         ) or not any(float(row.get("fine_mask_delta_mean", 0.0)) > 1e-8 for row in fine_rows)):
             errors.append(f"epoch_{epoch:03d} fine_transport_stats does not prove typed fine evidence differs from coarse")
         route_rows = _read_jsonl(epoch_dir / "route_ownership.jsonl")
-        if v4_run and (not route_rows or not any(row.get("summary") == "per_action_route_effect" for row in route_rows)):
+        if v5_run and (not route_rows or not any(row.get("summary") == "per_action_route_effect" for row in route_rows)):
             errors.append(f"epoch_{epoch:03d} route_ownership lacks per-action ownership diagnostics")
-        if v4_run:
+        if v5_run:
             for row in route_rows:
                 if row.get("route_mode") == "shadow" and row.get("action_final_visual_equal") is not True:
                     errors.append(f"epoch_{epoch:03d} shadow route changed final action before admission")

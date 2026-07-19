@@ -141,6 +141,14 @@ class MOSAICMaskedTargetRereader(nn.Module):
                 "action_route_gate_cap": self.active_gate_cap.clone(),
                 "action_typed_target_coordinates": support_typed["target_coordinates"],
                 "action_typed_local_offsets": support_typed["target_local_offsets"],
+                "action_support_route_mass": support_typed["route_mass"],
+                "action_veto_route_mass": veto_typed["route_mass"],
+                "action_support_topk_factor_ids": support_typed["topk_factor_ids"],
+                "action_veto_topk_factor_ids": veto_typed["topk_factor_ids"],
+                "action_support_slot_coordinates": support_typed["slot_coordinates"],
+                "action_veto_slot_coordinates": veto_typed["slot_coordinates"],
+                "action_support_zero_mass_mask": support_typed["zero_mass_mask"],
+                "action_veto_zero_mass_mask": veto_typed["zero_mass_mask"],
             }
         support_mask = torch.einsum("bfa,bfhw->bahw", support_weights, factor_masks.detach())
         veto_mask = torch.einsum("bfa,bfhw->bahw", veto_weights, factor_masks.detach())
@@ -165,4 +173,8 @@ class MOSAICMaskedTargetRereader(nn.Module):
             "action_support_gate": support_gate.expand(high.shape[0], -1),
             "action_veto_gate": veto_gate.expand(high.shape[0], -1),
             "action_route_gate_cap": self.active_gate_cap.clone(),
+            "action_support_route_mass": support_weights.sum(dim=1),
+            "action_veto_route_mass": veto_weights.sum(dim=1),
+            "action_support_zero_mass_mask": support_weights.sum(dim=1) <= 1e-8,
+            "action_veto_zero_mass_mask": veto_weights.sum(dim=1) <= 1e-8,
         }

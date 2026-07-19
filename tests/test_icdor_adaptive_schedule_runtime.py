@@ -74,14 +74,11 @@ def test_legacy_frozen_dino_vproj_checkpoint_keys_are_the_only_ignored_keys() ->
 
 def test_runtime_phase_comes_from_adaptive_state_not_epoch() -> None:
     schedule = ICDORAdaptiveSchedule(pilot=False)
-    # CREDO grants shadow-learning access from FOUNDATION. Discrete evidence
+    # V5 grants shadow-learning access from JOINT_SHADOW. Discrete evidence
     # admission only controls the final action route.
     assert _adaptive_phase(schedule).route_mode == "shadow"
 
-    schedule.state = "DUAL_REASON_SHADOW"
-    assert _adaptive_phase(schedule).route_mode == "shadow"
-
-    schedule.state = "SAFE_JOINT"
+    schedule.state = "ADMISSION_CONSOLIDATION"
     assert _adaptive_phase(schedule).route_mode == "admitted"
 
     source = Path("fate_oia/engine/train_acpr_mosaic_trust_icdor.py").read_text(encoding="utf-8")
@@ -97,9 +94,9 @@ def test_runtime_checkpoint_restores_adaptive_state_and_evidence_hashes(tmp_path
     action_queue, reason_queue, observed_reason_queue = _build_rank_queues(capacity=8, device=torch.device("cpu"))
     pareto = MOSAICActionParetoAdmission()
     schedule = ICDORAdaptiveSchedule(pilot=True)
-    schedule.state = "SAFE_JOINT"
+    schedule.state = "ADMISSION_CONSOLIDATION"
     schedule.state_epochs = 3
-    schedule.history.append({"epoch": 5, "state_after": "SAFE_JOINT"})
+    schedule.history.append({"epoch": 5, "state_after": "ADMISSION_CONSOLIDATION"})
     path = tmp_path / "checkpoint.pth"
     (tmp_path / "certificate.json").write_text(json.dumps({"sha256": "CERT"}), encoding="utf-8")
     (tmp_path / "edge.json").write_text(json.dumps({"sha256": "EDGE", "entries": {}}), encoding="utf-8")
@@ -111,7 +108,7 @@ def test_runtime_checkpoint_restores_adaptive_state_and_evidence_hashes(tmp_path
         observed_reason_queue=observed_reason_queue, pareto=pareto,
         adaptive_schedule=schedule,
     )
-    schedule.state = "FOUNDATION"
+    schedule.state = "JOINT_SHADOW"
     schedule.state_epochs = 0
 
     result = _load_resume(
@@ -123,9 +120,9 @@ def test_runtime_checkpoint_restores_adaptive_state_and_evidence_hashes(tmp_path
     )
 
     assert result == (6, 0.5, "CERT", "EDGE")
-    assert schedule.state == "SAFE_JOINT"
+    assert schedule.state == "ADMISSION_CONSOLIDATION"
     assert schedule.state_epochs == 3
-    assert schedule.history[-1]["state_after"] == "SAFE_JOINT"
+    assert schedule.history[-1]["state_after"] == "ADMISSION_CONSOLIDATION"
 
 
 def test_runtime_artifact_requires_train_only_transition_provenance(tmp_path: Path) -> None:
@@ -138,8 +135,8 @@ def test_runtime_artifact_requires_train_only_transition_provenance(tmp_path: Pa
     )
     row = {
         "epoch": 3,
-        "state_before": "FOUNDATION",
-        "state_after": "DUAL_REASON_SHADOW",
+        "state_before": "JOINT_SHADOW",
+        "state_after": "ADMISSION_CONSOLIDATION",
         "state_epochs_before": 3,
         "state_epochs_after": 0,
         "ready": True,
@@ -155,7 +152,7 @@ def test_runtime_artifact_requires_train_only_transition_provenance(tmp_path: Pa
     path = write_icdor_adaptive_schedule_transition(tmp_path, row)
 
     persisted = json.loads(path.read_text(encoding="utf-8").splitlines()[-1])
-    assert persisted["state_after"] == "DUAL_REASON_SHADOW"
+    assert persisted["state_after"] == "ADMISSION_CONSOLIDATION"
     assert persisted["certificate_sha256"] == "CERT"
 
     row["readiness"]["train_audit"]["source_split"] = "test"

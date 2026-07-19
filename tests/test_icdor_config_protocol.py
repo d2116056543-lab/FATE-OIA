@@ -37,9 +37,21 @@ def test_icdor_config_uses_three_isolated_lanes_and_no_legacy_state_action_path(
     assert config["loss"]["policy"]["reason_posterior_rank"] == 0.05
     assert config["loss"]["action_route"]["shadow_asl_weight"] == 0.50
     assert config["loss"]["action_route"]["intervention_weight"] == 0.10
-    assert config["loss"]["factor"]["visibility_weight"] == 0.50
-    assert config["loss"]["factor"]["selective_contrastive_weight"] == 0.05
-    assert config["loss"]["factor"]["positive_anchor_weight"] == 0.00
+    assert config["model"]["action_route"]["action_shadow_credibility_floor"] == 0.05
+    assert config["model"]["action_route"]["reason_semantic_credibility_floor"] == 0.15
+    assert config["loss"]["factor"] == {
+        "balanced_presence_weight": 1.00,
+        "visibility_weight": 0.50,
+        "geometry_weight": 0.15,
+        "query_identity_weight": 0.10,
+        "image_identity_weight": 0.10,
+        "prior_gap_weight": 0.05,
+        "matched_grounding_weight": 0.05,
+        "view_weight": 0.03,
+        "prototype_weight": 0.01,
+    }
+    assert config["loss"]["reason"]["latent_core_weight"] == 0.30
+    assert config["loss"]["reason"]["latent_weak_negative_weight"] == 0.15
     assert config["loss"]["reason"]["factor_latent_consistency_weight"] == 0.02
     assert config["loss"]["reason"]["escape_token_weight"] == 0.005
     assert config["edge_admission"]["audit_refresh_epochs"] == 2

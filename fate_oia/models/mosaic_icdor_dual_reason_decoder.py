@@ -192,12 +192,22 @@ class MOSAICICDORLatentReasonDecoder(nn.Module):
         unconstrained = entmax15_bisect(
             torch.cat((masked_scores, escape_scores), dim=-1), dim=-1
         )
-        factor_weights = torch.where(
+        relative_weights = torch.where(
             allowed.unsqueeze(0),
             unconstrained[:, :, :factor_count],
             torch.zeros_like(unconstrained[:, :, :factor_count]),
         )
-        escape_weight = 1.0 - factor_weights.sum(dim=-1, keepdim=True)
+        raw_mass = relative_weights.sum(dim=-1, keepdim=True)
+        has_evidence = (
+            (route_evidence.clamp_min(0.0) * allowed.unsqueeze(0).to(route_evidence.dtype))
+            .sum(dim=-1, keepdim=True)
+            > 1e-8
+        )
+        route_mass = raw_mass * has_evidence.to(raw_mass.dtype)
+        route_distribution = relative_weights / raw_mass.clamp_min(1e-8)
+        route_distribution = route_distribution * has_evidence.to(route_distribution.dtype)
+        factor_weights = route_distribution * route_mass
+        escape_weight = 1.0 - route_mass
         semantic = torch.einsum("brf,bfd->brd", factor_weights * route_evidence, route_features)
         typed_nodes = torch.zeros_like(semantic)
         if sampling_coordinates is not None or sampled_features is not None or sample_attention is not None:
@@ -211,8 +221,7 @@ class MOSAICICDORLatentReasonDecoder(nn.Module):
                 sample_attention.detach(),
                 factor_weights.transpose(1, 2).detach(),
             )
-            typed_active = factor_weights.sum(dim=-1, keepdim=True).detach()
-            typed_nodes = typed["target_nodes"] * typed_active
+            typed_nodes = typed["target_nodes"]
         typed_gain = self.typed_transport_gain.clamp(0.0, 0.25)
         semantic = self.semantic_norm(
             semantic + escape_weight * self.escape_tokens.unsqueeze(0) + typed_gain * typed_nodes
@@ -226,6 +235,9 @@ class MOSAICICDORLatentReasonDecoder(nn.Module):
             "reason_logits_latent": latent_logits,
             "reason_nodes_latent": semantic,
             "reason_factor_router_weights": factor_weights,
+            "reason_factor_route_distribution": route_distribution,
+            "reason_route_mass": route_mass.squeeze(-1),
+            "reason_zero_mass_mask": ~has_evidence.squeeze(-1),
             "reason_escape_weight": escape_weight.squeeze(-1),
             "reason_factor_masks": reason_factor_masks,
             "reason_latent_visual_nodes": visual_nodes,
@@ -244,15 +256,15 @@ class MOSAICICDORObservedReasonMixer(nn.Module):
 
     def __init__(self, *, init_mix: float = 0.05) -> None:
         super().__init__()
-        if not 0.0 < init_mix < 0.25:
-            raise ValueError("IC-DOR observed-reason residual init must be in (0,0.25)")
+        if not 0.0 < init_mix < 0.20:
+            raise ValueError("IC-DOR observed-reason residual init must be in (0,0.20)")
         # The direct visual reason path remains primary. Unlike the previous
         # compatibility shim, the resolved config now controls the initial
         # bounded residual exactly, so run artifacts can reproduce it.
         initial_alpha = float(init_mix)
-        raw = math.log(initial_alpha / (0.25 - initial_alpha))
+        raw = math.log(initial_alpha / (0.20 - initial_alpha))
         self.alpha_raw = nn.Parameter(torch.full((21,), raw))
-        self.max_alpha = 0.25
+        self.max_alpha = 0.20
 
     def forward(
         self,
@@ -260,18 +272,24 @@ class MOSAICICDORObservedReasonMixer(nn.Module):
         reason_observation_logits: torch.Tensor,
         *,
         latent_enabled: bool,
+        route_mass: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         if reason_visual_observed_logits.shape != reason_observation_logits.shape or reason_visual_observed_logits.shape[-1] != 21:
             raise ValueError("IC-DOR observed-reason mixer expects matching [B,21] logits")
         alpha = (self.max_alpha * torch.sigmoid(self.alpha_raw)).unsqueeze(0)
+        if route_mass is None:
+            route_mass = torch.ones_like(reason_visual_observed_logits)
+        if route_mass.shape != reason_visual_observed_logits.shape:
+            raise ValueError("IC-DOR observed-reason route mass must be [B,21]")
+        mass = route_mass.clamp(0.0, 1.0)
         observed = (
-            bounded_reason_residual(
-                reason_visual_observed_logits,
-                reason_observation_logits,
-                max_alpha=self.max_alpha,
-                alpha=alpha.squeeze(0),
-            )[0]
+            reason_visual_observed_logits
+            + alpha * mass * torch.tanh(reason_observation_logits - reason_visual_observed_logits)
             if latent_enabled
             else reason_visual_observed_logits
         )
-        return {"reason_observed_logits": observed, "reason_observed_mix_gate": alpha.expand_as(observed)}
+        return {
+            "reason_observed_logits": observed,
+            "reason_observed_mix_gate": alpha.expand_as(observed),
+            "reason_observed_route_mass": mass,
+        }

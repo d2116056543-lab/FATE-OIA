@@ -48,7 +48,17 @@ def posterior_weighted_reason_ranking_loss(
     current_posterior: torch.Tensor,
     sample_ids: Sequence[str | int],
     queue: MOSAICSoftRankQueue,
+    *,
+    label_gate: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    if label_gate is not None:
+        if label_gate.shape != (current_logits.shape[1],) or label_gate.dtype != torch.bool:
+            raise ValueError("posterior reason ranking label gate must be bool [R]")
+        # Admission is per label. A disabled label contributes neither a
+        # current positive nor a queue comparison to PU ranking.
+        current_posterior = current_posterior * label_gate.to(
+            dtype=current_posterior.dtype, device=current_posterior.device
+        ).view(1, -1)
     return _cross_image_ranking_loss(current_logits, current_posterior, sample_ids, queue)
 
 
