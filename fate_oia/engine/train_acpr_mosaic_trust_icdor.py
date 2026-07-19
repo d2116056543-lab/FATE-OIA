@@ -437,7 +437,9 @@ def _load_runtime_selection(
     """Load a full profile or an explicitly non-promotable diagnostic profile."""
     if not path.is_file():
         raise RuntimeError("IC-DOR requires a profiler-produced runtime selection")
-    runtime = json.loads(path.read_text(encoding="utf-8"))
+    # PowerShell can produce a UTF-8 BOM when it materializes a runtime artifact.
+    # ``utf-8-sig`` accepts both BOM and ordinary UTF-8 without changing JSON data.
+    runtime = json.loads(path.read_text(encoding="utf-8-sig"))
     status = runtime.get("status")
     if status in {"PASS", "selected"}:
         return runtime, "full_profile"

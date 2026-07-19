@@ -69,6 +69,21 @@ def test_partial_runtime_selection_is_explicitly_pilot_only(tmp_path: Path) -> N
     assert scope == "diagnostic_partial"
 
 
+def test_runtime_selection_accepts_windows_utf8_bom(tmp_path: Path) -> None:
+    selection = tmp_path / "selection-with-bom.json"
+    selection.write_text(json.dumps({
+        "status": "PARTIAL_DIAGNOSTIC",
+        "selected": {"status": "PASS", "batch_size": 8, "grad_accum": 4},
+    }), encoding="utf-8-sig")
+
+    payload, scope = _load_runtime_selection(
+        selection, pilot=True, allow_partial_runtime_selection=True,
+    )
+
+    assert payload["selected"]["batch_size"] == 8
+    assert scope == "diagnostic_partial"
+
+
 def test_pilot_epoch_limit_is_checked_before_loader_and_model_initialization() -> None:
     source = Path("fate_oia/engine/train_acpr_mosaic_trust_icdor.py").read_text(encoding="utf-8")
     main_index = source.index("def main")
