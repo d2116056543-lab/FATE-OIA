@@ -352,3 +352,39 @@ def test_credibility_and_fine_transport_config_change_the_real_forward_path() ->
 
     output = model(torch.randn(1, 3, 360, 640), return_masks=True)
     assert torch.allclose(output["factor_soft_masks"], output["factor_coarse_masks"])
+
+
+def test_override_mask_rebuilds_typed_coordinates_from_moved_evidence() -> None:
+    masks = torch.zeros(1, 1, 5, 7)
+    masks[0, 0, 1, 2] = 0.7
+    masks[0, 0, 3, 5] = 0.9
+    template = torch.zeros(1, 1, 1, 2, 3, 2)
+    coordinates = MOSAICTrustICDORModel._typed_coordinates_from_override_mask(masks, template)
+    x = (((coordinates[..., 0] + 1.0) * 7 / 2.0) - 0.5).round().long()
+    y = (((coordinates[..., 1] + 1.0) * 5 / 2.0) - 0.5).round().long()
+    sampled = masks[0, 0, y, x]
+    assert torch.all(sampled > 0.0)
+    # The highest-valued moved patch is the first typed slot.
+    assert (int(y.flatten()[0]), int(x.flatten()[0])) == (3, 5)
+
+
+def test_forward_override_moves_factor_typed_reread_coordinates() -> None:
+    model = _model().eval()
+    images = torch.randn(1, 3, 360, 640)
+    with torch.no_grad():
+        field = model.dino(images)
+        baseline = model(images, return_masks=True, precomputed_dino_field=field)
+        override = baseline["factor_soft_masks"].clone()
+        override[:, 0] = 0.0
+        override[0, 0, 11, 17] = 0.9
+        moved = model(
+            images,
+            return_masks=True,
+            precomputed_dino_field=field,
+            factor_mask_override=override,
+        )
+    coordinates = moved["sampling_coordinates"][0, 0]
+    x = (((coordinates[..., 0] + 1.0) * 80 / 2.0) - 0.5).round().long()
+    y = (((coordinates[..., 1] + 1.0) * 45 / 2.0) - 0.5).round().long()
+    assert torch.all(override[0, 0, y, x] > 0.0)
+    assert moved["factor_override_recomputed_typed_coordinates"].item() == 1.0

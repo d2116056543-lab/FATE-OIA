@@ -250,5 +250,8 @@ runtime:
   timed_profile_steps: 100
   dataloader_stability_minutes: 15
   target_transfer_intervention_chunk_size: 4
+  # Continuous sigmoid maps are converted to this many per-factor selected
+  # evidence slots before same-image equal-mass control interventions.
+  target_transfer_evidence_slots: 16
   # Epoch-zero online utility is bounded; bootstrap-quality target audit is every two epochs.
   online_target_probe_max_samples: 256

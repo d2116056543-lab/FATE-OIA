@@ -11,7 +11,7 @@ from typing import Any, Sequence
 import torch
 
 from .mosaic_icdor_audit_collectors import (
-    build_batch_matched_factor_control_overrides,
+    build_batch_matched_factor_selected_and_control_overrides,
     factor_control_spec,
     summarize_matched_control_arms,
 )
@@ -485,6 +485,7 @@ def collect_target_transfer_metrics(
     device: torch.device,
     route_mode: str,
     latent_enabled: bool,
+    evidence_slots: int = 16,
     source_split: str = "train_audit",
 ) -> dict[str, Any]:
     """Run full, selected-factor deletion, and matched random deletion forwards.
@@ -530,7 +531,6 @@ def collect_target_transfer_metrics(
                 images, route_mode=route_mode, latent_enabled=latent_enabled,
                 return_masks=True,
             )
-            full_prob = torch.sigmoid(full[probability_key]).float()
             evidence = full["factor_presence_prob"].float()
             if evidence.shape != (images.shape[0], factor_count):
                 raise ValueError("target transfer factor evidence does not match factor_ids")
@@ -538,6 +538,7 @@ def collect_target_transfer_metrics(
             if not isinstance(factor_masks, torch.Tensor) or factor_masks.ndim != 4 or factor_masks.shape[:2] != (images.shape[0], factor_count):
                 raise ValueError("target transfer requires real factor_soft_masks [batch, factor, height, width]")
             deleted_arms: list[torch.Tensor] = []
+            selected_arms: list[torch.Tensor] = []
             random_arms: list[torch.Tensor] = []
             random_arm_details: list[torch.Tensor] = []
             batch_availability = torch.zeros(images.shape[0], factor_count, dtype=torch.bool)
@@ -549,13 +550,14 @@ def collect_target_transfer_metrics(
                     return_masks=False, factor_intervention_keep_mask=keep,
                 )
                 spec = factor_specs[factor_index]
-                overrides, arm_rows = build_batch_matched_factor_control_overrides(
+                selected_override, overrides, arm_rows = build_batch_matched_factor_selected_and_control_overrides(
                     factor_masks,
                     factor_index=factor_index,
                     factor=spec["factor"], factor_type=spec["factor_type"], region=spec["region"],
                     identity_factor_types=identity_factor_types,
                     identity_regions=identity_regions,
                     identity_factor_names=identity_factor_names,
+                    evidence_slots=evidence_slots,
                 )
                 for arm_index, rows in enumerate(arm_rows):
                     control_records[factor_index][arm_index].extend(rows)
@@ -565,6 +567,10 @@ def collect_target_transfer_metrics(
                         for arm_index in range(len(arm_rows))
                     )
                 random_outputs = []
+                selected = model(
+                    images, route_mode=route_mode, latent_enabled=latent_enabled,
+                    return_masks=False, factor_mask_override=selected_override,
+                )
                 for override in overrides:
                     random_deleted = model(
                         images, route_mode=route_mode, latent_enabled=latent_enabled,
@@ -572,12 +578,13 @@ def collect_target_transfer_metrics(
                     )
                     random_outputs.append(torch.sigmoid(random_deleted[probability_key]).float())
                 deleted_arms.append(torch.sigmoid(deleted[probability_key]).float())
+                selected_arms.append(torch.sigmoid(selected[probability_key]).float())
                 random_stack = torch.stack(random_outputs, dim=1)
                 random_arm_details.append(random_stack)
                 random_arms.append(random_stack.mean(dim=1))
             visual_evidence.append(evidence.cpu())
             labels.append(target.cpu())
-            full_probability.append(full_prob[:, None, :].expand(-1, factor_count, -1).cpu())
+            full_probability.append(torch.stack(selected_arms, dim=1).cpu())
             deleted_probability.append(torch.stack(deleted_arms, dim=1).cpu())
             random_deleted_probability.append(torch.stack(random_arms, dim=1).cpu())
             random_deleted_probability_by_arm.append(torch.stack(random_arm_details, dim=1).cpu())
@@ -626,6 +633,7 @@ def collect_joint_target_transfer_metrics(
     route_mode: str,
     latent_enabled: bool,
     intervention_chunk_size: int = 4,
+    evidence_slots: int = 16,
     source_split: str = "train_audit",
 ) -> dict[str, Any]:
     """Collect action and reason transfer in one intervention sweep."""
@@ -676,10 +684,6 @@ def collect_joint_target_transfer_metrics(
                 images, route_mode=route_mode, latent_enabled=latent_enabled,
                 return_masks=True, **field_kwargs,
             )
-            full_prob = torch.cat((
-                torch.sigmoid(full["action_final_logits"]),
-                torch.sigmoid(full["reason_observed_logits"]),
-            ), dim=1).float()
             evidence = full["factor_presence_prob"].float()
             if evidence.shape != (images.shape[0], factor_count):
                 raise ValueError("joint target transfer factor evidence does not match factor ids")
@@ -687,6 +691,7 @@ def collect_joint_target_transfer_metrics(
             if not isinstance(factor_masks, torch.Tensor) or factor_masks.ndim != 4 or factor_masks.shape[:2] != (images.shape[0], factor_count):
                 raise ValueError("joint target transfer requires real factor_soft_masks [batch, factor, height, width]")
             deletion_interventions: list[torch.Tensor] = []
+            selected_interventions: list[torch.Tensor] = []
             random_interventions: list[torch.Tensor] = []
             batch_availability = torch.zeros(images.shape[0], factor_count, dtype=torch.bool)
             for factor_index in range(factor_count):
@@ -694,13 +699,14 @@ def collect_joint_target_transfer_metrics(
                 keep[:, factor_index] = 0.0
                 deletion_interventions.append(keep)
                 spec = factor_specs[factor_index]
-                overrides, arm_rows = build_batch_matched_factor_control_overrides(
+                selected_override, overrides, arm_rows = build_batch_matched_factor_selected_and_control_overrides(
                     factor_masks,
                     factor_index=factor_index,
                     factor=spec["factor"], factor_type=spec["factor_type"], region=spec["region"],
                     identity_factor_types=identity_factor_types,
                     identity_regions=identity_regions,
                     identity_factor_names=identity_factor_names,
+                    evidence_slots=evidence_slots,
                 )
                 for arm_index, rows in enumerate(arm_rows):
                     control_records[factor_index][arm_index].extend(rows)
@@ -710,10 +716,20 @@ def collect_joint_target_transfer_metrics(
                         for arm_index in range(len(arm_rows))
                     )
                 random_interventions.extend(overrides)
+                selected_interventions.append(selected_override)
             probability_keys = ("action_final_logits", "reason_observed_logits")
             deleted_arms, calls = _chunked_intervention_probabilities(
                 model, images, deletion_interventions,
                 intervention_argument="factor_intervention_keep_mask",
+                probability_keys=probability_keys,
+                route_mode=route_mode, latent_enabled=latent_enabled,
+                precomputed_dino_field=audit_field,
+                chunk_size=intervention_chunk_size,
+            )
+            intervention_forward_calls += calls
+            selected_outputs, calls = _chunked_intervention_probabilities(
+                model, images, selected_interventions,
+                intervention_argument="factor_mask_override",
                 probability_keys=probability_keys,
                 route_mode=route_mode, latent_enabled=latent_enabled,
                 precomputed_dino_field=audit_field,
@@ -737,9 +753,10 @@ def collect_joint_target_transfer_metrics(
                 torch.stack(random_outputs[index * 4 : (index + 1) * 4], dim=1)
                 for index in range(factor_count)
             ], dim=1)
+            selected_arms = torch.stack(selected_outputs, dim=1)
             visual_evidence.append(evidence.cpu())
             labels.append(target.cpu())
-            full_probability.append(full_prob[:, None, :].expand(-1, factor_count, -1).cpu())
+            full_probability.append(selected_arms.cpu())
             deleted_probability.append(torch.stack(deleted_arms, dim=1).cpu())
             random_deleted_probability.append(torch.stack(random_arms, dim=1).cpu())
             random_deleted_probability_by_arm.append(random_arm_details.cpu())
@@ -771,7 +788,7 @@ def collect_joint_target_transfer_metrics(
         "audit_batch_count": audit_batch_count,
         "intervention_chunk_size": intervention_chunk_size,
         "intervention_forward_calls": intervention_forward_calls,
-        "sequential_intervention_forward_calls": audit_batch_count * factor_count * 5,
+        "sequential_intervention_forward_calls": audit_batch_count * factor_count * 6,
     }
     result["source_split"] = source_split
     return result

@@ -21,6 +21,7 @@ def build_matched_factor_controls(
     identity_names: Sequence[str] = (),
     identity_types: Sequence[str] = (),
     identity_regions: Sequence[str] = (),
+    selected_factor_index: int | None = None,
     region_mask: torch.Tensor | None = None,
     min_controls: int = 4,
 ) -> list[dict[str, Any]]:
@@ -76,6 +77,11 @@ def build_matched_factor_controls(
         ):
             raise ValueError("IC-DOR identity control metadata must align with [N,H,W] masks")
         for index, mask in enumerate(identity_masks):
+            # An identity control must be a same-type *wrong* factor. Reusing
+            # the selected factor would turn a spatial re-placement into a
+            # falsely labelled identity intervention.
+            if selected_factor_index is not None and index == selected_factor_index:
+                continue
             if identity_types[index] == selected_factor_type and identity_regions[index] == selected_region:
                 candidate_scores = mask.float().unsqueeze(0) * eligible.float() * (~occupied).float()
                 available = candidate_scores.gt(0)
@@ -107,6 +113,201 @@ def build_matched_factor_controls(
     if len(controls) < min_controls:
         raise ValueError("IC-DOR matched controls require at least four non-overlapping equal-mass arms")
     return controls
+
+
+def _select_topk_continuous_evidence(
+    source: torch.Tensor,
+    *,
+    eligible: torch.Tensor,
+    evidence_slots: int,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float | int | str]]:
+    """Make an auditable sparse selected-evidence arm from a dense soft mask.
+
+    The model's factor maps are sigmoid/continuous, so ``mask > 0`` is almost
+    always the entire image. Controls must instead operate on the factor's own
+    top-K evidence slots inside its declared semantic region. The selected arm
+    retains the original continuous values at those slots; control arms later
+    receive exactly the same value multiset at non-overlapping locations.
+    """
+    if source.ndim != 2 or eligible.shape != (1, *source.shape):
+        raise ValueError("IC-DOR top-K evidence support must align with [H,W] source and [1,H,W] region")
+    if evidence_slots <= 0:
+        raise ValueError("IC-DOR evidence_slots must be positive")
+    source = source.detach()
+    eligible_2d = eligible.squeeze(0).bool()
+    eligible_values = source.masked_fill(~eligible_2d, 0.0)
+    positive = eligible_values > 0.0
+    positive_count = int(positive.sum())
+    source_region_mass = float(eligible_values.sum())
+    sparse = torch.zeros_like(source)
+    support = torch.zeros_like(source, dtype=torch.bool)
+    if positive_count == 0 or source_region_mass <= 0.0:
+        return sparse, support.unsqueeze(0), {
+            "support_method": "topk_continuous_evidence",
+            "selected_support_count": 0,
+            "selected_mass": 0.0,
+            "source_region_mass": source_region_mass,
+            "selected_mass_fraction": 0.0,
+        }
+    slot_count = min(int(evidence_slots), positive_count)
+    chosen = torch.topk(eligible_values.flatten(), k=slot_count, largest=True, sorted=False).indices
+    support.flatten()[chosen] = True
+    sparse[support] = source[support]
+    selected_mass = float(sparse.sum())
+    return sparse, support.unsqueeze(0), {
+        "support_method": "topk_continuous_evidence",
+        "selected_support_count": slot_count,
+        "selected_mass": selected_mass,
+        "source_region_mass": source_region_mass,
+        "selected_mass_fraction": selected_mass / max(source_region_mass, 1e-12),
+    }
+
+
+def _place_continuous_values_on_control(
+    selected_sparse: torch.Tensor,
+    selected_support: torch.Tensor,
+    control_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Move, rather than rescale, selected continuous evidence onto a control."""
+    if selected_support.shape != control_mask.shape or selected_support.shape != (1, *selected_sparse.shape):
+        raise ValueError("IC-DOR control support must align with selected evidence")
+    selected_values = selected_sparse[selected_support.squeeze(0)]
+    control_positions = control_mask.squeeze(0).flatten().nonzero(as_tuple=False).flatten()
+    if selected_values.numel() == 0 or selected_values.numel() != control_positions.numel():
+        raise ValueError("IC-DOR matched control must preserve selected continuous slot count")
+    replacement = torch.zeros_like(selected_sparse)
+    replacement.flatten()[control_positions] = selected_values
+    return replacement
+
+
+def build_batch_matched_factor_selected_and_control_overrides(
+    factor_masks: torch.Tensor,
+    *,
+    factor_index: int,
+    factor: str,
+    factor_type: str,
+    region: str,
+    identity_factor_types: Sequence[str] = (),
+    identity_regions: Sequence[str] = (),
+    identity_factor_names: Sequence[str] = (),
+    arm_count: int = 4,
+    evidence_slots: int = 16,
+) -> tuple[torch.Tensor, list[torch.Tensor], list[list[dict[str, Any]]]]:
+    """Build selected and matched-control interventions from batch-local masks.
+
+    All five arms retain the same nonzero continuous evidence values. The
+    selected arm is the factor's own top-K regional evidence; the first
+    control is a different factor with the same type/region, followed by
+    non-overlapping same-region spatial controls. No test label or geometry is
+    consulted.
+    """
+    if factor_masks.ndim != 4 or not factor_masks.is_floating_point() or not 0 <= factor_index < factor_masks.shape[1]:
+        raise ValueError("IC-DOR controls require floating [B,F,H,W] factor masks")
+    if arm_count < 4:
+        raise ValueError("IC-DOR controls require at least four arms")
+    batch, _, height, width = factor_masks.shape
+    region_mask = _semantic_region_mask(height, width, region=region, device=factor_masks.device)
+    selected_override = factor_masks.detach().clone()
+    overrides = [factor_masks.detach().clone() for _ in range(arm_count)]
+    arm_records: list[list[dict[str, Any]]] = [[] for _ in range(arm_count)]
+    for sample_index in range(batch):
+        source = factor_masks[sample_index, factor_index].detach()
+        selected_sparse, support, selected_stats = _select_topk_continuous_evidence(
+            source, eligible=region_mask, evidence_slots=evidence_slots
+        )
+        selected_override[sample_index, factor_index] = selected_sparse
+
+        def append_unavailable(reason: str) -> None:
+            for arm_index in range(arm_count):
+                arm_records[arm_index].append({
+                    "schema_version": "icdor_matched_control.v3",
+                    "arm_index": arm_index,
+                    "sample_index": sample_index,
+                    "factor": factor,
+                    "factor_type": factor_type,
+                    "region": region,
+                    "control_type": "unavailable_noop",
+                    "available": False,
+                    "unavailable_reason": reason,
+                    "control_support_method": "topk_continuous_evidence",
+                    "control_evidence_slots": int(evidence_slots),
+                    "selected_mass": float(selected_stats["selected_mass"]),
+                    "source_region_mass": float(selected_stats["source_region_mass"]),
+                    "selected_mass_fraction": float(selected_stats["selected_mass_fraction"]),
+                    "selected_support_count": int(selected_stats["selected_support_count"]),
+                    "control_mass": 0.0,
+                    "mass_error": 0.0,
+                    "overlap": 0.0,
+                })
+
+        if not bool(support.any()):
+            append_unavailable("empty_declared_region_topk_evidence")
+            continue
+        try:
+            candidates = build_matched_factor_controls(
+                support,
+                selected_factor_type=factor_type,
+                selected_region=region,
+                identity_masks=factor_masks[sample_index],
+                identity_names=identity_factor_names,
+                identity_types=identity_factor_types,
+                identity_regions=identity_regions,
+                selected_factor_index=factor_index,
+                region_mask=region_mask,
+                min_controls=arm_count,
+            )
+            identity_controls = [item for item in candidates if item["control_type"] == "same_type_identity"]
+            spatial_controls = [item for item in candidates if item["control_type"] == "spatial_roll"]
+            if not identity_controls or len(spatial_controls) < arm_count - 1:
+                raise ValueError("IC-DOR matched controls require identity and spatial arms")
+            controls = [identity_controls[0], *spatial_controls[: arm_count - 1]]
+        except ValueError as error:
+            if not any(
+                marker in str(error)
+                for marker in (
+                    "at least four non-overlapping equal-mass arms",
+                    "require identity and spatial arms",
+                )
+            ):
+                raise
+            append_unavailable("insufficient_identity_or_spatial_equal_mass_controls")
+            continue
+        selected_mass = float(selected_sparse.sum())
+        for arm_index, control in enumerate(controls):
+            replacement = _place_continuous_values_on_control(selected_sparse, support, control["mask"])
+            overrides[arm_index][sample_index, factor_index] = replacement
+            control_mass = float(replacement.sum())
+            mass_error = abs(control_mass - selected_mass) / max(selected_mass, 1e-12)
+            if mass_error > 0.05 or float(control["overlap"]) != 0.0:
+                raise ValueError("IC-DOR matched control violates non-overlap or mass tolerance")
+            arm_records[arm_index].append({
+                "schema_version": "icdor_matched_control.v3",
+                "arm_index": arm_index,
+                "sample_index": sample_index,
+                "factor": factor,
+                "factor_type": factor_type,
+                "region": region,
+                "control_type": control["control_type"],
+                "available": True,
+                "control_support_method": "topk_continuous_evidence",
+                "control_evidence_slots": int(evidence_slots),
+                "selected_mass": selected_mass,
+                "source_region_mass": float(selected_stats["source_region_mass"]),
+                "selected_mass_fraction": float(selected_stats["selected_mass_fraction"]),
+                "selected_support_count": int(selected_stats["selected_support_count"]),
+                "control_mass": control_mass,
+                "mass_error": mass_error,
+                "overlap": 0.0,
+                **{
+                    key: control[key]
+                    for key in (
+                        "identity_source_factor_index", "identity_source_factor_name",
+                        "identity_source_factor_type", "identity_source_region", "spatial_offset",
+                    )
+                    if key in control
+                },
+            })
+    return selected_override, overrides, arm_records
 
 
 def factor_control_spec(model: torch.nn.Module, *, factor_name: str, factor_index: int) -> dict[str, str]:
@@ -155,105 +356,18 @@ def build_batch_matched_factor_control_overrides(
     identity_factor_names: Sequence[str] = (),
     arm_count: int = 4,
 ) -> tuple[list[torch.Tensor], list[list[dict[str, Any]]]]:
-    """Build four batch-local, same-factor spatial intervention masks.
-
-    Each override replaces only the selected factor. The original mask values are
-    normalized into each non-overlapping support, preserving continuous mask mass.
-    """
-    if factor_masks.ndim != 4 or not factor_masks.is_floating_point() or not 0 <= factor_index < factor_masks.shape[1]:
-        raise ValueError("IC-DOR controls require floating [B,F,H,W] factor masks")
-    if arm_count < 4:
-        raise ValueError("IC-DOR controls require at least four arms")
-    batch, _, height, width = factor_masks.shape
-    region_mask = _semantic_region_mask(height, width, region=region, device=factor_masks.device)
-    overrides = [factor_masks.detach().clone() for _ in range(arm_count)]
-    arm_records: list[list[dict[str, Any]]] = [[] for _ in range(arm_count)]
-    for sample_index in range(batch):
-        source = factor_masks[sample_index, factor_index].detach()
-        support = source.gt(0).unsqueeze(0)
-        def append_unavailable(reason: str) -> None:
-            for arm_index in range(arm_count):
-                arm_records[arm_index].append({
-                    "schema_version": "icdor_matched_control.v2",
-                    "arm_index": arm_index,
-                    "sample_index": sample_index,
-                    "factor": factor,
-                    "factor_type": factor_type,
-                    "region": region,
-                    "control_type": "unavailable_noop",
-                    "available": False,
-                    "unavailable_reason": reason,
-                    "selected_mass": 0.0,
-                    "control_mass": 0.0,
-                    "mass_error": 0.0,
-                    "overlap": 0.0,
-                })
-
-        if not bool(support.any()):
-            append_unavailable("empty_selected_factor_mask")
-            continue
-        try:
-            candidates = build_matched_factor_controls(
-                support,
-                selected_factor_type=factor_type,
-                selected_region=region,
-                identity_masks=factor_masks[sample_index],
-                identity_names=identity_factor_names,
-                identity_types=identity_factor_types,
-                identity_regions=identity_regions,
-                region_mask=region_mask,
-                min_controls=arm_count,
-            )
-            identity_controls = [item for item in candidates if item["control_type"] == "same_type_identity"]
-            spatial_controls = [item for item in candidates if item["control_type"] == "spatial_roll"]
-            if not identity_controls or len(spatial_controls) < arm_count - 1:
-                raise ValueError("IC-DOR matched controls require identity and spatial arms")
-            controls = [identity_controls[0], *spatial_controls[: arm_count - 1]]
-        except ValueError as error:
-            if not any(
-                marker in str(error)
-                for marker in (
-                    "at least four non-overlapping equal-mass arms",
-                    "require identity and spatial arms",
-                )
-            ):
-                raise
-            append_unavailable("insufficient_identity_or_spatial_equal_mass_controls")
-            continue
-        selected_mass = float(source.sum())
-        support_mass = int(support.sum())
-        if selected_mass <= 0.0 or support_mass <= 0:
-            raise ValueError(f"IC-DOR {factor} has invalid matched-control mass")
-        scale = selected_mass / support_mass
-        for arm_index, control in enumerate(controls):
-            replacement = control["mask"].to(dtype=source.dtype).squeeze(0) * scale
-            overrides[arm_index][sample_index, factor_index] = replacement
-            control_mass = float(replacement.sum())
-            mass_error = abs(control_mass - selected_mass) / selected_mass
-            if mass_error > 0.05 or float(control["overlap"]) != 0.0:
-                raise ValueError("IC-DOR matched control violates non-overlap or mass tolerance")
-            arm_records[arm_index].append({
-                "schema_version": "icdor_matched_control.v2",
-                "arm_index": arm_index,
-                "sample_index": sample_index,
-                "factor": factor,
-                "factor_type": factor_type,
-                "region": region,
-                "control_type": control["control_type"],
-                "available": True,
-                "selected_mass": selected_mass,
-                "control_mass": control_mass,
-                "mass_error": mass_error,
-                "overlap": 0.0,
-                **{
-                    key: control[key]
-                    for key in (
-                        "identity_source_factor_index", "identity_source_factor_name",
-                        "identity_source_factor_type", "identity_source_region", "spatial_offset",
-                    )
-                    if key in control
-                },
-            })
+    """Backward-compatible control-only view of the selected/control builder."""
+    _, overrides, arm_records = build_batch_matched_factor_selected_and_control_overrides(
+        factor_masks,
+        factor_index=factor_index,
+        factor=factor,
+        factor_type=factor_type,
+        region=region,
+        identity_factor_types=identity_factor_types,
+        identity_regions=identity_regions,
+        identity_factor_names=identity_factor_names,
+        arm_count=arm_count,
+    )
     return overrides, arm_records
 
 
@@ -267,7 +381,7 @@ def summarize_matched_control_arms(arm_records: Sequence[Sequence[Mapping[str, A
         if not available:
             first = records[0]
             summaries.append({
-                "schema_version": "icdor_matched_control.v2",
+                "schema_version": "icdor_matched_control.v3",
                 "arm_index": int(first["arm_index"]),
                 "factor": str(first["factor"]),
                 "factor_type": str(first["factor_type"]),
@@ -279,6 +393,11 @@ def summarize_matched_control_arms(arm_records: Sequence[Sequence[Mapping[str, A
                 "max_overlap": None,
                 "selected_mass_total": 0.0,
                 "control_mass_total": 0.0,
+                "control_support_method": str(first.get("control_support_method", "topk_continuous_evidence")),
+                "control_evidence_slots": int(first.get("control_evidence_slots", 0)),
+                "selected_support_count_mean": 0.0,
+                "selected_mass_fraction_mean": 0.0,
+                "source_region_mass_total": 0.0,
                 "unavailable_reason": str(first.get("unavailable_reason", "insufficient_matched_controls")),
                 "identity_source_factor_indices": [],
                 "identity_source_factor_names": [],
@@ -289,7 +408,7 @@ def summarize_matched_control_arms(arm_records: Sequence[Sequence[Mapping[str, A
             continue
         first = available[0]
         summaries.append({
-            "schema_version": "icdor_matched_control.v2",
+            "schema_version": "icdor_matched_control.v3",
             "arm_index": int(first["arm_index"]),
             "factor": str(first["factor"]),
             "factor_type": str(first["factor_type"]),
@@ -301,6 +420,17 @@ def summarize_matched_control_arms(arm_records: Sequence[Sequence[Mapping[str, A
             "max_overlap": max(float(record["overlap"]) for record in available),
             "selected_mass_total": sum(float(record["selected_mass"]) for record in available),
             "control_mass_total": sum(float(record["control_mass"]) for record in available),
+            "control_support_method": str(first.get("control_support_method", "topk_continuous_evidence")),
+            "control_evidence_slots": int(first.get("control_evidence_slots", 0)),
+            "selected_support_count_mean": sum(
+                int(record.get("selected_support_count", 0)) for record in available
+            ) / len(available),
+            "selected_mass_fraction_mean": sum(
+                float(record.get("selected_mass_fraction", 0.0)) for record in available
+            ) / len(available),
+            "source_region_mass_total": sum(
+                float(record.get("source_region_mass", 0.0)) for record in available
+            ),
             "identity_source_factor_indices": sorted({
                 int(record["identity_source_factor_index"])
                 for record in available if "identity_source_factor_index" in record
@@ -860,7 +990,7 @@ def collect_edge_intervention_audit(
                 if factor_masks.ndim != 4:
                     raise ValueError("IC-DOR edge audit factor_soft_masks must be [batch, factor, height, width]")
                 factor_spec = factor_control_spec(model, factor_name=str(spec["factor"]), factor_index=factor_id)
-                overrides, arm_rows = build_batch_matched_factor_control_overrides(
+                selected_override, overrides, arm_rows = build_batch_matched_factor_selected_and_control_overrides(
                     factor_masks,
                     factor_index=factor_id,
                     factor=factor_spec["factor"],
@@ -880,13 +1010,19 @@ def collect_edge_intervention_audit(
                     dtype=torch.bool,
                 )
                 arm_outputs = []
+                selected_output = _forward(
+                    model, images, "full", {**kwargs, "factor_mask_override": selected_override}
+                )
                 for override in overrides:
                     output = _forward(model, images, "full", {**kwargs, "factor_mask_override": override})
                     action_logits = output.get("action_final_logits", output.get("action_logits_raw"))
                     if not isinstance(action_logits, torch.Tensor) or action_logits.shape != labels.shape:
                         raise ValueError("IC-DOR edge audit forward requires action_final_logits [batch, action]")
                     arm_outputs.append(action_logits[:, action_id].detach().float().cpu()[common_available])
-                action_logits = on_output.get("action_final_logits", on_output.get("action_logits_raw"))
+                # Compare selected top-K factor evidence against controls with
+                # the same continuous mass, never against the original dense
+                # sigmoid map.
+                action_logits = selected_output.get("action_final_logits", selected_output.get("action_logits_raw"))
                 if not isinstance(action_logits, torch.Tensor) or action_logits.shape != labels.shape:
                     raise ValueError("IC-DOR edge audit forward requires action_final_logits [batch, action]")
                 if not bool(common_available.any()):

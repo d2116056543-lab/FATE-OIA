@@ -30,6 +30,42 @@ def test_matched_controls_have_four_real_nonoverlap_arms_with_mass_tolerance() -
         assert row["region"] == "front"
 
 
+def test_dense_continuous_masks_use_topk_slots_and_wrong_factor_identity() -> None:
+    module = importlib.import_module("fate_oia.engine.mosaic_icdor_audit_collectors")
+    grid = torch.linspace(0.1, 1.0, 100).reshape(10, 10)
+    factor_masks = torch.stack((grid, grid.flip(-1))).unsqueeze(0)
+    selected, controls, arm_rows = module.build_batch_matched_factor_selected_and_control_overrides(
+        factor_masks,
+        factor_index=0,
+        factor="signal",
+        factor_type="point",
+        region="unspecified",
+        identity_factor_names=("signal", "other_signal"),
+        identity_factor_types=("point", "point"),
+        identity_regions=("unspecified", "unspecified"),
+        evidence_slots=4,
+    )
+
+    selected_mask = selected[0, 0]
+    assert torch.count_nonzero(selected_mask) == 4
+    assert torch.isclose(selected_mask.sum(), grid.flatten().topk(4).values.sum())
+    selected_support = selected_mask.bool()
+    control_supports = []
+    for arm_index, override in enumerate(controls):
+        replacement = override[0, 0]
+        control_support = replacement.bool()
+        control_supports.append(control_support)
+        assert torch.count_nonzero(control_support & selected_support) == 0
+        assert torch.isclose(replacement.sum(), selected_mask.sum(), atol=1e-6)
+        row = arm_rows[arm_index][0]
+        assert row["available"] is True
+        assert row["selected_support_count"] == 4
+        assert row["control_support_method"] == "topk_continuous_evidence"
+    assert arm_rows[0][0]["identity_source_factor_index"] == 1
+    for left, right in zip(control_supports, control_supports[1:]):
+        assert torch.count_nonzero(left & right) == 0
+
+
 def test_transfer_admission_must_beat_identity_and_spatial_controls_separately() -> None:
     module = importlib.import_module("fate_oia.engine.mosaic_target_transfer_metrics")
     selected = torch.tensor([[[0.9]], [[0.8]], [[0.2]], [[0.1]]])

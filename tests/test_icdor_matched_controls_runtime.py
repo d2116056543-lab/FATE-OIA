@@ -213,9 +213,10 @@ def test_joint_transfer_batches_factor_and_control_interventions() -> None:
     )
 
     assert transfer["summary"]["available_pair_count"] == 4
-    assert model.forward_calls == 4
-    assert transfer["collection_runtime"]["intervention_forward_calls"] == 3
-    assert transfer["collection_runtime"]["sequential_intervention_forward_calls"] == 10
+    # Full + deletion + selected top-K evidence + four matched control arms.
+    assert model.forward_calls == 5
+    assert transfer["collection_runtime"]["intervention_forward_calls"] == 4
+    assert transfer["collection_runtime"]["sequential_intervention_forward_calls"] == 12
     assert transfer["collection_runtime"]["intervention_chunk_size"] == 4
     arm_types = [arm["control_type"] for arm in transfer["per_target"][0]["matched_control_arms"]]
     assert arm_types == ["same_type_identity", "spatial_roll", "spatial_roll", "spatial_roll"]
@@ -239,7 +240,7 @@ def test_joint_transfer_batches_factor_and_control_interventions() -> None:
         latent_enabled=True,
         intervention_chunk_size=1,
     )
-    assert sequential_model.forward_calls == 11
+    assert sequential_model.forward_calls == 13
     assert sequential["per_target"] == transfer["per_target"]
     assert sequential["summary"] == transfer["summary"]
 
@@ -252,10 +253,12 @@ def test_training_config_wires_target_transfer_chunk_size() -> None:
         )
     )
     assert config["runtime"]["target_transfer_intervention_chunk_size"] == 4
+    assert config["runtime"]["target_transfer_evidence_slots"] == 16
     source = (root / "fate_oia" / "engine" / "train_acpr_mosaic_trust_icdor.py").read_text(
         encoding="utf-8"
     )
     assert 'intervention_chunk_size=int(config["runtime"]["target_transfer_intervention_chunk_size"])' in source
+    assert 'evidence_slots=int(config["runtime"]["target_transfer_evidence_slots"])' in source
     assert 'action_ids = {f"action:{name}" for name in model.ontology["action_names"]}' in source
 
 

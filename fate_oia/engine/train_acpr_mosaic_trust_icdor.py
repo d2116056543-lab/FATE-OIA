@@ -2733,6 +2733,7 @@ def main() -> None:
                 reason_directions=reason_directions,
                 device=device, route_mode=phase.route_mode, latent_enabled=phase.latent_enabled,
                 intervention_chunk_size=int(config["runtime"]["target_transfer_intervention_chunk_size"]),
+                evidence_slots=int(config["runtime"]["target_transfer_evidence_slots"]),
                 source_split="audit_target",
             )
             full_target_transfer = None
@@ -2754,6 +2755,7 @@ def main() -> None:
                     route_mode=phase.route_mode,
                     latent_enabled=phase.latent_enabled,
                     intervention_chunk_size=int(config["runtime"]["target_transfer_intervention_chunk_size"]),
+                    evidence_slots=int(config["runtime"]["target_transfer_evidence_slots"]),
                     source_split="audit_target",
                 )
             target_utility_transfer = (

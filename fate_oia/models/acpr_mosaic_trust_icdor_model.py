@@ -274,6 +274,48 @@ class MOSAICTrustICDORModel(nn.Module):
         # than clamp at an image boundary and accidentally change mask mass.
         return torch.remainder(sampling_coordinates + offset + 1.0, 2.0) - 1.0
 
+    @staticmethod
+    def _typed_coordinates_from_override_mask(
+        factor_masks: torch.Tensor,
+        coordinate_template: torch.Tensor,
+    ) -> torch.Tensor:
+        """Re-read moved selected/control evidence at its actual patch slots.
+
+        A mask-only intervention leaves the extractor's old typed coordinates
+        behind, which makes a spatial control look like a deletion. This helper
+        derives the same number of typed slots from each override mask and
+        repeats positive slots only when the extractor requests more samples
+        than the sparse intervention contains. It operates on batch-local
+        image evidence only and is used exclusively by audit interventions.
+        """
+        if factor_masks.ndim != 4 or coordinate_template.ndim != 6:
+            raise ValueError("IC-DOR override coordinate rebuild requires [B,F,H,W] and [B,F,A,H,S,2]")
+        batch_size, factor_count, height, width = factor_masks.shape
+        if coordinate_template.shape[:2] != (batch_size, factor_count):
+            raise ValueError("IC-DOR override coordinate template must match factor masks")
+        sample_shape = coordinate_template.shape[2:-1]
+        flat_count = int(torch.tensor(sample_shape).prod().item())
+        rebuilt = coordinate_template.detach().clone()
+        flat_masks = factor_masks.detach().reshape(batch_size, factor_count, -1)
+        for batch_index in range(batch_size):
+            for factor_index in range(factor_count):
+                values = flat_masks[batch_index, factor_index]
+                positive = (values > 0.0).nonzero(as_tuple=False).flatten()
+                if positive.numel() == 0:
+                    # A deleted/unavailable factor stays at the template; the
+                    # sampled mask below makes every typed value exactly zero.
+                    continue
+                ranked = positive[torch.argsort(values.index_select(0, positive), descending=True, stable=True)]
+                slots = ranked.repeat((flat_count + ranked.numel() - 1) // ranked.numel())[:flat_count]
+                y = torch.div(slots, width, rounding_mode="floor").to(dtype=rebuilt.dtype)
+                x = torch.remainder(slots, width).to(dtype=rebuilt.dtype)
+                coordinates = torch.stack(
+                    ((x + 0.5) * (2.0 / width) - 1.0, (y + 0.5) * (2.0 / height) - 1.0),
+                    dim=-1,
+                )
+                rebuilt[batch_index, factor_index] = coordinates.reshape(*sample_shape, 2)
+        return rebuilt
+
     @torch.no_grad()
     def set_factor_certificate_tiers(self, tiers: Sequence[str], *, certificate_sha256: str | None = None) -> None:
         if len(tiers) != self.factor_certificate_tier.numel() or any(tier not in _TIER_TO_ID for tier in tiers):
@@ -489,6 +531,15 @@ class MOSAICTrustICDORModel(nn.Module):
             factor_output["factor_soft_masks"] = factor_mask_override.to(
                 device=images.device, dtype=factor_output["factor_soft_masks"].dtype
             )
+            # A spatial override is a true re-read only if its typed evidence
+            # coordinates move with it. Reuse the current batch's F_hi field;
+            # no DINO/cache recomputation or labels are involved.
+            factor_output["sampling_coordinates"] = self._typed_coordinates_from_override_mask(
+                factor_output["factor_soft_masks"], factor_output["sampling_coordinates"]
+            )
+            factor_output["sampled_features"] = self._resample_typed_features(
+                factor_pyramid["F_hi"].detach(), factor_output["sampling_coordinates"]
+            )
         # A coarse mask override/deletion is not a real intervention unless it
         # also masks the typed path. The target rereaders otherwise retain
         # stale local samples even after a factor was removed from its mask.
@@ -671,6 +722,7 @@ class MOSAICTrustICDORModel(nn.Module):
             "factor_mask_mode_code": images.new_tensor({"configured": 0, "fine": 1, "coarse": 2}[factor_mask_mode]),
             "fine_transport_enabled": images.new_tensor(float(self.factor_extractor.fine_transport_enabled)),
             "factor_intervention_keep_mask": intervention_keep,
+            "factor_override_recomputed_typed_coordinates": images.new_tensor(float(factor_mask_override is not None)),
         }
         if random_reread_output is not None:
             output["action_matched_random_typed_target_coordinates"] = random_reread_output[
