@@ -19,6 +19,7 @@ from fate_oia.engine.train_acpr_mosaic_trust_icdor import (
     _load_resume,
     _load_runtime_selection,
     _should_collect_full_target_transfer,
+    _target_utility_payloads,
     _load_warm_start_model_only,
     _pending_evidence_document,
     _pilot_semantic_validation,
@@ -89,6 +90,23 @@ def test_pilot_uses_online_target_probe_without_duplicate_full_transfer() -> Non
     assert not _should_collect_full_target_transfer(pilot=True, full_target_audit_due=True)
     assert _should_collect_full_target_transfer(pilot=False, full_target_audit_due=True)
     assert not _should_collect_full_target_transfer(pilot=False, full_target_audit_due=False)
+
+
+def test_target_utility_payloads_export_builder_per_target_utility_records() -> None:
+    state = {
+        "semantic_compatibility": [[0.1]],
+        "action_target_utility": [[0.2]],
+        "per_target_utility": [{"factor_id": "factor", "target_id": "action:forward", "utility": 0.2}],
+    }
+
+    semantic, action = _target_utility_payloads(
+        epoch=0,
+        audit_level="online",
+        target_utility_state=state,
+    )
+
+    assert semantic["per_target"] == state["per_target_utility"]
+    assert action["per_target"] == state["per_target_utility"]
 
 
 def test_pilot_epoch_limit_is_checked_before_loader_and_model_initialization() -> None:

@@ -458,6 +458,33 @@ def _should_collect_full_target_transfer(*, pilot: bool, full_target_audit_due: 
     return bool(not pilot and full_target_audit_due)
 
 
+def _target_utility_payloads(
+    *, epoch: int, audit_level: str, target_utility_state: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Export the builder's per-target records with both V5 utility matrices."""
+    per_target = target_utility_state.get("per_target_utility")
+    if not isinstance(per_target, list):
+        raise ValueError("IC-DOR target utility builder must return per_target_utility")
+    shared = {
+        "epoch": int(epoch),
+        "available": True,
+        "source_split": "audit_target",
+        "audit_level": str(audit_level),
+        "per_target": per_target,
+    }
+    semantic_payload = {
+        "schema_version": "mosaic_semantic_compatibility.v1",
+        **shared,
+        "semantic_compatibility": target_utility_state["semantic_compatibility"],
+    }
+    action_payload = {
+        "schema_version": "mosaic_target_utility.v1",
+        **shared,
+        "action_target_utility": target_utility_state["action_target_utility"],
+    }
+    return semantic_payload, action_payload
+
+
 def _write_provisional_certificate_this_epoch(
     *, write_provisional: bool, freeze_certificate: bool
 ) -> bool:
@@ -2777,20 +2804,11 @@ def main() -> None:
                 ),
                 source_split="audit_target",
             )
-            semantic_compatibility_payload = {
-                "schema_version": "mosaic_semantic_compatibility.v1",
-                "epoch": epoch, "available": True, "source_split": "audit_target",
-                "audit_level": transfer_summary["target_utility_source"],
-                "semantic_compatibility": target_utility_state["semantic_compatibility"],
-                "per_target": target_utility_state["per_target"],
-            }
-            target_utility_payload = {
-                "schema_version": "mosaic_target_utility.v1",
-                "epoch": epoch, "available": True, "source_split": "audit_target",
-                "audit_level": transfer_summary["target_utility_source"],
-                "action_target_utility": target_utility_state["action_target_utility"],
-                "per_target": target_utility_state["per_target"],
-            }
+            semantic_compatibility_payload, target_utility_payload = _target_utility_payloads(
+                epoch=epoch,
+                audit_level=transfer_summary["target_utility_source"],
+                target_utility_state=target_utility_state,
+            )
         else:
             transfer_summary = _honest_row(epoch, "target_transfer", "interventions_disabled_in_foundation")
             transfer_summary.update({"source_split": "audit_target", "phase": phase.name})
