@@ -3,9 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import torch
+from torch import nn
 
 from fate_oia.engine.profile_acpr_mosaic_trust_icdor import (
     ICDORProfileError,
+    measure_real_phase_d,
     profile_runtime_candidates,
     select_runtime_candidate,
     wall_clock_samples_per_second,
@@ -67,6 +70,97 @@ def test_profiler_executes_every_configured_candidate_and_worker() -> None:
     assert payload["pass"] is True
     assert payload["selected"]["batch_size"] == 6
     assert payload["selected"]["num_workers"] == 4
+
+
+def test_profiler_emits_candidate_progress_without_changing_selection() -> None:
+    events = []
+
+    def measure(candidate, workers):
+        return {
+            **candidate,
+            "num_workers": workers,
+            "warmup_steps": 20,
+            "measured_steps": 100,
+            "samples_per_sec": 4.0,
+            "max_reserved_gb": 20.0,
+            "status": "PASS",
+        }
+
+    payload = profile_runtime_candidates(
+        [{"batch_size": 4, "grad_accum": 8}], [2], measure,
+        max_reserved_gb=43.5, progress_callback=events.append,
+    )
+
+    assert payload["selected"]["batch_size"] == 4
+    assert [event["event"] for event in events] == ["candidate_start", "candidate_end"]
+    assert events[0]["num_workers"] == 2
+
+
+def test_profiler_resume_skips_only_completed_real_candidates() -> None:
+    calls = []
+
+    def measure(candidate, workers):
+        calls.append((candidate["batch_size"], workers))
+        return {
+            **candidate,
+            "num_workers": workers,
+            "warmup_steps": 20,
+            "measured_steps": 100,
+            "samples_per_sec": 4.0,
+            "max_reserved_gb": 20.0,
+            "status": "PASS",
+        }
+
+    partial_rows = [{
+        "batch_size": 6, "grad_accum": 5, "num_workers": 4,
+        "warmup_steps": 20, "measured_steps": 100, "samples_per_sec": 4.0,
+        "max_reserved_gb": 20.0, "status": "PASS",
+        "measurement_origin": "real_phase_d_execution",
+    }]
+    checkpoints = []
+    payload = profile_runtime_candidates(
+        [{"batch_size": 6, "grad_accum": 5}], [4, 0], measure,
+        max_reserved_gb=43.5, completed_records=partial_rows,
+        checkpoint_callback=lambda rows: checkpoints.append(list(rows)),
+    )
+
+    assert calls == [(6, 0)]
+    assert len(payload["candidates"]) == 2
+    assert len(checkpoints) == 1
+    assert checkpoints[0][-1]["num_workers"] == 0
+
+
+def test_real_profiler_emits_periodic_step_progress() -> None:
+    class TinyProfileModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.action = nn.Linear(3, 4)
+            self.reason = nn.Linear(3, 21)
+
+        def forward(self, image, **_kwargs):
+            pooled = image.mean(dim=(2, 3))
+            return {
+                "action_final_logits": self.action(pooled),
+                "reason_observed_logits": self.reason(pooled),
+            }
+
+    model = TinyProfileModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    batch = {
+        "image": torch.randn(1, 3, 2, 2),
+        "action": torch.zeros(1, 4),
+        "reason": torch.zeros(1, 21),
+    }
+    events = []
+    record = measure_real_phase_d(
+        model, optimizer, [batch], device=torch.device("cpu"), batch_size=1,
+        grad_accum=1, num_workers=0, progress_callback=events.append,
+        progress_every=25,
+    )
+
+    assert record["status"] == "PASS"
+    assert [event["step"] for event in events] == [25, 50, 75, 100, 120]
+    assert events[-1]["measured_steps_complete"] == 100
 
 
 def test_real_profiler_reuses_one_grounding_index_and_unpacks_every_loader_split() -> None:

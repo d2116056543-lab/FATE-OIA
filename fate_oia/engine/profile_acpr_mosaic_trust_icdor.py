@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
+import os
 import statistics
 import time
 from pathlib import Path
@@ -72,9 +74,19 @@ def profile_runtime_candidates(
     measure: Callable[[dict[str, Any], int], Mapping[str, Any]],
     *,
     max_reserved_gb: float,
+    progress_callback: Callable[[Mapping[str, Any]], None] | None = None,
+    completed_records: Iterable[Mapping[str, Any]] = (),
+    checkpoint_callback: Callable[[Iterable[Mapping[str, Any]]], None] | None = None,
 ) -> dict[str, Any]:
     """Execute every configured batch/worker combination; never accept synthetic records."""
-    records: list[dict[str, Any]] = []
+    records = [dict(record) for record in completed_records]
+    completed = {
+        (int(record["batch_size"]), int(record["grad_accum"]), int(record["num_workers"]))
+        for record in records
+        if record.get("measurement_origin") == "real_phase_d_execution"
+        and record.get("status") in {"PASS", "OOM"}
+        and all(key in record for key in ("batch_size", "grad_accum", "num_workers"))
+    }
     for raw_candidate in candidates:
         candidate = dict(raw_candidate)
         if "batch_size" not in candidate or "grad_accum" not in candidate:
@@ -82,7 +94,24 @@ def profile_runtime_candidates(
         for workers in worker_candidates:
             if int(workers) < 0:
                 raise ICDORProfileError("num_workers candidate cannot be negative")
+            key = (int(candidate["batch_size"]), int(candidate["grad_accum"]), int(workers))
+            if key in completed:
+                if progress_callback is not None:
+                    progress_callback({
+                        "event": "candidate_resume_skip",
+                        "batch_size": key[0],
+                        "grad_accum": key[1],
+                        "num_workers": key[2],
+                    })
+                continue
             try:
+                if progress_callback is not None:
+                    progress_callback({
+                        "event": "candidate_start",
+                        "batch_size": int(candidate["batch_size"]),
+                        "grad_accum": int(candidate["grad_accum"]),
+                        "num_workers": int(workers),
+                    })
                 record = dict(measure(candidate, int(workers)))
             except torch.cuda.OutOfMemoryError as error:
                 record = {
@@ -95,6 +124,17 @@ def profile_runtime_candidates(
                 }
             record["measurement_origin"] = "real_phase_d_execution"
             records.append(record)
+            completed.add(key)
+            if checkpoint_callback is not None:
+                checkpoint_callback(records)
+            if progress_callback is not None:
+                progress_callback({
+                    "event": "candidate_end",
+                    "batch_size": int(candidate["batch_size"]),
+                    "grad_accum": int(candidate["grad_accum"]),
+                    "num_workers": int(workers),
+                    "status": str(record.get("status", "UNKNOWN")),
+                })
     selected = select_runtime_candidate(records, max_reserved_gb=max_reserved_gb)
     return {
         "pass": True,
@@ -136,10 +176,14 @@ def measure_real_phase_d(
     num_workers: int,
     warmup_steps: int = 20,
     measured_steps: int = 100,
+    progress_callback: Callable[[Mapping[str, Any]], None] | None = None,
+    progress_every: int = 25,
 ) -> dict[str, Any]:
     """Measure actual DINO->factor->reason->route forward, backward, and optimizer steps."""
     if warmup_steps < 20 or measured_steps < 100:
         raise ICDORProfileError("IC-DOR profiler requires 20 warmup and 100 measured steps")
+    if progress_every <= 0:
+        raise ICDORProfileError("IC-DOR profiler progress_every must be positive")
     model.train()
     batches = iter(_as_batch(loader))
     if device.type == "cuda":
@@ -181,6 +225,22 @@ def measure_real_phase_d(
         if index >= warmup_steps:
             step_times.append(end - start)
             data_wait.append(loaded - last_end)
+        if progress_callback is not None and (
+            (index + 1) % progress_every == 0 or index + 1 == warmup_steps + measured_steps
+        ):
+            progress_callback({
+                "event": "step",
+                "batch_size": int(batch_size),
+                "grad_accum": int(grad_accum),
+                "num_workers": int(num_workers),
+                "step": int(index + 1),
+                "total_steps": int(warmup_steps + measured_steps),
+                "measured_steps_complete": int(max(0, index + 1 - warmup_steps)),
+                "gpu_reserved_gb": (
+                    float(torch.cuda.max_memory_reserved(device) / 2**30)
+                    if device.type == "cuda" else 0.0
+                ),
+            })
         last_end = end
     sorted_steps = sorted(step_times)
     p95_index = min(len(sorted_steps) - 1, math.ceil(0.95 * len(sorted_steps)) - 1)
@@ -221,6 +281,13 @@ def write_runtime_selection(output: str | Path, records: Iterable[Mapping[str, A
     return payload
 
 
+def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(dict(payload), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="IC-DOR real Phase-D runtime profiler")
     parser.add_argument("--config", required=True)
@@ -244,6 +311,32 @@ def main() -> None:
     warmup = int(config["runtime"]["warmup_profile_steps"])
     measured = int(config["runtime"]["timed_profile_steps"])
     profile_root = Path(args.output).resolve().parent / "runtime_profile_data"
+    output_path = Path(args.output)
+    partial_path = output_path.with_name(output_path.stem + "_partial.json")
+    config_sha256 = hashlib.sha256(Path(args.config).read_bytes()).hexdigest()
+    completed_records: list[dict[str, Any]] = []
+    if partial_path.is_file():
+        partial = json.loads(partial_path.read_text(encoding="utf-8"))
+        if (
+            partial.get("schema_version") != "icdor_runtime_profile_partial.v1"
+            or partial.get("config_sha256") != config_sha256
+            or partial.get("runtime_candidates") != runtime_candidates
+            or partial.get("worker_candidates") != worker_candidates
+        ):
+            raise ICDORProfileError("runtime profile partial checkpoint is incompatible with this request")
+        existing = partial.get("candidates")
+        if not isinstance(existing, list):
+            raise ICDORProfileError("runtime profile partial checkpoint has invalid candidates")
+        completed_records = [dict(record) for record in existing]
+
+    def checkpoint(records: Iterable[Mapping[str, Any]]) -> None:
+        _write_json_atomic(partial_path, {
+            "schema_version": "icdor_runtime_profile_partial.v1",
+            "config_sha256": config_sha256,
+            "runtime_candidates": runtime_candidates,
+            "worker_candidates": worker_candidates,
+            "candidates": [dict(record) for record in records],
+        })
     grounding_index = BDD100KGroundingIndex(config["data"]["bdd100k_root"])
 
     def measure(candidate: dict[str, Any], workers: int) -> Mapping[str, Any]:
@@ -262,6 +355,9 @@ def main() -> None:
                 model, optimizer, loader, device=device, batch_size=batch_size,
                 grad_accum=grad_accum, num_workers=workers,
                 warmup_steps=warmup, measured_steps=measured,
+                progress_callback=lambda row: print(
+                    "icdor_profile " + json.dumps(dict(row), sort_keys=True), flush=True
+                ),
             )
         finally:
             del optimizer, model, loader
@@ -270,8 +366,14 @@ def main() -> None:
     payload = profile_runtime_candidates(
         runtime_candidates, worker_candidates, measure,
         max_reserved_gb=float(config["training"].get("max_reserved_vram_gb", args.max_reserved_gb)),
+        progress_callback=lambda row: print(
+            "icdor_profile " + json.dumps(dict(row), sort_keys=True), flush=True
+        ),
+        completed_records=completed_records,
+        checkpoint_callback=checkpoint,
     )
-    Path(args.output).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _write_json_atomic(output_path, payload)
+    partial_path.unlink(missing_ok=True)
     print(json.dumps(payload, indent=2, sort_keys=True))
 
 

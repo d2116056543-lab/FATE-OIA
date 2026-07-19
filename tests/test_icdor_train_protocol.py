@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import hashlib
+import json
 
 import pytest
 import torch
@@ -16,6 +17,7 @@ from fate_oia.engine.train_acpr_mosaic_trust_icdor import (
     _factor_audit_rows,
     _build_rank_queues,
     _load_resume,
+    _load_runtime_selection,
     _load_warm_start_model_only,
     _pending_evidence_document,
     _pilot_semantic_validation,
@@ -47,6 +49,24 @@ def test_full_cli_cannot_bypass_review_pass() -> None:
     source = Path("fate_oia/engine/train_acpr_mosaic_trust_icdor.py").read_text(encoding="utf-8")
     assert "if not args.pilot and not args.require_review_pass" in source
     assert "full training requires --require_review_pass" in source
+
+
+def test_partial_runtime_selection_is_explicitly_pilot_only(tmp_path: Path) -> None:
+    partial = tmp_path / "partial.json"
+    partial.write_text(json.dumps({
+        "status": "PARTIAL_DIAGNOSTIC",
+        "selected": {"status": "PASS", "batch_size": 8, "grad_accum": 4},
+    }), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="diagnostic-pilot-only"):
+        _load_runtime_selection(partial, pilot=False, allow_partial_runtime_selection=True)
+    with pytest.raises(RuntimeError, match="diagnostic-pilot-only"):
+        _load_runtime_selection(partial, pilot=True, allow_partial_runtime_selection=False)
+    payload, scope = _load_runtime_selection(
+        partial, pilot=True, allow_partial_runtime_selection=True,
+    )
+    assert payload["selected"]["batch_size"] == 8
+    assert scope == "diagnostic_partial"
 
 
 def test_pilot_epoch_limit_is_checked_before_loader_and_model_initialization() -> None:

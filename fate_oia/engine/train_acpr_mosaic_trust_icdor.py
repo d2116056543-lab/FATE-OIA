@@ -428,6 +428,29 @@ def _pilot_semantic_validation(
     }
 
 
+def _load_runtime_selection(
+    path: Path,
+    *,
+    pilot: bool,
+    allow_partial_runtime_selection: bool,
+) -> tuple[dict[str, Any], str]:
+    """Load a full profile or an explicitly non-promotable diagnostic profile."""
+    if not path.is_file():
+        raise RuntimeError("IC-DOR requires a profiler-produced runtime selection")
+    runtime = json.loads(path.read_text(encoding="utf-8"))
+    status = runtime.get("status")
+    if status in {"PASS", "selected"}:
+        return runtime, "full_profile"
+    if status == "PARTIAL_DIAGNOSTIC":
+        if not pilot or not allow_partial_runtime_selection:
+            raise RuntimeError("IC-DOR partial runtime selection is diagnostic-pilot-only")
+        selected = runtime.get("selected")
+        if not isinstance(selected, dict) or selected.get("status") != "PASS":
+            raise RuntimeError("IC-DOR partial runtime selection lacks one real passing candidate")
+        return runtime, "diagnostic_partial"
+    raise RuntimeError("IC-DOR runtime selection is not passing")
+
+
 def _write_provisional_certificate_this_epoch(
     *, write_provisional: bool, freeze_certificate: bool
 ) -> bool:
@@ -2354,6 +2377,7 @@ def main() -> None:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--gradient_accumulation_steps", type=int)
     parser.add_argument("--runtime_selection")
+    parser.add_argument("--allow_partial_runtime_selection", action="store_true")
     parser.add_argument("--review_pass")
     parser.add_argument("--require_review_pass", action="store_true")
     parser.add_argument("--pilot", action="store_true")
@@ -2396,11 +2420,11 @@ def main() -> None:
         torch.backends.cuda.matmul.allow_tf32 = bool(config["training"]["tf32"])
 
     runtime_path = Path(args.runtime_selection or config["runtime"]["runtime_selection_path"])
-    if not runtime_path.is_file():
-        raise RuntimeError("IC-DOR requires a profiler-produced runtime selection")
-    runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
-    if runtime.get("status") not in {"PASS", "selected"}:
-        raise RuntimeError("IC-DOR runtime selection is not passing")
+    runtime, runtime_selection_scope = _load_runtime_selection(
+        runtime_path,
+        pilot=bool(args.pilot),
+        allow_partial_runtime_selection=bool(args.allow_partial_runtime_selection),
+    )
     batch_size = int(args.batch_size or runtime["batch_size"])
     grad_accum = int(args.gradient_accumulation_steps or runtime["grad_accum"])
     if args.require_review_pass:
@@ -2491,6 +2515,7 @@ def main() -> None:
         "config_sha256": _sha256_file(config_path), "runtime_selection_sha256": _sha256_file(runtime_path),
         "batch_size": batch_size, "gradient_accumulation_steps": grad_accum,
         "effective_batch": batch_size * grad_accum, "pilot": bool(args.pilot),
+        "runtime_selection_scope": runtime_selection_scope,
     }
     source_manifest_path = Path(".review/icdor_source_manifest.json")
     if not source_manifest_path.is_file():
