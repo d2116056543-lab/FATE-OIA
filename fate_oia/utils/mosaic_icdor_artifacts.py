@@ -619,7 +619,9 @@ def _matched_control_provenance_valid(arms: Any) -> bool:
             for source in identity_sources
         )
         or identity_arm.get("identity_source_factor_indices") != [source["index"] for source in identity_sources]
-        or identity_names != [source["name"] for source in identity_sources]
+        # Display names are deliberately sorted independently in the compact
+        # summary.  Their semantic pairing is carried by identity_sources.
+        or sorted(identity_names) != sorted(source["name"] for source in identity_sources)
         or sorted(identity_types) != sorted({source["type"] for source in identity_sources})
         or sorted(identity_regions) != sorted({source["region"] for source in identity_sources})
     ):

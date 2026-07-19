@@ -126,7 +126,7 @@ def test_matched_control_provenance_requires_true_identity_and_nonzero_offsets()
 
 def test_matched_control_provenance_allows_multiple_aligned_wrong_identity_sources() -> None:
     arms = _matched_arms()
-    arms[0]["identity_source_factor_names"] = ["identity_factor", "another_identity_factor"]
+    arms[0]["identity_source_factor_names"] = ["another_identity_factor", "identity_factor"]
     arms[0]["identity_source_factor_indices"] = [1, 2]
     arms[0]["identity_sources"] = [
         {"index": 1, "name": "identity_factor", "type": "object", "region": "front_center"},
