@@ -777,10 +777,23 @@ def functional_hard_gates(
     )
     checks["v5_target_utility_cadence"] = "PASS"
     checks["artifact_schema_v5"] = "PASS"
-    evidence["batch_field_reuse"] = _require_source_tokens(
-        root / "fate_oia" / "models" / "mosaic_batch_field_reuse.py",
-        ("BatchLocalDinoFieldReuse", "no cross-batch persistence"),
-    )
+    evidence["batch_field_reuse"] = {
+        "field": _require_source_tokens(
+            root / "fate_oia" / "models" / "mosaic_batch_field_reuse.py",
+            ("BatchLocalDinoFieldReuse", "no cross-batch persistence"),
+        ),
+        # Factor credibility is a measurement audit. Its five ablations must
+        # reuse the batch-local DINO/factor field and cannot replay unrelated
+        # action/reason target branches merely because the full model can.
+        "factor_only_model": _require_source_tokens(
+            model_path,
+            ("prepare_factor_audit_context", "forward_factor_audit", "factor_pyramid"),
+        ),
+        "factor_only_collector": _require_source_tokens(
+            root / "fate_oia" / "engine" / "mosaic_icdor_audit_collectors.py",
+            ("_factor_audit_context", "_factor_audit_forward", "view_context", "mirror_context"),
+        ),
+    }
     checks["batch_field_reuse"] = "PASS"
     credo_model = _require_source_tokens(
         model_path,

@@ -349,6 +349,55 @@ def test_target_controls_reuse_only_batch_local_static_state() -> None:
     assert controlled["factor_override_recomputed_typed_coordinates"].item() == 1.0
 
 
+def test_factor_audit_context_matches_full_outputs_without_target_decoders() -> None:
+    """Factor credibility ablations must not replay unrelated target branches."""
+    torch.manual_seed(67)
+    model = _model().eval()
+    images = torch.randn(2, 3, 360, 640)
+    modes = ("full", "content_only", "prior_only", "query_shuffled", "image_shuffled")
+    with torch.no_grad():
+        direct = {
+            mode: model(images, factor_ablation_mode=mode, return_masks=True)
+            for mode in modes
+        }
+
+    calls = {"dino": 0, "factor": 0, "action": 0, "reason": 0, "extractor": 0}
+    hooks = [
+        model.dino.register_forward_hook(lambda *_: calls.__setitem__("dino", calls["dino"] + 1)),
+        model.factor_visual_pyramid.register_forward_hook(lambda *_: calls.__setitem__("factor", calls["factor"] + 1)),
+        model.action_visual_pyramid.register_forward_hook(lambda *_: calls.__setitem__("action", calls["action"] + 1)),
+        model.reason_visual_pyramid.register_forward_hook(lambda *_: calls.__setitem__("reason", calls["reason"] + 1)),
+        model.factor_extractor.register_forward_hook(lambda *_: calls.__setitem__("extractor", calls["extractor"] + 1)),
+    ]
+    try:
+        # A distinct tensor identity ensures this test counts the audit's own
+        # batch-local DINO field rather than reusing the direct baseline field.
+        audit_images = images.clone()
+        with torch.no_grad():
+            context = model.prepare_factor_audit_context(audit_images)
+            factor_only = {
+                mode: model.forward_factor_audit(
+                    audit_images,
+                    factor_ablation_mode=mode,
+                    context=context,
+                )
+                for mode in modes
+            }
+    finally:
+        for hook in hooks:
+            hook.remove()
+
+    for mode in modes:
+        for key in (
+            "factor_presence_prob",
+            "factor_visibility_prob",
+            "factor_soft_masks",
+            "prototype_weights",
+        ):
+            torch.testing.assert_close(factor_only[mode][key], direct[mode][key])
+    assert calls == {"dino": 1, "factor": 1, "action": 0, "reason": 0, "extractor": 5}
+
+
 def test_credibility_and_fine_transport_config_change_the_real_forward_path() -> None:
     config = load_config("configs/fate_oia_train_360x640_acpr_mosaic_trust_v3_icdor.yaml")
     config["model"]["action_route"].update(

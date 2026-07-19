@@ -395,6 +395,92 @@ class MOSAICTrustICDORModel(nn.Module):
         return value
 
     @torch.no_grad()
+    def prepare_factor_audit_context(
+        self,
+        images: torch.Tensor,
+        *,
+        precomputed_dino_field: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Prepare one batch-local factor field for all visual credibility ablations.
+
+        Factor credibility only consumes factor measurement outputs.  Replaying
+        action/reason pyramids for content/prior/query/image ablations both adds
+        cost and risks obscuring the audit's actual scope.  This context holds
+        only the current image batch's DINO field and factor pyramid; it is never
+        persisted or reused across batches.
+        """
+        if self.training or torch.is_grad_enabled():
+            raise RuntimeError("IC-DOR factor audit context is evaluation-only under torch.no_grad")
+        field = self._batch_field_reuse(images) if precomputed_dino_field is None else precomputed_dino_field
+        if not isinstance(field, Mapping) or "patch_tokens_by_layer" not in field or "grid_hw" not in field:
+            raise ValueError("IC-DOR factor audit requires a valid batch-local DINO field")
+        patch_tokens = field["patch_tokens_by_layer"]
+        if not isinstance(patch_tokens, torch.Tensor) or patch_tokens.shape[0] != images.shape[0]:
+            raise ValueError("IC-DOR factor audit field does not match image batch")
+        if patch_tokens.device != images.device:
+            raise ValueError("IC-DOR factor audit field must remain on the image device")
+        return {
+            "schema_version": "mosaic_icdor_factor_audit_context.v1",
+            "batch_size": int(images.shape[0]),
+            "spatial_shape": tuple(images.shape[1:]),
+            "device": str(images.device),
+            "field": field,
+            "factor_pyramid": self.factor_adapter(self._features(self.factor_visual_pyramid(patch_tokens))),
+        }
+
+    @torch.no_grad()
+    def forward_factor_audit(
+        self,
+        images: torch.Tensor,
+        *,
+        factor_ablation_mode: str = "full",
+        context: Mapping[str, Any] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Run a factor-only audit ablation without action/reason target decoders.
+
+        The returned fields are intentionally the exact factor fields consumed by
+        ``collect_factor_audit``.  Its five ablations differ only in the same
+        prior/query/image operations used by ``forward``; this keeps audit
+        metrics numerically identical while avoiding unrelated target work.
+        """
+        if self.training or torch.is_grad_enabled():
+            raise RuntimeError("IC-DOR factor audit forward is evaluation-only under torch.no_grad")
+        if factor_ablation_mode not in {"full", "content_only", "prior_only", "query_shuffled", "image_shuffled"}:
+            raise ValueError("IC-DOR factor audit ablation mode is invalid")
+        if context is None:
+            context = self.prepare_factor_audit_context(images)
+        required = {"schema_version", "batch_size", "spatial_shape", "device", "field", "factor_pyramid"}
+        missing = required.difference(context)
+        if missing or context.get("schema_version") != "mosaic_icdor_factor_audit_context.v1":
+            raise ValueError(f"IC-DOR factor audit context is invalid: missing={sorted(missing)}")
+        if int(context["batch_size"]) != images.shape[0] or tuple(context["spatial_shape"]) != tuple(images.shape[1:]):
+            raise ValueError("IC-DOR factor audit context does not match image batch")
+        if str(context["device"]) != str(images.device):
+            raise ValueError("IC-DOR factor audit context must remain on the image device")
+        factor_pyramid = context["factor_pyramid"]
+        if not isinstance(factor_pyramid, Mapping):
+            raise ValueError("IC-DOR factor audit context lacks its factor pyramid")
+        factor_input = {
+            key: value.roll(shifts=1, dims=0) if factor_ablation_mode == "image_shuffled" else value
+            for key, value in factor_pyramid.items()
+        }
+        prior_mode = factor_ablation_mode if factor_ablation_mode in {"content_only", "prior_only"} else "full"
+        query_permutation = (
+            torch.roll(torch.arange(self.factor_certificate_tier.numel(), device=images.device), shifts=1)
+            if factor_ablation_mode == "query_shuffled" else None
+        )
+        output = self.factor_extractor(factor_input, prior_mode=prior_mode, query_permutation=query_permutation)
+        return {
+            key: output[key]
+            for key in (
+                "factor_presence_prob",
+                "factor_visibility_prob",
+                "factor_soft_masks",
+                "prototype_weights",
+            )
+        }
+
+    @torch.no_grad()
     def prepare_intervention_context(
         self,
         images: torch.Tensor,

@@ -21,6 +21,8 @@ def test_audit_enforces_v5_credibility_and_schedule_contracts() -> None:
     assert "pu_gate=model.reason_pu_gate" in source
     assert "factor_semantic_contract" in source
     assert "factor_audit_aligned_loss_chain" in source
+    assert "factor_only_model" in source
+    assert "factor_only_collector" in source
     assert "labelwise_pu" in source
     assert "route_distribution * route_mass" in source
     assert "factor_prior_presence_logits" in source

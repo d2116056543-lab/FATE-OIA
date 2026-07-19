@@ -526,6 +526,40 @@ def _forward(model: torch.nn.Module, images: torch.Tensor, mode: str, forward_kw
     return output
 
 
+def _factor_audit_context(model: torch.nn.Module, images: torch.Tensor) -> tuple[Mapping[str, Any] | None, Any | None]:
+    """Use the real model's factor-only path when it is available.
+
+    Small test doubles intentionally keep the legacy full-forward fallback.  The
+    production IC-DOR model supplies both methods, so its five factor ablations
+    share a single DINO/factor measurement rather than replaying target branches.
+    """
+    prepare = getattr(model, "prepare_factor_audit_context", None)
+    factor_forward = getattr(model, "forward_factor_audit", None)
+    if callable(prepare) and callable(factor_forward):
+        context = prepare(images)
+        if not isinstance(context, Mapping):
+            raise ValueError("IC-DOR factor audit context must be a mapping")
+        return context, factor_forward
+    return None, None
+
+
+def _factor_audit_forward(
+    model: torch.nn.Module,
+    images: torch.Tensor,
+    mode: str,
+    forward_kwargs: Mapping[str, Any],
+    *,
+    context: Mapping[str, Any] | None,
+    factor_forward: Any | None,
+) -> Mapping[str, Any]:
+    if context is None or factor_forward is None:
+        return _forward(model, images, mode, forward_kwargs)
+    output = factor_forward(images, factor_ablation_mode=mode, context=context)
+    if not isinstance(output, Mapping):
+        raise ValueError("IC-DOR factor-only audit forward must return a mapping")
+    return output
+
+
 def _tensor(output: Mapping[str, Any], key: str, *, rows: int, columns: int | None = None) -> torch.Tensor:
     value = output.get(key)
     if not isinstance(value, torch.Tensor) or value.shape[0] != rows:
@@ -725,7 +759,13 @@ def collect_factor_audit(
                 weak = supervision["weak_negative_mask"].detach().cpu()
             geometry_known = _tensor(grounding, "geometry_known_mask", rows=images.shape[0], columns=factor_count).bool()
             geometry = _tensor(grounding, "geometry_masks", rows=images.shape[0], columns=factor_count)
-            outputs = {mode: _forward(model, images, mode, kwargs) for mode in _ABLATION_MODES}
+            factor_context, factor_forward = _factor_audit_context(model, images)
+            outputs = {
+                mode: _factor_audit_forward(
+                    model, images, mode, kwargs, context=factor_context, factor_forward=factor_forward,
+                )
+                for mode in _ABLATION_MODES
+            }
             full = outputs["full"]
             views = batch.get("audit_views")
             if not isinstance(views, torch.Tensor) or views.ndim != images.ndim + 1 or views.shape[0] != images.shape[0] or views.shape[1] < 2:
@@ -733,8 +773,16 @@ def collect_factor_audit(
             mirror_view = batch.get("audit_mirror_view")
             if not isinstance(mirror_view, torch.Tensor) or mirror_view.shape != images.shape:
                 raise ValueError("IC-DOR factor audit requires a registered audit_mirror_view per image")
-            view_output = _forward(model, views[:, 1].to(device), "full", kwargs)
-            mirror_output = _forward(model, mirror_view.to(device), "full", kwargs)
+            view_images = views[:, 1].to(device)
+            view_context, view_factor_forward = _factor_audit_context(model, view_images)
+            view_output = _factor_audit_forward(
+                model, view_images, "full", kwargs, context=view_context, factor_forward=view_factor_forward,
+            )
+            mirror_images = mirror_view.to(device)
+            mirror_context, mirror_factor_forward = _factor_audit_context(model, mirror_images)
+            mirror_output = _factor_audit_forward(
+                model, mirror_images, "full", kwargs, context=mirror_context, factor_forward=mirror_factor_forward,
+            )
             collected["target"].append(target)
             collected["known"].append(known)
             collected["weak"].append(weak)

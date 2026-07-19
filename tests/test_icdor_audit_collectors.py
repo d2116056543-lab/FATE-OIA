@@ -38,6 +38,8 @@ class _AuditModel(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.grad_enabled_during_forward: list[bool] = []
+        self.factor_audit_context_calls = 0
+        self.factor_audit_modes: list[str] = []
         self.action_router = SimpleNamespace(
             candidate_edge_mask=torch.ones(2, 2, 2, dtype=torch.bool),
             edge_admission_mask=torch.tensor(
@@ -47,6 +49,22 @@ class _AuditModel(torch.nn.Module):
 
     def set_edge_admission(self, mask: torch.Tensor) -> None:
         self.action_router.edge_admission_mask = mask.detach().clone()
+
+    def prepare_factor_audit_context(self, images: torch.Tensor) -> dict[str, int]:
+        self.factor_audit_context_calls += 1
+        return {"batch_size": int(images.shape[0])}
+
+    def forward_factor_audit(
+        self,
+        images: torch.Tensor,
+        *,
+        factor_ablation_mode: str,
+        context: dict[str, int],
+        **_: object,
+    ) -> dict[str, torch.Tensor | dict[str, torch.Tensor]]:
+        assert context["batch_size"] == images.shape[0]
+        self.factor_audit_modes.append(factor_ablation_mode)
+        return self.forward(images, factor_ablation_mode=factor_ablation_mode)
 
     def forward(self, images: torch.Tensor, *, factor_ablation_mode: str = "full", **_) -> dict[str, torch.Tensor | dict[str, torch.Tensor]]:
         self.grad_enabled_during_forward.append(torch.is_grad_enabled())
@@ -133,6 +151,11 @@ class ICDORAuditCollectorsTest(unittest.TestCase):
 
         self.assertTrue(model.grad_enabled_during_forward)
         self.assertFalse(any(model.grad_enabled_during_forward))
+        self.assertEqual(model.factor_audit_context_calls, 3)
+        self.assertEqual(
+            model.factor_audit_modes,
+            ["full", "content_only", "prior_only", "query_shuffled", "image_shuffled", "full", "full"],
+        )
 
         self.assertEqual(result["source_split"], "train_audit")
         self.assertEqual(
