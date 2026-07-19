@@ -66,6 +66,18 @@ def test_dense_continuous_masks_use_topk_slots_and_wrong_factor_identity() -> No
         assert torch.count_nonzero(left & right) == 0
 
 
+def test_factor_control_spec_reads_v5_weak_region_declaration() -> None:
+    module = importlib.import_module("fate_oia.engine.mosaic_icdor_audit_collectors")
+    model = type("Model", (), {
+        "ontology": {
+            "factors": ({"name": "signal", "type": "point", "weak_regions": ["upper_front"]},)
+        }
+    })()
+    assert module.factor_control_spec(model, factor_name="signal", factor_index=0) == {
+        "factor": "signal", "factor_type": "point", "region": "upper_front",
+    }
+
+
 def test_transfer_admission_must_beat_identity_and_spatial_controls_separately() -> None:
     module = importlib.import_module("fate_oia.engine.mosaic_target_transfer_metrics")
     selected = torch.tensor([[[0.9]], [[0.8]], [[0.2]], [[0.1]]])

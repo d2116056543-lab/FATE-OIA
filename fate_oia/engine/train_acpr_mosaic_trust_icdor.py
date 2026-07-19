@@ -2762,7 +2762,15 @@ def main() -> None:
                 full_target_transfer if full_target_transfer is not None else online_target_transfer
             )
             transfer_summary = {
-                "epoch": epoch, "available": True, "source_split": "audit_target",
+                # Keep a flat, validated provenance contract for the active
+                # online/full transfer while retaining both payloads below for
+                # diagnostic comparison.
+                "epoch": epoch,
+                "available": True,
+                "source_split": "audit_target",
+                "schema_version": target_utility_transfer["schema_version"],
+                "audit_level": "full" if full_target_transfer is not None else "online",
+                **target_utility_transfer["summary"],
                 "online_target_transfer": {
                     "schema_version": online_target_transfer["schema_version"],
                     "collection_runtime": online_target_transfer["collection_runtime"],

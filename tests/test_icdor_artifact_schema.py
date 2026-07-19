@@ -44,16 +44,23 @@ def _matched_arms() -> list[dict[str, object]]:
         "available_sample_count": 2,
         "max_mass_error": 0.0,
         "max_overlap": 0.0,
+        "control_support_method": "topk_continuous_evidence",
+        "control_evidence_slots": 16,
+        "selected_support_count_mean": 16.0,
+        "selected_mass_fraction_mean": 0.25,
+        "source_region_mass_total": 8.0,
+        "selected_factor_indices": [0],
     }
     return [
         {
             **common,
             "control_type": "same_type_identity",
             "identity_source_factor_names": ["identity_factor"],
+            "identity_source_factor_indices": [1],
             "identity_source_factor_types": ["object"],
-            "identity_source_regions": ["front"],
+            "identity_source_regions": ["front_center"],
             "factor_type": "object",
-            "region": "front",
+            "region": "front_center",
             "spatial_offsets": [],
         },
         *[
@@ -61,10 +68,11 @@ def _matched_arms() -> list[dict[str, object]]:
                 **common,
                 "control_type": "spatial_roll",
                 "identity_source_factor_names": [],
+                "identity_source_factor_indices": [],
                 "identity_source_factor_types": [],
                 "identity_source_regions": [],
                 "factor_type": "object",
-                "region": "front",
+                "region": "front_center",
                 "spatial_offsets": [[offset, offset + 1]],
             }
             for offset in range(3)
@@ -95,6 +103,12 @@ def test_matched_control_provenance_requires_true_identity_and_nonzero_offsets()
     unavailable = deepcopy(valid)
     unavailable[0]["available_sample_count"] = 0
     mutations.append(unavailable)
+    reused_selected_factor = deepcopy(valid)
+    reused_selected_factor[0]["identity_source_factor_indices"] = [0]
+    mutations.append(reused_selected_factor)
+    unspecified_region = deepcopy(valid)
+    unspecified_region[0]["region"] = "unspecified"
+    mutations.append(unspecified_region)
 
     assert all(_matched_control_provenance_valid(arms) is False for arms in mutations)
 

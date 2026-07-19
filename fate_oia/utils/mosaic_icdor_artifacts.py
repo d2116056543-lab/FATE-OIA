@@ -597,13 +597,19 @@ def _matched_control_provenance_valid(arms: Any) -> bool:
     identity_regions = identity_arm.get("identity_source_regions")
     selected_type = identity_arm.get("factor_type")
     selected_region = identity_arm.get("region")
+    selected_indices = identity_arm.get("selected_factor_indices")
     if (
         not isinstance(identity_names, list) or not identity_names
         or not isinstance(identity_types, list) or len(identity_types) != len(identity_names)
         or not isinstance(identity_regions, list) or len(identity_regions) != len(identity_names)
-        or not selected_type or not selected_region
+        or not selected_type or selected_region not in {
+            "upper_front", "front_center", "left_corridor", "right_corridor", "center_corridor"
+        }
+        or not isinstance(selected_indices, list) or len(selected_indices) != 1
+        or not isinstance(selected_indices[0], int)
         or any(value != selected_type for value in identity_types)
         or any(value != selected_region for value in identity_regions)
+        or selected_indices[0] in identity_arm.get("identity_source_factor_indices", [])
     ):
         return False
     for arm in spatial:
@@ -625,6 +631,16 @@ def _matched_control_provenance_valid(arms: Any) -> bool:
         and float(arm["max_mass_error"]) <= 0.05
         and arm.get("max_overlap") is not None
         and float(arm["max_overlap"]) == 0.0
+        and arm.get("control_support_method") == "topk_continuous_evidence"
+        and isinstance(arm.get("control_evidence_slots"), int)
+        and int(arm["control_evidence_slots"]) > 0
+        and isinstance(arm.get("selected_support_count_mean"), (int, float))
+        and float(arm["selected_support_count_mean"]) > 0.0
+        and isinstance(arm.get("selected_mass_fraction_mean"), (int, float))
+        and 0.0 < float(arm["selected_mass_fraction_mean"]) <= 1.0
+        and isinstance(arm.get("source_region_mass_total"), (int, float))
+        and float(arm["source_region_mass_total"]) > 0.0
+        and arm.get("selected_factor_indices") == selected_indices
         for arm in arms
     )
 
@@ -797,15 +813,29 @@ def validate_icdor_artifact_schema(
             or transfer.get("audit_level") not in {"online", "full"}
         ):
             errors.append(f"epoch_{epoch:03d} V5 online target transfer is unavailable or lacks audit provenance")
-        if not transfer_rows or any(
-            row.get("available") is not True
-            or row.get("source_split") != "audit_target"
-            or row.get("audit_level") not in {"online", "full"}
-            or not transfer_fields <= set(row)
-            or row.get("tes_identity") is None
-            or row.get("tes_spatial") is None
-            or not _matched_control_provenance_valid(row.get("matched_control_arms"))
-            for row in transfer_rows
+        available_transfer_rows = [row for row in transfer_rows if row.get("available") is True]
+        unavailable_transfer_rows = [row for row in transfer_rows if row.get("available") is not True]
+        if (
+            not transfer_rows
+            or not available_transfer_rows
+            or any(
+                row.get("source_split") != "audit_target"
+                or row.get("audit_level") not in {"online", "full"}
+                or not transfer_fields <= set(row)
+                or row.get("tes_identity") is None
+                or row.get("tes_spatial") is None
+                or not _matched_control_provenance_valid(row.get("matched_control_arms"))
+                for row in available_transfer_rows
+            )
+            # Candidate edges without an honest same-type/same-region control
+            # must remain explicit abstentions, not fake zero-effect rows.
+            or any(
+                row.get("source_split") != "audit_target"
+                or row.get("audit_level") not in {"online", "full"}
+                or not isinstance(row.get("unavailable_reason"), str)
+                or not row.get("unavailable_reason")
+                for row in unavailable_transfer_rows
+            )
         ):
             errors.append(f"epoch_{epoch:03d} V5 target transfer rows are incomplete")
         visual_credibility = json.loads((epoch_dir / "visual_credibility.json").read_text(encoding="utf-8"))

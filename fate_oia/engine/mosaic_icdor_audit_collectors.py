@@ -224,6 +224,7 @@ def build_batch_matched_factor_selected_and_control_overrides(
                     "arm_index": arm_index,
                     "sample_index": sample_index,
                     "factor": factor,
+                    "selected_factor_index": factor_index,
                     "factor_type": factor_type,
                     "region": region,
                     "control_type": "unavailable_noop",
@@ -285,6 +286,7 @@ def build_batch_matched_factor_selected_and_control_overrides(
                 "arm_index": arm_index,
                 "sample_index": sample_index,
                 "factor": factor,
+                "selected_factor_index": factor_index,
                 "factor_type": factor_type,
                 "region": region,
                 "control_type": control["control_type"],
@@ -317,10 +319,15 @@ def factor_control_spec(model: torch.nn.Module, *, factor_name: str, factor_inde
     if isinstance(factors, Sequence) and factor_index < len(factors) and isinstance(factors[factor_index], Mapping):
         factor = factors[factor_index]
         if str(factor.get("name", factor_name)) == factor_name:
+            declared_regions = factor.get("weak_regions")
+            if isinstance(declared_regions, Sequence) and not isinstance(declared_regions, (str, bytes)):
+                declared_region = str(declared_regions[0]) if len(declared_regions) == 1 else "unspecified"
+            else:
+                declared_region = "unspecified"
             return {
                 "factor": factor_name,
                 "factor_type": str(factor.get("type", "unknown")),
-                "region": str(factor.get("spatial", factor.get("region_prior", "unspecified"))),
+                "region": str(factor.get("spatial", factor.get("region_prior", declared_region))),
             }
     return {"factor": factor_name, "factor_type": "unknown", "region": "unspecified"}
 
@@ -398,6 +405,10 @@ def summarize_matched_control_arms(arm_records: Sequence[Sequence[Mapping[str, A
                 "selected_support_count_mean": 0.0,
                 "selected_mass_fraction_mean": 0.0,
                 "source_region_mass_total": 0.0,
+                "selected_factor_indices": sorted({
+                    int(record["selected_factor_index"])
+                    for record in records if "selected_factor_index" in record
+                }),
                 "unavailable_reason": str(first.get("unavailable_reason", "insufficient_matched_controls")),
                 "identity_source_factor_indices": [],
                 "identity_source_factor_names": [],
@@ -431,6 +442,10 @@ def summarize_matched_control_arms(arm_records: Sequence[Sequence[Mapping[str, A
             "source_region_mass_total": sum(
                 float(record.get("source_region_mass", 0.0)) for record in available
             ),
+            "selected_factor_indices": sorted({
+                int(record["selected_factor_index"])
+                for record in available if "selected_factor_index" in record
+            }),
             "identity_source_factor_indices": sorted({
                 int(record["identity_source_factor_index"])
                 for record in available if "identity_source_factor_index" in record
