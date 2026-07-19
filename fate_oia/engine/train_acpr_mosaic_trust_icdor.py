@@ -454,8 +454,13 @@ def _load_runtime_selection(
 
 
 def _should_collect_full_target_transfer(*, pilot: bool, full_target_audit_due: bool) -> bool:
-    """Keep pilot target utility measurable without duplicating the formal audit."""
-    return bool(not pilot and full_target_audit_due)
+    """Run the same every-two-epoch target audit in pilot and formal runs.
+
+    The pilot is the mechanism gate, so it cannot substitute a tiny online probe
+    for the 512-row matched-control audit required to assess target effectiveness.
+    """
+    del pilot
+    return bool(full_target_audit_due)
 
 
 def _target_utility_payloads(

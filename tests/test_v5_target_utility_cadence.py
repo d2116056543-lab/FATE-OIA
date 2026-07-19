@@ -13,6 +13,8 @@ def test_target_utility_has_epoch_zero_online_and_two_epoch_full_cadence() -> No
     assert schedule.full_target_audit_due(epoch=0)
     assert not schedule.full_target_audit_due(epoch=1)
     assert schedule.full_target_audit_due(epoch=2)
+    assert trainer._should_collect_full_target_transfer(pilot=True, full_target_audit_due=True)
+    assert not trainer._should_collect_full_target_transfer(pilot=True, full_target_audit_due=False)
 
 
 def test_trainer_uses_separate_online_and_full_target_audits() -> None:
