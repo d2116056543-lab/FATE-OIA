@@ -859,13 +859,16 @@ def _edge_metrics(
     direction: str,
     random_identity: torch.Tensor,
     random_spatial: torch.Tensor,
-) -> dict[str, float]:
+) -> dict[str, float] | None:
     probability_on, probability_off, probability_random = on.sigmoid(), off.sigmoid(), random.sigmoid()
     probability_identity = random_identity.sigmoid()
     probability_spatial = random_spatial.sigmoid()
     positive = labels > 0.5
     if not bool(positive.any()) or bool(positive.all()):
-        raise ValueError("IC-DOR edge audit requires positive and negative action examples")
+        # A bounded smoke may legitimately contain only one class for an
+        # action.  It cannot estimate a target-effect metric, but it must not
+        # fabricate a zero effect or abort all independent diagnostics.
+        return None
     if direction == "support":
         evaluation_rows = positive
         signed = probability_on - probability_off
@@ -881,7 +884,7 @@ def _edge_metrics(
     else:
         raise ValueError("IC-DOR edge direction must be support or veto")
     if not bool(evaluation_rows.any()):
-        raise ValueError("IC-DOR edge audit lacks direction-specific evaluation rows")
+        return None
     tet = float(signed[evaluation_rows].mean())
     random_effect = float(random_signed[evaluation_rows].mean())
     identity_effect = float(identity_signed[evaluation_rows].mean())
@@ -1083,6 +1086,23 @@ def collect_edge_intervention_audit(
             random_identity=values["random_identity"],
             random_spatial=values["random_spatial"],
         )
+        if metrics is None:
+            edge_stats[key] = {
+                "factor": str(spec["factor"]), "action": str(spec["action"]),
+                "direction": str(spec["direction"]), "polarity": str(spec["polarity"]),
+                "available": False,
+                "unavailable_reason": "insufficient_action_class_coverage",
+                "matched_counts": {
+                    "factor_on": int(values["on"].numel()),
+                    "factor_off": int(values["off"].numel()),
+                    "equal_mass_random": int(values["random"].numel()),
+                    "same_type_identity": int(values["random_identity"].numel()),
+                    "spatial_roll": int(values["random_spatial"].numel()),
+                },
+                "matched_control_arms": summarize_matched_control_arms(control_records[key]),
+                "metrics": None, "bootstrap_ci95": None, "bootstrap_lcb95": None,
+            }
+            continue
         # Calibration gain is reported as a separate descriptive metric; it is
         # not an admission statistic and therefore has no bootstrap gate.
         replicate = {name: [] for name in metrics if name != "calibration_gain"}
@@ -1094,6 +1114,8 @@ def collect_edge_intervention_audit(
                 random_identity=values["random_identity"][indices],
                 random_spatial=values["random_spatial"][indices],
             )
+            if sampled is None:
+                raise RuntimeError("IC-DOR stratified edge bootstrap lost required class coverage")
             for name in replicate:
                 replicate[name].append(sampled[name])
         intervals = {name: {"lower": _quantile(samples, 0.025), "upper": _quantile(samples, 0.975)} for name, samples in replicate.items()}

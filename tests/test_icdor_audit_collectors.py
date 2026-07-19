@@ -223,3 +223,26 @@ class ICDORAuditCollectorsTest(unittest.TestCase):
                 "cca", "ap_delta", "isolated_edge_ap", "visual_ap",
             },
         )
+
+    def test_edge_collector_marks_single_class_smoke_as_unavailable_not_zero_effect(self) -> None:
+        batch = _batch()
+        # A one-class action slice cannot support AP or target-effect
+        # estimation.  The collector must preserve this as unavailable.
+        batch["action"][:, 0] = 1.0
+
+        result = collect_edge_intervention_audit(
+            _AuditModel(),
+            [batch],
+            factor_names=("f0", "f1"),
+            action_names=("stop", "go"),
+            edge_specs=({"factor": "f0", "action": "stop", "direction": "support", "polarity": "present"},),
+            device=torch.device("cpu"),
+            bootstrap_replicates=16,
+            bootstrap_seed=17,
+        )
+
+        edge = result["edge_stats"]["support:f0->stop"]
+        self.assertFalse(edge["available"])
+        self.assertEqual(edge["unavailable_reason"], "insufficient_action_class_coverage")
+        self.assertIsNone(edge["metrics"])
+        self.assertEqual(edge["matched_counts"]["factor_on"], 4)
