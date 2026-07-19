@@ -790,6 +790,16 @@ def _loader(
     return DataLoader(dataset, **kwargs)
 
 
+def _audit_loader_workers(config: dict[str, Any], *, train_num_workers: int) -> int:
+    """Bound sequential audit pools without reducing train-image prefetching."""
+    if train_num_workers < 0:
+        raise ValueError("train_num_workers must be non-negative")
+    audit_workers = int(config["data"].get("audit_num_workers", 1))
+    if audit_workers < 0:
+        raise ValueError("data.audit_num_workers must be non-negative")
+    return min(audit_workers, train_num_workers)
+
+
 def _subset_indices(indices: Iterable[int], limit: int | None) -> list[int]:
     ordered = list(indices)
     if limit is None or limit >= len(ordered):
@@ -1075,13 +1085,17 @@ def build_icdor_loaders(
     # A deliberately capped pilot may contain fewer samples than one batch.
     # Keep that partial batch so diagnostic smoke exercises the actual model.
     core_drop_last = not (max_train_samples is not None and len(core_dataset) < batch_size)
+    # Audit/calibration/test phases run one after another. Giving each its own
+    # full Windows worker pool starts five pools for a single training run,
+    # without improving concurrent throughput.
+    audit_workers = _audit_loader_workers(config, train_num_workers=num_workers)
     return (
         _loader(core_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, config=config,
                 generator=torch.Generator().manual_seed(seed), drop_last=core_drop_last),
-        _loader(Subset(train, audit_visual), batch_size=batch_size, shuffle=False, num_workers=num_workers, config=config),
-        _loader(Subset(train, audit_target), batch_size=batch_size, shuffle=False, num_workers=num_workers, config=config),
-        _loader(Subset(train, calib), batch_size=batch_size, shuffle=False, num_workers=num_workers, config=config),
-        _loader(Subset(test, test_indices), batch_size=batch_size, shuffle=False, num_workers=num_workers, config=config),
+        _loader(Subset(train, audit_visual), batch_size=batch_size, shuffle=False, num_workers=audit_workers, config=config),
+        _loader(Subset(train, audit_target), batch_size=batch_size, shuffle=False, num_workers=audit_workers, config=config),
+        _loader(Subset(train, calib), batch_size=batch_size, shuffle=False, num_workers=audit_workers, config=config),
+        _loader(Subset(test, test_indices), batch_size=batch_size, shuffle=False, num_workers=audit_workers, config=config),
         stats,
     )
 

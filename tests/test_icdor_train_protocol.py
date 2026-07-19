@@ -37,6 +37,7 @@ from fate_oia.engine.train_acpr_mosaic_trust_icdor import (
     compute_icdor_training_losses,
     load_config,
     _loader,
+    _audit_loader_workers,
 )
 
 
@@ -71,6 +72,14 @@ def test_capped_smoke_loader_keeps_the_only_partial_training_batch() -> None:
 
     batch = next(iter(loader))
     assert batch["image"].shape[0] == 1
+
+
+def test_audit_loaders_use_their_own_configured_worker_budget() -> None:
+    """Keep train prefetch parallel while avoiding five Windows worker pools."""
+    assert _audit_loader_workers({"data": {"audit_num_workers": 1}}, train_num_workers=4) == 1
+    assert _audit_loader_workers({"data": {}}, train_num_workers=4) == 1
+    assert _audit_loader_workers({"data": {"audit_num_workers": 9}}, train_num_workers=4) == 4
+    assert _audit_loader_workers({"data": {"audit_num_workers": 0}}, train_num_workers=4) == 0
 
 
 def test_limited_train_subset_explicitly_disables_tail_drop_only_when_needed() -> None:
