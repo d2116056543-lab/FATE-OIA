@@ -213,6 +213,8 @@ class ICDORAuditCollectorsTest(unittest.TestCase):
         identity_arm = edge["matched_control_arms"][0]
         self.assertEqual(identity_arm["control_type"], "same_type_identity")
         self.assertEqual(identity_arm["identity_source_factor_names"], ["f1"])
+        self.assertEqual(identity_arm["identity_sources"][0]["index"], 1)
+        self.assertEqual(identity_arm["identity_sources"][0]["name"], "f1")
         self.assertTrue(all(arm["spatial_offsets"] for arm in edge["matched_control_arms"][1:]))
         self.assertGreaterEqual(edge["metrics"]["ap_delta"], 0.0)
         self.assertGreaterEqual(edge["metrics"]["isolated_edge_ap"], edge["metrics"]["visual_ap"])

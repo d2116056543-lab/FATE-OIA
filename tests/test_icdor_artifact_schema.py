@@ -59,6 +59,7 @@ def _matched_arms() -> list[dict[str, object]]:
             "identity_source_factor_indices": [1],
             "identity_source_factor_types": ["object"],
             "identity_source_regions": ["front_center"],
+            "identity_sources": [{"index": 1, "name": "identity_factor", "type": "object", "region": "front_center"}],
             "factor_type": "object",
             "region": "front_center",
             "spatial_offsets": [],
@@ -69,8 +70,9 @@ def _matched_arms() -> list[dict[str, object]]:
                 "control_type": "spatial_roll",
                 "identity_source_factor_names": [],
                 "identity_source_factor_indices": [],
-                "identity_source_factor_types": [],
-                "identity_source_regions": [],
+            "identity_source_factor_types": [],
+            "identity_source_regions": [],
+            "identity_sources": [],
                 "factor_type": "object",
                 "region": "front_center",
                 "spatial_offsets": [[offset, offset + 1]],
@@ -109,8 +111,28 @@ def test_matched_control_provenance_requires_true_identity_and_nonzero_offsets()
     unspecified_region = deepcopy(valid)
     unspecified_region[0]["region"] = "unspecified"
     mutations.append(unspecified_region)
+    missing_sources = deepcopy(valid)
+    missing_sources[0]["identity_sources"] = []
+    mutations.append(missing_sources)
+    wrong_source_type = deepcopy(valid)
+    wrong_source_type[0]["identity_sources"][0]["type"] = "lane"
+    mutations.append(wrong_source_type)
+    reused_source = deepcopy(valid)
+    reused_source[0]["identity_sources"][0]["index"] = 0
+    mutations.append(reused_source)
 
     assert all(_matched_control_provenance_valid(arms) is False for arms in mutations)
+
+
+def test_matched_control_provenance_allows_multiple_aligned_wrong_identity_sources() -> None:
+    arms = _matched_arms()
+    arms[0]["identity_source_factor_names"] = ["identity_factor", "another_identity_factor"]
+    arms[0]["identity_source_factor_indices"] = [1, 2]
+    arms[0]["identity_sources"] = [
+        {"index": 1, "name": "identity_factor", "type": "object", "region": "front_center"},
+        {"index": 2, "name": "another_identity_factor", "type": "object", "region": "front_center"},
+    ]
+    assert _matched_control_provenance_valid(arms) is True
 
 
 def _json_payloads() -> dict[str, dict[str, object]]:

@@ -595,21 +595,33 @@ def _matched_control_provenance_valid(arms: Any) -> bool:
     identity_names = identity_arm.get("identity_source_factor_names")
     identity_types = identity_arm.get("identity_source_factor_types")
     identity_regions = identity_arm.get("identity_source_regions")
+    identity_sources = identity_arm.get("identity_sources")
     selected_type = identity_arm.get("factor_type")
     selected_region = identity_arm.get("region")
     selected_indices = identity_arm.get("selected_factor_indices")
     if (
         not isinstance(identity_names, list) or not identity_names
-        or not isinstance(identity_types, list) or len(identity_types) != len(identity_names)
-        or not isinstance(identity_regions, list) or len(identity_regions) != len(identity_names)
+        or not isinstance(identity_types, list) or not identity_types
+        or not isinstance(identity_regions, list) or not identity_regions
+        or not isinstance(identity_sources, list) or not identity_sources
         or not selected_type or selected_region not in {
             "upper_front", "front_center", "left_corridor", "right_corridor", "center_corridor"
         }
         or not isinstance(selected_indices, list) or len(selected_indices) != 1
         or not isinstance(selected_indices[0], int)
-        or any(value != selected_type for value in identity_types)
-        or any(value != selected_region for value in identity_regions)
-        or selected_indices[0] in identity_arm.get("identity_source_factor_indices", [])
+        or any(
+            not isinstance(source, dict)
+            or not isinstance(source.get("index"), int)
+            or not isinstance(source.get("name"), str) or not source["name"]
+            or source.get("type") != selected_type
+            or source.get("region") != selected_region
+            or source["index"] == selected_indices[0]
+            for source in identity_sources
+        )
+        or identity_arm.get("identity_source_factor_indices") != [source["index"] for source in identity_sources]
+        or identity_names != [source["name"] for source in identity_sources]
+        or sorted(identity_types) != sorted({source["type"] for source in identity_sources})
+        or sorted(identity_regions) != sorted({source["region"] for source in identity_sources})
     ):
         return False
     for arm in spatial:

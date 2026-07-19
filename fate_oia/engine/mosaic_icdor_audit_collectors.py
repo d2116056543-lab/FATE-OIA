@@ -418,6 +418,24 @@ def summarize_matched_control_arms(arm_records: Sequence[Sequence[Mapping[str, A
             })
             continue
         first = available[0]
+        identity_sources = sorted({
+            (
+                int(record["identity_source_factor_index"]),
+                str(record["identity_source_factor_name"]),
+                str(record["identity_source_factor_type"]),
+                str(record["identity_source_region"]),
+            )
+            for record in available
+            if all(
+                key in record
+                for key in (
+                    "identity_source_factor_index",
+                    "identity_source_factor_name",
+                    "identity_source_factor_type",
+                    "identity_source_region",
+                )
+            )
+        })
         summaries.append({
             "schema_version": "icdor_matched_control.v3",
             "arm_index": int(first["arm_index"]),
@@ -462,6 +480,14 @@ def summarize_matched_control_arms(arm_records: Sequence[Sequence[Mapping[str, A
                 str(record["identity_source_region"])
                 for record in available if "identity_source_region" in record
             }),
+            # Keep the factor/name/type/region tuple aligned.  Separate
+            # summary arrays above are useful for display but lose that
+            # relation when several legitimate identity controls share type
+            # and region.
+            "identity_sources": [
+                {"index": index, "name": name, "type": factor_type, "region": region}
+                for index, name, factor_type, region in identity_sources
+            ],
             "spatial_offsets": sorted({
                 tuple(int(value) for value in record["spatial_offset"])
                 for record in available if "spatial_offset" in record
