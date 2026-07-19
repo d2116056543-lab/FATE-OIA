@@ -98,7 +98,7 @@ def profile_runtime_candidates(
     completed = {
         (int(record["batch_size"]), int(record["grad_accum"]), int(record["num_workers"]))
         for record in records
-        if record.get("measurement_origin") == "real_phase_d_execution"
+        if record.get("measurement_origin") == "model_only_phase_d_execution"
         and record.get("status") in {"PASS", "OOM"}
         and all(key in record for key in ("batch_size", "grad_accum", "num_workers"))
     }
@@ -137,7 +137,11 @@ def profile_runtime_candidates(
                     "warmup_steps": 0,
                     "measured_steps": 0,
                 }
-            record["measurement_origin"] = "real_phase_d_execution"
+            # This benchmark measures a single model-only forward/backward loop.
+            # It intentionally excludes the trainer's control construction, losses,
+            # queues, and epoch-level target audit, so it must not be labeled as a
+            # complete train_icdor_epoch execution.
+            record["measurement_origin"] = "model_only_phase_d_execution"
             records.append(record)
             completed.add(key)
             if checkpoint_callback is not None:
@@ -170,6 +174,94 @@ def profile_runtime_candidates(
         "grad_accum": int(selected["grad_accum"]),
         "num_workers": int(selected["num_workers"]),
         "candidates": records,
+    }
+
+
+def summarize_actual_training_epoch(
+    run_dir: str | Path,
+    *,
+    max_reserved_gb: float,
+    epoch_name: str = "epoch_000",
+) -> dict[str, Any]:
+    """Summarize a real trainer epoch, including its target-control audit cost.
+
+    The model-only profiler remains useful for a fast candidate screen, but the
+    resulting record is deliberately partial. This function reads artifacts
+    emitted by ``train_icdor_epoch`` so a pilot can state its real step-memory
+    and target-control costs without claiming a synthetic profile is complete.
+    """
+    if max_reserved_gb <= 0 or not math.isfinite(max_reserved_gb):
+        raise ICDORProfileError("actual training profile requires a finite positive memory limit")
+    epoch_dir = Path(run_dir) / epoch_name
+    runtime_path = epoch_dir / "runtime_stats.jsonl"
+    target_path = epoch_dir / "target_transfer_summary.json"
+    if not runtime_path.is_file():
+        raise ICDORProfileError(f"actual training profile is missing runtime stats: {runtime_path}")
+    if not target_path.is_file():
+        raise ICDORProfileError(f"actual training profile is missing target summary: {target_path}")
+
+    rows: list[dict[str, Any]] = []
+    for line in runtime_path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            value = json.loads(line)
+            if not isinstance(value, dict):
+                raise ICDORProfileError("actual training runtime row must be an object")
+            rows.append(value)
+    if not rows:
+        raise ICDORProfileError("actual training profile requires at least one trainer step")
+
+    try:
+        step_seconds = [float(row["step_sec"]) for row in rows]
+        load_gap_seconds = [float(row["load_gap_sec"]) for row in rows]
+        reserved_values = [float(row["gpu_reserved_gb"]) for row in rows]
+    except (KeyError, TypeError, ValueError) as error:
+        raise ICDORProfileError("actual training runtime row is incomplete") from error
+    if (
+        any(not math.isfinite(value) or value <= 0 for value in step_seconds)
+        or any(not math.isfinite(value) or value < 0 for value in load_gap_seconds)
+        or any(not math.isfinite(value) or value < 0 for value in reserved_values)
+    ):
+        raise ICDORProfileError("actual training runtime row has invalid timing or memory")
+
+    target_payload = json.loads(target_path.read_text(encoding="utf-8"))
+    if not isinstance(target_payload, dict):
+        raise ICDORProfileError("actual training target summary must be an object")
+    full_target = target_payload.get("full_target_transfer")
+    if not isinstance(full_target, Mapping):
+        raise ICDORProfileError("actual training profile requires the full target-transfer audit")
+    control_runtime = full_target.get("collection_runtime")
+    if not isinstance(control_runtime, Mapping):
+        raise ICDORProfileError("actual training profile requires target-control timing")
+    try:
+        control_seconds = float(control_runtime["elapsed_seconds"])
+        control_forwards = int(control_runtime["intervention_forward_calls"])
+        static_reuse = bool(control_runtime["static_context_reuse_enabled"])
+        static_reexecution = int(control_runtime["static_visual_reexecution_during_controls"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ICDORProfileError("actual training target-control timing is incomplete") from error
+    if not math.isfinite(control_seconds) or control_seconds <= 0 or control_forwards <= 0:
+        raise ICDORProfileError("actual training target-control timing is invalid")
+    if not static_reuse or static_reexecution != 0:
+        raise ICDORProfileError("actual training profile requires static visual context reuse")
+
+    sorted_steps = sorted(step_seconds)
+    p95_index = min(len(sorted_steps) - 1, math.ceil(0.95 * len(sorted_steps)) - 1)
+    max_reserved = max(reserved_values)
+    return {
+        "status": "PASS" if max_reserved <= max_reserved_gb else "OVER_MEMORY_LIMIT",
+        "profile_scope": "actual_training_epoch",
+        "measurement_origin": "train_icdor_epoch_execution",
+        "epoch_name": epoch_name,
+        "train_step_count": len(rows),
+        "train_step_p50_ms": 1000.0 * statistics.median(step_seconds),
+        "train_step_p95_ms": 1000.0 * sorted_steps[p95_index],
+        "load_gap_p50_ms": 1000.0 * statistics.median(load_gap_seconds),
+        "max_reserved_gb": max_reserved,
+        "max_reserved_gb_limit": max_reserved_gb,
+        "target_control_seconds": control_seconds,
+        "target_control_forward_calls": control_forwards,
+        "target_static_context_reuse_verified": True,
+        "target_static_visual_reexecution_during_controls": static_reexecution,
     }
 
 
