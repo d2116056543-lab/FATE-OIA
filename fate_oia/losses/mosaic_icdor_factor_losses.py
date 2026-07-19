@@ -128,7 +128,11 @@ def factor_query_identity_loss(
         if not bool(active.any()) or not bool(same_type_wrong.any()):
             continue
         correct = score[active, factor_id, factor_id]
-        wrong = score[active, factor_id, same_type_wrong].amax(dim=-1)
+        # Select the batch and query axes separately.  Two boolean advanced
+        # indices in one expression are broadcast together, which breaks when
+        # the number of active samples differs from the number of same-type
+        # alternatives.
+        wrong = score[active, factor_id][:, same_type_wrong].amax(dim=-1)
         terms.append(F.relu(float(margin) - correct + wrong).mean())
     return torch.stack(terms).mean() if terms else factor_features.sum() * 0.0
 
