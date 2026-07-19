@@ -761,16 +761,19 @@ def _loader(
     num_workers: int,
     config: dict[str, Any],
     generator: torch.Generator | None = None,
+    drop_last: bool | None = None,
 ) -> DataLoader:
     if batch_size <= 0 or num_workers < 0:
         raise ValueError("IC-DOR loader requires positive batch_size and non-negative num_workers")
+    if drop_last is None:
+        drop_last = bool(shuffle)
     kwargs: dict[str, Any] = {
         "batch_size": batch_size,
         "shuffle": shuffle,
         "num_workers": num_workers,
         "pin_memory": bool(config["data"]["pin_memory"]),
         "collate_fn": _collate,
-        "drop_last": bool(shuffle),
+        "drop_last": bool(drop_last),
         "generator": generator,
     }
     if num_workers:
@@ -1063,9 +1066,13 @@ def build_icdor_loaders(
         "train_calib_positive_counts": list(split.calib_positive_counts),
         **_icdor_full_split_manifest_fields(split),
     }
+    core_dataset = Subset(train, core)
+    # A deliberately capped pilot may contain fewer samples than one batch.
+    # Keep that partial batch so diagnostic smoke exercises the actual model.
+    core_drop_last = not (max_train_samples is not None and len(core_dataset) < batch_size)
     return (
-        _loader(Subset(train, core), batch_size=batch_size, shuffle=True, num_workers=num_workers, config=config,
-                generator=torch.Generator().manual_seed(seed)),
+        _loader(core_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, config=config,
+                generator=torch.Generator().manual_seed(seed), drop_last=core_drop_last),
         _loader(Subset(train, audit_visual), batch_size=batch_size, shuffle=False, num_workers=num_workers, config=config),
         _loader(Subset(train, audit_target), batch_size=batch_size, shuffle=False, num_workers=num_workers, config=config),
         _loader(Subset(train, calib), batch_size=batch_size, shuffle=False, num_workers=num_workers, config=config),

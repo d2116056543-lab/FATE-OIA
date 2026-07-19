@@ -36,6 +36,7 @@ from fate_oia.engine.train_acpr_mosaic_trust_icdor import (
     build_icdor_model,
     compute_icdor_training_losses,
     load_config,
+    _loader,
 )
 
 
@@ -51,6 +52,31 @@ def test_full_cli_cannot_bypass_review_pass() -> None:
     source = Path("fate_oia/engine/train_acpr_mosaic_trust_icdor.py").read_text(encoding="utf-8")
     assert "if not args.pilot and not args.require_review_pass" in source
     assert "full training requires --require_review_pass" in source
+
+
+def test_capped_smoke_loader_keeps_the_only_partial_training_batch() -> None:
+    config = {"data": {"pin_memory": False, "persistent_workers": False, "prefetch_factor": 2}}
+    row = {
+        "image": torch.zeros(3, 2, 2),
+        "action": torch.zeros(4),
+        "reason": torch.zeros(21),
+        "file_name": "smoke.jpg",
+        "image_path": "smoke.jpg",
+        "split": "train",
+    }
+
+    loader = _loader(
+        [row], batch_size=8, shuffle=True, num_workers=0, config=config, drop_last=False,
+    )
+
+    batch = next(iter(loader))
+    assert batch["image"].shape[0] == 1
+
+
+def test_limited_train_subset_explicitly_disables_tail_drop_only_when_needed() -> None:
+    source = Path("fate_oia/engine/train_acpr_mosaic_trust_icdor.py").read_text(encoding="utf-8")
+    assert "core_drop_last = not (max_train_samples is not None and len(core_dataset) < batch_size)" in source
+    assert "drop_last=core_drop_last" in source
 
 
 def test_partial_runtime_selection_is_explicitly_pilot_only(tmp_path: Path) -> None:
