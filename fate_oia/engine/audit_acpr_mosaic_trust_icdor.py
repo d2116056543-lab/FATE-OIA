@@ -767,7 +767,11 @@ def functional_hard_gates(
         trainer_path,
         (
             "online_target_probe_due(epoch=epoch)",
-            "full_target_audit_due(epoch=epoch, every_epochs=refresh_every)",
+            # The invocation deliberately spans lines in the trainer so this
+            # audit checks the receiver and the epoch/cadence arguments
+            # separately rather than requiring a formatting-specific string.
+            "adaptive_schedule.full_target_audit_due(",
+            "epoch=epoch, every_epochs=refresh_every",
             '"audit_level": "online"', '"audit_level": "full"',
         ),
     )

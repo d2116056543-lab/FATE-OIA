@@ -267,6 +267,7 @@ def test_joint_transfer_reuses_and_repeats_batch_local_dino_field() -> None:
         def __init__(self) -> None:
             super().__init__()
             self.dino_calls = 0
+            self.context_calls = 0
 
         def dino(self, images: torch.Tensor) -> dict[str, object]:
             self.dino_calls += 1
@@ -276,8 +277,16 @@ def test_joint_transfer_reuses_and_repeats_batch_local_dino_field() -> None:
                 "original_tokens": 101,
             }
 
+        def prepare_intervention_context(
+            self, images: torch.Tensor, *, precomputed_dino_field: dict[str, object] | None = None,
+        ) -> dict[str, object]:
+            self.context_calls += 1
+            assert isinstance(precomputed_dino_field, dict)
+            return {"batch_size": images.shape[0], "dino_field": precomputed_dino_field}
+
         def forward(self, images: torch.Tensor, **kwargs: object) -> dict[str, torch.Tensor]:
-            field = kwargs.get("precomputed_dino_field")
+            context = kwargs.get("intervention_context")
+            field = context["dino_field"] if isinstance(context, dict) else kwargs.get("precomputed_dino_field")
             assert isinstance(field, dict)
             tokens = field["patch_tokens_by_layer"]
             assert isinstance(tokens, torch.Tensor)
@@ -285,7 +294,7 @@ def test_joint_transfer_reuses_and_repeats_batch_local_dino_field() -> None:
             return super().forward(images, **kwargs)
 
     model = DinoRuntimeModel()
-    collect_joint_target_transfer_metrics(
+    transfer = collect_joint_target_transfer_metrics(
         model,
         [_batch()],
         factor_ids=("signal",),
@@ -299,6 +308,12 @@ def test_joint_transfer_reuses_and_repeats_batch_local_dino_field() -> None:
         intervention_chunk_size=4,
     )
     assert model.dino_calls == 1
+    assert model.context_calls == 1
+    runtime = transfer["collection_runtime"]
+    assert runtime["static_context_preparation_calls"] == 1
+    assert runtime["static_context_reuse_enabled"] is True
+    assert runtime["static_visual_reexecution_during_controls"] == 0
+    assert runtime["control_reexecution_scope"] == ["action_router_rereader", "reason_router_rereader"]
 
 
 def test_edge_metrics_require_identity_and_spatial_controls_separately() -> None:

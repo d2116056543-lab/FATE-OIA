@@ -36,6 +36,17 @@ def _repeat_batch_field(value: Any, repeats: int, batch_size: int) -> Any:
     return value
 
 
+def _repeat_intervention_context(
+    context: Mapping[str, Any], *, repeats: int, batch_size: int,
+) -> dict[str, Any]:
+    """Expand one immutable batch-local audit context for packed controls."""
+    repeated = _repeat_batch_field(context, repeats, batch_size)
+    if not isinstance(repeated, dict):
+        raise ValueError("IC-DOR repeated intervention context must remain a mapping")
+    repeated["batch_size"] = int(batch_size * repeats)
+    return repeated
+
+
 def _chunked_intervention_probabilities(
     model: torch.nn.Module,
     images: torch.Tensor,
@@ -46,6 +57,7 @@ def _chunked_intervention_probabilities(
     route_mode: str,
     latent_enabled: bool,
     precomputed_dino_field: Mapping[str, Any] | None,
+    intervention_context: Mapping[str, Any] | None,
     chunk_size: int,
 ) -> tuple[list[torch.Tensor], int]:
     """Execute independent interventions in chunks without changing row order."""
@@ -63,7 +75,11 @@ def _chunked_intervention_probabilities(
             "return_masks": False,
             intervention_argument: torch.cat(chunk, dim=0),
         }
-        if precomputed_dino_field is not None:
+        if intervention_context is not None:
+            kwargs["intervention_context"] = _repeat_intervention_context(
+                intervention_context, repeats=len(chunk), batch_size=batch_size,
+            )
+        elif precomputed_dino_field is not None:
             kwargs["precomputed_dino_field"] = _repeat_batch_field(
                 precomputed_dino_field, len(chunk), batch_size
             )
@@ -524,12 +540,26 @@ def collect_target_transfer_metrics(
             if not split_values or any(value != source_split for value in split_values):
                 raise ValueError(f"target transfer collector accepts {source_split} only")
             images = batch["image"].to(device)
+            audit_field = model.dino(images) if hasattr(model, "dino") else None
+            field_kwargs = {"precomputed_dino_field": audit_field} if audit_field is not None else {}
+            context_builder = getattr(model, "prepare_intervention_context", None)
+            intervention_context = (
+                context_builder(images, **field_kwargs)
+                if callable(context_builder) else None
+            )
+            forward_kwargs: dict[str, Any] = {
+                "route_mode": route_mode,
+                "latent_enabled": latent_enabled,
+            }
+            if intervention_context is not None:
+                forward_kwargs["intervention_context"] = intervention_context
+            else:
+                forward_kwargs.update(field_kwargs)
             target = batch[label_key].to(device).float()
             if target.shape != (images.shape[0], target_count):
                 raise ValueError("target transfer labels do not match target_ids")
             full = model(
-                images, route_mode=route_mode, latent_enabled=latent_enabled,
-                return_masks=True,
+                images, return_masks=True, **forward_kwargs,
             )
             evidence = full["factor_presence_prob"].float()
             if evidence.shape != (images.shape[0], factor_count):
@@ -546,8 +576,7 @@ def collect_target_transfer_metrics(
                 keep = torch.ones(images.shape[0], factor_count, device=device)
                 keep[:, factor_index] = 0.0
                 deleted = model(
-                    images, route_mode=route_mode, latent_enabled=latent_enabled,
-                    return_masks=False, factor_intervention_keep_mask=keep,
+                    images, return_masks=False, factor_intervention_keep_mask=keep, **forward_kwargs,
                 )
                 spec = factor_specs[factor_index]
                 selected_override, overrides, arm_rows = build_batch_matched_factor_selected_and_control_overrides(
@@ -568,13 +597,11 @@ def collect_target_transfer_metrics(
                     )
                 random_outputs = []
                 selected = model(
-                    images, route_mode=route_mode, latent_enabled=latent_enabled,
-                    return_masks=False, factor_mask_override=selected_override,
+                    images, return_masks=False, factor_mask_override=selected_override, **forward_kwargs,
                 )
                 for override in overrides:
                     random_deleted = model(
-                        images, route_mode=route_mode, latent_enabled=latent_enabled,
-                        return_masks=False, factor_mask_override=override,
+                        images, return_masks=False, factor_mask_override=override, **forward_kwargs,
                     )
                     random_outputs.append(torch.sigmoid(random_deleted[probability_key]).float())
                 deleted_arms.append(torch.sigmoid(deleted[probability_key]).float())
@@ -665,6 +692,8 @@ def collect_joint_target_transfer_metrics(
     matched_control_availability: list[torch.Tensor] = []
     intervention_forward_calls = 0
     audit_batch_count = 0
+    static_context_preparation_calls = 0
+    static_context_reuse_enabled = False
     was_training = model.training
     model.eval()
     try:
@@ -680,10 +709,24 @@ def collect_joint_target_transfer_metrics(
             target = torch.cat((batch["action"], batch["reason"]), dim=1).to(device).float()
             if target.shape != (images.shape[0], len(target_ids)):
                 raise ValueError("joint target transfer labels do not match action/reason ids")
-            full = model(
-                images, route_mode=route_mode, latent_enabled=latent_enabled,
-                return_masks=True, **field_kwargs,
+            context_builder = getattr(model, "prepare_intervention_context", None)
+            intervention_context = (
+                context_builder(images, **field_kwargs)
+                if callable(context_builder) else None
             )
+            if intervention_context is not None:
+                static_context_preparation_calls += 1
+                static_context_reuse_enabled = True
+            full_kwargs: dict[str, Any] = {
+                "route_mode": route_mode,
+                "latent_enabled": latent_enabled,
+                "return_masks": True,
+            }
+            if intervention_context is not None:
+                full_kwargs["intervention_context"] = intervention_context
+            else:
+                full_kwargs.update(field_kwargs)
+            full = model(images, **full_kwargs)
             evidence = full["factor_presence_prob"].float()
             if evidence.shape != (images.shape[0], factor_count):
                 raise ValueError("joint target transfer factor evidence does not match factor ids")
@@ -724,6 +767,7 @@ def collect_joint_target_transfer_metrics(
                 probability_keys=probability_keys,
                 route_mode=route_mode, latent_enabled=latent_enabled,
                 precomputed_dino_field=audit_field,
+                intervention_context=intervention_context,
                 chunk_size=intervention_chunk_size,
             )
             intervention_forward_calls += calls
@@ -733,6 +777,7 @@ def collect_joint_target_transfer_metrics(
                 probability_keys=probability_keys,
                 route_mode=route_mode, latent_enabled=latent_enabled,
                 precomputed_dino_field=audit_field,
+                intervention_context=intervention_context,
                 chunk_size=intervention_chunk_size,
             )
             intervention_forward_calls += calls
@@ -742,6 +787,7 @@ def collect_joint_target_transfer_metrics(
                 probability_keys=probability_keys,
                 route_mode=route_mode, latent_enabled=latent_enabled,
                 precomputed_dino_field=audit_field,
+                intervention_context=intervention_context,
                 chunk_size=intervention_chunk_size,
             )
             intervention_forward_calls += calls
@@ -789,6 +835,15 @@ def collect_joint_target_transfer_metrics(
         "intervention_chunk_size": intervention_chunk_size,
         "intervention_forward_calls": intervention_forward_calls,
         "sequential_intervention_forward_calls": audit_batch_count * factor_count * 6,
+        # Contexts are batch-local and evaluation-only. This makes the V5
+        # no-static-reexecution claim visible in each audit artifact.
+        "static_context_preparation_calls": static_context_preparation_calls,
+        "static_context_reuse_enabled": static_context_reuse_enabled,
+        "static_visual_reexecution_during_controls": 0 if static_context_reuse_enabled else None,
+        "control_reexecution_scope": (
+            ["action_router_rereader", "reason_router_rereader"]
+            if static_context_reuse_enabled else ["model_forward_fallback"]
+        ),
     }
     result["source_split"] = source_split
     return result

@@ -305,6 +305,50 @@ def test_batch_local_dino_reuse_is_exact_and_not_a_persistent_cache() -> None:
     assert not hasattr(model, "feature_cache")
 
 
+def test_target_controls_reuse_only_batch_local_static_state() -> None:
+    """A matched control may rerun target reads, never its static visual measurement."""
+    model = _model().eval()
+    factor_count = len(model.ontology["factors"])
+    model.continuous_credibility.update_from_audit(torch.full((factor_count,), 0.4))
+    images = torch.randn(1, 3, 360, 640)
+    calls = {"factor_pyramid": 0, "action_pyramid": 0, "reason_pyramid": 0, "factor_extractor": 0, "router": 0, "rereader": 0}
+    hooks = [
+        model.factor_visual_pyramid.register_forward_hook(lambda *_: calls.__setitem__("factor_pyramid", calls["factor_pyramid"] + 1)),
+        model.action_visual_pyramid.register_forward_hook(lambda *_: calls.__setitem__("action_pyramid", calls["action_pyramid"] + 1)),
+        model.reason_visual_pyramid.register_forward_hook(lambda *_: calls.__setitem__("reason_pyramid", calls["reason_pyramid"] + 1)),
+        model.factor_extractor.register_forward_hook(lambda *_: calls.__setitem__("factor_extractor", calls["factor_extractor"] + 1)),
+        model.action_router.register_forward_hook(lambda *_: calls.__setitem__("router", calls["router"] + 1)),
+        model.action_rereader.register_forward_hook(lambda *_: calls.__setitem__("rereader", calls["rereader"] + 1)),
+    ]
+    try:
+        with torch.no_grad():
+            field = model.dino(images)
+            direct = model(images, route_mode="shadow", latent_enabled=True, precomputed_dino_field=field, return_masks=True)
+            context = model.prepare_intervention_context(images, precomputed_dino_field=field)
+            static_after_context = {key: calls[key] for key in ("factor_pyramid", "action_pyramid", "reason_pyramid", "factor_extractor")}
+            contextual = model(images, route_mode="shadow", latent_enabled=True, intervention_context=context, return_masks=True)
+            override = direct["factor_soft_masks"].clone()
+            override[:, 0] = 0.0
+            override[0, 0, 8, 12] = 1.0
+            controlled = model(
+                images,
+                route_mode="shadow",
+                latent_enabled=True,
+                intervention_context=context,
+                factor_mask_override=override,
+            )
+    finally:
+        for hook in hooks:
+            hook.remove()
+
+    assert torch.equal(contextual["action_final_logits"], direct["action_final_logits"])
+    assert torch.equal(contextual["reason_observed_logits"], direct["reason_observed_logits"])
+    assert {key: calls[key] for key in static_after_context} == static_after_context
+    assert calls["router"] >= 3
+    assert calls["rereader"] >= 3
+    assert controlled["factor_override_recomputed_typed_coordinates"].item() == 1.0
+
+
 def test_credibility_and_fine_transport_config_change_the_real_forward_path() -> None:
     config = load_config("configs/fate_oia_train_360x640_acpr_mosaic_trust_v3_icdor.yaml")
     config["model"]["action_route"].update(

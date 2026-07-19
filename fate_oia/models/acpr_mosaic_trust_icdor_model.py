@@ -381,6 +381,96 @@ class MOSAICTrustICDORModel(nn.Module):
     def certificate_sha256(self) -> str:
         return bytes(self.certificate_sha256_bytes.detach().cpu().tolist()).hex().upper()
 
+    @staticmethod
+    def _clone_intervention_value(value: Any) -> Any:
+        """Clone mutable batch tensors before an audit intervention changes them."""
+        if isinstance(value, torch.Tensor):
+            return value.clone()
+        if isinstance(value, Mapping):
+            return {key: MOSAICTrustICDORModel._clone_intervention_value(item) for key, item in value.items()}
+        if isinstance(value, tuple):
+            return tuple(MOSAICTrustICDORModel._clone_intervention_value(item) for item in value)
+        if isinstance(value, list):
+            return [MOSAICTrustICDORModel._clone_intervention_value(item) for item in value]
+        return value
+
+    @torch.no_grad()
+    def prepare_intervention_context(
+        self,
+        images: torch.Tensor,
+        *,
+        precomputed_dino_field: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Build the non-intervened state once for same-image audit controls.
+
+        The context is evaluation-only and batch-local. It contains image-derived
+        tensors only, never labels or persistent features. A subsequent control
+        forward still rebuilds typed coordinates and reruns the target router and
+        rereaders after its factor intervention.
+        """
+        if self.training:
+            raise RuntimeError("IC-DOR intervention context is evaluation-only")
+        field = self._batch_field_reuse(images) if precomputed_dino_field is None else precomputed_dino_field
+        if not isinstance(field, Mapping) or "patch_tokens_by_layer" not in field or "grid_hw" not in field:
+            raise ValueError("IC-DOR precomputed DINO field is invalid")
+        field_tokens = field["patch_tokens_by_layer"]
+        if not isinstance(field_tokens, torch.Tensor) or field_tokens.shape[0] != images.shape[0]:
+            raise ValueError("IC-DOR precomputed DINO field does not match image batch")
+        if field_tokens.device != images.device:
+            raise ValueError("IC-DOR precomputed DINO field must remain on the image device")
+
+        patch_tokens = field_tokens
+        factor_pyramid = self.factor_adapter(self._features(self.factor_visual_pyramid(patch_tokens)))
+        action_pyramid = self.action_adapter(self._features(self.action_visual_pyramid(patch_tokens)))
+        reason_pyramid = self.reason_adapter(self._features(self.reason_visual_pyramid(patch_tokens)))
+        factor_output = self.factor_extractor(factor_pyramid, prior_mode="full", query_permutation=None)
+        sample_support = (factor_output["sample_attention"] > 1e-5).float().sum(dim=(-1, -2, -3))
+        credibility = self.continuous_credibility(
+            factor_output["factor_features"],
+            factor_output["factor_presence_prob"],
+            factor_output["factor_uncertainty"],
+            grounding_score=(
+                sample_support
+                / float(max(1, factor_output["sample_attention"].shape[-3] * factor_output["sample_attention"].shape[-2] * factor_output["sample_attention"].shape[-1]))
+            ).clamp(0.0, 1.0),
+            sample_support=sample_support,
+        )
+        stored_credibility = self.continuous_credibility.ema_cV.to(
+            device=images.device,
+            dtype=factor_output["factor_features"].dtype,
+        ).view(1, -1).expand(images.shape[0], -1)
+        credibility["cV_batch_measurement"] = credibility["cV"]
+        credibility["cV"] = stored_credibility
+        credibility["cV_ema"] = stored_credibility
+        factor_output.update(credibility)
+        continuous_route_weight = stored_credibility.detach().clamp(0.0, 1.0)
+        action_route_train_access = self.action_shadow_credibility_floor + (
+            1.0 - self.action_shadow_credibility_floor
+        ) * continuous_route_weight
+        reason_route_train_access = self.reason_semantic_credibility_floor + (
+            1.0 - self.reason_semantic_credibility_floor
+        ) * continuous_route_weight
+        factor_output["cV_route_effective"] = continuous_route_weight
+        factor_output["cV_action_shadow_training_access"] = action_route_train_access
+        factor_output["cV_reason_training_access"] = reason_route_train_access
+        return {
+            "schema_version": "mosaic_icdor_intervention_context.v1",
+            "batch_size": int(images.shape[0]),
+            "spatial_shape": tuple(images.shape[1:]),
+            "device": str(images.device),
+            "field": field,
+            "factor_pyramid": factor_pyramid,
+            "action_pyramid": action_pyramid,
+            "reason_pyramid": reason_pyramid,
+            "factor_output": factor_output,
+            "action_output": self.action_visual_decoder(action_pyramid),
+            "reason_visual": self.reason_visual_decoder(reason_pyramid),
+            "continuous_route_weight": continuous_route_weight,
+            "action_route_train_access": action_route_train_access,
+            "reason_route_train_access": reason_route_train_access,
+            "target_utility_state": self.target_utility(),
+        }
+
     def forward(
         self,
         images: torch.Tensor,
@@ -394,6 +484,7 @@ class MOSAICTrustICDORModel(nn.Module):
         factor_intervention_keep_mask: torch.Tensor | None = None,
         factor_mask_override: torch.Tensor | None = None,
         precomputed_dino_field: Mapping[str, Any] | None = None,
+        intervention_context: Mapping[str, Any] | None = None,
         return_masks: bool = False,
         return_diagnostics: bool = False,
     ) -> dict[str, torch.Tensor | dict[str, Any]]:
@@ -407,85 +498,89 @@ class MOSAICTrustICDORModel(nn.Module):
             route_mode = "admitted" if bool(self.action_router.edge_admission_mask.any()) else "shadow"
         if factor_ablation_mode in {"content_only", "prior_only"}:
             prior_mode = factor_ablation_mode
-        # Audit interventions may reuse this batch-local field. It is never
-        # persisted, never reused across samples/batches, and contains no labels.
-        field = (
-            self._batch_field_reuse(images)
-            if precomputed_dino_field is None
-            else precomputed_dino_field
-        )
-        if not isinstance(field, Mapping) or "patch_tokens_by_layer" not in field or "grid_hw" not in field:
-            raise ValueError("IC-DOR precomputed DINO field is invalid")
-        field_tokens = field["patch_tokens_by_layer"]
-        if not isinstance(field_tokens, torch.Tensor) or field_tokens.shape[0] != images.shape[0]:
-            raise ValueError("IC-DOR precomputed DINO field does not match image batch")
-        if field_tokens.device != images.device:
-            raise ValueError("IC-DOR precomputed DINO field must remain on the image device")
-        patch_tokens = field["patch_tokens_by_layer"]
-        factor_pyramid = self.factor_adapter(self._features(self.factor_visual_pyramid(patch_tokens)))
-        action_pyramid = self.action_adapter(self._features(self.action_visual_pyramid(patch_tokens)))
-        reason_pyramid = self.reason_adapter(self._features(self.reason_visual_pyramid(patch_tokens)))
-        factor_input = {
-            key: value.roll(shifts=1, dims=0) if factor_ablation_mode == "image_shuffled" else value
-            for key, value in factor_pyramid.items()
-        }
-        query_permutation = (
-            torch.roll(torch.arange(self.factor_certificate_tier.numel(), device=images.device), shifts=1)
-            if factor_ablation_mode == "query_shuffled"
-            else None
-        )
-        factor_output = self.factor_extractor(
-            factor_input,
-            prior_mode=prior_mode,
-            query_permutation=query_permutation,
-        )
-        # The V5 prior-gap objective compares the visual measurement against
-        # the extractor's own no-image branch while reusing this batch's DINO
-        # field and pyramid. It never becomes an action/reason input.
-        if return_diagnostics:
-            prior_factor_output = self.factor_extractor(factor_pyramid, prior_mode="prior_only")
-            factor_output["factor_prior_presence_logits"] = prior_factor_output["factor_presence_logits"]
-        if factor_mask_mode == "fine":
-            factor_output["factor_soft_masks"] = factor_output["factor_fine_masks"]
-        elif factor_mask_mode == "coarse":
-            factor_output["factor_soft_masks"] = factor_output["factor_coarse_masks"]
-        sample_support = (factor_output["sample_attention"] > 1e-5).float().sum(dim=(-1, -2, -3))
-        credibility = self.continuous_credibility(
-            factor_output["factor_features"],
-            factor_output["factor_presence_prob"],
-            factor_output["factor_uncertainty"],
-            grounding_score=(
-                sample_support
-                / float(max(1, factor_output["sample_attention"].shape[-3] * factor_output["sample_attention"].shape[-2] * factor_output["sample_attention"].shape[-1]))
-            ).clamp(0.0, 1.0),
-            sample_support=sample_support,
-        )
-        # Only the completed audit_visual pass may update or provide routing
-        # credibility. Per-batch measurements remain diagnostics, never a
-        # same-epoch self-certification signal.
-        stored_credibility = self.continuous_credibility.ema_cV.to(
-            device=images.device,
-            dtype=factor_output["factor_features"].dtype,
-        ).view(1, -1).expand(images.shape[0], -1)
-        credibility["cV_batch_measurement"] = credibility["cV"]
-        credibility["cV"] = stored_credibility
-        credibility["cV_ema"] = stored_credibility
-        factor_output.update(credibility)
-        # Training access and deployment admission are deliberately distinct.
-        # These floors are only a learning-access interpolation prescribed by
-        # CREDO-MAP. They never enter the final-edge admission predicate, and
-        # raw cV remains exported unchanged for audit/calibration.
-        continuous_route_weight = stored_credibility.detach().clamp(0.0, 1.0)
-        action_route_train_access = self.action_shadow_credibility_floor + (
-            1.0 - self.action_shadow_credibility_floor
-        ) * continuous_route_weight
-        reason_route_train_access = self.reason_semantic_credibility_floor + (
-            1.0 - self.reason_semantic_credibility_floor
-        ) * continuous_route_weight
-        factor_output["cV_route_effective"] = continuous_route_weight
-        factor_output["cV_action_shadow_training_access"] = action_route_train_access
-        factor_output["cV_reason_training_access"] = reason_route_train_access
-        target_utility_state = self.target_utility()
+        if intervention_context is not None:
+            if self.training or torch.is_grad_enabled():
+                raise RuntimeError("IC-DOR intervention context is evaluation-only under torch.no_grad")
+            if precomputed_dino_field is not None:
+                raise ValueError("IC-DOR intervention context already owns its batch-local DINO field")
+            if return_diagnostics or factor_ablation_mode != "full" or prior_mode != "full" or factor_mask_mode != "configured":
+                raise ValueError("IC-DOR intervention context only supports full configured audit forwards")
+            required = {
+                "schema_version", "batch_size", "spatial_shape", "device", "field", "factor_pyramid",
+                "action_pyramid", "reason_pyramid", "factor_output", "action_output", "reason_visual",
+                "continuous_route_weight", "action_route_train_access", "reason_route_train_access", "target_utility_state",
+            }
+            missing = required.difference(intervention_context)
+            if missing or intervention_context.get("schema_version") != "mosaic_icdor_intervention_context.v1":
+                raise ValueError(f"IC-DOR intervention context is invalid: missing={sorted(missing)}")
+            if int(intervention_context["batch_size"]) != images.shape[0] or tuple(intervention_context["spatial_shape"]) != tuple(images.shape[1:]):
+                raise ValueError("IC-DOR intervention context does not match image batch")
+            if str(intervention_context["device"]) != str(images.device):
+                raise ValueError("IC-DOR intervention context must remain on the image device")
+            field = intervention_context["field"]
+            factor_pyramid = intervention_context["factor_pyramid"]
+            action_pyramid = intervention_context["action_pyramid"]
+            reason_pyramid = intervention_context["reason_pyramid"]
+            factor_output = self._clone_intervention_value(intervention_context["factor_output"])
+            action_output = self._clone_intervention_value(intervention_context["action_output"])
+            reason_visual = self._clone_intervention_value(intervention_context["reason_visual"])
+            continuous_route_weight = intervention_context["continuous_route_weight"]
+            action_route_train_access = intervention_context["action_route_train_access"]
+            reason_route_train_access = intervention_context["reason_route_train_access"]
+            target_utility_state = intervention_context["target_utility_state"]
+        else:
+            # Audit interventions may reuse this batch-local field. It is never
+            # persisted, never reused across samples/batches, and contains no labels.
+            field = self._batch_field_reuse(images) if precomputed_dino_field is None else precomputed_dino_field
+            if not isinstance(field, Mapping) or "patch_tokens_by_layer" not in field or "grid_hw" not in field:
+                raise ValueError("IC-DOR precomputed DINO field is invalid")
+            field_tokens = field["patch_tokens_by_layer"]
+            if not isinstance(field_tokens, torch.Tensor) or field_tokens.shape[0] != images.shape[0]:
+                raise ValueError("IC-DOR precomputed DINO field does not match image batch")
+            if field_tokens.device != images.device:
+                raise ValueError("IC-DOR precomputed DINO field must remain on the image device")
+            patch_tokens = field_tokens
+            factor_pyramid = self.factor_adapter(self._features(self.factor_visual_pyramid(patch_tokens)))
+            action_pyramid = self.action_adapter(self._features(self.action_visual_pyramid(patch_tokens)))
+            reason_pyramid = self.reason_adapter(self._features(self.reason_visual_pyramid(patch_tokens)))
+            factor_input = {
+                key: value.roll(shifts=1, dims=0) if factor_ablation_mode == "image_shuffled" else value
+                for key, value in factor_pyramid.items()
+            }
+            query_permutation = (
+                torch.roll(torch.arange(self.factor_certificate_tier.numel(), device=images.device), shifts=1)
+                if factor_ablation_mode == "query_shuffled" else None
+            )
+            factor_output = self.factor_extractor(factor_input, prior_mode=prior_mode, query_permutation=query_permutation)
+            if return_diagnostics:
+                prior_factor_output = self.factor_extractor(factor_pyramid, prior_mode="prior_only")
+                factor_output["factor_prior_presence_logits"] = prior_factor_output["factor_presence_logits"]
+            if factor_mask_mode == "fine":
+                factor_output["factor_soft_masks"] = factor_output["factor_fine_masks"]
+            elif factor_mask_mode == "coarse":
+                factor_output["factor_soft_masks"] = factor_output["factor_coarse_masks"]
+            sample_support = (factor_output["sample_attention"] > 1e-5).float().sum(dim=(-1, -2, -3))
+            credibility = self.continuous_credibility(
+                factor_output["factor_features"], factor_output["factor_presence_prob"], factor_output["factor_uncertainty"],
+                grounding_score=(sample_support / float(max(1, factor_output["sample_attention"].shape[-3] * factor_output["sample_attention"].shape[-2] * factor_output["sample_attention"].shape[-1]))).clamp(0.0, 1.0),
+                sample_support=sample_support,
+            )
+            stored_credibility = self.continuous_credibility.ema_cV.to(
+                device=images.device, dtype=factor_output["factor_features"].dtype,
+            ).view(1, -1).expand(images.shape[0], -1)
+            credibility["cV_batch_measurement"] = credibility["cV"]
+            credibility["cV"] = stored_credibility
+            credibility["cV_ema"] = stored_credibility
+            factor_output.update(credibility)
+            continuous_route_weight = stored_credibility.detach().clamp(0.0, 1.0)
+            action_route_train_access = self.action_shadow_credibility_floor + (1.0 - self.action_shadow_credibility_floor) * continuous_route_weight
+            reason_route_train_access = self.reason_semantic_credibility_floor + (1.0 - self.reason_semantic_credibility_floor) * continuous_route_weight
+            factor_output["cV_route_effective"] = continuous_route_weight
+            factor_output["cV_action_shadow_training_access"] = action_route_train_access
+            factor_output["cV_reason_training_access"] = reason_route_train_access
+            target_utility_state = self.target_utility()
+            action_output = self.action_visual_decoder(action_pyramid)
+            reason_visual = self.reason_visual_decoder(reason_pyramid)
         if factor_intervention_keep_mask is None:
             intervention_keep = images.new_ones(images.shape[0], self.factor_certificate_tier.numel())
         else:
@@ -557,7 +652,6 @@ class MOSAICTrustICDORModel(nn.Module):
         action_sampling_coordinates = factor_output["sampling_coordinates"].detach()
         action_sampled_features = factor_output["sampled_features"].detach()
         action_sample_attention = factor_output["sample_attention"].detach()
-        action_output = self.action_visual_decoder(action_pyramid)
         router_output = self.action_router(
             action_factor_features,
             action_positive_evidence,
@@ -622,7 +716,6 @@ class MOSAICTrustICDORModel(nn.Module):
             else torch.zeros(self.action_router.action_count, dtype=torch.bool, device=images.device)
         )
         action_final = compose_final_action_logits(action_output["action_visual_logits"], action_shadow, admitted)
-        reason_visual = self.reason_visual_decoder(reason_pyramid)
         if reason_route_mode == "full":
             reason_reliability = reason_route_train_access
             reason_factor_features = factor_output["factor_features"] * reason_reliability.unsqueeze(-1)

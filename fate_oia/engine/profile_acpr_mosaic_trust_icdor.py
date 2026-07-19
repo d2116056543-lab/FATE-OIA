@@ -35,17 +35,25 @@ def wall_clock_samples_per_second(
     return batch_size * len(compute) / elapsed
 
 
-def select_runtime_candidate(records: Iterable[Mapping[str, Any]], *, max_reserved_gb: float = 43.5) -> dict[str, Any]:
-    """Select only a complete, stable real measurement under the reserved-memory cap."""
+def select_runtime_candidate(
+    records: Iterable[Mapping[str, Any],],
+    *,
+    max_reserved_gb: float = 43.5,
+    minimum_warmup_steps: int = 20,
+    minimum_measured_steps: int = 100,
+) -> dict[str, Any]:
+    """Select only a real measurement meeting the caller's declared profile scope."""
+    if minimum_warmup_steps < 1 or minimum_measured_steps < 1:
+        raise ICDORProfileError("runtime profile minimum steps must be positive")
     accepted: list[dict[str, Any]] = []
     incomplete: list[str] = []
     for raw in records:
         record = dict(raw)
-        if int(record.get("warmup_steps", 0)) < 20:
-            incomplete.append("20 warmup steps")
+        if int(record.get("warmup_steps", 0)) < minimum_warmup_steps:
+            incomplete.append(f"{minimum_warmup_steps} warmup steps")
             continue
-        if int(record.get("measured_steps", 0)) < 100:
-            incomplete.append("100 measured steps")
+        if int(record.get("measured_steps", 0)) < minimum_measured_steps:
+            incomplete.append(f"{minimum_measured_steps} measured steps")
             continue
         if record.get("status") != "PASS":
             continue
@@ -77,8 +85,15 @@ def profile_runtime_candidates(
     progress_callback: Callable[[Mapping[str, Any]], None] | None = None,
     completed_records: Iterable[Mapping[str, Any]] = (),
     checkpoint_callback: Callable[[Iterable[Mapping[str, Any]]], None] | None = None,
+    diagnostic: bool = False,
+    minimum_warmup_steps: int = 20,
+    minimum_measured_steps: int = 100,
 ) -> dict[str, Any]:
     """Execute every configured batch/worker combination; never accept synthetic records."""
+    if diagnostic and (minimum_warmup_steps < 2 or minimum_measured_steps < 4):
+        raise ICDORProfileError("diagnostic profile requires at least 2 warmup and 4 measured steps")
+    if not diagnostic and (minimum_warmup_steps != 20 or minimum_measured_steps != 100):
+        raise ICDORProfileError("formal runtime profile requires exactly 20 warmup and 100 measured steps")
     records = [dict(record) for record in completed_records]
     completed = {
         (int(record["batch_size"]), int(record["grad_accum"]), int(record["num_workers"]))
@@ -135,10 +150,18 @@ def profile_runtime_candidates(
                     "num_workers": int(workers),
                     "status": str(record.get("status", "UNKNOWN")),
                 })
-    selected = select_runtime_candidate(records, max_reserved_gb=max_reserved_gb)
+    selected = select_runtime_candidate(
+        records,
+        max_reserved_gb=max_reserved_gb,
+        minimum_warmup_steps=minimum_warmup_steps,
+        minimum_measured_steps=minimum_measured_steps,
+    )
     return {
         "pass": True,
-        "status": "PASS",
+        "status": "PARTIAL_DIAGNOSTIC" if diagnostic else "PASS",
+        "profile_scope": "pilot_diagnostic" if diagnostic else "formal_full",
+        "minimum_warmup_steps": minimum_warmup_steps,
+        "minimum_measured_steps": minimum_measured_steps,
         "selection_rule": "highest_samples_per_sec_under_reserved_limit_then_larger_batch",
         "max_reserved_gb_limit": max_reserved_gb,
         "selected": selected,
@@ -178,9 +201,13 @@ def measure_real_phase_d(
     measured_steps: int = 100,
     progress_callback: Callable[[Mapping[str, Any]], None] | None = None,
     progress_every: int = 25,
+    diagnostic: bool = False,
 ) -> dict[str, Any]:
     """Measure actual DINO->factor->reason->route forward, backward, and optimizer steps."""
-    if warmup_steps < 20 or measured_steps < 100:
+    if diagnostic:
+        if warmup_steps < 2 or measured_steps < 4:
+            raise ICDORProfileError("IC-DOR diagnostic profiler requires 2 warmup and 4 measured steps")
+    elif warmup_steps < 20 or measured_steps < 100:
         raise ICDORProfileError("IC-DOR profiler requires 20 warmup and 100 measured steps")
     if progress_every <= 0:
         raise ICDORProfileError("IC-DOR profiler progress_every must be positive")
@@ -294,6 +321,9 @@ def main() -> None:
     parser.add_argument("--output", required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--max_reserved_gb", type=float, default=43.5)
+    parser.add_argument("--diagnostic", action="store_true")
+    parser.add_argument("--warmup_steps", type=int)
+    parser.add_argument("--measured_steps", type=int)
     args = parser.parse_args()
     from fate_oia.engine.train_acpr_mosaic_trust_icdor import (
         build_icdor_loaders,
@@ -308,8 +338,16 @@ def main() -> None:
         raise ICDORProfileError("formal IC-DOR profiler requires a real CUDA DINO execution")
     runtime_candidates = list(config["training"]["runtime_candidates"])
     worker_candidates = list(config["data"]["num_workers_candidates"])
-    warmup = int(config["runtime"]["warmup_profile_steps"])
-    measured = int(config["runtime"]["timed_profile_steps"])
+    diagnostic = bool(args.diagnostic)
+    warmup = int(args.warmup_steps if args.warmup_steps is not None else config["runtime"]["warmup_profile_steps"])
+    measured = int(args.measured_steps if args.measured_steps is not None else config["runtime"]["timed_profile_steps"])
+    if diagnostic:
+        if len(runtime_candidates) != 1 or len(worker_candidates) != 1:
+            raise ICDORProfileError("diagnostic runtime profile requires exactly one configured batch and worker candidate")
+        if warmup < 2 or measured < 4:
+            raise ICDORProfileError("diagnostic runtime profile requires at least 2 warmup and 4 measured steps")
+    elif warmup != 20 or measured != 100:
+        raise ICDORProfileError("formal runtime profile requires exactly 20 warmup and 100 measured steps")
     profile_root = Path(args.output).resolve().parent / "runtime_profile_data"
     output_path = Path(args.output)
     partial_path = output_path.with_name(output_path.stem + "_partial.json")
@@ -355,6 +393,7 @@ def main() -> None:
                 model, optimizer, loader, device=device, batch_size=batch_size,
                 grad_accum=grad_accum, num_workers=workers,
                 warmup_steps=warmup, measured_steps=measured,
+                diagnostic=diagnostic,
                 progress_callback=lambda row: print(
                     "icdor_profile " + json.dumps(dict(row), sort_keys=True), flush=True
                 ),
@@ -371,6 +410,9 @@ def main() -> None:
         ),
         completed_records=completed_records,
         checkpoint_callback=checkpoint,
+        diagnostic=diagnostic,
+        minimum_warmup_steps=warmup,
+        minimum_measured_steps=measured,
     )
     _write_json_atomic(output_path, payload)
     partial_path.unlink(missing_ok=True)

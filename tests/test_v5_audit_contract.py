@@ -27,6 +27,9 @@ def test_audit_enforces_v5_credibility_and_schedule_contracts() -> None:
     assert "_git_branch" in source
     assert "manifest target branch does not match current branch" in source
 
+    assert '"adaptive_schedule.full_target_audit_due("' in source
+    assert '"epoch=epoch, every_epochs=refresh_every"' in source
+
     assert "observable_cV_min_for_admission" not in source
     assert "action_credibility_min_for_admission" not in source
     assert '"FOUNDATION"' not in source
