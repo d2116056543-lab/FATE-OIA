@@ -453,6 +453,11 @@ def _load_runtime_selection(
     raise RuntimeError("IC-DOR runtime selection is not passing")
 
 
+def _should_collect_full_target_transfer(*, pilot: bool, full_target_audit_due: bool) -> bool:
+    """Keep pilot target utility measurable without duplicating the formal audit."""
+    return bool(not pilot and full_target_audit_due)
+
+
 def _write_provisional_certificate_this_epoch(
     *, write_provisional: bool, freeze_certificate: bool
 ) -> bool:
@@ -2704,7 +2709,12 @@ def main() -> None:
                 source_split="audit_target",
             )
             full_target_transfer = None
-            if adaptive_schedule.full_target_audit_due(epoch=epoch, every_epochs=refresh_every):
+            if _should_collect_full_target_transfer(
+                pilot=args.pilot,
+                full_target_audit_due=adaptive_schedule.full_target_audit_due(
+                    epoch=epoch, every_epochs=refresh_every,
+                ),
+            ):
                 full_target_transfer = collect_joint_target_transfer_metrics(
                     model,
                     _audit_batches(audit_target_loader, grounding_index, source_split="audit_target"),

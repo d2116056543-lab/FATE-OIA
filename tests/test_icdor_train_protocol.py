@@ -18,6 +18,7 @@ from fate_oia.engine.train_acpr_mosaic_trust_icdor import (
     _build_rank_queues,
     _load_resume,
     _load_runtime_selection,
+    _should_collect_full_target_transfer,
     _load_warm_start_model_only,
     _pending_evidence_document,
     _pilot_semantic_validation,
@@ -82,6 +83,12 @@ def test_runtime_selection_accepts_windows_utf8_bom(tmp_path: Path) -> None:
 
     assert payload["selected"]["batch_size"] == 8
     assert scope == "diagnostic_partial"
+
+
+def test_pilot_uses_online_target_probe_without_duplicate_full_transfer() -> None:
+    assert not _should_collect_full_target_transfer(pilot=True, full_target_audit_due=True)
+    assert _should_collect_full_target_transfer(pilot=False, full_target_audit_due=True)
+    assert not _should_collect_full_target_transfer(pilot=False, full_target_audit_due=False)
 
 
 def test_pilot_epoch_limit_is_checked_before_loader_and_model_initialization() -> None:
