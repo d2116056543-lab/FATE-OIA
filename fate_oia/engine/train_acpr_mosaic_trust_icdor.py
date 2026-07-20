@@ -2476,6 +2476,11 @@ def main() -> None:
     parser.add_argument("--allow_partial_runtime_selection", action="store_true")
     parser.add_argument("--review_pass")
     parser.add_argument("--require_review_pass", action="store_true")
+    parser.add_argument(
+        "--allow_unreviewed_full_train",
+        action="store_true",
+        help="Explicitly bypass REVIEW_PASS; record the run as unreviewed in its manifest.",
+    )
     parser.add_argument("--pilot", action="store_true")
     parser.add_argument("--screening", action="store_true")
     parser.add_argument("--screening_audit_samples", type=int, default=1)
@@ -2489,7 +2494,10 @@ def main() -> None:
     parser.add_argument("--max_test_samples", type=int)
     parser.add_argument("--seed", type=int, default=20260713)
     args = parser.parse_args()
-    if not args.pilot and not args.screening and not args.require_review_pass:
+    unreviewed_override = bool(args.allow_unreviewed_full_train and not args.require_review_pass)
+    if args.allow_unreviewed_full_train and args.require_review_pass:
+        raise RuntimeError("IC-DOR --allow_unreviewed_full_train cannot be combined with --require_review_pass")
+    if not args.pilot and not args.screening and not args.require_review_pass and not unreviewed_override:
         raise RuntimeError("IC-DOR full training requires --require_review_pass")
     if args.resume and args.warm_start_model_checkpoint:
         raise RuntimeError("IC-DOR --resume and --warm_start_model_checkpoint are mutually exclusive")
@@ -2633,6 +2641,13 @@ def main() -> None:
         "batch_size": batch_size, "gradient_accumulation_steps": grad_accum,
         "effective_batch": batch_size * grad_accum, "pilot": bool(args.pilot),
         "screening": screening,
+        "review_pass_required": bool(args.require_review_pass),
+        "review_pass_bypassed": bool(unreviewed_override),
+        "unreviewed_full_train_override": bool(unreviewed_override),
+        "formal_review_status": (
+            "BYPASSED_EXPLICITLY" if unreviewed_override
+            else ("PASS_REQUIRED" if args.require_review_pass else "NOT_APPLICABLE")
+        ),
         "screening_limits": screening_limits,
         "runtime_selection_scope": runtime_selection_scope,
     }
