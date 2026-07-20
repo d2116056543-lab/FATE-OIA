@@ -463,6 +463,42 @@ def _should_collect_full_target_transfer(*, pilot: bool, full_target_audit_due: 
     return bool(full_target_audit_due)
 
 
+def _screening_runtime_limits(
+    *,
+    screening: bool,
+    max_audit_samples: int | None,
+    max_target_samples: int | None,
+    bootstrap_replicates: int,
+    audit_cap: int = 8,
+    target_cap: int = 8,
+    bootstrap_cap: int = 8,
+) -> dict[str, int | None]:
+    """Bound only the explicit diagnostic path, never the formal audit.
+
+    The formal V5 protocol needs its full factor bootstrap and target audit.
+    A screening run has a different purpose: execute the real image/training
+    path quickly enough to expose whether the innovation is alive.  Capping
+    these values here prevents a user-supplied 32-row screening run from
+    silently inheriting the formal 1000-replicate bootstrap.
+    """
+    if not screening:
+        return {
+            "audit_samples": max_audit_samples,
+            "target_samples": max_target_samples,
+            "bootstrap_replicates": int(bootstrap_replicates),
+        }
+
+    def _bounded(value: int | None, default: int, ceiling: int) -> int:
+        requested = default if value is None or int(value) <= 0 else int(value)
+        return max(1, min(requested, int(ceiling)))
+
+    return {
+        "audit_samples": _bounded(max_audit_samples, audit_cap, audit_cap),
+        "target_samples": _bounded(max_target_samples, target_cap, target_cap),
+        "bootstrap_replicates": _bounded(bootstrap_replicates, bootstrap_cap, bootstrap_cap),
+    }
+
+
 def _target_utility_payloads(
     *, epoch: int, audit_level: str, target_utility_state: Mapping[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -2441,6 +2477,10 @@ def main() -> None:
     parser.add_argument("--review_pass")
     parser.add_argument("--require_review_pass", action="store_true")
     parser.add_argument("--pilot", action="store_true")
+    parser.add_argument("--screening", action="store_true")
+    parser.add_argument("--screening_audit_samples", type=int, default=8)
+    parser.add_argument("--screening_target_samples", type=int, default=8)
+    parser.add_argument("--screening_bootstrap_replicates", type=int, default=8)
     parser.add_argument("--resume")
     parser.add_argument("--warm_start_model_checkpoint")
     parser.add_argument("--max_train_samples", type=int)
@@ -2449,17 +2489,30 @@ def main() -> None:
     parser.add_argument("--max_test_samples", type=int)
     parser.add_argument("--seed", type=int, default=20260713)
     args = parser.parse_args()
-    if not args.pilot and not args.require_review_pass:
+    if not args.pilot and not args.screening and not args.require_review_pass:
         raise RuntimeError("IC-DOR full training requires --require_review_pass")
     if args.resume and args.warm_start_model_checkpoint:
         raise RuntimeError("IC-DOR --resume and --warm_start_model_checkpoint are mutually exclusive")
     # Reject invalid pilot requests before scanning BDD100K, constructing DINO,
     # or allocating GPU memory.
-    if args.pilot and args.epochs is not None and args.epochs > 6:
+    if (args.pilot or args.screening) and args.epochs is not None and args.epochs > 6:
         raise RuntimeError("IC-DOR pilot is limited to six epochs")
 
     config_path = Path(args.config).resolve()
     config = load_config(config_path)
+    screening = bool(args.screening)
+    screening_limits = _screening_runtime_limits(
+        screening=screening,
+        max_audit_samples=args.screening_audit_samples if screening else args.max_audit_samples,
+        max_target_samples=args.screening_target_samples if screening else args.max_audit_samples,
+        bootstrap_replicates=(
+            args.screening_bootstrap_replicates
+            if screening else int(config["credibility"]["bootstrap_replicates"])
+        ),
+        audit_cap=8,
+        target_cap=8,
+        bootstrap_cap=8,
+    )
     output = Path(args.output_dir).resolve()
     output.mkdir(parents=True, exist_ok=True)
     semantic_sources = (
@@ -2482,7 +2535,7 @@ def main() -> None:
     runtime_path = Path(args.runtime_selection or config["runtime"]["runtime_selection_path"])
     runtime, runtime_selection_scope = _load_runtime_selection(
         runtime_path,
-        pilot=bool(args.pilot),
+        pilot=bool(args.pilot or screening),
         allow_partial_runtime_selection=bool(args.allow_partial_runtime_selection),
     )
     batch_size = int(args.batch_size or runtime["batch_size"])
@@ -2529,7 +2582,11 @@ def main() -> None:
     grounding_index = BDD100KGroundingIndex(config["data"]["bdd100k_root"])
     train_loader, audit_visual_loader, audit_target_loader, calib_loader, test_loader, split_stats = build_icdor_loaders(
         config, output, batch_size=batch_size, num_workers=args.num_workers,
-        max_train_samples=args.max_train_samples, max_audit_samples=args.max_audit_samples,
+        max_train_samples=args.max_train_samples,
+        max_audit_samples=(
+            int(screening_limits["audit_samples"])
+            if screening else args.max_audit_samples
+        ),
         max_calib_samples=args.max_calib_samples, max_test_samples=args.max_test_samples,
         visual_grounding_index=grounding_index,
     )
@@ -2540,7 +2597,7 @@ def main() -> None:
     (output / "parameter_ownership.json").write_text(
         json.dumps({"parameters": ownership}, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
-    epochs = int(args.epochs or (6 if args.pilot else config["training"]["epochs"]))
+    epochs = int(args.epochs or (6 if args.pilot or screening else config["training"]["epochs"]))
     updates_per_epoch = math.ceil(len(train_loader) / grad_accum)
     scheduler = _scheduler(
         optimizer, epochs=epochs, updates_per_epoch=updates_per_epoch,
@@ -2556,7 +2613,7 @@ def main() -> None:
     action_queue, reason_queue, observed_reason_queue = _build_rank_queues(
         capacity=int(config["selective_observation"]["posterior_queue_size"]), device=device
     )
-    adaptive_schedule = ICDORAdaptiveSchedule(pilot=args.pilot)
+    adaptive_schedule = ICDORAdaptiveSchedule(pilot=bool(args.pilot or screening))
 
     certificate_path = output / "factor_certificate.json"
     edge_path = output / "edge_admission.json"
@@ -2575,6 +2632,8 @@ def main() -> None:
         "config_sha256": _sha256_file(config_path), "runtime_selection_sha256": _sha256_file(runtime_path),
         "batch_size": batch_size, "gradient_accumulation_steps": grad_accum,
         "effective_batch": batch_size * grad_accum, "pilot": bool(args.pilot),
+        "screening": screening,
+        "screening_limits": screening_limits,
         "runtime_selection_scope": runtime_selection_scope,
     }
     source_manifest_path = Path(".review/icdor_source_manifest.json")
@@ -2606,6 +2665,17 @@ def main() -> None:
             split_manifest=split_stats, runtime_selection=runtime,
             factor_certificate=pending_certificate, edge_admission=pending_edge,
         )
+    if screening:
+        _write_json(
+            output / "screening_runtime.json",
+            {
+                "screening": True,
+                "limits": screening_limits,
+                "formal_audit_unchanged": True,
+                "full_target_intervention_skipped": True,
+                "interpretation": "diagnostic_only_not_formal_admission_evidence",
+            },
+        )
     previous_certificate_tiers: dict[str, str] | None = None
     if certificate_sha is not None and certificate_path.is_file():
         previous_certificate_tiers = _certificate_tiers(
@@ -2620,7 +2690,7 @@ def main() -> None:
         grounding_builder,
         factor_names=factor_names,
         device=device,
-        bootstrap_replicates=int(config["credibility"]["bootstrap_replicates"]),
+        bootstrap_replicates=int(screening_limits["bootstrap_replicates"]),
         bootstrap_seed=args.seed,
         forward_kwargs={"route_mode": "off", "latent_enabled": False, "return_masks": True},
         source_split="audit_visual",
@@ -2655,8 +2725,11 @@ def main() -> None:
             factor_names=factor_names,
             device=device,
             bootstrap_replicates=(
-                int(config["factor_certificate"]["bootstrap_replicates"])
-                if adaptive_schedule.policy().write_provisional_certificate else 100
+                int(screening_limits["bootstrap_replicates"])
+                if screening else (
+                    int(config["factor_certificate"]["bootstrap_replicates"])
+                    if adaptive_schedule.policy().write_provisional_certificate else 100
+                )
             ),
             bootstrap_seed=args.seed + epoch,
             forward_kwargs={"route_mode": "off", "latent_enabled": False, "return_masks": True},
@@ -2685,6 +2758,8 @@ def main() -> None:
 
         refresh_every = int(config["edge_admission"]["audit_refresh_epochs"])
         should_refresh_edge = (
+            not screening
+            and
             adaptive_schedule.policy().enable_interventions
             and not adaptive_schedule.policy().freeze_edge_admission
             and adaptive_schedule.full_target_audit_due(
@@ -2716,8 +2791,18 @@ def main() -> None:
             json.loads(edge_path.read_text(encoding="utf-8"))
             if edge_path.is_file() else dict(pending_edge)
         )
+        def _target_audit_batches() -> Iterable[Mapping[str, Any]]:
+            if screening:
+                return _limited_audit_batches(
+                    audit_target_loader,
+                    grounding_index,
+                    source_split="audit_target",
+                    max_samples=int(screening_limits["target_samples"]),
+                )
+            return _audit_batches(audit_target_loader, grounding_index, source_split="audit_target")
+
         branch_readiness, hidden_recovery_rows = collect_train_audit_branch_readiness(
-            model, _audit_batches(audit_target_loader, grounding_index, source_split="audit_target"), device,
+            model, _target_audit_batches(), device,
             route_mode=phase.route_mode, latent_enabled=phase.latent_enabled,
             seed=args.seed + epoch,
             safe_joint_entry_exp_map=adaptive_schedule.safe_joint_entry_exp_map,
@@ -2750,7 +2835,10 @@ def main() -> None:
                     audit_target_loader,
                     grounding_index,
                     source_split="audit_target",
-                    max_samples=int(config["runtime"]["online_target_probe_max_samples"]),
+                    max_samples=(
+                        int(screening_limits["target_samples"])
+                        if screening else int(config["runtime"]["online_target_probe_max_samples"])
+                    ),
                 ),
                 factor_ids=factor_names,
                 action_ids=list(model.ontology["action_names"]),
@@ -2764,11 +2852,11 @@ def main() -> None:
             )
             full_target_transfer = None
             if _should_collect_full_target_transfer(
-                pilot=args.pilot,
+                pilot=args.pilot or screening,
                 full_target_audit_due=adaptive_schedule.full_target_audit_due(
                     epoch=epoch, every_epochs=refresh_every,
                 ),
-            ):
+            ) and not screening:
                 full_target_transfer = collect_joint_target_transfer_metrics(
                     model,
                     _audit_batches(audit_target_loader, grounding_index, source_split="audit_target"),
