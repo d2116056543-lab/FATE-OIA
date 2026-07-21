@@ -2483,6 +2483,11 @@ def main() -> None:
     )
     parser.add_argument("--pilot", action="store_true")
     parser.add_argument("--screening", action="store_true")
+    parser.add_argument(
+        "--light_epoch_eval",
+        action="store_true",
+        help="Skip expensive epoch-end audits and keep only calibration, test metrics, and core diagnostics.",
+    )
     parser.add_argument("--screening_audit_samples", type=int, default=1)
     parser.add_argument("--screening_target_samples", type=int, default=2)
     parser.add_argument("--screening_bootstrap_replicates", type=int, default=4)
@@ -2696,21 +2701,31 @@ def main() -> None:
         previous_certificate_tiers = _certificate_tiers(
             json.loads(certificate_path.read_text(encoding="utf-8"))
         )
-    # Bootstrap epoch 0 from the independent visual audit. Later refreshes
-    # occur only after an epoch, so every training forward reads a detached
-    # credibility state from the preceding audit pass.
-    bootstrap_visual_audit = collect_factor_audit(
-        model,
-        _audit_batches(audit_visual_loader, grounding_index, source_split="audit_visual"),
-        grounding_builder,
-        factor_names=factor_names,
-        device=device,
-        bootstrap_replicates=int(screening_limits["bootstrap_replicates"]),
-        bootstrap_seed=args.seed,
-        forward_kwargs={"route_mode": "off", "latent_enabled": False, "return_masks": True},
-        source_split="audit_visual",
-    )
-    bootstrap_credibility = refresh_model_visual_credibility(model, bootstrap_visual_audit)
+    # Bootstrap epoch 0 from the independent visual audit. The explicit
+    # light continuation path reuses the checkpoint's detached credibility
+    # state so a resume does not rescan the full audit population.
+    if args.light_epoch_eval:
+        bootstrap_credibility = {
+            "credibility": model.continuous_credibility.ema_cV.detach().clone(),
+            "source_split": "resume_checkpoint",
+            "reason_labels_used": False,
+            "factor_names": factor_names,
+            "components": {"status": "reused_from_checkpoint"},
+            "mean_abs_cV_delta": 0.0,
+        }
+    else:
+        bootstrap_visual_audit = collect_factor_audit(
+            model,
+            _audit_batches(audit_visual_loader, grounding_index, source_split="audit_visual"),
+            grounding_builder,
+            factor_names=factor_names,
+            device=device,
+            bootstrap_replicates=int(screening_limits["bootstrap_replicates"]),
+            bootstrap_seed=args.seed,
+            forward_kwargs={"route_mode": "off", "latent_enabled": False, "return_masks": True},
+            source_split="audit_visual",
+        )
+        bootstrap_credibility = refresh_model_visual_credibility(model, bootstrap_visual_audit)
     _write_json(output / "visual_credibility_bootstrap.json", _visual_credibility_payload(bootstrap_credibility, epoch=-1))
     for epoch in range(start_epoch, epochs):
         if adaptive_schedule.failed_closed:
@@ -2732,6 +2747,108 @@ def main() -> None:
         )
         for row in epoch_train["runtime_rows"]:
             row["action_route_gate_cap"] = route_gate_cap
+
+        if args.light_epoch_eval:
+            # Fast continuation intentionally freezes audit-driven admissions
+            # and credibility/PU updates. It still evaluates the deploy path
+            # on test, preserving the primary metric and all core diagnostics.
+            calibration_rows = fit_icdor_calibration(
+                model, calib_loader, device, epoch=epoch, route_mode=phase.route_mode,
+                latent_enabled=phase.latent_enabled, config=config,
+            )
+            evaluation = evaluate_icdor(
+                model, test_loader, device, epoch=epoch, route_mode=phase.route_mode,
+                latent_enabled=phase.latent_enabled,
+            )
+            epoch_dir = output / f"epoch_{epoch:03d}"
+            visual_credibility = {
+                "credibility": model.continuous_credibility.ema_cV.detach().clone(),
+                "source_split": "resume_checkpoint",
+                "reason_labels_used": False,
+                "factor_names": factor_names,
+                "components": {"status": "frozen_in_light_epoch_eval"},
+                "mean_abs_cV_delta": 0.0,
+            }
+            visual_credibility_payload = _visual_credibility_payload(visual_credibility, epoch=epoch)
+            factor_audit_payload = {
+                "epoch": epoch,
+                "source_split": "audit_visual",
+                "status": "skipped",
+                "available": False,
+                "unavailable_reason": "light_epoch_eval",
+                "factor_stats": {},
+            }
+            factor_audit_rows = [_honest_row(epoch, "factor_audit", "light_epoch_eval")]
+            certificate_snapshot = (
+                json.loads(certificate_path.read_text(encoding="utf-8"))
+                if certificate_path.is_file() else dict(pending_certificate)
+            )
+            edge_document = (
+                json.loads(edge_path.read_text(encoding="utf-8"))
+                if edge_path.is_file() else dict(pending_edge)
+            )
+            transfer_rows = [_honest_row(epoch, "target_transfer", "light_epoch_eval")]
+            pareto_rows = [_honest_row(epoch, "pareto", "light_epoch_eval")]
+            visual_manifest = {
+                "available": False,
+                "unavailable_reason": "light_epoch_eval",
+                "source_split": "audit_visual",
+            }
+            hidden_recovery_rows = []
+            json_payloads = {
+                "metrics_summary.json": evaluation["metrics_summary"],
+                "branch_metrics.json": evaluation["branch_metrics"],
+                "mechanism_summary.json": {
+                    "epoch": epoch,
+                    "light_epoch_eval": True,
+                    "audit_status": "skipped",
+                    "metrics": evaluation["metrics_summary"],
+                },
+                "per_label_metrics.json": evaluation["per_label_metrics"],
+                "factor_certificate_snapshot.json": certificate_snapshot,
+                "factor_audit.json": factor_audit_payload,
+                "target_transfer_summary.json": transfer_rows[0],
+                "visual_credibility.json": visual_credibility_payload,
+                "semantic_compatibility.json": transfer_rows[0],
+                "target_utility.json": transfer_rows[0],
+                "visual_audit_manifest.json": visual_manifest,
+            }
+            jsonl_payloads = {
+                "loss_components.jsonl": epoch_train["loss_rows"],
+                "factor_stats.jsonl": factor_audit_rows,
+                "prototype_stats.jsonl": evaluation["prototype_rows"],
+                "action_route_stats.jsonl": evaluation["route_rows"],
+                "reason_dual_observation_stats.jsonl": evaluation["reason_rows"],
+                "target_transfer_stats.jsonl": transfer_rows,
+                "pareto_stats.jsonl": pareto_rows,
+                "gradient_ownership.jsonl": epoch_train["gradient_rows"],
+                "calibration_stats.jsonl": calibration_rows,
+                "runtime_stats.jsonl": epoch_train["runtime_rows"],
+                "failure_cases.jsonl": evaluation["failure_rows"],
+                "credibility_stats.jsonl": evaluation["credibility_rows"],
+                "fine_transport_stats.jsonl": evaluation["fine_transport_rows"],
+                "route_ownership.jsonl": evaluation["route_ownership_rows"],
+            }
+            write_icdor_epoch_artifacts(
+                output, epoch=epoch, json_payloads=json_payloads, jsonl_payloads=jsonl_payloads,
+                logits=evaluation["logits"], file_names=evaluation["file_names"],
+            )
+            joint = float(evaluation["metrics_summary"]["deploy_fixed"]["joint"])
+            checkpoint_args = dict(
+                model=model, optimizer=optimizer, scheduler=scheduler, epoch=epoch,
+                best_joint=max(best_joint, joint), certificate_sha256=certificate_sha,
+                edge_admission_sha256=edge_sha, config_sha256=manifest["config_sha256"],
+                split_sha256=split_stats["split_sha256"],
+                action_queue=action_queue, reason_queue=reason_queue,
+                observed_reason_queue=observed_reason_queue, pareto=pareto,
+                adaptive_schedule=adaptive_schedule,
+            )
+            _save_checkpoint(output / "checkpoint_latest.pth", **checkpoint_args)
+            if joint > best_joint:
+                best_joint = joint
+                _save_checkpoint(output / "checkpoint_best_test_joint.pth", **checkpoint_args)
+            print("icdor_light_epoch " + json.dumps(evaluation["metrics_summary"], sort_keys=True), flush=True)
+            continue
 
         factor_audit_payload = collect_factor_audit(
             model,
