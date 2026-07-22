@@ -1,0 +1,46 @@
+data_root: E:\sbw\BDD-OIA\data
+raw_root: E:\sbw\BDD-OIA
+bdd100k_root: E:\sbw\BDD100K
+pretrained_weights: ckp\reference\dino_deitsmall8_pretrain.pth
+image_height: 360
+image_width: 640
+patch_size: 8
+action_dim: 4
+reason_dim: 21
+eval_splits: test
+best_selection_split: test
+best_selection_metric: deploy_fixed_joint
+token_compression: none
+feature_cache_enabled: false
+experiment: {name: precise_oia_v1, direct_image: true, test_only_evaluation: true, internal_test_selected: true, publication_eligible_selection: false}
+backbone: {arch: vit_small, patch_size: 8, selected_layers: [3, 7, 11], freeze_backbone: true, no_grad_backbone: true, autocast_dtype: bfloat16, clear_internal_attention_cache: true}
+visual: {dim: 384, adapter_hidden: 192, context_pool_hw: [9, 16], local_kernel: 3, rezero_init: 0.02}
+category: {heads: 4, intra_layers: 1, reread_passes: 1, sampling_points_per_layer: 4, action_exchange_gamma_init: 0.05, reason_exchange_gamma_init: 0.05, exchange_gamma_max: 0.25, reread_gamma_init: 0.08, reread_gamma_max: 0.35}
+evidence: {field_config: configs\precise_evidence_fields.yaml, latent_slots: 6, actor_parts: 4, traffic_parts: 4, region_parts: 8, curve_parts: 8, latent_parts: 4, reliability_tau: 0.20, min_positive: 64, min_reliable_negative: 128, min_geometry_valid: 64}
+reason: {semantics_config: configs\precise_reason_semantics.yaml, annotation_rank: 8, annotation_delta_cap: 0.75, semantic_weight_floor: 0.25}
+exchange: {overlap_tau: 0.08, overlap_slope: 12.0, reliability_eps: 0.0001, explicit_only_for_certification: true}
+intervention: {max_pairs_per_batch: 24, margin: 0.10, control_mass_tolerance: 0.05, target_credit_grad_ratio: 0.20}
+pu: {enabled: false, weight: 0.0}
+training:
+  epochs: 12
+  batch_size: 8
+  gradient_accumulation_steps: 4
+  fallback_ladder: [[8, 4], [7, 5], [6, 5], [5, 6], [4, 8]]
+  num_workers: 8
+  persistent_workers: true
+  prefetch_factor: 4
+  pin_memory: true
+  precision: bf16
+  optimizer: AdamW
+  scheduler: warmup_cosine_steps
+  warmup_ratio: 0.05
+  weight_decay: 0.05
+  grad_clip_action: 1.0
+  grad_clip_reason: 0.8
+  grad_clip_evidence: 0.8
+  no_metric_early_stop: true
+optimizer: {action_foundation: {lr: 0.0002, weight_decay: 0.05}, action_decoder: {lr: 0.0003, weight_decay: 0.05}, reason_adapter_decoder: {lr: 0.0003, weight_decay: 0.05}, evidence_core: {lr: 0.0002, weight_decay: 0.05}, exchange_and_reread: {lr: 0.0002, weight_decay: 0.05}, annotation_adapter: {lr: 0.0005, weight_decay: 0.01}, threshold_head: {lr: 0.0007, weight_decay: 0.0}}
+augmentation: {mirror_pair_fraction: 0.25, brightness: 0.10, contrast: 0.10, hue: 0.0}
+threshold: {enabled: true, train_calib_fraction: 0.10, train_trunk_on_all_train: true, start_epoch: 1, warmup_epochs: 1, lr_threshold: 0.0007}
+diagnostics: {batch_log_every_optimizer_steps: 50, counterfactual_test_samples: 64, case_export_count: 32, no_extra_dino_forward: true}
+runtime: {target_peak_reserved_gb: 45.0, hard_max_reserved_gb: 46.5, foreground_only: true, test_every_epoch: true, save_every_epoch: true}

@@ -1,0 +1,17 @@
+explicit_fields:
+  - {name: traffic_light, family: traffic_control, sector: upper, part_type: points, num_parts: 4, supervision_sources: [detection], state_schema: [red, green, yellow_or_other, unknown], geometry_required: true, minimum_coverage: 0.01}
+  - {name: traffic_sign, family: traffic_control, sector: upper, part_type: points, num_parts: 4, supervision_sources: [detection], state_schema: [], geometry_required: true, minimum_coverage: 0.01}
+  - {name: actor_left, family: actor, sector: left, part_type: points, num_parts: 4, supervision_sources: [detection], type_schema: [vehicle, pedestrian, rider, other], geometry_required: true, minimum_coverage: 0.01}
+  - {name: actor_center, family: actor, sector: center, part_type: points, num_parts: 4, supervision_sources: [detection], type_schema: [vehicle, pedestrian, rider, other], geometry_required: true, minimum_coverage: 0.01}
+  - {name: actor_right, family: actor, sector: right, part_type: points, num_parts: 4, supervision_sources: [detection], type_schema: [vehicle, pedestrian, rider, other], geometry_required: true, minimum_coverage: 0.01}
+  - {name: drivable_left, family: drivable, sector: left, part_type: region, num_parts: 8, supervision_sources: [drivable], state_schema: [], geometry_required: true, minimum_coverage: 0.01}
+  - {name: drivable_center, family: drivable, sector: center, part_type: region, num_parts: 8, supervision_sources: [drivable], state_schema: [], geometry_required: true, minimum_coverage: 0.01}
+  - {name: drivable_right, family: drivable, sector: right, part_type: region, num_parts: 8, supervision_sources: [drivable], state_schema: [], geometry_required: true, minimum_coverage: 0.01}
+  - {name: boundary_left, family: boundary, sector: left, part_type: ordered_curve, num_parts: 8, supervision_sources: [lane], state_schema: [solid, dashed_or_other, unknown], geometry_required: true, minimum_coverage: 0.01}
+  - {name: boundary_right, family: boundary, sector: right, part_type: ordered_curve, num_parts: 8, supervision_sources: [lane], state_schema: [solid, dashed_or_other, unknown], geometry_required: true, minimum_coverage: 0.01}
+latent_slots:
+  count: 6
+  part_type: deformable
+  num_parts: 4
+  certifiable: false
+  name: null

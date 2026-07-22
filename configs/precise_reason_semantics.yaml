@@ -1,0 +1,22 @@
+reasons:
+  - {id: 0, name: "Traffic light is green", entity: traffic_light, state: green, sector: upper, decision_role: proceed, allowed_evidence_families: [traffic_control], explicit_certifiable: true, mirror_partner: 0}
+  - {id: 1, name: "Follow traffic", entity: traffic, state: following, sector: center, decision_role: proceed, allowed_evidence_families: [actor, drivable], explicit_certifiable: true, mirror_partner: 1}
+  - {id: 2, name: "Road is clear", entity: road, state: clear, sector: center, decision_role: proceed, allowed_evidence_families: [actor, drivable, boundary], explicit_certifiable: true, mirror_partner: 2}
+  - {id: 3, name: "Traffic light", entity: traffic_light, state: visible, sector: upper, decision_role: traffic_control, allowed_evidence_families: [traffic_control], explicit_certifiable: true, mirror_partner: 3}
+  - {id: 4, name: "Traffic sign", entity: traffic_sign, state: visible, sector: upper, decision_role: traffic_control, allowed_evidence_families: [traffic_control], explicit_certifiable: true, mirror_partner: 4}
+  - {id: 5, name: "Obstacle: car", entity: vehicle, state: present, sector: center, decision_role: avoid, allowed_evidence_families: [actor], explicit_certifiable: true, mirror_partner: 5}
+  - {id: 6, name: "Obstacle: person", entity: pedestrian, state: present, sector: center, decision_role: avoid, allowed_evidence_families: [actor], explicit_certifiable: true, mirror_partner: 6}
+  - {id: 7, name: "Obstacle: rider", entity: rider, state: present, sector: center, decision_role: avoid, allowed_evidence_families: [actor], explicit_certifiable: true, mirror_partner: 7}
+  - {id: 8, name: "Obstacle: others", entity: obstacle, state: present, sector: center, decision_role: avoid, allowed_evidence_families: [actor], explicit_certifiable: true, mirror_partner: 8}
+  - {id: 9, name: "No lane on the left", entity: boundary, state: absent, sector: left, decision_role: side_constraint, allowed_evidence_families: [boundary, drivable], explicit_certifiable: true, mirror_partner: 15}
+  - {id: 10, name: "Obstacles on the left lane", entity: actor, state: occupied, sector: left, decision_role: side_constraint, allowed_evidence_families: [actor, drivable], explicit_certifiable: true, mirror_partner: 16}
+  - {id: 11, name: "Solid line on the left", entity: boundary, state: solid, sector: left, decision_role: side_constraint, allowed_evidence_families: [boundary], explicit_certifiable: true, mirror_partner: 17}
+  - {id: 12, name: "On the left-turn lane", entity: lane, state: turn_lane, sector: left, decision_role: side_permission, allowed_evidence_families: [latent, boundary, drivable], explicit_certifiable: false, mirror_partner: 18}
+  - {id: 13, name: "Traffic light allows left", entity: traffic_light, state: allows_left, sector: upper, decision_role: side_permission, allowed_evidence_families: [latent, traffic_control], explicit_certifiable: false, mirror_partner: 19}
+  - {id: 14, name: "Front car turning left", entity: vehicle, state: turning_left, sector: center, decision_role: side_constraint, allowed_evidence_families: [latent, actor], explicit_certifiable: false, mirror_partner: 20}
+  - {id: 15, name: "No lane on the right", entity: boundary, state: absent, sector: right, decision_role: side_constraint, allowed_evidence_families: [boundary, drivable], explicit_certifiable: true, mirror_partner: 9}
+  - {id: 16, name: "Obstacles on the right lane", entity: actor, state: occupied, sector: right, decision_role: side_constraint, allowed_evidence_families: [actor, drivable], explicit_certifiable: true, mirror_partner: 10}
+  - {id: 17, name: "Solid line on the right", entity: boundary, state: solid, sector: right, decision_role: side_constraint, allowed_evidence_families: [boundary], explicit_certifiable: true, mirror_partner: 11}
+  - {id: 18, name: "On the right-turn lane", entity: lane, state: turn_lane, sector: right, decision_role: side_permission, allowed_evidence_families: [latent, boundary, drivable], explicit_certifiable: false, mirror_partner: 12}
+  - {id: 19, name: "Traffic light allows right", entity: traffic_light, state: allows_right, sector: upper, decision_role: side_permission, allowed_evidence_families: [latent, traffic_control], explicit_certifiable: false, mirror_partner: 13}
+  - {id: 20, name: "Front car turning right", entity: vehicle, state: turning_right, sector: center, decision_role: side_constraint, allowed_evidence_families: [latent, actor], explicit_certifiable: false, mirror_partner: 14}

@@ -1,0 +1,17 @@
+actions:
+  - id: 0
+    name: forward
+    query_base: forward
+    side_embedding: none
+  - id: 1
+    name: stop
+    query_base: stop
+    side_embedding: none
+  - id: 2
+    name: left
+    query_base: side_shared
+    side_embedding: left
+  - id: 3
+    name: right
+    query_base: side_shared
+    side_embedding: right
