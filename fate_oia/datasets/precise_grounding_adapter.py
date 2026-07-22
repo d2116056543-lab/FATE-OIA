@@ -30,6 +30,18 @@ def _flatten_labels(raw: Any) -> list[dict[str, Any]]:
     return []
 
 
+def _poly_vertices(label: dict[str, Any]) -> list[list[float]]:
+    """Read both official direct-point and vertices-dict poly2d formats."""
+    raw = label.get("poly2d") or []
+    if raw and all(isinstance(point, (list, tuple)) and len(point) >= 2 for point in raw):
+        return [[float(point[0]), float(point[1])] for point in raw]
+    return [
+        [float(point[0]), float(point[1])]
+        for poly in raw if isinstance(poly, dict)
+        for point in poly.get("vertices", []) if isinstance(point, (list, tuple)) and len(point) >= 2
+    ]
+
+
 class PRECISEGroundingAdapter:
     """Converts task-aware metadata into reliable-positive/negative/unknown targets."""
 
@@ -92,7 +104,7 @@ class PRECISEGroundingAdapter:
 
     @staticmethod
     def _curve_parts(labels: list[dict[str, Any]], parts: int) -> torch.Tensor | None:
-        points = [point for label in labels for poly in (label.get("poly2d") or []) if isinstance(poly, dict) for point in poly.get("vertices", []) if isinstance(point, (list, tuple)) and len(point) >= 2]
+        points = [point for label in labels for point in _poly_vertices(label)]
         if len(points) < 2:
             return None
         raw = torch.tensor([[float(point[0]) / 1280.0, float(point[1]) / 720.0] for point in points], dtype=torch.float32)
@@ -110,8 +122,7 @@ class PRECISEGroundingAdapter:
 
     @staticmethod
     def _poly_sector(label: dict[str, Any]) -> str:
-        polys = label.get("poly2d") or []
-        points = [point for poly in polys if isinstance(poly, dict) for point in poly.get("vertices", []) if isinstance(point, (list, tuple)) and len(point) >= 2]
+        points = _poly_vertices(label)
         if not points:
             return "center"
         x_mean = sum(float(point[0]) for point in points) / len(points)
@@ -143,11 +154,9 @@ class PRECISEGroundingAdapter:
         draw = ImageDraw.Draw(canvas)
         if kind == "curve":
             for label in labels:
-                for poly in label.get("poly2d") or []:
-                    vertices = poly.get("vertices", []) if isinstance(poly, dict) else []
-                    points = [(float(point[0]) / 1280.0 * (width - 1), float(point[1]) / 720.0 * (height - 1)) for point in vertices if isinstance(point, (list, tuple)) and len(point) >= 2]
-                    if len(points) >= 2:
-                        draw.line(points, fill=255, width=2)
+                points = [(point[0] / 1280.0 * (width - 1), point[1] / 720.0 * (height - 1)) for point in _poly_vertices(label)]
+                if len(points) >= 2:
+                    draw.line(points, fill=255, width=2)
         else:
             for label in labels:
                 box = label.get("box2d") or label.get("box") or {}

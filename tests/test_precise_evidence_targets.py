@@ -117,6 +117,22 @@ def test_boundary_polylines_are_partitioned_around_ego_center_not_image_thirds()
     assert target["boundary_right"]["presence"].item() == 1
 
 
+def test_native_bdd100k_direct_poly2d_points_produce_ordered_curve_targets():
+    adapter = _adapter()
+    record = TaskAwareGroundingRecord(("labels.json",), ("labels.json",), (), (), {"detection": True, "lane": True, "drivable": False})
+    metadata = {"lane": [
+        {"category": "lane/single white", "poly2d": [[500, 300, "L"], [520, 500, "L"], [560, 700, "L"]]},
+        {"category": "lane/single white", "poly2d": [[720, 300, "L"], [740, 500, "L"], [780, 700, "L"]]},
+    ]}
+    target = adapter.from_metadata(record, metadata)
+    for name in ("boundary_left", "boundary_right"):
+        assert target[name]["presence"].item() == 1
+        assert target[name]["geometry_valid"].item() == 1
+        assert target[name]["part_valid"].item() == 1
+        assert target[name]["soft_mask"].sum().item() > 0
+        assert torch.all(target[name]["part_coordinates"][1:, 1] >= target[name]["part_coordinates"][:-1, 1])
+
+
 def test_known_vehicle_is_not_mislabeled_as_other_actor_type():
     adapter = _adapter()
     record = TaskAwareGroundingRecord(("det.json",), (), (), (), {"detection": True, "lane": False, "drivable": False})
