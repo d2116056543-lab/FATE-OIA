@@ -10,6 +10,7 @@ from typing import Any
 
 import torch
 import yaml
+from torch.nn import functional as F
 from torch.utils.data import DataLoader, Subset
 
 from fate_oia.datasets.bdd_oia_multitask import BDDOIAMultiTaskDataset

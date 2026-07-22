@@ -36,3 +36,4 @@ def test_runtime_profile_binds_real_forward_to_git_and_config():
     assert "owner_gradient_matrix_passed" in source
     assert "curve_distance_valid_count" in source
     assert 'config["runtime"]["target_peak_reserved_gb"]' in source
+    assert "from torch.nn import functional as F" in source
