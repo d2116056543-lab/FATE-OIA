@@ -15,8 +15,6 @@ def _scalar(value: float) -> torch.Tensor:
 
 def _flatten_labels(raw: Any) -> list[dict[str, Any]]:
     if isinstance(raw, dict):
-        if raw.get("category") or raw.get("name"):
-            return [raw]
         if isinstance(raw.get("labels"), list):
             return [item for item in raw["labels"] if isinstance(item, dict)]
         if isinstance(raw.get("frames"), list):
@@ -25,6 +23,8 @@ def _flatten_labels(raw: Any) -> list[dict[str, Any]]:
                 for frame in raw["frames"] if isinstance(frame, dict)
                 for item in frame.get("objects", frame.get("labels", [])) if isinstance(item, dict)
             ]
+        if raw.get("category"):
+            return [raw]
     if isinstance(raw, list):
         return [item for item in raw if isinstance(item, dict)]
     return []
@@ -115,7 +115,7 @@ class PRECISEGroundingAdapter:
         if not points:
             return "center"
         x_mean = sum(float(point[0]) for point in points) / len(points)
-        return "left" if x_mean < 1280.0 / 3.0 else "right" if x_mean > 2.0 * 1280.0 / 3.0 else "center"
+        return "left" if x_mean < 1280.0 * 0.5 else "right"
 
     def _drivable_geometry(self, paths: tuple[str, ...], sector: str) -> tuple[float, bool, torch.Tensor]:
         """Read the official direct-drivable pixels into the model's 45x80 grid."""

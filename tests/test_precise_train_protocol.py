@@ -3,7 +3,7 @@ from pathlib import Path
 import torch
 import yaml
 
-from fate_oia.engine.train_precise_oia import build_optimizers
+from fate_oia.engine.train_precise_oia import _slice_batch_output, build_optimizers
 from fate_oia.models.precise_oia_model import PRECISEOIAModel
 
 
@@ -38,9 +38,11 @@ def test_all_planned_mechanism_losses_are_called_by_trainer():
 
 def test_non_main_losses_share_update_based_warmup_and_required_diagnostics_are_logged():
     source = (ROOT / "fate_oia" / "engine" / "train_precise_oia.py").read_text(encoding="utf-8")
-    assert "main_loss = losses[\"loss_total\"] - 0.15 * losses[\"loss_evidence\"]" in source
+    assert "latent_regularizer = 0.15 * 0.02 * losses[\"loss_evidence_latent_diversity\"]" in source
+    assert "main_loss = losses[\"loss_total\"] - 0.15 * losses[\"loss_evidence\"] - latent_regularizer" in source
     assert "total_loss = main_loss + auxiliary_warmup * (" in source
     assert "0.15 * losses[\"loss_evidence\"]" in source
+    assert "+ latent_regularizer" in source
     for field in (
         "action_reread_to_direct_ratio",
         "reason_reread_to_direct_ratio",
@@ -94,3 +96,33 @@ def test_norm_bias_and_embedding_parameters_have_zero_weight_decay():
     optimizers = build_optimizers(model, config)
     assert set(optimizers) == {"action_foundation", "action_decoder", "reason_semantic", "evidence_core", "exchange_reread", "annotation_adapter", "threshold_head"}
     assert all(any(group["weight_decay"] == 0.0 for group in optimizer.param_groups) for optimizer in optimizers.values())
+
+
+def test_batch_output_slicing_never_slices_schema_tensors_when_sizes_coincide():
+    full_batch = 10
+    output = {
+        "action_logits_final_raw": torch.randn(full_batch, 4),
+        "evidence_view_consistency": torch.linspace(0.1, 1.0, 10),
+        "action_evidence_family_mask": torch.ones(4, 10, dtype=torch.bool),
+        "evidence_part_valid": torch.ones(10, 8, dtype=torch.bool),
+        "evidence_geometry_type": torch.arange(10),
+        "branch_logits": {"reason_semantic": torch.randn(full_batch, 21)},
+    }
+
+    canonical = _slice_batch_output(output, 8, full_batch)
+    mirrored = _slice_batch_output(output, full_batch, full_batch, start=8)
+
+    assert canonical["action_logits_final_raw"].shape == (8, 4)
+    assert mirrored["action_logits_final_raw"].shape == (2, 4)
+    assert canonical["branch_logits"]["reason_semantic"].shape == (8, 21)
+    assert mirrored["branch_logits"]["reason_semantic"].shape == (2, 21)
+    for key in ("evidence_view_consistency", "action_evidence_family_mask", "evidence_part_valid", "evidence_geometry_type"):
+        assert torch.equal(canonical[key], output[key])
+        assert torch.equal(mirrored[key], output[key])
+
+
+def test_runtime_profiles_are_memory_isolated_and_persisted_before_selection():
+    source = (ROOT / "fate_oia" / "engine" / "profile_precise_oia.py").read_text(encoding="utf-8")
+    assert "gc.collect()" in source
+    assert source.count("torch.cuda.empty_cache()") >= 2
+    assert source.index('(root / "runtime_profile.json").write_text') < source.index("selected = choose_runtime_profile")

@@ -87,13 +87,16 @@ def evidence_loss(evidence: dict[str, torch.Tensor], targets: dict[str, torch.Te
     grid = torch.stack([xx, yy], dim=-1).view(1, 1, 1, height, width, 2)
     target_distance = ((grid - part_target.float().unsqueeze(-2).unsqueeze(-2)) / 0.07).square().sum(-1)
     generated_masks = (torch.exp(-0.5 * target_distance) * part_mask.unsqueeze(-1).unsqueeze(-1)).amax(2)
-    target_masks = targets.get("soft_masks", generated_masks).to(anchor).float()
-    predicted_masks = evidence["soft_masks"].clamp(1e-5, 1.0 - 1e-5)
+    target_masks = targets.get("soft_masks", generated_masks).to(device=anchor.device, dtype=torch.float32)
+    predicted_masks = evidence["soft_masks"].float().clamp(1e-5, 1.0 - 1e-5)
     geometry_type = evidence["geometry_type"].view(1, -1)
     point = (geometry_type == 0).float() * part_valid
     region = (geometry_type == 1).float() * part_valid
     curve = (geometry_type == 2).float() * part_valid
-    focal = F.binary_cross_entropy(predicted_masks, target_masks, reduction="none") * (predicted_masks - target_masks).abs().pow(2)
+    # Probability-space BCE is intentionally local FP32: PyTorch forbids
+    # BCELoss under autocast, while the rest of PRECISE remains bf16.
+    with torch.autocast(device_type=anchor.device.type, enabled=False):
+        focal = F.binary_cross_entropy(predicted_masks, target_masks, reduction="none") * (predicted_masks - target_masks).abs().pow(2)
     focal = (focal.mean((-1, -2)) * point).sum() / point.sum().clamp_min(1.0)
     intersection = (predicted_masks * target_masks).sum((-1, -2))
     dice = 1.0 - (2.0 * intersection + 1e-5) / (predicted_masks.sum((-1, -2)) + target_masks.sum((-1, -2)) + 1e-5)
@@ -122,7 +125,10 @@ def evidence_loss(evidence: dict[str, torch.Tensor], targets: dict[str, torch.Te
     identity = torch.eye(latent.shape[1], device=latent.device, dtype=torch.bool).unsqueeze(0)
     latent_diversity = latent_similarity.masked_select((~identity).expand_as(latent_similarity)).square().mean()
     view_value = evidence.get("view_consistency_loss", zero)
-    value = presence_value + 0.3 * state_value + 0.2 * geometry_value + 0.1 * prototype_value + 0.05 * view_value + 0.02 * latent_diversity
+    # Keep latent diversity as a separately owned task regularizer.  Folding
+    # it into the grounding row would make evidence loss update the
+    # reason-owned latent slots and violate the declared owner matrix.
+    value = presence_value + 0.3 * state_value + 0.2 * geometry_value + 0.1 * prototype_value + 0.05 * view_value
     return {"loss_evidence": value, "loss_evidence_presence": presence_value, "loss_evidence_state": state_value, "loss_evidence_geometry": geometry_value, "loss_evidence_prototype": prototype_value, "loss_evidence_view": view_value, "loss_evidence_latent_diversity": latent_diversity, "curve_distance_valid_count": curve.sum(), "valid_count": valid.sum()}
 
 
@@ -141,5 +147,5 @@ def total_precise_losses(output: dict[str, torch.Tensor], action_targets: torch.
     reason_direct = asymmetric_multilabel_loss(output["reason_logits_direct"], reason_targets)
     reason_observed = asymmetric_multilabel_loss(output["reason_logits_observed"], reason_targets)
     evidence = evidence_loss({"presence_logits": output["evidence_presence_logits"], "observability_logits": output["evidence_observability_logits"], "state_logits": output["evidence_state_logits"], "part_coordinates": output["evidence_part_coordinates"], "part_scales": output["evidence_part_scales"], "soft_masks": output["evidence_masks"], "prototype_margin": output["evidence_prototype_margin"], "latent_tokens": output["latent_evidence_tokens"], "part_valid": output["evidence_part_valid"], "geometry_type": output["evidence_geometry_type"]}, evidence_targets)
-    total = action_final + 0.5 * action_direct + reason_semantic + 0.5 * reason_direct + reason_observed + 0.15 * evidence["loss_evidence"]
+    total = action_final + 0.5 * action_direct + reason_semantic + 0.5 * reason_direct + reason_observed + 0.15 * evidence["loss_evidence"] + 0.15 * 0.02 * evidence["loss_evidence_latent_diversity"]
     return {"loss_total": total, "loss_action_final": action_final, "loss_action_direct": action_direct, "loss_reason_semantic": reason_semantic, "loss_reason_direct": reason_direct, "loss_reason_observed": reason_observed, **evidence}

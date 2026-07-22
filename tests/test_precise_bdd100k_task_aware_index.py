@@ -35,6 +35,48 @@ def test_missing_source_is_unknown_not_negative(tmp_path: Path):
     assert record.source_complete["drivable"] is False
 
 
+def test_bdd_oia_clip_frame_suffix_resolves_to_bdd100k_base_stem(tmp_path: Path):
+    root = tmp_path / "bdd100k"
+    _write(root / "labels" / "det" / "9af44b54-7aae6c7d.json", {"name": "9af44b54-7aae6c7d.jpg", "frames": []})
+    index = BDD100KTaskAwareIndex(root, emit_manifest=False)
+    assert index.get("9af44b54-7aae6c7d_3.jpg").source_complete["detection"] is True
+    assert index.metadata_for("9af44b54-7aae6c7d_1.jpg")["detection"]
+
+
+def test_numeric_suffix_is_only_removed_from_uuid_style_bdd_clip_stems(tmp_path: Path):
+    root = tmp_path / "bdd100k"
+    _write(root / "labels" / "det" / "ordinary_3.json", {"name": "ordinary_3.jpg", "frames": []})
+    index = BDD100KTaskAwareIndex(root, emit_manifest=False)
+    assert index.get("ordinary_3.jpg").source_complete["detection"] is True
+    assert index.get("ordinary_1.jpg").source_complete["detection"] is False
+
+
+def test_multiframe_json_metadata_is_bound_to_its_own_stem_without_cross_image_leakage(tmp_path: Path):
+    root = tmp_path / "bdd100k"
+    payload = [
+        {"name": "aaaaaaaa-bbbbbbbb.jpg", "labels": [{"category": "car", "box2d": {"x1": 1, "y1": 2, "x2": 3, "y2": 4}}]},
+        {"name": "cccccccc-dddddddd.jpg", "labels": [{"category": "pedestrian", "box2d": {"x1": 5, "y1": 6, "x2": 7, "y2": 8}}]},
+    ]
+    _write(root / "bdd100k_labels" / "det_train.json", payload)
+    index = BDD100KTaskAwareIndex(root, emit_manifest=False)
+    first = index.metadata_for("aaaaaaaa-bbbbbbbb_1.jpg")["detection"]
+    second = index.metadata_for("cccccccc-dddddddd_3.jpg")["detection"]
+    assert first == [payload[0]]
+    assert second == [payload[1]]
+
+
+def test_poly2d_in_list_format_is_indexed_as_lane_for_only_that_frame(tmp_path: Path):
+    root = tmp_path / "bdd100k"
+    payload = [
+        {"name": "aaaaaaaa-bbbbbbbb.jpg", "labels": [{"category": "lane", "poly2d": [{"vertices": [[0, 0], [1, 1]]}]}]},
+        {"name": "cccccccc-dddddddd.jpg", "labels": []},
+    ]
+    _write(root / "bdd100k_labels" / "labels.json", payload)
+    index = BDD100KTaskAwareIndex(root, emit_manifest=False)
+    assert index.get("aaaaaaaa-bbbbbbbb_1.jpg").source_complete["lane"] is True
+    assert index.get("cccccccc-dddddddd_1.jpg").source_complete["lane"] is False
+
+
 def test_manifest_has_counts_duplicates_missing_and_hashes(tmp_path: Path):
     root = tmp_path / "bdd100k"
     _write(root / "detection" / "a.json", {"name": "a.jpg", "frames": []})

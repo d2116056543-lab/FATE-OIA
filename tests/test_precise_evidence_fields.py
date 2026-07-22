@@ -49,17 +49,24 @@ def test_reliability_is_continuous_and_increases_with_observability_logit():
 
 def test_evidence_loss_contains_geometry_prototype_view_and_latent_terms():
     fields = load_evidence_fields(ROOT / "configs" / "precise_evidence_fields.yaml")
-    output = PRECISEEvidenceFields(fields)(torch.randn(1, 3, 3600, 384))
+    model = PRECISEEvidenceFields(fields)
+    output = model(torch.randn(1, 3, 3600, 384))
     targets = {
         "presence": torch.ones(1, 10), "presence_valid": torch.ones(1, 10),
         "observability": torch.ones(1, 10), "state": torch.zeros(1, 10, 4),
         "state_valid": torch.ones(1, 10), "part_coordinates": output["part_coordinates"].detach(),
         "part_valid": torch.ones(1, 10),
     }
-    losses = evidence_loss(output, targets)
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        losses = evidence_loss(output, targets)
     for key in ("loss_evidence_prototype", "loss_evidence_view", "loss_evidence_latent_diversity", "curve_distance_valid_count"):
         assert key in losses
     assert losses["curve_distance_valid_count"].item() == 2
+    assert torch.isfinite(losses["loss_evidence"])
+    grounding_grads = torch.autograd.grad(losses["loss_evidence"], model.latent_parameters(), retain_graph=True, allow_unused=True)
+    diversity_grads = torch.autograd.grad(losses["loss_evidence_latent_diversity"], model.latent_parameters(), allow_unused=True)
+    assert all(value is None or value.abs().sum().item() == 0.0 for value in grounding_grads)
+    assert any(value is not None and value.abs().sum().item() > 0.0 for value in diversity_grads)
 
 
 def test_evidence_view_consistency_aligns_field_identity_masks_and_x_coordinates():

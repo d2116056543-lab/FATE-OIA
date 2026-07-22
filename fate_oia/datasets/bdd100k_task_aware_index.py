@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,7 +21,11 @@ class TaskAwareGroundingRecord:
 def _stem(name: str) -> str:
     stem = Path(name).stem
     # BDD100K color drivable maps use <image>_drivable_color.png.
-    return stem.removesuffix("_drivable_color").removesuffix("_drivable_id")
+    stem = stem.removesuffix("_drivable_color").removesuffix("_drivable_id")
+    # BDD-OIA clips append a frame index to the original BDD100K UUID stem
+    # (for example <8hex>-<8hex>_3.jpg).  Grounding annotations retain the
+    # base image stem, so normalize only this precise UUID-like convention.
+    return re.sub(r"^([0-9a-fA-F]{8}-[0-9a-fA-F]{8})_[0-9]+$", r"\1", stem)
 
 
 def _read_json(path: Path) -> Any | None:
@@ -47,7 +52,11 @@ class BDD100KTaskAwareIndex:
             self.write_manifest(target)
 
     def _source_kind(self, path: Path, payload: Any | None = None) -> str:
-        lower = str(path).lower().replace("\\", "/")
+        try:
+            semantic_path = path.relative_to(self.root)
+        except ValueError:
+            semantic_path = Path(path.name)
+        lower = str(semantic_path).lower().replace("\\", "/")
         if "drivable" in lower:
             return "drivable"
         if "semantic" in lower:
@@ -73,6 +82,35 @@ class BDD100KTaskAwareIndex:
                 return sorted(set(found))
         return [_stem(path.name)]
 
+    def _metadata_items(self, path: Path, payload: Any | None) -> list[tuple[str, Any | None]]:
+        """Split aggregate annotation files into per-image metadata records."""
+        if isinstance(payload, list):
+            items = []
+            for item in payload:
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("name") or item.get("file_name") or item.get("filename")
+                if name:
+                    items.append((_stem(str(name)), item))
+            if items:
+                return items
+        if isinstance(payload, dict):
+            frames = payload.get("frames")
+            frame_items = []
+            if isinstance(frames, list):
+                for frame in frames:
+                    if not isinstance(frame, dict):
+                        continue
+                    name = frame.get("name") or frame.get("file_name") or frame.get("filename")
+                    if name:
+                        frame_items.append((_stem(str(name)), frame))
+            if frame_items:
+                return frame_items
+            name = payload.get("name") or payload.get("file_name") or payload.get("filename")
+            if name:
+                return [(_stem(str(name)), payload)]
+        return [(_stem(path.name), payload)]
+
     def _scan(self) -> None:
         if not self.root.exists():
             return
@@ -94,29 +132,33 @@ class BDD100KTaskAwareIndex:
                 kind = self._source_kind(path, payload)
                 if suffix != ".json" and kind not in {"drivable", "semantic"}:
                     continue
-                kinds = [kind]
-                # The public 100k JSON contains detection boxes and lane/poly2d
-                # records together.  Keep the two semantic sources separately
-                # while retaining the original file in both source lists.
-                if suffix == ".json" and self._contains_poly2d(payload):
-                    kinds.append("lane")
                 self._paths[kind].append(str(path))
-                for stem in self._file_stems(path, payload):
+                if suffix == ".json" and kind != "lane" and self._contains_poly2d(payload):
+                    self._paths["lane"].append(str(path))
+                for stem, item_payload in self._metadata_items(path, payload):
+                    kinds = [kind]
+                    # The public 100k JSON can mix boxes and poly2d labels in
+                    # one aggregate file.  Lane completeness is frame-local.
+                    if suffix == ".json" and self._contains_poly2d(item_payload):
+                        kinds.append("lane")
                     for source in set(kinds):
                         self._records[stem][source].append(str(path))
-                        if payload is not None:
-                            self._metadata[stem][source].append(payload)
+                        if item_payload is not None:
+                            self._metadata[stem][source].append(item_payload)
 
     @staticmethod
     def _contains_poly2d(payload: Any) -> bool:
+        if isinstance(payload, list):
+            return any(BDD100KTaskAwareIndex._contains_poly2d(item) for item in payload)
         if not isinstance(payload, dict):
             return False
+        if payload.get("poly2d"):
+            return True
+        labels = payload.get("objects", payload.get("labels", []))
+        if isinstance(labels, list) and any(isinstance(item, dict) and item.get("poly2d") for item in labels):
+            return True
         frames = payload.get("frames", [])
-        return any(
-            isinstance(item, dict) and item.get("poly2d")
-            for frame in frames if isinstance(frame, dict)
-            for item in frame.get("objects", frame.get("labels", []))
-        )
+        return isinstance(frames, list) and any(BDD100KTaskAwareIndex._contains_poly2d(frame) for frame in frames)
 
     def _freeze(self) -> None:
         for stem, sources in self._records.items():

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import json
 import subprocess
@@ -46,6 +47,9 @@ def _make_loader(config: dict[str, Any], dataset, batch_size: int) -> DataLoader
 
 
 def _profile_one(config: dict[str, Any], args: argparse.Namespace, dataset, adapter, targets, active_fields, batch_size: int, accum: int, device: torch.device, root: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
     loader = _make_loader(config, dataset, batch_size)
     model = PRECISEOIAModel(Path(args.config).parent, config["pretrained_weights"], evidence_schema=active_fields, model_config=config).to(device)
     optimizers = build_optimizers(model, config)
@@ -85,13 +89,7 @@ def _profile_one(config: dict[str, Any], args: argparse.Namespace, dataset, adap
                 intervention = packed_target_specific_interventions(model, output, action_target, reason_target, int(config["intervention"]["max_pairs_per_batch"]))
                 mirror_loss = losses["loss_total"] * 0.0
                 if mirror_count:
-                    def mirror_slice(value):
-                        if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == model_input.shape[0]:
-                            return value[images.shape[0]:]
-                        if isinstance(value, dict):
-                            return {key: mirror_slice(item) for key, item in value.items()}
-                        return value
-                    mirrored = mirror_slice(full_output)
+                    mirrored = _slice_batch_output(full_output, model_input.shape[0], model_input.shape[0], start=images.shape[0])
                     action_map = torch.tensor([0, 1, 3, 2], device=device)
                     reason_map = torch.tensor([int(row["mirror_partner"]) for row in model.reason_schema], device=device)
                     field_map = model.evidence_fields.mirror_field_indices
@@ -153,6 +151,10 @@ def _profile_one(config: dict[str, Any], args: argparse.Namespace, dataset, adap
         owner_gradient_matrix["intervention"]["evidence_core"] > 0.0,
     ))
     profile = {"batch_size": batch_size, "grad_accum": accum, "workers": int(config["training"]["num_workers"]), "warmup_steps": args.warmup_steps, "measure_steps": measured, "samples_per_sec": total_images / elapsed if measured else 0.0, "peak_reserved_gb": peak, "dino_call_count": 1 if core else 0, "core_mechanisms_enabled": core, "valid": bool(valid and measured == args.measure_steps and core), "failure_reason": reason, "forward_shapes": forward_shapes, "gradient_firewall": firewall_report, "gradient_firewall_passed": bool(non_annotation) and all(float(value) == 0.0 for value in non_annotation.values()), "owner_gradient_matrix": owner_gradient_matrix, "owner_gradient_matrix_passed": evidence_isolated and observed_isolated and threshold_isolated and expected_active, "curve_distance_valid_count": float(losses.get("curve_distance_valid_count", torch.tensor(0.0)).detach().item()) if 'losses' in locals() else 0.0}
+    del model, optimizers, loader
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
     return profile, rows
 
 
@@ -175,11 +177,11 @@ def main() -> None:
     for batch, accum in ((10, 3), (8, 4), (6, 5)):
         profile, rows = _profile_one(config, args, dataset, adapter, targets, active_fields, batch, accum, device, root)
         profiles.append(profile); steps.extend(rows)
+    (root / "runtime_profile.json").write_text(json.dumps(profiles, indent=2), encoding="utf-8")
+    (root / "runtime_steps.jsonl").write_text("".join(json.dumps(item) + "\n" for item in steps), encoding="utf-8")
     selected = choose_runtime_profile(profiles, float(config["runtime"]["hard_max_reserved_gb"]), float(config["runtime"]["target_peak_reserved_gb"]))
     selected["git_head"] = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     selected["config_sha256"] = hashlib.sha256(Path(args.config).read_bytes()).hexdigest()
-    (root / "runtime_profile.json").write_text(json.dumps(profiles, indent=2), encoding="utf-8")
-    (root / "runtime_steps.jsonl").write_text("".join(json.dumps(item) + "\n" for item in steps), encoding="utf-8")
     (root / "selected_runtime_profile.json").write_text(json.dumps(selected, indent=2), encoding="utf-8")
     real_forward = {
         "passed": bool(selected["valid"] and selected["dino_call_count"] == 1 and selected["owner_gradient_matrix_passed"] and selected["curve_distance_valid_count"] > 0 and selected["forward_shapes"].get("action_logits_final_raw", [0, 0])[-1] == 4 and selected["forward_shapes"].get("reason_logits_final_raw", [0, 0])[-1] == 21),

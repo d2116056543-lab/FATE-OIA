@@ -83,6 +83,40 @@ def test_label_objects_and_drivable_map_are_not_silently_dropped(tmp_path: Path)
     assert batch["soft_masks"][0, 6].sum().item() > 0
 
 
+def test_named_frame_container_is_unwrapped_before_category_matching():
+    adapter = _adapter()
+    record = TaskAwareGroundingRecord(("labels.json",), (), (), (), {"detection": True, "lane": False, "drivable": False})
+    metadata = {"detection": [{"name": "aaaaaaaa-bbbbbbbb.jpg", "labels": [
+        {"category": "car", "box2d": {"x1": 500, "x2": 700, "y1": 300, "y2": 500}}
+    ]}]}
+    target = adapter.from_metadata(record, metadata)
+    assert target["actor_center"]["presence"].item() == 1
+
+
+def test_named_clip_container_unwraps_frame_objects_and_poly2d():
+    adapter = _adapter()
+    record = TaskAwareGroundingRecord(("labels.json",), ("labels.json",), (), (), {"detection": True, "lane": True, "drivable": False})
+    metadata = {"detection": [{"name": "aaaaaaaa-bbbbbbbb.jpg", "frames": [{"objects": [
+        {"category": "car", "box2d": {"x1": 500, "x2": 700, "y1": 300, "y2": 500}},
+        {"category": "lane/road curb", "poly2d": [{"vertices": [[100, 500], [200, 650]]}]},
+    ]}]}]}
+    target = adapter.from_metadata(record, metadata)
+    assert target["actor_center"]["presence"].item() == 1
+    assert target["boundary_left"]["presence"].item() == 1
+
+
+def test_boundary_polylines_are_partitioned_around_ego_center_not_image_thirds():
+    adapter = _adapter()
+    record = TaskAwareGroundingRecord(("labels.json",), ("labels.json",), (), (), {"detection": True, "lane": True, "drivable": False})
+    metadata = {"lane": [
+        {"category": "lane/single white", "poly2d": [{"vertices": [[500, 400], [560, 700]]}]},
+        {"category": "lane/single white", "poly2d": [{"vertices": [[720, 400], [780, 700]]}]},
+    ]}
+    target = adapter.from_metadata(record, metadata)
+    assert target["boundary_left"]["presence"].item() == 1
+    assert target["boundary_right"]["presence"].item() == 1
+
+
 def test_known_vehicle_is_not_mislabeled_as_other_actor_type():
     adapter = _adapter()
     record = TaskAwareGroundingRecord(("det.json",), (), (), (), {"detection": True, "lane": False, "drivable": False})

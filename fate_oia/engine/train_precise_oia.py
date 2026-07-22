@@ -186,11 +186,24 @@ def _dataset_samples(dataset) -> list[Any]:
     return [parent[int(index)] for index in dataset.indices]
 
 
-def _slice_batch_output(value: Any, stop: int, full_batch: int) -> Any:
-    if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == full_batch:
-        return value[:stop]
+_STATIC_OUTPUT_TENSOR_KEYS = {
+    "evidence_view_consistency",
+    "action_evidence_family_mask",
+    "evidence_part_valid",
+    "evidence_geometry_type",
+}
+
+
+def _slice_batch_output(value: Any, stop: int, full_batch: int, start: int = 0, key: str | None = None) -> Any:
+    """Slice batch-valued model outputs without corrupting schema tensors.
+
+    Static evidence tensors can have a leading dimension equal to a runtime
+    batch size by coincidence, so shape alone is not a sufficient contract.
+    """
+    if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == full_batch and key not in _STATIC_OUTPUT_TENSOR_KEYS:
+        return value[start:stop]
     if isinstance(value, dict):
-        return {key: _slice_batch_output(item, stop, full_batch) for key, item in value.items()}
+        return {child_key: _slice_batch_output(item, stop, full_batch, start=start, key=child_key) for child_key, item in value.items()}
     return value
 
 
@@ -318,13 +331,7 @@ def train(args: argparse.Namespace) -> None:
             output = _slice_batch_output(full_output, batch_size, model_input.shape[0])
             mirror_output = None
             if mirror_count:
-                def mirror_slice(value: Any) -> Any:
-                    if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == model_input.shape[0]:
-                        return value[batch_size:]
-                    if isinstance(value, dict):
-                        return {key: mirror_slice(item) for key, item in value.items()}
-                    return value
-                mirror_output = mirror_slice(full_output)
+                mirror_output = _slice_batch_output(full_output, model_input.shape[0], model_input.shape[0], start=batch_size)
             target_batch = grounding_adapter.stack_batch([train_grounding[name] for name in batch["file_name"]], device)
             action_target = batch["action"].to(device)
             reason_target = batch["reason"].to(device)
@@ -355,9 +362,11 @@ def train(args: argparse.Namespace) -> None:
                 intervention = packed_target_specific_interventions(model, output, action_target, reason_target, int(config["intervention"]["max_pairs_per_batch"]))
             total_updates = max(1, math.ceil(len(train_loader) / args.gradient_accumulation_steps) * args.epochs)
             auxiliary_warmup = min(1.0, float(global_optimizer_step + 1) / max(1.0, 0.10 * total_updates))
-            main_loss = losses["loss_total"] - 0.15 * losses["loss_evidence"]
+            latent_regularizer = 0.15 * 0.02 * losses["loss_evidence_latent_diversity"]
+            main_loss = losses["loss_total"] - 0.15 * losses["loss_evidence"] - latent_regularizer
             total_loss = main_loss + auxiliary_warmup * (
                 0.15 * losses["loss_evidence"]
+                + latent_regularizer
                 + loss_refinement
                 + loss_mirror
                 + intervention["loss_intervention"]
