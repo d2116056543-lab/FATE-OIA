@@ -18,12 +18,17 @@ class TaskAwareGroundingRecord:
 
 
 def _stem(name: str) -> str:
-    return Path(name).stem
+    stem = Path(name).stem
+    # BDD100K color drivable maps use <image>_drivable_color.png.
+    return stem.removesuffix("_drivable_color").removesuffix("_drivable_id")
 
 
-def _read_json(path: Path) -> Any:
-    with path.open("r", encoding="utf-8", errors="ignore") as handle:
-        return json.load(handle)
+def _read_json(path: Path) -> Any | None:
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
 
 
 class BDD100KTaskAwareIndex:
@@ -34,6 +39,7 @@ class BDD100KTaskAwareIndex:
         self._records: dict[str, dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
         self._metadata: dict[str, dict[str, list[Any]]] = defaultdict(lambda: defaultdict(list))
         self._paths: dict[str, list[str]] = defaultdict(list)
+        self.invalid_json_paths: list[str] = []
         self._scan()
         self._freeze()
         if emit_manifest or manifest_path is not None:
@@ -70,21 +76,47 @@ class BDD100KTaskAwareIndex:
     def _scan(self) -> None:
         if not self.root.exists():
             return
-        for path in self.root.rglob("*"):
-            if not path.is_file():
-                continue
-            suffix = path.suffix.lower()
-            if suffix not in {".json", ".png", ".jpg", ".jpeg"}:
-                continue
-            payload: Any | None = _read_json(path) if suffix == ".json" else None
-            kind = self._source_kind(path, payload)
-            if suffix != ".json" and kind not in {"drivable", "semantic"}:
-                continue
-            self._paths[kind].append(str(path))
-            for stem in self._file_stems(path, payload):
-                self._records[stem][kind].append(str(path))
-                if payload is not None:
-                    self._metadata[stem][kind].append(payload)
+        # Do not walk RGB image trees: they are not annotation sources and
+        # make startup scale with every BDD100K image rather than its labels.
+        known_roots = [self.root / name for name in ("bdd100k_labels", "bdd100k_drivable_maps", "bdd100k_seg") if (self.root / name).exists()]
+        scan_roots = known_roots or [self.root]
+        for scan_root in scan_roots:
+            for path in scan_root.rglob("*"):
+                if not path.is_file():
+                    continue
+                suffix = path.suffix.lower()
+                if suffix not in {".json", ".png", ".jpg", ".jpeg"}:
+                    continue
+                payload: Any | None = _read_json(path) if suffix == ".json" else None
+                if suffix == ".json" and payload is None:
+                    self.invalid_json_paths.append(str(path))
+                    continue
+                kind = self._source_kind(path, payload)
+                if suffix != ".json" and kind not in {"drivable", "semantic"}:
+                    continue
+                kinds = [kind]
+                # The public 100k JSON contains detection boxes and lane/poly2d
+                # records together.  Keep the two semantic sources separately
+                # while retaining the original file in both source lists.
+                if suffix == ".json" and self._contains_poly2d(payload):
+                    kinds.append("lane")
+                self._paths[kind].append(str(path))
+                for stem in self._file_stems(path, payload):
+                    for source in set(kinds):
+                        self._records[stem][source].append(str(path))
+                        if payload is not None:
+                            self._metadata[stem][source].append(payload)
+
+    @staticmethod
+    def _contains_poly2d(payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        frames = payload.get("frames", [])
+        return any(
+            isinstance(item, dict) and item.get("poly2d")
+            for frame in frames if isinstance(frame, dict)
+            for item in frame.get("objects", frame.get("labels", []))
+        )
 
     def _freeze(self) -> None:
         for stem, sources in self._records.items():
@@ -107,7 +139,19 @@ class BDD100KTaskAwareIndex:
     def write_manifest(self, path: str | Path) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        hashes = {item: hashlib.sha256(Path(item).read_bytes()).hexdigest() for values in self._paths.values() for item in values}
+        # Full hashing every dense PNG serializes startup behind many GB of IO.
+        # A content hash remains exact for JSON annotation sources; maps use a
+        # deterministic metadata fingerprint and are reopened only when a
+        # sample's target is built.
+        hashes = {}
+        for values in self._paths.values():
+            for item in values:
+                source = Path(item)
+                stat = source.stat()
+                if source.suffix.lower() == ".json":
+                    hashes[item] = hashlib.sha256(source.read_bytes()).hexdigest()
+                else:
+                    hashes[item] = hashlib.sha256(f"{source}|{stat.st_size}|{stat.st_mtime_ns}".encode("utf-8")).hexdigest()
         payload = {
             "root": str(self.root),
             "source_counts": {kind: len(values) for kind, values in self._paths.items()},
@@ -115,5 +159,6 @@ class BDD100KTaskAwareIndex:
             "duplicates": {stem: {kind: values for kind, values in sources.items() if len(values) > 1} for stem, sources in self._records.items()},
             "missing": {kind: sum(not bool(sources.get(kind)) for sources in self._records.values()) for kind in ("detection", "lane", "drivable", "semantic")},
             "hashes": hashes,
+            "invalid_json_paths": sorted(self.invalid_json_paths),
         }
         path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")

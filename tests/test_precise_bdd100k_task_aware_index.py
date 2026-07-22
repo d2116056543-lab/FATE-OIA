@@ -55,3 +55,13 @@ def test_metadata_is_preparsed_once_at_startup(tmp_path: Path):
     second = index.metadata_for("a.jpg")
     assert first is second
     assert first["detection"]
+
+
+def test_malformed_json_is_recorded_and_never_becomes_a_negative_source(tmp_path: Path):
+    root = tmp_path / "bdd100k"
+    bad = root / "labels" / "broken.json"
+    bad.parent.mkdir(parents=True, exist_ok=True)
+    bad.write_text("not-json", encoding="utf-8")
+    index = BDD100KTaskAwareIndex(root, emit_manifest=False)
+    assert index.get("broken.jpg").source_complete["detection"] is False
+    assert index.invalid_json_paths == [str(bad)]

@@ -51,3 +51,29 @@ def test_targets_expose_required_provenance_fields():
     target = adapter.from_metadata(record, {})["traffic_sign"]
     assert {"target", "valid_mask", "reliability", "source_id", "geometry_valid", "observability_target"} <= set(target)
     assert all(torch.is_tensor(value) for key, value in target.items() if key not in {"source_id"})
+
+
+def test_label_objects_and_drivable_map_are_not_silently_dropped(tmp_path: Path):
+    """BDD100K stores labels in frame.objects and drivable supervision in a map."""
+    from PIL import Image
+
+    adapter = _adapter()
+    map_path = tmp_path / "frame_drivable_color.png"
+    Image.new("RGB", (12, 12), color=(255, 0, 0)).save(map_path)
+    record = TaskAwareGroundingRecord(
+        ("labels.json",), ("labels.json",), (str(map_path),), (),
+        {"detection": True, "lane": True, "drivable": True, "semantic": False},
+    )
+    metadata = {"detection": [{"frames": [{"objects": [
+        {"category": "car", "box2d": {"x1": 500, "x2": 700, "y1": 300, "y2": 500}},
+        {"category": "lane/road curb", "attributes": {"style": "solid"}, "poly2d": [{"vertices": [[100, 500], [200, 650]]}]},
+    ]}]}]}
+    target = adapter.from_metadata(record, metadata)
+    assert target["actor_center"]["presence"].item() == 1
+    assert target["drivable_center"]["presence"].item() > 0
+    assert target["drivable_center"]["geometry_valid"].item() == 1
+    assert target["boundary_left"]["presence_valid"].item() == 1
+    batch = adapter.stack_batch([target])
+    assert batch["state"].shape == (1, 10, 4)
+    assert batch["part_coordinates"].shape == (1, 10, 8, 2)
+    assert batch["part_valid"].sum().item() > 0

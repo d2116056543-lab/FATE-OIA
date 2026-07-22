@@ -40,15 +40,24 @@ def evidence_loss(evidence: dict[str, torch.Tensor], targets: dict[str, torch.Te
     anchor = evidence["presence_logits"]
     zero = anchor.sum() * 0.0
     if targets is None:
-        return {"loss_evidence": zero, "valid_count": torch.tensor(0, device=anchor.device)}
+        return {"loss_evidence": zero, "loss_evidence_presence": zero, "loss_evidence_state": zero, "loss_evidence_geometry": zero, "valid_count": torch.tensor(0, device=anchor.device)}
     presence_target = targets.get("presence")
     valid = targets.get("presence_valid")
     if presence_target is None or valid is None or valid.sum() == 0:
-        return {"loss_evidence": zero, "valid_count": torch.tensor(0, device=anchor.device)}
+        return {"loss_evidence": zero, "loss_evidence_presence": zero, "loss_evidence_state": zero, "loss_evidence_geometry": zero, "valid_count": torch.tensor(0, device=anchor.device)}
     presence = F.binary_cross_entropy_with_logits(anchor, presence_target.float(), reduction="none")
     observability = F.binary_cross_entropy_with_logits(evidence["observability_logits"], targets["observability"].float(), reduction="none")
-    value = ((presence + 0.3 * observability) * valid.float()).sum() / valid.float().sum().clamp_min(1.0)
-    return {"loss_evidence": value, "valid_count": valid.sum()}
+    presence_value = ((presence + 0.3 * observability) * valid.float()).sum() / valid.float().sum().clamp_min(1.0)
+    state_valid = targets.get("state_valid", torch.zeros_like(valid)).float()
+    state_target = targets.get("state", evidence["state_logits"].detach() * 0.0)
+    state_raw = F.binary_cross_entropy_with_logits(evidence["state_logits"], state_target.float(), reduction="none").mean(-1)
+    state_value = (state_raw * state_valid).sum() / state_valid.sum().clamp_min(1.0)
+    part_valid = targets.get("part_valid", torch.zeros_like(valid)).float()
+    part_target = targets.get("part_coordinates", evidence["part_coordinates"].detach())
+    geometry_raw = F.smooth_l1_loss(evidence["part_coordinates"], part_target.float(), reduction="none").mean(dim=(-1, -2))
+    geometry_value = (geometry_raw * part_valid).sum() / part_valid.sum().clamp_min(1.0)
+    value = presence_value + 0.25 * state_value + 0.15 * geometry_value
+    return {"loss_evidence": value, "loss_evidence_presence": presence_value, "loss_evidence_state": state_value, "loss_evidence_geometry": geometry_value, "valid_count": valid.sum()}
 
 
 def total_precise_losses(output: dict[str, torch.Tensor], action_targets: torch.Tensor, reason_targets: torch.Tensor, evidence_targets: dict[str, torch.Tensor] | None = None) -> dict[str, torch.Tensor]:
@@ -58,6 +67,6 @@ def total_precise_losses(output: dict[str, torch.Tensor], action_targets: torch.
     reason_semantic = asymmetric_multilabel_loss(output["reason_logits_semantic"], reason_targets, reason_weight)
     reason_direct = asymmetric_multilabel_loss(output["reason_logits_direct"], reason_targets)
     reason_observed = asymmetric_multilabel_loss(output["reason_logits_observed"], reason_targets)
-    evidence = evidence_loss({"presence_logits": output["evidence_presence_logits"], "observability_logits": output["evidence_observability_logits"]}, evidence_targets)
+    evidence = evidence_loss({"presence_logits": output["evidence_presence_logits"], "observability_logits": output["evidence_observability_logits"], "state_logits": output["evidence_state_logits"], "part_coordinates": output["evidence_part_coordinates"]}, evidence_targets)
     total = action_final + 0.5 * action_direct + reason_semantic + 0.5 * reason_direct + reason_observed + 0.15 * evidence["loss_evidence"]
     return {"loss_total": total, "loss_action_final": action_final, "loss_action_direct": action_direct, "loss_reason_semantic": reason_semantic, "loss_reason_direct": reason_direct, "loss_reason_observed": reason_observed, **evidence}

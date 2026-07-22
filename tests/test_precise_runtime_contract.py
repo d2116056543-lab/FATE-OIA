@@ -2,6 +2,8 @@ from pathlib import Path
 
 import yaml
 
+from fate_oia.engine.profile_precise_oia import choose_runtime_profile
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -14,3 +16,12 @@ def test_runtime_config_preserves_complete_core_path_and_fast_loader_contract():
     assert config["training"]["persistent_workers"] is True
     assert config["training"]["prefetch_factor"] == 4
     assert config["runtime"]["hard_max_reserved_gb"] == 46.5
+
+
+def test_runtime_profile_selects_fastest_safe_profile_and_prefers_lower_memory_on_ties():
+    selected = choose_runtime_profile([
+        {"batch_size": 10, "samples_per_sec": 5.0, "peak_reserved_gb": 45.5, "valid": True},
+        {"batch_size": 8, "samples_per_sec": 4.9, "peak_reserved_gb": 40.0, "valid": True},
+        {"batch_size": 6, "samples_per_sec": 6.0, "peak_reserved_gb": 47.0, "valid": False},
+    ], hard_limit_gb=46.5)
+    assert selected["batch_size"] == 8

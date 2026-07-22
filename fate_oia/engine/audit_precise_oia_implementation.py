@@ -30,6 +30,13 @@ def _git(args: list[str]) -> str:
     return subprocess.check_output(["git", *args], text=True).strip()
 
 
+def _tree_sha(paths: list[Path]) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(paths):
+        digest.update(str(path).encode("utf-8")); digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
 def run_audit(config_path: str | Path, output_dir: str | Path, mode: str) -> dict:
     root = Path.cwd()
     output = Path(output_dir)
@@ -38,7 +45,7 @@ def run_audit(config_path: str | Path, output_dir: str | Path, mode: str) -> dic
     missing = [path for path in REQUIRED if not (root / path).exists()]
     source = list((root / "fate_oia").rglob("precise_*.py"))
     compile_ok = compileall.compile_dir(root / "fate_oia", quiet=1)
-    forbidden = ("ACPROIAModel", "ACPRLabelTrunk", "ACPRScenePredicateHead", "ACPRPredicateReasoner", "ACPRPairMemory", "ACPRActionComboAux", "reason_gt_to_action", "reason_logits_observed_to_action", "Start-Process", "Start-Job", "nohup", "Register-ScheduledTask")
+    forbidden = ("ACPROIAModel", "ACPRLabelTrunk", "ACPRScenePredicateHead", "WeakPredicateTargetBuilder", "ACPRPredicateReasoner", "ACPRPairMemory", "ACPRActionComboAux", "ACPRCalibrationHead", "reason_gt_to_action", "reason_logits_observed_to_action", "Start-Process", "Start-Job", "nohup", "Register-ScheduledTask", "feature_cache_enabled: true", "token_compression: keep_merge")
     hits = {token: [] for token in forbidden}
     for path in source:
         text = path.read_text(encoding="utf-8")
@@ -48,10 +55,27 @@ def run_audit(config_path: str | Path, output_dir: str | Path, mode: str) -> dic
     model = PRECISEOIAModel(Path(config_path).parent, use_mock_dino=True)
     with torch.no_grad():
         forward = model(torch.randn(1, 3, 360, 640))
-    checks = {"dino_shapes": list(forward["action_logits_final_raw"].shape) == [1, 4] and list(forward["reason_logits_final_raw"].shape) == [1, 21], "dino_call_one": int(forward["diagnostics"]["dino_call_count"]) == 1, "test_only": config["eval_splits"] == "test" and config["best_selection_split"] == "test", "no_compression": config["token_compression"] == "none", "annotation_firewall_source": "semantic_logits.detach() + delta" in (root / "fate_oia/models/precise_annotation_head.py").read_text(encoding="utf-8")}
+    runtime_file = root / ".review" / "precise_oia_v1" / "runtime" / "selected_runtime_profile.json"
+    real_forward_file = root / ".review" / "precise_oia_v1" / "real_forward.json"
+    runtime = json.loads(runtime_file.read_text(encoding="utf-8")) if runtime_file.exists() else {}
+    real_forward = json.loads(real_forward_file.read_text(encoding="utf-8")) if real_forward_file.exists() else {}
+    checks = {
+        "mock_forward_contract": list(forward["action_logits_final_raw"].shape) == [1, 4] and list(forward["reason_logits_final_raw"].shape) == [1, 21],
+        "dino_call_one": int(forward["diagnostics"]["dino_call_count"]) == 1,
+        "test_only": config["eval_splits"] == "test" and config["best_selection_split"] == "test",
+        "no_compression": config["token_compression"] == "none" and not config["feature_cache_enabled"],
+        "annotation_firewall_source": "semantic_logits.detach() + delta" in (root / "fate_oia/models/precise_annotation_head.py").read_text(encoding="utf-8"),
+        "actual_runtime_profile": bool(runtime.get("valid")) and int(runtime.get("dino_call_count", 0)) == 1,
+        "real_forward_passed": bool(real_forward.get("passed")),
+        "gradient_firewall_passed": bool(real_forward.get("gradient_firewall_passed")),
+    }
     clean_hits = {token: values for token, values in hits.items() if values}
-    status = "PRE_PILOT_ELIGIBLE" if not missing and compile_ok and not clean_hits and all(checks.values()) else "CHANGES_REQUIRED"
-    record = {"status": status, "git_head": _git(["rev-parse", "HEAD"]), "branch": _git(["branch", "--show-current"]), "base_commit": "373aa49feac17372574fd7fb056c1d79c7c848fe", "config_sha256": _sha(Path(config_path)), "skill_sha256": _sha(root / ".codex/skills/precise-oia-implementation-audit/SKILL.md"), "checked_files": list(REQUIRED), "missing": missing, "forbidden_pattern_results": clean_hits, "functional_checks": checks, "compile_ok": compile_ok, "mode": mode, "unresolved": missing + list(clean_hits)}
+    clean_tree = not _git(["status", "--porcelain"])
+    status = "PRE_PILOT_ELIGIBLE" if not missing and compile_ok and not clean_hits and clean_tree and all(checks.values()) else "CHANGES_REQUIRED"
+    unresolved = missing + list(clean_hits) + [name for name, passed in checks.items() if not passed]
+    if not clean_tree:
+        unresolved.append("git_worktree_dirty")
+    record = {"status": status, "git_head": _git(["rev-parse", "HEAD"]), "branch": _git(["branch", "--show-current"]), "base_commit": "373aa49feac17372574fd7fb056c1d79c7c848fe", "config_sha256": _sha(Path(config_path)), "skill_sha256": _sha(root / ".codex/skills/precise-oia-implementation-audit/SKILL.md"), "source_tree_sha256": _tree_sha(source), "checked_files": list(REQUIRED), "missing": missing, "forbidden_pattern_results": clean_hits, "functional_checks": checks, "compile_ok": compile_ok, "git_clean": clean_tree, "mode": mode, "unresolved": unresolved}
     (output / "implementation_audit_PRECISE_OIA_V1.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
     gate = root / ".review" / "PRECISE_OIA_V1_PRE_PILOT_ELIGIBLE.json"
     gate.parent.mkdir(parents=True, exist_ok=True)
