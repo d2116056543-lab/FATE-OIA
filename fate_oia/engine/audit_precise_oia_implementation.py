@@ -59,6 +59,8 @@ def run_audit(config_path: str | Path, output_dir: str | Path, mode: str) -> dic
     real_forward_file = root / ".review" / "precise_oia_v1" / "real_forward.json"
     runtime = json.loads(runtime_file.read_text(encoding="utf-8")) if runtime_file.exists() else {}
     real_forward = json.loads(real_forward_file.read_text(encoding="utf-8")) if real_forward_file.exists() else {}
+    trainer_source = (root / "fate_oia/engine/train_precise_oia.py").read_text(encoding="utf-8")
+    supervisor_source = (root / "fate_oia/engine/supervise_precise_oia_foreground.py").read_text(encoding="utf-8")
     checks = {
         "mock_forward_contract": list(forward["action_logits_final_raw"].shape) == [1, 4] and list(forward["reason_logits_final_raw"].shape) == [1, 21],
         "dino_call_one": int(forward["diagnostics"]["dino_call_count"]) == 1,
@@ -68,6 +70,14 @@ def run_audit(config_path: str | Path, output_dir: str | Path, mode: str) -> dic
         "actual_runtime_profile": bool(runtime.get("valid")) and int(runtime.get("dino_call_count", 0)) == 1,
         "real_forward_passed": bool(real_forward.get("passed")),
         "gradient_firewall_passed": bool(real_forward.get("gradient_firewall_passed")),
+        # A module that is merely importable is not an implementation.  These
+        # checks deliberately inspect the formal training/pilot call chain.
+        "intervention_called_by_trainer": "target_specific_intervention_loss" in trainer_source,
+        "mirror_consistency_called_by_trainer": "two_way_consistency_loss" in trainer_source,
+        "refinement_called_by_trainer": "refinement_loss" in trainer_source,
+        "train_calib_threshold_called": "make_train_calib_indices" in trainer_source and "update_teacher" in trainer_source,
+        "pcvl_called_by_pilot_supervisor": "run_precise_pcvl" in supervisor_source,
+        "resume_scheduler_contract": "scheduler" in trainer_source and "resume_checkpoint" in trainer_source,
     }
     clean_hits = {token: values for token, values in hits.items() if values}
     clean_tree = not _git(["status", "--porcelain"])

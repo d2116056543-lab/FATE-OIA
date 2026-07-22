@@ -10,6 +10,7 @@ from typing import Any
 import torch
 import yaml
 from torch.utils.data import DataLoader, Subset
+from torch.nn import functional as F
 
 from fate_oia.datasets.bdd_oia_multitask import BDDOIAMultiTaskDataset
 from fate_oia.datasets.bdd100k_task_aware_index import BDD100KTaskAwareIndex
@@ -22,6 +23,7 @@ from fate_oia.utils.precise_artifacts import append_jsonl, save_epoch_tensors, w
 from fate_oia.utils.precise_gradient_ownership import ownership_snapshot, parameter_ownership
 from fate_oia.utils.precise_runtime import gpu_memory_gb
 from fate_oia.utils.precise_schema import load_evidence_fields
+from fate_oia.utils.acpr_train_calib_split import make_train_calib_indices
 
 
 def _config(path: str | Path) -> dict[str, Any]:
@@ -44,6 +46,17 @@ def build_optimizers(model: PRECISEOIAModel, config: dict[str, Any]) -> list[tor
         setting = owner_config[mapped.get(owner, owner)]
         optimizers.append(torch.optim.AdamW(parameters, lr=float(setting["lr"]), weight_decay=float(setting["weight_decay"])))
     return optimizers
+
+
+def build_schedulers(optimizers: list[torch.optim.Optimizer], updates_per_epoch: int, epochs: int, warmup_ratio: float) -> list[torch.optim.lr_scheduler.LambdaLR]:
+    total = max(1, updates_per_epoch * epochs)
+    warmup = max(1, int(total * warmup_ratio))
+    def scale(step: int) -> float:
+        if step < warmup:
+            return float(step + 1) / warmup
+        progress = min(1.0, (step - warmup) / max(1, total - warmup))
+        return 0.05 + 0.95 * 0.5 * (1.0 + math.cos(math.pi * progress))
+    return [torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=scale) for optimizer in optimizers]
 
 
 def _dataset_samples(dataset) -> list[Any]:
@@ -80,13 +93,18 @@ def train(args: argparse.Namespace) -> None:
         train_set = Subset(train_set, range(min(args.max_train_samples, len(train_set))))
     if args.max_test_samples:
         test_set = Subset(test_set, range(min(args.max_test_samples, len(test_set))))
-    train_loader = _loader(train_set, args.batch_size, args.num_workers, True)
+    main_indices, calib_indices = make_train_calib_indices(train_set, config["threshold"]["train_calib_fraction"])
+    train_main = Subset(train_set, main_indices)
+    train_calib = Subset(train_set, calib_indices)
+    train_loader = _loader(train_main, args.batch_size, args.num_workers, True)
+    calib_loader = _loader(train_calib, args.batch_size, args.num_workers, False)
     test_loader = _loader(test_set, args.batch_size, args.num_workers, False)
     model = PRECISEOIAModel(Path(args.config).parent, config["pretrained_weights"]).to(device)
     optimizers = build_optimizers(model, config)
+    schedulers = build_schedulers(optimizers, math.ceil(len(train_loader) / args.gradient_accumulation_steps), args.epochs, config["training"]["warmup_ratio"])
     best = -float("inf")
     write_resolved_config(output_dir / "config_resolved.yaml", config)
-    write_json(output_dir / "run_manifest.json", {"test_only": True, "best_selection_split": "test", "feature_cache_enabled": False, "token_compression": "none", "internal_test_selected": True, "publication_eligible_selection": False, "command_line": vars(args)})
+    write_json(output_dir / "run_manifest.json", {"test_only": True, "best_selection_split": "test", "feature_cache_enabled": False, "token_compression": "none", "internal_test_selected": True, "publication_eligible_selection": False, "train_calib_count": len(calib_indices), "train_main_count": len(main_indices), "command_line": vars(args)})
     grounding_adapter, train_grounding = build_train_grounding_targets(train_set, config, output_dir)
     for epoch in range(args.epochs):
         model.train()
@@ -101,11 +119,28 @@ def train(args: argparse.Namespace) -> None:
                 for optimizer in optimizers:
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
+                for scheduler in schedulers:
+                    scheduler.step()
             if micro_step % config["diagnostics"]["batch_log_every_optimizer_steps"] == 0:
                 record = {key: float(value.detach().item()) for key, value in losses.items() if value.ndim == 0}
                 record.update({"epoch": epoch, "micro_step": micro_step, "optimizer_step": (micro_step + 1) // args.gradient_accumulation_steps, "action_exchange_to_direct_ratio": float(output["action_exchange_delta"].pow(2).mean().sqrt().div(output["action_logits_direct"].pow(2).mean().sqrt().clamp_min(1e-6)).item()), "reason_exchange_to_direct_ratio": float(output["reason_exchange_delta"].pow(2).mean().sqrt().div(output["reason_logits_direct"].pow(2).mean().sqrt().clamp_min(1e-6)).item()), "explicit_reliability_mean": float(output["evidence_reliability"].mean().item()), "reference_center_collapse_rate": float(output["center_collapse_rate"].item()), **gpu_memory_gb(device), **ownership_snapshot(model)})
                 append_jsonl(output_dir / "loss_components.jsonl", record)
             last_output = output
+        # Never drop an incomplete accumulated tail batch.
+        if len(train_loader) % args.gradient_accumulation_steps:
+            for optimizer in optimizers:
+                optimizer.step(); optimizer.zero_grad(set_to_none=True)
+            for scheduler in schedulers:
+                scheduler.step()
+        # CalAlign is trained only on the deterministic train-calib split.
+        model.threshold_head.train()
+        for calib_batch in calib_loader:
+            with torch.no_grad():
+                raw = model(calib_batch["image"].to(device, non_blocking=True))
+            threshold = model.threshold_head(raw["action_logits_final_raw"].detach(), raw["reason_logits_observed"].detach())
+            threshold_loss = F.binary_cross_entropy_with_logits(threshold["action_logits_deploy"], calib_batch["action"].to(device)) + F.binary_cross_entropy_with_logits(threshold["reason_logits_deploy"], calib_batch["reason"].to(device))
+            optimizers[-1].zero_grad(set_to_none=True); threshold_loss.backward(); optimizers[-1].step()
+        model.threshold_head.update_teacher(model.threshold_head.compose_theta().detach(), ema=1.0)
         metrics, tensors = evaluate_precise(model, test_loader, device)
         epoch_dir = output_dir / f"epoch_{epoch:03d}"
         epoch_dir.mkdir(parents=True, exist_ok=True)
@@ -120,7 +155,7 @@ def train(args: argparse.Namespace) -> None:
             write_json(epoch_dir / "annotation_gap.json", {"annotation_delta_rms": float(last_output["annotation_delta"].pow(2).mean().sqrt().item()), "semantic_observed_gap_rms": float((last_output["reason_logits_semantic"] - last_output["reason_logits_observed"]).pow(2).mean().sqrt().item())})
         save_epoch_tensors(epoch_dir, {"action_logits_direct": tensors["action_direct"], "action_logits_final_raw": tensors["action_final_raw"], "action_logits_deploy": tensors["action_deploy"], "reason_logits_direct": tensors["reason_direct"], "reason_logits_semantic": tensors["reason_semantic"], "reason_logits_observed": tensors["reason_observed"], "reason_logits_deploy": tensors["reason_deploy"]}, tensors["labels_action"], tensors["labels_reason"])
         append_jsonl(output_dir / "metrics_summary.jsonl", {"epoch": epoch, "deploy_fixed_joint": metrics["deploy_fixed_joint"]})
-        checkpoint = {"model": model.state_dict(), "epoch": epoch, "optimizers": [item.state_dict() for item in optimizers], "rng_state": torch.get_rng_state()}
+        checkpoint = {"model": model.state_dict(), "epoch": epoch, "optimizers": [item.state_dict() for item in optimizers], "schedulers": [item.state_dict() for item in schedulers], "rng_state": torch.get_rng_state(), "threshold_teacher": model.threshold_head.theta_teacher.detach().cpu(), "active_field_schema": [field["name"] for field in load_evidence_fields(config["evidence"]["field_config"])]}
         torch.save(checkpoint, output_dir / "checkpoint_latest.pth")
         if metrics["deploy_fixed_joint"] > best:
             best = metrics["deploy_fixed_joint"]
@@ -140,6 +175,7 @@ def main() -> None:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=20260722)
     parser.add_argument("--test_only", action="store_true")
+    parser.add_argument("--resume_checkpoint", default=None)
     args = parser.parse_args()
     train(args)
 
