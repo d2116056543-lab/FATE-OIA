@@ -76,4 +76,30 @@ def test_label_objects_and_drivable_map_are_not_silently_dropped(tmp_path: Path)
     batch = adapter.stack_batch([target])
     assert batch["state"].shape == (1, 10, 4)
     assert batch["part_coordinates"].shape == (1, 10, 8, 2)
+    assert batch["part_scales"].shape == (1, 10, 8, 2)
+    assert batch["part_scales"][0, 3].sum().item() > 0
     assert batch["part_valid"].sum().item() > 0
+    assert batch["soft_masks"].shape == (1, 10, 45, 80)
+    assert batch["soft_masks"][0, 6].sum().item() > 0
+
+
+def test_known_vehicle_is_not_mislabeled_as_other_actor_type():
+    adapter = _adapter()
+    record = TaskAwareGroundingRecord(("det.json",), (), (), (), {"detection": True, "lane": False, "drivable": False})
+    targets = adapter.from_metadata(record, {"detection": [
+        {"category": "car", "box2d": {"x1": 500, "x2": 700, "y1": 300, "y2": 500}}
+    ]})
+    assert torch.equal(targets["actor_center"]["state"], torch.tensor([1.0, 0.0, 0.0, 0.0]))
+
+
+def test_coverage_reports_state_and_source_completeness():
+    adapter = _adapter()
+    complete = TaskAwareGroundingRecord(("det.json",), (), (), (), {"detection": True, "lane": False, "drivable": False})
+    missing = TaskAwareGroundingRecord((), (), (), (), {"detection": False, "lane": False, "drivable": False})
+    report = adapter.coverage([
+        adapter.from_metadata(complete, {"detection": [{"category": "car", "box2d": {"x1": 500, "x2": 700, "y1": 300, "y2": 500}}]}),
+        adapter.from_metadata(missing, {}),
+    ])
+    center = report["actor_center"]
+    assert center["state_valid_count"] == 1
+    assert center["source_complete_rate"] == 0.5

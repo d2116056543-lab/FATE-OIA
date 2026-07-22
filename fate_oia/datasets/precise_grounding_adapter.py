@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from fate_oia.datasets.bdd100k_task_aware_index import TaskAwareGroundingRecord
 
@@ -35,6 +35,7 @@ class PRECISEGroundingAdapter:
 
     def __init__(self, fields: list[dict[str, Any]]) -> None:
         self.fields = fields
+        self.grid_hw = (45, 80)
 
     @staticmethod
     def _sector(label: dict[str, Any]) -> str:
@@ -63,6 +64,7 @@ class PRECISEGroundingAdapter:
             "geometry_valid": _scalar(float(geometry and complete)), "observability_target": _scalar(obs), "presence": _scalar(float(present)),
             "presence_valid": _scalar(valid), "observability": _scalar(obs), "state": state, "state_valid": _scalar(state_valid),
             "part_coordinates": torch.zeros(parts, 2), "part_scales": torch.zeros(parts, 2), "part_valid": _scalar(0.0),
+            "soft_mask": torch.zeros(self.grid_hw, dtype=torch.float32),
         }
 
     @staticmethod
@@ -75,6 +77,18 @@ class PRECISEGroundingAdapter:
             return None
         points = torch.tensor([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=torch.float32)
         return points[:parts] if parts <= 4 else points.repeat((parts + 3) // 4, 1)[:parts]
+
+    @staticmethod
+    def _box_scales(label: dict[str, Any], parts: int) -> torch.Tensor | None:
+        box = label.get("box2d") or label.get("box") or {}
+        try:
+            scale = torch.tensor([
+                max(float(box["x2"]) - float(box["x1"]), 1.0) / 1280.0,
+                max(float(box["y2"]) - float(box["y1"]), 1.0) / 720.0,
+            ], dtype=torch.float32)
+        except (KeyError, TypeError, ValueError):
+            return None
+        return scale.view(1, 2).repeat(parts, 1)
 
     @staticmethod
     def _curve_parts(labels: list[dict[str, Any]], parts: int) -> torch.Tensor | None:
@@ -103,24 +117,45 @@ class PRECISEGroundingAdapter:
         x_mean = sum(float(point[0]) for point in points) / len(points)
         return "left" if x_mean < 1280.0 / 3.0 else "right" if x_mean > 2.0 * 1280.0 / 3.0 else "center"
 
-    @staticmethod
-    def _drivable_fraction(paths: tuple[str, ...], sector: str) -> tuple[float, bool]:
-        """Read the official red direct-drivable map once during target build."""
+    def _drivable_geometry(self, paths: tuple[str, ...], sector: str) -> tuple[float, bool, torch.Tensor]:
+        """Read the official direct-drivable pixels into the model's 45x80 grid."""
+        height, width = self.grid_hw
         for raw_path in paths:
             try:
-                image = Image.open(Path(raw_path)).convert("RGB")
-                width, height = image.size
+                image = Image.open(Path(raw_path)).convert("RGB").resize((width, height), Image.Resampling.NEAREST)
+                pixels = torch.tensor(list(image.getdata()), dtype=torch.uint8).view(height, width, 3)
+                direct = (pixels[..., 0] >= 200) & (pixels[..., 1] <= 80) & (pixels[..., 2] <= 80)
                 thirds = {"left": (0, width // 3), "center": (width // 3, 2 * width // 3), "right": (2 * width // 3, width)}
                 x0, x1 = thirds[sector]
-                # Lower road region avoids treating the upper sky/background as a negative.
-                pixels = list(image.crop((x0, int(height * 0.35), x1, height)).getdata())
-                if not pixels:
-                    continue
-                direct = sum(1 for red, green, blue in pixels if red >= 200 and green <= 80 and blue <= 80)
-                return direct / len(pixels), True
+                sector_mask = torch.zeros_like(direct)
+                sector_mask[:, x0:x1] = True
+                direct = direct & sector_mask
+                lower = direct[int(height * 0.35):, x0:x1]
+                fraction = float(lower.float().mean().item()) if lower.numel() else 0.0
+                return fraction, True, direct.float()
             except (OSError, ValueError):
                 continue
-        return 0.0, False
+        return 0.0, False, torch.zeros(self.grid_hw, dtype=torch.float32)
+
+    def _geometry_mask(self, labels: list[dict[str, Any]], kind: str) -> torch.Tensor:
+        height, width = self.grid_hw
+        canvas = Image.new("L", (width, height), color=0)
+        draw = ImageDraw.Draw(canvas)
+        if kind == "curve":
+            for label in labels:
+                for poly in label.get("poly2d") or []:
+                    vertices = poly.get("vertices", []) if isinstance(poly, dict) else []
+                    points = [(float(point[0]) / 1280.0 * (width - 1), float(point[1]) / 720.0 * (height - 1)) for point in vertices if isinstance(point, (list, tuple)) and len(point) >= 2]
+                    if len(points) >= 2:
+                        draw.line(points, fill=255, width=2)
+        else:
+            for label in labels:
+                box = label.get("box2d") or label.get("box") or {}
+                try:
+                    draw.rectangle((float(box["x1"]) / 1280.0 * width, float(box["y1"]) / 720.0 * height, float(box["x2"]) / 1280.0 * width, float(box["y2"]) / 720.0 * height), fill=255)
+                except (KeyError, TypeError, ValueError):
+                    continue
+        return torch.tensor(list(canvas.getdata()), dtype=torch.float32).view(height, width) / 255.0
 
     def from_metadata(self, record: TaskAwareGroundingRecord, metadata: dict[str, Any]) -> dict[str, dict[str, Any]]:
         detections = [label for source in metadata.get("detection", []) for label in _flatten_labels(source)]
@@ -136,13 +171,15 @@ class PRECISEGroundingAdapter:
             elif name.startswith("actor_"):
                 labels = [item for item in detections if self._is_category(item, ("car", "truck", "bus", "vehicle", "pedestrian", "rider", "bike", "motor")) and self._sector(item) == sector]
             if name.startswith("drivable_"):
-                fraction, readable = self._drivable_fraction(record.drivable_maps, sector)
+                fraction, readable, soft_mask = self._drivable_geometry(record.drivable_maps, sector)
                 target = self._base(field, record, fraction > 0.0, readable, state_valid=0.0)
                 target["presence"] = _scalar(fraction)
                 target["target"] = _scalar(fraction)
                 target["geometry_valid"] = _scalar(float(readable and record.source_complete.get("drivable", False)))
                 target["part_coordinates"] = self._region_parts(sector, int(field["num_parts"]))
+                target["part_scales"] = torch.tensor([0.15, 0.25]).view(1, 2).repeat(int(field["num_parts"]), 1)
                 target["part_valid"] = _scalar(float(readable and record.source_complete.get("drivable", False)))
+                target["soft_mask"] = soft_mask
                 result[name] = target
                 continue
             if name.startswith("boundary_"):
@@ -164,7 +201,8 @@ class PRECISEGroundingAdapter:
                 state[0] = float(any(word in category for category in categories for word in ("car", "truck", "bus", "vehicle")))
                 state[1] = float(any("pedestrian" in category for category in categories))
                 state[2] = float(any(word in category for category in categories for word in ("rider", "bike", "motor")))
-                state[3] = float(any(state[index] == 0 for index in range(3)))
+                known_words = ("car", "truck", "bus", "vehicle", "pedestrian", "rider", "bike", "motor")
+                state[3] = float(any(not any(word in category for word in known_words) for category in categories))
                 state_valid = 1.0
             elif name.startswith("boundary_") and labels:
                 state = torch.zeros(3)
@@ -177,7 +215,11 @@ class PRECISEGroundingAdapter:
                 coords = self._curve_parts(labels, int(field["num_parts"])) if name.startswith("boundary_") else self._box_parts(labels[0], int(field["num_parts"]))
                 if coords is not None:
                     target["part_coordinates"] = coords
+                    scales = torch.full_like(coords, 0.03) if name.startswith("boundary_") else self._box_scales(labels[0], int(field["num_parts"]))
+                    if scales is not None:
+                        target["part_scales"] = scales
                     target["part_valid"] = _scalar(float(target["geometry_valid"].item() > 0))
+                    target["soft_mask"] = self._geometry_mask(labels, "curve" if name.startswith("boundary_") else "box")
             result[name] = target
         return result
 
@@ -194,13 +236,18 @@ class PRECISEGroundingAdapter:
         max_parts = max(int(field["num_parts"]) for field in self.fields)
         state = torch.zeros(len(samples), len(self.fields), max_state)
         parts = torch.zeros(len(samples), len(self.fields), max_parts, 2)
+        scales = torch.zeros_like(parts)
         for row, sample in enumerate(samples):
             for column, field in enumerate(self.fields):
                 item = sample[field["name"]]
                 state[row, column, : item["state"].numel()] = item["state"]
                 parts[row, column, : item["part_coordinates"].shape[0]] = item["part_coordinates"]
+                scales[row, column, : item["part_scales"].shape[0]] = item["part_scales"]
         result["state"] = state.to(device) if device is not None else state
         result["part_coordinates"] = parts.to(device) if device is not None else parts
+        result["part_scales"] = scales.to(device) if device is not None else scales
+        masks = torch.stack([torch.stack([sample[field["name"]]["soft_mask"] for field in self.fields]) for sample in samples])
+        result["soft_masks"] = masks.to(device) if device is not None else masks
         return result
 
     def coverage(self, samples: list[dict[str, dict[str, Any]]]) -> dict[str, dict[str, int]]:
@@ -212,5 +259,14 @@ class PRECISEGroundingAdapter:
             negative = sum(int(item["presence"].item() == 0 and item["presence_valid"].item() > 0) for item in values)
             geometry = sum(int(item["geometry_valid"].item() > 0) for item in values)
             unknown = sum(int(item["presence_valid"].item() == 0) for item in values)
-            report[name] = {"positive_count": positive, "reliable_negative_count": negative, "geometry_valid_count": geometry, "unknown_count": unknown}
+            state_valid = sum(int(item["state_valid"].item() > 0) for item in values)
+            source_complete_rate = (positive + negative) / max(len(values), 1)
+            report[name] = {
+                "positive_count": positive,
+                "reliable_negative_count": negative,
+                "geometry_valid_count": geometry,
+                "state_valid_count": state_valid,
+                "unknown_count": unknown,
+                "source_complete_rate": source_complete_rate,
+            }
         return report

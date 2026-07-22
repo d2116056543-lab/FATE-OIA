@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import random
+import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -11,16 +14,22 @@ import torch
 import yaml
 from torch.utils.data import DataLoader, Subset
 from torch.nn import functional as F
+from torch.nn.utils import clip_grad_norm_
 
 from fate_oia.datasets.bdd_oia_multitask import BDDOIAMultiTaskDataset
 from fate_oia.datasets.bdd100k_task_aware_index import BDD100KTaskAwareIndex
 from fate_oia.datasets.precise_grounding_adapter import PRECISEGroundingAdapter
 from fate_oia.engine.eval_precise_oia import evaluate_precise
+from fate_oia.engine.export_precise_cases import export_precise_cases
 from fate_oia.losses.precise_losses import total_precise_losses
+from fate_oia.losses.precise_losses import evidence_view_consistency_loss, refinement_loss, two_way_consistency_loss
+from fate_oia.losses.precise_intervention_losses import packed_target_specific_interventions
 from fate_oia.models.precise_oia_model import PRECISEOIAModel
+from fate_oia.models.precise_pcvl_probes import PRECISEPCVLProbes
+from fate_oia.engine.run_precise_pcvl import evaluate_pcvl, train_pcvl_step
 from fate_oia.transforms_precise import PRECISEImageTransform
 from fate_oia.utils.precise_artifacts import append_jsonl, save_epoch_tensors, write_json, write_resolved_config
-from fate_oia.utils.precise_gradient_ownership import ownership_snapshot, parameter_ownership
+from fate_oia.utils.precise_gradient_ownership import grad_norm, ownership_snapshot, parameter_ownership, projected_target_credit_grads, tensor_list_norm
 from fate_oia.utils.precise_runtime import gpu_memory_gb
 from fate_oia.utils.precise_schema import load_evidence_fields
 from fate_oia.utils.acpr_train_calib_split import make_train_calib_indices
@@ -31,6 +40,34 @@ def _config(path: str | Path) -> dict[str, Any]:
         return yaml.safe_load(handle)
 
 
+def _implementation_fingerprint(config_path: str | Path) -> dict[str, Any]:
+    root = Path.cwd()
+    sources = sorted(root.glob("fate_oia/**/*precise*.py"))
+    digest = hashlib.sha256()
+    for path in sources:
+        digest.update(str(path.relative_to(root)).encode("utf-8")); digest.update(path.read_bytes())
+    try:
+        head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    except Exception:
+        head = "unavailable"
+    return {"git_head": head, "source_tree_sha256": digest.hexdigest(), "config_sha256": hashlib.sha256(Path(config_path).read_bytes()).hexdigest(), "checked_source_count": len(sources)}
+
+
+def _observed_firewall(model: PRECISEOIAModel, observed_loss: torch.Tensor) -> dict[str, float]:
+    owners = parameter_ownership(model)
+    checked = ("action_foundation", "action_decoder", "reason_semantic", "evidence_core", "exchange_reread", "annotation_adapter")
+    parameters = [parameter for owner in checked for parameter in owners[owner]]
+    gradients = torch.autograd.grad(observed_loss, parameters, retain_graph=True, allow_unused=True)
+    result = {}
+    offset = 0
+    for owner in checked:
+        owner_gradients = gradients[offset:offset + len(owners[owner])]
+        offset += len(owners[owner])
+        norms = [gradient.detach().norm() for gradient in owner_gradients if gradient is not None]
+        result[f"observed_to_{owner}_grad_norm"] = float(torch.stack(norms).norm().item()) if norms else 0.0
+    return result
+
+
 def _loader(dataset, batch_size: int, workers: int, shuffle: bool) -> DataLoader:
     kwargs = {"batch_size": batch_size, "shuffle": shuffle, "num_workers": workers, "pin_memory": True}
     if workers > 0:
@@ -38,17 +75,65 @@ def _loader(dataset, batch_size: int, workers: int, shuffle: bool) -> DataLoader
     return DataLoader(dataset, **kwargs)
 
 
-def build_optimizers(model: PRECISEOIAModel, config: dict[str, Any]) -> list[torch.optim.Optimizer]:
+def build_optimizers(model: PRECISEOIAModel, config: dict[str, Any]) -> dict[str, torch.optim.Optimizer]:
     owner_config = config["optimizer"]
     mapped = {"reason_semantic": "reason_adapter_decoder", "exchange_reread": "exchange_and_reread"}
-    optimizers = []
+    optimizers = {}
+    parameter_names = {id(parameter): name for name, parameter in model.named_parameters()}
     for owner, parameters in parameter_ownership(model).items():
         setting = owner_config[mapped.get(owner, owner)]
-        optimizers.append(torch.optim.AdamW(parameters, lr=float(setting["lr"]), weight_decay=float(setting["weight_decay"])))
+        decay, no_decay = [], []
+        for parameter in parameters:
+            name = parameter_names[id(parameter)]
+            if parameter.ndim <= 1 or name.endswith(".bias") or "embedding" in name or ".entity." in name or ".state." in name or ".sector." in name or ".role." in name:
+                no_decay.append(parameter)
+            else:
+                decay.append(parameter)
+        groups = []
+        if decay:
+            groups.append({"params": decay, "weight_decay": float(setting["weight_decay"])})
+        if no_decay:
+            groups.append({"params": no_decay, "weight_decay": 0.0})
+        optimizers[owner] = torch.optim.AdamW(groups, lr=float(setting["lr"]))
     return optimizers
 
 
-def build_schedulers(optimizers: list[torch.optim.Optimizer], updates_per_epoch: int, epochs: int, warmup_ratio: float) -> list[torch.optim.lr_scheduler.LambdaLR]:
+def _step_owners(
+    model: PRECISEOIAModel,
+    owners: tuple[str, ...],
+    optimizers: dict[str, torch.optim.Optimizer],
+    schedulers: dict[str, torch.optim.lr_scheduler.LambdaLR],
+    config: dict[str, Any],
+    step_counts: dict[str, int],
+) -> dict[str, dict[str, float]]:
+    parameters_by_owner = parameter_ownership(model)
+    action_clip = float(config["training"]["grad_clip_action"])
+    reason_clip = float(config["training"]["grad_clip_reason"])
+    evidence_clip = float(config["training"]["grad_clip_evidence"])
+    stats = {}
+    for owner in owners:
+        parameters = parameters_by_owner[owner]
+        before = [parameter.detach().clone() for parameter in parameters]
+        pre = float(grad_norm(parameters).item())
+        clip = action_clip if owner.startswith("action") else evidence_clip if owner == "evidence_core" else reason_clip
+        clip_grad_norm_(parameters, clip)
+        post = float(grad_norm(parameters).item())
+        optimizers[owner].step()
+        delta = torch.stack([(parameter.detach() - old).norm() for parameter, old in zip(parameters, before)]).norm().item()
+        optimizers[owner].zero_grad(set_to_none=True)
+        schedulers[owner].step()
+        step_counts[owner] += 1
+        stats[owner] = {
+            "parameter_count": float(sum(parameter.numel() for parameter in parameters)),
+            "grad_norm_pre_clip": pre,
+            "grad_norm_post_clip": post,
+            "parameter_delta_norm": float(delta),
+            "optimizer_step_count": float(step_counts[owner]),
+        }
+    return stats
+
+
+def build_schedulers(optimizers: dict[str, torch.optim.Optimizer], updates_per_epoch: int, epochs: int, warmup_ratio: float) -> dict[str, torch.optim.lr_scheduler.LambdaLR]:
     total = max(1, updates_per_epoch * epochs)
     warmup = max(1, int(total * warmup_ratio))
     def scale(step: int) -> float:
@@ -56,14 +141,75 @@ def build_schedulers(optimizers: list[torch.optim.Optimizer], updates_per_epoch:
             return float(step + 1) / warmup
         progress = min(1.0, (step - warmup) / max(1, total - warmup))
         return 0.05 + 0.95 * 0.5 * (1.0 + math.cos(math.pi * progress))
-    return [torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=scale) for optimizer in optimizers]
+    return {owner: torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=scale) for owner, optimizer in optimizers.items()}
+
+
+def load_resume_checkpoint(
+    checkpoint_path: str | Path,
+    model: PRECISEOIAModel,
+    optimizers: dict[str, torch.optim.Optimizer],
+    schedulers: dict[str, torch.optim.lr_scheduler.LambdaLR],
+    device: torch.device,
+    expected_fingerprint: dict[str, Any],
+    pcvl_probes: PRECISEPCVLProbes | None = None,
+    pcvl_optimizer: torch.optim.Optimizer | None = None,
+) -> tuple[int, int, int, float, dict[str, float], dict[str, int]]:
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    if checkpoint.get("implementation_fingerprint") != expected_fingerprint:
+        raise RuntimeError("Resume checkpoint implementation/config fingerprint does not match current code")
+    current_fields = [field["name"] for field in model.evidence_schema]
+    if checkpoint.get("active_field_schema") != current_fields:
+        raise RuntimeError("Resume checkpoint active evidence schema does not match current preflight")
+    model.load_state_dict(checkpoint["model"])
+    for owner, optimizer in optimizers.items():
+        optimizer.load_state_dict(checkpoint["optimizers"][owner])
+    for owner, scheduler in schedulers.items():
+        scheduler.load_state_dict(checkpoint["schedulers"][owner])
+    torch.set_rng_state(checkpoint["rng_state"])
+    random.setstate(checkpoint["python_rng_state"])
+    if torch.cuda.is_available() and checkpoint.get("cuda_rng_state") is not None:
+        torch.cuda.set_rng_state_all(checkpoint["cuda_rng_state"])
+    if pcvl_probes is not None:
+        if "pcvl_probes" not in checkpoint or "pcvl_optimizer" not in checkpoint:
+            raise RuntimeError("Pilot resume checkpoint is missing PCVL probe state")
+        pcvl_probes.load_state_dict(checkpoint["pcvl_probes"])
+        if pcvl_optimizer is None:
+            raise RuntimeError("Pilot resume requires a PCVL optimizer")
+        pcvl_optimizer.load_state_dict(checkpoint["pcvl_optimizer"])
+    return int(checkpoint["epoch"]) + 1, int(checkpoint["global_optimizer_step"]), int(checkpoint.get("global_micro_step", 0)), float(checkpoint.get("best_deploy_joint", -float("inf"))), dict(checkpoint.get("best_scores", {})), {key: int(value) for key, value in checkpoint.get("optimizer_step_counts", {}).items()}
 
 
 def _dataset_samples(dataset) -> list[Any]:
-    return dataset.dataset.samples if isinstance(dataset, Subset) else dataset.samples
+    if not isinstance(dataset, Subset):
+        return dataset.samples
+    parent = _dataset_samples(dataset.dataset)
+    return [parent[int(index)] for index in dataset.indices]
 
 
-def build_train_grounding_targets(dataset, config: dict[str, Any], output_dir: Path) -> tuple[PRECISEGroundingAdapter, dict[str, dict[str, dict[str, Any]]]]:
+def _slice_batch_output(value: Any, stop: int, full_batch: int) -> Any:
+    if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == full_batch:
+        return value[:stop]
+    if isinstance(value, dict):
+        return {key: _slice_batch_output(item, stop, full_batch) for key, item in value.items()}
+    return value
+
+
+def select_active_evidence_fields(fields: list[dict[str, Any]], coverage: dict[str, dict[str, int]], config: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str]]:
+    unsupported = {
+        field["name"] for field in fields
+        if coverage[field["name"]]["positive_count"] < config["min_positive"]
+        or coverage[field["name"]]["reliable_negative_count"] < config["min_reliable_negative"]
+        or (field.get("geometry_required", False) and coverage[field["name"]]["geometry_valid_count"] < config["min_geometry_valid"])
+    }
+    mirror = {"actor_left": "actor_right", "actor_right": "actor_left", "drivable_left": "drivable_right", "drivable_right": "drivable_left", "boundary_left": "boundary_right", "boundary_right": "boundary_left"}
+    unsupported |= {mirror[name] for name in list(unsupported) if name in mirror}
+    active = [field for field in fields if field["name"] not in unsupported]
+    if not active:
+        raise RuntimeError("No explicit PRECISE evidence field passed coverage preflight")
+    return active, sorted(unsupported)
+
+
+def build_train_grounding_targets(dataset, config: dict[str, Any], output_dir: Path, enforce_coverage: bool = True) -> tuple[PRECISEGroundingAdapter, dict[str, dict[str, dict[str, Any]]], list[dict[str, Any]]]:
     fields = load_evidence_fields(Path(config["evidence"]["field_config"]))
     adapter = PRECISEGroundingAdapter(fields)
     index = BDD100KTaskAwareIndex(config["bdd100k_root"], manifest_path=output_dir / "grounding_source_manifest.json")
@@ -72,11 +218,13 @@ def build_train_grounding_targets(dataset, config: dict[str, Any], output_dir: P
         targets[sample.file_name] = adapter.from_metadata(index.get(sample.file_name), index.metadata_for(sample.file_name))
     coverage = adapter.coverage(list(targets.values()))
     write_json(output_dir / "evidence_field_preflight.json", coverage)
-    threshold = config["evidence"]
-    unsupported = [name for name, value in coverage.items() if value["positive_count"] < threshold["min_positive"] or value["reliable_negative_count"] < threshold["min_reliable_negative"] or value["geometry_valid_count"] < threshold["min_geometry_valid"]]
-    if unsupported:
-        raise RuntimeError(f"PRECISE evidence fields failed coverage preflight: {unsupported}")
-    return adapter, targets
+    active_fields, unsupported = select_active_evidence_fields(fields, coverage, config["evidence"]) if enforce_coverage else (fields, [])
+    active_names = {field["name"] for field in active_fields}
+    active_targets = {sample: {name: value for name, value in sample_targets.items() if name in active_names} for sample, sample_targets in targets.items()}
+    active_adapter = PRECISEGroundingAdapter(active_fields)
+    with (output_dir / "active_evidence_fields.yaml").open("w", encoding="utf-8") as handle:
+        yaml.safe_dump({"explicit_fields": active_fields, "disabled_fields": unsupported}, handle, sort_keys=False)
+    return active_adapter, active_targets, active_fields
 
 
 def train(args: argparse.Namespace) -> None:
@@ -87,79 +235,275 @@ def train(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     transform = PRECISEImageTransform(return_mirror=False)
-    train_set = BDDOIAMultiTaskDataset(config["data_root"], config["raw_root"], "train", 4, 21, True, transform)
+    full_train_set = BDDOIAMultiTaskDataset(config["data_root"], config["raw_root"], "train", 4, 21, True, transform)
+    train_set = full_train_set
     test_set = BDDOIAMultiTaskDataset(config["data_root"], config["raw_root"], "test", 4, 21, True, transform)
     if args.max_train_samples:
         train_set = Subset(train_set, range(min(args.max_train_samples, len(train_set))))
     if args.max_test_samples:
         test_set = Subset(test_set, range(min(args.max_test_samples, len(test_set))))
-    main_indices, calib_indices = make_train_calib_indices(train_set, config["threshold"]["train_calib_fraction"])
+    audit_indices: list[int] = []
+    if args.mode == "pilot":
+        generator = torch.Generator().manual_seed(args.seed)
+        order = torch.randperm(len(train_set), generator=generator).tolist()
+        required = min(len(order), 4096 + 1024 + 512)
+        order = order[:required]
+        main_count = min(4096, max(1, required - 1536))
+        audit_count = min(1024, max(0, required - main_count - 512))
+        main_indices = order[:main_count]
+        audit_indices = order[main_count:main_count + audit_count]
+        calib_indices = order[main_count + audit_count:]
+    else:
+        main_indices, calib_indices = make_train_calib_indices(train_set, config["threshold"]["train_calib_fraction"])
     train_main = Subset(train_set, main_indices)
     train_calib = Subset(train_set, calib_indices)
     train_loader = _loader(train_main, args.batch_size, args.num_workers, True)
     calib_loader = _loader(train_calib, args.batch_size, args.num_workers, False)
+    audit_loader = _loader(Subset(train_set, audit_indices), args.batch_size, args.num_workers, False) if audit_indices else None
     test_loader = _loader(test_set, args.batch_size, args.num_workers, False)
-    model = PRECISEOIAModel(Path(args.config).parent, config["pretrained_weights"]).to(device)
+    # Field eligibility is a dataset property, not a smoke-subsample property.
+    grounding_adapter, train_grounding, active_fields = build_train_grounding_targets(full_train_set, config, output_dir)
+    model = PRECISEOIAModel(Path(args.config).parent, config["pretrained_weights"], evidence_schema=active_fields, model_config=config).to(device)
     optimizers = build_optimizers(model, config)
     schedulers = build_schedulers(optimizers, math.ceil(len(train_loader) / args.gradient_accumulation_steps), args.epochs, config["training"]["warmup_ratio"])
     best = -float("inf")
+    best_scores = {"action_mf1": -float("inf"), "exp_mf1": -float("inf"), "exp_map": -float("inf"), "semantic_exp_map": -float("inf")}
+    start_epoch = 0
+    global_optimizer_step = 0
+    global_micro_step = 0
+    resumed_step_counts: dict[str, int] = {}
+    pcvl_probes = PRECISEPCVLProbes().to(device) if args.mode == "pilot" else None
+    pcvl_optimizer = torch.optim.AdamW(pcvl_probes.parameters(), lr=3e-4) if pcvl_probes is not None else None
+    fingerprint = _implementation_fingerprint(args.config)
+    if args.resume_checkpoint:
+        start_epoch, global_optimizer_step, global_micro_step, best, resumed_best_scores, resumed_step_counts = load_resume_checkpoint(
+            args.resume_checkpoint, model, optimizers, schedulers, device, fingerprint, pcvl_probes, pcvl_optimizer
+        )
+        best_scores.update(resumed_best_scores)
     write_resolved_config(output_dir / "config_resolved.yaml", config)
-    write_json(output_dir / "run_manifest.json", {"test_only": True, "best_selection_split": "test", "feature_cache_enabled": False, "token_compression": "none", "internal_test_selected": True, "publication_eligible_selection": False, "train_calib_count": len(calib_indices), "train_main_count": len(main_indices), "command_line": vars(args)})
-    grounding_adapter, train_grounding = build_train_grounding_targets(train_set, config, output_dir)
-    for epoch in range(args.epochs):
+    write_json(output_dir / "implementation_fingerprint.json", fingerprint)
+    write_json(output_dir / "run_manifest.json", {"git_head": fingerprint["git_head"], "base_commit": "373aa49feac17372574fd7fb056c1d79c7c848fe", "test_only": True, "selection_protocol": "internal_test_selected", "best_selection_split": "test", "feature_cache_enabled": False, "token_compression": "none", "internal_test_selected": True, "publication_eligible_selection": False, "selected_layers": [3, 7, 11], "pretrained_weights": config["pretrained_weights"], "train_calib_count": len(calib_indices), "train_main_count": len(main_indices), "train_audit_count": len(audit_indices), "pcvl_pilot_only": args.mode == "pilot", "active_evidence_fields": [field["name"] for field in active_fields], "command_line": vars(args)})
+    profile_path = Path(".review/precise_oia_v1/runtime/selected_runtime_profile.json")
+    write_json(output_dir / "runtime_profile.json", json.loads(profile_path.read_text(encoding="utf-8")) if profile_path.exists() else {"available": False, "reason": "actual-path profile has not passed yet"})
+    representation_owners = tuple(owner for owner in optimizers if owner != "threshold_head")
+    optimizer_step_counts = {owner: resumed_step_counts.get(owner, 0) for owner in optimizers}
+    last_owner_stats: dict[str, dict[str, float]] = {}
+    autocast_enabled = device.type == "cuda" and config["training"]["precision"] == "bf16"
+    last_batch_finished = time.perf_counter()
+    firewall_report: dict[str, float] = {}
+    last_threshold_loss = 0.0
+    for epoch in range(start_epoch, args.epochs):
         model.train()
         last_output = None
         for micro_step, batch in enumerate(train_loader):
-            output = model(batch["image"].to(device, non_blocking=True))
+            global_micro_step += 1
+            batch_started = time.perf_counter()
+            data_time = batch_started - last_batch_finished
+            images = batch["image"].to(device, non_blocking=True)
+            batch_size = images.shape[0]
+            mirror_count = min(batch_size, max(0, int(round(batch_size * float(config["augmentation"]["mirror_pair_fraction"])))))
+            model_input = torch.cat([images, images[:mirror_count].flip(-1)], dim=0) if mirror_count else images
+            dino_started = time.perf_counter()
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
+                dino_output = model.dino(model_input)
+            dino_time = time.perf_counter() - dino_started
+            visual_started = time.perf_counter()
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
+                visual_field = model.visual_field(dino_output)
+            visual_field_time = time.perf_counter() - visual_started
+            decode_started = time.perf_counter()
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
+                full_output = model.decode_from_field(visual_field)
+            decode_time = time.perf_counter() - decode_started
+            output = _slice_batch_output(full_output, batch_size, model_input.shape[0])
+            mirror_output = None
+            if mirror_count:
+                def mirror_slice(value: Any) -> Any:
+                    if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == model_input.shape[0]:
+                        return value[batch_size:]
+                    if isinstance(value, dict):
+                        return {key: mirror_slice(item) for key, item in value.items()}
+                    return value
+                mirror_output = mirror_slice(full_output)
             target_batch = grounding_adapter.stack_batch([train_grounding[name] for name in batch["file_name"]], device)
-            losses = total_precise_losses(output, batch["action"].to(device), batch["reason"].to(device), target_batch)
-            deploy_loss = 0.02 * (torch.nn.functional.binary_cross_entropy_with_logits(output["action_logits_deploy"], batch["action"].to(device)) + torch.nn.functional.binary_cross_entropy_with_logits(output["reason_logits_deploy"], batch["reason"].to(device)))
-            (losses["loss_total"] + deploy_loss).div(args.gradient_accumulation_steps).backward()
-            if (micro_step + 1) % args.gradient_accumulation_steps == 0:
-                for optimizer in optimizers:
-                    optimizer.step()
-                    optimizer.zero_grad(set_to_none=True)
-                for scheduler in schedulers:
-                    scheduler.step()
-            if micro_step % config["diagnostics"]["batch_log_every_optimizer_steps"] == 0:
+            action_target = batch["action"].to(device)
+            reason_target = batch["reason"].to(device)
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
+                losses = total_precise_losses(output, action_target, reason_target, target_batch)
+            if pcvl_probes is not None and pcvl_optimizer is not None:
+                pcvl_loss = train_pcvl_step(pcvl_probes, pcvl_optimizer, output, target_batch, action_target)
+                losses["loss_pcvl_detached"] = torch.tensor(pcvl_loss, device=device)
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
+                loss_refinement = 0.05 * (
+                    refinement_loss(output["action_logits_direct"], output["action_logits_final_raw"], action_target)
+                    + refinement_loss(output["reason_logits_direct"], output["reason_logits_semantic"], reason_target)
+                )
+            loss_mirror = losses["loss_total"] * 0.0
+            loss_evidence_view = losses["loss_total"] * 0.0
+            if mirror_output is not None:
+                action_mirror = torch.tensor([0, 1, 3, 2], device=device)
+                reason_mirror = torch.tensor([int(row["mirror_partner"]) for row in model.reason_schema], device=device)
+                field_mirror = model.evidence_fields.mirror_field_indices
+                loss_evidence_view = evidence_view_consistency_loss(output, mirror_output, field_mirror)
+                loss_mirror = (
+                    0.05 * two_way_consistency_loss(output["action_logits_final_raw"][:mirror_count], mirror_output["action_logits_final_raw"], action_mirror)
+                    + 0.05 * two_way_consistency_loss(output["reason_logits_semantic"][:mirror_count], mirror_output["reason_logits_semantic"], reason_mirror)
+                    + 0.0075 * loss_evidence_view
+                )
+                model.evidence_fields.update_view_consistency(output["explicit_evidence_tokens"][:mirror_count].detach(), mirror_output["explicit_evidence_tokens"].detach())
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
+                intervention = packed_target_specific_interventions(model, output, action_target, reason_target, int(config["intervention"]["max_pairs_per_batch"]))
+            total_updates = max(1, math.ceil(len(train_loader) / args.gradient_accumulation_steps) * args.epochs)
+            auxiliary_warmup = min(1.0, float(global_optimizer_step + 1) / max(1.0, 0.10 * total_updates))
+            main_loss = losses["loss_total"] - 0.15 * losses["loss_evidence"]
+            total_loss = main_loss + auxiliary_warmup * (
+                0.15 * losses["loss_evidence"]
+                + loss_refinement
+                + loss_mirror
+                + intervention["loss_intervention"]
+            )
+            evidence_parameters = parameter_ownership(model)["evidence_core"]
+            grounding_credit, raw_credit, projected_credit = projected_target_credit_grads(
+                auxiliary_warmup * 0.15 * losses["loss_evidence"],
+                auxiliary_warmup * intervention["loss_intervention"],
+                evidence_parameters,
+                float(config["intervention"]["target_credit_grad_ratio"]),
+            )
+            if micro_step == 0:
+                firewall_report = _observed_firewall(model, losses["loss_reason_observed"])
+            backward_started = time.perf_counter()
+            total_loss.div(args.gradient_accumulation_steps).backward()
+            for parameter, raw_grad, projected_grad in zip(evidence_parameters, raw_credit, projected_credit):
+                if parameter.grad is not None and raw_grad is not None and projected_grad is not None:
+                    parameter.grad.add_((projected_grad - raw_grad) / args.gradient_accumulation_steps)
+            backward_time = time.perf_counter() - backward_started
+            losses.update({"loss_total": total_loss, "loss_refinement": loss_refinement, "loss_mirror": loss_mirror, "loss_evidence_view": loss_evidence_view, **intervention, "auxiliary_warmup": torch.tensor(auxiliary_warmup, device=device)})
+            did_step = (micro_step + 1) % args.gradient_accumulation_steps == 0
+            optimizer_time = 0.0
+            if did_step:
+                optimizer_started = time.perf_counter()
+                last_owner_stats = _step_owners(model, representation_owners, optimizers, schedulers, config, optimizer_step_counts)
+                optimizer_time = time.perf_counter() - optimizer_started
+                global_optimizer_step += 1
+            if did_step and global_optimizer_step % int(config["diagnostics"]["batch_log_every_optimizer_steps"]) == 0:
                 record = {key: float(value.detach().item()) for key, value in losses.items() if value.ndim == 0}
-                record.update({"epoch": epoch, "micro_step": micro_step, "optimizer_step": (micro_step + 1) // args.gradient_accumulation_steps, "action_exchange_to_direct_ratio": float(output["action_exchange_delta"].pow(2).mean().sqrt().div(output["action_logits_direct"].pow(2).mean().sqrt().clamp_min(1e-6)).item()), "reason_exchange_to_direct_ratio": float(output["reason_exchange_delta"].pow(2).mean().sqrt().div(output["reason_logits_direct"].pow(2).mean().sqrt().clamp_min(1e-6)).item()), "explicit_reliability_mean": float(output["evidence_reliability"].mean().item()), "reference_center_collapse_rate": float(output["center_collapse_rate"].item()), **gpu_memory_gb(device), **ownership_snapshot(model)})
+                elapsed = max(time.perf_counter() - batch_started, 1e-8)
+                action_direct_error = F.binary_cross_entropy_with_logits(output["action_logits_direct"].detach(), action_target.float(), reduction="none").mean(-1)
+                action_refined_error = F.binary_cross_entropy_with_logits(output["action_logits_final_raw"].detach(), action_target.float(), reduction="none").mean(-1)
+                reason_direct_error = F.binary_cross_entropy_with_logits(output["reason_logits_direct"].detach(), reason_target.float(), reduction="none").mean(-1)
+                reason_refined_error = F.binary_cross_entropy_with_logits(output["reason_logits_semantic"].detach(), reason_target.float(), reduction="none").mean(-1)
+                action_hard = action_direct_error >= action_direct_error.median()
+                reason_hard = reason_direct_error >= reason_direct_error.median()
+                hard_improvement = 0.5 * (
+                    ((action_refined_error < action_direct_error) & action_hard).float().sum() / action_hard.float().sum().clamp_min(1.0)
+                    + ((reason_refined_error < reason_direct_error) & reason_hard).float().sum() / reason_hard.float().sum().clamp_min(1.0)
+                )
+                easy_regression = 0.5 * (
+                    ((action_refined_error > action_direct_error + 0.02) & ~action_hard).float().sum() / (~action_hard).float().sum().clamp_min(1.0)
+                    + ((reason_refined_error > reason_direct_error + 0.02) & ~reason_hard).float().sum() / (~reason_hard).float().sum().clamp_min(1.0)
+                )
+                action_direct_rms = output["action_logits_direct"].pow(2).mean().sqrt().clamp_min(1e-6)
+                reason_direct_rms = output["reason_logits_direct"].pow(2).mean().sqrt().clamp_min(1e-6)
+                record.update({"event": "precise_batch", "epoch": epoch, "micro_step": micro_step, "optimizer_step": global_optimizer_step, "data_time": data_time, "dino_time": dino_time, "visual_field_time": visual_field_time, "evidence_time": float(output["diagnostics"]["evidence_seconds"]), "decode_time": decode_time, "backward_time": backward_time, "optimizer_time": optimizer_time, "samples_per_sec": float(batch_size / elapsed), "loss_threshold": last_threshold_loss, "action_direct_logit_rms": float(action_direct_rms), "action_reread_delta_rms": float(output["action_reread_delta"].pow(2).mean().sqrt()), "action_exchange_delta_rms": float(output["action_exchange_delta"].pow(2).mean().sqrt()), "action_reread_to_direct_ratio": float(output["action_reread_delta"].pow(2).mean().sqrt().div(action_direct_rms).item()), "action_exchange_to_direct_ratio": float(output["action_exchange_delta"].pow(2).mean().sqrt().div(action_direct_rms).item()), "reason_direct_logit_rms": float(reason_direct_rms), "reason_reread_delta_rms": float(output["reason_reread_delta"].pow(2).mean().sqrt()), "reason_exchange_delta_rms": float(output["reason_exchange_delta"].pow(2).mean().sqrt()), "reason_reread_to_direct_ratio": float(output["reason_reread_delta"].pow(2).mean().sqrt().div(reason_direct_rms).item()), "reason_exchange_to_direct_ratio": float(output["reason_exchange_delta"].pow(2).mean().sqrt().div(reason_direct_rms).item()), "annotation_delta_rms": float(output["annotation_delta"].pow(2).mean().sqrt()), "explicit_reliability_mean": float(output["evidence_reliability"].mean().item()), "explicit_reliability_std": float(output["evidence_reliability"].std().item()), "explicit_strong_rate": float((output["evidence_reliability"] >= 0.7).float().mean()), "explicit_unreliable_rate": float((output["evidence_reliability"] < 0.3).float().mean()), "latent_token_norm": float(output["latent_evidence_tokens"].norm(dim=-1).mean()), "view_consistency_mean": float(model.evidence_fields.view_consistency_ema.mean()), "overlap_mean": float(output["exchange_overlap"].mean()), "overlap_max": float(output["exchange_overlap"].max()), "gate_mean": float(output["exchange_gate"].mean()), "gate_max": float(output["exchange_gate"].max()), "gate_active_rate_gt_0p1": float((output["exchange_gate"] > 0.1).float().mean()), "wrong_target_message_ratio": float(output["wrong_target_message_ratio"]), "reference_center_collapse_rate": float(output["center_collapse_rate"].item()), "reference_out_of_bounds_rate": float(output["out_of_bounds_rate"].item()), "hard_sample_improvement_rate": float(hard_improvement), "easy_sample_regression_rate": float(easy_regression), "grad_action_foundation": last_owner_stats.get("action_foundation", {}).get("grad_norm_pre_clip", 0.0), "grad_action_decoder": last_owner_stats.get("action_decoder", {}).get("grad_norm_pre_clip", 0.0), "grad_reason": last_owner_stats.get("reason_semantic", {}).get("grad_norm_pre_clip", 0.0), "grad_evidence_grounding": float(tensor_list_norm(grounding_credit)), "grad_evidence_target_credit_raw": float(tensor_list_norm(raw_credit)), "grad_evidence_target_credit_projected": float(tensor_list_norm(projected_credit)), "grad_annotation": last_owner_stats.get("annotation_adapter", {}).get("grad_norm_pre_clip", 0.0), "owner_diagnostics": last_owner_stats, **firewall_report, **gpu_memory_gb(device), **ownership_snapshot(model)})
+                family_indices: dict[str, list[int]] = {}
+                for field_index, field in enumerate(active_fields):
+                    family_indices.setdefault(str(field["family"]), []).append(field_index)
+                presence_probs = torch.sigmoid(output["evidence_presence_logits"])
+                observability_probs = torch.sigmoid(output["evidence_observability_logits"])
+                reference_variance = output["reference_point_variance"].detach()
+                record.update({
+                    "per_family_presence_rate": {family: float(presence_probs[:, indices].mean()) for family, indices in family_indices.items()},
+                    "per_family_observability_rate": {family: float(observability_probs[:, indices].mean()) for family, indices in family_indices.items()},
+                    "prototype_margin_mean": float(output["evidence_prototype_margin"].mean()),
+                    "evidence_attention_entropy": float(output["evidence_attention_entropy"]),
+                    "evidence_effective_support": float(output["evidence_effective_support"]),
+                    "action_reason_message_norm": float(output["action_reason_message_norm"]),
+                    "reason_action_message_norm": float(output["reason_action_message_norm"]),
+                    "reason_token_shuffle_delta": float(output["reason_token_shuffle_delta"]),
+                    "evidence_shuffle_delta": float(output["evidence_shuffle_delta"]),
+                    "reference_point_variance_x": float(reference_variance[0]),
+                    "reference_point_variance_y": float(reference_variance[1]),
+                })
                 append_jsonl(output_dir / "loss_components.jsonl", record)
+                append_jsonl(output_dir / "gradient_ownership.jsonl", {"epoch": epoch, "optimizer_step": global_optimizer_step, "owners": last_owner_stats, **firewall_report})
+                append_jsonl(output_dir / "mechanism_batch_stats.jsonl", {key: record[key] for key in ("epoch", "optimizer_step", "action_exchange_to_direct_ratio", "reason_exchange_to_direct_ratio", "explicit_reliability_mean", "gate_active_rate_gt_0p1", "reference_center_collapse_rate", "selected_effect_mean", "control_effect_mean", "wrong_effect_mean")})
+                print(json.dumps(record, sort_keys=True), flush=True)
             last_output = output
+            last_batch_finished = time.perf_counter()
         # Never drop an incomplete accumulated tail batch.
         if len(train_loader) % args.gradient_accumulation_steps:
-            for optimizer in optimizers:
-                optimizer.step(); optimizer.zero_grad(set_to_none=True)
-            for scheduler in schedulers:
-                scheduler.step()
+            last_owner_stats = _step_owners(model, representation_owners, optimizers, schedulers, config, optimizer_step_counts)
+            global_optimizer_step += 1
         # CalAlign is trained only on the deterministic train-calib split.
+        threshold_values = []
         model.threshold_head.train()
-        for calib_batch in calib_loader:
+        for calib_batch in calib_loader if epoch >= int(config["threshold"]["start_epoch"]) else ():
             with torch.no_grad():
                 raw = model(calib_batch["image"].to(device, non_blocking=True))
-            threshold = model.threshold_head(raw["action_logits_final_raw"].detach(), raw["reason_logits_observed"].detach())
-            threshold_loss = F.binary_cross_entropy_with_logits(threshold["action_logits_deploy"], calib_batch["action"].to(device)) + F.binary_cross_entropy_with_logits(threshold["reason_logits_deploy"], calib_batch["reason"].to(device))
-            optimizers[-1].zero_grad(set_to_none=True); threshold_loss.backward(); optimizers[-1].step()
-        model.threshold_head.update_teacher(model.threshold_head.compose_theta().detach(), ema=1.0)
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
+                threshold = model.threshold_head(raw["action_logits_final_raw"].detach(), raw["reason_logits_observed"].detach())
+                threshold_loss = F.binary_cross_entropy_with_logits(threshold["action_logits_deploy"], calib_batch["action"].to(device)) + F.binary_cross_entropy_with_logits(threshold["reason_logits_deploy"], calib_batch["reason"].to(device))
+            optimizers["threshold_head"].zero_grad(set_to_none=True)
+            threshold_loss.backward()
+            clip_grad_norm_(parameter_ownership(model)["threshold_head"], float(config["training"]["grad_clip_reason"]))
+            optimizers["threshold_head"].step()
+            schedulers["threshold_head"].step()
+            optimizer_step_counts["threshold_head"] += 1
+            threshold_values.append(float(threshold_loss.detach()))
+        if threshold_values:
+            last_threshold_loss = sum(threshold_values) / len(threshold_values)
+            model.threshold_head.update_teacher(model.threshold_head.compose_theta().detach(), ema=1.0)
         metrics, tensors = evaluate_precise(model, test_loader, device)
+        if pcvl_probes is not None and audit_loader is not None:
+            def audit_target_provider(audit_batch, audit_device):
+                return grounding_adapter.stack_batch([train_grounding[name] for name in audit_batch["file_name"]], audit_device)
+            evaluate_pcvl(pcvl_probes, model, audit_loader, audit_target_provider, device, output_dir / "pcvl")
         epoch_dir = output_dir / f"epoch_{epoch:03d}"
         epoch_dir.mkdir(parents=True, exist_ok=True)
         write_json(epoch_dir / "metrics_summary.json", metrics)
         write_json(epoch_dir / "branch_metrics.json", metrics)
-        write_json(epoch_dir / "gradient_firewall.json", ownership_snapshot(model))
+        write_json(epoch_dir / "gradient_firewall.json", firewall_report)
+        write_json(epoch_dir / "counterfactual_stats.json", metrics["counterfactual"])
+        write_json(epoch_dir / "per_action_metrics.json", metrics["action_deploy"])
+        write_json(epoch_dir / "per_reason_metrics.json", {"observed": metrics["reason_observed"], "semantic": metrics["reason_semantic"], "deploy": metrics["reason_deploy"]})
         if last_output is not None:
             write_json(epoch_dir / "evidence_family_stats.json", {"presence_mean": [float(value) for value in torch.sigmoid(last_output["evidence_presence_logits"]).mean(0).detach().cpu()], "observability_mean": [float(value) for value in torch.sigmoid(last_output["evidence_observability_logits"]).mean(0).detach().cpu()]})
             write_json(epoch_dir / "evidence_reliability.json", {"mean": [float(value) for value in last_output["evidence_reliability"].mean(0).detach().cpu()], "strong_rate": float((last_output["evidence_reliability"] >= 0.70).float().mean().item()), "weak_rate": float(((last_output["evidence_reliability"] >= 0.30) & (last_output["evidence_reliability"] < 0.70)).float().mean().item())})
             write_json(epoch_dir / "exchange_stats.json", {"overlap_mean": float(last_output["exchange_overlap"].mean().item()), "gate_mean": float(last_output["exchange_gate"].mean().item()), "gate_active_rate_gt_0p1": float((last_output["exchange_gate"] > 0.1).float().mean().item())})
             write_json(epoch_dir / "reread_stats.json", {"center_collapse_rate": float(last_output["center_collapse_rate"].item()), "out_of_bounds_rate": float(last_output["out_of_bounds_rate"].item()), "reference_variance": [float(value) for value in last_output["reference_point_variance"].detach().cpu()]})
             write_json(epoch_dir / "annotation_gap.json", {"annotation_delta_rms": float(last_output["annotation_delta"].pow(2).mean().sqrt().item()), "semantic_observed_gap_rms": float((last_output["reason_logits_semantic"] - last_output["reason_logits_observed"]).pow(2).mean().sqrt().item())})
-        save_epoch_tensors(epoch_dir, {"action_logits_direct": tensors["action_direct"], "action_logits_final_raw": tensors["action_final_raw"], "action_logits_deploy": tensors["action_deploy"], "reason_logits_direct": tensors["reason_direct"], "reason_logits_semantic": tensors["reason_semantic"], "reason_logits_observed": tensors["reason_observed"], "reason_logits_deploy": tensors["reason_deploy"]}, tensors["labels_action"], tensors["labels_reason"])
-        append_jsonl(output_dir / "metrics_summary.jsonl", {"epoch": epoch, "deploy_fixed_joint": metrics["deploy_fixed_joint"]})
-        checkpoint = {"model": model.state_dict(), "epoch": epoch, "optimizers": [item.state_dict() for item in optimizers], "schedulers": [item.state_dict() for item in schedulers], "rng_state": torch.get_rng_state(), "threshold_teacher": model.threshold_head.theta_teacher.detach().cpu(), "active_field_schema": [field["name"] for field in load_evidence_fields(config["evidence"]["field_config"])]}
-        torch.save(checkpoint, output_dir / "checkpoint_latest.pth")
-        if metrics["deploy_fixed_joint"] > best:
+        save_epoch_tensors(epoch_dir, {name: value for name, value in tensors.items() if isinstance(value, torch.Tensor) and (name.startswith("action_") or name.startswith("reason_"))}, tensors["labels_action"], tensors["labels_reason"])
+        action_errors = F.binary_cross_entropy_with_logits(tensors["action_deploy"], tensors["labels_action"], reduction="none").sum(-1)
+        reason_errors = F.binary_cross_entropy_with_logits(tensors["reason_deploy"], tensors["labels_reason"], reduction="none").sum(-1)
+        worst_indices = (action_errors + reason_errors).topk(min(32, len(action_errors))).indices.tolist()
+        for index in worst_indices:
+            name = tensors["file_names"][index]
+            action_error = F.binary_cross_entropy_with_logits(tensors["action_deploy"][index], tensors["labels_action"][index], reduction="sum")
+            reason_error = F.binary_cross_entropy_with_logits(tensors["reason_deploy"][index], tensors["labels_reason"][index], reduction="sum")
+            append_jsonl(epoch_dir / "failure_cases.jsonl", {"file_name": name, "action_bce": float(action_error), "reason_bce": float(reason_error)})
+        for index, name in enumerate(tensors["file_names"][:32]):
+            append_jsonl(epoch_dir / "evidence_cases.jsonl", {"file_name": name, "reliability": tensors["evidence_reliability"][index].tolist(), "presence": tensors["evidence_presence"][index].tolist(), "part_coordinates": tensors["evidence_coordinates"][index].tolist()})
+        export_precise_cases(epoch_dir / "case_exports", tensors["case_rows"])
+        append_jsonl(output_dir / "metrics_summary.jsonl", {"epoch": epoch, **metrics, "optimizer_step_counts": optimizer_step_counts})
+        score_values = {"action_mf1": metrics["action_deploy"]["Act_mF1"], "exp_mf1": metrics["reason_deploy"]["Exp_mF1"], "exp_map": metrics["reason_deploy"]["Exp_mAP"], "semantic_exp_map": metrics["reason_semantic"]["Exp_mAP"]}
+        improved = {name: value > best_scores[name] for name, value in score_values.items()}
+        for name, value in score_values.items():
+            if improved[name]:
+                best_scores[name] = value
+        joint_improved = metrics["deploy_fixed_joint"] > best
+        if joint_improved:
             best = metrics["deploy_fixed_joint"]
+        checkpoint = {"model": model.state_dict(), "epoch": epoch, "optimizers": {owner: item.state_dict() for owner, item in optimizers.items()}, "schedulers": {owner: item.state_dict() for owner, item in schedulers.items()}, "rng_state": torch.get_rng_state(), "python_rng_state": random.getstate(), "cuda_rng_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None, "global_optimizer_step": global_optimizer_step, "global_micro_step": global_micro_step, "optimizer_step_counts": optimizer_step_counts, "best_deploy_joint": best, "best_scores": best_scores, "threshold_teacher": model.threshold_head.theta_teacher.detach().cpu(), "view_consistency_ema": model.evidence_fields.view_consistency_ema.detach().cpu(), "active_field_schema": [field["name"] for field in active_fields], "implementation_fingerprint": fingerprint}
+        if pcvl_probes is not None and pcvl_optimizer is not None:
+            checkpoint["pcvl_probes"] = pcvl_probes.state_dict()
+            checkpoint["pcvl_optimizer"] = pcvl_optimizer.state_dict()
+        torch.save(checkpoint, output_dir / "checkpoint_latest.pth")
+        if joint_improved:
             torch.save(checkpoint, output_dir / "checkpoint_best_test_deploy_joint.pth")
+        checkpoint_names = {"action_mf1": "checkpoint_best_test_action_mf1.pth", "exp_mf1": "checkpoint_best_test_exp_mf1.pth", "exp_map": "checkpoint_best_test_exp_map.pth", "semantic_exp_map": "checkpoint_best_test_semantic_exp_map.pth"}
+        for name, was_improved in improved.items():
+            if was_improved:
+                torch.save(checkpoint, output_dir / checkpoint_names[name])
 
 
 def main() -> None:
@@ -176,6 +520,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=20260722)
     parser.add_argument("--test_only", action="store_true")
     parser.add_argument("--resume_checkpoint", default=None)
+    parser.add_argument("--mode", choices=("pilot", "full"), default="full")
     args = parser.parse_args()
     train(args)
 

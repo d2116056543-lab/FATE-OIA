@@ -10,16 +10,18 @@ from fate_oia.models.acpr_sparse_ops import entmax15_bisect
 
 
 class PRECISESemanticExchange(nn.Module):
-    def __init__(self, fields: list[dict[str, Any]], reason_schema: list[dict[str, Any]], dim: int = 384, overlap_tau: float = 0.08, overlap_slope: float = 12.0, gamma_init: float = 0.05, gamma_max: float = 0.25) -> None:
+    def __init__(self, fields: list[dict[str, Any]], reason_schema: list[dict[str, Any]], dim: int = 384, overlap_tau: float = 0.08, overlap_slope: float = 12.0, reliability_eps: float = 1e-4, action_gamma_init: float = 0.05, reason_gamma_init: float = 0.05, gamma_max: float = 0.25) -> None:
         super().__init__()
         self.fields = fields
         self.reason_schema = reason_schema
         self.overlap_tau = overlap_tau
         self.overlap_slope = overlap_slope
+        self.reliability_eps = reliability_eps
         self.gamma_max = gamma_max
-        raw = math.log((gamma_init / gamma_max) / (1.0 - gamma_init / gamma_max))
-        self.action_gamma_raw = nn.Parameter(torch.full((4,), raw))
-        self.reason_gamma_raw = nn.Parameter(torch.full((21,), raw))
+        action_raw = math.log((action_gamma_init / gamma_max) / (1.0 - action_gamma_init / gamma_max))
+        reason_raw = math.log((reason_gamma_init / gamma_max) / (1.0 - reason_gamma_init / gamma_max))
+        self.action_gamma_raw = nn.Parameter(torch.full((4,), action_raw))
+        self.reason_gamma_raw = nn.Parameter(torch.full((21,), reason_raw))
         self.action_query = nn.Linear(dim, dim, bias=False)
         self.reason_query = nn.Linear(dim, dim, bias=False)
         self.evidence_key = nn.Linear(dim, dim, bias=False)
@@ -39,12 +41,15 @@ class PRECISESemanticExchange(nn.Module):
 
     def _attention(self, tokens: torch.Tensor, query: nn.Linear, mask: torch.Tensor, evidence: torch.Tensor, reliability: torch.Tensor) -> torch.Tensor:
         logits = torch.einsum("bcd,bed->bce", query(tokens), self.evidence_key(evidence)) / (tokens.shape[-1] ** 0.5)
-        logits = logits + reliability.clamp_min(1e-4).log().unsqueeze(1)
-        logits = logits.masked_fill(~mask.view(1, *mask.shape), -1e4)
-        return entmax15_bisect(logits, dim=-1)
+        logits = logits + reliability.clamp_min(self.reliability_eps).log().unsqueeze(1)
+        allowed = mask.view(1, *mask.shape)
+        logits = logits.masked_fill(~allowed, -1e4)
+        attention = entmax15_bisect(logits, dim=-1) * allowed
+        return attention / attention.sum(-1, keepdim=True).clamp_min(1e-8)
 
-    def forward(self, action_tokens: torch.Tensor, reason_tokens: torch.Tensor, explicit_evidence: torch.Tensor, reliability: torch.Tensor, mode: str = "certified") -> dict[str, torch.Tensor]:
-        evidence, rho = explicit_evidence, reliability
+    def forward(self, action_tokens: torch.Tensor, reason_tokens: torch.Tensor, explicit_evidence: torch.Tensor, reliability: torch.Tensor, mode: str = "certified", evidence_grad: bool = False) -> dict[str, torch.Tensor]:
+        evidence = explicit_evidence if evidence_grad else explicit_evidence.detach()
+        rho = reliability if evidence_grad else reliability.detach()
         reasons = reason_tokens
         if mode == "evidence_shuffled":
             evidence, rho = evidence.roll(1, 0), rho.roll(1, 0)
@@ -76,5 +81,7 @@ class PRECISESemanticExchange(nn.Module):
             "exchange_gate": action_gate,
             "action_exchange_delta": action_delta,
             "reason_exchange_delta": reason_delta,
+            "action_reason_message_norm": action_message.norm(dim=-1).mean(),
+            "reason_action_message_norm": reason_message.norm(dim=-1).mean(),
             "wrong_target_message_ratio": action_weights.min(dim=-1).values.mean() / action_weights.max(dim=-1).values.mean().clamp_min(1e-8),
         }

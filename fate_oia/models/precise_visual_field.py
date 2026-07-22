@@ -57,13 +57,16 @@ class PRECISEVisualField(nn.Module):
 
     def _perspective(self, device: torch.device, dtype: torch.dtype, grid_hw: tuple[int, int]) -> torch.Tensor:
         height, width = grid_hw
-        yy, xx = torch.meshgrid(torch.arange(height, device=device, dtype=dtype), torch.arange(width, device=device, dtype=dtype), indexing="ij")
+        # Build perspective coordinates in fp32. In bf16, the 1e-5 bottom-row
+        # guard rounds away and log1p(-1) produces an infinite feature.
+        yy, xx = torch.meshgrid(torch.arange(height, device=device, dtype=torch.float32), torch.arange(width, device=device, dtype=torch.float32), indexing="ij")
         lateral = 2.0 * xx / max(width - 1, 1) - 1.0
-        distance = -torch.log1p(-yy / max(height - 1, 1) + 1e-5)
+        normalized_y = (yy / max(height - 1, 1)).clamp(0.0, 1.0 - 1e-5)
+        distance = -torch.log1p(-normalized_y)
         angle = torch.atan((xx - width / 2.0) / (height - yy + 1e-5))
         scale = torch.log1p(yy / max(height - 1, 1))
         coords = torch.stack([lateral, distance, angle, scale], dim=-1).reshape(1, height * width, 4)
-        return self.perspective_projection(coords)
+        return self.perspective_projection(coords).to(dtype=dtype)
 
     def _context(self, layers: torch.Tensor, cls_tokens: torch.Tensor, grid_hw: tuple[int, int]) -> torch.Tensor:
         batch, layers_count, _, dim = layers.shape

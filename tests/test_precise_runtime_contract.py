@@ -25,3 +25,14 @@ def test_runtime_profile_selects_fastest_safe_profile_and_prefers_lower_memory_o
         {"batch_size": 6, "samples_per_sec": 6.0, "peak_reserved_gb": 47.0, "valid": False},
     ], hard_limit_gb=46.5)
     assert selected["batch_size"] == 8
+
+
+def test_runtime_profile_binds_real_forward_to_git_and_config():
+    source = (ROOT / "fate_oia" / "engine" / "profile_precise_oia.py").read_text(encoding="utf-8")
+    assert 'selected["git_head"]' in source
+    assert 'selected["config_sha256"]' in source
+    assert 'root.parent / "real_forward.json"' in source
+    assert "_observed_firewall(" in source
+    assert "owner_gradient_matrix_passed" in source
+    assert "curve_distance_valid_count" in source
+    assert 'config["runtime"]["target_peak_reserved_gb"]' in source

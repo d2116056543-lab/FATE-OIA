@@ -23,6 +23,28 @@ def grad_norm(parameters: Iterable[nn.Parameter]) -> torch.Tensor:
     return torch.stack(values).norm()
 
 
+def tensor_list_norm(values: Iterable[torch.Tensor | None]) -> torch.Tensor:
+    norms = [value.detach().float().norm() for value in values if value is not None]
+    return torch.stack(norms).norm() if norms else torch.tensor(0.0)
+
+
+def loss_owner_gradient_matrix(model: nn.Module, named_losses: dict[str, torch.Tensor]) -> dict[str, dict[str, float]]:
+    owners = parameter_ownership(model)
+    owner_names = tuple(owners)
+    flat_parameters = [parameter for owner in owner_names for parameter in owners[owner]]
+    matrix: dict[str, dict[str, float]] = {}
+    for loss_name, loss in named_losses.items():
+        gradients = torch.autograd.grad(loss, flat_parameters, retain_graph=True, allow_unused=True)
+        row: dict[str, float] = {}
+        offset = 0
+        for owner in owner_names:
+            owner_gradients = gradients[offset:offset + len(owners[owner])]
+            offset += len(owners[owner])
+            row[owner] = float(tensor_list_norm(owner_gradients).item())
+        matrix[loss_name] = row
+    return matrix
+
+
 def project_target_credit_gradient(grounding_grad: torch.Tensor, target_credit_grad: torch.Tensor, max_ratio: float = 0.20) -> torch.Tensor:
     denominator = grounding_grad.square().sum().clamp_min(1e-12)
     projected = target_credit_grad
@@ -35,3 +57,23 @@ def project_target_credit_gradient(grounding_grad: torch.Tensor, target_credit_g
 
 def ownership_snapshot(model: nn.Module) -> dict[str, float]:
     return {owner: float(grad_norm(parameters).item()) for owner, parameters in parameter_ownership(model).items()}
+
+
+def projected_target_credit_grads(
+    grounding_loss: torch.Tensor,
+    target_credit_loss: torch.Tensor,
+    parameters: list[nn.Parameter],
+    max_ratio: float = 0.20,
+) -> tuple[list[torch.Tensor | None], list[torch.Tensor | None], list[torch.Tensor | None]]:
+    grounding = torch.autograd.grad(grounding_loss, parameters, retain_graph=True, allow_unused=True)
+    target = torch.autograd.grad(target_credit_loss, parameters, retain_graph=True, allow_unused=True)
+    projected: list[torch.Tensor | None] = []
+    for parameter, ground_grad, target_grad in zip(parameters, grounding, target):
+        if target_grad is None:
+            projected.append(None)
+            continue
+        if ground_grad is None:
+            projected.append(torch.zeros_like(parameter))
+            continue
+        projected.append(project_target_credit_gradient(ground_grad, target_grad, max_ratio))
+    return list(grounding), list(target), projected

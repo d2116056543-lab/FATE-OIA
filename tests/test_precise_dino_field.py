@@ -23,3 +23,10 @@ def test_dino_rejects_non_contract_image_shape():
         assert "360x640" in str(error)
     else:
         raise AssertionError("non-contract image shape was accepted")
+
+
+def test_frozen_dino_remains_eval_when_parent_enters_train_mode():
+    model = PRECISEDinoFieldExtractor(use_mock_dino=True)
+    model.train()
+    assert model.training is False
+    assert model.dino.training is False

@@ -37,6 +37,12 @@ class PRECISEDinoFieldExtractor(nn.Module):
             parameter.requires_grad = False
         self.dino.eval()
 
+    def train(self, mode: bool = True):
+        """Keep the frozen DINO backbone in inference mode permanently."""
+        super().train(False)
+        self.dino.eval()
+        return self
+
     def _clear_internal_references(self) -> None:
         if self.use_mock_dino:
             return
@@ -59,7 +65,7 @@ class PRECISEDinoFieldExtractor(nn.Module):
         if tuple(images.shape[-2:]) != (360, 640):
             raise ValueError(f"PRECISE expects 360x640 images, got {tuple(images.shape[-2:])}")
         self.dino_call_count += 1
-        with torch.no_grad():
+        with torch.no_grad(), torch.autocast(device_type=images.device.type, dtype=torch.bfloat16, enabled=images.is_cuda):
             if self.use_mock_dino:
                 patches, cls = self._mock_forward(images)
             else:

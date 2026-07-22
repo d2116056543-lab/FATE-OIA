@@ -36,7 +36,8 @@ def write_resolved_config(path: str | Path, config: dict[str, Any]) -> None:
 def save_epoch_tensors(epoch_dir: str | Path, output: dict[str, Any], action: torch.Tensor, reason: torch.Tensor) -> None:
     target = Path(epoch_dir)
     target.mkdir(parents=True, exist_ok=True)
-    for name in ("action_logits_direct", "action_logits_final_raw", "action_logits_deploy", "reason_logits_direct", "reason_logits_semantic", "reason_logits_observed", "reason_logits_deploy"):
-        torch.save(output[name].detach().cpu(), target / f"logits_{name}.pt")
+    for name, value in output.items():
+        if isinstance(value, torch.Tensor) and (name.startswith("action_") or name.startswith("reason_")):
+            torch.save(value.detach().cpu(), target / f"logits_{name}.pt")
     torch.save(action.detach().cpu(), target / "labels_action.pt")
     torch.save(reason.detach().cpu(), target / "labels_reason.pt")
