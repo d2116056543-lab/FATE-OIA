@@ -21,9 +21,17 @@ from fate_oia.datasets.bdd100k_task_aware_index import BDD100KTaskAwareIndex
 from fate_oia.datasets.precise_grounding_adapter import PRECISEGroundingAdapter
 from fate_oia.engine.eval_precise_oia import evaluate_precise
 from fate_oia.engine.export_precise_cases import export_precise_cases
+from fate_oia.engine.precise_curriculum import (
+    curriculum_sha256,
+    curriculum_state_for_epoch,
+    owner_active_epoch_counts,
+)
 from fate_oia.losses.precise_losses import total_precise_losses
 from fate_oia.losses.precise_losses import evidence_view_consistency_loss, refinement_loss, two_way_consistency_loss
-from fate_oia.losses.precise_intervention_losses import packed_target_specific_interventions
+from fate_oia.losses.precise_intervention_losses import (
+    empty_packed_target_specific_interventions,
+    packed_target_specific_interventions,
+)
 from fate_oia.models.precise_oia_model import PRECISEOIAModel
 from fate_oia.models.precise_pcvl_probes import PRECISEPCVLProbes
 from fate_oia.engine.run_precise_pcvl import evaluate_pcvl, train_pcvl_step
@@ -53,6 +61,39 @@ def _implementation_fingerprint(config_path: str | Path) -> dict[str, Any]:
     return {"git_head": head, "source_tree_sha256": digest.hexdigest(), "config_sha256": hashlib.sha256(Path(config_path).read_bytes()).hexdigest(), "checked_source_count": len(sources)}
 
 
+def verify_full_curriculum_authorization(
+    config: dict[str, Any],
+    fingerprint: dict[str, Any],
+    gate_path: str | Path = ".review/PRECISE_OIA_V1_FULL_CURRICULUM_READY.json",
+) -> dict[str, Any]:
+    gate_file = Path(gate_path)
+    if not gate_file.exists():
+        raise RuntimeError("Full PRECISE training requires FULL_CURRICULUM_READY")
+    gate = json.loads(gate_file.read_text(encoding="utf-8"))
+    skill = Path(".codex/skills/precise-oia-implementation-audit/SKILL.md")
+    expected = {
+        "status": "FULL_CURRICULUM_READY",
+        "git_head": fingerprint["git_head"],
+        "config_sha256": fingerprint["config_sha256"],
+        "source_tree_sha256": fingerprint["source_tree_sha256"],
+        "skill_sha256": hashlib.sha256(skill.read_bytes()).hexdigest(),
+        "curriculum_sha256": curriculum_sha256(config),
+        "override_source": "user_approved_2026-07-23",
+    }
+    mismatches = [name for name, value in expected.items() if gate.get(name) != value]
+    if gate.get("unresolved"):
+        mismatches.append("unresolved")
+    if not gate.get("runtime_profile_passed"):
+        mismatches.append("runtime_profile_passed")
+    if not gate.get("curriculum_checks") or not all(gate["curriculum_checks"].values()):
+        mismatches.append("curriculum_checks")
+    if not gate.get("functional_checks") or not all(gate["functional_checks"].values()):
+        mismatches.append("functional_checks")
+    if mismatches:
+        raise RuntimeError(f"FULL_CURRICULUM_READY identity/contract mismatch: {sorted(set(mismatches))}")
+    return gate
+
+
 def _index_sha(indices: list[int]) -> str:
     payload = ",".join(str(index) for index in indices).encode("ascii")
     return hashlib.sha256(payload).hexdigest()
@@ -71,7 +112,16 @@ def _file_names_sha256(names: list[str]) -> str:
 
 def _observed_firewall(model: PRECISEOIAModel, observed_loss: torch.Tensor) -> dict[str, float]:
     owners = parameter_ownership(model)
-    checked = ("action_foundation", "action_decoder", "reason_semantic", "evidence_core", "exchange_reread", "annotation_adapter")
+    checked = (
+        "action_foundation",
+        "action_decoder",
+        "reason_semantic",
+        "evidence_core",
+        "reread_adapter",
+        "exchange_adapter",
+        "reason_latent",
+        "annotation_adapter",
+    )
     parameters = [parameter for owner in checked for parameter in owners[owner]]
     gradients = torch.autograd.grad(observed_loss, parameters, retain_graph=True, allow_unused=True)
     result = {}
@@ -106,11 +156,10 @@ def _training_split_indices(dataset, mode: str, seed: int, calib_fraction: float
 
 def build_optimizers(model: PRECISEOIAModel, config: dict[str, Any]) -> dict[str, torch.optim.Optimizer]:
     owner_config = config["optimizer"]
-    mapped = {"reason_semantic": "reason_adapter_decoder", "exchange_reread": "exchange_and_reread"}
     optimizers = {}
     parameter_names = {id(parameter): name for name, parameter in model.named_parameters()}
     for owner, parameters in parameter_ownership(model).items():
-        setting = owner_config[mapped.get(owner, owner)]
+        setting = owner_config[owner]
         decay, no_decay = [], []
         for parameter in parameters:
             name = parameter_names[id(parameter)]
@@ -134,6 +183,7 @@ def _step_owners(
     schedulers: dict[str, torch.optim.lr_scheduler.LambdaLR],
     config: dict[str, Any],
     step_counts: dict[str, int],
+    owner_active: dict[str, bool],
 ) -> dict[str, dict[str, float]]:
     parameters_by_owner = parameter_ownership(model)
     action_clip = float(config["training"]["grad_clip_action"])
@@ -142,6 +192,18 @@ def _step_owners(
     stats = {}
     for owner in owners:
         parameters = parameters_by_owner[owner]
+        if not owner_active[owner]:
+            optimizers[owner].zero_grad(set_to_none=True)
+            stats[owner] = {
+                "active": 0.0,
+                "parameter_count": float(sum(parameter.numel() for parameter in parameters)),
+                "grad_norm_pre_clip": 0.0,
+                "grad_norm_post_clip": 0.0,
+                "parameter_delta_norm": 0.0,
+                "optimizer_step_count": float(step_counts[owner]),
+                "lr": float(optimizers[owner].param_groups[0]["lr"]),
+            }
+            continue
         before = [parameter.detach().clone() for parameter in parameters]
         pre = float(grad_norm(parameters).item())
         clip = action_clip if owner.startswith("action") else evidence_clip if owner == "evidence_core" else reason_clip
@@ -153,25 +215,28 @@ def _step_owners(
         schedulers[owner].step()
         step_counts[owner] += 1
         stats[owner] = {
+            "active": 1.0,
             "parameter_count": float(sum(parameter.numel() for parameter in parameters)),
             "grad_norm_pre_clip": pre,
             "grad_norm_post_clip": post,
             "parameter_delta_norm": float(delta),
             "optimizer_step_count": float(step_counts[owner]),
+            "lr": float(optimizers[owner].param_groups[0]["lr"]),
         }
     return stats
 
 
-def build_schedulers(optimizers: dict[str, torch.optim.Optimizer], updates_per_epoch: int | dict[str, int], epochs: int, warmup_ratio: float) -> dict[str, torch.optim.lr_scheduler.LambdaLR]:
+def build_schedulers(optimizers: dict[str, torch.optim.Optimizer], updates_per_epoch: int | dict[str, int], active_epochs: int | dict[str, int], warmup_ratio: float) -> dict[str, torch.optim.lr_scheduler.LambdaLR]:
     schedulers = {}
     for owner, optimizer in optimizers.items():
         owner_updates = updates_per_epoch[owner] if isinstance(updates_per_epoch, dict) else updates_per_epoch
-        total = max(1, owner_updates * epochs)
+        owner_epochs = active_epochs[owner] if isinstance(active_epochs, dict) else active_epochs
+        total = max(1, owner_updates * owner_epochs)
         warmup = max(1, int(total * warmup_ratio))
         def scale(step: int, total_steps: int = total, warmup_steps: int = warmup) -> float:
             if step < warmup_steps:
                 return float(step + 1) / warmup_steps
-            progress = min(1.0, (step - warmup_steps) / max(1, total_steps - warmup_steps))
+            progress = min(1.0, (step - warmup_steps) / max(1, total_steps - warmup_steps - 1))
             return 0.05 + 0.95 * 0.5 * (1.0 + math.cos(math.pi * progress))
         schedulers[owner] = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=scale)
     return schedulers
@@ -184,12 +249,55 @@ def load_resume_checkpoint(
     schedulers: dict[str, torch.optim.lr_scheduler.LambdaLR],
     device: torch.device,
     expected_fingerprint: dict[str, Any],
+    expected_curriculum_sha256: str,
+    expected_owner_active_epochs: dict[str, int],
+    curriculum_config: dict[str, Any] | None = None,
+    updates_per_epoch: dict[str, int] | None = None,
     pcvl_probes: PRECISEPCVLProbes | None = None,
     pcvl_optimizer: torch.optim.Optimizer | None = None,
 ) -> tuple[int, int, int, float, dict[str, float], dict[str, int], int, int]:
     checkpoint = torch.load(checkpoint_path, map_location=device)
     if checkpoint.get("implementation_fingerprint") != expected_fingerprint:
         raise RuntimeError("Resume checkpoint implementation/config fingerprint does not match current code")
+    if checkpoint.get("curriculum_sha256") != expected_curriculum_sha256:
+        raise RuntimeError("Resume checkpoint curriculum hash does not match current schedule")
+    if checkpoint.get("owner_active_epochs") != expected_owner_active_epochs:
+        raise RuntimeError("Resume checkpoint owner active-epoch totals do not match current schedule")
+    required_lifecycle = {
+        "curriculum_state",
+        "optimizer_step_counts",
+        "optimizers",
+        "schedulers",
+        "owner_step_deltas",
+    }
+    missing_lifecycle = sorted(required_lifecycle - set(checkpoint))
+    if missing_lifecycle:
+        raise RuntimeError(f"Resume checkpoint is missing lifecycle fields: {missing_lifecycle}")
+    if curriculum_config is not None:
+        if updates_per_epoch is None:
+            raise RuntimeError("Strict curriculum resume requires updates_per_epoch")
+        saved_epoch = int(checkpoint["epoch"])
+        expected_state = curriculum_state_for_epoch(curriculum_config, saved_epoch).to_dict()
+        expected_state.pop("owner_active")
+        if checkpoint["curriculum_state"] != expected_state:
+            raise RuntimeError("Resume checkpoint curriculum state does not match its saved epoch")
+        expected_steps = {
+            owner: int(updates_per_epoch[owner])
+            * sum(
+                int(curriculum_state_for_epoch(curriculum_config, epoch).owner_active[owner])
+                for epoch in range(saved_epoch + 1)
+            )
+            for owner in expected_owner_active_epochs
+        }
+        saved_steps = {owner: int(value) for owner, value in checkpoint["optimizer_step_counts"].items()}
+        if saved_steps != expected_steps:
+            raise RuntimeError("Resume checkpoint owner-local step counters are inconsistent")
+        for owner in expected_owner_active_epochs:
+            optimizer_state = checkpoint["optimizers"][owner]["state"]
+            if bool(optimizer_state) != (expected_steps[owner] > 0):
+                raise RuntimeError(f"Resume checkpoint optimizer lifecycle mismatch for {owner}")
+            if int(checkpoint["schedulers"][owner]["last_epoch"]) != expected_steps[owner]:
+                raise RuntimeError(f"Resume checkpoint scheduler lifecycle mismatch for {owner}")
     current_fields = [field["name"] for field in model.evidence_schema]
     if checkpoint.get("active_field_schema") != current_fields:
         raise RuntimeError("Resume checkpoint active evidence schema does not match current preflight")
@@ -276,11 +384,18 @@ def build_train_grounding_targets(dataset, config: dict[str, Any], output_dir: P
 
 def train(args: argparse.Namespace) -> None:
     config = _config(args.config)
+    if args.mode == "full" and not args.allow_full_with_embedded_curriculum:
+        raise RuntimeError("Full PRECISE training requires the approved embedded-curriculum override")
+    if args.mode == "full" and args.epochs != int(config["curriculum"]["epochs"]):
+        raise RuntimeError("Full PRECISE epochs must match the fixed curriculum")
     torch.manual_seed(args.seed)
     random.seed(args.seed)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    fingerprint = _implementation_fingerprint(args.config)
+    if args.mode == "full":
+        verify_full_curriculum_authorization(config, fingerprint)
     augmentation = config["augmentation"]
     train_transform = PRECISEImageTransform(return_mirror=False, training=True, brightness=float(augmentation["brightness"]), contrast=float(augmentation["contrast"]))
     eval_transform = PRECISEImageTransform(return_mirror=False, training=False)
@@ -313,7 +428,9 @@ def train(args: argparse.Namespace) -> None:
     optimizers = build_optimizers(model, config)
     trunk_updates = math.ceil(len(train_loader) / args.gradient_accumulation_steps)
     updates_by_owner = {owner: (len(calib_loader) if owner == "threshold_head" else trunk_updates) for owner in optimizers}
-    schedulers = build_schedulers(optimizers, updates_by_owner, args.epochs, config["training"]["warmup_ratio"])
+    active_epochs_by_owner = owner_active_epoch_counts(config, args.epochs) if args.mode == "full" else {owner: args.epochs for owner in optimizers}
+    curriculum_digest = curriculum_sha256(config)
+    schedulers = build_schedulers(optimizers, updates_by_owner, active_epochs_by_owner, config["training"]["warmup_ratio"])
     best = -float("inf")
     best_scores = {"action_mf1": -float("inf"), "exp_mf1": -float("inf"), "exp_map": -float("inf"), "semantic_exp_map": -float("inf")}
     start_epoch = 0
@@ -325,10 +442,20 @@ def train(args: argparse.Namespace) -> None:
     pcvl_optimizer_step_count = 0
     pcvl_nonzero_update_count = 0
     last_pcvl_update = {"loss": 0.0, "grad_norm": 0.0, "parameter_delta_norm": 0.0}
-    fingerprint = _implementation_fingerprint(args.config)
     if args.resume_checkpoint:
         start_epoch, global_optimizer_step, global_micro_step, best, resumed_best_scores, resumed_step_counts, pcvl_optimizer_step_count, pcvl_nonzero_update_count = load_resume_checkpoint(
-            args.resume_checkpoint, model, optimizers, schedulers, device, fingerprint, pcvl_probes, pcvl_optimizer
+            args.resume_checkpoint,
+            model,
+            optimizers,
+            schedulers,
+            device,
+            fingerprint,
+            curriculum_digest,
+            active_epochs_by_owner,
+            config,
+            updates_by_owner,
+            pcvl_probes,
+            pcvl_optimizer,
         )
         best_scores.update(resumed_best_scores)
     write_resolved_config(output_dir / "config_resolved.yaml", config)
@@ -337,7 +464,7 @@ def train(args: argparse.Namespace) -> None:
     action_schema_path = Path(args.config).parent / "precise_action_semantics.yaml"
     audit_file_names = _dataset_file_names(Subset(train_eval_set, audit_indices)) if audit_indices else []
     test_file_names = _dataset_file_names(test_set)
-    run_manifest = {"git_head": fingerprint["git_head"], "source_tree_sha256": fingerprint["source_tree_sha256"], "config_sha256": fingerprint["config_sha256"], "skill_sha256": hashlib.sha256(skill_path.read_bytes()).hexdigest() if skill_path.exists() else "missing", "action_schema_sha256": hashlib.sha256(action_schema_path.read_bytes()).hexdigest(), "base_commit": "373aa49feac17372574fd7fb056c1d79c7c848fe", "test_only": True, "selection_protocol": "internal_test_selected", "best_selection_split": "test", "feature_cache_enabled": False, "token_compression": "none", "internal_test_selected": True, "publication_eligible_selection": False, "selected_layers": [3, 7, 11], "pretrained_weights": config["pretrained_weights"], "pretrained_weights_sha256": model.dino.pretrained_weights_sha256, "dino_loaded_state_key_count": len(model.dino.loaded_state_keys), "dino_missing_keys": list(model.dino.missing_keys), "dino_unexpected_keys": list(model.dino.unexpected_keys), "seed": args.seed, "epochs": args.epochs, "train_dataset_count": len(train_set), "test_count": len(test_set), "test_file_names_sha256": _file_names_sha256(test_file_names), "train_calib_count": len(calib_indices), "train_main_count": len(main_indices), "train_audit_count": len(audit_indices), "train_main_indices_sha256": _index_sha(main_indices), "train_audit_indices_sha256": _index_sha(audit_indices), "train_audit_file_names_sha256": _file_names_sha256(audit_file_names), "train_calib_indices_sha256": _index_sha(calib_indices), "train_trunk_on_all_train": bool(config["threshold"].get("train_trunk_on_all_train", False)), "pcvl_pilot_only": args.mode == "pilot", "active_evidence_fields": [field["name"] for field in active_fields], "command_line": vars(args)}
+    run_manifest = {"git_head": fingerprint["git_head"], "source_tree_sha256": fingerprint["source_tree_sha256"], "config_sha256": fingerprint["config_sha256"], "skill_sha256": hashlib.sha256(skill_path.read_bytes()).hexdigest() if skill_path.exists() else "missing", "action_schema_sha256": hashlib.sha256(action_schema_path.read_bytes()).hexdigest(), "base_commit": "373aa49feac17372574fd7fb056c1d79c7c848fe", "test_only": True, "selection_protocol": "internal_test_selected", "best_selection_split": "test", "feature_cache_enabled": False, "token_compression": "none", "internal_test_selected": True, "publication_eligible_selection": False, "selected_layers": [3, 7, 11], "pretrained_weights": config["pretrained_weights"], "pretrained_weights_sha256": model.dino.pretrained_weights_sha256, "dino_loaded_state_key_count": len(model.dino.loaded_state_keys), "dino_missing_keys": list(model.dino.missing_keys), "dino_unexpected_keys": list(model.dino.unexpected_keys), "seed": args.seed, "epochs": args.epochs, "train_dataset_count": len(train_set), "test_count": len(test_set), "test_file_names_sha256": _file_names_sha256(test_file_names), "train_calib_count": len(calib_indices), "train_main_count": len(main_indices), "train_audit_count": len(audit_indices), "train_main_indices_sha256": _index_sha(main_indices), "train_audit_indices_sha256": _index_sha(audit_indices), "train_audit_file_names_sha256": _file_names_sha256(audit_file_names), "train_calib_indices_sha256": _index_sha(calib_indices), "train_trunk_on_all_train": bool(config["threshold"].get("train_trunk_on_all_train", False)), "pcvl_pilot_only": args.mode == "pilot", "active_evidence_fields": [field["name"] for field in active_fields], "command_line": vars(args), "curriculum_name": config["curriculum"]["name"], "curriculum_version": config["curriculum"]["version"], "curriculum_schedule": config["curriculum"]["schedule"], "curriculum_sha256": curriculum_digest, "owner_active_epochs": active_epochs_by_owner, "embedded_curriculum_override": bool(args.allow_full_with_embedded_curriculum), "override_source": "user_approved_2026-07-23" if args.allow_full_with_embedded_curriculum else None}
     write_json(output_dir / "run_manifest.json", run_manifest)
     profile_path = Path(".review/precise_oia_v1/runtime/selected_runtime_profile.json")
     write_json(output_dir / "runtime_profile.json", json.loads(profile_path.read_text(encoding="utf-8")) if profile_path.exists() else {"available": False, "reason": "actual-path profile has not passed yet"})
@@ -351,6 +478,13 @@ def train(args: argparse.Namespace) -> None:
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     for epoch in range(start_epoch, args.epochs):
+        curriculum_state = curriculum_state_for_epoch(config, epoch) if args.mode == "full" else None
+        if curriculum_state is not None:
+            model.set_curriculum_state(curriculum_state)
+            owner_active = curriculum_state.owner_active
+        else:
+            owner_active = {owner: True for owner in optimizers}
+        epoch_start_step_counts = dict(optimizer_step_counts)
         model.train()
         last_output = None
         for micro_step, batch in enumerate(train_loader):
@@ -408,8 +542,25 @@ def train(args: argparse.Namespace) -> None:
                 )
                 loss_mirror = 0.02 * mirror_composite
                 model.evidence_fields.update_view_consistency(output["explicit_evidence_tokens"][:mirror_count].detach(), mirror_output["explicit_evidence_tokens"].detach())
-            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
-                intervention = packed_target_specific_interventions(model, output, action_target, reason_target, int(config["intervention"]["max_pairs_per_batch"]))
+            intervention_scale = float(model.curriculum_state()["intervention"])
+            if intervention_scale > 0.0:
+                with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
+                    intervention = packed_target_specific_interventions(
+                        model,
+                        output,
+                        action_target,
+                        reason_target,
+                        int(config["intervention"]["max_pairs_per_batch"]),
+                    )
+            else:
+                intervention = empty_packed_target_specific_interventions(
+                    output["action_logits_final_raw"],
+                    output["reason_logits_semantic"],
+                )
+            intervention_raw_loss = intervention["loss_intervention"]
+            intervention["loss_intervention_raw"] = intervention_raw_loss
+            intervention["loss_intervention"] = intervention_scale * intervention_raw_loss
+            intervention["intervention_activation"] = torch.tensor(intervention_scale, device=device)
             total_updates = max(1, math.ceil(len(train_loader) / args.gradient_accumulation_steps) * args.epochs)
             auxiliary_warmup = min(1.0, float(global_optimizer_step + 1) / max(1.0, 0.10 * total_updates))
             latent_regularizer = 0.15 * 0.02 * losses["loss_evidence_latent_diversity"]
@@ -441,7 +592,7 @@ def train(args: argparse.Namespace) -> None:
             optimizer_time = 0.0
             if did_step:
                 optimizer_started = time.perf_counter()
-                last_owner_stats = _step_owners(model, representation_owners, optimizers, schedulers, config, optimizer_step_counts)
+                last_owner_stats = _step_owners(model, representation_owners, optimizers, schedulers, config, optimizer_step_counts, owner_active)
                 optimizer_time = time.perf_counter() - optimizer_started
                 global_optimizer_step += 1
             if did_step and global_optimizer_step % int(config["diagnostics"]["batch_log_every_optimizer_steps"]) == 0:
@@ -463,7 +614,7 @@ def train(args: argparse.Namespace) -> None:
                 )
                 action_direct_rms = output["action_logits_direct"].pow(2).mean().sqrt().clamp_min(1e-6)
                 reason_direct_rms = output["reason_logits_direct"].pow(2).mean().sqrt().clamp_min(1e-6)
-                record.update({"event": "precise_batch", "epoch": epoch, "micro_step": micro_step, "optimizer_step": global_optimizer_step, "data_time": data_time, "dino_time": dino_time, "visual_field_time": visual_field_time, "evidence_time": float(output["diagnostics"]["evidence_seconds"]), "decode_time": decode_time, "backward_time": backward_time, "optimizer_time": optimizer_time, "samples_per_sec": float(batch_size / elapsed), "loss_threshold": last_threshold_loss, "action_direct_logit_rms": float(action_direct_rms), "action_reread_delta_rms": float(output["action_reread_delta"].pow(2).mean().sqrt()), "action_exchange_delta_rms": float(output["action_exchange_delta"].pow(2).mean().sqrt()), "action_reread_to_direct_ratio": float(output["action_reread_delta"].pow(2).mean().sqrt().div(action_direct_rms).item()), "action_exchange_to_direct_ratio": float(output["action_exchange_delta"].pow(2).mean().sqrt().div(action_direct_rms).item()), "reason_direct_logit_rms": float(reason_direct_rms), "reason_reread_delta_rms": float(output["reason_reread_delta"].pow(2).mean().sqrt()), "reason_exchange_delta_rms": float(output["reason_exchange_delta"].pow(2).mean().sqrt()), "reason_reread_to_direct_ratio": float(output["reason_reread_delta"].pow(2).mean().sqrt().div(reason_direct_rms).item()), "reason_exchange_to_direct_ratio": float(output["reason_exchange_delta"].pow(2).mean().sqrt().div(reason_direct_rms).item()), "annotation_delta_rms": float(output["annotation_delta"].pow(2).mean().sqrt()), "explicit_reliability_mean": float(output["evidence_reliability"].mean().item()), "explicit_reliability_std": float(output["evidence_reliability"].std().item()), "explicit_strong_rate": float((output["evidence_reliability"] >= 0.7).float().mean()), "explicit_unreliable_rate": float((output["evidence_reliability"] < 0.3).float().mean()), "latent_token_norm": float(output["latent_evidence_tokens"].norm(dim=-1).mean()), "view_consistency_mean": float(model.evidence_fields.view_consistency_ema.mean()), "overlap_mean": float(output["exchange_overlap"].mean()), "overlap_max": float(output["exchange_overlap"].max()), "gate_mean": float(output["exchange_gate"].mean()), "gate_max": float(output["exchange_gate"].max()), "gate_active_rate_gt_0p1": float((output["exchange_gate"] > 0.1).float().mean()), "wrong_target_message_ratio": float(output["wrong_target_message_ratio"]), "reference_center_collapse_rate": float(output["center_collapse_rate"].item()), "reference_out_of_bounds_rate": float(output["out_of_bounds_rate"].item()), "hard_sample_improvement_rate": float(hard_improvement), "easy_sample_regression_rate": float(easy_regression), "grad_action_foundation": last_owner_stats.get("action_foundation", {}).get("grad_norm_pre_clip", 0.0), "grad_action_decoder": last_owner_stats.get("action_decoder", {}).get("grad_norm_pre_clip", 0.0), "grad_reason": last_owner_stats.get("reason_semantic", {}).get("grad_norm_pre_clip", 0.0), "grad_evidence_grounding": float(tensor_list_norm(grounding_credit)), "grad_evidence_target_credit_raw": float(tensor_list_norm(raw_credit)), "grad_evidence_target_credit_projected": float(tensor_list_norm(projected_credit)), "grad_annotation": last_owner_stats.get("annotation_adapter", {}).get("grad_norm_pre_clip", 0.0), "owner_diagnostics": last_owner_stats, **firewall_report, **gpu_memory_gb(device), **ownership_snapshot(model)})
+                record.update({"event": "precise_batch", "epoch": epoch, "micro_step": micro_step, "optimizer_step": global_optimizer_step, "data_time": data_time, "dino_time": dino_time, "visual_field_time": visual_field_time, "evidence_time": float(output["diagnostics"]["evidence_seconds"]), "decode_time": decode_time, "backward_time": backward_time, "optimizer_time": optimizer_time, "samples_per_sec": float(batch_size / elapsed), "loss_threshold": last_threshold_loss, "action_direct_logit_rms": float(action_direct_rms), "action_reread_delta_rms": float(output["action_reread_delta_effective"].pow(2).mean().sqrt()), "action_reread_delta_raw_rms": float(output["action_reread_delta_raw"].pow(2).mean().sqrt()), "action_exchange_delta_rms": float(output["action_exchange_delta_effective"].pow(2).mean().sqrt()), "action_exchange_delta_raw_rms": float(output["action_exchange_delta_raw"].pow(2).mean().sqrt()), "action_reread_to_direct_ratio": float(output["action_reread_delta_effective"].pow(2).mean().sqrt().div(action_direct_rms).item()), "action_exchange_to_direct_ratio": float(output["action_exchange_delta_effective"].pow(2).mean().sqrt().div(action_direct_rms).item()), "reason_direct_logit_rms": float(reason_direct_rms), "reason_reread_delta_rms": float(output["reason_reread_delta_effective"].pow(2).mean().sqrt()), "reason_reread_delta_raw_rms": float(output["reason_reread_delta_raw"].pow(2).mean().sqrt()), "reason_exchange_delta_rms": float(output["reason_exchange_delta_effective"].pow(2).mean().sqrt()), "reason_exchange_delta_raw_rms": float(output["reason_exchange_delta_raw"].pow(2).mean().sqrt()), "reason_latent_delta_raw_rms": float(output["reason_latent_delta_raw"].pow(2).mean().sqrt()), "reason_latent_delta_effective_rms": float(output["reason_latent_delta_effective"].pow(2).mean().sqrt()), "reason_reread_to_direct_ratio": float(output["reason_reread_delta_effective"].pow(2).mean().sqrt().div(reason_direct_rms).item()), "reason_exchange_to_direct_ratio": float(output["reason_exchange_delta_effective"].pow(2).mean().sqrt().div(reason_direct_rms).item()), "annotation_delta_rms": float(output["annotation_delta_effective"].pow(2).mean().sqrt()), "annotation_delta_raw_rms": float(output["annotation_delta_raw"].pow(2).mean().sqrt()), "threshold_logit_raw_rms": float(output["threshold_logit_raw"].pow(2).mean().sqrt()), "threshold_logit_effective_rms": float(output["threshold_logit_effective"].pow(2).mean().sqrt()), "curriculum_state": model.curriculum_state(), "owner_active": owner_active, "owner_step_counts": dict(optimizer_step_counts), "owner_lrs": {owner: float(item.param_groups[0]["lr"]) for owner, item in optimizers.items()}, "curriculum_sha256": curriculum_digest, "explicit_reliability_mean": float(output["evidence_reliability"].mean().item()), "explicit_reliability_std": float(output["evidence_reliability"].std().item()), "explicit_strong_rate": float((output["evidence_reliability"] >= 0.7).float().mean()), "explicit_unreliable_rate": float((output["evidence_reliability"] < 0.3).float().mean()), "latent_token_norm": float(output["latent_evidence_tokens"].norm(dim=-1).mean()), "view_consistency_mean": float(model.evidence_fields.view_consistency_ema.mean()), "overlap_mean": float(output["exchange_overlap"].mean()), "overlap_max": float(output["exchange_overlap"].max()), "gate_mean": float(output["exchange_gate"].mean()), "gate_max": float(output["exchange_gate"].max()), "gate_active_rate_gt_0p1": float((output["exchange_gate"] > 0.1).float().mean()), "wrong_target_message_ratio": float(output["wrong_target_message_ratio"]), "reference_center_collapse_rate": float(output["center_collapse_rate"].item()), "reference_out_of_bounds_rate": float(output["out_of_bounds_rate"].item()), "hard_sample_improvement_rate": float(hard_improvement), "easy_sample_regression_rate": float(easy_regression), "grad_action_foundation": last_owner_stats.get("action_foundation", {}).get("grad_norm_pre_clip", 0.0), "grad_action_decoder": last_owner_stats.get("action_decoder", {}).get("grad_norm_pre_clip", 0.0), "grad_reason": last_owner_stats.get("reason_semantic", {}).get("grad_norm_pre_clip", 0.0), "grad_evidence_grounding": float(tensor_list_norm(grounding_credit)), "grad_evidence_target_credit_raw": float(tensor_list_norm(raw_credit)), "grad_evidence_target_credit_projected": float(tensor_list_norm(projected_credit)), "grad_annotation": last_owner_stats.get("annotation_adapter", {}).get("grad_norm_pre_clip", 0.0), "owner_diagnostics": last_owner_stats, **firewall_report, **gpu_memory_gb(device), **ownership_snapshot(model)})
                 record.update({
                     "dino_call_count_batch": dino_call_count_batch,
                     "pcvl_optimizer_step_count": pcvl_optimizer_step_count,
@@ -499,16 +650,17 @@ def train(args: argparse.Namespace) -> None:
             last_batch_finished = time.perf_counter()
         # Never drop an incomplete accumulated tail batch.
         if len(train_loader) % args.gradient_accumulation_steps:
-            last_owner_stats = _step_owners(model, representation_owners, optimizers, schedulers, config, optimizer_step_counts)
+            last_owner_stats = _step_owners(model, representation_owners, optimizers, schedulers, config, optimizer_step_counts, owner_active)
             global_optimizer_step += 1
         # CalAlign is trained only on the deterministic train-calib split.
         threshold_values = []
+        threshold_teacher_before = model.threshold_head.theta_teacher.detach().clone()
         model.threshold_head.train()
-        for calib_batch in calib_loader if epoch >= int(config["threshold"]["start_epoch"]) else ():
+        for calib_batch in calib_loader if owner_active["threshold_head"] else ():
             with torch.no_grad():
                 raw = model(calib_batch["image"].to(device, non_blocking=True))
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
-                threshold = model.threshold_head(raw["action_logits_final_raw"].detach(), raw["reason_logits_observed"].detach())
+                threshold = model._threshold_with_activation(raw["action_logits_final_raw"].detach(), raw["reason_logits_observed"].detach())
                 threshold_loss = F.binary_cross_entropy_with_logits(threshold["action_logits_deploy"], calib_batch["action"].to(device)) + F.binary_cross_entropy_with_logits(threshold["reason_logits_deploy"], calib_batch["reason"].to(device))
             optimizers["threshold_head"].zero_grad(set_to_none=True)
             threshold_loss.backward()
@@ -519,7 +671,31 @@ def train(args: argparse.Namespace) -> None:
             threshold_values.append(float(threshold_loss.detach()))
         if threshold_values:
             last_threshold_loss = sum(threshold_values) / len(threshold_values)
-            model.threshold_head.update_teacher(model.threshold_head.compose_theta().detach(), ema=1.0)
+            if float(model.curriculum_state()["threshold"]) >= 1.0:
+                model.threshold_head.update_teacher(model.threshold_head.compose_theta().detach(), ema=1.0)
+        epoch_step_deltas = {owner: optimizer_step_counts[owner] - epoch_start_step_counts[owner] for owner in optimizers}
+        protocol_errors = []
+        for owner, active in owner_active.items():
+            if active and epoch_step_deltas[owner] <= 0:
+                protocol_errors.append(f"active owner {owner} did not step")
+            if not active and epoch_step_deltas[owner] != 0:
+                protocol_errors.append(f"inactive owner {owner} advanced by {epoch_step_deltas[owner]}")
+            if not active and optimizers[owner].state:
+                protocol_errors.append(f"inactive owner {owner} has optimizer state")
+            if int(schedulers[owner].last_epoch) != optimizer_step_counts[owner]:
+                protocol_errors.append(
+                    f"owner {owner} scheduler clock {schedulers[owner].last_epoch} "
+                    f"does not match steps {optimizer_step_counts[owner]}"
+                )
+        if float(model.curriculum_state()["threshold"]) < 1.0 and not torch.equal(
+            threshold_teacher_before, model.threshold_head.theta_teacher
+        ):
+            protocol_errors.append("threshold teacher mutated before full threshold activation")
+        if epoch >= 6 and not all(owner_active.values()):
+            protocol_errors.append("safe_joint epoch does not activate every owner")
+        if protocol_errors:
+            write_json(output_dir / f"curriculum_protocol_error_epoch_{epoch:03d}.json", {"epoch": epoch, "curriculum_state": model.curriculum_state(), "owner_step_deltas": epoch_step_deltas, "errors": protocol_errors})
+            raise RuntimeError("; ".join(protocol_errors))
         metrics, tensors = evaluate_precise(model, test_loader, device)
         if pcvl_probes is not None and audit_loader is not None:
             def audit_target_provider(audit_batch, audit_device):
@@ -560,7 +736,26 @@ def train(args: argparse.Namespace) -> None:
         for index, name in enumerate(tensors["file_names"][:32]):
             append_jsonl(epoch_dir / "evidence_cases.jsonl", {"file_name": name, "reliability": tensors["evidence_reliability"][index].tolist(), "presence": tensors["evidence_presence"][index].tolist(), "part_coordinates": tensors["evidence_coordinates"][index].tolist()})
         export_precise_cases(epoch_dir / "case_exports", tensors["case_rows"])
-        append_jsonl(output_dir / "metrics_summary.jsonl", {"epoch": epoch, **metrics, "optimizer_step_counts": optimizer_step_counts, "pcvl_optimizer_step_count": pcvl_optimizer_step_count, "pcvl_nonzero_update_count": pcvl_nonzero_update_count})
+        curriculum_epoch_record = {
+            "epoch": epoch,
+            "curriculum_state": model.curriculum_state(),
+            "curriculum_sha256": curriculum_digest,
+            "owner_active": owner_active,
+            "owner_step_deltas": epoch_step_deltas,
+            "owner_step_counts": dict(optimizer_step_counts),
+            "owner_scheduler_last_epoch": {
+                owner: int(item.last_epoch) for owner, item in schedulers.items()
+            },
+            "owner_optimizer_state_nonempty": {
+                owner: bool(item.state) for owner, item in optimizers.items()
+            },
+            "owner_lrs": {owner: float(item.param_groups[0]["lr"]) for owner, item in optimizers.items()},
+            "threshold_teacher_updated": bool(
+                not torch.equal(threshold_teacher_before, model.threshold_head.theta_teacher)
+            ),
+        }
+        write_json(epoch_dir / "curriculum_state.json", curriculum_epoch_record)
+        append_jsonl(output_dir / "metrics_summary.jsonl", {"epoch": epoch, **metrics, **curriculum_epoch_record, "pcvl_optimizer_step_count": pcvl_optimizer_step_count, "pcvl_nonzero_update_count": pcvl_nonzero_update_count})
         score_values = {"action_mf1": metrics["action_deploy"]["Act_mF1"], "exp_mf1": metrics["reason_deploy"]["Exp_mF1"], "exp_map": metrics["reason_deploy"]["Exp_mAP"], "semantic_exp_map": metrics["reason_semantic"]["Exp_mAP"]}
         improved = {name: value > best_scores[name] for name, value in score_values.items()}
         for name, value in score_values.items():
@@ -569,7 +764,7 @@ def train(args: argparse.Namespace) -> None:
         joint_improved = metrics["deploy_fixed_joint"] > best
         if joint_improved:
             best = metrics["deploy_fixed_joint"]
-        checkpoint = {"model": model.state_dict(), "epoch": epoch, "optimizers": {owner: item.state_dict() for owner, item in optimizers.items()}, "schedulers": {owner: item.state_dict() for owner, item in schedulers.items()}, "rng_state": torch.get_rng_state(), "python_rng_state": random.getstate(), "cuda_rng_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None, "global_optimizer_step": global_optimizer_step, "global_micro_step": global_micro_step, "optimizer_step_counts": optimizer_step_counts, "best_deploy_joint": best, "best_scores": best_scores, "threshold_teacher": model.threshold_head.theta_teacher.detach().cpu(), "view_consistency_ema": model.evidence_fields.view_consistency_ema.detach().cpu(), "active_field_schema": [field["name"] for field in active_fields], "implementation_fingerprint": fingerprint}
+        checkpoint = {"model": model.state_dict(), "epoch": epoch, "optimizers": {owner: item.state_dict() for owner, item in optimizers.items()}, "schedulers": {owner: item.state_dict() for owner, item in schedulers.items()}, "rng_state": torch.get_rng_state(), "python_rng_state": random.getstate(), "cuda_rng_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None, "global_optimizer_step": global_optimizer_step, "global_micro_step": global_micro_step, "optimizer_step_counts": optimizer_step_counts, "best_deploy_joint": best, "best_scores": best_scores, "threshold_teacher": model.threshold_head.theta_teacher.detach().cpu(), "view_consistency_ema": model.evidence_fields.view_consistency_ema.detach().cpu(), "active_field_schema": [field["name"] for field in active_fields], "implementation_fingerprint": fingerprint, "curriculum_state": model.curriculum_state(), "curriculum_sha256": curriculum_digest, "owner_active_epochs": active_epochs_by_owner, "owner_step_deltas": epoch_step_deltas}
         checkpoint["pcvl_optimizer_step_count"] = pcvl_optimizer_step_count
         checkpoint["pcvl_nonzero_update_count"] = pcvl_nonzero_update_count
         if pcvl_probes is not None and pcvl_optimizer is not None:
@@ -599,6 +794,7 @@ def main() -> None:
     parser.add_argument("--test_only", action="store_true")
     parser.add_argument("--resume_checkpoint", default=None)
     parser.add_argument("--mode", choices=("pilot", "full"), default="full")
+    parser.add_argument("--allow_full_with_embedded_curriculum", action="store_true")
     args = parser.parse_args()
     train(args)
 

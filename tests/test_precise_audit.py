@@ -1,11 +1,38 @@
 from pathlib import Path
 
-from fate_oia.engine.audit_precise_oia_implementation import REQUIRED, _scan_forbidden, REQUIRED_PILOT_CHECKS
+from fate_oia.engine.audit_precise_oia_implementation import (
+    REQUIRED,
+    REQUIRED_CURRICULUM_CHECKS,
+    REQUIRED_PILOT_CHECKS,
+    _scan_forbidden,
+)
 
 
 def test_audit_requires_full_precise_source_surface():
     assert len(REQUIRED) >= 30
     assert "fate_oia/models/precise_oia_model.py" in REQUIRED
+    assert "fate_oia/engine/precise_curriculum.py" in REQUIRED
+
+
+def test_curriculum_gate_covers_static_schedule_owner_and_override_contracts():
+    assert {
+        "preflight_gate_current",
+        "fixed_schedule_exact",
+        "owner_mapping_exact",
+        "owner_active_epoch_totals_exact",
+        "inactive_optimizer_state_empty_at_launch",
+        "threshold_deploy_scaled",
+        "runtime_assertions_wired",
+        "runtime_profile_bound",
+        "embedded_curriculum_override_bound",
+        "old_full_gate_not_authoritative",
+        "skill_authorizes_embedded_curriculum",
+        "trainer_enforces_curriculum_gate",
+        "inactive_intervention_skipped",
+        "owner_local_lifecycle_asserted",
+        "strict_resume_lifecycle",
+        "threshold_teacher_full_activation_only",
+    } == REQUIRED_CURRICULUM_CHECKS
 
 
 def test_forbidden_scan_covers_config_and_script_without_self_matching_audit_rules():
@@ -67,6 +94,13 @@ def test_full_gate_binds_pilot_checkpoint_and_raw_artifacts():
 def test_audit_accepts_skill_post_pilot_mode_as_full_gate_mode():
     source = (Path(__file__).resolve().parents[1] / "fate_oia" / "engine" / "audit_precise_oia_implementation.py").read_text(encoding="utf-8")
     assert 'mode in {"pilot", "post_pilot"}' in source
+
+
+def test_audit_has_a_distinct_full_curriculum_gate_mode():
+    source = (Path(__file__).resolve().parents[1] / "fate_oia" / "engine" / "audit_precise_oia_implementation.py").read_text(encoding="utf-8")
+    assert "FULL_CURRICULUM_READY" in source
+    assert "PRECISE_OIA_V1_FULL_CURRICULUM_READY.json" in source
+    assert "--write_full_curriculum_ready" in source
 
 
 def test_epoch_artifact_gate_loads_and_validates_tensor_contents():

@@ -41,6 +41,48 @@ def _empty_task_result(base_logits: torch.Tensor) -> dict[str, torch.Tensor]:
     return {"loss_intervention": zero, "selected_effect_mean": zero.detach(), "control_effect_mean": zero.detach(), "wrong_effect_mean": zero.detach(), "pair_count": zero.detach(), "hard_rate": zero.detach(), "easy_rate": zero.detach(), "sign_agreement": zero.detach(), "per_target_count": per_target, "per_target_selected_sum": per_target.clone(), "per_target_control_sum": per_target.clone(), "per_target_wrong_sum": per_target.clone(), "per_target_sign_sum": per_target.clone()}
 
 
+def empty_packed_target_specific_interventions(
+    action_logits: torch.Tensor,
+    reason_logits: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Return the complete intervention schema without running deletion forwards."""
+    action = _empty_task_result(action_logits)
+    reason = _empty_task_result(reason_logits)
+    zero = action["loss_intervention"]
+    return {
+        "loss_intervention": zero,
+        "loss_intervention_action": zero,
+        "loss_intervention_reason": zero,
+        "selected_effect_mean": zero.detach(),
+        "control_effect_mean": zero.detach(),
+        "wrong_effect_mean": zero.detach(),
+        "intervention_pair_count": zero.detach(),
+        "intervention_hard_rate": zero.detach(),
+        "intervention_easy_rate": zero.detach(),
+        "sign_agreement": zero.detach(),
+        **{
+            f"action_{key}": action[key]
+            for key in (
+                "per_target_count",
+                "per_target_selected_sum",
+                "per_target_control_sum",
+                "per_target_wrong_sum",
+                "per_target_sign_sum",
+            )
+        },
+        **{
+            f"reason_{key}": reason[key]
+            for key in (
+                "per_target_count",
+                "per_target_selected_sum",
+                "per_target_control_sum",
+                "per_target_wrong_sum",
+                "per_target_sign_sum",
+            )
+        },
+    }
+
+
 def balanced_positive_pairs(targets: torch.Tensor, max_pairs: int, deterministic: bool = False) -> torch.Tensor:
     """Sample positives round-robin by target instead of truncating row-major indices."""
     pools = []

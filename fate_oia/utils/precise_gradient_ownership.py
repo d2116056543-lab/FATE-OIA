@@ -6,7 +6,17 @@ import torch
 from torch import nn
 
 
-OWNER_NAMES = ("action_foundation", "action_decoder", "reason_semantic", "evidence_core", "exchange_reread", "annotation_adapter", "threshold_head")
+OWNER_NAMES = (
+    "action_foundation",
+    "action_decoder",
+    "reason_semantic",
+    "evidence_core",
+    "reread_adapter",
+    "exchange_adapter",
+    "reason_latent",
+    "annotation_adapter",
+    "threshold_head",
+)
 
 
 def parameter_ownership(model: nn.Module) -> dict[str, list[nn.Parameter]]:

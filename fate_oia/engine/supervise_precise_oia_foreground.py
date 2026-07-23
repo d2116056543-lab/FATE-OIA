@@ -10,6 +10,7 @@ from pathlib import Path
 import yaml
 
 from fate_oia.engine.audit_precise_oia_implementation import REQUIRED, _tree_sha
+from fate_oia.engine.precise_curriculum import curriculum_sha256, owner_active_epoch_counts
 
 
 def _run(command: list[str]) -> None:
@@ -60,6 +61,16 @@ def verify_review_hash(path: Path, config_path: Path, expected_status: str) -> N
         stale = [name for name, digest in artifact_hashes.items() if not (pilot_dir / name).is_file() or _sha(pilot_dir / name) != digest]
         if stale:
             raise SystemExit(f"PRECISE full gate pilot artifacts are stale or missing: {stale[:5]}")
+    if expected_status == "FULL_CURRICULUM_READY":
+        curriculum_checks = record.get("curriculum_checks", {})
+        if not curriculum_checks or not all(bool(value) for value in curriculum_checks.values()):
+            raise SystemExit("PRECISE full curriculum gate is missing successful curriculum checks")
+        if record.get("curriculum_sha256") != curriculum_sha256(config):
+            raise SystemExit("PRECISE full curriculum gate has a stale curriculum hash")
+        if record.get("owner_active_epochs") != owner_active_epoch_counts(config, int(config["curriculum"]["epochs"])):
+            raise SystemExit("PRECISE full curriculum gate has stale owner active-epoch totals")
+        if record.get("override_source") != "user_approved_2026-07-23":
+            raise SystemExit("PRECISE full curriculum gate is missing user override provenance")
     if subprocess.check_output(["git", "status", "--porcelain"], text=True).strip():
         raise SystemExit("PRECISE review gate cannot authorize a dirty worktree")
 
@@ -114,6 +125,7 @@ def main() -> None:
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--allow_full_with_embedded_curriculum", action="store_true")
     args = parser.parse_args()
     if args.mode == "pilot" and args.epochs != 3:
         raise SystemExit("PRECISE pilot epochs != 3; the scientific gate requires exactly three epochs")
@@ -132,14 +144,18 @@ def main() -> None:
         _run(audit)
     verify_review_hash(review, Path(args.config), expected_status="PRE_PILOT_ELIGIBLE")
     verify_remote_head()
-    if args.mode == "full" and not (root / ".review" / "PRECISE_OIA_V1_FULL_TRAIN_READY.json").exists():
-        raise SystemExit("Full PRECISE training is blocked until current-hash FULL_TRAIN_READY exists")
     if args.mode == "full":
-        verify_review_hash(root / ".review" / "PRECISE_OIA_V1_FULL_TRAIN_READY.json", Path(args.config), expected_status="FULL_TRAIN_READY")
+        if not args.allow_full_with_embedded_curriculum:
+            raise SystemExit("Full PRECISE curriculum training requires the explicit user-approved override")
+        curriculum_gate = root / ".review" / "PRECISE_OIA_V1_FULL_CURRICULUM_READY.json"
+        _run([sys.executable, "-m", "fate_oia.engine.audit_precise_oia_implementation", "--config", args.config, "--output_dir", ".review/precise_oia_v1/full_curriculum", "--device", args.device, "--mode", "curriculum", "--write_full_curriculum_ready"])
+        verify_review_hash(curriculum_gate, Path(args.config), expected_status="FULL_CURRICULUM_READY")
     run_dir = Path(args.output_dir) / args.mode
     assert_fresh_run_dir(run_dir)
     selected_batch, selected_accum = selected_runtime_args(root / ".review/precise_oia_v1/runtime/selected_runtime_profile.json", args.batch_size, args.gradient_accumulation_steps)
     command = [sys.executable, "-u", "-m", "fate_oia.engine.train_precise_oia", "--config", args.config, "--output_dir", str(run_dir), "--epochs", str(args.epochs), "--batch_size", str(selected_batch), "--gradient_accumulation_steps", str(selected_accum), "--num_workers", str(args.num_workers), "--device", args.device, "--mode", args.mode]
+    if args.mode == "full":
+        command.append("--allow_full_with_embedded_curriculum")
     if args.mode == "pilot":
         command.extend(["--max_test_samples", "512"])
     _run(command)

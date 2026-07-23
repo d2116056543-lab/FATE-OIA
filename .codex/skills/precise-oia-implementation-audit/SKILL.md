@@ -1073,6 +1073,10 @@ E:\Anaconda\envs\sbw39\python.exe -m fate_oia.engine.profile_precise_oia `
 
 ## Pilot
 
+The historical pilot path below remains available for ordinary PRECISE runs.
+It is not the authorization path for the user-approved embedded-curriculum
+full run dated 2026-07-23.
+
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\FATE_OIA_precise_oia_v1_foreground.ps1 `
   -Mode pilot `
@@ -1163,6 +1167,45 @@ Use:
 }
 ```
 
+## FULL_CURRICULUM_READY
+
+`.review/PRECISE_OIA_V1_FULL_CURRICULUM_READY.json`
+
+This is the only artifact allowed to authorize the embedded-curriculum run.
+`FULL_TRAIN_READY cannot authorize the embedded-curriculum run`.
+
+Required fields:
+
+```json
+{
+  "status": "FULL_CURRICULUM_READY",
+  "git_head": "...",
+  "config_sha256": "...",
+  "skill_sha256": "...",
+  "source_tree_sha256": "...",
+  "curriculum_sha256": "...",
+  "curriculum_epochs": 12,
+  "provenance": "user_approved_2026-07-23",
+  "prelaunch_assertions_passed": true,
+  "runtime_assertions_required": true,
+  "runtime_selected": {},
+  "unresolved": []
+}
+```
+
+The gate must bind the canonical curriculum JSON, per-owner active epoch
+counts, clean git HEAD, exact skill/config hashes, real-DINO forward,
+gradient-firewall checks, and the selected runtime profile. Source, config,
+skill, or curriculum changes invalidate it. Runtime assertions must then
+verify epoch-boundary scales, inactive-owner zero updates and empty optimizer
+state, local scheduler clocks, and all mechanisms active at epoch 6.
+
+The full command must include:
+
+```text
+--allow_full_with_embedded_curriculum
+```
+
 ---
 
 # 27. Review states
@@ -1174,6 +1217,7 @@ CHANGES_REQUIRED
 PRE_PILOT_ELIGIBLE
 SCIENTIFIC_GATE_FAILED
 FULL_TRAIN_READY
+FULL_CURRICULUM_READY
 FULL_RUN_COMPLETE
 ```
 

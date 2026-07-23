@@ -65,6 +65,66 @@ class PRECISEOIAModel(nn.Module):
         self.reason_latent_query = nn.Linear(384, 384, bias=False)
         self.reason_latent_value = nn.Linear(384, 384, bias=False)
         self.reason_latent_gamma_raw = nn.Parameter(torch.tensor(-1.3862944))
+        self._curriculum_state: dict[str, Any] = {
+            "epoch": -1,
+            "stage": "legacy_all_on",
+            "foundation": 1.0,
+            "evidence": 1.0,
+            "reread": 1.0,
+            "annotation": 1.0,
+            "exchange": 1.0,
+            "reason_latent": 1.0,
+            "intervention": 1.0,
+            "threshold": 1.0,
+        }
+
+    def set_curriculum_state(self, state: Any) -> None:
+        value = state.to_dict() if hasattr(state, "to_dict") else dict(state)
+        required = ("epoch", "stage", "foundation", "evidence", "reread", "annotation", "exchange", "reason_latent", "intervention", "threshold")
+        missing = [name for name in required if name not in value]
+        if missing:
+            raise ValueError(f"curriculum state is missing {missing}")
+        for name in required[2:]:
+            scale = float(value[name])
+            if scale < 0.0 or scale > 1.0:
+                raise ValueError(f"curriculum scale {name} is outside [0, 1]")
+        self._curriculum_state = {name: value[name] for name in required}
+
+    def curriculum_state(self) -> dict[str, Any]:
+        return dict(self._curriculum_state)
+
+    def _scale(self, name: str) -> float:
+        return float(self._curriculum_state[name])
+
+    def _effective_exchange(self, exchange: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        scale = self._scale("exchange")
+        value = dict(exchange)
+        value["action_exchange_delta_raw"] = exchange["action_exchange_delta"]
+        value["reason_exchange_delta_raw"] = exchange["reason_exchange_delta"]
+        value["action_exchange_delta_effective"] = scale * exchange["action_exchange_delta"]
+        value["reason_exchange_delta_effective"] = scale * exchange["reason_exchange_delta"]
+        value["action_exchange_delta"] = value["action_exchange_delta_effective"]
+        value["reason_exchange_delta"] = value["reason_exchange_delta_effective"]
+        return value
+
+    def _threshold_with_activation(self, action_logits: torch.Tensor, reason_logits: torch.Tensor) -> dict[str, torch.Tensor]:
+        raw = self.threshold_head(action_logits, reason_logits)
+        theta_raw = raw["threshold_logit"]
+        theta_effective = self._scale("threshold") * theta_raw
+        base = torch.cat([action_logits, reason_logits], dim=-1)
+        deploy = base - theta_effective.view(1, -1)
+        calibrated = deploy / raw["temperature"].view(1, -1)
+        return {
+            **raw,
+            "logits_deploy": deploy,
+            "logits_calibrated": calibrated,
+            "action_logits_deploy": deploy[:, :4],
+            "reason_logits_deploy": deploy[:, 4:],
+            "action_logits_calibrated": calibrated[:, :4],
+            "reason_logits_calibrated": calibrated[:, 4:],
+            "threshold_logit_raw": theta_raw,
+            "threshold_logit_effective": theta_effective,
+        }
 
     def encode_images(self, images: torch.Tensor) -> VisualFieldBundle:
         return self.visual_field(self.dino(images))
@@ -75,30 +135,52 @@ class PRECISEOIAModel(nn.Module):
         evidence_started = time.perf_counter()
         evidence = self.evidence_fields(field.evidence_layers, latent_layers=field.reason_layers)
         evidence_seconds = time.perf_counter() - evidence_started
-        reread = self.rereader(first["action_tokens_direct"], first["reason_tokens_direct"], evidence, field.action_layers, field.reason_layers, first["action_logits_direct"], first["reason_logits_direct"])
-        action_reread_tokens = first["action_tokens_direct"] + reread["action_reread_delta"]
-        reason_reread_tokens = first["reason_tokens_direct"] + reread["reason_reread_delta"]
-        exchange_certified = self.exchange(action_reread_tokens, reason_reread_tokens, evidence["explicit_tokens"], evidence["reliability"], "certified")
-        exchange_ungated = self.exchange(action_reread_tokens, reason_reread_tokens, evidence["explicit_tokens"], evidence["reliability"], "ungated")
+        reread_raw = self.rereader(first["action_tokens_direct"], first["reason_tokens_direct"], evidence, field.action_layers, field.reason_layers, first["action_logits_direct"], first["reason_logits_direct"])
+        reread_scale = self._scale("reread")
+        reread = {
+            **reread_raw,
+            "action_reread_delta_raw": reread_raw["action_reread_delta"],
+            "reason_reread_delta_raw": reread_raw["reason_reread_delta"],
+            "action_reread_delta_effective": reread_scale * reread_raw["action_reread_delta"],
+            "reason_reread_delta_effective": reread_scale * reread_raw["reason_reread_delta"],
+        }
+        reread["action_reread_delta"] = reread["action_reread_delta_effective"]
+        reread["reason_reread_delta"] = reread["reason_reread_delta_effective"]
+        action_refined_direct_anchor = self.action_refined_head(first["action_tokens_direct"]).squeeze(-1)
+        reason_refined_direct_anchor = self.reason_refined_head(first["reason_tokens_direct"]).squeeze(-1)
+        action_reread_tokens = first["action_tokens_direct"] + reread["action_reread_delta_effective"]
+        reason_reread_tokens = first["reason_tokens_direct"] + reread["reason_reread_delta_effective"]
+        exchange_certified = self._effective_exchange(self.exchange(action_reread_tokens, reason_reread_tokens, evidence["explicit_tokens"], evidence["reliability"], "certified"))
+        exchange_ungated = self._effective_exchange(self.exchange(action_reread_tokens, reason_reread_tokens, evidence["explicit_tokens"], evidence["reliability"], "ungated"))
         action_final_tokens = action_reread_tokens + exchange_certified["action_exchange_delta"]
-        latent_scores = torch.einsum("brd,bld->brl", self.reason_latent_query(reason_reread_tokens), evidence["latent_tokens"]) / (reason_reread_tokens.shape[-1] ** 0.5)
+        latent_evidence_for_reason = evidence["latent_tokens"].detach()
+        latent_scores = torch.einsum("brd,bld->brl", self.reason_latent_query(reason_reread_tokens), latent_evidence_for_reason) / (reason_reread_tokens.shape[-1] ** 0.5)
         latent_attention = torch.softmax(latent_scores, dim=-1)
-        latent_message = torch.einsum("brl,bld->brd", latent_attention, self.reason_latent_value(evidence["latent_tokens"]))
-        reason_latent_delta = 0.20 * torch.sigmoid(self.reason_latent_gamma_raw) * latent_message
-        reason_semantic_tokens = reason_reread_tokens + exchange_certified["reason_exchange_delta"] + reason_latent_delta
+        latent_message = torch.einsum("brl,bld->brd", latent_attention, self.reason_latent_value(latent_evidence_for_reason))
+        reason_latent_delta_raw = 0.20 * torch.sigmoid(self.reason_latent_gamma_raw) * latent_message
+        reason_latent_delta = self._scale("reason_latent") * reason_latent_delta_raw
+        reason_semantic_tokens = reason_reread_tokens + exchange_certified["reason_exchange_delta_effective"] + reason_latent_delta
         action_reread_logits = self.action_refined_head(action_reread_tokens).squeeze(-1)
         action_final_raw = self.action_refined_head(action_final_tokens).squeeze(-1)
         reason_semantic = self.reason_refined_head(reason_semantic_tokens).squeeze(-1)
         context = field.reason_context.mean(dim=1)
-        annotation = self.annotation_head(reason_semantic_tokens, context, reason_semantic)
-        threshold = self.threshold_head(action_final_raw, annotation["reason_logits_observed"])
-        off = self.exchange(action_reread_tokens, reason_reread_tokens, evidence["explicit_tokens"], evidence["reliability"], "off")
+        annotation_raw = self.annotation_head(reason_semantic_tokens, context, reason_semantic)
+        annotation_delta = self._scale("annotation") * annotation_raw["annotation_delta"]
+        annotation = {
+            **annotation_raw,
+            "annotation_delta_raw": annotation_raw["annotation_delta"],
+            "annotation_delta_effective": annotation_delta,
+            "annotation_delta": annotation_delta,
+            "reason_logits_observed": reason_semantic.detach() + annotation_delta,
+        }
+        threshold = self._threshold_with_activation(action_final_raw, annotation["reason_logits_observed"])
+        off = self._effective_exchange(self.exchange(action_reread_tokens, reason_reread_tokens, evidence["explicit_tokens"], evidence["reliability"], "off"))
         off_action = self.action_refined_head(action_reread_tokens + off["action_exchange_delta"]).squeeze(-1)
         off_reason = self.reason_refined_head(reason_reread_tokens + reason_latent_delta).squeeze(-1)
-        explicit_reason = self.reason_refined_head(reason_reread_tokens + exchange_certified["reason_exchange_delta"]).squeeze(-1)
+        explicit_reason = self.reason_refined_head(reason_reread_tokens + exchange_certified["reason_exchange_delta_effective"]).squeeze(-1)
         latent_reason = self.reason_refined_head(reason_reread_tokens + reason_latent_delta).squeeze(-1)
-        evidence_shuffled = self.exchange(action_reread_tokens, reason_reread_tokens, evidence["explicit_tokens"], evidence["reliability"], "evidence_shuffled")
-        reason_shuffled = self.exchange(action_reread_tokens, reason_reread_tokens, evidence["explicit_tokens"], evidence["reliability"], "reason_tokens_shuffled")
+        evidence_shuffled = self._effective_exchange(self.exchange(action_reread_tokens, reason_reread_tokens, evidence["explicit_tokens"], evidence["reliability"], "evidence_shuffled"))
+        reason_shuffled = self._effective_exchange(self.exchange(action_reread_tokens, reason_reread_tokens, evidence["explicit_tokens"], evidence["reliability"], "reason_tokens_shuffled"))
         evidence_shuffled_reason = self.reason_refined_head(reason_reread_tokens + evidence_shuffled["reason_exchange_delta"] + reason_latent_delta).squeeze(-1)
         reason_shuffled_reason = self.reason_refined_head(reason_reread_tokens + reason_shuffled["reason_exchange_delta"] + reason_latent_delta).squeeze(-1)
         field_attention = evidence["field_attention"].clamp_min(1e-8)
@@ -106,6 +188,8 @@ class PRECISEOIAModel(nn.Module):
         evidence_effective_support = (field_attention > (1.0 / field_attention.shape[-1])).float().sum(-1).mean()
         output: dict[str, Any] = {
             **first,
+            "action_logits_refined_direct_anchor": action_refined_direct_anchor,
+            "reason_logits_refined_direct_anchor": reason_refined_direct_anchor,
             "action_logits_reread": action_reread_logits,
             "action_logits_exchange_ungated": self.action_refined_head(action_reread_tokens + exchange_ungated["action_exchange_delta"]).squeeze(-1),
             "action_logits_exchange_certified": action_final_raw,
@@ -120,6 +204,8 @@ class PRECISEOIAModel(nn.Module):
             "action_tokens_reread": action_reread_tokens,
             "reason_tokens_semantic": reason_semantic_tokens,
             "reason_latent_delta": reason_latent_delta,
+            "reason_latent_delta_raw": reason_latent_delta_raw,
+            "reason_latent_delta_effective": reason_latent_delta,
             "reason_latent_attention": latent_attention,
             "reason_tokens_reread": reason_reread_tokens,
             "explicit_evidence_tokens": evidence["explicit_tokens"],
@@ -151,16 +237,19 @@ class PRECISEOIAModel(nn.Module):
             **exchange_certified,
             **reread,
             **annotation,
+            "threshold_logit_raw": threshold["threshold_logit_raw"],
+            "threshold_logit_effective": threshold["threshold_logit_effective"],
             "action_logits_deploy": threshold["action_logits_deploy"],
             "reason_logits_deploy": threshold["reason_logits_deploy"],
             "action_logits_calibrated": threshold["action_logits_calibrated"],
             "reason_logits_calibrated": threshold["reason_logits_calibrated"],
+            "curriculum_state": self.curriculum_state(),
         }
         output["branch_logits"] = {
-            "action_direct": first["action_logits_direct"], "action_reread_no_exchange": action_reread_logits,
+            "action_direct": first["action_logits_direct"], "action_refined_direct_anchor": action_refined_direct_anchor, "action_reread_no_exchange": action_reread_logits,
             "action_ungated_exchange": output["action_logits_exchange_ungated"], "action_certified_exchange": action_final_raw,
             "action_final_raw": action_final_raw, "action_deploy": output["action_logits_deploy"],
-            "reason_direct": first["reason_logits_direct"], "reason_semantic": reason_semantic,
+            "reason_direct": first["reason_logits_direct"], "reason_refined_direct_anchor": reason_refined_direct_anchor, "reason_semantic": reason_semantic,
             "reason_observed": annotation["reason_logits_observed"], "reason_deploy": output["reason_logits_deploy"],
             "action_explicit_only": action_final_raw,
             "reason_explicit_only": explicit_reason,
@@ -188,7 +277,7 @@ class PRECISEOIAModel(nn.Module):
     ) -> dict[str, torch.Tensor]:
         """Re-run only exchange and task heads for packed interventions."""
         with torch.autocast(device_type=action_reread_tokens.device.type, dtype=torch.bfloat16, enabled=action_reread_tokens.is_cuda):
-            exchange = self.exchange(action_reread_tokens, reason_reread_tokens, explicit_evidence, reliability, "certified", evidence_grad=True)
+            exchange = self._effective_exchange(self.exchange(action_reread_tokens, reason_reread_tokens, explicit_evidence, reliability, "certified", evidence_grad=True))
             action = self.action_refined_head(action_reread_tokens + exchange["action_exchange_delta"]).squeeze(-1)
             latent = torch.zeros_like(reason_reread_tokens) if reason_latent_delta is None else reason_latent_delta
             reason = self.reason_refined_head(reason_reread_tokens + exchange["reason_exchange_delta"] + latent).squeeze(-1)
@@ -211,13 +300,13 @@ class PRECISEOIAModel(nn.Module):
     ) -> dict[str, torch.Tensor]:
         """Recompute reread and exchange from cached DINO fields after evidence intervention."""
         with torch.autocast(device_type=action_tokens_direct.device.type, dtype=torch.bfloat16, enabled=action_tokens_direct.is_cuda):
-            reread = self.rereader(
+            reread_raw = self.rereader(
                 action_tokens_direct, reason_tokens_direct,
                 {"explicit_tokens": explicit_evidence, "part_coordinates": part_coordinates, "part_valid": part_valid, "reliability": reliability, "field_enabled": field_enabled},
                 action_layers, reason_layers, action_logits_direct, reason_logits_direct,
             )
-            action_reread = action_tokens_direct + reread["action_reread_delta"]
-            reason_reread = reason_tokens_direct + reread["reason_reread_delta"]
+            action_reread = action_tokens_direct + self._scale("reread") * reread_raw["action_reread_delta"]
+            reason_reread = reason_tokens_direct + self._scale("reread") * reread_raw["reason_reread_delta"]
         return self.decode_cached_exchange(action_reread, reason_reread, explicit_evidence, reliability, reason_latent_delta)
 
     def forward(self, images: torch.Tensor, *, mirror_map: dict | None = None, diagnostic_modes: tuple[str, ...] = ()) -> dict[str, Any]:
@@ -239,9 +328,11 @@ class PRECISEOIAModel(nn.Module):
                 *self.category_decoder.action_head.parameters(),
                 *self.action_refined_head.parameters(),
             ],
-            "reason_semantic": visual["reason_semantic"] + list(self.category_decoder.reason_cross.parameters()) + list(self.category_decoder.reason_self.parameters()) + list(self.category_decoder.reason_head.parameters()) + list(self.reason_refined_head.parameters()) + list(self.category_decoder.entity.parameters()) + list(self.category_decoder.state.parameters()) + list(self.category_decoder.sector.parameters()) + list(self.category_decoder.role.parameters()) + list(self.category_decoder.reason_residual.parameters()) + self.evidence_fields.latent_parameters() + list(self.reason_latent_query.parameters()) + list(self.reason_latent_value.parameters()) + [self.reason_latent_gamma_raw],
-            "evidence_core": visual["evidence_core"] + self.evidence_fields.explicit_parameters(),
-            "exchange_reread": list(self.exchange.parameters()) + list(self.rereader.parameters()),
+            "reason_semantic": visual["reason_semantic"] + list(self.category_decoder.reason_cross.parameters()) + list(self.category_decoder.reason_self.parameters()) + list(self.category_decoder.reason_head.parameters()) + list(self.reason_refined_head.parameters()) + list(self.category_decoder.entity.parameters()) + list(self.category_decoder.state.parameters()) + list(self.category_decoder.sector.parameters()) + list(self.category_decoder.role.parameters()) + list(self.category_decoder.reason_residual.parameters()),
+            "evidence_core": visual["evidence_core"] + self.evidence_fields.explicit_parameters() + self.evidence_fields.latent_parameters(),
+            "reread_adapter": list(self.rereader.parameters()),
+            "exchange_adapter": list(self.exchange.parameters()),
+            "reason_latent": list(self.reason_latent_query.parameters()) + list(self.reason_latent_value.parameters()) + [self.reason_latent_gamma_raw],
             "annotation_adapter": list(self.annotation_head.parameters()),
             "threshold_head": list(self.threshold_head.parameters()),
         }

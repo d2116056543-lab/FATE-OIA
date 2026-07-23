@@ -20,6 +20,18 @@ evidence: {field_config: configs\precise_evidence_fields.yaml, latent_slots: 6, 
 reason: {semantics_config: configs\precise_reason_semantics.yaml, annotation_rank: 8, annotation_delta_cap: 0.75, semantic_weight_floor: 0.25}
 exchange: {overlap_tau: 0.08, overlap_slope: 12.0, reliability_eps: 0.0001, explicit_only_for_certification: true}
 intervention: {max_pairs_per_batch: 24, margin: 0.10, control_mass_tolerance: 0.05, target_credit_grad_ratio: 0.20}
+curriculum:
+  name: precise_full_curriculum_v1
+  version: 1
+  epochs: 12
+  override_source: user_approved_2026-07-23
+  schedule:
+    - {start_epoch: 0, end_epoch: 1, stage: foundation, foundation: 1.0, evidence: 1.0, reread: 0.0, annotation: 0.0, exchange: 0.0, reason_latent: 0.0, intervention: 0.0, threshold: 0.0}
+    - {start_epoch: 2, end_epoch: 2, stage: grounding_ramp_1, foundation: 1.0, evidence: 1.0, reread: 0.35, annotation: 0.35, exchange: 0.0, reason_latent: 0.0, intervention: 0.0, threshold: 0.5}
+    - {start_epoch: 3, end_epoch: 3, stage: grounding_ramp_2, foundation: 1.0, evidence: 1.0, reread: 0.70, annotation: 0.70, exchange: 0.0, reason_latent: 0.0, intervention: 0.0, threshold: 1.0}
+    - {start_epoch: 4, end_epoch: 4, stage: joint_ramp_1, foundation: 1.0, evidence: 1.0, reread: 1.0, annotation: 1.0, exchange: 0.35, reason_latent: 0.35, intervention: 0.25, threshold: 1.0}
+    - {start_epoch: 5, end_epoch: 5, stage: joint_ramp_2, foundation: 1.0, evidence: 1.0, reread: 1.0, annotation: 1.0, exchange: 0.70, reason_latent: 0.70, intervention: 0.60, threshold: 1.0}
+    - {start_epoch: 6, end_epoch: 11, stage: safe_joint, foundation: 1.0, evidence: 1.0, reread: 1.0, annotation: 1.0, exchange: 1.0, reason_latent: 1.0, intervention: 1.0, threshold: 1.0}
 pu: {enabled: false, weight: 0.0}
 training:
   epochs: 12
@@ -39,8 +51,8 @@ training:
   grad_clip_reason: 0.8
   grad_clip_evidence: 0.8
   no_metric_early_stop: true
-optimizer: {action_foundation: {lr: 0.0002, weight_decay: 0.05}, action_decoder: {lr: 0.0003, weight_decay: 0.05}, reason_adapter_decoder: {lr: 0.0003, weight_decay: 0.05}, evidence_core: {lr: 0.0002, weight_decay: 0.05}, exchange_and_reread: {lr: 0.0002, weight_decay: 0.05}, annotation_adapter: {lr: 0.0005, weight_decay: 0.01}, threshold_head: {lr: 0.0007, weight_decay: 0.0}}
+optimizer: {action_foundation: {lr: 0.0002, weight_decay: 0.05}, action_decoder: {lr: 0.0003, weight_decay: 0.05}, reason_semantic: {lr: 0.0003, weight_decay: 0.05}, evidence_core: {lr: 0.0002, weight_decay: 0.05}, reread_adapter: {lr: 0.0002, weight_decay: 0.05}, exchange_adapter: {lr: 0.0002, weight_decay: 0.05}, reason_latent: {lr: 0.0003, weight_decay: 0.05}, annotation_adapter: {lr: 0.0005, weight_decay: 0.01}, threshold_head: {lr: 0.0007, weight_decay: 0.0}}
 augmentation: {mirror_pair_fraction: 0.25, brightness: 0.10, contrast: 0.10, hue: 0.0}
-threshold: {enabled: true, train_calib_fraction: 0.10, train_trunk_on_all_train: true, start_epoch: 1, warmup_epochs: 1, lr_threshold: 0.0007}
+threshold: {enabled: true, train_calib_fraction: 0.10, train_trunk_on_all_train: true, start_epoch: 2, warmup_epochs: 1, lr_threshold: 0.0007}
 diagnostics: {batch_log_every_optimizer_steps: 50, counterfactual_test_samples: 64, case_export_count: 32, no_extra_dino_forward: true}
 runtime: {target_peak_reserved_gb: 45.0, hard_max_reserved_gb: 46.5, foreground_only: true, test_every_epoch: true, save_every_epoch: true}

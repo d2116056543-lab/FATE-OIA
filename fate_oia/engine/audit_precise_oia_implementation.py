@@ -14,6 +14,8 @@ import torch
 import yaml
 
 from fate_oia.models.precise_oia_model import PRECISEOIAModel
+from fate_oia.engine.precise_curriculum import curriculum_sha256, curriculum_state_for_epoch, owner_active_epoch_counts
+from fate_oia.engine.train_precise_oia import build_optimizers
 from fate_oia.engine.eval_precise_oia import EVAL_BRANCHES
 from fate_oia.engine.run_precise_pcvl import _average_precision, validate_pcvl_artifacts
 from fate_oia.metrics import multilabel_metrics_from_logits
@@ -24,7 +26,7 @@ REQUIRED = (
     "fate_oia/datasets/bdd100k_task_aware_index.py", "fate_oia/datasets/precise_grounding_adapter.py", "fate_oia/transforms_precise.py",
     "fate_oia/models/precise_dino_field.py", "fate_oia/models/precise_visual_field.py", "fate_oia/models/precise_category_decoder.py", "fate_oia/models/precise_evidence_fields.py", "fate_oia/models/precise_visual_rereader.py", "fate_oia/models/precise_semantic_exchange.py", "fate_oia/models/precise_annotation_head.py", "fate_oia/models/precise_pcvl_probes.py", "fate_oia/models/precise_oia_model.py",
     "fate_oia/losses/precise_losses.py", "fate_oia/losses/precise_intervention_losses.py", "fate_oia/utils/precise_schema.py", "fate_oia/utils/precise_artifacts.py", "fate_oia/utils/precise_gradient_ownership.py", "fate_oia/utils/precise_runtime.py",
-    "fate_oia/engine/train_precise_oia.py", "fate_oia/engine/eval_precise_oia.py", "fate_oia/engine/run_precise_pcvl.py", "fate_oia/engine/profile_precise_oia.py", "fate_oia/engine/audit_precise_oia_implementation.py", "fate_oia/engine/export_precise_cases.py", "fate_oia/engine/supervise_precise_oia_foreground.py", "scripts/FATE_OIA_precise_oia_v1_foreground.ps1",
+    "fate_oia/engine/precise_curriculum.py", "fate_oia/engine/train_precise_oia.py", "fate_oia/engine/eval_precise_oia.py", "fate_oia/engine/run_precise_pcvl.py", "fate_oia/engine/profile_precise_oia.py", "fate_oia/engine/audit_precise_oia_implementation.py", "fate_oia/engine/export_precise_cases.py", "fate_oia/engine/supervise_precise_oia_foreground.py", "scripts/FATE_OIA_precise_oia_v1_foreground.ps1",
 )
 
 FORBIDDEN = (
@@ -45,6 +47,117 @@ REQUIRED_PILOT_CHECKS = {
     "annotation_delta_nonzero", "pcvl_artifacts_complete", "pcvl_predicate_action_value_supported",
     "pcvl_learned_evidence_supported", "pcvl_learned_exchange_supported", "pilot_artifacts_hash_bound",
 }
+
+REQUIRED_CURRICULUM_CHECKS = {
+    "preflight_gate_current",
+    "fixed_schedule_exact",
+    "owner_mapping_exact",
+    "owner_active_epoch_totals_exact",
+    "inactive_optimizer_state_empty_at_launch",
+    "threshold_deploy_scaled",
+    "runtime_assertions_wired",
+    "runtime_profile_bound",
+    "embedded_curriculum_override_bound",
+    "old_full_gate_not_authoritative",
+    "skill_authorizes_embedded_curriculum",
+    "trainer_enforces_curriculum_gate",
+    "inactive_intervention_skipped",
+    "owner_local_lifecycle_asserted",
+    "strict_resume_lifecycle",
+    "threshold_teacher_full_activation_only",
+}
+
+
+def _curriculum_checks(
+    root: Path,
+    config: dict,
+    model: PRECISEOIAModel,
+    head: str,
+    config_sha: str,
+    source_tree_sha: str,
+    runtime: dict,
+) -> dict[str, bool]:
+    preflight_path = root / ".review" / "PRECISE_OIA_V1_PRE_PILOT_ELIGIBLE.json"
+    preflight = json.loads(preflight_path.read_text(encoding="utf-8")) if preflight_path.exists() else {}
+    states = [curriculum_state_for_epoch(config, epoch) for epoch in range(12)]
+    expected_scales = [
+        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+        (0.35, 0.35, 0.0, 0.0, 0.0, 0.5),
+        (0.70, 0.70, 0.0, 0.0, 0.0, 1.0),
+        (1.0, 1.0, 0.35, 0.35, 0.25, 1.0),
+        (1.0, 1.0, 0.70, 0.70, 0.60, 1.0),
+    ] + [(1.0, 1.0, 1.0, 1.0, 1.0, 1.0)] * 6
+    actual_scales = [(state.reread, state.annotation, state.exchange, state.reason_latent, state.intervention, state.threshold) for state in states]
+    expected_owners = {
+        "action_foundation", "action_decoder", "reason_semantic", "evidence_core",
+        "reread_adapter", "exchange_adapter", "reason_latent",
+        "annotation_adapter", "threshold_head",
+    }
+    active_totals = owner_active_epoch_counts(config, 12)
+    expected_totals = {
+        "action_foundation": 12, "action_decoder": 12, "reason_semantic": 12,
+        "evidence_core": 12, "reread_adapter": 10, "annotation_adapter": 10,
+        "threshold_head": 10, "exchange_adapter": 8, "reason_latent": 8,
+    }
+    optimizers = build_optimizers(model, config)
+    trainer_source = (root / "fate_oia/engine/train_precise_oia.py").read_text(encoding="utf-8")
+    supervisor_source = (root / "fate_oia/engine/supervise_precise_oia_foreground.py").read_text(encoding="utf-8")
+    model_source = (root / "fate_oia/models/precise_oia_model.py").read_text(encoding="utf-8")
+    skill_source = (root / ".codex/skills/precise-oia-implementation-audit/SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    checks = {
+        "preflight_gate_current": preflight.get("status") == "PRE_PILOT_ELIGIBLE" and preflight.get("git_head") == head and preflight.get("config_sha256") == config_sha and preflight.get("source_tree_sha256") == source_tree_sha and not preflight.get("unresolved"),
+        "fixed_schedule_exact": actual_scales == expected_scales and curriculum_sha256(config) != "",
+        "owner_mapping_exact": set(model.owned_parameters()) == expected_owners,
+        "owner_active_epoch_totals_exact": active_totals == expected_totals,
+        "inactive_optimizer_state_empty_at_launch": all(not optimizer.state for optimizer in optimizers.values()),
+        "threshold_deploy_scaled": "theta_effective = self._scale(\"threshold\") * theta_raw" in model_source,
+        "runtime_assertions_wired": all(token in trainer_source for token in ("epoch_step_deltas", "curriculum_protocol_error_epoch_", "inactive owner", "safe_joint epoch")),
+        "runtime_profile_bound": bool(runtime.get("valid")) and runtime.get("git_head") == head and runtime.get("config_sha256") == config_sha,
+        "embedded_curriculum_override_bound": config["curriculum"].get("override_source") == "user_approved_2026-07-23" and "--allow_full_with_embedded_curriculum" in trainer_source and "--allow_full_with_embedded_curriculum" in supervisor_source,
+        "old_full_gate_not_authoritative": "PRECISE_OIA_V1_FULL_TRAIN_READY.json" not in supervisor_source and "PRECISE_OIA_V1_FULL_CURRICULUM_READY.json" in supervisor_source,
+        "skill_authorizes_embedded_curriculum": all(
+            token in skill_source
+            for token in (
+                "PRECISE_OIA_V1_FULL_CURRICULUM_READY.json",
+                "user_approved_2026-07-23",
+                "FULL_TRAIN_READY cannot authorize the embedded-curriculum run",
+            )
+        ),
+        "trainer_enforces_curriculum_gate": "verify_full_curriculum_authorization(config, fingerprint)" in trainer_source,
+        "inactive_intervention_skipped": all(
+            token in trainer_source
+            for token in (
+                "if intervention_scale > 0.0:",
+                "empty_packed_target_specific_interventions(",
+            )
+        ),
+        "owner_local_lifecycle_asserted": all(
+            token in trainer_source
+            for token in (
+                "scheduler clock",
+                "owner_optimizer_state_nonempty",
+                "owner_scheduler_last_epoch",
+            )
+        ),
+        "strict_resume_lifecycle": all(
+            token in trainer_source
+            for token in (
+                "Resume checkpoint curriculum state does not match its saved epoch",
+                "Resume checkpoint owner-local step counters are inconsistent",
+                "Resume checkpoint scheduler lifecycle mismatch",
+            )
+        ),
+        "threshold_teacher_full_activation_only": (
+            'if float(model.curriculum_state()["threshold"]) >= 1.0:' in trainer_source
+            and "threshold teacher mutated before full threshold activation" in trainer_source
+        ),
+    }
+    if set(checks) != REQUIRED_CURRICULUM_CHECKS:
+        raise RuntimeError(f"Curriculum check schema drift: {sorted(set(checks) ^ REQUIRED_CURRICULUM_CHECKS)}")
+    return checks
 
 
 def _sha(path: Path) -> str:
@@ -387,8 +500,11 @@ def run_audit(config_path: str | Path, output_dir: str | Path, mode: str, pilot_
     preflight_pass = not missing and compile_ok and not clean_hits and not incomplete_hits and clean_tree and all(checks.values())
     expected_identity = {"git_head": head, "config_sha256": config_sha, "source_tree_sha256": _training_source_sha(root), "skill_sha256": _sha(repo_skill), "pretrained_weights_sha256": dino_sha, "action_schema_sha256": action_schema_sha}
     pilot_checks = _pilot_checks(Path(pilot_dir), expected_identity) if mode in {"pilot", "post_pilot"} and pilot_dir else {}
+    curriculum_checks = _curriculum_checks(root, config, model, head, config_sha, source_tree_sha, runtime) if mode == "curriculum" else {}
     if mode in {"pilot", "post_pilot"}:
         status = "FULL_TRAIN_READY" if preflight_pass and pilot_checks and all(pilot_checks.values()) else "SCIENTIFIC_GATE_FAILED"
+    elif mode == "curriculum":
+        status = "FULL_CURRICULUM_READY" if preflight_pass and curriculum_checks and all(curriculum_checks.values()) else "CURRICULUM_GATE_FAILED"
     else:
         status = "PRE_PILOT_ELIGIBLE" if preflight_pass else "CHANGES_REQUIRED"
     unresolved = missing + list(clean_hits) + list(incomplete_hits) + [name for name, passed in checks.items() if not passed]
@@ -396,7 +512,9 @@ def run_audit(config_path: str | Path, output_dir: str | Path, mode: str, pilot_
         unresolved.append("git_worktree_dirty")
     if pilot_checks:
         unresolved.extend(name for name, passed in pilot_checks.items() if not passed)
-    record = {"status": status, "git_head": head, "branch": branch, "base_commit": base_commit, "config_sha256": config_sha, "skill_sha256": _sha(repo_skill), "action_schema_sha256": action_schema_sha, "pretrained_weights_sha256": dino_sha, "user_skill_path": str(user_skill), "source_tree_sha256": source_tree_sha, "checked_files": list(REQUIRED), "missing": missing, "forbidden_pattern_results": clean_hits, "incomplete_implementation_results": incomplete_hits, "functional_checks": checks, "pilot_checks": pilot_checks, "compile_ok": compile_ok, "tests_passed": pytest_ok, "real_forward_passed": bool(real_forward.get("passed")), "gradient_firewall_passed": bool(real_forward.get("gradient_firewall_passed")), "dino_call_contract_passed": int(runtime.get("dino_call_count", 0)) == 1, "runtime_profile_passed": bool(runtime.get("valid")), "pytest": {"passed": pytest_ok, "returncode": pytest_run.returncode, "stdout_tail": pytest_run.stdout[-4000:], "stderr_tail": pytest_run.stderr[-4000:]}, "git_clean": clean_tree, "mode": mode, "unresolved": sorted(set(unresolved))}
+    if curriculum_checks:
+        unresolved.extend(name for name, passed in curriculum_checks.items() if not passed)
+    record = {"status": status, "git_head": head, "branch": branch, "base_commit": base_commit, "config_sha256": config_sha, "skill_sha256": _sha(repo_skill), "action_schema_sha256": action_schema_sha, "pretrained_weights_sha256": dino_sha, "user_skill_path": str(user_skill), "source_tree_sha256": source_tree_sha, "checked_files": list(REQUIRED), "missing": missing, "forbidden_pattern_results": clean_hits, "incomplete_implementation_results": incomplete_hits, "functional_checks": checks, "pilot_checks": pilot_checks, "curriculum_checks": curriculum_checks, "curriculum_sha256": curriculum_sha256(config), "curriculum_schedule": config["curriculum"]["schedule"], "owner_active_epochs": owner_active_epoch_counts(config, 12), "override_source": config["curriculum"].get("override_source"), "compile_ok": compile_ok, "tests_passed": pytest_ok, "real_forward_passed": bool(real_forward.get("passed")), "gradient_firewall_passed": bool(real_forward.get("gradient_firewall_passed")), "dino_call_contract_passed": int(runtime.get("dino_call_count", 0)) == 1, "runtime_profile_passed": bool(runtime.get("valid")), "pytest": {"passed": pytest_ok, "returncode": pytest_run.returncode, "stdout_tail": pytest_run.stdout[-4000:], "stderr_tail": pytest_run.stderr[-4000:]}, "git_clean": clean_tree, "mode": mode, "unresolved": sorted(set(unresolved))}
     if mode in {"pilot", "post_pilot"}:
         record.update({"pilot_complete": pilot_checks.get("three_epochs_complete", False), "mechanisms_active": all(pilot_checks.get(name, False) for name in REQUIRED_PILOT_CHECKS if name not in {"pcvl_predicate_action_value_supported"}), "pcvl": json.loads((Path(pilot_dir) / "pcvl" / "pcvl_metrics.json").read_text(encoding="utf-8")) if (Path(pilot_dir) / "pcvl" / "pcvl_metrics.json").exists() else {}, "runtime_selected": runtime, "pilot_dir": str(Path(pilot_dir).resolve()), "pilot_artifact_hashes": _pilot_artifact_hashes(Path(pilot_dir))})
     (output / "implementation_audit_PRECISE_OIA_V1.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
@@ -406,6 +524,8 @@ def run_audit(config_path: str | Path, output_dir: str | Path, mode: str, pilot_
         gate.write_text(json.dumps(record, indent=2), encoding="utf-8")
     if write_gate and status == "FULL_TRAIN_READY":
         (root / ".review" / "PRECISE_OIA_V1_FULL_TRAIN_READY.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
+    if write_gate and status == "FULL_CURRICULUM_READY":
+        (root / ".review" / "PRECISE_OIA_V1_FULL_CURRICULUM_READY.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
     return record
 
 
@@ -417,12 +537,13 @@ def main() -> None:
     parser.add_argument("--mode", default="preflight")
     parser.add_argument("--write_pre_pilot_eligible", action="store_true")
     parser.add_argument("--write_full_train_ready", action="store_true")
+    parser.add_argument("--write_full_curriculum_ready", action="store_true")
     parser.add_argument("--pilot_dir")
     args = parser.parse_args()
-    write_gate = args.write_full_train_ready if args.mode in {"pilot", "post_pilot"} else args.write_pre_pilot_eligible
+    write_gate = args.write_full_train_ready if args.mode in {"pilot", "post_pilot"} else args.write_full_curriculum_ready if args.mode == "curriculum" else args.write_pre_pilot_eligible
     record = run_audit(args.config, args.output_dir, args.mode, args.pilot_dir, write_gate=write_gate, device_name=args.device)
     print(json.dumps(record, sort_keys=True))
-    expected = "FULL_TRAIN_READY" if args.mode in {"pilot", "post_pilot"} else "PRE_PILOT_ELIGIBLE"
+    expected = "FULL_TRAIN_READY" if args.mode in {"pilot", "post_pilot"} else "FULL_CURRICULUM_READY" if args.mode == "curriculum" else "PRE_PILOT_ELIGIBLE"
     if record["status"] != expected:
         raise SystemExit(2)
 

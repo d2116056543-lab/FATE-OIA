@@ -12,12 +12,13 @@ def test_target_credit_projection_preserves_grounding_alignment_and_cap():
     assert projected.norm().item() <= 0.2 * grounding.norm().item() + 1e-7
 
 
-def test_latent_evidence_parameters_are_reason_owned_not_grounding_owned():
+def test_latent_evidence_parameters_are_grounding_owned_not_reason_owned():
     model = PRECISEOIAModel(use_mock_dino=True)
     owners = parameter_ownership(model)
     latent_ids = {id(parameter) for parameter in model.evidence_fields.latent_parameters()}
-    assert latent_ids <= {id(parameter) for parameter in owners["reason_semantic"]}
-    assert latent_ids.isdisjoint({id(parameter) for parameter in owners["evidence_core"]})
+    assert latent_ids <= {id(parameter) for parameter in owners["evidence_core"]}
+    assert latent_ids.isdisjoint({id(parameter) for parameter in owners["reason_semantic"]})
+    assert latent_ids.isdisjoint({id(parameter) for parameter in owners["reason_latent"]})
 
 
 def test_main_task_logits_cannot_bypass_projection_to_train_evidence_core():

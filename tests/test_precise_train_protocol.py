@@ -1,10 +1,21 @@
+import hashlib
+import json
 from pathlib import Path
 
+import pytest
 import torch
 import yaml
 from PIL import Image
 
-from fate_oia.engine.train_precise_oia import _slice_batch_output, build_optimizers, _training_split_indices
+from fate_oia.engine.precise_curriculum import curriculum_state_for_epoch, owner_active_epoch_counts
+from fate_oia.engine.train_precise_oia import (
+    _slice_batch_output,
+    _step_owners,
+    _training_split_indices,
+    build_optimizers,
+    build_schedulers,
+    verify_full_curriculum_authorization,
+)
 from fate_oia.losses.precise_losses import refinement_loss
 from fate_oia.models.precise_oia_model import PRECISEOIAModel
 from fate_oia.utils.precise_gradient_ownership import parameter_ownership
@@ -100,8 +111,88 @@ def test_norm_bias_and_embedding_parameters_have_zero_weight_decay():
     config = yaml.safe_load((ROOT / "configs" / "fate_oia_train_360x640_precise_oia_v1.yaml").read_text(encoding="utf-8"))
     model = PRECISEOIAModel(use_mock_dino=True)
     optimizers = build_optimizers(model, config)
-    assert set(optimizers) == {"action_foundation", "action_decoder", "reason_semantic", "evidence_core", "exchange_reread", "annotation_adapter", "threshold_head"}
+    assert set(optimizers) == {
+        "action_foundation",
+        "action_decoder",
+        "reason_semantic",
+        "evidence_core",
+        "reread_adapter",
+        "exchange_adapter",
+        "reason_latent",
+        "annotation_adapter",
+        "threshold_head",
+    }
     assert all(any(group["weight_decay"] == 0.0 for group in optimizer.param_groups) for optimizer in optimizers.values())
+
+
+def test_latent_evidence_and_latent_message_have_distinct_owners():
+    model = PRECISEOIAModel(use_mock_dino=True)
+    owners = parameter_ownership(model)
+    evidence_ids = {id(parameter) for parameter in owners["evidence_core"]}
+    latent_message_ids = {id(parameter) for parameter in owners["reason_latent"]}
+    assert {id(parameter) for parameter in model.evidence_fields.latent_parameters()} <= evidence_ids
+    assert {id(parameter) for parameter in model.reason_latent_query.parameters()} <= latent_message_ids
+    assert {id(parameter) for parameter in model.reason_latent_value.parameters()} <= latent_message_ids
+    assert id(model.reason_latent_gamma_raw) in latent_message_ids
+
+
+def test_inactive_owner_has_empty_state_no_clock_advance_and_cleared_gradients():
+    config = yaml.safe_load((ROOT / "configs" / "fate_oia_train_360x640_precise_oia_v1.yaml").read_text(encoding="utf-8"))
+    model = PRECISEOIAModel(use_mock_dino=True)
+    optimizers = build_optimizers(model, config)
+    updates = {owner: 1 for owner in optimizers}
+    schedulers = build_schedulers(
+        optimizers,
+        updates,
+        owner_active_epoch_counts(config, 12),
+        float(config["training"]["warmup_ratio"]),
+    )
+    counts = {owner: 0 for owner in optimizers}
+    owner = "reread_adapter"
+    for parameter in parameter_ownership(model)[owner]:
+        parameter.grad = torch.ones_like(parameter)
+    stats = _step_owners(
+        model,
+        (owner,),
+        optimizers,
+        schedulers,
+        config,
+        counts,
+        curriculum_state_for_epoch(config, 1).owner_active,
+    )
+    assert counts[owner] == 0
+    assert not optimizers[owner].state
+    assert all(parameter.grad is None for parameter in parameter_ownership(model)[owner])
+    assert stats[owner]["active"] == 0.0
+
+    for parameter in parameter_ownership(model)[owner]:
+        parameter.grad = torch.ones_like(parameter)
+    stats = _step_owners(
+        model,
+        (owner,),
+        optimizers,
+        schedulers,
+        config,
+        counts,
+        curriculum_state_for_epoch(config, 2).owner_active,
+    )
+    assert counts[owner] == 1
+    assert optimizers[owner].state
+    assert stats[owner]["active"] == 1.0
+    assert stats[owner]["optimizer_step_count"] == 1.0
+
+
+def test_owner_local_scheduler_reaches_min_lr_on_final_active_update():
+    parameter = torch.nn.Parameter(torch.tensor(1.0))
+    optimizer = torch.optim.AdamW([parameter], lr=1e-3)
+    scheduler = build_schedulers({"owner": optimizer}, {"owner": 4}, {"owner": 1}, 0.25)["owner"]
+    used_lrs = []
+    for _ in range(4):
+        used_lrs.append(optimizer.param_groups[0]["lr"])
+        optimizer.step()
+        scheduler.step()
+    assert used_lrs[-1] == pytest.approx(5e-5)
+    assert scheduler.last_epoch == 4
 
 
 def test_every_trainable_parameter_has_exactly_one_optimizer_owner():
@@ -200,3 +291,57 @@ def test_mirror_loss_uses_the_planned_total_weight():
     profile_source = (ROOT / "fate_oia" / "engine" / "profile_precise_oia.py").read_text(encoding="utf-8")
     assert "loss_mirror = 0.02 *" in source
     assert "mirror_loss = 0.02 *" in profile_source
+
+
+def test_inactive_intervention_is_not_computed():
+    source = (ROOT / "fate_oia" / "engine" / "train_precise_oia.py").read_text(encoding="utf-8")
+    activation = source.index('intervention_scale = float(model.curriculum_state()["intervention"])')
+    guarded_call = source.index("if intervention_scale > 0.0:", activation)
+    packed_call = source.index("packed_target_specific_interventions(", guarded_call)
+    zero_branch = source.index("else:", packed_call)
+    assert activation < guarded_call < packed_call < zero_branch
+    assert "empty_packed_target_specific_interventions(" in source[zero_branch:]
+
+
+def test_full_curriculum_skill_contract_replaces_pilot_authority():
+    skill = (ROOT / ".codex" / "skills" / "precise-oia-implementation-audit" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    assert "PRECISE_OIA_V1_FULL_CURRICULUM_READY.json" in skill
+    assert "user_approved_2026-07-23" in skill
+    assert "FULL_TRAIN_READY cannot authorize the embedded-curriculum run" in skill
+
+
+def test_trainer_validates_full_curriculum_gate_itself(tmp_path, monkeypatch):
+    config = yaml.safe_load(
+        (ROOT / "configs" / "fate_oia_train_360x640_precise_oia_v1.yaml").read_text(encoding="utf-8")
+    )
+    skill_path = tmp_path / ".codex" / "skills" / "precise-oia-implementation-audit" / "SKILL.md"
+    skill_path.parent.mkdir(parents=True)
+    skill_path.write_text("curriculum skill", encoding="utf-8")
+    fingerprint = {
+        "git_head": "head",
+        "config_sha256": "config",
+        "source_tree_sha256": "source",
+    }
+    gate = {
+        "status": "FULL_CURRICULUM_READY",
+        **fingerprint,
+        "skill_sha256": hashlib.sha256(skill_path.read_bytes()).hexdigest(),
+        "curriculum_sha256": __import__(
+            "fate_oia.engine.precise_curriculum", fromlist=["curriculum_sha256"]
+        ).curriculum_sha256(config),
+        "override_source": "user_approved_2026-07-23",
+        "runtime_profile_passed": True,
+        "functional_checks": {"all": True},
+        "curriculum_checks": {"all": True},
+        "unresolved": [],
+    }
+    gate_path = tmp_path / "gate.json"
+    gate_path.write_text(json.dumps(gate), encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    assert verify_full_curriculum_authorization(config, fingerprint, gate_path)["status"] == "FULL_CURRICULUM_READY"
+    gate["git_head"] = "wrong"
+    gate_path.write_text(json.dumps(gate), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="git_head"):
+        verify_full_curriculum_authorization(config, fingerprint, gate_path)
