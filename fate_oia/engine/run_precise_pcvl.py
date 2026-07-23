@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +13,38 @@ from torch.nn import functional as F
 from fate_oia.models.precise_pcvl_probes import PRECISEPCVLProbes
 
 
-PCVL_FILES = ("pcvl_metrics.json", "pcvl_per_action.json", "pcvl_bootstrap.json", "pcvl_value_decomposition.json")
+PCVL_FILES = (
+    "pcvl_metrics.json", "pcvl_per_action.json", "pcvl_bootstrap.json",
+    "pcvl_value_decomposition.json", "pcvl_provenance.json",
+)
+
+
+def _state_sha256(module: torch.nn.Module, *, trainable_only: bool = False) -> str:
+    trainable = {name for name, parameter in module.named_parameters() if parameter.requires_grad}
+    digest = hashlib.sha256()
+    for name, value in sorted(module.state_dict().items()):
+        if trainable_only and name not in trainable:
+            continue
+        tensor = value.detach().cpu().contiguous()
+        digest.update(name.encode("utf-8"))
+        digest.update(str(tuple(tensor.shape)).encode("ascii"))
+        digest.update(str(tensor.dtype).encode("ascii"))
+        digest.update(tensor.numpy().tobytes())
+    return digest.hexdigest()
+
+
+def _names_sha256(names: list[str]) -> str:
+    return hashlib.sha256("\n".join(names).encode("utf-8")).hexdigest()
+
+
+def _all_finite(value: Any) -> bool:
+    if isinstance(value, dict):
+        return all(_all_finite(item) for item in value.values())
+    if isinstance(value, list):
+        return all(_all_finite(item) for item in value)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return math.isfinite(float(value))
+    return True
 
 
 def build_oracle_structured_evidence(
@@ -102,11 +135,13 @@ def evaluate_pcvl(
     target_provider,
     device: torch.device,
     output_dir: str | Path,
+    provenance: dict[str, Any],
 ) -> dict[str, Any]:
     probes.eval()
     model.eval()
     predictions = {key: [] for key in ("u0", "u1", "u2", "u3")}
     labels = []
+    file_names: list[str] = []
     for batch in loader:
         output = model(batch["image"].to(device, non_blocking=True))
         structured = target_provider(batch, device)
@@ -114,6 +149,7 @@ def evaluate_pcvl(
         for key, value in logits.items():
             predictions[key].append(torch.sigmoid(value).cpu())
         labels.append(batch["action"].cpu())
+        file_names.extend(str(name) for name in batch["file_name"])
     target = torch.cat(labels)
     per_action = {}
     metrics = {}
@@ -158,19 +194,54 @@ def evaluate_pcvl(
         }
     (root / "pcvl_bootstrap.json").write_text(json.dumps(bootstrap, indent=2), encoding="utf-8")
     (root / "pcvl_value_decomposition.json").write_text(json.dumps(decomposition, indent=2), encoding="utf-8")
+    bound_provenance = {
+        **provenance,
+        "sample_count": len(file_names),
+        "file_names_sha256": _names_sha256(file_names),
+        "model_trainable_state_sha256": _state_sha256(model, trainable_only=True),
+        "probe_state_sha256": _state_sha256(probes),
+    }
+    (root / "pcvl_provenance.json").write_text(json.dumps(bound_provenance, indent=2), encoding="utf-8")
     probes.train()
     return {**metrics, **decomposition}
 
 
-def validate_pcvl_artifacts(path: str | Path) -> None:
+def validate_pcvl_artifacts(path: str | Path, expected_identity: dict[str, Any] | None = None) -> None:
     root = Path(path)
     missing = [name for name in PCVL_FILES if not (root / name).exists()]
     if missing:
         raise RuntimeError(f"Missing PCVL pilot artifacts: {missing}")
-    metrics = json.loads((root / "pcvl_metrics.json").read_text(encoding="utf-8"))
+    loaded = {name: json.loads((root / name).read_text(encoding="utf-8")) for name in PCVL_FILES}
+    if not _all_finite(loaded):
+        raise RuntimeError("PCVL artifacts contain non-finite values")
+    metrics = loaded["pcvl_metrics.json"]
     for key in ("u0_action_map", "u1_action_map", "u2_action_map", "u3_action_map", "predicate_action_value_supported"):
         if key not in metrics:
             raise RuntimeError(f"PCVL metrics missing {key}")
+    per_action = loaded["pcvl_per_action.json"]
+    if any(key not in per_action or len(per_action[key]) != 4 for key in ("u0", "u1", "u2", "u3")):
+        raise RuntimeError("PCVL per-action schema is invalid")
+    bootstrap = loaded["pcvl_bootstrap.json"]
+    for key in ("delta_value", "delta_measurement", "delta_interaction", "delta_learned_value", "delta_learned_interaction"):
+        if key not in bootstrap or any(field not in bootstrap[key] for field in ("mean", "ci_low", "ci_high", "positive_rate")):
+            raise RuntimeError(f"PCVL bootstrap schema missing {key}")
+    provenance = loaded["pcvl_provenance.json"]
+    required_provenance = (
+        "git_head", "source_tree_sha256", "config_sha256", "skill_sha256",
+        "pretrained_weights_sha256", "action_schema_sha256",
+        "train_audit_indices_sha256", "train_audit_file_names_sha256",
+        "sample_count", "file_names_sha256", "model_trainable_state_sha256",
+        "probe_state_sha256", "epoch",
+    )
+    missing_provenance = [key for key in required_provenance if key not in provenance]
+    if missing_provenance:
+        raise RuntimeError(f"PCVL provenance missing {missing_provenance}")
+    if provenance["file_names_sha256"] != provenance["train_audit_file_names_sha256"]:
+        raise RuntimeError("PCVL provenance audit file order does not match the bound split")
+    if expected_identity is not None:
+        mismatched = [key for key, value in expected_identity.items() if provenance.get(key) != value]
+        if mismatched:
+            raise RuntimeError(f"PCVL provenance identity mismatch: {mismatched}")
 
 
 def main() -> None:

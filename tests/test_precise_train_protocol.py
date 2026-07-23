@@ -191,3 +191,9 @@ def test_manifest_binds_action_schema_and_exact_dino_weight_identity():
     source = (ROOT / "fate_oia" / "engine" / "train_precise_oia.py").read_text(encoding="utf-8")
     assert '"pretrained_weights_sha256"' in source
     assert '"action_schema_sha256"' in source
+    assert '"train_audit_file_names_sha256"' in source
+
+
+def test_mirror_loss_uses_the_planned_total_weight():
+    source = (ROOT / "fate_oia" / "engine" / "train_precise_oia.py").read_text(encoding="utf-8")
+    assert "loss_mirror = 0.02 *" in source

@@ -58,6 +58,17 @@ def _index_sha(indices: list[int]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _dataset_file_names(dataset) -> list[str]:
+    if isinstance(dataset, Subset):
+        parent = _dataset_file_names(dataset.dataset)
+        return [parent[int(index)] for index in dataset.indices]
+    return [str(sample.file_name) for sample in dataset.samples]
+
+
+def _file_names_sha256(names: list[str]) -> str:
+    return hashlib.sha256("\n".join(names).encode("utf-8")).hexdigest()
+
+
 def _observed_firewall(model: PRECISEOIAModel, observed_loss: torch.Tensor) -> dict[str, float]:
     owners = parameter_ownership(model)
     checked = ("action_foundation", "action_decoder", "reason_semantic", "evidence_core", "exchange_reread", "annotation_adapter")
@@ -323,7 +334,9 @@ def train(args: argparse.Namespace) -> None:
     write_json(output_dir / "implementation_fingerprint.json", fingerprint)
     skill_path = Path(".codex/skills/precise-oia-implementation-audit/SKILL.md")
     action_schema_path = Path(args.config).parent / "precise_action_semantics.yaml"
-    write_json(output_dir / "run_manifest.json", {"git_head": fingerprint["git_head"], "source_tree_sha256": fingerprint["source_tree_sha256"], "config_sha256": fingerprint["config_sha256"], "skill_sha256": hashlib.sha256(skill_path.read_bytes()).hexdigest() if skill_path.exists() else "missing", "action_schema_sha256": hashlib.sha256(action_schema_path.read_bytes()).hexdigest(), "base_commit": "373aa49feac17372574fd7fb056c1d79c7c848fe", "test_only": True, "selection_protocol": "internal_test_selected", "best_selection_split": "test", "feature_cache_enabled": False, "token_compression": "none", "internal_test_selected": True, "publication_eligible_selection": False, "selected_layers": [3, 7, 11], "pretrained_weights": config["pretrained_weights"], "pretrained_weights_sha256": model.dino.pretrained_weights_sha256, "dino_loaded_state_key_count": len(model.dino.loaded_state_keys), "dino_missing_keys": list(model.dino.missing_keys), "dino_unexpected_keys": list(model.dino.unexpected_keys), "seed": args.seed, "epochs": args.epochs, "train_dataset_count": len(train_set), "test_count": len(test_set), "train_calib_count": len(calib_indices), "train_main_count": len(main_indices), "train_audit_count": len(audit_indices), "train_main_indices_sha256": _index_sha(main_indices), "train_audit_indices_sha256": _index_sha(audit_indices), "train_calib_indices_sha256": _index_sha(calib_indices), "train_trunk_on_all_train": bool(config["threshold"].get("train_trunk_on_all_train", False)), "pcvl_pilot_only": args.mode == "pilot", "active_evidence_fields": [field["name"] for field in active_fields], "command_line": vars(args)})
+    audit_file_names = _dataset_file_names(Subset(train_eval_set, audit_indices)) if audit_indices else []
+    run_manifest = {"git_head": fingerprint["git_head"], "source_tree_sha256": fingerprint["source_tree_sha256"], "config_sha256": fingerprint["config_sha256"], "skill_sha256": hashlib.sha256(skill_path.read_bytes()).hexdigest() if skill_path.exists() else "missing", "action_schema_sha256": hashlib.sha256(action_schema_path.read_bytes()).hexdigest(), "base_commit": "373aa49feac17372574fd7fb056c1d79c7c848fe", "test_only": True, "selection_protocol": "internal_test_selected", "best_selection_split": "test", "feature_cache_enabled": False, "token_compression": "none", "internal_test_selected": True, "publication_eligible_selection": False, "selected_layers": [3, 7, 11], "pretrained_weights": config["pretrained_weights"], "pretrained_weights_sha256": model.dino.pretrained_weights_sha256, "dino_loaded_state_key_count": len(model.dino.loaded_state_keys), "dino_missing_keys": list(model.dino.missing_keys), "dino_unexpected_keys": list(model.dino.unexpected_keys), "seed": args.seed, "epochs": args.epochs, "train_dataset_count": len(train_set), "test_count": len(test_set), "train_calib_count": len(calib_indices), "train_main_count": len(main_indices), "train_audit_count": len(audit_indices), "train_main_indices_sha256": _index_sha(main_indices), "train_audit_indices_sha256": _index_sha(audit_indices), "train_audit_file_names_sha256": _file_names_sha256(audit_file_names), "train_calib_indices_sha256": _index_sha(calib_indices), "train_trunk_on_all_train": bool(config["threshold"].get("train_trunk_on_all_train", False)), "pcvl_pilot_only": args.mode == "pilot", "active_evidence_fields": [field["name"] for field in active_fields], "command_line": vars(args)}
+    write_json(output_dir / "run_manifest.json", run_manifest)
     profile_path = Path(".review/precise_oia_v1/runtime/selected_runtime_profile.json")
     write_json(output_dir / "runtime_profile.json", json.loads(profile_path.read_text(encoding="utf-8")) if profile_path.exists() else {"available": False, "reason": "actual-path profile has not passed yet"})
     representation_owners = tuple(owner for owner in optimizers if owner != "threshold_head")
@@ -386,11 +399,12 @@ def train(args: argparse.Namespace) -> None:
                 reason_mirror = torch.tensor([int(row["mirror_partner"]) for row in model.reason_schema], device=device)
                 field_mirror = model.evidence_fields.mirror_field_indices
                 loss_evidence_view = evidence_view_consistency_loss(output, mirror_output, field_mirror)
-                loss_mirror = (
-                    0.05 * two_way_consistency_loss(output["action_logits_final_raw"][:mirror_count], mirror_output["action_logits_final_raw"], action_mirror)
-                    + 0.05 * two_way_consistency_loss(output["reason_logits_semantic"][:mirror_count], mirror_output["reason_logits_semantic"], reason_mirror)
-                    + 0.0075 * loss_evidence_view
+                mirror_composite = (
+                    two_way_consistency_loss(output["action_logits_final_raw"][:mirror_count], mirror_output["action_logits_final_raw"], action_mirror)
+                    + two_way_consistency_loss(output["reason_logits_semantic"][:mirror_count], mirror_output["reason_logits_semantic"], reason_mirror)
+                    + loss_evidence_view
                 )
+                loss_mirror = 0.02 * mirror_composite
                 model.evidence_fields.update_view_consistency(output["explicit_evidence_tokens"][:mirror_count].detach(), mirror_output["explicit_evidence_tokens"].detach())
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
                 intervention = packed_target_specific_interventions(model, output, action_target, reason_target, int(config["intervention"]["max_pairs_per_batch"]))
@@ -508,7 +522,15 @@ def train(args: argparse.Namespace) -> None:
         if pcvl_probes is not None and audit_loader is not None:
             def audit_target_provider(audit_batch, audit_device):
                 return grounding_adapter.stack_batch([train_grounding[name] for name in audit_batch["file_name"]], audit_device)
-            evaluate_pcvl(pcvl_probes, model, audit_loader, audit_target_provider, device, output_dir / "pcvl")
+            pcvl_identity_keys = (
+                "git_head", "source_tree_sha256", "config_sha256", "skill_sha256",
+                "pretrained_weights_sha256", "action_schema_sha256",
+                "train_audit_indices_sha256", "train_audit_file_names_sha256",
+            )
+            evaluate_pcvl(
+                pcvl_probes, model, audit_loader, audit_target_provider, device, output_dir / "pcvl",
+                provenance={**{key: run_manifest[key] for key in pcvl_identity_keys}, "epoch": epoch},
+            )
         epoch_dir = output_dir / f"epoch_{epoch:03d}"
         epoch_dir.mkdir(parents=True, exist_ok=True)
         write_json(epoch_dir / "metrics_summary.json", metrics)

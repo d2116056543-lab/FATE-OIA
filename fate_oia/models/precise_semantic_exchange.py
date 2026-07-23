@@ -32,11 +32,22 @@ class PRECISESemanticExchange(nn.Module):
         self.register_buffer("family_mask_action", self._action_mask())
         self.register_buffer("family_mask_reason", self._reason_mask())
         self.register_buffer("reason_explicit_certifiable", torch.tensor([bool(row["explicit_certifiable"]) for row in reason_schema], dtype=torch.bool))
-        compatibility = torch.zeros(4, 21, dtype=torch.bool)
-        compatibility[0, 0:3] = True
-        compatibility[1, 3:9] = True
-        compatibility[2, 9:15] = True
-        compatibility[3, 15:21] = True
+        compatibility = torch.zeros(4, len(reason_schema), dtype=torch.bool)
+        for column, row in enumerate(reason_schema):
+            role = str(row["decision_role"])
+            sector = str(row["sector"])
+            state = str(row["state"])
+            if role == "proceed":
+                action = 0
+            elif role in {"traffic_control", "avoid"}:
+                action = 1
+            elif sector == "left" or state.endswith("_left"):
+                action = 2
+            elif sector == "right" or state.endswith("_right"):
+                action = 3
+            else:
+                raise ValueError(f"Reason semantics cannot be assigned to an action: {row}")
+            compatibility[action, column] = True
         self.register_buffer("action_reason_compatibility", compatibility)
 
     def _action_mask(self) -> torch.Tensor:

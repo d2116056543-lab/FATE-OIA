@@ -39,6 +39,24 @@ def test_wrong_target_ratio_uses_action_reason_groups_not_min_max_weights():
     assert torch.allclose(output["wrong_target_message_ratio"], expected)
 
 
+def test_action_reason_compatibility_is_derived_from_semantics_not_row_ranges():
+    fields = load_evidence_fields(ROOT / "configs" / "precise_evidence_fields.yaml")
+    reasons = load_reason_semantics(ROOT / "configs" / "precise_reason_semantics.yaml")
+    permuted = reasons[9:] + reasons[:9]
+    model = PRECISESemanticExchange(fields, permuted)
+    for column, reason in enumerate(permuted):
+        state = str(reason["state"])
+        if reason["decision_role"] == "proceed":
+            expected_action = 0
+        elif reason["decision_role"] in {"traffic_control", "avoid"}:
+            expected_action = 1
+        elif reason["sector"] == "left" or state.endswith("_left"):
+            expected_action = 2
+        else:
+            expected_action = 3
+        assert model.action_reason_compatibility[:, column].nonzero().flatten().tolist() == [expected_action]
+
+
 def test_noncertifiable_and_incompatible_reasons_cannot_enter_action_exchange():
     model = _model()
     output = model(

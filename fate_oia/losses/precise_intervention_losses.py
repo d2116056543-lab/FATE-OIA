@@ -70,6 +70,7 @@ def _candidate_control(
     sample_index: torch.Tensor,
     field_index: torch.Tensor,
     tolerance: float,
+    deterministic: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     coordinates = output["evidence_part_coordinates"][sample_index, field_index]
     selected_mask = output["evidence_masks"][sample_index, field_index]
@@ -108,8 +109,19 @@ def _candidate_control(
         if candidate_index.numel() < mass:
             valid[row] = False
             continue
-        rank = selected_mask[row].flatten()[candidate_index].argsort()
-        support = candidate_index[rank[:mass]]
+        if deterministic:
+            # A held-out control must not be constructed from deliberately
+            # low-attention patches. Use a stateless spatial permutation so
+            # repeated audits are reproducible but independent of scores.
+            keys = torch.remainder(
+                candidate_index.to(torch.int64) * 1103515245
+                + (field + 1) * 12345
+                + (row + 1) * 2654435761,
+                2147483647,
+            )
+            support = candidate_index[keys.argsort()[:mass]]
+        else:
+            support = candidate_index[torch.randperm(candidate_index.numel(), device=candidate_index.device)[:mass]]
         control_mask[row].flatten()[support] = 1.0
         count = int(part_count[row].item())
         chosen = support[torch.linspace(0, len(support) - 1, count, device=support.device).round().long()]
@@ -143,7 +155,9 @@ def _task_intervention(model, output, targets: torch.Tensor, task: str, max_pair
     selected_evidence[rows, field_index] = 0.0
     selected_reliability[rows, field_index] = 0.0
 
-    control_token, _, control_coordinates, valid_control = _candidate_control(model, output, sample_index, field_index, control_tolerance)
+    control_token, _, control_coordinates, valid_control = _candidate_control(
+        model, output, sample_index, field_index, control_tolerance, deterministic=deterministic
+    )
     if not valid_control.any():
         return _empty_task_result(base_logits)
     sample_index = sample_index[valid_control]

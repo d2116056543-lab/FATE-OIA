@@ -2,7 +2,7 @@ from pathlib import Path
 
 import torch
 
-from fate_oia.engine.run_precise_pcvl import build_oracle_structured_evidence, train_pcvl_step
+from fate_oia.engine.run_precise_pcvl import build_oracle_structured_evidence, train_pcvl_step, validate_pcvl_artifacts
 
 from fate_oia.models.precise_pcvl_probes import PRECISEPCVLProbes
 
@@ -89,3 +89,16 @@ def test_pcvl_step_reports_real_gradient_and_parameter_delta():
     result = train_pcvl_step(probes, optimizer, output, structured, torch.randint(0, 2, (2, 4)).float())
     assert result["grad_norm"] > 0
     assert result["parameter_delta_norm"] > 0
+
+
+def test_pcvl_validation_rejects_unbound_or_nonfinite_artifacts(tmp_path):
+    (tmp_path / "pcvl_metrics.json").write_text('{"u0_action_map": 0.1, "u1_action_map": 0.2, "u2_action_map": 0.2, "u3_action_map": 0.3, "predicate_action_value_supported": true}', encoding="utf-8")
+    (tmp_path / "pcvl_per_action.json").write_text('{"u0": [0.1, 0.1, 0.1, 0.1], "u1": [0.2, 0.2, 0.2, 0.2], "u2": [0.2, 0.2, 0.2, 0.2], "u3": [0.3, 0.3, 0.3, 0.3]}', encoding="utf-8")
+    (tmp_path / "pcvl_bootstrap.json").write_text('{"delta_value": {"mean": 0.1, "ci_low": 0.01, "ci_high": 0.2, "positive_rate": 1.0}}', encoding="utf-8")
+    (tmp_path / "pcvl_value_decomposition.json").write_text('{"delta_value": 0.1, "delta_measurement": 0.0, "delta_interaction": 0.1, "delta_learned_value": 0.1, "delta_learned_interaction": 0.1}', encoding="utf-8")
+    try:
+        validate_pcvl_artifacts(tmp_path)
+    except RuntimeError as error:
+        assert "provenance" in str(error).lower()
+    else:
+        raise AssertionError("unbound PCVL artifacts were accepted")

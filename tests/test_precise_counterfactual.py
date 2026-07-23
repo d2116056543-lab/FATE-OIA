@@ -1,6 +1,6 @@
 import torch
 
-from fate_oia.losses.precise_intervention_losses import balanced_positive_pairs, incompatible_target_mask, matched_control_is_valid, packed_target_specific_interventions, target_specific_intervention_loss
+from fate_oia.losses.precise_intervention_losses import _candidate_control, balanced_positive_pairs, incompatible_target_mask, matched_control_is_valid, packed_target_specific_interventions, target_specific_intervention_loss
 from fate_oia.models.precise_oia_model import PRECISEOIAModel
 
 
@@ -44,6 +44,39 @@ def test_matched_control_enforces_mass_and_nonoverlap():
     control = torch.tensor([[[0.0, 1.0], [0.0, 0.0]]])
     valid = matched_control_is_valid(selected, control, torch.tensor([True]), torch.tensor([True]), torch.tensor([True]))
     assert valid.item() is True
+
+
+def test_deterministic_control_is_not_selected_from_lowest_attention_scores():
+    class Fields:
+        part_count = torch.tensor([1])
+
+    class Model:
+        evidence_fields = Fields()
+        evidence_schema = [{"sector": "center"}]
+
+    selected = torch.zeros(45, 80)
+    selected[20, 35] = 1.0
+    first = selected.clone()
+    second = selected.clone()
+    allowed = torch.zeros_like(selected, dtype=torch.bool)
+    allowed[12:, 24:56] = True
+    candidate = torch.where(allowed.flatten() & ~(selected.flatten() > 0.5))[0]
+    first.flatten()[candidate] = torch.linspace(0.0, 0.4, candidate.numel())
+    second.flatten()[candidate] = torch.linspace(0.4, 0.0, candidate.numel())
+
+    def output(mask):
+        return {
+            "evidence_part_coordinates": torch.tensor([[[[0.44, 0.45]]]]),
+            "evidence_masks": mask.view(1, 1, 45, 80),
+            "evidence_source_tokens": torch.arange(3600.0).view(1, 3600, 1),
+        }
+
+    args = (Model(), torch.tensor([0]), torch.tensor([0]), 0.05)
+    _, first_mask, first_coordinates, first_valid = _candidate_control(args[0], output(first), *args[1:], deterministic=True)
+    _, second_mask, second_coordinates, second_valid = _candidate_control(args[0], output(second), *args[1:], deterministic=True)
+    assert first_valid.item() and second_valid.item()
+    assert torch.equal(first_mask, second_mask)
+    assert torch.equal(first_coordinates, second_coordinates)
 
 
 def test_wrong_target_candidates_are_incompatible_with_selected_evidence_family():
