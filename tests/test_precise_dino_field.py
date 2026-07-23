@@ -1,4 +1,5 @@
 import torch
+import vision_transformer as vits
 
 from fate_oia.models.precise_dino_field import PRECISEDinoFieldExtractor
 
@@ -30,3 +31,25 @@ def test_frozen_dino_remains_eval_when_parent_enters_train_mode():
     model.train()
     assert model.training is False
     assert model.dino.training is False
+
+
+def test_real_dino_loader_requires_exact_official_state_and_records_identity(tmp_path):
+    reference = vits.vit_small(patch_size=8, num_classes=0)
+    path = tmp_path / "official.pth"
+    torch.save(reference.state_dict(), path)
+    model = PRECISEDinoFieldExtractor(pretrained_weights=str(path))
+    assert len(model.loaded_state_keys) == len(reference.state_dict())
+    assert model.missing_keys == ()
+    assert model.unexpected_keys == ()
+    assert len(model.pretrained_weights_sha256) == 64
+
+    broken = dict(reference.state_dict())
+    broken.pop(next(iter(broken)))
+    broken_path = tmp_path / "broken.pth"
+    torch.save(broken, broken_path)
+    try:
+        PRECISEDinoFieldExtractor(pretrained_weights=str(broken_path))
+    except RuntimeError as error:
+        assert "exactly match" in str(error)
+    else:
+        raise AssertionError("incomplete DINO weights were silently accepted")

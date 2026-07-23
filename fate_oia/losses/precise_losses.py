@@ -4,6 +4,61 @@ import torch
 from torch.nn import functional as F
 
 
+def _soft_erode(mask: torch.Tensor) -> torch.Tensor:
+    return -F.max_pool2d(-mask, kernel_size=3, stride=1, padding=1)
+
+
+def _soft_dilate(mask: torch.Tensor) -> torch.Tensor:
+    return F.max_pool2d(mask, kernel_size=3, stride=1, padding=1)
+
+
+def _soft_skeleton(mask: torch.Tensor, iterations: int = 12) -> torch.Tensor:
+    opened = _soft_dilate(_soft_erode(mask))
+    skeleton = F.relu(mask - opened)
+    eroded = mask
+    for _ in range(iterations):
+        eroded = _soft_erode(eroded)
+        opened = _soft_dilate(_soft_erode(eroded))
+        delta = F.relu(eroded - opened)
+        skeleton = skeleton + F.relu(delta - skeleton * delta)
+    return skeleton
+
+
+def _soft_cldice_per_map(predicted: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    pred_skeleton = _soft_skeleton(predicted)
+    target_skeleton = _soft_skeleton(target)
+    topology_precision = (pred_skeleton * target).sum((-1, -2)) / pred_skeleton.sum((-1, -2)).clamp_min(1e-6)
+    topology_sensitivity = (target_skeleton * predicted).sum((-1, -2)) / target_skeleton.sum((-1, -2)).clamp_min(1e-6)
+    return 1.0 - (2.0 * topology_precision * topology_sensitivity) / (topology_precision + topology_sensitivity).clamp_min(1e-6)
+
+
+def _soft_cldice_loss(predicted: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    return _soft_cldice_per_map(predicted, target).mean()
+
+
+def _soft_distance_to_foreground(mask: torch.Tensor, iterations: int = 16) -> torch.Tensor:
+    covered = mask.clamp(0.0, 1.0)
+    distance = torch.zeros_like(mask)
+    for step in range(1, iterations + 1):
+        expanded = _soft_dilate(covered)
+        ring = F.relu(expanded - covered)
+        distance = distance + float(step) * ring
+        covered = expanded
+    return distance + float(iterations + 1) * (1.0 - covered)
+
+
+def _symmetric_soft_distance_transform_per_map(predicted: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    target_distance = _soft_distance_to_foreground(target.detach())
+    predicted_distance = _soft_distance_to_foreground(predicted)
+    pred_to_target = (predicted * target_distance).sum((-1, -2)) / predicted.sum((-1, -2)).clamp_min(1e-6)
+    target_to_pred = (target * predicted_distance).sum((-1, -2)) / target.sum((-1, -2)).clamp_min(1e-6)
+    return pred_to_target + target_to_pred
+
+
+def _symmetric_soft_distance_transform_loss(predicted: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    return _symmetric_soft_distance_transform_per_map(predicted, target).mean()
+
+
 def asymmetric_multilabel_loss(logits: torch.Tensor, targets: torch.Tensor, weight: torch.Tensor | None = None, gamma_negative: float = 2.0, gamma_positive: float = 0.0) -> torch.Tensor:
     targets = targets.float()
     probs = torch.sigmoid(logits)
@@ -77,8 +132,10 @@ def evidence_loss(evidence: dict[str, torch.Tensor], targets: dict[str, torch.Te
     presence_value = ((presence + 0.3 * observability) * valid.float()).sum() / valid.float().sum().clamp_min(1.0)
     state_valid = targets.get("state_valid", torch.zeros_like(valid)).float()
     state_target = targets.get("state", evidence["state_logits"].detach() * 0.0)
-    state_raw = F.binary_cross_entropy_with_logits(evidence["state_logits"], state_target.float(), reduction="none").mean(-1)
-    state_value = (state_raw * state_valid).sum() / state_valid.sum().clamp_min(1.0)
+    state_channel_valid = evidence["state_channel_valid"].to(anchor).view(1, *evidence["state_channel_valid"].shape)
+    state_raw = F.binary_cross_entropy_with_logits(evidence["state_logits"], state_target.float(), reduction="none")
+    state_mask = state_channel_valid * state_valid.unsqueeze(-1)
+    state_value = (state_raw * state_mask).sum() / state_mask.sum().clamp_min(1.0)
     part_valid = targets.get("part_valid", torch.zeros_like(valid)).float()
     part_target = targets.get("part_coordinates", evidence["part_coordinates"].detach())
     part_mask = evidence["part_valid"].to(anchor).view(1, *evidence["part_valid"].shape)
@@ -101,27 +158,19 @@ def evidence_loss(evidence: dict[str, torch.Tensor], targets: dict[str, torch.Te
     # Probability-space BCE is intentionally local FP32: PyTorch forbids
     # BCELoss under autocast, while the rest of PRECISE remains bf16.
     with torch.autocast(device_type=anchor.device.type, enabled=False):
-        focal = F.binary_cross_entropy(predicted_masks, target_masks, reduction="none") * (predicted_masks - target_masks).abs().pow(2)
-    focal = (focal.mean((-1, -2)) * point).sum() / point.sum().clamp_min(1.0)
+        mask_bce = F.binary_cross_entropy(predicted_masks, target_masks, reduction="none")
+        focal_map = (mask_bce * (predicted_masks - target_masks).abs().pow(2)).mean((-1, -2))
+        curve_bce_map = mask_bce.mean((-1, -2))
+    focal = (focal_map * point).sum() / point.sum().clamp_min(1.0)
     intersection = (predicted_masks * target_masks).sum((-1, -2))
     dice = 1.0 - (2.0 * intersection + 1e-5) / (predicted_masks.sum((-1, -2)) + target_masks.sum((-1, -2)) + 1e-5)
     region_dice = (dice * region).sum() / region.sum().clamp_min(1.0)
-    pred_dx = predicted_masks[..., 1:] - predicted_masks[..., :-1]
-    target_dx = target_masks[..., 1:] - target_masks[..., :-1]
-    pred_dy = predicted_masks[..., 1:, :] - predicted_masks[..., :-1, :]
-    target_dy = target_masks[..., 1:, :] - target_masks[..., :-1, :]
-    cldice = (pred_dx - target_dx).abs().mean((-1, -2)) + (pred_dy - target_dy).abs().mean((-1, -2))
-    cldice = (cldice * curve).sum() / curve.sum().clamp_min(1.0)
-    curve_indices = torch.where(evidence["geometry_type"] == 2)[0]
-    curve_distance = zero
-    if curve_indices.numel() > 0:
-        predicted_curve = evidence["part_coordinates"][:, curve_indices]
-        target_curve = part_target[:, curve_indices].float()
-        distances = torch.cdist(predicted_curve.flatten(0, 1), target_curve.flatten(0, 1))
-        symmetric = distances.min(-1).values.mean(-1) + distances.min(-2).values.mean(-1)
-        curve_valid = part_valid[:, curve_indices].flatten()
-        curve_distance = (symmetric * curve_valid).sum() / curve_valid.sum().clamp_min(1.0)
-    geometry_value = coordinate_value + scale_value + focal + region_dice + cldice + curve_distance
+    curve_bce = (curve_bce_map * curve).sum() / curve.sum().clamp_min(1.0)
+    cldice_map = _soft_cldice_per_map(predicted_masks, target_masks)
+    cldice = (cldice_map * curve).sum() / curve.sum().clamp_min(1.0)
+    curve_distance_map = _symmetric_soft_distance_transform_per_map(predicted_masks, target_masks)
+    curve_distance = (curve_distance_map * curve).sum() / curve.sum().clamp_min(1.0)
+    geometry_value = coordinate_value + scale_value + focal + region_dice + curve_bce + cldice + curve_distance
     margin = evidence["prototype_margin"]
     prototype_raw = presence_target.float() * F.softplus(-margin) + (1.0 - presence_target.float()) * F.softplus(margin)
     prototype_value = (prototype_raw * valid.float()).sum() / valid.float().sum().clamp_min(1.0)
@@ -151,6 +200,6 @@ def total_precise_losses(output: dict[str, torch.Tensor], action_targets: torch.
     reason_semantic = asymmetric_multilabel_loss(output["reason_logits_semantic"], reason_targets, reason_weight)
     reason_direct = asymmetric_multilabel_loss(output["reason_logits_direct"], reason_targets)
     reason_observed = asymmetric_multilabel_loss(output["reason_logits_observed"], reason_targets)
-    evidence = evidence_loss({"presence_logits": output["evidence_presence_logits"], "observability_logits": output["evidence_observability_logits"], "state_logits": output["evidence_state_logits"], "part_coordinates": output["evidence_part_coordinates"], "part_scales": output["evidence_part_scales"], "soft_masks": output["evidence_masks"], "prototype_margin": output["evidence_prototype_margin"], "latent_tokens": output["latent_evidence_tokens"], "part_valid": output["evidence_part_valid"], "geometry_type": output["evidence_geometry_type"]}, evidence_targets)
+    evidence = evidence_loss({"presence_logits": output["evidence_presence_logits"], "observability_logits": output["evidence_observability_logits"], "state_logits": output["evidence_state_logits"], "state_channel_valid": output["evidence_state_channel_valid"], "part_coordinates": output["evidence_part_coordinates"], "part_scales": output["evidence_part_scales"], "soft_masks": output["evidence_masks"], "prototype_margin": output["evidence_prototype_margin"], "latent_tokens": output["latent_evidence_tokens"], "part_valid": output["evidence_part_valid"], "geometry_type": output["evidence_geometry_type"]}, evidence_targets)
     total = action_final + 0.5 * action_direct + reason_semantic + 0.5 * reason_direct + reason_observed + 0.15 * evidence["loss_evidence"] + 0.15 * 0.02 * evidence["loss_evidence_latent_diversity"]
     return {"loss_total": total, "loss_action_final": action_final, "loss_action_direct": action_direct, "loss_reason_semantic": reason_semantic, "loss_reason_direct": reason_direct, "loss_reason_observed": reason_observed, **evidence}

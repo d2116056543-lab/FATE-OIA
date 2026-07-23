@@ -1,5 +1,7 @@
 from pathlib import Path
 
+from fate_oia.engine.supervise_precise_oia_foreground import selected_runtime_args
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -20,7 +22,7 @@ def test_supervisor_profiles_real_complete_path_before_preflight_audit():
 
 def test_review_gate_verification_checks_status_source_tree_and_pilot_checks():
     source = (ROOT / "fate_oia" / "engine" / "supervise_precise_oia_foreground.py").read_text(encoding="utf-8")
-    for required in ("expected_status", "source_tree_sha256", "functional_checks", "pilot_checks"):
+    for required in ("expected_status", "source_tree_sha256", "functional_checks", "pilot_checks", "pretrained_weights_sha256", "action_schema_sha256"):
         assert required in source
     assert 'expected_status="FULL_TRAIN_READY"' in source
 
@@ -30,3 +32,9 @@ def test_supervisor_rejects_stale_or_mixed_pilot_directory_and_uses_profile_sele
     assert "assert_fresh_run_dir" in source
     assert "selected_runtime_profile.json" in source
     assert "epochs != 3" in source
+
+
+def test_supervisor_consumes_the_exact_runtime_profile_schema(tmp_path):
+    profile = tmp_path / "selected.json"
+    profile.write_text('{"valid": true, "batch_size": 8, "grad_accum": 4}', encoding="utf-8")
+    assert selected_runtime_args(profile, 1, 1) == (8, 4)

@@ -150,7 +150,8 @@ def _profile_one(config: dict[str, Any], args: argparse.Namespace, dataset, adap
         owner_gradient_matrix["threshold"]["threshold_head"] > 0.0,
         owner_gradient_matrix["intervention"]["evidence_core"] > 0.0,
     ))
-    profile = {"batch_size": batch_size, "grad_accum": accum, "workers": int(config["training"]["num_workers"]), "warmup_steps": args.warmup_steps, "measure_steps": measured, "samples_per_sec": total_images / elapsed if measured else 0.0, "peak_reserved_gb": peak, "dino_call_count": 1 if core else 0, "core_mechanisms_enabled": core, "valid": bool(valid and measured == args.measure_steps and core), "failure_reason": reason, "forward_shapes": forward_shapes, "gradient_firewall": firewall_report, "gradient_firewall_passed": bool(non_annotation) and all(float(value) == 0.0 for value in non_annotation.values()), "owner_gradient_matrix": owner_gradient_matrix, "owner_gradient_matrix_passed": evidence_isolated and observed_isolated and threshold_isolated and expected_active, "curve_distance_valid_count": float(losses.get("curve_distance_valid_count", torch.tensor(0.0)).detach().item()) if 'losses' in locals() else 0.0}
+    exact_dino = len(model.dino.loaded_state_keys) > 0 and not model.dino.missing_keys and not model.dino.unexpected_keys
+    profile = {"batch_size": batch_size, "grad_accum": accum, "workers": int(config["training"]["num_workers"]), "warmup_steps": args.warmup_steps, "measure_steps": measured, "samples_per_sec": total_images / elapsed if measured else 0.0, "peak_reserved_gb": peak, "dino_call_count": 1 if core else 0, "dino_weights_sha256": model.dino.pretrained_weights_sha256, "dino_loaded_state_key_count": len(model.dino.loaded_state_keys), "dino_missing_keys": list(model.dino.missing_keys), "dino_unexpected_keys": list(model.dino.unexpected_keys), "core_mechanisms_enabled": core, "valid": bool(valid and measured == args.measure_steps and core and exact_dino), "failure_reason": reason, "forward_shapes": forward_shapes, "gradient_firewall": firewall_report, "gradient_firewall_passed": bool(non_annotation) and all(float(value) == 0.0 for value in non_annotation.values()), "owner_gradient_matrix": owner_gradient_matrix, "owner_gradient_matrix_passed": evidence_isolated and observed_isolated and threshold_isolated and expected_active, "curve_distance_valid_count": float(losses.get("curve_distance_valid_count", torch.tensor(0.0)).detach().item()) if 'losses' in locals() else 0.0}
     del model, optimizers, loader
     gc.collect()
     if device.type == "cuda":
@@ -193,6 +194,10 @@ def main() -> None:
         "forward_shapes": selected["forward_shapes"],
         "git_head": selected["git_head"],
         "config_sha256": selected["config_sha256"],
+        "dino_weights_sha256": selected["dino_weights_sha256"],
+        "dino_loaded_state_key_count": selected["dino_loaded_state_key_count"],
+        "dino_missing_keys": selected["dino_missing_keys"],
+        "dino_unexpected_keys": selected["dino_unexpected_keys"],
     }
     (root.parent / "real_forward.json").write_text(json.dumps(real_forward, indent=2), encoding="utf-8")
 

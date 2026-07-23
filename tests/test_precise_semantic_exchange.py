@@ -37,3 +37,16 @@ def test_wrong_target_ratio_uses_action_reason_groups_not_min_max_weights():
     output = model(torch.randn(2, 4, 384), torch.randn(2, 21, 384), torch.randn(2, 10, 384), torch.full((2, 10), 0.7))
     expected = output["wrong_target_message_mass"] / output["correct_target_message_mass"].clamp_min(1e-8)
     assert torch.allclose(output["wrong_target_message_ratio"], expected)
+
+
+def test_noncertifiable_and_incompatible_reasons_cannot_enter_action_exchange():
+    model = _model()
+    output = model(
+        torch.randn(2, 4, 384), torch.randn(2, 21, 384),
+        torch.randn(2, 10, 384), torch.full((2, 10), 0.7),
+    )
+    certifiable = model.reason_explicit_certifiable
+    allowed = model.action_reason_compatibility & certifiable.view(1, -1)
+    assert torch.equal(output["reason_evidence_attention"][:, ~certifiable], torch.zeros_like(output["reason_evidence_attention"][:, ~certifiable]))
+    assert torch.equal(output["action_reason_weights"].masked_select(~allowed.view(1, 4, 21)), torch.zeros_like(output["action_reason_weights"].masked_select(~allowed.view(1, 4, 21))))
+    assert float(output["wrong_target_message_mass"]) == 0.0

@@ -31,6 +31,7 @@ class PRECISESemanticExchange(nn.Module):
         self.reason_pair = nn.Linear(dim, dim, bias=False)
         self.register_buffer("family_mask_action", self._action_mask())
         self.register_buffer("family_mask_reason", self._reason_mask())
+        self.register_buffer("reason_explicit_certifiable", torch.tensor([bool(row["explicit_certifiable"]) for row in reason_schema], dtype=torch.bool))
         compatibility = torch.zeros(4, 21, dtype=torch.bool)
         compatibility[0, 0:3] = True
         compatibility[1, 3:9] = True
@@ -43,7 +44,10 @@ class PRECISESemanticExchange(nn.Module):
         return torch.tensor([[field["family"] in allowed for field in self.fields] for allowed in action_families], dtype=torch.bool)
 
     def _reason_mask(self) -> torch.Tensor:
-        return torch.tensor([[field["family"] in set(row["allowed_evidence_families"]) for field in self.fields] for row in self.reason_schema], dtype=torch.bool)
+        return torch.tensor([
+            [bool(row["explicit_certifiable"]) and field["family"] in set(row["allowed_evidence_families"]) for field in self.fields]
+            for row in self.reason_schema
+        ], dtype=torch.bool)
 
     def _attention(self, tokens: torch.Tensor, query: nn.Linear, mask: torch.Tensor, evidence: torch.Tensor, reliability: torch.Tensor) -> torch.Tensor:
         logits = torch.einsum("bcd,bed->bce", query(tokens), self.evidence_key(evidence)) / (tokens.shape[-1] ** 0.5)
@@ -73,8 +77,9 @@ class PRECISESemanticExchange(nn.Module):
             action_certificate = torch.zeros_like(action_certificate)
             reason_certificate = torch.zeros_like(reason_certificate)
         reason_scores = torch.einsum("bad,brd->bar", self.action_pair(action_tokens), self.reason_pair(reasons.detach())) / (action_tokens.shape[-1] ** 0.5)
-        action_weights = torch.softmax(reason_scores + action_certificate.clamp_min(1e-8).log(), dim=-1) * action_certificate
-        compatible = self.action_reason_compatibility.view(1, 4, 21)
+        compatible = (self.action_reason_compatibility & self.reason_explicit_certifiable.view(1, -1)).view(1, 4, 21)
+        action_logits = reason_scores + action_certificate.clamp_min(1e-8).log()
+        action_weights = torch.softmax(action_logits.masked_fill(~compatible, -torch.inf), dim=-1) * action_certificate * compatible
         correct_mass = action_weights.masked_fill(~compatible, 0.0).sum(-1).mean()
         wrong_mass = action_weights.masked_fill(compatible, 0.0).sum(-1).mean()
         action_message = torch.einsum("bar,brd->bad", action_weights, self.reason_value(reasons.detach()))
@@ -90,6 +95,7 @@ class PRECISESemanticExchange(nn.Module):
             "exchange_gate": action_gate,
             "action_exchange_delta": action_delta,
             "reason_exchange_delta": reason_delta,
+            "action_reason_weights": action_weights,
             "action_reason_message_norm": action_message.norm(dim=-1).mean(),
             "reason_action_message_norm": reason_message.norm(dim=-1).mean(),
             "correct_target_message_mass": correct_mass,

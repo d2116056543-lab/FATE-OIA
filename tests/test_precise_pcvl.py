@@ -2,7 +2,7 @@ from pathlib import Path
 
 import torch
 
-from fate_oia.engine.run_precise_pcvl import build_oracle_structured_evidence
+from fate_oia.engine.run_precise_pcvl import build_oracle_structured_evidence, train_pcvl_step
 
 from fate_oia.models.precise_pcvl_probes import PRECISEPCVLProbes
 
@@ -42,6 +42,50 @@ def test_pcvl_oracle_is_constructed_from_train_only_structured_targets():
     assert not torch.equal(oracle[0, 0], oracle[0, 1])
 
 
+def test_pcvl_oracle_ignores_padded_part_coordinates_and_scales():
+    targets = {
+        "presence": torch.ones(1, 1), "presence_valid": torch.ones(1, 1),
+        "observability": torch.ones(1, 1), "state": torch.zeros(1, 1, 2),
+        "state_valid": torch.ones(1, 1), "part_valid": torch.ones(1, 1),
+        "part_coordinates": torch.tensor([[[[0.25, 0.75], [0.0, 0.0], [0.0, 0.0]]]]),
+        "part_scales": torch.tensor([[[[0.10, 0.20], [0.0, 0.0], [0.0, 0.0]]]]),
+        "soft_masks": torch.zeros(1, 1, 2, 2),
+    }
+    changed_padding = {key: value.clone() for key, value in targets.items()}
+    changed_padding["part_coordinates"][0, 0, 1:] = torch.tensor([[0.9, 0.1], [0.7, 0.3]])
+    reference = torch.randn(1, 1, 32)
+    first = build_oracle_structured_evidence(targets, reference)
+    second = build_oracle_structured_evidence(changed_padding, reference)
+    assert torch.equal(first, second)
+
+
 def test_pcvl_pilot_records_optimizer_steps_for_gate_validation():
     source = (Path(__file__).resolve().parents[1] / "fate_oia" / "engine" / "train_precise_oia.py").read_text(encoding="utf-8")
     assert "pcvl_optimizer_step_count" in source
+
+
+def test_pcvl_reports_learned_evidence_and_exchange_value_not_only_oracle_value():
+    source = (Path(__file__).resolve().parents[1] / "fate_oia" / "engine" / "run_precise_pcvl.py").read_text(encoding="utf-8")
+    assert '"delta_learned_value"' in source
+    assert '"delta_learned_interaction"' in source
+
+
+def test_pcvl_step_reports_real_gradient_and_parameter_delta():
+    probes = PRECISEPCVLProbes(dim=16)
+    optimizer = torch.optim.AdamW(probes.parameters(), lr=1e-3)
+    output = {
+        "action_tokens_direct": torch.randn(2, 4, 16),
+        "explicit_evidence_tokens": torch.randn(2, 10, 16),
+        "action_evidence_family_mask": torch.ones(4, 10, dtype=torch.bool),
+        "action_exchange_delta": torch.randn(2, 4, 16),
+    }
+    structured = {
+        "presence": torch.ones(2, 10), "presence_valid": torch.ones(2, 10),
+        "observability": torch.ones(2, 10), "state_valid": torch.ones(2, 10),
+        "state": torch.zeros(2, 10, 4), "part_valid": torch.ones(2, 10),
+        "part_coordinates": torch.rand(2, 10, 4, 2), "part_scales": torch.rand(2, 10, 4, 2),
+        "soft_masks": torch.rand(2, 10, 4, 4),
+    }
+    result = train_pcvl_step(probes, optimizer, output, structured, torch.randint(0, 2, (2, 4)).float())
+    assert result["grad_norm"] > 0
+    assert result["parameter_delta_norm"] > 0

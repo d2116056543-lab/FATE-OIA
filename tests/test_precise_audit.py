@@ -38,4 +38,18 @@ def test_pilot_gate_covers_every_plan_defined_runtime_and_mechanism_requirement(
         "annotation_delta_nonzero",
         "pcvl_artifacts_complete",
         "pcvl_predicate_action_value_supported",
+        "pcvl_learned_evidence_supported",
+        "pcvl_learned_exchange_supported",
     }.issubset(REQUIRED_PILOT_CHECKS)
+
+
+def test_selected_control_gate_reads_heldout_epoch_metrics_not_train_batches():
+    source = (Path(__file__).resolve().parents[1] / "fate_oia" / "engine" / "audit_precise_oia_implementation.py").read_text(encoding="utf-8")
+    assert 'latest_metrics.get("counterfactual", {})' in source
+    assert 'heldout_counterfactual.get("selected_control_margin"' in source
+
+
+def test_epoch_artifact_gate_loads_and_validates_tensor_contents():
+    source = (Path(__file__).resolve().parents[1] / "fate_oia" / "engine" / "audit_precise_oia_implementation.py").read_text(encoding="utf-8")
+    for token in ("torch.load", "torch.isfinite", "expected_samples", "file_names.json"):
+        assert token in source

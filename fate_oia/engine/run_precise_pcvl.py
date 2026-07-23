@@ -26,8 +26,16 @@ def build_oracle_structured_evidence(
     state_valid = structured_targets.get("state_valid", valid).to(learned_evidence).float()
     state = structured_targets["state"].to(learned_evidence).float() * state_valid.unsqueeze(-1)
     geometry_valid = structured_targets.get("part_valid", presence * valid).to(learned_evidence).float() * presence * valid
-    coordinates = structured_targets["part_coordinates"].to(learned_evidence).float().mean(-2) * geometry_valid.unsqueeze(-1)
-    scales = structured_targets.get("part_scales", torch.zeros_like(structured_targets["part_coordinates"])).to(learned_evidence).float().mean(-2) * geometry_valid.unsqueeze(-1)
+    raw_coordinates = structured_targets["part_coordinates"].to(learned_evidence).float()
+    raw_scales = structured_targets.get("part_scales", torch.zeros_like(structured_targets["part_coordinates"])).to(learned_evidence).float()
+    # Batch collation pads heterogeneous fields to the largest part count.
+    # Scale is zero only for padded slots, so it is the stable per-part mask.
+    part_mask = raw_scales.abs().sum(-1) > 0
+    part_count = part_mask.sum(-1, keepdim=True).clamp_min(1).to(raw_coordinates)
+    coordinates = (raw_coordinates * part_mask.unsqueeze(-1)).sum(-2) / part_count
+    scales = (raw_scales * part_mask.unsqueeze(-1)).sum(-2) / part_count
+    coordinates = coordinates * geometry_valid.unsqueeze(-1)
+    scales = scales * geometry_valid.unsqueeze(-1)
     masks = structured_targets.get("soft_masks")
     if masks is None:
         mask_stats = learned_evidence.new_zeros(*presence.shape, 3)
@@ -58,13 +66,18 @@ def train_pcvl_step(
     output: dict[str, torch.Tensor],
     structured_targets: dict[str, torch.Tensor],
     action_targets: torch.Tensor,
-) -> float:
+) -> dict[str, float]:
     logits = probes(*pcvl_inputs(output, structured_targets))
     loss = sum(F.binary_cross_entropy_with_logits(value, action_targets.float()) for value in logits.values())
     optimizer.zero_grad(set_to_none=True)
+    before = [parameter.detach().clone() for parameter in probes.parameters()]
     loss.backward()
+    gradients = [parameter.grad.detach().norm() for parameter in probes.parameters() if parameter.grad is not None]
+    grad_norm = torch.stack(gradients).norm() if gradients else loss.new_zeros(())
     optimizer.step()
-    return float(loss.detach().item())
+    deltas = [(parameter.detach() - old).norm() for parameter, old in zip(probes.parameters(), before)]
+    delta_norm = torch.stack(deltas).norm() if deltas else loss.new_zeros(())
+    return {"loss": float(loss.detach()), "grad_norm": float(grad_norm), "parameter_delta_norm": float(delta_norm)}
 
 
 def _average_precision(probabilities: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
@@ -112,6 +125,8 @@ def evaluate_pcvl(
         "delta_value": metrics["u1_action_map"] - metrics["u0_action_map"],
         "delta_measurement": metrics["u2_action_map"] - metrics["u1_action_map"],
         "delta_interaction": metrics["u3_action_map"] - metrics["u2_action_map"],
+        "delta_learned_value": metrics["u2_action_map"] - metrics["u0_action_map"],
+        "delta_learned_interaction": metrics["u3_action_map"] - metrics["u2_action_map"],
     }
     metrics["predicate_action_value_supported"] = bool(decomposition["delta_value"] > 0.0)
     root = Path(output_dir)
@@ -129,9 +144,11 @@ def evaluate_pcvl(
             "delta_value": sampled_map["u1"] - sampled_map["u0"],
             "delta_measurement": sampled_map["u2"] - sampled_map["u1"],
             "delta_interaction": sampled_map["u3"] - sampled_map["u2"],
+            "delta_learned_value": sampled_map["u2"] - sampled_map["u0"],
+            "delta_learned_interaction": sampled_map["u3"] - sampled_map["u2"],
         })
     bootstrap = {}
-    for name in ("delta_value", "delta_measurement", "delta_interaction"):
+    for name in ("delta_value", "delta_measurement", "delta_interaction", "delta_learned_value", "delta_learned_interaction"):
         values = torch.tensor([row[name] for row in bootstrap_rows])
         bootstrap[name] = {
             "mean": float(values.mean()),

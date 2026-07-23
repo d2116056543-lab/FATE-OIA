@@ -41,13 +41,16 @@ def _empty_task_result(base_logits: torch.Tensor) -> dict[str, torch.Tensor]:
     return {"loss_intervention": zero, "selected_effect_mean": zero.detach(), "control_effect_mean": zero.detach(), "wrong_effect_mean": zero.detach(), "pair_count": zero.detach(), "hard_rate": zero.detach(), "easy_rate": zero.detach(), "sign_agreement": zero.detach(), "per_target_count": per_target, "per_target_selected_sum": per_target.clone(), "per_target_control_sum": per_target.clone(), "per_target_wrong_sum": per_target.clone(), "per_target_sign_sum": per_target.clone()}
 
 
-def balanced_positive_pairs(targets: torch.Tensor, max_pairs: int) -> torch.Tensor:
+def balanced_positive_pairs(targets: torch.Tensor, max_pairs: int, deterministic: bool = False) -> torch.Tensor:
     """Sample positives round-robin by target instead of truncating row-major indices."""
     pools = []
     for target in range(targets.shape[1]):
         samples = torch.where(targets[:, target] > 0)[0]
         if samples.numel():
-            samples = samples[torch.randperm(samples.numel(), device=samples.device)]
+            if deterministic:
+                samples = samples.sort().values
+            else:
+                samples = samples[torch.randperm(samples.numel(), device=samples.device)]
             pools.append(torch.stack([samples, torch.full_like(samples, target)], dim=1))
     selected = []
     round_index = 0
@@ -121,10 +124,10 @@ def _candidate_control(
     return control_token, control_mask, control_coordinates, valid
 
 
-def _task_intervention(model, output, targets: torch.Tensor, task: str, max_pairs: int, margin: float, control_tolerance: float) -> dict[str, torch.Tensor]:
+def _task_intervention(model, output, targets: torch.Tensor, task: str, max_pairs: int, margin: float, control_tolerance: float, deterministic: bool = False) -> dict[str, torch.Tensor]:
     attention = output[f"{task}_evidence_attention"]
     base_logits = output["action_logits_final_raw" if task == "action" else "reason_logits_semantic"]
-    positive = balanced_positive_pairs(targets.float(), max_pairs)
+    positive = balanced_positive_pairs(targets.float(), max_pairs, deterministic=deterministic)
     if positive.numel() == 0:
         return _empty_task_result(base_logits)
     sample_index, target_index = positive[:, 0], positive[:, 1]
@@ -135,6 +138,8 @@ def _task_intervention(model, output, targets: torch.Tensor, task: str, max_pair
     selected_evidence = explicit.clone()
     selected_reliability = reliability.clone()
     rows = torch.arange(len(positive), device=explicit.device)
+    selected_field_enabled = torch.ones(explicit.shape[:2], dtype=torch.bool, device=explicit.device)
+    selected_field_enabled[rows, field_index] = False
     selected_evidence[rows, field_index] = 0.0
     selected_reliability[rows, field_index] = 0.0
 
@@ -148,6 +153,7 @@ def _task_intervention(model, output, targets: torch.Tensor, task: str, max_pair
     reliability = reliability[valid_control]
     selected_evidence = selected_evidence[valid_control]
     selected_reliability = selected_reliability[valid_control]
+    selected_field_enabled = selected_field_enabled[valid_control]
     control_token = control_token[valid_control]
     control_coordinates = control_coordinates[valid_control]
     rows = torch.arange(len(sample_index), device=explicit.device)
@@ -163,7 +169,7 @@ def _task_intervention(model, output, targets: torch.Tensor, task: str, max_pair
         output["action_field_layers"][sample_index], output["reason_field_layers"][sample_index],
         output["action_logits_direct"][sample_index], output["reason_logits_direct"][sample_index],
     )
-    selected = model.decode_cached_intervention(*common, selected_evidence, selected_reliability, coordinates, output["evidence_part_valid"], latent_delta)[f"{task}_logits"]
+    selected = model.decode_cached_intervention(*common, selected_evidence, selected_reliability, coordinates, output["evidence_part_valid"], latent_delta, field_enabled=selected_field_enabled)[f"{task}_logits"]
     control = model.decode_cached_intervention(*common, control_evidence, reliability, control_part_coordinates, output["evidence_part_valid"], latent_delta)[f"{task}_logits"]
     base = base_logits[sample_index]
     selected_effect = base[rows, target_index] - selected[rows, target_index]
@@ -197,12 +203,12 @@ def _task_intervention(model, output, targets: torch.Tensor, task: str, max_pair
     return {**loss, "selected_effect_mean": selected_effect.detach().mean(), "control_effect_mean": control_effect.detach().mean(), "wrong_effect_mean": wrong_effect.detach().mean(), "pair_count": torch.tensor(float(sample_index.numel()), device=base.device), "hard_rate": hard_rate.detach(), "easy_rate": easy_rate.detach(), "sign_agreement": sign.mean(), "per_target_count": count, "per_target_selected_sum": selected_sum, "per_target_control_sum": control_sum, "per_target_wrong_sum": wrong_sum, "per_target_sign_sum": sign_sum}
 
 
-def packed_target_specific_interventions(model, output, action_targets: torch.Tensor, reason_targets: torch.Tensor, max_pairs: int = 24, margin: float | None = None, control_tolerance: float | None = None) -> dict[str, torch.Tensor]:
+def packed_target_specific_interventions(model, output, action_targets: torch.Tensor, reason_targets: torch.Tensor, max_pairs: int = 24, margin: float | None = None, control_tolerance: float | None = None, deterministic: bool = False) -> dict[str, torch.Tensor]:
     margin = float(model.intervention_margin if margin is None else margin)
     control_tolerance = float(model.intervention_control_mass_tolerance if control_tolerance is None else control_tolerance)
     action_pairs = max_pairs // 2
-    action = _task_intervention(model, output, action_targets, "action", action_pairs, margin, control_tolerance)
-    reason = _task_intervention(model, output, reason_targets, "reason", max_pairs - action_pairs, margin, control_tolerance)
+    action = _task_intervention(model, output, action_targets, "action", action_pairs, margin, control_tolerance, deterministic)
+    reason = _task_intervention(model, output, reason_targets, "reason", max_pairs - action_pairs, margin, control_tolerance, deterministic)
     total_count = (action["pair_count"] + reason["pair_count"]).clamp_min(1.0)
     def weighted(name: str) -> torch.Tensor:
         return (action[name] * action["pair_count"] + reason[name] * reason["pair_count"]) / total_count

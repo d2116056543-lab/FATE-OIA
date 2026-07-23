@@ -13,6 +13,12 @@ def parameter_ownership(model: nn.Module) -> dict[str, list[nn.Parameter]]:
     owned = model.owned_parameters()
     if set(owned) != set(OWNER_NAMES):
         raise ValueError("PRECISE parameter ownership is incomplete")
+    flattened = [parameter for parameters in owned.values() for parameter in parameters]
+    trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    if len({id(parameter) for parameter in flattened}) != len(flattened):
+        raise ValueError("PRECISE trainable parameter belongs to multiple optimizer owners")
+    if {id(parameter) for parameter in flattened} != {id(parameter) for parameter in trainable}:
+        raise ValueError("PRECISE optimizer owners do not cover every trainable parameter exactly once")
     return owned
 
 

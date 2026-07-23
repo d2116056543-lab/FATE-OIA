@@ -60,6 +60,44 @@ def test_actor_state_is_partwise_noisy_or_and_certificate_controls_reliability()
     assert torch.all(output["reliability"] <= output["certificate_probability"] + 1e-6)
 
 
+def test_actor_type_output_follows_dynamic_active_schema_indices():
+    fields = load_evidence_fields(ROOT / "configs" / "precise_evidence_fields.yaml")
+    # Coverage preflight may disable a non-actor field, so actors are not
+    # guaranteed to remain at fixed columns 2:5.
+    fields = [field for field in fields if field["name"] != "traffic_light"]
+    model = PRECISEEvidenceFields(fields)
+    output = model(torch.randn(1, 3, 3600, 384))
+    assert torch.equal(output["type_logits_actor"], output["state_logits"][:, model.actor_indices, :4])
+
+
+def test_actor_indices_are_bound_to_left_center_right_names_not_yaml_order():
+    fields = load_evidence_fields(ROOT / "configs" / "precise_evidence_fields.yaml")
+    actors = [field for field in fields if field["family"] == "actor"]
+    others = [field for field in fields if field["family"] != "actor"]
+    reordered = others[:2] + [actors[2], actors[0], actors[1]] + others[2:]
+    model = PRECISEEvidenceFields(reordered)
+    names = [reordered[index]["name"] for index in model.actor_indices.tolist()]
+    assert names == ["actor_left", "actor_center", "actor_right"]
+
+
+def test_state_loss_ignores_schema_padding_channels():
+    fields = load_evidence_fields(ROOT / "configs" / "precise_evidence_fields.yaml")
+    model = PRECISEEvidenceFields(fields)
+    output = model(torch.randn(1, 3, 3600, 384))
+    targets = {
+        "presence": torch.ones(1, 10), "presence_valid": torch.ones(1, 10),
+        "observability": torch.ones(1, 10), "state": torch.zeros_like(output["state_logits"]),
+        "state_valid": torch.ones(1, 10), "part_coordinates": output["part_coordinates"].detach(),
+        "part_valid": torch.ones(1, 10),
+    }
+    base = evidence_loss(output, targets)["loss_evidence_state"]
+    perturbed = dict(output)
+    padded = (~output["state_channel_valid"]).view(1, *output["state_channel_valid"].shape)
+    perturbed["state_logits"] = output["state_logits"] + padded.to(output["state_logits"]) * 100.0
+    changed = evidence_loss(perturbed, targets)["loss_evidence_state"]
+    assert torch.allclose(base, changed, atol=1e-7)
+
+
 def test_evidence_loss_contains_geometry_prototype_view_and_latent_terms():
     fields = load_evidence_fields(ROOT / "configs" / "precise_evidence_fields.yaml")
     model = PRECISEEvidenceFields(fields)

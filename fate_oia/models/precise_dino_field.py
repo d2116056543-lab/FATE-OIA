@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+from pathlib import Path
 from typing import Any
 
 import torch
 from torch import nn
 
-import utils as dino_utils
 import vision_transformer as vits
 
 
@@ -28,11 +29,34 @@ class PRECISEDinoFieldExtractor(nn.Module):
         self.original_tokens = 3601
         self.dino_call_count = 0
         self.use_mock_dino = bool(use_mock_dino)
+        self.pretrained_weights_path = str(pretrained_weights)
+        self.pretrained_weights_sha256 = "mock"
+        self.loaded_state_keys: tuple[str, ...] = ()
+        self.missing_keys: tuple[str, ...] = ()
+        self.unexpected_keys: tuple[str, ...] = ()
         if self.use_mock_dino:
             self.dino = nn.Conv2d(3, 384, kernel_size=patch_size, stride=patch_size, bias=False)
         else:
             self.dino = vits.__dict__[arch](patch_size=patch_size, num_classes=0)
-            dino_utils.load_pretrained_weights(self.dino, pretrained_weights, checkpoint_key, arch, patch_size)
+            path = Path(pretrained_weights)
+            if not path.is_file():
+                raise FileNotFoundError(f"PRECISE official DINO weights are missing: {path}")
+            self.pretrained_weights_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+            payload = torch.load(path, map_location="cpu", weights_only=True)
+            if isinstance(payload, dict) and checkpoint_key in payload:
+                payload = payload[checkpoint_key]
+            if not isinstance(payload, dict) or not payload or not all(torch.is_tensor(value) for value in payload.values()):
+                raise RuntimeError("PRECISE DINO checkpoint must be an official tensor state dict or contain the configured checkpoint key")
+            state = {key.removeprefix("module.").removeprefix("backbone."): value for key, value in payload.items()}
+            incompatible = self.dino.load_state_dict(state, strict=False)
+            self.loaded_state_keys = tuple(sorted(state))
+            self.missing_keys = tuple(incompatible.missing_keys)
+            self.unexpected_keys = tuple(incompatible.unexpected_keys)
+            if self.missing_keys or self.unexpected_keys or len(state) != len(self.dino.state_dict()):
+                raise RuntimeError(
+                    "PRECISE official DINO weights must exactly match ViT-S/8; "
+                    f"missing={self.missing_keys}, unexpected={self.unexpected_keys}"
+                )
         for parameter in self.dino.parameters():
             parameter.requires_grad = False
         self.dino.eval()

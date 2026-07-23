@@ -25,6 +25,7 @@ def evaluate_precise(model: torch.nn.Module, loader: Iterable[dict[str, Any]], d
     evidence_reliability, evidence_presence, evidence_observability, evidence_coordinates = [], [], [], []
     exchange_overlap, exchange_gate, reference_points, raw_reference_points = [], [], [], []
     annotation_delta, semantic_observed_gap = [], []
+    actor_part_occupancy, actor_part_type = [], []
     counterfactual_rows = []
     case_rows: list[dict[str, Any]] = []
     for batch in loader:
@@ -45,8 +46,10 @@ def evaluate_precise(model: torch.nn.Module, loader: Iterable[dict[str, Any]], d
         raw_reference_points.append(output["raw_reference_points"].detach().cpu())
         annotation_delta.append(output["annotation_delta"].detach().cpu())
         semantic_observed_gap.append((output["reason_logits_semantic"] - output["reason_logits_observed"]).detach().cpu())
+        actor_part_occupancy.append(torch.sigmoid(output["evidence_actor_part_occupancy_logits"]).detach().cpu())
+        actor_part_type.append(torch.sigmoid(output["evidence_actor_part_type_logits"]).detach().cpu())
         if sum(int(row["count"]) for row in counterfactual_rows) < 64:
-            intervention = packed_target_specific_interventions(model, output, batch["action"].to(device), batch["reason"].to(device), max_pairs=24)
+            intervention = packed_target_specific_interventions(model, output, batch["action"].to(device), batch["reason"].to(device), max_pairs=24, deterministic=True)
             counterfactual_rows.append({"selected": float(intervention["selected_effect_mean"]), "control": float(intervention["control_effect_mean"]), "wrong": float(intervention["wrong_effect_mean"]), "count": float(intervention["intervention_pair_count"]), "sign": float(intervention["sign_agreement"]), **{key: intervention[key].detach().cpu() for key in intervention if "per_target_" in key}})
         for row_index, file_name in enumerate(batch["file_name"]):
             if len(case_rows) >= 32:
@@ -60,7 +63,7 @@ def evaluate_precise(model: torch.nn.Module, loader: Iterable[dict[str, Any]], d
             row_output = take_row(output)
             row_action = batch["action"][row_index:row_index + 1].to(device)
             row_reason = batch["reason"][row_index:row_index + 1].to(device)
-            row_intervention = packed_target_specific_interventions(model, row_output, row_action, row_reason, max_pairs=8)
+            row_intervention = packed_target_specific_interventions(model, row_output, row_action, row_reason, max_pairs=8, deterministic=True)
             row_branches = row_output["branch_logits"]
             case_rows.append({
                 "file_name": file_name,
@@ -126,6 +129,8 @@ def evaluate_precise(model: torch.nn.Module, loader: Iterable[dict[str, Any]], d
         "reference_variance": reference_tensor.var(dim=(0, 1, 2, 3), unbiased=False).tolist(),
         "annotation_delta_rms": float(annotation_tensor.square().mean().sqrt()),
         "semantic_observed_gap_rms": float(semantic_gap_tensor.square().mean().sqrt()),
+        "actor_part_occupancy_mean": torch.cat(actor_part_occupancy).mean(dim=0).tolist(),
+        "actor_part_type_mean": torch.cat(actor_part_type).mean(dim=0).tolist(),
     }
     model.train()
     return metrics, {**tensors, "labels_action": action, "labels_reason": reason, "file_names": file_names, "evidence_reliability": reliability_tensor, "evidence_presence": presence_tensor, "evidence_observability": observability_tensor, "evidence_coordinates": torch.cat(evidence_coordinates), "case_rows": case_rows}

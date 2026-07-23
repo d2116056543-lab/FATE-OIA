@@ -31,6 +31,14 @@ def test_positive_pair_budget_is_target_balanced_not_row_major_truncated():
     assert sorted(pairs[:, 1].tolist()) == [0, 1, 2, 3]
 
 
+def test_positive_pair_sampling_can_be_deterministic_for_epoch_audit():
+    targets = torch.ones(8, 4)
+    first = balanced_positive_pairs(targets, 12, deterministic=True)
+    torch.manual_seed(999)
+    second = balanced_positive_pairs(targets, 12, deterministic=True)
+    assert torch.equal(first, second)
+
+
 def test_matched_control_enforces_mass_and_nonoverlap():
     selected = torch.tensor([[[1.0, 0.0], [0.0, 0.0]]])
     control = torch.tensor([[[0.0, 1.0], [0.0, 0.0]]])
@@ -59,16 +67,19 @@ def test_packed_intervention_reuses_cached_field_and_backpropagates():
     reason[0, 3] = 1.0
     reason[1, 10] = 1.0
     calls = 0
+    enabled_masks = []
     original = model.decode_cached_intervention
     def counted(*args, **kwargs):
         nonlocal calls
         calls += 1
+        enabled_masks.append(kwargs.get("field_enabled"))
         return original(*args, **kwargs)
     model.decode_cached_intervention = counted
     losses = packed_target_specific_interventions(model, output, action, reason, max_pairs=4)
     losses["loss_intervention"].backward()
     assert model.dino.dino_call_count == calls_before
     assert calls > 0
+    assert any(mask is not None and (~mask).any() for mask in enabled_masks)
     assert 0 < losses["intervention_pair_count"].item() <= 4
     assert 0.0 <= losses["intervention_hard_rate"].item() <= 1.0
     assert 0.0 <= losses["intervention_easy_rate"].item() <= 1.0

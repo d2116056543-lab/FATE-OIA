@@ -15,7 +15,7 @@ from fate_oia.models.precise_evidence_fields import PRECISEEvidenceFields
 from fate_oia.models.precise_semantic_exchange import PRECISESemanticExchange
 from fate_oia.models.precise_visual_field import PRECISEVisualField, VisualFieldBundle
 from fate_oia.models.precise_visual_rereader import PRECISEVisualRereader
-from fate_oia.utils.precise_schema import load_evidence_fields, load_reason_semantics
+from fate_oia.utils.precise_schema import load_action_semantics, load_evidence_fields, load_reason_semantics
 
 
 class PRECISEOIAModel(nn.Module):
@@ -38,6 +38,7 @@ class PRECISEOIAModel(nn.Module):
         if dim != 384:
             raise ValueError("PRECISE V1 official DINO field dimension must remain 384")
         self.reason_schema = load_reason_semantics(root / "precise_reason_semantics.yaml")
+        self.action_schema = load_action_semantics(root / "precise_action_semantics.yaml")
         self.evidence_schema = evidence_schema if evidence_schema is not None else load_evidence_fields(root / "precise_evidence_fields.yaml")
         expected_parts = {"traffic_control": int(evidence_config.get("traffic_parts", 4)), "actor": int(evidence_config.get("actor_parts", 4)), "drivable": int(evidence_config.get("region_parts", 8)), "boundary": int(evidence_config.get("curve_parts", 8))}
         if any(int(field["num_parts"]) != expected_parts[field["family"]] for field in self.evidence_schema):
@@ -50,7 +51,7 @@ class PRECISEOIAModel(nn.Module):
             use_mock_dino=use_mock_dino,
         )
         self.visual_field = PRECISEVisualField(dim=dim, hidden=int(visual.get("adapter_hidden", 192)), local_kernel=int(visual.get("local_kernel", 3)), rezero_init=float(visual.get("rezero_init", 0.02)), context_pool_hw=tuple(visual.get("context_pool_hw", (9, 16))))
-        self.category_decoder = PRECISECategoryDecoder(self.reason_schema, dim=dim, heads=int(category.get("heads", 4)))
+        self.category_decoder = PRECISECategoryDecoder(self.reason_schema, self.action_schema, dim=dim, heads=int(category.get("heads", 4)))
         self.evidence_fields = PRECISEEvidenceFields(self.evidence_schema, dim=dim, latent_slots=int(evidence_config.get("latent_slots", 6)), latent_parts=int(evidence_config.get("latent_parts", 4)), reliability_tau=float(evidence_config.get("reliability_tau", 0.20)))
         self.rereader = PRECISEVisualRereader(dim=dim, sampling_points_per_layer=int(category.get("sampling_points_per_layer", 4)), gamma_init=float(category.get("reread_gamma_init", 0.08)), gamma_max=float(category.get("reread_gamma_max", 0.35)))
         self.exchange = PRECISESemanticExchange(self.evidence_schema, self.reason_schema, dim=dim, overlap_tau=float(exchange.get("overlap_tau", 0.08)), overlap_slope=float(exchange.get("overlap_slope", 12.0)), reliability_eps=float(exchange.get("reliability_eps", 1e-4)), action_gamma_init=float(category.get("action_exchange_gamma_init", 0.05)), reason_gamma_init=float(category.get("reason_exchange_gamma_init", 0.05)), gamma_max=float(category.get("exchange_gamma_max", 0.25)))
@@ -134,6 +135,7 @@ class PRECISEOIAModel(nn.Module):
             "evidence_presence_logits": evidence["presence_logits"],
             "evidence_observability_logits": evidence["observability_logits"],
             "evidence_state_logits": evidence["state_logits"],
+            "evidence_state_channel_valid": evidence["state_channel_valid"],
             "evidence_part_coordinates": evidence["part_coordinates"],
             "evidence_part_scales": evidence["part_scales"],
             "evidence_masks": evidence["soft_masks"],
@@ -205,12 +207,13 @@ class PRECISEOIAModel(nn.Module):
         part_coordinates: torch.Tensor,
         part_valid: torch.Tensor,
         reason_latent_delta: torch.Tensor,
+        field_enabled: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Recompute reread and exchange from cached DINO fields after evidence intervention."""
         with torch.autocast(device_type=action_tokens_direct.device.type, dtype=torch.bfloat16, enabled=action_tokens_direct.is_cuda):
             reread = self.rereader(
                 action_tokens_direct, reason_tokens_direct,
-                {"explicit_tokens": explicit_evidence, "part_coordinates": part_coordinates, "part_valid": part_valid, "reliability": reliability},
+                {"explicit_tokens": explicit_evidence, "part_coordinates": part_coordinates, "part_valid": part_valid, "reliability": reliability, "field_enabled": field_enabled},
                 action_layers, reason_layers, action_logits_direct, reason_logits_direct,
             )
             action_reread = action_tokens_direct + reread["action_reread_delta"]
@@ -227,7 +230,15 @@ class PRECISEOIAModel(nn.Module):
         visual = self.visual_field.owned_parameters()
         return {
             "action_foundation": visual["action_foundation"],
-            "action_decoder": list(self.category_decoder.action_cross.parameters()) + list(self.category_decoder.action_self.parameters()) + list(self.category_decoder.action_head.parameters()) + list(self.action_refined_head.parameters()),
+            "action_decoder": [
+                self.category_decoder.forward_query, self.category_decoder.stop_query,
+                self.category_decoder.side_shared, self.category_decoder.left_embedding,
+                self.category_decoder.right_embedding,
+                *self.category_decoder.action_cross.parameters(),
+                *self.category_decoder.action_self.parameters(),
+                *self.category_decoder.action_head.parameters(),
+                *self.action_refined_head.parameters(),
+            ],
             "reason_semantic": visual["reason_semantic"] + list(self.category_decoder.reason_cross.parameters()) + list(self.category_decoder.reason_self.parameters()) + list(self.category_decoder.reason_head.parameters()) + list(self.reason_refined_head.parameters()) + list(self.category_decoder.entity.parameters()) + list(self.category_decoder.state.parameters()) + list(self.category_decoder.sector.parameters()) + list(self.category_decoder.role.parameters()) + list(self.category_decoder.reason_residual.parameters()) + self.evidence_fields.latent_parameters() + list(self.reason_latent_query.parameters()) + list(self.reason_latent_value.parameters()) + [self.reason_latent_gamma_raw],
             "evidence_core": visual["evidence_core"] + self.evidence_fields.explicit_parameters(),
             "exchange_reread": list(self.exchange.parameters()) + list(self.rereader.parameters()),

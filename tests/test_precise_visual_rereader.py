@@ -3,6 +3,16 @@ import torch
 from fate_oia.models.precise_visual_rereader import PRECISEVisualRereader
 
 
+def test_disabled_evidence_field_cannot_receive_reread_attention():
+    rereader = PRECISEVisualRereader(dim=8, sampling_points_per_layer=2)
+    tokens = torch.randn(1, 2, 8)
+    fields = torch.randn(1, 3, 8)
+    enabled = torch.tensor([[True, False, True]])
+    attention = rereader._field_attention(tokens, fields, rereader.action_field_query, enabled)
+    assert torch.equal(attention[..., 1], torch.zeros_like(attention[..., 1]))
+    assert torch.allclose(attention.sum(-1), torch.ones_like(attention.sum(-1)))
+
+
 def _evidence(batch=2):
     coordinates = torch.rand(batch, 10, 8, 2)
     part_valid = torch.ones(10, 8, dtype=torch.bool)

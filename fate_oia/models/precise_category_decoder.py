@@ -7,9 +7,10 @@ from torch import nn
 
 
 class PRECISECategoryDecoder(nn.Module):
-    def __init__(self, reason_schema: list[dict[str, Any]], dim: int = 384, heads: int = 4) -> None:
+    def __init__(self, reason_schema: list[dict[str, Any]], action_schema: list[dict[str, Any]], dim: int = 384, heads: int = 4) -> None:
         super().__init__()
         self.reason_schema = reason_schema
+        self.action_schema = action_schema
         self.entity = nn.Embedding(len({row["entity"] for row in reason_schema}), dim)
         self.state = nn.Embedding(len({row["state"] for row in reason_schema}), dim)
         self.sector = nn.Embedding(len({row["sector"] for row in reason_schema}), dim)
@@ -36,7 +37,9 @@ class PRECISECategoryDecoder(nn.Module):
         return torch.tensor([values[row[key]] for row in self.reason_schema], dtype=torch.long)
 
     def action_queries(self) -> torch.Tensor:
-        return torch.stack([self.forward_query, self.stop_query, self.side_shared + self.left_embedding, self.side_shared + self.right_embedding])
+        base = {"forward": self.forward_query, "stop": self.stop_query, "side_shared": self.side_shared}
+        side = {"none": 0.0, "left": self.left_embedding, "right": self.right_embedding}
+        return torch.stack([base[row["query_base"]] + side[row["side_embedding"]] for row in self.action_schema])
 
     def reason_queries(self) -> torch.Tensor:
         device = self.reason_residual.weight.device

@@ -40,6 +40,7 @@ REQUIRED_PILOT_CHECKS = {
     "action_reread_ratio_in_range", "reason_reread_ratio_in_range", "reliability_noncollapsed",
     "reference_not_center_collapsed", "selected_beats_control", "evidence_shuffle_changes_reason",
     "annotation_delta_nonzero", "pcvl_artifacts_complete", "pcvl_predicate_action_value_supported",
+    "pcvl_learned_evidence_supported", "pcvl_learned_exchange_supported",
 }
 
 
@@ -124,6 +125,8 @@ def _pilot_checks(pilot_dir: Path, expected_identity: dict[str, str]) -> dict[st
     metrics = _jsonl(pilot_dir / "metrics_summary.jsonl")
     pcvl_path = pilot_dir / "pcvl" / "pcvl_metrics.json"
     pcvl = json.loads(pcvl_path.read_text(encoding="utf-8")) if pcvl_path.exists() else {}
+    bootstrap_path = pilot_dir / "pcvl" / "pcvl_bootstrap.json"
+    bootstrap = json.loads(bootstrap_path.read_text(encoding="utf-8")) if bootstrap_path.exists() else {}
     manifest_path = pilot_dir / "run_manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
     latest_mechanism = mechanism[-1] if mechanism else {}
@@ -140,21 +143,38 @@ def _pilot_checks(pilot_dir: Path, expected_identity: dict[str, str]) -> dict[st
     def median(name: str, default: float = -1.0) -> float:
         values = [float(row[name]) for row in final_rows if name in row]
         return float(statistics.median(values)) if values else default
-    pair_count = sum(float(row.get("intervention_pair_count", 0.0)) for row in final_rows)
-    selected = sum(float(row.get("selected_effect_mean", 0.0)) * float(row.get("intervention_pair_count", 0.0)) for row in final_rows)
-    control = sum(float(row.get("control_effect_mean", 0.0)) * float(row.get("intervention_pair_count", 0.0)) for row in final_rows)
+    heldout_counterfactual = latest_metrics.get("counterfactual", {})
     expected_indices = _expected_pilot_index_hashes(int(manifest.get("train_dataset_count", 0)), int(manifest.get("seed", -1))) if int(manifest.get("train_dataset_count", 0)) >= 5632 else {}
     representation_owners = {name: value for name, value in owners.items() if name != "threshold_head"}
     epoch_required = {
         "metrics_summary.json", "branch_metrics.json", "per_action_metrics.json", "per_reason_metrics.json",
         "evidence_family_stats.json", "evidence_reliability.json", "exchange_stats.json", "reread_stats.json",
         "annotation_gap.json", "counterfactual_stats.json", "gradient_firewall.json", "failure_cases.jsonl",
-        "evidence_cases.jsonl", "labels_action.pt", "labels_reason.pt",
+        "evidence_cases.jsonl", "labels_action.pt", "labels_reason.pt", "file_names.json",
     }
     def complete_epoch(epoch: int) -> bool:
         directory = pilot_dir / f"epoch_{epoch:03d}"
         tensors = {f"logits_{name}.pt" for name in EVAL_BRANCHES}
-        return directory.is_dir() and all((directory / name).exists() for name in epoch_required | tensors)
+        required = epoch_required | tensors
+        if not directory.is_dir() or not all((directory / name).exists() for name in required):
+            return False
+        try:
+            expected_samples = int(manifest["test_count"])
+            action_labels = torch.load(directory / "labels_action.pt", map_location="cpu", weights_only=True)
+            reason_labels = torch.load(directory / "labels_reason.pt", map_location="cpu", weights_only=True)
+            names = json.loads((directory / "file_names.json").read_text(encoding="utf-8"))["file_names"]
+            if action_labels.shape != (expected_samples, 4) or reason_labels.shape != (expected_samples, 21) or len(names) != expected_samples:
+                return False
+            if not torch.isfinite(action_labels).all() or not torch.isfinite(reason_labels).all():
+                return False
+            for branch in EVAL_BRANCHES:
+                logits = torch.load(directory / f"logits_{branch}.pt", map_location="cpu", weights_only=True)
+                width = 4 if branch.startswith("action_") else 21
+                if logits.shape != (expected_samples, width) or not torch.isfinite(logits).all():
+                    return False
+            return True
+        except (OSError, ValueError, KeyError, RuntimeError, TypeError):
+            return False
     checks = {
         "pilot_identity_matches_current_code": all(manifest.get(key) == value for key, value in expected_identity.items()),
         "pilot_sample_contract": manifest.get("train_main_count") == 4096 and manifest.get("train_audit_count") == 1024 and manifest.get("train_calib_count") == 512 and manifest.get("test_count") == 512 and manifest.get("seed") == 20260722 and manifest.get("epochs") == 3 and bool(expected_indices) and all(manifest.get(key) == value for key, value in expected_indices.items()),
@@ -166,7 +186,7 @@ def _pilot_checks(pilot_dir: Path, expected_identity: dict[str, str]) -> dict[st
         "dino_call_count_one": bool(mechanism) and all(int(row.get("dino_call_count_batch", -1)) == 1 for row in mechanism),
         "peak_reserved_under_hard_limit": bool(mechanism) and max(float(row.get("gpu_peak_reserved_gb", float("inf"))) for row in mechanism) < 46.5,
         "all_intended_owners_stepped": bool(representation_owners) and bool(optimizer_counts) and all(float(value) > 0 for value in optimizer_counts.values()) and all(float(value.get("parameter_delta_norm", 0.0)) > 0 for value in representation_owners.values()),
-        "pcvl_optimizer_stepped": int(latest_metrics.get("pcvl_optimizer_step_count", 0)) > 0 and median("pcvl_optimizer_step_count", 0) > 0,
+        "pcvl_optimizer_stepped": int(latest_metrics.get("pcvl_optimizer_step_count", 0)) > 0 and int(latest_metrics.get("pcvl_nonzero_update_count", 0)) > 0 and median("pcvl_grad_norm", 0) > 0 and median("pcvl_parameter_delta_norm", 0) > 0,
         "observed_firewall_exact_zero": bool(firewall) and all(float(value) == 0.0 for value in firewall.values()),
         "action_exchange_ratio_in_range": 0.01 <= median("action_exchange_to_direct_ratio") <= 0.25,
         "reason_exchange_ratio_in_range": 0.01 <= median("reason_exchange_to_direct_ratio") <= 0.30,
@@ -174,11 +194,13 @@ def _pilot_checks(pilot_dir: Path, expected_identity: dict[str, str]) -> dict[st
         "reason_reread_ratio_in_range": 0.02 <= median("reason_reread_to_direct_ratio") <= 0.30,
         "reliability_noncollapsed": 0.0 < median("explicit_reliability_mean") < 1.0 and median("explicit_reliability_std", 0.0) > 1e-6,
         "reference_not_center_collapsed": median("reference_center_collapse_rate", 1.0) < 0.70,
-        "selected_beats_control": pair_count > 0 and selected > control,
-        "evidence_shuffle_changes_reason": bool(reason_semantic) and bool(evidence_shuffled) and abs(float(reason_semantic.get("Exp_mAP", 0)) - float(evidence_shuffled.get("Exp_mAP", 0))) > 1e-6,
-        "annotation_delta_nonzero": any((pilot_dir / f"epoch_{epoch:03d}" / "annotation_gap.json").exists() and json.loads((pilot_dir / f"epoch_{epoch:03d}" / "annotation_gap.json").read_text(encoding="utf-8")).get("annotation_delta_rms", 0) > 0 for epoch in range(3)),
+        "selected_beats_control": float(heldout_counterfactual.get("selected_control_margin", -float("inf"))) > 0.0,
+        "evidence_shuffle_changes_reason": bool(reason_semantic) and bool(evidence_shuffled) and abs(float(reason_semantic.get("Exp_mAP", 0)) - float(evidence_shuffled.get("Exp_mAP", 0))) >= 1e-4,
+        "annotation_delta_nonzero": all((pilot_dir / f"epoch_{epoch:03d}" / "annotation_gap.json").exists() and json.loads((pilot_dir / f"epoch_{epoch:03d}" / "annotation_gap.json").read_text(encoding="utf-8")).get("annotation_delta_rms", 0) >= 1e-5 for epoch in range(3)),
         "pcvl_artifacts_complete": all((pilot_dir / "pcvl" / name).exists() for name in ("pcvl_metrics.json", "pcvl_per_action.json", "pcvl_bootstrap.json", "pcvl_value_decomposition.json")),
-        "pcvl_predicate_action_value_supported": bool(pcvl.get("predicate_action_value_supported")) and float(pcvl.get("u1_action_map", 0)) > float(pcvl.get("u0_action_map", 0)),
+        "pcvl_predicate_action_value_supported": bool(pcvl.get("predicate_action_value_supported")) and float(pcvl.get("u1_action_map", 0)) > float(pcvl.get("u0_action_map", 0)) and float(bootstrap.get("delta_value", {}).get("ci_low", -1.0)) > 0.0 and float(bootstrap.get("delta_value", {}).get("positive_rate", 0.0)) >= 0.95,
+        "pcvl_learned_evidence_supported": float(pcvl.get("u2_action_map", 0)) > float(pcvl.get("u0_action_map", 0)) and float(bootstrap.get("delta_learned_value", {}).get("ci_low", -1.0)) > 0.0,
+        "pcvl_learned_exchange_supported": float(pcvl.get("u3_action_map", 0)) > float(pcvl.get("u2_action_map", 0)) and float(bootstrap.get("delta_learned_interaction", {}).get("ci_low", -1.0)) > 0.0,
     }
     if set(checks) != REQUIRED_PILOT_CHECKS:
         raise RuntimeError(f"Pilot check schema drift: {sorted(set(checks) ^ REQUIRED_PILOT_CHECKS)}")
@@ -190,6 +212,10 @@ def run_audit(config_path: str | Path, output_dir: str | Path, mode: str, pilot_
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     config = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
+    dino_path = root / config["pretrained_weights"]
+    dino_sha = _sha(dino_path) if dino_path.is_file() else "missing"
+    action_schema_path = root / "configs" / "precise_action_semantics.yaml"
+    action_schema_sha = _sha(action_schema_path) if action_schema_path.is_file() else "missing"
     missing = [path for path in REQUIRED if not (root / path).exists()]
     source = list((root / "fate_oia").rglob("precise_*.py"))
     review_sources = [root / item for item in REQUIRED if (root / item).exists()]
@@ -226,6 +252,8 @@ def run_audit(config_path: str | Path, output_dir: str | Path, mode: str, pilot_
     checks = {
         "mock_forward_contract": list(forward["action_logits_final_raw"].shape) == [1, 4] and list(forward["reason_logits_final_raw"].shape) == [1, 21],
         "dino_call_one": int(forward["diagnostics"]["dino_call_count"]) == 1,
+        "official_dino_exact_identity": dino_sha != "missing" and bool(real_forward.get("dino_loaded_state_key_count", 0)) and not real_forward.get("dino_missing_keys") and not real_forward.get("dino_unexpected_keys") and real_forward.get("dino_weights_sha256") == dino_sha,
+        "action_semantics_runtime_wired": [row["name"] for row in model.action_schema] == ["forward", "stop", "left", "right"] and "load_action_semantics" in (root / "fate_oia/models/precise_oia_model.py").read_text(encoding="utf-8"),
         "test_only": config["eval_splits"] == "test" and config["best_selection_split"] == "test",
         "no_compression": config["token_compression"] == "none" and not config["feature_cache_enabled"],
         "annotation_firewall_source": "semantic_logits.detach() + delta" in (root / "fate_oia/models/precise_annotation_head.py").read_text(encoding="utf-8"),
@@ -255,7 +283,7 @@ def run_audit(config_path: str | Path, output_dir: str | Path, mode: str, pilot_
     }
     clean_tree = not _git(["status", "--porcelain"])
     preflight_pass = not missing and compile_ok and not clean_hits and not incomplete_hits and clean_tree and all(checks.values())
-    expected_identity = {"git_head": head, "config_sha256": config_sha, "source_tree_sha256": _training_source_sha(root), "skill_sha256": _sha(repo_skill)}
+    expected_identity = {"git_head": head, "config_sha256": config_sha, "source_tree_sha256": _training_source_sha(root), "skill_sha256": _sha(repo_skill), "pretrained_weights_sha256": dino_sha, "action_schema_sha256": action_schema_sha}
     pilot_checks = _pilot_checks(Path(pilot_dir), expected_identity) if mode == "pilot" and pilot_dir else {}
     if mode == "pilot":
         status = "FULL_TRAIN_READY" if preflight_pass and pilot_checks and all(pilot_checks.values()) else "SCIENTIFIC_GATE_FAILED"
@@ -266,7 +294,7 @@ def run_audit(config_path: str | Path, output_dir: str | Path, mode: str, pilot_
         unresolved.append("git_worktree_dirty")
     if pilot_checks:
         unresolved.extend(name for name, passed in pilot_checks.items() if not passed)
-    record = {"status": status, "git_head": head, "branch": branch, "base_commit": base_commit, "config_sha256": config_sha, "skill_sha256": _sha(repo_skill), "user_skill_path": str(user_skill), "source_tree_sha256": source_tree_sha, "checked_files": list(REQUIRED), "missing": missing, "forbidden_pattern_results": clean_hits, "incomplete_implementation_results": incomplete_hits, "functional_checks": checks, "pilot_checks": pilot_checks, "compile_ok": compile_ok, "tests_passed": pytest_ok, "real_forward_passed": bool(real_forward.get("passed")), "gradient_firewall_passed": bool(real_forward.get("gradient_firewall_passed")), "dino_call_contract_passed": int(runtime.get("dino_call_count", 0)) == 1, "runtime_profile_passed": bool(runtime.get("valid")), "pytest": {"passed": pytest_ok, "returncode": pytest_run.returncode, "stdout_tail": pytest_run.stdout[-4000:], "stderr_tail": pytest_run.stderr[-4000:]}, "git_clean": clean_tree, "mode": mode, "unresolved": sorted(set(unresolved))}
+    record = {"status": status, "git_head": head, "branch": branch, "base_commit": base_commit, "config_sha256": config_sha, "skill_sha256": _sha(repo_skill), "action_schema_sha256": action_schema_sha, "pretrained_weights_sha256": dino_sha, "user_skill_path": str(user_skill), "source_tree_sha256": source_tree_sha, "checked_files": list(REQUIRED), "missing": missing, "forbidden_pattern_results": clean_hits, "incomplete_implementation_results": incomplete_hits, "functional_checks": checks, "pilot_checks": pilot_checks, "compile_ok": compile_ok, "tests_passed": pytest_ok, "real_forward_passed": bool(real_forward.get("passed")), "gradient_firewall_passed": bool(real_forward.get("gradient_firewall_passed")), "dino_call_contract_passed": int(runtime.get("dino_call_count", 0)) == 1, "runtime_profile_passed": bool(runtime.get("valid")), "pytest": {"passed": pytest_ok, "returncode": pytest_run.returncode, "stdout_tail": pytest_run.stdout[-4000:], "stderr_tail": pytest_run.stderr[-4000:]}, "git_clean": clean_tree, "mode": mode, "unresolved": sorted(set(unresolved))}
     if mode == "pilot":
         record.update({"pilot_complete": pilot_checks.get("three_epochs_complete", False), "mechanisms_active": all(pilot_checks.get(name, False) for name in REQUIRED_PILOT_CHECKS if name not in {"pcvl_predicate_action_value_supported"}), "pcvl": json.loads((Path(pilot_dir) / "pcvl" / "pcvl_metrics.json").read_text(encoding="utf-8")) if (Path(pilot_dir) / "pcvl" / "pcvl_metrics.json").exists() else {}, "runtime_selected": runtime})
     (output / "implementation_audit_PRECISE_OIA_V1.json").write_text(json.dumps(record, indent=2), encoding="utf-8")

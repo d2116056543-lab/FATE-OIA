@@ -26,7 +26,11 @@ class PRECISEEvidenceFields(nn.Module):
         self.latent_value = nn.Linear(dim, dim, bias=False)
         self.presence = nn.Linear(dim, 1)
         self.observability = nn.Linear(dim, 1)
-        self.state_heads = nn.ModuleList([nn.Linear(dim, max(1, len(field.get("state_schema", field.get("type_schema", []))))) for field in fields])
+        state_widths = [max(1, len(field.get("state_schema", field.get("type_schema", [])))) for field in fields]
+        self.state_heads = nn.ModuleList([nn.Linear(dim, width) for width in state_widths])
+        self.max_state_width = max(state_widths)
+        state_channel_valid = torch.arange(self.max_state_width).view(1, -1) < torch.tensor(state_widths).view(-1, 1)
+        self.register_buffer("state_channel_valid", state_channel_valid)
         self.actor_part_type = nn.Linear(dim, 4)
         self.actor_part_occupancy = nn.Linear(dim, 1)
         self.part_offsets = nn.Parameter(torch.zeros(self.num_explicit, self.max_parts, 2))
@@ -45,9 +49,10 @@ class PRECISEEvidenceFields(nn.Module):
                 curve_anchor[index, : int(field["num_parts"])] = torch.linspace(0.15, 0.95, int(field["num_parts"]))
         self.register_buffer("curve_y_anchor", curve_anchor)
         names = [field["name"] for field in fields]
-        actor_indices = [index for index, field in enumerate(fields) if field["family"] == "actor"]
-        if len(actor_indices) != 3:
+        actor_names = ("actor_left", "actor_center", "actor_right")
+        if any(name not in names for name in actor_names):
             raise ValueError("PRECISE requires left/center/right actor evidence fields")
+        actor_indices = [names.index(name) for name in actor_names]
         self.register_buffer("actor_indices", torch.tensor(actor_indices, dtype=torch.long))
         mirror_names = {
             "actor_left": "actor_right", "actor_right": "actor_left",
@@ -151,8 +156,7 @@ class PRECISEEvidenceFields(nn.Module):
         soft_masks = torch.exp(-0.5 * distance).amax(dim=2)
         presence_logits = self.presence(explicit).squeeze(-1)
         observability_logits = self.observability(explicit).squeeze(-1)
-        max_state = max(head.out_features for head in self.state_heads)
-        state_logits = explicit.new_zeros(batch, self.num_explicit, max_state)
+        state_logits = explicit.new_zeros(batch, self.num_explicit, self.max_state_width)
         for index, head in enumerate(self.state_heads):
             state_logits[:, index, : head.out_features] = head(explicit[:, index])
         actor_part_type_logits = self.actor_part_type(part_features[:, self.actor_indices])
@@ -181,7 +185,8 @@ class PRECISEEvidenceFields(nn.Module):
             "presence_logits": presence_logits,
             "observability_logits": observability_logits,
             "state_logits": state_logits,
-            "type_logits_actor": state_logits[:, 2:5, :4],
+            "state_channel_valid": self.state_channel_valid,
+            "type_logits_actor": state_logits[:, self.actor_indices, :4],
             "actor_part_type_logits": actor_part_type_logits[:, :, :4],
             "actor_part_occupancy_logits": actor_part_occupancy_logits[:, :, :4],
             "actor_type_probability": actor_type_probability,

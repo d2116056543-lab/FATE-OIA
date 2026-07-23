@@ -151,15 +151,19 @@ def _step_owners(
     return stats
 
 
-def build_schedulers(optimizers: dict[str, torch.optim.Optimizer], updates_per_epoch: int, epochs: int, warmup_ratio: float) -> dict[str, torch.optim.lr_scheduler.LambdaLR]:
-    total = max(1, updates_per_epoch * epochs)
-    warmup = max(1, int(total * warmup_ratio))
-    def scale(step: int) -> float:
-        if step < warmup:
-            return float(step + 1) / warmup
-        progress = min(1.0, (step - warmup) / max(1, total - warmup))
-        return 0.05 + 0.95 * 0.5 * (1.0 + math.cos(math.pi * progress))
-    return {owner: torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=scale) for owner, optimizer in optimizers.items()}
+def build_schedulers(optimizers: dict[str, torch.optim.Optimizer], updates_per_epoch: int | dict[str, int], epochs: int, warmup_ratio: float) -> dict[str, torch.optim.lr_scheduler.LambdaLR]:
+    schedulers = {}
+    for owner, optimizer in optimizers.items():
+        owner_updates = updates_per_epoch[owner] if isinstance(updates_per_epoch, dict) else updates_per_epoch
+        total = max(1, owner_updates * epochs)
+        warmup = max(1, int(total * warmup_ratio))
+        def scale(step: int, total_steps: int = total, warmup_steps: int = warmup) -> float:
+            if step < warmup_steps:
+                return float(step + 1) / warmup_steps
+            progress = min(1.0, (step - warmup_steps) / max(1, total_steps - warmup_steps))
+            return 0.05 + 0.95 * 0.5 * (1.0 + math.cos(math.pi * progress))
+        schedulers[owner] = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=scale)
+    return schedulers
 
 
 def load_resume_checkpoint(
@@ -171,7 +175,7 @@ def load_resume_checkpoint(
     expected_fingerprint: dict[str, Any],
     pcvl_probes: PRECISEPCVLProbes | None = None,
     pcvl_optimizer: torch.optim.Optimizer | None = None,
-) -> tuple[int, int, int, float, dict[str, float], dict[str, int], int]:
+) -> tuple[int, int, int, float, dict[str, float], dict[str, int], int, int]:
     checkpoint = torch.load(checkpoint_path, map_location=device)
     if checkpoint.get("implementation_fingerprint") != expected_fingerprint:
         raise RuntimeError("Resume checkpoint implementation/config fingerprint does not match current code")
@@ -194,7 +198,7 @@ def load_resume_checkpoint(
         if pcvl_optimizer is None:
             raise RuntimeError("Pilot resume requires a PCVL optimizer")
         pcvl_optimizer.load_state_dict(checkpoint["pcvl_optimizer"])
-    return int(checkpoint["epoch"]) + 1, int(checkpoint["global_optimizer_step"]), int(checkpoint.get("global_micro_step", 0)), float(checkpoint.get("best_deploy_joint", -float("inf"))), dict(checkpoint.get("best_scores", {})), {key: int(value) for key, value in checkpoint.get("optimizer_step_counts", {}).items()}, int(checkpoint.get("pcvl_optimizer_step_count", 0))
+    return int(checkpoint["epoch"]) + 1, int(checkpoint["global_optimizer_step"]), int(checkpoint.get("global_micro_step", 0)), float(checkpoint.get("best_deploy_joint", -float("inf"))), dict(checkpoint.get("best_scores", {})), {key: int(value) for key, value in checkpoint.get("optimizer_step_counts", {}).items()}, int(checkpoint.get("pcvl_optimizer_step_count", 0)), int(checkpoint.get("pcvl_nonzero_update_count", 0))
 
 
 def _dataset_samples(dataset) -> list[Any]:
@@ -295,7 +299,9 @@ def train(args: argparse.Namespace) -> None:
     grounding_adapter, train_grounding, active_fields = build_train_grounding_targets(full_train_set, config, output_dir)
     model = PRECISEOIAModel(Path(args.config).parent, config["pretrained_weights"], evidence_schema=active_fields, model_config=config).to(device)
     optimizers = build_optimizers(model, config)
-    schedulers = build_schedulers(optimizers, math.ceil(len(train_loader) / args.gradient_accumulation_steps), args.epochs, config["training"]["warmup_ratio"])
+    trunk_updates = math.ceil(len(train_loader) / args.gradient_accumulation_steps)
+    updates_by_owner = {owner: (len(calib_loader) if owner == "threshold_head" else trunk_updates) for owner in optimizers}
+    schedulers = build_schedulers(optimizers, updates_by_owner, args.epochs, config["training"]["warmup_ratio"])
     best = -float("inf")
     best_scores = {"action_mf1": -float("inf"), "exp_mf1": -float("inf"), "exp_map": -float("inf"), "semantic_exp_map": -float("inf")}
     start_epoch = 0
@@ -305,16 +311,19 @@ def train(args: argparse.Namespace) -> None:
     pcvl_probes = PRECISEPCVLProbes().to(device) if args.mode == "pilot" else None
     pcvl_optimizer = torch.optim.AdamW(pcvl_probes.parameters(), lr=3e-4) if pcvl_probes is not None else None
     pcvl_optimizer_step_count = 0
+    pcvl_nonzero_update_count = 0
+    last_pcvl_update = {"loss": 0.0, "grad_norm": 0.0, "parameter_delta_norm": 0.0}
     fingerprint = _implementation_fingerprint(args.config)
     if args.resume_checkpoint:
-        start_epoch, global_optimizer_step, global_micro_step, best, resumed_best_scores, resumed_step_counts, pcvl_optimizer_step_count = load_resume_checkpoint(
+        start_epoch, global_optimizer_step, global_micro_step, best, resumed_best_scores, resumed_step_counts, pcvl_optimizer_step_count, pcvl_nonzero_update_count = load_resume_checkpoint(
             args.resume_checkpoint, model, optimizers, schedulers, device, fingerprint, pcvl_probes, pcvl_optimizer
         )
         best_scores.update(resumed_best_scores)
     write_resolved_config(output_dir / "config_resolved.yaml", config)
     write_json(output_dir / "implementation_fingerprint.json", fingerprint)
     skill_path = Path(".codex/skills/precise-oia-implementation-audit/SKILL.md")
-    write_json(output_dir / "run_manifest.json", {"git_head": fingerprint["git_head"], "source_tree_sha256": fingerprint["source_tree_sha256"], "config_sha256": fingerprint["config_sha256"], "skill_sha256": hashlib.sha256(skill_path.read_bytes()).hexdigest() if skill_path.exists() else "missing", "base_commit": "373aa49feac17372574fd7fb056c1d79c7c848fe", "test_only": True, "selection_protocol": "internal_test_selected", "best_selection_split": "test", "feature_cache_enabled": False, "token_compression": "none", "internal_test_selected": True, "publication_eligible_selection": False, "selected_layers": [3, 7, 11], "pretrained_weights": config["pretrained_weights"], "seed": args.seed, "epochs": args.epochs, "train_dataset_count": len(train_set), "test_count": len(test_set), "train_calib_count": len(calib_indices), "train_main_count": len(main_indices), "train_audit_count": len(audit_indices), "train_main_indices_sha256": _index_sha(main_indices), "train_audit_indices_sha256": _index_sha(audit_indices), "train_calib_indices_sha256": _index_sha(calib_indices), "train_trunk_on_all_train": bool(config["threshold"].get("train_trunk_on_all_train", False)), "pcvl_pilot_only": args.mode == "pilot", "active_evidence_fields": [field["name"] for field in active_fields], "command_line": vars(args)})
+    action_schema_path = Path(args.config).parent / "precise_action_semantics.yaml"
+    write_json(output_dir / "run_manifest.json", {"git_head": fingerprint["git_head"], "source_tree_sha256": fingerprint["source_tree_sha256"], "config_sha256": fingerprint["config_sha256"], "skill_sha256": hashlib.sha256(skill_path.read_bytes()).hexdigest() if skill_path.exists() else "missing", "action_schema_sha256": hashlib.sha256(action_schema_path.read_bytes()).hexdigest(), "base_commit": "373aa49feac17372574fd7fb056c1d79c7c848fe", "test_only": True, "selection_protocol": "internal_test_selected", "best_selection_split": "test", "feature_cache_enabled": False, "token_compression": "none", "internal_test_selected": True, "publication_eligible_selection": False, "selected_layers": [3, 7, 11], "pretrained_weights": config["pretrained_weights"], "pretrained_weights_sha256": model.dino.pretrained_weights_sha256, "dino_loaded_state_key_count": len(model.dino.loaded_state_keys), "dino_missing_keys": list(model.dino.missing_keys), "dino_unexpected_keys": list(model.dino.unexpected_keys), "seed": args.seed, "epochs": args.epochs, "train_dataset_count": len(train_set), "test_count": len(test_set), "train_calib_count": len(calib_indices), "train_main_count": len(main_indices), "train_audit_count": len(audit_indices), "train_main_indices_sha256": _index_sha(main_indices), "train_audit_indices_sha256": _index_sha(audit_indices), "train_calib_indices_sha256": _index_sha(calib_indices), "train_trunk_on_all_train": bool(config["threshold"].get("train_trunk_on_all_train", False)), "pcvl_pilot_only": args.mode == "pilot", "active_evidence_fields": [field["name"] for field in active_fields], "command_line": vars(args)})
     profile_path = Path(".review/precise_oia_v1/runtime/selected_runtime_profile.json")
     write_json(output_dir / "runtime_profile.json", json.loads(profile_path.read_text(encoding="utf-8")) if profile_path.exists() else {"available": False, "reason": "actual-path profile has not passed yet"})
     representation_owners = tuple(owner for owner in optimizers if owner != "threshold_head")
@@ -361,9 +370,10 @@ def train(args: argparse.Namespace) -> None:
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
                 losses = total_precise_losses(output, action_target, reason_target, target_batch)
             if pcvl_probes is not None and pcvl_optimizer is not None:
-                pcvl_loss = train_pcvl_step(pcvl_probes, pcvl_optimizer, output, target_batch, action_target)
+                last_pcvl_update = train_pcvl_step(pcvl_probes, pcvl_optimizer, output, target_batch, action_target)
                 pcvl_optimizer_step_count += 1
-                losses["loss_pcvl_detached"] = torch.tensor(pcvl_loss, device=device)
+                pcvl_nonzero_update_count += int(last_pcvl_update["parameter_delta_norm"] > 0.0 and last_pcvl_update["grad_norm"] > 0.0)
+                losses["loss_pcvl_detached"] = torch.tensor(last_pcvl_update["loss"], device=device)
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
                 loss_refinement = 0.05 * (
                     refinement_loss(output["action_logits_direct"], output["action_logits_final_raw"], action_target)
@@ -425,8 +435,8 @@ def train(args: argparse.Namespace) -> None:
                 action_refined_error = F.binary_cross_entropy_with_logits(output["action_logits_final_raw"].detach(), action_target.float(), reduction="none").mean(-1)
                 reason_direct_error = F.binary_cross_entropy_with_logits(output["reason_logits_direct"].detach(), reason_target.float(), reduction="none").mean(-1)
                 reason_refined_error = F.binary_cross_entropy_with_logits(output["reason_logits_semantic"].detach(), reason_target.float(), reduction="none").mean(-1)
-                action_hard = action_direct_error >= action_direct_error.median()
-                reason_hard = reason_direct_error >= reason_direct_error.median()
+                action_hard = action_direct_error >= torch.quantile(action_direct_error.float(), 0.5).to(action_direct_error)
+                reason_hard = reason_direct_error >= torch.quantile(reason_direct_error.float(), 0.5).to(reason_direct_error)
                 hard_improvement = 0.5 * (
                     ((action_refined_error < action_direct_error) & action_hard).float().sum() / action_hard.float().sum().clamp_min(1.0)
                     + ((reason_refined_error < reason_direct_error) & reason_hard).float().sum() / reason_hard.float().sum().clamp_min(1.0)
@@ -441,6 +451,9 @@ def train(args: argparse.Namespace) -> None:
                 record.update({
                     "dino_call_count_batch": dino_call_count_batch,
                     "pcvl_optimizer_step_count": pcvl_optimizer_step_count,
+                    "pcvl_nonzero_update_count": pcvl_nonzero_update_count,
+                    "pcvl_grad_norm": last_pcvl_update["grad_norm"],
+                    "pcvl_parameter_delta_norm": last_pcvl_update["parameter_delta_norm"],
                     "gpu_peak_reserved_gb": torch.cuda.max_memory_reserved(device) / 1024 ** 3 if device.type == "cuda" else 0.0,
                 })
                 family_indices: dict[str, list[int]] = {}
@@ -464,7 +477,7 @@ def train(args: argparse.Namespace) -> None:
                 })
                 append_jsonl(output_dir / "loss_components.jsonl", record)
                 append_jsonl(output_dir / "gradient_ownership.jsonl", {"epoch": epoch, "optimizer_step": global_optimizer_step, "owners": last_owner_stats, **firewall_report})
-                append_jsonl(output_dir / "mechanism_batch_stats.jsonl", {key: record[key] for key in ("epoch", "optimizer_step", "dino_call_count_batch", "pcvl_optimizer_step_count", "gpu_peak_reserved_gb", "action_exchange_to_direct_ratio", "reason_exchange_to_direct_ratio", "action_reread_to_direct_ratio", "reason_reread_to_direct_ratio", "explicit_reliability_mean", "explicit_reliability_std", "gate_active_rate_gt_0p1", "reference_center_collapse_rate", "selected_effect_mean", "control_effect_mean", "wrong_effect_mean", "intervention_pair_count", "annotation_delta_rms")})
+                append_jsonl(output_dir / "mechanism_batch_stats.jsonl", {key: record[key] for key in ("epoch", "optimizer_step", "dino_call_count_batch", "pcvl_optimizer_step_count", "pcvl_nonzero_update_count", "pcvl_grad_norm", "pcvl_parameter_delta_norm", "gpu_peak_reserved_gb", "action_exchange_to_direct_ratio", "reason_exchange_to_direct_ratio", "action_reread_to_direct_ratio", "reason_reread_to_direct_ratio", "explicit_reliability_mean", "explicit_reliability_std", "gate_active_rate_gt_0p1", "reference_center_collapse_rate", "selected_effect_mean", "control_effect_mean", "wrong_effect_mean", "intervention_pair_count", "annotation_delta_rms")})
                 print(json.dumps(record, sort_keys=True), flush=True)
             last_output = output
             last_batch_finished = time.perf_counter()
@@ -505,12 +518,13 @@ def train(args: argparse.Namespace) -> None:
         write_json(epoch_dir / "per_action_metrics.json", metrics["action_deploy"])
         write_json(epoch_dir / "per_reason_metrics.json", {"observed": metrics["reason_observed"], "semantic": metrics["reason_semantic"], "deploy": metrics["reason_deploy"]})
         mechanism_test = metrics["mechanism_test"]
-        write_json(epoch_dir / "evidence_family_stats.json", {"aggregation": "full_test", "presence_mean": mechanism_test["presence_mean"], "observability_mean": mechanism_test["observability_mean"]})
+        write_json(epoch_dir / "evidence_family_stats.json", {"aggregation": "full_test", "presence_mean": mechanism_test["presence_mean"], "observability_mean": mechanism_test["observability_mean"], "actor_part_occupancy_mean": mechanism_test["actor_part_occupancy_mean"], "actor_part_type_mean": mechanism_test["actor_part_type_mean"]})
         write_json(epoch_dir / "evidence_reliability.json", {"aggregation": "full_test", "mean": mechanism_test["reliability_mean"], "strong_rate": mechanism_test["reliability_strong_rate"], "weak_rate": mechanism_test["reliability_weak_rate"]})
         write_json(epoch_dir / "exchange_stats.json", {"aggregation": "full_test", "overlap_mean": mechanism_test["overlap_mean"], "gate_mean": mechanism_test["gate_mean"], "gate_active_rate_gt_0p1": mechanism_test["gate_active_rate_gt_0p1"]})
         write_json(epoch_dir / "reread_stats.json", {"aggregation": "full_test", "center_collapse_rate": mechanism_test["center_collapse_rate"], "out_of_bounds_rate": mechanism_test["out_of_bounds_rate"], "reference_variance": mechanism_test["reference_variance"]})
         write_json(epoch_dir / "annotation_gap.json", {"aggregation": "full_test", "annotation_delta_rms": mechanism_test["annotation_delta_rms"], "semantic_observed_gap_rms": mechanism_test["semantic_observed_gap_rms"]})
         save_epoch_tensors(epoch_dir, {name: value for name, value in tensors.items() if isinstance(value, torch.Tensor) and (name.startswith("action_") or name.startswith("reason_"))}, tensors["labels_action"], tensors["labels_reason"])
+        write_json(epoch_dir / "file_names.json", {"file_names": tensors["file_names"]})
         action_errors = F.binary_cross_entropy_with_logits(tensors["action_deploy"], tensors["labels_action"], reduction="none").sum(-1)
         reason_errors = F.binary_cross_entropy_with_logits(tensors["reason_deploy"], tensors["labels_reason"], reduction="none").sum(-1)
         worst_indices = (action_errors + reason_errors).topk(min(32, len(action_errors))).indices.tolist()
@@ -522,7 +536,7 @@ def train(args: argparse.Namespace) -> None:
         for index, name in enumerate(tensors["file_names"][:32]):
             append_jsonl(epoch_dir / "evidence_cases.jsonl", {"file_name": name, "reliability": tensors["evidence_reliability"][index].tolist(), "presence": tensors["evidence_presence"][index].tolist(), "part_coordinates": tensors["evidence_coordinates"][index].tolist()})
         export_precise_cases(epoch_dir / "case_exports", tensors["case_rows"])
-        append_jsonl(output_dir / "metrics_summary.jsonl", {"epoch": epoch, **metrics, "optimizer_step_counts": optimizer_step_counts, "pcvl_optimizer_step_count": pcvl_optimizer_step_count})
+        append_jsonl(output_dir / "metrics_summary.jsonl", {"epoch": epoch, **metrics, "optimizer_step_counts": optimizer_step_counts, "pcvl_optimizer_step_count": pcvl_optimizer_step_count, "pcvl_nonzero_update_count": pcvl_nonzero_update_count})
         score_values = {"action_mf1": metrics["action_deploy"]["Act_mF1"], "exp_mf1": metrics["reason_deploy"]["Exp_mF1"], "exp_map": metrics["reason_deploy"]["Exp_mAP"], "semantic_exp_map": metrics["reason_semantic"]["Exp_mAP"]}
         improved = {name: value > best_scores[name] for name, value in score_values.items()}
         for name, value in score_values.items():
@@ -533,6 +547,7 @@ def train(args: argparse.Namespace) -> None:
             best = metrics["deploy_fixed_joint"]
         checkpoint = {"model": model.state_dict(), "epoch": epoch, "optimizers": {owner: item.state_dict() for owner, item in optimizers.items()}, "schedulers": {owner: item.state_dict() for owner, item in schedulers.items()}, "rng_state": torch.get_rng_state(), "python_rng_state": random.getstate(), "cuda_rng_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None, "global_optimizer_step": global_optimizer_step, "global_micro_step": global_micro_step, "optimizer_step_counts": optimizer_step_counts, "best_deploy_joint": best, "best_scores": best_scores, "threshold_teacher": model.threshold_head.theta_teacher.detach().cpu(), "view_consistency_ema": model.evidence_fields.view_consistency_ema.detach().cpu(), "active_field_schema": [field["name"] for field in active_fields], "implementation_fingerprint": fingerprint}
         checkpoint["pcvl_optimizer_step_count"] = pcvl_optimizer_step_count
+        checkpoint["pcvl_nonzero_update_count"] = pcvl_nonzero_update_count
         if pcvl_probes is not None and pcvl_optimizer is not None:
             checkpoint["pcvl_probes"] = pcvl_probes.state_dict()
             checkpoint["pcvl_optimizer"] = pcvl_optimizer.state_dict()

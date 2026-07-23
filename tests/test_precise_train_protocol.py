@@ -2,10 +2,13 @@ from pathlib import Path
 
 import torch
 import yaml
+from PIL import Image
 
 from fate_oia.engine.train_precise_oia import _slice_batch_output, build_optimizers, _training_split_indices
 from fate_oia.losses.precise_losses import refinement_loss
 from fate_oia.models.precise_oia_model import PRECISEOIAModel
+from fate_oia.utils.precise_gradient_ownership import parameter_ownership
+from fate_oia.transforms_precise import PRECISEImageTransform
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,6 +26,7 @@ def test_main_representation_loss_cannot_train_threshold_head():
     source = (ROOT / "fate_oia" / "engine" / "train_precise_oia.py").read_text(encoding="utf-8")
     assert "deploy_loss" not in source
     assert "for calib_batch in calib_loader" in source
+    assert 'len(calib_loader) if owner == "threshold_head" else trunk_updates' in source
 
 
 def test_all_planned_mechanism_losses_are_called_by_trainer():
@@ -100,6 +104,15 @@ def test_norm_bias_and_embedding_parameters_have_zero_weight_decay():
     assert all(any(group["weight_decay"] == 0.0 for group in optimizer.param_groups) for optimizer in optimizers.values())
 
 
+def test_every_trainable_parameter_has_exactly_one_optimizer_owner():
+    model = PRECISEOIAModel(use_mock_dino=True)
+    owners = parameter_ownership(model)
+    flattened = [parameter for parameters in owners.values() for parameter in parameters]
+    trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    assert len({id(parameter) for parameter in flattened}) == len(flattened)
+    assert {id(parameter) for parameter in flattened} == {id(parameter) for parameter in trainable}
+
+
 def test_batch_output_slicing_never_slices_schema_tensors_when_sizes_coincide():
     full_batch = 10
     output = {
@@ -157,9 +170,24 @@ def test_configured_brightness_and_contrast_are_wired_only_to_train_transform():
     assert "Subset(train_eval_set, audit_indices)" in source
 
 
+def test_photometric_augmentation_is_stateless_for_resume_equivalence():
+    transform = PRECISEImageTransform(training=True, brightness=0.1, contrast=0.1)
+    image = Image.new("RGB", (80, 45), color=(80, 120, 160))
+    first, _ = transform(image)
+    torch.manual_seed(999)
+    second, _ = transform(image)
+    assert torch.equal(first, second)
+
+
 def test_epoch_mechanism_artifacts_are_full_test_aggregates_not_last_train_batch():
     source = (ROOT / "fate_oia" / "engine" / "train_precise_oia.py").read_text(encoding="utf-8")
     assert 'mechanism_test = metrics["mechanism_test"]' in source
     assert '"aggregation": "full_test"' in source
     artifact_section = source[source.index('mechanism_test = metrics["mechanism_test"]'):source.index("save_epoch_tensors", source.index('mechanism_test = metrics["mechanism_test"]'))]
     assert "last_output" not in artifact_section
+
+
+def test_manifest_binds_action_schema_and_exact_dino_weight_identity():
+    source = (ROOT / "fate_oia" / "engine" / "train_precise_oia.py").read_text(encoding="utf-8")
+    assert '"pretrained_weights_sha256"' in source
+    assert '"action_schema_sha256"' in source

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 
 import torch
 from PIL import ImageEnhance, ImageOps
@@ -22,11 +23,14 @@ class PRECISEImageTransform:
 
     def __call__(self, image):
         if self.training:
+            digest = hashlib.sha256(image.convert("RGB").resize((8, 8)).tobytes()).digest()
+            brightness_unit = int.from_bytes(digest[:8], "little") / float(2**64 - 1)
+            contrast_unit = int.from_bytes(digest[8:16], "little") / float(2**64 - 1)
             if self.brightness > 0:
-                factor = 1.0 + (2.0 * torch.rand(()).item() - 1.0) * self.brightness
+                factor = 1.0 + (2.0 * brightness_unit - 1.0) * self.brightness
                 image = ImageEnhance.Brightness(image).enhance(factor)
             if self.contrast > 0:
-                factor = 1.0 + (2.0 * torch.rand(()).item() - 1.0) * self.contrast
+                factor = 1.0 + (2.0 * contrast_unit - 1.0) * self.contrast
                 image = ImageEnhance.Contrast(image).enhance(factor)
         canonical, meta = self.base(image)
         if not self.return_mirror:

@@ -20,8 +20,12 @@ class PRECISEVisualRereader(nn.Module):
         self.action_projection = nn.Linear(dim, dim)
         self.reason_projection = nn.Linear(dim, dim)
 
-    def _field_attention(self, tokens: torch.Tensor, fields: torch.Tensor, query: nn.Linear) -> torch.Tensor:
+    def _field_attention(self, tokens: torch.Tensor, fields: torch.Tensor, query: nn.Linear, field_enabled: torch.Tensor | None = None) -> torch.Tensor:
         logits = torch.einsum("bcd,bed->bce", query(tokens), fields) / (tokens.shape[-1] ** 0.5)
+        if field_enabled is not None:
+            if field_enabled.shape != fields.shape[:2] or not field_enabled.any(-1).all():
+                raise ValueError("Each reread sample must retain at least one enabled evidence field")
+            logits = logits.masked_fill(~field_enabled[:, None, :], -torch.inf)
         top = logits.topk(k=min(2, logits.shape[-1]), dim=-1).indices
         mask = torch.zeros_like(logits, dtype=torch.bool).scatter_(-1, top, True)
         return torch.softmax(logits.masked_fill(~mask, -torch.inf), dim=-1)
@@ -64,8 +68,9 @@ class PRECISEVisualRereader(nn.Module):
         coordinates = evidence["part_coordinates"].detach()
         part_valid = evidence["part_valid"].detach()
         reliability = evidence["reliability"].detach()
-        action_attention = self._field_attention(action_tokens, fields, self.action_field_query)
-        reason_attention = self._field_attention(reason_tokens, fields, self.reason_field_query)
+        field_enabled = evidence.get("field_enabled")
+        action_attention = self._field_attention(action_tokens, fields, self.action_field_query, field_enabled)
+        reason_attention = self._field_attention(reason_tokens, fields, self.reason_field_query, field_enabled)
         action_demand = self._demand_state(action_logits, action_attention, reliability)
         reason_demand = self._demand_state(reason_logits, reason_attention, reliability)
         joined_tokens = torch.cat([action_tokens, reason_tokens], dim=1)

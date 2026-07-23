@@ -7,6 +7,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import yaml
+
 from fate_oia.engine.audit_precise_oia_implementation import REQUIRED, _tree_sha
 
 
@@ -27,6 +29,9 @@ def verify_review_hash(path: Path, config_path: Path, expected_status: str) -> N
     functional = record.get("functional_checks", {})
     repo_skill = Path.cwd() / ".codex/skills/precise-oia-implementation-audit/SKILL.md"
     user_skill = Path.home() / ".codex/skills/precise-oia-implementation-audit/SKILL.md"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    dino_path = Path.cwd() / config["pretrained_weights"]
+    action_schema_path = config_path.parent / "precise_action_semantics.yaml"
     if (
         record.get("status") != expected_status
         or record.get("git_head") != head
@@ -35,6 +40,9 @@ def verify_review_hash(path: Path, config_path: Path, expected_status: str) -> N
         or not repo_skill.exists()
         or not user_skill.exists()
         or record.get("skill_sha256") != _sha(repo_skill)
+        or not dino_path.is_file()
+        or record.get("pretrained_weights_sha256") != _sha(dino_path)
+        or record.get("action_schema_sha256") != _sha(action_schema_path)
         or _sha(repo_skill) != _sha(user_skill)
         or not functional
         or not all(bool(value) for value in functional.values())
@@ -60,7 +68,7 @@ def selected_runtime_args(path: Path, fallback_batch: int, fallback_accum: int) 
     record = json.loads(path.read_text(encoding="utf-8"))
     if not record.get("valid"):
         raise SystemExit("Selected PRECISE runtime profile is not valid")
-    return int(record["batch_size"]), int(record["gradient_accumulation_steps"])
+    return int(record["batch_size"]), int(record["grad_accum"])
 
 
 def review_is_current(path: Path, config_path: Path, expected_status: str = "PRE_PILOT_ELIGIBLE") -> bool:
@@ -70,7 +78,10 @@ def review_is_current(path: Path, config_path: Path, expected_status: str = "PRE
         record = json.loads(path.read_text(encoding="utf-8"))
         head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
         source_paths = [Path.cwd() / item for item in REQUIRED]
-        return record.get("status") == expected_status and record.get("git_head") == head and record.get("config_sha256") == _sha(config_path) and record.get("source_tree_sha256") == _tree_sha(source_paths) and not record.get("unresolved")
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        dino_path = Path.cwd() / config["pretrained_weights"]
+        action_schema_path = config_path.parent / "precise_action_semantics.yaml"
+        return record.get("status") == expected_status and record.get("git_head") == head and record.get("config_sha256") == _sha(config_path) and record.get("source_tree_sha256") == _tree_sha(source_paths) and dino_path.is_file() and record.get("pretrained_weights_sha256") == _sha(dino_path) and record.get("action_schema_sha256") == _sha(action_schema_path) and not record.get("unresolved")
     except (OSError, ValueError, subprocess.SubprocessError):
         return False
 
