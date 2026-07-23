@@ -68,6 +68,8 @@ def test_pcvl_reports_learned_evidence_and_exchange_value_not_only_oracle_value(
     source = (Path(__file__).resolve().parents[1] / "fate_oia" / "engine" / "run_precise_pcvl.py").read_text(encoding="utf-8")
     assert '"delta_learned_value"' in source
     assert '"delta_learned_interaction"' in source
+    for artifact in ("pcvl_probabilities.pt", "pcvl_labels.pt", "pcvl_file_names.json"):
+        assert artifact in source
 
 
 def test_pcvl_step_reports_real_gradient_and_parameter_delta():
@@ -102,3 +104,25 @@ def test_pcvl_validation_rejects_unbound_or_nonfinite_artifacts(tmp_path):
         assert "provenance" in str(error).lower()
     else:
         raise AssertionError("unbound PCVL artifacts were accepted")
+
+
+def test_pcvl_validation_recomputes_metrics_from_raw_predictions(tmp_path):
+    probabilities = {key: torch.tensor([[0.9, 0.1, 0.8, 0.2], [0.1, 0.9, 0.2, 0.8]]) for key in ("u0", "u1", "u2", "u3")}
+    labels = torch.tensor([[1.0, 0.0, 1.0, 0.0], [0.0, 1.0, 0.0, 1.0]])
+    torch.save(probabilities, tmp_path / "pcvl_probabilities.pt")
+    torch.save(labels, tmp_path / "pcvl_labels.pt")
+    (tmp_path / "pcvl_file_names.json").write_text('{"file_names": ["a", "b"]}', encoding="utf-8")
+    (tmp_path / "pcvl_metrics.json").write_text('{"u0_action_map": 0.0, "u1_action_map": 0.0, "u2_action_map": 0.0, "u3_action_map": 0.0, "predicate_action_value_supported": false}', encoding="utf-8")
+    (tmp_path / "pcvl_per_action.json").write_text('{"u0": [0,0,0,0], "u1": [0,0,0,0], "u2": [0,0,0,0], "u3": [0,0,0,0]}', encoding="utf-8")
+    (tmp_path / "pcvl_bootstrap.json").write_text('{"delta_value":{"mean":0,"ci_low":0,"ci_high":0,"positive_rate":0},"delta_measurement":{"mean":0,"ci_low":0,"ci_high":0,"positive_rate":0},"delta_interaction":{"mean":0,"ci_low":0,"ci_high":0,"positive_rate":0},"delta_learned_value":{"mean":0,"ci_low":0,"ci_high":0,"positive_rate":0},"delta_learned_interaction":{"mean":0,"ci_low":0,"ci_high":0,"positive_rate":0}}', encoding="utf-8")
+    (tmp_path / "pcvl_value_decomposition.json").write_text('{"delta_value":0,"delta_measurement":0,"delta_interaction":0,"delta_learned_value":0,"delta_learned_interaction":0}', encoding="utf-8")
+    names_hash = __import__("hashlib").sha256("a\nb".encode()).hexdigest()
+    provenance = {key: "x" for key in ("git_head","source_tree_sha256","config_sha256","skill_sha256","pretrained_weights_sha256","action_schema_sha256","train_audit_indices_sha256","model_trainable_state_sha256","probe_state_sha256")}
+    provenance.update({"train_audit_file_names_sha256": names_hash, "file_names_sha256": names_hash, "sample_count": 2, "epoch": 2})
+    (tmp_path / "pcvl_provenance.json").write_text(__import__("json").dumps(provenance), encoding="utf-8")
+    try:
+        validate_pcvl_artifacts(tmp_path)
+    except RuntimeError as error:
+        assert "recomputed" in str(error).lower()
+    else:
+        raise AssertionError("tampered PCVL aggregate metrics were accepted")

@@ -47,6 +47,21 @@ def test_selected_control_gate_reads_heldout_epoch_metrics_not_train_batches():
     source = (Path(__file__).resolve().parents[1] / "fate_oia" / "engine" / "audit_precise_oia_implementation.py").read_text(encoding="utf-8")
     assert 'latest_metrics.get("counterfactual", {})' in source
     assert 'heldout_counterfactual.get("selected_control_margin"' in source
+    assert '"selected_beats_control_action"' in source
+    assert '"selected_beats_control_reason"' in source
+
+
+def test_full_gate_binds_pilot_checkpoint_and_raw_artifacts():
+    audit = (Path(__file__).resolve().parents[1] / "fate_oia" / "engine" / "audit_precise_oia_implementation.py").read_text(encoding="utf-8")
+    supervisor = (Path(__file__).resolve().parents[1] / "fate_oia" / "engine" / "supervise_precise_oia_foreground.py").read_text(encoding="utf-8")
+    for token in ("pilot_artifact_hashes", "checkpoint_latest.pth", "pcvl_probabilities.pt", "test_file_names_sha256"):
+        assert token in audit
+    assert "pilot_artifact_hashes" in supervisor
+
+
+def test_audit_accepts_skill_post_pilot_mode_as_full_gate_mode():
+    source = (Path(__file__).resolve().parents[1] / "fate_oia" / "engine" / "audit_precise_oia_implementation.py").read_text(encoding="utf-8")
+    assert 'mode in {"pilot", "post_pilot"}' in source
 
 
 def test_epoch_artifact_gate_loads_and_validates_tensor_contents():

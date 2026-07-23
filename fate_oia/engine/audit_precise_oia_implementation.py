@@ -40,9 +40,10 @@ REQUIRED_PILOT_CHECKS = {
     "peak_reserved_under_hard_limit", "all_intended_owners_stepped", "pcvl_optimizer_stepped",
     "observed_firewall_exact_zero", "action_exchange_ratio_in_range", "reason_exchange_ratio_in_range",
     "action_reread_ratio_in_range", "reason_reread_ratio_in_range", "reliability_noncollapsed",
-    "reference_not_center_collapsed", "selected_beats_control", "evidence_shuffle_changes_reason",
+    "reference_not_center_collapsed", "selected_beats_control", "selected_beats_control_action",
+    "selected_beats_control_reason", "evidence_shuffle_changes_reason",
     "annotation_delta_nonzero", "pcvl_artifacts_complete", "pcvl_predicate_action_value_supported",
-    "pcvl_learned_evidence_supported", "pcvl_learned_exchange_supported",
+    "pcvl_learned_evidence_supported", "pcvl_learned_exchange_supported", "pilot_artifacts_hash_bound",
 }
 
 
@@ -98,6 +99,36 @@ def _finite(value) -> bool:
     return True
 
 
+def _file_sha(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _state_dict_sha(state: dict[str, torch.Tensor]) -> str:
+    digest = hashlib.sha256()
+    for name, value in sorted(state.items()):
+        tensor = value.detach().cpu().contiguous()
+        digest.update(name.encode("utf-8"))
+        digest.update(str(tuple(tensor.shape)).encode("ascii"))
+        digest.update(str(tensor.dtype).encode("ascii"))
+        digest.update(tensor.numpy().tobytes())
+    return digest.hexdigest()
+
+
+def _pilot_artifact_hashes(pilot_dir: Path) -> dict[str, str]:
+    paths = [Path("checkpoint_latest.pth"), Path("run_manifest.json")]
+    paths.extend(Path("pcvl") / name for name in (
+        "pcvl_metrics.json", "pcvl_bootstrap.json", "pcvl_probabilities.pt",
+        "pcvl_labels.pt", "pcvl_file_names.json", "pcvl_provenance.json",
+    ))
+    for epoch in range(3):
+        directory = Path(f"epoch_{epoch:03d}")
+        paths.extend((directory / "metrics_summary.json", directory / "labels_action.pt", directory / "labels_reason.pt", directory / "file_names.json"))
+        paths.extend(directory / f"logits_{name}.pt" for name in EVAL_BRANCHES)
+    if not all((pilot_dir / path).is_file() for path in paths):
+        return {}
+    return {path.as_posix(): _file_sha(pilot_dir / path) for path in paths}
+
+
 def _scan_forbidden(root: Path) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
     scan_paths = set(root.glob("fate_oia/**/*precise*.py"))
     scan_paths.update(root.glob("configs/*precise*.yaml"))
@@ -139,7 +170,10 @@ def _pilot_checks(pilot_dir: Path, expected_identity: dict[str, str]) -> dict[st
     latest_metrics = metrics[-1] if metrics else {}
     owners = latest_gradient.get("owners", {})
     optimizer_counts = latest_metrics.get("optimizer_step_counts", {})
-    firewall = {key: value for key, value in latest_gradient.items() if key.startswith("observed_to_") and key != "observed_to_annotation_adapter_grad_norm"}
+    firewall_rows = [
+        {key: value for key, value in row.items() if key.startswith("observed_to_") and key != "observed_to_annotation_adapter_grad_norm"}
+        for row in gradients
+    ]
     branch = latest_metrics
     reason_semantic = branch.get("reason_semantic", {})
     evidence_shuffled = branch.get("reason_evidence_shuffled", {})
@@ -179,6 +213,9 @@ def _pilot_checks(pilot_dir: Path, expected_identity: dict[str, str]) -> dict[st
             names = json.loads((directory / "file_names.json").read_text(encoding="utf-8"))["file_names"]
             if action_labels.shape != (expected_samples, 4) or reason_labels.shape != (expected_samples, 21) or len(names) != expected_samples:
                 return False
+            names_sha = hashlib.sha256("\n".join(names).encode("utf-8")).hexdigest()
+            if names_sha != manifest.get("test_file_names_sha256"):
+                return False
             if not torch.isfinite(action_labels).all() or not torch.isfinite(reason_labels).all():
                 return False
             for branch in EVAL_BRANCHES:
@@ -204,9 +241,21 @@ def _pilot_checks(pilot_dir: Path, expected_identity: dict[str, str]) -> dict[st
     pcvl_expected = {key: manifest.get(key) for key in pcvl_identity_keys}
     try:
         validate_pcvl_artifacts(pilot_dir / "pcvl", expected_identity=pcvl_expected)
-        pcvl_artifacts_valid = True
+        provenance = json.loads((pilot_dir / "pcvl" / "pcvl_provenance.json").read_text(encoding="utf-8"))
+        checkpoint = torch.load(pilot_dir / "checkpoint_latest.pth", map_location="cpu", weights_only=False)
+        pcvl_artifacts_valid = (
+            provenance.get("model_state_sha256") == _state_dict_sha(checkpoint["model"])
+            and provenance.get("probe_state_sha256") == _state_dict_sha(checkpoint["pcvl_probes"])
+        )
     except (OSError, ValueError, KeyError, RuntimeError, TypeError, json.JSONDecodeError):
         pcvl_artifacts_valid = False
+    def task_counterfactual_positive(task: str) -> bool:
+        rows = heldout_counterfactual.get(f"per_{task}", [])
+        total = sum(float(row.get("count", 0.0)) for row in rows)
+        margin = sum(float(row.get("count", 0.0)) * (float(row.get("selected", 0.0)) - float(row.get("control", 0.0))) for row in rows)
+        return total > 0.0 and margin / total > 0.0
+
+    artifact_hashes = _pilot_artifact_hashes(pilot_dir)
     checks = {
         "pilot_identity_matches_current_code": all(manifest.get(key) == value for key, value in expected_identity.items()),
         "pilot_sample_contract": manifest.get("train_main_count") == 4096 and manifest.get("train_audit_count") == 1024 and manifest.get("train_calib_count") == 512 and manifest.get("test_count") == 512 and manifest.get("seed") == 20260722 and manifest.get("epochs") == 3 and bool(expected_indices) and all(manifest.get(key) == value for key, value in expected_indices.items()),
@@ -219,7 +268,7 @@ def _pilot_checks(pilot_dir: Path, expected_identity: dict[str, str]) -> dict[st
         "peak_reserved_under_hard_limit": bool(mechanism) and max(float(row.get("gpu_peak_reserved_gb", float("inf"))) for row in mechanism) < 46.5,
         "all_intended_owners_stepped": owner_epoch_activity and bool(optimizer_counts) and all(float(value) > 0 for value in optimizer_counts.values()),
         "pcvl_optimizer_stepped": int(latest_metrics.get("pcvl_optimizer_step_count", 0)) > 0 and int(latest_metrics.get("pcvl_nonzero_update_count", 0)) > 0 and median("pcvl_grad_norm", 0) > 0 and median("pcvl_parameter_delta_norm", 0) > 0,
-        "observed_firewall_exact_zero": bool(firewall) and all(float(value) == 0.0 for value in firewall.values()),
+        "observed_firewall_exact_zero": bool(firewall_rows) and all(row and all(float(value) == 0.0 for value in row.values()) for row in firewall_rows),
         "action_exchange_ratio_in_range": 0.01 <= median("action_exchange_to_direct_ratio") <= 0.25,
         "reason_exchange_ratio_in_range": 0.01 <= median("reason_exchange_to_direct_ratio") <= 0.30,
         "action_reread_ratio_in_range": 0.02 <= median("action_reread_to_direct_ratio") <= 0.30,
@@ -227,9 +276,12 @@ def _pilot_checks(pilot_dir: Path, expected_identity: dict[str, str]) -> dict[st
         "reliability_noncollapsed": 0.0 < median("explicit_reliability_mean") < 1.0 and median("explicit_reliability_std", 0.0) > 1e-6,
         "reference_not_center_collapsed": median("reference_center_collapse_rate", 1.0) < 0.70,
         "selected_beats_control": float(heldout_counterfactual.get("selected_control_margin", -float("inf"))) > 0.0,
-        "evidence_shuffle_changes_reason": bool(reason_semantic) and bool(evidence_shuffled) and abs(float(reason_semantic.get("Exp_mAP", 0)) - float(evidence_shuffled.get("Exp_mAP", 0))) >= 1e-4,
+        "selected_beats_control_action": task_counterfactual_positive("action"),
+        "selected_beats_control_reason": task_counterfactual_positive("reason"),
+        "evidence_shuffle_changes_reason": bool(reason_semantic) and bool(evidence_shuffled) and float(reason_semantic.get("Exp_mAP", 0)) - float(evidence_shuffled.get("Exp_mAP", 0)) >= 1e-4,
         "annotation_delta_nonzero": all((pilot_dir / f"epoch_{epoch:03d}" / "annotation_gap.json").exists() and json.loads((pilot_dir / f"epoch_{epoch:03d}" / "annotation_gap.json").read_text(encoding="utf-8")).get("annotation_delta_rms", 0) >= 1e-5 for epoch in range(3)),
         "pcvl_artifacts_complete": pcvl_artifacts_valid,
+        "pilot_artifacts_hash_bound": bool(artifact_hashes),
         "pcvl_predicate_action_value_supported": bool(pcvl.get("predicate_action_value_supported")) and float(pcvl.get("u1_action_map", 0)) > float(pcvl.get("u0_action_map", 0)) and float(bootstrap.get("delta_value", {}).get("ci_low", -1.0)) > 0.0 and float(bootstrap.get("delta_value", {}).get("positive_rate", 0.0)) >= 0.95,
         "pcvl_learned_evidence_supported": float(pcvl.get("u2_action_map", 0)) > float(pcvl.get("u0_action_map", 0)) and float(bootstrap.get("delta_learned_value", {}).get("ci_low", -1.0)) > 0.0,
         "pcvl_learned_exchange_supported": float(pcvl.get("u3_action_map", 0)) > float(pcvl.get("u2_action_map", 0)) and float(bootstrap.get("delta_learned_interaction", {}).get("ci_low", -1.0)) > 0.0,
@@ -316,8 +368,8 @@ def run_audit(config_path: str | Path, output_dir: str | Path, mode: str, pilot_
     clean_tree = not _git(["status", "--porcelain"])
     preflight_pass = not missing and compile_ok and not clean_hits and not incomplete_hits and clean_tree and all(checks.values())
     expected_identity = {"git_head": head, "config_sha256": config_sha, "source_tree_sha256": _training_source_sha(root), "skill_sha256": _sha(repo_skill), "pretrained_weights_sha256": dino_sha, "action_schema_sha256": action_schema_sha}
-    pilot_checks = _pilot_checks(Path(pilot_dir), expected_identity) if mode == "pilot" and pilot_dir else {}
-    if mode == "pilot":
+    pilot_checks = _pilot_checks(Path(pilot_dir), expected_identity) if mode in {"pilot", "post_pilot"} and pilot_dir else {}
+    if mode in {"pilot", "post_pilot"}:
         status = "FULL_TRAIN_READY" if preflight_pass and pilot_checks and all(pilot_checks.values()) else "SCIENTIFIC_GATE_FAILED"
     else:
         status = "PRE_PILOT_ELIGIBLE" if preflight_pass else "CHANGES_REQUIRED"
@@ -327,8 +379,8 @@ def run_audit(config_path: str | Path, output_dir: str | Path, mode: str, pilot_
     if pilot_checks:
         unresolved.extend(name for name, passed in pilot_checks.items() if not passed)
     record = {"status": status, "git_head": head, "branch": branch, "base_commit": base_commit, "config_sha256": config_sha, "skill_sha256": _sha(repo_skill), "action_schema_sha256": action_schema_sha, "pretrained_weights_sha256": dino_sha, "user_skill_path": str(user_skill), "source_tree_sha256": source_tree_sha, "checked_files": list(REQUIRED), "missing": missing, "forbidden_pattern_results": clean_hits, "incomplete_implementation_results": incomplete_hits, "functional_checks": checks, "pilot_checks": pilot_checks, "compile_ok": compile_ok, "tests_passed": pytest_ok, "real_forward_passed": bool(real_forward.get("passed")), "gradient_firewall_passed": bool(real_forward.get("gradient_firewall_passed")), "dino_call_contract_passed": int(runtime.get("dino_call_count", 0)) == 1, "runtime_profile_passed": bool(runtime.get("valid")), "pytest": {"passed": pytest_ok, "returncode": pytest_run.returncode, "stdout_tail": pytest_run.stdout[-4000:], "stderr_tail": pytest_run.stderr[-4000:]}, "git_clean": clean_tree, "mode": mode, "unresolved": sorted(set(unresolved))}
-    if mode == "pilot":
-        record.update({"pilot_complete": pilot_checks.get("three_epochs_complete", False), "mechanisms_active": all(pilot_checks.get(name, False) for name in REQUIRED_PILOT_CHECKS if name not in {"pcvl_predicate_action_value_supported"}), "pcvl": json.loads((Path(pilot_dir) / "pcvl" / "pcvl_metrics.json").read_text(encoding="utf-8")) if (Path(pilot_dir) / "pcvl" / "pcvl_metrics.json").exists() else {}, "runtime_selected": runtime})
+    if mode in {"pilot", "post_pilot"}:
+        record.update({"pilot_complete": pilot_checks.get("three_epochs_complete", False), "mechanisms_active": all(pilot_checks.get(name, False) for name in REQUIRED_PILOT_CHECKS if name not in {"pcvl_predicate_action_value_supported"}), "pcvl": json.loads((Path(pilot_dir) / "pcvl" / "pcvl_metrics.json").read_text(encoding="utf-8")) if (Path(pilot_dir) / "pcvl" / "pcvl_metrics.json").exists() else {}, "runtime_selected": runtime, "pilot_dir": str(Path(pilot_dir).resolve()), "pilot_artifact_hashes": _pilot_artifact_hashes(Path(pilot_dir))})
     (output / "implementation_audit_PRECISE_OIA_V1.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
     gate = root / ".review" / "PRECISE_OIA_V1_PRE_PILOT_ELIGIBLE.json"
     gate.parent.mkdir(parents=True, exist_ok=True)
@@ -349,10 +401,10 @@ def main() -> None:
     parser.add_argument("--write_full_train_ready", action="store_true")
     parser.add_argument("--pilot_dir")
     args = parser.parse_args()
-    write_gate = args.write_full_train_ready if args.mode == "pilot" else args.write_pre_pilot_eligible
+    write_gate = args.write_full_train_ready if args.mode in {"pilot", "post_pilot"} else args.write_pre_pilot_eligible
     record = run_audit(args.config, args.output_dir, args.mode, args.pilot_dir, write_gate=write_gate, device_name=args.device)
     print(json.dumps(record, sort_keys=True))
-    expected = "FULL_TRAIN_READY" if args.mode == "pilot" else "PRE_PILOT_ELIGIBLE"
+    expected = "FULL_TRAIN_READY" if args.mode in {"pilot", "post_pilot"} else "PRE_PILOT_ELIGIBLE"
     if record["status"] != expected:
         raise SystemExit(2)
 

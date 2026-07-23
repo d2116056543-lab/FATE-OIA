@@ -136,6 +136,19 @@ def _candidate_control(
     return control_token, control_mask, control_coordinates, valid
 
 
+def _norm_matched_control_token(selected_token: torch.Tensor, control_token: torch.Tensor) -> torch.Tensor:
+    """Match replacement strength to deleting the selected token.
+
+    The planned interventions remain different (selected deletion versus a
+    matched spatial replacement), but their token-space perturbation norms are
+    equal so the selected-control margin cannot be won by deletion magnitude.
+    """
+    deletion_norm = selected_token.norm(dim=-1, keepdim=True)
+    replacement_delta = control_token - selected_token
+    replacement_norm = replacement_delta.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+    return selected_token + replacement_delta * (deletion_norm / replacement_norm)
+
+
 def _task_intervention(model, output, targets: torch.Tensor, task: str, max_pairs: int, margin: float, control_tolerance: float, deterministic: bool = False) -> dict[str, torch.Tensor]:
     attention = output[f"{task}_evidence_attention"]
     base_logits = output["action_logits_final_raw" if task == "action" else "reason_logits_semantic"]
@@ -172,7 +185,10 @@ def _task_intervention(model, output, targets: torch.Tensor, task: str, max_pair
     control_coordinates = control_coordinates[valid_control]
     rows = torch.arange(len(sample_index), device=explicit.device)
     control_evidence = explicit.clone()
-    control_evidence[rows, field_index] = control_token.to(dtype=control_evidence.dtype)
+    selected_token = explicit[rows, field_index]
+    control_evidence[rows, field_index] = _norm_matched_control_token(
+        selected_token, control_token.to(dtype=control_evidence.dtype)
+    )
 
     latent_delta = output["reason_latent_delta"][sample_index]
     coordinates = output["evidence_part_coordinates"][sample_index]

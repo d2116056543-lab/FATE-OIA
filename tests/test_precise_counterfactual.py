@@ -1,6 +1,6 @@
 import torch
 
-from fate_oia.losses.precise_intervention_losses import _candidate_control, balanced_positive_pairs, incompatible_target_mask, matched_control_is_valid, packed_target_specific_interventions, target_specific_intervention_loss
+from fate_oia.losses.precise_intervention_losses import _candidate_control, _norm_matched_control_token, balanced_positive_pairs, incompatible_target_mask, matched_control_is_valid, packed_target_specific_interventions, target_specific_intervention_loss
 from fate_oia.models.precise_oia_model import PRECISEOIAModel
 
 
@@ -44,6 +44,15 @@ def test_matched_control_enforces_mass_and_nonoverlap():
     control = torch.tensor([[[0.0, 1.0], [0.0, 0.0]]])
     valid = matched_control_is_valid(selected, control, torch.tensor([True]), torch.tensor([True]), torch.tensor([True]))
     assert valid.item() is True
+
+
+def test_control_replacement_has_same_token_perturbation_norm_as_selected_deletion():
+    selected_token = torch.tensor([[3.0, 4.0]])
+    sampled_control = torch.tensor([[-8.0, 1.0]])
+    matched = _norm_matched_control_token(selected_token, sampled_control)
+    selected_deletion_norm = selected_token.norm(dim=-1)
+    control_replacement_norm = (matched - selected_token).norm(dim=-1)
+    assert torch.allclose(control_replacement_norm, selected_deletion_norm, atol=1e-6)
 
 
 def test_deterministic_control_is_not_selected_from_lowest_attention_scores():

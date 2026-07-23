@@ -53,6 +53,13 @@ def verify_review_hash(path: Path, config_path: Path, expected_status: str) -> N
         pilot_checks = record.get("pilot_checks", {})
         if not pilot_checks or not all(bool(value) for value in pilot_checks.values()):
             raise SystemExit("PRECISE full gate is missing successful scientific pilot checks")
+        pilot_dir = Path(record.get("pilot_dir", ""))
+        artifact_hashes = record.get("pilot_artifact_hashes", {})
+        if not pilot_dir.is_dir() or not artifact_hashes:
+            raise SystemExit("PRECISE full gate is not bound to a pilot directory and artifacts")
+        stale = [name for name, digest in artifact_hashes.items() if not (pilot_dir / name).is_file() or _sha(pilot_dir / name) != digest]
+        if stale:
+            raise SystemExit(f"PRECISE full gate pilot artifacts are stale or missing: {stale[:5]}")
     if subprocess.check_output(["git", "status", "--porcelain"], text=True).strip():
         raise SystemExit("PRECISE review gate cannot authorize a dirty worktree")
 

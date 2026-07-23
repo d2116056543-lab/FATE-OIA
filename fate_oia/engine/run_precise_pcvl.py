@@ -16,6 +16,7 @@ from fate_oia.models.precise_pcvl_probes import PRECISEPCVLProbes
 PCVL_FILES = (
     "pcvl_metrics.json", "pcvl_per_action.json", "pcvl_bootstrap.json",
     "pcvl_value_decomposition.json", "pcvl_provenance.json",
+    "pcvl_probabilities.pt", "pcvl_labels.pt", "pcvl_file_names.json",
 )
 
 
@@ -170,6 +171,9 @@ def evaluate_pcvl(
     (root / "pcvl_metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     (root / "pcvl_per_action.json").write_text(json.dumps(per_action, indent=2), encoding="utf-8")
     probability_tensors = {key: torch.cat(chunks) for key, chunks in predictions.items()}
+    torch.save(probability_tensors, root / "pcvl_probabilities.pt")
+    torch.save(target, root / "pcvl_labels.pt")
+    (root / "pcvl_file_names.json").write_text(json.dumps({"file_names": file_names}, indent=2), encoding="utf-8")
     generator = torch.Generator().manual_seed(20260722)
     bootstrap_rows = []
     for _ in range(200):
@@ -198,6 +202,7 @@ def evaluate_pcvl(
         **provenance,
         "sample_count": len(file_names),
         "file_names_sha256": _names_sha256(file_names),
+        "model_state_sha256": _state_sha256(model),
         "model_trainable_state_sha256": _state_sha256(model, trainable_only=True),
         "probe_state_sha256": _state_sha256(probes),
     }
@@ -211,7 +216,8 @@ def validate_pcvl_artifacts(path: str | Path, expected_identity: dict[str, Any] 
     missing = [name for name in PCVL_FILES if not (root / name).exists()]
     if missing:
         raise RuntimeError(f"Missing PCVL pilot artifacts: {missing}")
-    loaded = {name: json.loads((root / name).read_text(encoding="utf-8")) for name in PCVL_FILES}
+    json_files = [name for name in PCVL_FILES if name.endswith(".json")]
+    loaded = {name: json.loads((root / name).read_text(encoding="utf-8")) for name in json_files}
     if not _all_finite(loaded):
         raise RuntimeError("PCVL artifacts contain non-finite values")
     metrics = loaded["pcvl_metrics.json"]
@@ -221,16 +227,51 @@ def validate_pcvl_artifacts(path: str | Path, expected_identity: dict[str, Any] 
     per_action = loaded["pcvl_per_action.json"]
     if any(key not in per_action or len(per_action[key]) != 4 for key in ("u0", "u1", "u2", "u3")):
         raise RuntimeError("PCVL per-action schema is invalid")
+    probabilities = torch.load(root / "pcvl_probabilities.pt", map_location="cpu", weights_only=True)
+    labels = torch.load(root / "pcvl_labels.pt", map_location="cpu", weights_only=True)
+    names = loaded["pcvl_file_names.json"].get("file_names", [])
+    if set(probabilities) != {"u0", "u1", "u2", "u3"} or labels.ndim != 2 or labels.shape[1] != 4:
+        raise RuntimeError("PCVL raw prediction schema is invalid")
+    if any(value.shape != labels.shape or not torch.isfinite(value).all() for value in probabilities.values()) or not torch.isfinite(labels).all() or len(names) != len(labels):
+        raise RuntimeError("PCVL raw predictions are incomplete or non-finite")
+    for key, value in probabilities.items():
+        recomputed = _average_precision(value, labels)
+        recomputed_map = float(torch.nanmean(recomputed))
+        if abs(recomputed_map - float(metrics[f"{key}_action_map"])) > 1e-8:
+            raise RuntimeError(f"PCVL recomputed {key} mAP does not match aggregate metrics")
+        for actual, recorded in zip(recomputed, per_action[key]):
+            if torch.isnan(actual):
+                if recorded is not None:
+                    raise RuntimeError(f"PCVL recomputed {key} per-action AP mismatch")
+            elif recorded is None or abs(float(actual) - float(recorded)) > 1e-8:
+                raise RuntimeError(f"PCVL recomputed {key} per-action AP mismatch")
     bootstrap = loaded["pcvl_bootstrap.json"]
     for key in ("delta_value", "delta_measurement", "delta_interaction", "delta_learned_value", "delta_learned_interaction"):
         if key not in bootstrap or any(field not in bootstrap[key] for field in ("mean", "ci_low", "ci_high", "positive_rate")):
             raise RuntimeError(f"PCVL bootstrap schema missing {key}")
+    generator = torch.Generator().manual_seed(20260722)
+    raw_rows = []
+    for _ in range(200):
+        sample = torch.randint(0, len(labels), (len(labels),), generator=generator)
+        sampled = {key: float(torch.nanmean(_average_precision(value[sample], labels[sample]))) for key, value in probabilities.items()}
+        raw_rows.append({
+            "delta_value": sampled["u1"] - sampled["u0"],
+            "delta_measurement": sampled["u2"] - sampled["u1"],
+            "delta_interaction": sampled["u3"] - sampled["u2"],
+            "delta_learned_value": sampled["u2"] - sampled["u0"],
+            "delta_learned_interaction": sampled["u3"] - sampled["u2"],
+        })
+    for key in raw_rows[0]:
+        values = torch.tensor([row[key] for row in raw_rows])
+        expected = {"mean": float(values.mean()), "ci_low": float(values.quantile(0.025)), "ci_high": float(values.quantile(0.975)), "positive_rate": float((values > 0).float().mean())}
+        if any(abs(expected[field] - float(bootstrap[key][field])) > 1e-8 for field in expected):
+            raise RuntimeError(f"PCVL recomputed bootstrap {key} does not match aggregate artifact")
     provenance = loaded["pcvl_provenance.json"]
     required_provenance = (
         "git_head", "source_tree_sha256", "config_sha256", "skill_sha256",
         "pretrained_weights_sha256", "action_schema_sha256",
         "train_audit_indices_sha256", "train_audit_file_names_sha256",
-        "sample_count", "file_names_sha256", "model_trainable_state_sha256",
+        "sample_count", "file_names_sha256", "model_state_sha256", "model_trainable_state_sha256",
         "probe_state_sha256", "epoch",
     )
     missing_provenance = [key for key in required_provenance if key not in provenance]
@@ -238,6 +279,8 @@ def validate_pcvl_artifacts(path: str | Path, expected_identity: dict[str, Any] 
         raise RuntimeError(f"PCVL provenance missing {missing_provenance}")
     if provenance["file_names_sha256"] != provenance["train_audit_file_names_sha256"]:
         raise RuntimeError("PCVL provenance audit file order does not match the bound split")
+    if provenance["sample_count"] != len(names) or provenance["file_names_sha256"] != _names_sha256(names):
+        raise RuntimeError("PCVL raw sample identity does not match provenance")
     if expected_identity is not None:
         mismatched = [key for key, value in expected_identity.items() if provenance.get(key) != value]
         if mismatched:
