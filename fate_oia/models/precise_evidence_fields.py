@@ -27,6 +27,8 @@ class PRECISEEvidenceFields(nn.Module):
         self.presence = nn.Linear(dim, 1)
         self.observability = nn.Linear(dim, 1)
         self.state_heads = nn.ModuleList([nn.Linear(dim, max(1, len(field.get("state_schema", field.get("type_schema", []))))) for field in fields])
+        self.actor_part_type = nn.Linear(dim, 4)
+        self.actor_part_occupancy = nn.Linear(dim, 1)
         self.part_offsets = nn.Parameter(torch.zeros(self.num_explicit, self.max_parts, 2))
         self.part_scales_raw = nn.Parameter(torch.zeros(self.num_explicit, self.max_parts, 2))
         self.positive_prototypes = nn.Parameter(torch.randn(self.num_explicit, dim) * 0.02)
@@ -43,6 +45,10 @@ class PRECISEEvidenceFields(nn.Module):
                 curve_anchor[index, : int(field["num_parts"])] = torch.linspace(0.15, 0.95, int(field["num_parts"]))
         self.register_buffer("curve_y_anchor", curve_anchor)
         names = [field["name"] for field in fields]
+        actor_indices = [index for index, field in enumerate(fields) if field["family"] == "actor"]
+        if len(actor_indices) != 3:
+            raise ValueError("PRECISE requires left/center/right actor evidence fields")
+        self.register_buffer("actor_indices", torch.tensor(actor_indices, dtype=torch.long))
         mirror_names = {
             "actor_left": "actor_right", "actor_right": "actor_left",
             "drivable_left": "drivable_right", "drivable_right": "drivable_left",
@@ -74,7 +80,7 @@ class PRECISEEvidenceFields(nn.Module):
             logits = logits + spatial * (curve_anchor >= 0).view(1, *curve_anchor.shape, 1)
         return torch.softmax(logits, dim=-1)
 
-    def _derived_atoms(self, presence: torch.Tensor, state_logits: torch.Tensor) -> dict[str, torch.Tensor]:
+    def _derived_atoms(self, presence: torch.Tensor, state_logits: torch.Tensor, actor_type_probability: torch.Tensor) -> dict[str, torch.Tensor]:
         p = torch.sigmoid(presence)
         state = torch.sigmoid(state_logits)
         name_to_idx = {field["name"]: idx for idx, field in enumerate(self.fields)}
@@ -88,10 +94,10 @@ class PRECISEEvidenceFields(nn.Module):
             "traffic_light_red": typed("traffic_light", 0),
             "traffic_light_green": typed("traffic_light", 1),
             "traffic_sign_visible": probability("traffic_sign"),
-            "front_vehicle_visible": typed("actor_center", 0),
-            "front_pedestrian_visible": typed("actor_center", 1),
-            "front_rider_visible": typed("actor_center", 2),
-            "front_other_obstacle": typed("actor_center", 3),
+            "front_vehicle_visible": actor_type_probability[:, 1, 0],
+            "front_pedestrian_visible": actor_type_probability[:, 1, 1],
+            "front_rider_visible": actor_type_probability[:, 1, 2],
+            "front_other_obstacle": actor_type_probability[:, 1, 3],
             "left_occupied": probability("actor_left"),
             "center_occupied": probability("actor_center"),
             "right_occupied": probability("actor_right"),
@@ -104,6 +110,15 @@ class PRECISEEvidenceFields(nn.Module):
             "right_solid_boundary": typed("boundary_right", 0),
         }
         return atom
+
+    def _certificate_probability(self, atoms: dict[str, torch.Tensor]) -> torch.Tensor:
+        names = {
+            "traffic_light": "traffic_light_visible", "traffic_sign": "traffic_sign_visible",
+            "actor_left": "left_occupied", "actor_center": "center_occupied", "actor_right": "right_occupied",
+            "drivable_left": "left_drivable", "drivable_center": "center_drivable", "drivable_right": "right_drivable",
+            "boundary_left": "left_boundary_visible", "boundary_right": "right_boundary_visible",
+        }
+        return torch.stack([atoms[names[field["name"]]] for field in self.fields], dim=1)
 
     def forward(self, evidence_layers: torch.Tensor, latent_layers: torch.Tensor | None = None) -> dict[str, torch.Tensor | dict[str, torch.Tensor]]:
         batch, layer_count, token_count, dim = evidence_layers.shape
@@ -140,12 +155,25 @@ class PRECISEEvidenceFields(nn.Module):
         state_logits = explicit.new_zeros(batch, self.num_explicit, max_state)
         for index, head in enumerate(self.state_heads):
             state_logits[:, index, : head.out_features] = head(explicit[:, index])
+        actor_part_type_logits = self.actor_part_type(part_features[:, self.actor_indices])
+        actor_part_occupancy_logits = self.actor_part_occupancy(part_features[:, self.actor_indices]).squeeze(-1)
+        actor_valid = self.part_valid[self.actor_indices].view(1, 3, self.max_parts, 1)
+        actor_occupancy_probability = torch.sigmoid(actor_part_occupancy_logits) * actor_valid.squeeze(-1).to(actor_part_occupancy_logits)
+        actor_presence_probability = 1.0 - (1.0 - actor_occupancy_probability).prod(dim=2)
+        actor_joint_probability = actor_occupancy_probability.unsqueeze(-1) * torch.sigmoid(actor_part_type_logits)
+        actor_type_probability = 1.0 - (1.0 - actor_joint_probability).prod(dim=2)
+        actor_noisy_or_logits = torch.logit(actor_type_probability.clamp(1e-6, 1.0 - 1e-6))
+        presence_logits = presence_logits.clone()
+        presence_logits[:, self.actor_indices] = torch.logit(actor_presence_probability.clamp(1e-6, 1.0 - 1e-6)).to(presence_logits)
+        state_logits = state_logits.clone()
+        state_logits[:, self.actor_indices, :4] = actor_noisy_or_logits.to(state_logits)
         pos = torch.nn.functional.normalize(self.positive_prototypes, dim=-1)
         neg = torch.nn.functional.normalize(self.negative_prototypes, dim=-1)
         normalized = torch.nn.functional.normalize(explicit, dim=-1)
         margin = (normalized * pos.unsqueeze(0)).sum(-1) - (normalized * neg.unsqueeze(0)).sum(-1)
-        reliability = torch.sigmoid(observability_logits) * torch.sigmoid(margin / self.reliability_tau) * self.view_consistency_ema.view(1, -1)
-        derived = self._derived_atoms(presence_logits, state_logits)
+        derived = self._derived_atoms(presence_logits, state_logits, actor_type_probability)
+        certificate_probability = self._certificate_probability(derived)
+        reliability = certificate_probability * torch.sigmoid(observability_logits) * torch.sigmoid(margin / self.reliability_tau) * self.view_consistency_ema.view(1, -1)
         field_attention = part_attention.sum(2) / self.part_count.to(tokens).view(1, -1, 1)
         return {
             "explicit_tokens": explicit,
@@ -154,10 +182,14 @@ class PRECISEEvidenceFields(nn.Module):
             "observability_logits": observability_logits,
             "state_logits": state_logits,
             "type_logits_actor": state_logits[:, 2:5, :4],
+            "actor_part_type_logits": actor_part_type_logits[:, :, :4],
+            "actor_part_occupancy_logits": actor_part_occupancy_logits[:, :, :4],
+            "actor_type_probability": actor_type_probability,
             "part_coordinates": part_coordinates,
             "part_scales": part_scales,
             "soft_masks": soft_masks,
             "derived_atom_probs": derived,
+            "certificate_probability": certificate_probability,
             "reliability": reliability,
             "field_attention": field_attention,
             "explicit_part_attention": part_attention,

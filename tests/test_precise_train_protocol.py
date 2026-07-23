@@ -3,7 +3,8 @@ from pathlib import Path
 import torch
 import yaml
 
-from fate_oia.engine.train_precise_oia import _slice_batch_output, build_optimizers
+from fate_oia.engine.train_precise_oia import _slice_batch_output, build_optimizers, _training_split_indices
+from fate_oia.losses.precise_losses import refinement_loss
 from fate_oia.models.precise_oia_model import PRECISEOIAModel
 
 
@@ -74,6 +75,7 @@ def test_pilot_resume_restores_pcvl_probe_and_optimizer_state():
     assert '"pcvl_optimizer"' in source
     assert "pcvl_probes.load_state_dict" in source
     assert "pcvl_optimizer.load_state_dict" in source
+    assert "checkpoint_meta = torch.load" not in source
 
 
 def test_sample_limited_smoke_uses_full_train_metadata_for_field_preflight():
@@ -126,3 +128,38 @@ def test_runtime_profiles_are_memory_isolated_and_persisted_before_selection():
     assert "gc.collect()" in source
     assert source.count("torch.cuda.empty_cache()") >= 2
     assert source.index('(root / "runtime_profile.json").write_text') < source.index("selected = choose_runtime_profile")
+
+
+def test_refinement_easy_nonregression_allows_small_degradation():
+    direct = torch.tensor([[5.0], [0.0]])
+    targets = torch.ones(2, 1)
+    refined = torch.tensor([[4.9], [0.1]])
+    loss = refinement_loss(direct, refined, targets)
+    assert float(loss) == 0.0
+
+
+def test_full_split_honors_train_trunk_on_all_train_but_pilot_stays_disjoint():
+    dataset = list(range(16082))
+    main, audit, calib = _training_split_indices(dataset, "full", 20260722, 0.10, True)
+    assert len(main) == 16082
+    assert len(calib) > 0
+    assert set(calib).issubset(set(main))
+    pilot_main, pilot_audit, pilot_calib = _training_split_indices(dataset, "pilot", 20260722, 0.10, True)
+    assert (len(pilot_main), len(pilot_audit), len(pilot_calib)) == (4096, 1024, 512)
+    assert not (set(pilot_main) & set(pilot_audit) or set(pilot_main) & set(pilot_calib) or set(pilot_audit) & set(pilot_calib))
+
+
+def test_configured_brightness_and_contrast_are_wired_only_to_train_transform():
+    source = (ROOT / "fate_oia" / "engine" / "train_precise_oia.py").read_text(encoding="utf-8")
+    assert 'training=True, brightness=float(augmentation["brightness"]), contrast=float(augmentation["contrast"])' in source
+    assert "training=False" in source
+    assert "train_calib = Subset(train_eval_set, calib_indices)" in source
+    assert "Subset(train_eval_set, audit_indices)" in source
+
+
+def test_epoch_mechanism_artifacts_are_full_test_aggregates_not_last_train_batch():
+    source = (ROOT / "fate_oia" / "engine" / "train_precise_oia.py").read_text(encoding="utf-8")
+    assert 'mechanism_test = metrics["mechanism_test"]' in source
+    assert '"aggregation": "full_test"' in source
+    artifact_section = source[source.index('mechanism_test = metrics["mechanism_test"]'):source.index("save_epoch_tensors", source.index('mechanism_test = metrics["mechanism_test"]'))]
+    assert "last_output" not in artifact_section

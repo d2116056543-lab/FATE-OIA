@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+
 import torch
 from torch import nn
 
@@ -18,7 +20,12 @@ class PRECISEPCVLProbes(nn.Module):
 
     def __init__(self, dim: int = 384) -> None:
         super().__init__()
-        self.u0, self.u1, self.u2, self.u3 = _Probe(dim), _Probe(dim), _Probe(dim), _Probe(dim)
+        self.u0 = _Probe(dim)
+        # Equal capacity is insufficient when random initialization differs;
+        # identical starts isolate the incremental information in U1/U2/U3.
+        self.u1 = copy.deepcopy(self.u0)
+        self.u2 = copy.deepcopy(self.u0)
+        self.u3 = copy.deepcopy(self.u0)
 
     def forward(self, base_tokens: torch.Tensor, oracle_evidence: torch.Tensor, learned_evidence: torch.Tensor, learned_exchange: torch.Tensor) -> dict[str, torch.Tensor]:
         if base_tokens.shape != oracle_evidence.shape or base_tokens.shape != learned_evidence.shape or base_tokens.shape != learned_exchange.shape:

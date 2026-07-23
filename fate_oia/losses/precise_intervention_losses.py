@@ -4,12 +4,20 @@ import torch
 from torch.nn import functional as F
 
 
-def target_specific_intervention_loss(selected_effect: torch.Tensor, control_effect: torch.Tensor, wrong_effect: torch.Tensor, base_logits: torch.Tensor, intervened_logits: torch.Tensor, targets: torch.Tensor, margin: float = 0.10, nonreg_delta: float = 0.02) -> dict[str, torch.Tensor]:
+def target_specific_intervention_loss(selected_effect: torch.Tensor, control_effect: torch.Tensor, wrong_effect: torch.Tensor, base_logits: torch.Tensor, intervened_logits: torch.Tensor, targets: torch.Tensor, margin: float = 0.10, nonreg_delta: float = 0.02, target_indices: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
     direct = (margin + control_effect - selected_effect).relu().mean()
     specific = (margin + wrong_effect - selected_effect).relu().mean()
     base = F.binary_cross_entropy_with_logits(base_logits.detach(), targets.float(), reduction="none")
     intervened = F.binary_cross_entropy_with_logits(intervened_logits, targets.float(), reduction="none")
-    nonreg = (intervened - base - nonreg_delta).relu().mean()
+    nonreg_raw = (intervened - base - nonreg_delta).relu()
+    if target_indices is not None:
+        # The selected target is expected to worsen when its evidence is
+        # deleted. Non-regression therefore applies only to the other labels.
+        non_target = torch.ones_like(nonreg_raw, dtype=torch.bool)
+        non_target.scatter_(1, target_indices.view(-1, 1), False)
+        nonreg = nonreg_raw.masked_select(non_target).mean() if non_target.any() else nonreg_raw.sum() * 0.0
+    else:
+        nonreg = nonreg_raw.mean()
     return {"loss_intervention_direct": direct, "loss_intervention_specific": specific, "loss_intervention_nonreg": nonreg, "loss_intervention": 0.10 * direct + 0.05 * specific + 0.05 * nonreg}
 
 
@@ -33,13 +41,33 @@ def _empty_task_result(base_logits: torch.Tensor) -> dict[str, torch.Tensor]:
     return {"loss_intervention": zero, "selected_effect_mean": zero.detach(), "control_effect_mean": zero.detach(), "wrong_effect_mean": zero.detach(), "pair_count": zero.detach(), "hard_rate": zero.detach(), "easy_rate": zero.detach(), "sign_agreement": zero.detach(), "per_target_count": per_target, "per_target_selected_sum": per_target.clone(), "per_target_control_sum": per_target.clone(), "per_target_wrong_sum": per_target.clone(), "per_target_sign_sum": per_target.clone()}
 
 
+def balanced_positive_pairs(targets: torch.Tensor, max_pairs: int) -> torch.Tensor:
+    """Sample positives round-robin by target instead of truncating row-major indices."""
+    pools = []
+    for target in range(targets.shape[1]):
+        samples = torch.where(targets[:, target] > 0)[0]
+        if samples.numel():
+            samples = samples[torch.randperm(samples.numel(), device=samples.device)]
+            pools.append(torch.stack([samples, torch.full_like(samples, target)], dim=1))
+    selected = []
+    round_index = 0
+    while len(selected) < max_pairs and any(round_index < len(pool) for pool in pools):
+        for pool in pools:
+            if round_index < len(pool):
+                selected.append(pool[round_index])
+                if len(selected) == max_pairs:
+                    break
+        round_index += 1
+    return torch.stack(selected) if selected else torch.empty(0, 2, dtype=torch.long, device=targets.device)
+
+
 def _candidate_control(
     model,
     output: dict[str, torch.Tensor],
     sample_index: torch.Tensor,
     field_index: torch.Tensor,
     tolerance: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     coordinates = output["evidence_part_coordinates"][sample_index, field_index]
     selected_mask = output["evidence_masks"][sample_index, field_index]
     part_count = model.evidence_fields.part_count[field_index]
@@ -90,16 +118,15 @@ def _candidate_control(
     grid = (control_coordinates.view(len(rows), -1, 1, 2) * 2.0 - 1.0).to(dtype=source.dtype)
     sampled = F.grid_sample(source, grid, mode="bilinear", align_corners=True).squeeze(-1).transpose(1, 2)
     control_token = (sampled * part_valid.unsqueeze(-1)).sum(1) / part_count.to(sampled).view(-1, 1)
-    return control_token, control_mask, valid
+    return control_token, control_mask, control_coordinates, valid
 
 
 def _task_intervention(model, output, targets: torch.Tensor, task: str, max_pairs: int, margin: float, control_tolerance: float) -> dict[str, torch.Tensor]:
     attention = output[f"{task}_evidence_attention"]
     base_logits = output["action_logits_final_raw" if task == "action" else "reason_logits_semantic"]
-    positive = targets.float().nonzero(as_tuple=False)
+    positive = balanced_positive_pairs(targets.float(), max_pairs)
     if positive.numel() == 0:
         return _empty_task_result(base_logits)
-    positive = positive[:max_pairs]
     sample_index, target_index = positive[:, 0], positive[:, 1]
     scores = attention[sample_index, target_index] * output["evidence_reliability"][sample_index]
     field_index = scores.argmax(-1)
@@ -111,7 +138,7 @@ def _task_intervention(model, output, targets: torch.Tensor, task: str, max_pair
     selected_evidence[rows, field_index] = 0.0
     selected_reliability[rows, field_index] = 0.0
 
-    control_token, _, valid_control = _candidate_control(model, output, sample_index, field_index, control_tolerance)
+    control_token, _, control_coordinates, valid_control = _candidate_control(model, output, sample_index, field_index, control_tolerance)
     if not valid_control.any():
         return _empty_task_result(base_logits)
     sample_index = sample_index[valid_control]
@@ -122,15 +149,22 @@ def _task_intervention(model, output, targets: torch.Tensor, task: str, max_pair
     selected_evidence = selected_evidence[valid_control]
     selected_reliability = selected_reliability[valid_control]
     control_token = control_token[valid_control]
+    control_coordinates = control_coordinates[valid_control]
     rows = torch.arange(len(sample_index), device=explicit.device)
     control_evidence = explicit.clone()
     control_evidence[rows, field_index] = control_token.to(dtype=control_evidence.dtype)
 
-    action_tokens = output["action_tokens_reread"][sample_index]
-    reason_tokens = output["reason_tokens_reread"][sample_index]
     latent_delta = output["reason_latent_delta"][sample_index]
-    selected = model.decode_cached_exchange(action_tokens, reason_tokens, selected_evidence, selected_reliability, latent_delta)[f"{task}_logits"]
-    control = model.decode_cached_exchange(action_tokens, reason_tokens, control_evidence, reliability, latent_delta)[f"{task}_logits"]
+    coordinates = output["evidence_part_coordinates"][sample_index]
+    control_part_coordinates = coordinates.clone()
+    control_part_coordinates[rows, field_index] = control_coordinates
+    common = (
+        output["action_tokens_direct"][sample_index], output["reason_tokens_direct"][sample_index],
+        output["action_field_layers"][sample_index], output["reason_field_layers"][sample_index],
+        output["action_logits_direct"][sample_index], output["reason_logits_direct"][sample_index],
+    )
+    selected = model.decode_cached_intervention(*common, selected_evidence, selected_reliability, coordinates, output["evidence_part_valid"], latent_delta)[f"{task}_logits"]
+    control = model.decode_cached_intervention(*common, control_evidence, reliability, control_part_coordinates, output["evidence_part_valid"], latent_delta)[f"{task}_logits"]
     base = base_logits[sample_index]
     selected_effect = base[rows, target_index] - selected[rows, target_index]
     control_effect = base[rows, target_index] - control[rows, target_index]
@@ -151,7 +185,7 @@ def _task_intervention(model, output, targets: torch.Tensor, task: str, max_pair
     incompatible = base.detach().masked_fill(~incompatible_mask, -torch.inf)
     wrong_target = incompatible.argmax(-1)
     wrong_effect = base[rows, wrong_target] - selected[rows, wrong_target]
-    loss = target_specific_intervention_loss(selected_effect, control_effect, wrong_effect, base, selected, targets[sample_index], margin=margin)
+    loss = target_specific_intervention_loss(selected_effect, control_effect, wrong_effect, base, selected, targets[sample_index], margin=margin, target_indices=target_index)
     hard_rate = (selected_effect <= control_effect).float().mean()
     easy_rate = (selected_effect > control_effect + 0.10).float().mean()
     count = base.new_zeros(base.shape[-1]).scatter_add_(0, target_index, torch.ones_like(target_index, dtype=base.dtype))
@@ -169,17 +203,20 @@ def packed_target_specific_interventions(model, output, action_targets: torch.Te
     action_pairs = max_pairs // 2
     action = _task_intervention(model, output, action_targets, "action", action_pairs, margin, control_tolerance)
     reason = _task_intervention(model, output, reason_targets, "reason", max_pairs - action_pairs, margin, control_tolerance)
+    total_count = (action["pair_count"] + reason["pair_count"]).clamp_min(1.0)
+    def weighted(name: str) -> torch.Tensor:
+        return (action[name] * action["pair_count"] + reason[name] * reason["pair_count"]) / total_count
     return {
         "loss_intervention": action["loss_intervention"] + reason["loss_intervention"],
         "loss_intervention_action": action["loss_intervention"],
         "loss_intervention_reason": reason["loss_intervention"],
-        "selected_effect_mean": 0.5 * (action["selected_effect_mean"] + reason["selected_effect_mean"]),
-        "control_effect_mean": 0.5 * (action["control_effect_mean"] + reason["control_effect_mean"]),
-        "wrong_effect_mean": 0.5 * (action["wrong_effect_mean"] + reason["wrong_effect_mean"]),
+        "selected_effect_mean": weighted("selected_effect_mean"),
+        "control_effect_mean": weighted("control_effect_mean"),
+        "wrong_effect_mean": weighted("wrong_effect_mean"),
         "intervention_pair_count": action["pair_count"] + reason["pair_count"],
-        "intervention_hard_rate": 0.5 * (action["hard_rate"] + reason["hard_rate"]),
-        "intervention_easy_rate": 0.5 * (action["easy_rate"] + reason["easy_rate"]),
-        "sign_agreement": 0.5 * (action["sign_agreement"] + reason["sign_agreement"]),
+        "intervention_hard_rate": weighted("hard_rate"),
+        "intervention_easy_rate": weighted("easy_rate"),
+        "sign_agreement": weighted("sign_agreement"),
         **{f"action_{key}": action[key] for key in ("per_target_count", "per_target_selected_sum", "per_target_control_sum", "per_target_wrong_sum", "per_target_sign_sum")},
         **{f"reason_{key}": reason[key] for key in ("per_target_count", "per_target_selected_sum", "per_target_control_sum", "per_target_wrong_sum", "per_target_sign_sum")},
     }

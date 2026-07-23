@@ -21,6 +21,9 @@ def test_evidence_fields_emit_multipart_explicit_and_unnamed_latent_tokens():
     assert output["reliability"].shape == (2, 10)
     assert set(("traffic_light_visible", "right_solid_boundary")) <= set(output["derived_atom_probs"])
     assert output["explicit_part_attention"].shape == (2, 10, 8, 3600)
+    assert output["actor_part_type_logits"].shape == (2, 3, 4, 4)
+    assert output["actor_part_occupancy_logits"].shape == (2, 3, 4)
+    assert output["certificate_probability"].shape == (2, 10)
     assert output["latent_part_attention"].shape == (2, 6, 4, 3600)
     # Ordered curve parts must occupy distinct y anchors rather than repeat a centroid.
     left_curve_y = output["part_coordinates"][:, 8, :8, 1]
@@ -45,6 +48,16 @@ def test_reliability_is_continuous_and_increases_with_observability_logit():
     base = model(torch.randn(1, 3, 3600, 384))
     assert torch.isfinite(base["reliability"]).all()
     assert (base["reliability"] > 0).any() and (base["reliability"] < 1).any()
+
+
+def test_actor_state_is_partwise_noisy_or_and_certificate_controls_reliability():
+    fields = load_evidence_fields(ROOT / "configs" / "precise_evidence_fields.yaml")
+    model = PRECISEEvidenceFields(fields)
+    output = model(torch.randn(1, 3, 3600, 384))
+    joint = torch.sigmoid(output["actor_part_occupancy_logits"]).unsqueeze(-1) * torch.sigmoid(output["actor_part_type_logits"])
+    expected = 1.0 - (1.0 - joint).prod(dim=2)
+    assert torch.allclose(torch.sigmoid(output["state_logits"][:, 2:5, :4]), expected, atol=1e-5)
+    assert torch.all(output["reliability"] <= output["certificate_probability"] + 1e-6)
 
 
 def test_evidence_loss_contains_geometry_prototype_view_and_latent_terms():

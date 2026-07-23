@@ -23,3 +23,10 @@ def test_review_gate_verification_checks_status_source_tree_and_pilot_checks():
     for required in ("expected_status", "source_tree_sha256", "functional_checks", "pilot_checks"):
         assert required in source
     assert 'expected_status="FULL_TRAIN_READY"' in source
+
+
+def test_supervisor_rejects_stale_or_mixed_pilot_directory_and_uses_profile_selection():
+    source = (ROOT / "fate_oia" / "engine" / "supervise_precise_oia_foreground.py").read_text(encoding="utf-8")
+    assert "assert_fresh_run_dir" in source
+    assert "selected_runtime_profile.json" in source
+    assert "epochs != 3" in source

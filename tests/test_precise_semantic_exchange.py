@@ -28,3 +28,12 @@ def test_action_exchange_blocks_reason_owner_gradient():
     output["action_exchange_delta"].square().mean().backward()
     assert reason.grad is None
     assert action.grad is not None
+
+
+def test_wrong_target_ratio_uses_action_reason_groups_not_min_max_weights():
+    model = _model()
+    assert model.action_reason_compatibility.shape == (4, 21)
+    assert model.action_reason_compatibility.sum(dim=1).tolist() == [3, 6, 6, 6]
+    output = model(torch.randn(2, 4, 384), torch.randn(2, 21, 384), torch.randn(2, 10, 384), torch.full((2, 10), 0.7))
+    expected = output["wrong_target_message_mass"] / output["correct_target_message_mass"].clamp_min(1e-8)
+    assert torch.allclose(output["wrong_target_message_ratio"], expected)

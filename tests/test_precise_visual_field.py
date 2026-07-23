@@ -22,3 +22,22 @@ def test_reason_loss_does_not_update_action_foundation():
     output.reason_layers.square().mean().backward()
     assert all(parameter.grad is None for parameter in field.action_foundation.parameters())
     assert any(parameter.grad is not None for parameter in field.reason_private.parameters())
+
+
+def test_visual_field_owner_specific_position_parameters_are_isolated():
+    field = PRECISEVisualField()
+    owners = field.owned_parameters()
+    assert not ({id(value) for value in owners["action_foundation"]} & {id(value) for value in owners["reason_semantic"]})
+    assert not ({id(value) for value in owners["action_foundation"]} & {id(value) for value in owners["evidence_core"]})
+    output = field(_dino_batch(1))
+    output.reason_layers.square().mean().backward()
+    assert field.layer_embedding["action"].grad is None
+    assert field.layer_embedding["reason"].grad is not None
+
+
+def test_visual_field_includes_full_rank_2d_and_perspective_position_encoding():
+    field = PRECISEVisualField()
+    position = field._perspective("action", torch.device("cpu"), torch.float32, (45, 80))
+    assert position.shape == (1, 3600, 384)
+    assert not torch.equal(position[:, 0], position[:, 1])
+    assert not torch.equal(position[:, 0], position[:, 80])

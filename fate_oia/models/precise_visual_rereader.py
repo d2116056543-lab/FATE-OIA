@@ -36,15 +36,17 @@ class PRECISEVisualRereader(nn.Module):
         coverage = (attention > 0).float().sum(-1) / attention.shape[-1]
         return torch.stack([probability, entropy, support, veto, conflict, coverage], dim=-1)
 
-    def _references(self, tokens: torch.Tensor, attention: torch.Tensor, part_coordinates: torch.Tensor, demand_state: torch.Tensor, layer_count: int) -> torch.Tensor:
-        field_center = part_coordinates.mean(dim=2)
+    def _references(self, tokens: torch.Tensor, attention: torch.Tensor, part_coordinates: torch.Tensor, part_valid: torch.Tensor, demand_state: torch.Tensor, layer_count: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        valid = part_valid.to(part_coordinates).view(1, *part_valid.shape, 1)
+        field_center = (part_coordinates * valid).sum(dim=2) / valid.sum(dim=2).clamp_min(1.0)
         base = torch.einsum("bce,bed->bcd", attention, field_center)
         error = 0.10 * torch.tanh(self.error_mlp(torch.cat([tokens, demand_state], dim=-1)))
-        reference = (base + error).clamp(0.0, 1.0)
+        reference = base + error
         offsets = torch.tensor([[-0.03, -0.03], [0.03, -0.03], [-0.03, 0.03], [0.03, 0.03]], device=tokens.device, dtype=tokens.dtype)[: self.points]
-        references = (reference[:, :, None, None, :] + offsets.view(1, 1, 1, self.points, 2)).clamp(0.0, 1.0)
+        raw_references = reference[:, :, None, None, :] + offsets.view(1, 1, 1, self.points, 2)
+        references = raw_references.clamp(0.0, 1.0)
         entropy = -(attention.clamp_min(1e-8) * attention.clamp_min(1e-8).log()).sum(-1)
-        return references.expand(-1, -1, layer_count, -1, -1), entropy
+        return references.expand(-1, -1, layer_count, -1, -1), raw_references.expand(-1, -1, layer_count, -1, -1), entropy
 
     def _sample(self, layers: torch.Tensor, references: torch.Tensor) -> torch.Tensor:
         batch, layers_count, _, dim = layers.shape
@@ -60,6 +62,7 @@ class PRECISEVisualRereader(nn.Module):
     def forward(self, action_tokens: torch.Tensor, reason_tokens: torch.Tensor, evidence: dict[str, torch.Tensor], action_layers: torch.Tensor, reason_layers: torch.Tensor, action_logits: torch.Tensor, reason_logits: torch.Tensor) -> dict[str, torch.Tensor]:
         fields = evidence["explicit_tokens"].detach()
         coordinates = evidence["part_coordinates"].detach()
+        part_valid = evidence["part_valid"].detach()
         reliability = evidence["reliability"].detach()
         action_attention = self._field_attention(action_tokens, fields, self.action_field_query)
         reason_attention = self._field_attention(reason_tokens, fields, self.reason_field_query)
@@ -68,7 +71,7 @@ class PRECISEVisualRereader(nn.Module):
         joined_tokens = torch.cat([action_tokens, reason_tokens], dim=1)
         joined_attention = torch.cat([action_attention, reason_attention], dim=1)
         demand = torch.cat([action_demand, reason_demand], dim=1)
-        references, entropy = self._references(joined_tokens, joined_attention, coordinates, demand, action_layers.shape[1])
+        references, raw_references, entropy = self._references(joined_tokens, joined_attention, coordinates, part_valid, demand, action_layers.shape[1])
         action_samples = self._sample(action_layers, references[:, :4])
         reason_samples = self._sample(reason_layers, references[:, 4:])
         gamma = self.gamma_max * torch.sigmoid(self.gamma_raw)
@@ -77,11 +80,12 @@ class PRECISEVisualRereader(nn.Module):
         points = references
         variance = points.var(dim=(0, 1, 2, 3), unbiased=False)
         center_collapse = ((points - 0.5).abs().amax(dim=-1) < 0.10).float().mean()
-        out_of_bounds = ((points < 0.0) | (points > 1.0)).any(dim=-1).float().mean()
+        out_of_bounds = ((raw_references < 0.0) | (raw_references > 1.0)).any(dim=-1).float().mean()
         return {
             "action_reread_delta": action_delta,
             "reason_reread_delta": reason_delta,
             "reference_points": points,
+            "raw_reference_points": raw_references,
             "sampling_weights": joined_attention,
             "reference_entropy": entropy.squeeze(-1),
             "evidence_demand_state": demand,

@@ -37,10 +37,15 @@ def evidence_view_consistency_loss(output: dict[str, torch.Tensor], mirrored: di
 def refinement_loss(direct_logits: torch.Tensor, refined_logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     direct = F.binary_cross_entropy_with_logits(direct_logits.detach(), targets.float(), reduction="none")
     refined = F.binary_cross_entropy_with_logits(refined_logits, targets.float(), reduction="none")
-    hard = (direct >= direct.median()).float()
+    # torch.median selects the lower middle element for even-sized tensors,
+    # which can classify every sample as hard in small/smoke batches.
+    threshold = torch.quantile(direct.detach().float().reshape(-1), 0.5)
+    hard = (direct >= threshold.to(direct)).float()
     easy = 1.0 - hard
     improve = (refined - direct).relu() * hard
-    regress = (refined - direct + 0.02).relu() * easy
+    # Easy examples may regress by at most 0.02; the previous sign instead
+    # required an improvement of 0.02 and over-regularized already-correct rows.
+    regress = (refined - direct - 0.02).relu() * easy
     return (improve + regress).mean()
 
 

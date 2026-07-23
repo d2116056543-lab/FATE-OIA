@@ -25,11 +25,17 @@ def verify_review_hash(path: Path, config_path: Path, expected_status: str) -> N
     head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     source_paths = [Path.cwd() / item for item in REQUIRED]
     functional = record.get("functional_checks", {})
+    repo_skill = Path.cwd() / ".codex/skills/precise-oia-implementation-audit/SKILL.md"
+    user_skill = Path.home() / ".codex/skills/precise-oia-implementation-audit/SKILL.md"
     if (
         record.get("status") != expected_status
         or record.get("git_head") != head
         or record.get("config_sha256") != _sha(config_path)
         or record.get("source_tree_sha256") != _tree_sha(source_paths)
+        or not repo_skill.exists()
+        or not user_skill.exists()
+        or record.get("skill_sha256") != _sha(repo_skill)
+        or _sha(repo_skill) != _sha(user_skill)
         or not functional
         or not all(bool(value) for value in functional.values())
         or record.get("unresolved")
@@ -41,6 +47,20 @@ def verify_review_hash(path: Path, config_path: Path, expected_status: str) -> N
             raise SystemExit("PRECISE full gate is missing successful scientific pilot checks")
     if subprocess.check_output(["git", "status", "--porcelain"], text=True).strip():
         raise SystemExit("PRECISE review gate cannot authorize a dirty worktree")
+
+
+def assert_fresh_run_dir(path: Path) -> None:
+    if path.exists() and any(path.iterdir()):
+        raise SystemExit(f"PRECISE run directory is not empty and could mix stale artifacts: {path}")
+
+
+def selected_runtime_args(path: Path, fallback_batch: int, fallback_accum: int) -> tuple[int, int]:
+    if not path.exists():
+        return fallback_batch, fallback_accum
+    record = json.loads(path.read_text(encoding="utf-8"))
+    if not record.get("valid"):
+        raise SystemExit("Selected PRECISE runtime profile is not valid")
+    return int(record["batch_size"]), int(record["gradient_accumulation_steps"])
 
 
 def review_is_current(path: Path, config_path: Path, expected_status: str = "PRE_PILOT_ELIGIBLE") -> bool:
@@ -77,6 +97,8 @@ def main() -> None:
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
+    if args.mode == "pilot" and args.epochs != 3:
+        raise SystemExit("PRECISE pilot epochs != 3; the scientific gate requires exactly three epochs")
     root = Path.cwd()
     review = root / ".review" / "PRECISE_OIA_V1_PRE_PILOT_ELIGIBLE.json"
     audit = [sys.executable, "-m", "fate_oia.engine.audit_precise_oia_implementation", "--config", args.config, "--output_dir", ".review/precise_oia_v1", "--device", args.device, "--mode", "preflight", "--write_pre_pilot_eligible"]
@@ -97,7 +119,9 @@ def main() -> None:
     if args.mode == "full":
         verify_review_hash(root / ".review" / "PRECISE_OIA_V1_FULL_TRAIN_READY.json", Path(args.config), expected_status="FULL_TRAIN_READY")
     run_dir = Path(args.output_dir) / args.mode
-    command = [sys.executable, "-u", "-m", "fate_oia.engine.train_precise_oia", "--config", args.config, "--output_dir", str(run_dir), "--epochs", str(args.epochs), "--batch_size", str(args.batch_size), "--gradient_accumulation_steps", str(args.gradient_accumulation_steps), "--num_workers", str(args.num_workers), "--device", args.device, "--mode", args.mode]
+    assert_fresh_run_dir(run_dir)
+    selected_batch, selected_accum = selected_runtime_args(root / ".review/precise_oia_v1/runtime/selected_runtime_profile.json", args.batch_size, args.gradient_accumulation_steps)
+    command = [sys.executable, "-u", "-m", "fate_oia.engine.train_precise_oia", "--config", args.config, "--output_dir", str(run_dir), "--epochs", str(args.epochs), "--batch_size", str(selected_batch), "--gradient_accumulation_steps", str(selected_accum), "--num_workers", str(args.num_workers), "--device", args.device, "--mode", args.mode]
     if args.mode == "pilot":
         command.extend(["--max_test_samples", "512"])
     _run(command)

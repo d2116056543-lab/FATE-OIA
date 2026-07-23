@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import torch
 
 from fate_oia.engine.run_precise_pcvl import build_oracle_structured_evidence
@@ -7,6 +9,9 @@ from fate_oia.models.precise_pcvl_probes import PRECISEPCVLProbes
 
 def test_pcvl_uses_equal_capacity_detached_base_probes():
     probes = PRECISEPCVLProbes()
+    reference = probes.u0.state_dict()
+    for probe in (probes.u1, probes.u2, probes.u3):
+        assert all(torch.equal(reference[name], probe.state_dict()[name]) for name in reference)
     base = torch.randn(2, 4, 384, requires_grad=True)
     out = probes(base, torch.randn(2, 4, 384), torch.randn(2, 4, 384), torch.randn(2, 4, 384))
     assert set(out) == {"u0", "u1", "u2", "u3"}
@@ -35,3 +40,8 @@ def test_pcvl_oracle_is_constructed_from_train_only_structured_targets():
     assert oracle[0, 0].abs().sum() > 0
     assert oracle[0, 1].abs().sum() > 0
     assert not torch.equal(oracle[0, 0], oracle[0, 1])
+
+
+def test_pcvl_pilot_records_optimizer_steps_for_gate_validation():
+    source = (Path(__file__).resolve().parents[1] / "fate_oia" / "engine" / "train_precise_oia.py").read_text(encoding="utf-8")
+    assert "pcvl_optimizer_step_count" in source

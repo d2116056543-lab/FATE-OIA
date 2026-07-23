@@ -5,6 +5,7 @@ import compileall
 import hashlib
 import json
 import re
+import statistics
 import subprocess
 import sys
 from pathlib import Path
@@ -13,6 +14,7 @@ import torch
 import yaml
 
 from fate_oia.models.precise_oia_model import PRECISEOIAModel
+from fate_oia.engine.eval_precise_oia import EVAL_BRANCHES
 
 
 REQUIRED = (
@@ -30,6 +32,16 @@ FORBIDDEN = (
     "Register-ScheduledTask", "feature_cache_enabled: true", "token_compression: keep_merge",
 )
 
+REQUIRED_PILOT_CHECKS = {
+    "pilot_identity_matches_current_code", "pilot_sample_contract", "three_epochs_complete",
+    "mechanism_rows_present", "mechanism_epoch_coverage", "epoch_artifacts_complete", "all_values_finite", "dino_call_count_one",
+    "peak_reserved_under_hard_limit", "all_intended_owners_stepped", "pcvl_optimizer_stepped",
+    "observed_firewall_exact_zero", "action_exchange_ratio_in_range", "reason_exchange_ratio_in_range",
+    "action_reread_ratio_in_range", "reason_reread_ratio_in_range", "reliability_noncollapsed",
+    "reference_not_center_collapsed", "selected_beats_control", "evidence_shuffle_changes_reason",
+    "annotation_delta_nonzero", "pcvl_artifacts_complete", "pcvl_predicate_action_value_supported",
+}
+
 
 def _sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -44,6 +56,27 @@ def _tree_sha(paths: list[Path]) -> str:
     for path in sorted(paths):
         digest.update(str(path).encode("utf-8")); digest.update(path.read_bytes())
     return digest.hexdigest()
+
+
+def _training_source_sha(root: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(root.glob("fate_oia/**/*precise*.py")):
+        digest.update(str(path.relative_to(root)).encode("utf-8"))
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def _index_sha(indices: list[int]) -> str:
+    return hashlib.sha256(",".join(str(index) for index in indices).encode("ascii")).hexdigest()
+
+
+def _expected_pilot_index_hashes(total: int, seed: int) -> dict[str, str]:
+    order = torch.randperm(total, generator=torch.Generator().manual_seed(seed)).tolist()[:5632]
+    return {
+        "train_main_indices_sha256": _index_sha(order[:4096]),
+        "train_audit_indices_sha256": _index_sha(order[4096:5120]),
+        "train_calib_indices_sha256": _index_sha(order[5120:5632]),
+    }
 
 
 def _jsonl(path: Path) -> list[dict]:
@@ -85,12 +118,14 @@ def _scan_forbidden(root: Path) -> tuple[dict[str, list[str]], dict[str, list[st
     return ({key: value for key, value in forbidden_hits.items() if value}, {key: value for key, value in incomplete_hits.items() if value})
 
 
-def _pilot_checks(pilot_dir: Path) -> dict[str, bool]:
+def _pilot_checks(pilot_dir: Path, expected_identity: dict[str, str]) -> dict[str, bool]:
     mechanism = _jsonl(pilot_dir / "mechanism_batch_stats.jsonl")
     gradients = _jsonl(pilot_dir / "gradient_ownership.jsonl")
     metrics = _jsonl(pilot_dir / "metrics_summary.jsonl")
     pcvl_path = pilot_dir / "pcvl" / "pcvl_metrics.json"
     pcvl = json.loads(pcvl_path.read_text(encoding="utf-8")) if pcvl_path.exists() else {}
+    manifest_path = pilot_dir / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
     latest_mechanism = mechanism[-1] if mechanism else {}
     latest_gradient = gradients[-1] if gradients else {}
     latest_metrics = metrics[-1] if metrics else {}
@@ -100,22 +135,54 @@ def _pilot_checks(pilot_dir: Path) -> dict[str, bool]:
     branch = latest_metrics
     reason_semantic = branch.get("reason_semantic", {})
     evidence_shuffled = branch.get("reason_evidence_shuffled", {})
-    return {
-        "three_epochs_complete": len(metrics) == 3,
+    final_epoch = max((int(row.get("epoch", -1)) for row in mechanism), default=-1)
+    final_rows = [row for row in mechanism if int(row.get("epoch", -1)) == final_epoch]
+    def median(name: str, default: float = -1.0) -> float:
+        values = [float(row[name]) for row in final_rows if name in row]
+        return float(statistics.median(values)) if values else default
+    pair_count = sum(float(row.get("intervention_pair_count", 0.0)) for row in final_rows)
+    selected = sum(float(row.get("selected_effect_mean", 0.0)) * float(row.get("intervention_pair_count", 0.0)) for row in final_rows)
+    control = sum(float(row.get("control_effect_mean", 0.0)) * float(row.get("intervention_pair_count", 0.0)) for row in final_rows)
+    expected_indices = _expected_pilot_index_hashes(int(manifest.get("train_dataset_count", 0)), int(manifest.get("seed", -1))) if int(manifest.get("train_dataset_count", 0)) >= 5632 else {}
+    representation_owners = {name: value for name, value in owners.items() if name != "threshold_head"}
+    epoch_required = {
+        "metrics_summary.json", "branch_metrics.json", "per_action_metrics.json", "per_reason_metrics.json",
+        "evidence_family_stats.json", "evidence_reliability.json", "exchange_stats.json", "reread_stats.json",
+        "annotation_gap.json", "counterfactual_stats.json", "gradient_firewall.json", "failure_cases.jsonl",
+        "evidence_cases.jsonl", "labels_action.pt", "labels_reason.pt",
+    }
+    def complete_epoch(epoch: int) -> bool:
+        directory = pilot_dir / f"epoch_{epoch:03d}"
+        tensors = {f"logits_{name}.pt" for name in EVAL_BRANCHES}
+        return directory.is_dir() and all((directory / name).exists() for name in epoch_required | tensors)
+    checks = {
+        "pilot_identity_matches_current_code": all(manifest.get(key) == value for key, value in expected_identity.items()),
+        "pilot_sample_contract": manifest.get("train_main_count") == 4096 and manifest.get("train_audit_count") == 1024 and manifest.get("train_calib_count") == 512 and manifest.get("test_count") == 512 and manifest.get("seed") == 20260722 and manifest.get("epochs") == 3 and bool(expected_indices) and all(manifest.get(key) == value for key, value in expected_indices.items()),
+        "three_epochs_complete": sorted(int(row.get("epoch", -1)) for row in metrics) == [0, 1, 2],
         "mechanism_rows_present": bool(mechanism),
+        "mechanism_epoch_coverage": all(any(int(row.get("epoch", -1)) == epoch for row in mechanism) for epoch in range(3)),
+        "epoch_artifacts_complete": all(complete_epoch(epoch) for epoch in range(3)) and (pilot_dir / "checkpoint_latest.pth").exists(),
         "all_values_finite": _finite(mechanism) and _finite(gradients) and _finite(metrics) and _finite(pcvl),
-        "all_intended_owners_stepped": bool(owners) and bool(optimizer_counts) and all(float(value) > 0 for value in optimizer_counts.values()),
+        "dino_call_count_one": bool(mechanism) and all(int(row.get("dino_call_count_batch", -1)) == 1 for row in mechanism),
+        "peak_reserved_under_hard_limit": bool(mechanism) and max(float(row.get("gpu_peak_reserved_gb", float("inf"))) for row in mechanism) < 46.5,
+        "all_intended_owners_stepped": bool(representation_owners) and bool(optimizer_counts) and all(float(value) > 0 for value in optimizer_counts.values()) and all(float(value.get("parameter_delta_norm", 0.0)) > 0 for value in representation_owners.values()),
+        "pcvl_optimizer_stepped": int(latest_metrics.get("pcvl_optimizer_step_count", 0)) > 0 and median("pcvl_optimizer_step_count", 0) > 0,
         "observed_firewall_exact_zero": bool(firewall) and all(float(value) == 0.0 for value in firewall.values()),
-        "action_exchange_ratio_in_range": 0.01 <= float(latest_mechanism.get("action_exchange_to_direct_ratio", -1)) <= 0.25,
-        "reason_exchange_ratio_in_range": 0.01 <= float(latest_mechanism.get("reason_exchange_to_direct_ratio", -1)) <= 0.30,
-        "reliability_noncollapsed": 0.0 < float(latest_mechanism.get("explicit_reliability_mean", -1)) < 1.0,
-        "reference_not_center_collapsed": float(latest_mechanism.get("reference_center_collapse_rate", 1.0)) < 0.70,
-        "selected_beats_control": float(latest_mechanism.get("selected_effect_mean", -1)) > float(latest_mechanism.get("control_effect_mean", 0)),
+        "action_exchange_ratio_in_range": 0.01 <= median("action_exchange_to_direct_ratio") <= 0.25,
+        "reason_exchange_ratio_in_range": 0.01 <= median("reason_exchange_to_direct_ratio") <= 0.30,
+        "action_reread_ratio_in_range": 0.02 <= median("action_reread_to_direct_ratio") <= 0.30,
+        "reason_reread_ratio_in_range": 0.02 <= median("reason_reread_to_direct_ratio") <= 0.30,
+        "reliability_noncollapsed": 0.0 < median("explicit_reliability_mean") < 1.0 and median("explicit_reliability_std", 0.0) > 1e-6,
+        "reference_not_center_collapsed": median("reference_center_collapse_rate", 1.0) < 0.70,
+        "selected_beats_control": pair_count > 0 and selected > control,
         "evidence_shuffle_changes_reason": bool(reason_semantic) and bool(evidence_shuffled) and abs(float(reason_semantic.get("Exp_mAP", 0)) - float(evidence_shuffled.get("Exp_mAP", 0))) > 1e-6,
         "annotation_delta_nonzero": any((pilot_dir / f"epoch_{epoch:03d}" / "annotation_gap.json").exists() and json.loads((pilot_dir / f"epoch_{epoch:03d}" / "annotation_gap.json").read_text(encoding="utf-8")).get("annotation_delta_rms", 0) > 0 for epoch in range(3)),
         "pcvl_artifacts_complete": all((pilot_dir / "pcvl" / name).exists() for name in ("pcvl_metrics.json", "pcvl_per_action.json", "pcvl_bootstrap.json", "pcvl_value_decomposition.json")),
         "pcvl_predicate_action_value_supported": bool(pcvl.get("predicate_action_value_supported")) and float(pcvl.get("u1_action_map", 0)) > float(pcvl.get("u0_action_map", 0)),
     }
+    if set(checks) != REQUIRED_PILOT_CHECKS:
+        raise RuntimeError(f"Pilot check schema drift: {sorted(set(checks) ^ REQUIRED_PILOT_CHECKS)}")
+    return checks
 
 
 def run_audit(config_path: str | Path, output_dir: str | Path, mode: str, pilot_dir: str | Path | None = None, write_gate: bool = False, device_name: str = "cuda") -> dict:
@@ -128,6 +195,11 @@ def run_audit(config_path: str | Path, output_dir: str | Path, mode: str, pilot_
     review_sources = [root / item for item in REQUIRED if (root / item).exists()]
     compile_ok = compileall.compile_dir(root / "fate_oia", quiet=1)
     test_files = sorted(str(path) for path in (root / "tests").glob("test_precise_*.py"))
+    regression_names = (
+        "test_acpr_calalign_forward.py", "test_acpr_calalign_train_protocol.py",
+        "test_acpr_threshold_head.py", "test_acpr_threshold_losses.py", "test_acpr_threshold_search.py",
+    )
+    test_files.extend(str(root / "tests" / name) for name in regression_names if (root / "tests" / name).exists())
     pytest_run = subprocess.run([sys.executable, "-m", "pytest", *test_files, "-q"], capture_output=True, text=True, check=False)
     pytest_ok = pytest_run.returncode == 0
     clean_hits, incomplete_hits = _scan_forbidden(root)
@@ -147,6 +219,10 @@ def run_audit(config_path: str | Path, output_dir: str | Path, mode: str, pilot_
     user_skill = Path.home() / ".codex/skills/precise-oia-implementation-audit/SKILL.md"
     head = _git(["rev-parse", "HEAD"])
     config_sha = _sha(Path(config_path))
+    source_tree_sha = _tree_sha(review_sources)
+    branch = _git(["branch", "--show-current"])
+    base_commit = "373aa49feac17372574fd7fb056c1d79c7c848fe"
+    base_is_ancestor = subprocess.run(["git", "merge-base", "--is-ancestor", base_commit, "HEAD"], check=False).returncode == 0
     checks = {
         "mock_forward_contract": list(forward["action_logits_final_raw"].shape) == [1, 4] and list(forward["reason_logits_final_raw"].shape) == [1, 21],
         "dino_call_one": int(forward["diagnostics"]["dino_call_count"]) == 1,
@@ -175,10 +251,12 @@ def run_audit(config_path: str | Path, output_dir: str | Path, mode: str, pilot_
         "bf16_and_owner_clip_called": "torch.autocast(" in trainer_source and "clip_grad_norm_(" in trainer_source,
         "targeted_pytest_passed": pytest_ok,
         "skill_installed_and_identical": user_skill.exists() and _sha(user_skill) == _sha(repo_skill),
+        "branch_and_base_contract": branch == "acpr_precise_oia_v1_direct_image" and base_is_ancestor,
     }
     clean_tree = not _git(["status", "--porcelain"])
     preflight_pass = not missing and compile_ok and not clean_hits and not incomplete_hits and clean_tree and all(checks.values())
-    pilot_checks = _pilot_checks(Path(pilot_dir)) if mode == "pilot" and pilot_dir else {}
+    expected_identity = {"git_head": head, "config_sha256": config_sha, "source_tree_sha256": _training_source_sha(root), "skill_sha256": _sha(repo_skill)}
+    pilot_checks = _pilot_checks(Path(pilot_dir), expected_identity) if mode == "pilot" and pilot_dir else {}
     if mode == "pilot":
         status = "FULL_TRAIN_READY" if preflight_pass and pilot_checks and all(pilot_checks.values()) else "SCIENTIFIC_GATE_FAILED"
     else:
@@ -188,7 +266,9 @@ def run_audit(config_path: str | Path, output_dir: str | Path, mode: str, pilot_
         unresolved.append("git_worktree_dirty")
     if pilot_checks:
         unresolved.extend(name for name, passed in pilot_checks.items() if not passed)
-    record = {"status": status, "git_head": head, "branch": _git(["branch", "--show-current"]), "base_commit": "373aa49feac17372574fd7fb056c1d79c7c848fe", "config_sha256": config_sha, "skill_sha256": _sha(repo_skill), "user_skill_path": str(user_skill), "source_tree_sha256": _tree_sha(review_sources), "checked_files": list(REQUIRED), "missing": missing, "forbidden_pattern_results": clean_hits, "incomplete_implementation_results": incomplete_hits, "functional_checks": checks, "pilot_checks": pilot_checks, "compile_ok": compile_ok, "pytest": {"passed": pytest_ok, "returncode": pytest_run.returncode, "stdout_tail": pytest_run.stdout[-4000:], "stderr_tail": pytest_run.stderr[-4000:]}, "git_clean": clean_tree, "mode": mode, "unresolved": sorted(set(unresolved))}
+    record = {"status": status, "git_head": head, "branch": branch, "base_commit": base_commit, "config_sha256": config_sha, "skill_sha256": _sha(repo_skill), "user_skill_path": str(user_skill), "source_tree_sha256": source_tree_sha, "checked_files": list(REQUIRED), "missing": missing, "forbidden_pattern_results": clean_hits, "incomplete_implementation_results": incomplete_hits, "functional_checks": checks, "pilot_checks": pilot_checks, "compile_ok": compile_ok, "tests_passed": pytest_ok, "real_forward_passed": bool(real_forward.get("passed")), "gradient_firewall_passed": bool(real_forward.get("gradient_firewall_passed")), "dino_call_contract_passed": int(runtime.get("dino_call_count", 0)) == 1, "runtime_profile_passed": bool(runtime.get("valid")), "pytest": {"passed": pytest_ok, "returncode": pytest_run.returncode, "stdout_tail": pytest_run.stdout[-4000:], "stderr_tail": pytest_run.stderr[-4000:]}, "git_clean": clean_tree, "mode": mode, "unresolved": sorted(set(unresolved))}
+    if mode == "pilot":
+        record.update({"pilot_complete": pilot_checks.get("three_epochs_complete", False), "mechanisms_active": all(pilot_checks.get(name, False) for name in REQUIRED_PILOT_CHECKS if name not in {"pcvl_predicate_action_value_supported"}), "pcvl": json.loads((Path(pilot_dir) / "pcvl" / "pcvl_metrics.json").read_text(encoding="utf-8")) if (Path(pilot_dir) / "pcvl" / "pcvl_metrics.json").exists() else {}, "runtime_selected": runtime})
     (output / "implementation_audit_PRECISE_OIA_V1.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
     gate = root / ".review" / "PRECISE_OIA_V1_PRE_PILOT_ELIGIBLE.json"
     gate.parent.mkdir(parents=True, exist_ok=True)

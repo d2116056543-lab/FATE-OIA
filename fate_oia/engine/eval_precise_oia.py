@@ -22,7 +22,9 @@ def evaluate_precise(model: torch.nn.Module, loader: Iterable[dict[str, Any]], d
     model.eval()
     collected: dict[str, list[torch.Tensor]] = {name: [] for name in EVAL_BRANCHES}
     actions, reasons, file_names = [], [], []
-    evidence_reliability, evidence_presence, evidence_coordinates = [], [], []
+    evidence_reliability, evidence_presence, evidence_observability, evidence_coordinates = [], [], [], []
+    exchange_overlap, exchange_gate, reference_points, raw_reference_points = [], [], [], []
+    annotation_delta, semantic_observed_gap = [], []
     counterfactual_rows = []
     case_rows: list[dict[str, Any]] = []
     for batch in loader:
@@ -35,7 +37,14 @@ def evaluate_precise(model: torch.nn.Module, loader: Iterable[dict[str, Any]], d
         file_names.extend(batch["file_name"])
         evidence_reliability.append(output["evidence_reliability"].detach().cpu())
         evidence_presence.append(torch.sigmoid(output["evidence_presence_logits"]).detach().cpu())
+        evidence_observability.append(torch.sigmoid(output["evidence_observability_logits"]).detach().cpu())
         evidence_coordinates.append(output["evidence_part_coordinates"].detach().cpu())
+        exchange_overlap.append(output["exchange_overlap"].detach().cpu())
+        exchange_gate.append(output["exchange_gate"].detach().cpu())
+        reference_points.append(output["reference_points"].detach().cpu())
+        raw_reference_points.append(output["raw_reference_points"].detach().cpu())
+        annotation_delta.append(output["annotation_delta"].detach().cpu())
+        semantic_observed_gap.append((output["reason_logits_semantic"] - output["reason_logits_observed"]).detach().cpu())
         if sum(int(row["count"]) for row in counterfactual_rows) < 64:
             intervention = packed_target_specific_interventions(model, output, batch["action"].to(device), batch["reason"].to(device), max_pairs=24)
             counterfactual_rows.append({"selected": float(intervention["selected_effect_mean"]), "control": float(intervention["control_effect_mean"]), "wrong": float(intervention["wrong_effect_mean"]), "count": float(intervention["intervention_pair_count"]), "sign": float(intervention["sign_agreement"]), **{key: intervention[key].detach().cpu() for key in intervention if "per_target_" in key}})
@@ -94,5 +103,29 @@ def evaluate_precise(model: torch.nn.Module, loader: Iterable[dict[str, Any]], d
         "per_action": per_target("action", 4),
         "per_reason": per_target("reason", 21),
     }
+    reliability_tensor = torch.cat(evidence_reliability)
+    presence_tensor = torch.cat(evidence_presence)
+    observability_tensor = torch.cat(evidence_observability)
+    overlap_tensor = torch.cat(exchange_overlap)
+    gate_tensor = torch.cat(exchange_gate)
+    reference_tensor = torch.cat(reference_points)
+    raw_reference_tensor = torch.cat(raw_reference_points)
+    annotation_tensor = torch.cat(annotation_delta)
+    semantic_gap_tensor = torch.cat(semantic_observed_gap)
+    metrics["mechanism_test"] = {
+        "presence_mean": presence_tensor.mean(0).tolist(),
+        "observability_mean": observability_tensor.mean(0).tolist(),
+        "reliability_mean": reliability_tensor.mean(0).tolist(),
+        "reliability_strong_rate": float((reliability_tensor >= 0.70).float().mean()),
+        "reliability_weak_rate": float(((reliability_tensor >= 0.30) & (reliability_tensor < 0.70)).float().mean()),
+        "overlap_mean": float(overlap_tensor.mean()),
+        "gate_mean": float(gate_tensor.mean()),
+        "gate_active_rate_gt_0p1": float((gate_tensor > 0.1).float().mean()),
+        "center_collapse_rate": float(((reference_tensor - 0.5).abs().amax(dim=-1) < 0.10).float().mean()),
+        "out_of_bounds_rate": float(((raw_reference_tensor < 0.0) | (raw_reference_tensor > 1.0)).any(dim=-1).float().mean()),
+        "reference_variance": reference_tensor.var(dim=(0, 1, 2, 3), unbiased=False).tolist(),
+        "annotation_delta_rms": float(annotation_tensor.square().mean().sqrt()),
+        "semantic_observed_gap_rms": float(semantic_gap_tensor.square().mean().sqrt()),
+    }
     model.train()
-    return metrics, {**tensors, "labels_action": action, "labels_reason": reason, "file_names": file_names, "evidence_reliability": torch.cat(evidence_reliability), "evidence_presence": torch.cat(evidence_presence), "evidence_coordinates": torch.cat(evidence_coordinates), "case_rows": case_rows}
+    return metrics, {**tensors, "labels_action": action, "labels_reason": reason, "file_names": file_names, "evidence_reliability": reliability_tensor, "evidence_presence": presence_tensor, "evidence_observability": observability_tensor, "evidence_coordinates": torch.cat(evidence_coordinates), "case_rows": case_rows}

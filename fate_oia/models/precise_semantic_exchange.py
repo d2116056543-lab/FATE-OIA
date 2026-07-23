@@ -31,6 +31,12 @@ class PRECISESemanticExchange(nn.Module):
         self.reason_pair = nn.Linear(dim, dim, bias=False)
         self.register_buffer("family_mask_action", self._action_mask())
         self.register_buffer("family_mask_reason", self._reason_mask())
+        compatibility = torch.zeros(4, 21, dtype=torch.bool)
+        compatibility[0, 0:3] = True
+        compatibility[1, 3:9] = True
+        compatibility[2, 9:15] = True
+        compatibility[3, 15:21] = True
+        self.register_buffer("action_reason_compatibility", compatibility)
 
     def _action_mask(self) -> torch.Tensor:
         action_families = [{"actor", "drivable", "boundary"}, {"traffic_control", "actor", "boundary"}, {"actor", "drivable", "boundary"}, {"actor", "drivable", "boundary"}]
@@ -68,6 +74,9 @@ class PRECISESemanticExchange(nn.Module):
             reason_certificate = torch.zeros_like(reason_certificate)
         reason_scores = torch.einsum("bad,brd->bar", self.action_pair(action_tokens), self.reason_pair(reasons.detach())) / (action_tokens.shape[-1] ** 0.5)
         action_weights = torch.softmax(reason_scores + action_certificate.clamp_min(1e-8).log(), dim=-1) * action_certificate
+        compatible = self.action_reason_compatibility.view(1, 4, 21)
+        correct_mass = action_weights.masked_fill(~compatible, 0.0).sum(-1).mean()
+        wrong_mass = action_weights.masked_fill(compatible, 0.0).sum(-1).mean()
         action_message = torch.einsum("bar,brd->bad", action_weights, self.reason_value(reasons.detach()))
         action_delta = self.gamma_max * torch.sigmoid(self.action_gamma_raw).view(1, 4, 1) * action_message
         action_scores = torch.einsum("brd,bad->bra", self.reason_pair(reasons), self.action_pair(action_tokens.detach())) / (action_tokens.shape[-1] ** 0.5)
@@ -83,5 +92,7 @@ class PRECISESemanticExchange(nn.Module):
             "reason_exchange_delta": reason_delta,
             "action_reason_message_norm": action_message.norm(dim=-1).mean(),
             "reason_action_message_norm": reason_message.norm(dim=-1).mean(),
-            "wrong_target_message_ratio": action_weights.min(dim=-1).values.mean() / action_weights.max(dim=-1).values.mean().clamp_min(1e-8),
+            "correct_target_message_mass": correct_mass,
+            "wrong_target_message_mass": wrong_mass,
+            "wrong_target_message_ratio": wrong_mass / correct_mass.clamp_min(1e-8),
         }

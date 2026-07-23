@@ -1,6 +1,6 @@
 import torch
 
-from fate_oia.losses.precise_intervention_losses import incompatible_target_mask, matched_control_is_valid, packed_target_specific_interventions, target_specific_intervention_loss
+from fate_oia.losses.precise_intervention_losses import balanced_positive_pairs, incompatible_target_mask, matched_control_is_valid, packed_target_specific_interventions, target_specific_intervention_loss
 from fate_oia.models.precise_oia_model import PRECISEOIAModel
 
 
@@ -10,6 +10,25 @@ def test_selected_effect_and_wrong_target_have_required_loss_direction():
     good = target_specific_intervention_loss(torch.full((2, 4), 0.5), torch.full((2, 4), 0.1), torch.full((2, 4), 0.1), base, base, target)["loss_intervention"]
     bad = target_specific_intervention_loss(torch.full((2, 4), 0.1), torch.full((2, 4), 0.5), torch.full((2, 4), 0.6), base, base, target)["loss_intervention"]
     assert good < bad
+
+
+def test_nonregression_excludes_the_selected_target_that_deletion_must_hurt():
+    base = torch.tensor([[4.0, -4.0]])
+    intervened = torch.tensor([[-4.0, -4.0]])
+    target = torch.tensor([[1.0, 0.0]])
+    result = target_specific_intervention_loss(
+        torch.tensor([8.0]), torch.tensor([0.0]), torch.tensor([0.0]),
+        base, intervened, target, target_indices=torch.tensor([0]),
+    )
+    assert float(result["loss_intervention_nonreg"]) == 0.0
+
+
+def test_positive_pair_budget_is_target_balanced_not_row_major_truncated():
+    targets = torch.zeros(4, 4)
+    targets[0, :] = 1.0
+    targets[1:, 0] = 1.0
+    pairs = balanced_positive_pairs(targets, 4)
+    assert sorted(pairs[:, 1].tolist()) == [0, 1, 2, 3]
 
 
 def test_matched_control_enforces_mass_and_nonoverlap():
@@ -39,9 +58,17 @@ def test_packed_intervention_reuses_cached_field_and_backpropagates():
     reason = torch.zeros(2, 21)
     reason[0, 3] = 1.0
     reason[1, 10] = 1.0
+    calls = 0
+    original = model.decode_cached_intervention
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+    model.decode_cached_intervention = counted
     losses = packed_target_specific_interventions(model, output, action, reason, max_pairs=4)
     losses["loss_intervention"].backward()
     assert model.dino.dino_call_count == calls_before
+    assert calls > 0
     assert 0 < losses["intervention_pair_count"].item() <= 4
     assert 0.0 <= losses["intervention_hard_rate"].item() <= 1.0
     assert 0.0 <= losses["intervention_easy_rate"].item() <= 1.0

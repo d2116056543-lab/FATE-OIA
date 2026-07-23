@@ -112,6 +112,10 @@ class PRECISEOIAModel(nn.Module):
             "reason_logits_semantic": reason_semantic,
             "reason_logits_final_raw": annotation["reason_logits_observed"],
             "action_tokens_final": action_final_tokens,
+            "action_tokens_direct": first["action_tokens_direct"],
+            "reason_tokens_direct": first["reason_tokens_direct"],
+            "action_field_layers": field.action_layers,
+            "reason_field_layers": field.reason_layers,
             "action_tokens_reread": action_reread_tokens,
             "reason_tokens_semantic": reason_semantic_tokens,
             "reason_latent_delta": reason_latent_delta,
@@ -120,6 +124,9 @@ class PRECISEOIAModel(nn.Module):
             "explicit_evidence_tokens": evidence["explicit_tokens"],
             "latent_evidence_tokens": evidence["latent_tokens"],
             "derived_atom_probs": evidence["derived_atom_probs"],
+            "evidence_certificate_probability": evidence["certificate_probability"],
+            "evidence_actor_part_type_logits": evidence["actor_part_type_logits"],
+            "evidence_actor_part_occupancy_logits": evidence["actor_part_occupancy_logits"],
             "evidence_reliability": evidence["reliability"],
             "evidence_view_consistency": self.evidence_fields.view_consistency_ema.detach(),
             "semantic_weight_floor": self.semantic_weight_floor,
@@ -184,6 +191,31 @@ class PRECISEOIAModel(nn.Module):
             latent = torch.zeros_like(reason_reread_tokens) if reason_latent_delta is None else reason_latent_delta
             reason = self.reason_refined_head(reason_reread_tokens + exchange["reason_exchange_delta"] + latent).squeeze(-1)
         return {"action_logits": action, "reason_logits": reason, **exchange}
+
+    def decode_cached_intervention(
+        self,
+        action_tokens_direct: torch.Tensor,
+        reason_tokens_direct: torch.Tensor,
+        action_layers: torch.Tensor,
+        reason_layers: torch.Tensor,
+        action_logits_direct: torch.Tensor,
+        reason_logits_direct: torch.Tensor,
+        explicit_evidence: torch.Tensor,
+        reliability: torch.Tensor,
+        part_coordinates: torch.Tensor,
+        part_valid: torch.Tensor,
+        reason_latent_delta: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Recompute reread and exchange from cached DINO fields after evidence intervention."""
+        with torch.autocast(device_type=action_tokens_direct.device.type, dtype=torch.bfloat16, enabled=action_tokens_direct.is_cuda):
+            reread = self.rereader(
+                action_tokens_direct, reason_tokens_direct,
+                {"explicit_tokens": explicit_evidence, "part_coordinates": part_coordinates, "part_valid": part_valid, "reliability": reliability},
+                action_layers, reason_layers, action_logits_direct, reason_logits_direct,
+            )
+            action_reread = action_tokens_direct + reread["action_reread_delta"]
+            reason_reread = reason_tokens_direct + reread["reason_reread_delta"]
+        return self.decode_cached_exchange(action_reread, reason_reread, explicit_evidence, reliability, reason_latent_delta)
 
     def forward(self, images: torch.Tensor, *, mirror_map: dict | None = None, diagnostic_modes: tuple[str, ...] = ()) -> dict[str, Any]:
         # Evaluator and audit callers invoke model(images) directly, so they
