@@ -223,6 +223,7 @@ _STATIC_OUTPUT_TENSOR_KEYS = {
     "evidence_view_consistency",
     "action_evidence_family_mask",
     "evidence_part_valid",
+    "evidence_state_channel_valid",
     "evidence_geometry_type",
 }
 

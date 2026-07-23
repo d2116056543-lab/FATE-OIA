@@ -120,6 +120,7 @@ def test_batch_output_slicing_never_slices_schema_tensors_when_sizes_coincide():
         "evidence_view_consistency": torch.linspace(0.1, 1.0, 10),
         "action_evidence_family_mask": torch.ones(4, 10, dtype=torch.bool),
         "evidence_part_valid": torch.ones(10, 8, dtype=torch.bool),
+        "evidence_state_channel_valid": torch.ones(10, 8, dtype=torch.bool),
         "evidence_geometry_type": torch.arange(10),
         "branch_logits": {"reason_semantic": torch.randn(full_batch, 21)},
     }
@@ -131,7 +132,7 @@ def test_batch_output_slicing_never_slices_schema_tensors_when_sizes_coincide():
     assert mirrored["action_logits_final_raw"].shape == (2, 4)
     assert canonical["branch_logits"]["reason_semantic"].shape == (8, 21)
     assert mirrored["branch_logits"]["reason_semantic"].shape == (2, 21)
-    for key in ("evidence_view_consistency", "action_evidence_family_mask", "evidence_part_valid", "evidence_geometry_type"):
+    for key in ("evidence_view_consistency", "action_evidence_family_mask", "evidence_part_valid", "evidence_state_channel_valid", "evidence_geometry_type"):
         assert torch.equal(canonical[key], output[key])
         assert torch.equal(mirrored[key], output[key])
 
