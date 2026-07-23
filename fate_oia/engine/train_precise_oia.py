@@ -65,6 +65,7 @@ def verify_full_curriculum_authorization(
     config: dict[str, Any],
     fingerprint: dict[str, Any],
     gate_path: str | Path = ".review/PRECISE_OIA_V1_FULL_CURRICULUM_READY.json",
+    require_clean: bool = True,
 ) -> dict[str, Any]:
     gate_file = Path(gate_path)
     if not gate_file.exists():
@@ -75,7 +76,7 @@ def verify_full_curriculum_authorization(
         "status": "FULL_CURRICULUM_READY",
         "git_head": fingerprint["git_head"],
         "config_sha256": fingerprint["config_sha256"],
-        "source_tree_sha256": fingerprint["source_tree_sha256"],
+        "training_source_sha256": fingerprint["source_tree_sha256"],
         "skill_sha256": hashlib.sha256(skill.read_bytes()).hexdigest(),
         "curriculum_sha256": curriculum_sha256(config),
         "override_source": "user_approved_2026-07-23",
@@ -89,6 +90,8 @@ def verify_full_curriculum_authorization(
         mismatches.append("curriculum_checks")
     if not gate.get("functional_checks") or not all(gate["functional_checks"].values()):
         mismatches.append("functional_checks")
+    if require_clean and subprocess.check_output(["git", "status", "--porcelain"], text=True).strip():
+        mismatches.append("git_worktree_dirty")
     if mismatches:
         raise RuntimeError(f"FULL_CURRICULUM_READY identity/contract mismatch: {sorted(set(mismatches))}")
     return gate

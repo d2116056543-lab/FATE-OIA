@@ -7,6 +7,8 @@ from fate_oia.engine.audit_precise_oia_implementation import (
     _scan_forbidden,
 )
 
+ROOT = Path(__file__).resolve().parents[1]
+
 
 def test_audit_requires_full_precise_source_surface():
     assert len(REQUIRED) >= 30
@@ -33,6 +35,14 @@ def test_curriculum_gate_covers_static_schedule_owner_and_override_contracts():
         "strict_resume_lifecycle",
         "threshold_teacher_full_activation_only",
     } == REQUIRED_CURRICULUM_CHECKS
+
+
+def test_audit_exports_both_review_and_training_source_hashes():
+    source = (
+        ROOT / "fate_oia" / "engine" / "audit_precise_oia_implementation.py"
+    ).read_text(encoding="utf-8")
+    assert '"source_tree_sha256": source_tree_sha' in source
+    assert '"training_source_sha256": _training_source_sha(root)' in source
 
 
 def test_forbidden_scan_covers_config_and_script_without_self_matching_audit_rules():

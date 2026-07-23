@@ -327,6 +327,7 @@ def test_trainer_validates_full_curriculum_gate_itself(tmp_path, monkeypatch):
     gate = {
         "status": "FULL_CURRICULUM_READY",
         **fingerprint,
+        "training_source_sha256": fingerprint["source_tree_sha256"],
         "skill_sha256": hashlib.sha256(skill_path.read_bytes()).hexdigest(),
         "curriculum_sha256": __import__(
             "fate_oia.engine.precise_curriculum", fromlist=["curriculum_sha256"]
@@ -340,8 +341,10 @@ def test_trainer_validates_full_curriculum_gate_itself(tmp_path, monkeypatch):
     gate_path = tmp_path / "gate.json"
     gate_path.write_text(json.dumps(gate), encoding="utf-8")
     monkeypatch.chdir(tmp_path)
-    assert verify_full_curriculum_authorization(config, fingerprint, gate_path)["status"] == "FULL_CURRICULUM_READY"
+    assert verify_full_curriculum_authorization(
+        config, fingerprint, gate_path, require_clean=False
+    )["status"] == "FULL_CURRICULUM_READY"
     gate["git_head"] = "wrong"
     gate_path.write_text(json.dumps(gate), encoding="utf-8")
     with pytest.raises(RuntimeError, match="git_head"):
-        verify_full_curriculum_authorization(config, fingerprint, gate_path)
+        verify_full_curriculum_authorization(config, fingerprint, gate_path, require_clean=False)

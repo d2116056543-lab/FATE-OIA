@@ -1117,6 +1117,7 @@ Required fields:
   "config_sha256": "...",
   "skill_sha256": "...",
   "source_tree_sha256": "...",
+  "training_source_sha256": "...",
   "tests_passed": true,
   "real_forward_passed": true,
   "gradient_firewall_passed": true,
