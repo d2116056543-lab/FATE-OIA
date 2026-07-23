@@ -93,7 +93,12 @@ def _profile_one(config: dict[str, Any], args: argparse.Namespace, dataset, adap
                     action_map = torch.tensor([0, 1, 3, 2], device=device)
                     reason_map = torch.tensor([int(row["mirror_partner"]) for row in model.reason_schema], device=device)
                     field_map = model.evidence_fields.mirror_field_indices
-                    mirror_loss = 0.05 * two_way_consistency_loss(output["action_logits_final_raw"][:mirror_count], mirrored["action_logits_final_raw"], action_map) + 0.05 * two_way_consistency_loss(output["reason_logits_semantic"][:mirror_count], mirrored["reason_logits_semantic"], reason_map) + 0.0075 * evidence_view_consistency_loss(output, mirrored, field_map)
+                    mirror_composite = (
+                        two_way_consistency_loss(output["action_logits_final_raw"][:mirror_count], mirrored["action_logits_final_raw"], action_map)
+                        + two_way_consistency_loss(output["reason_logits_semantic"][:mirror_count], mirrored["reason_logits_semantic"], reason_map)
+                        + evidence_view_consistency_loss(output, mirrored, field_map)
+                    )
+                    mirror_loss = 0.02 * mirror_composite
                 full_loss = losses["loss_total"] + refine + intervention["loss_intervention"] + mirror_loss
             if not firewall_report:
                 firewall_report = _observed_firewall(model, losses["loss_reason_observed"])
