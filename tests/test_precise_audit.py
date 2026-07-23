@@ -34,6 +34,9 @@ def test_pilot_gate_covers_every_plan_defined_runtime_and_mechanism_requirement(
         "reliability_noncollapsed",
         "reference_not_center_collapsed",
         "selected_beats_control",
+        "selected_beats_control_action",
+        "selected_beats_control_reason",
+        "target_counterfactual_coverage",
         "evidence_shuffle_changes_reason",
         "annotation_delta_nonzero",
         "pcvl_artifacts_complete",
@@ -49,6 +52,8 @@ def test_selected_control_gate_reads_heldout_epoch_metrics_not_train_batches():
     assert 'heldout_counterfactual.get("selected_control_margin"' in source
     assert '"selected_beats_control_action"' in source
     assert '"selected_beats_control_reason"' in source
+    assert 'positive_rate' in source and 'valid_targets' in source and 'dominance' in source
+    assert 'logits_reason_evidence_shuffled.pt' in source
 
 
 def test_full_gate_binds_pilot_checkpoint_and_raw_artifacts():

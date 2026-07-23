@@ -15,7 +15,7 @@ import yaml
 
 from fate_oia.models.precise_oia_model import PRECISEOIAModel
 from fate_oia.engine.eval_precise_oia import EVAL_BRANCHES
-from fate_oia.engine.run_precise_pcvl import validate_pcvl_artifacts
+from fate_oia.engine.run_precise_pcvl import _average_precision, validate_pcvl_artifacts
 from fate_oia.metrics import multilabel_metrics_from_logits
 
 
@@ -41,7 +41,7 @@ REQUIRED_PILOT_CHECKS = {
     "observed_firewall_exact_zero", "action_exchange_ratio_in_range", "reason_exchange_ratio_in_range",
     "action_reread_ratio_in_range", "reason_reread_ratio_in_range", "reliability_noncollapsed",
     "reference_not_center_collapsed", "selected_beats_control", "selected_beats_control_action",
-    "selected_beats_control_reason", "evidence_shuffle_changes_reason",
+    "selected_beats_control_reason", "target_counterfactual_coverage", "evidence_shuffle_changes_reason",
     "annotation_delta_nonzero", "pcvl_artifacts_complete", "pcvl_predicate_action_value_supported",
     "pcvl_learned_evidence_supported", "pcvl_learned_exchange_supported", "pilot_artifacts_hash_bound",
 }
@@ -249,11 +249,28 @@ def _pilot_checks(pilot_dir: Path, expected_identity: dict[str, str]) -> dict[st
         )
     except (OSError, ValueError, KeyError, RuntimeError, TypeError, json.JSONDecodeError):
         pcvl_artifacts_valid = False
-    def task_counterfactual_positive(task: str) -> bool:
+    def task_counterfactual_stats(task: str) -> dict[str, float]:
         rows = heldout_counterfactual.get(f"per_{task}", [])
-        total = sum(float(row.get("count", 0.0)) for row in rows)
-        margin = sum(float(row.get("count", 0.0)) * (float(row.get("selected", 0.0)) - float(row.get("control", 0.0))) for row in rows)
-        return total > 0.0 and margin / total > 0.0
+        valid = [row for row in rows if float(row.get("count", 0.0)) >= 2.0]
+        total = sum(float(row.get("count", 0.0)) for row in valid)
+        margins = [float(row.get("selected", 0.0)) - float(row.get("control", 0.0)) for row in valid]
+        weighted = sum(float(row.get("count", 0.0)) * margin for row, margin in zip(valid, margins)) / max(total, 1.0)
+        return {"weighted_margin": weighted, "positive_rate": sum(margin > 0.0 for margin in margins) / max(len(margins), 1), "valid_targets": len(valid), "target_count": len(rows), "dominance": max((float(row.get("count", 0.0)) for row in valid), default=0.0) / max(total, 1.0)}
+
+    action_cf = task_counterfactual_stats("action")
+    reason_cf = task_counterfactual_stats("reason")
+    try:
+        final_dir = pilot_dir / f"epoch_{final_epoch:03d}"
+        reason_labels = torch.load(final_dir / "labels_reason.pt", map_location="cpu", weights_only=True)
+        reason_base_logits = torch.load(final_dir / "logits_reason_semantic.pt", map_location="cpu", weights_only=True)
+        reason_shuffled_logits = torch.load(final_dir / "logits_reason_evidence_shuffled.pt", map_location="cpu", weights_only=True)
+        base_ap = _average_precision(torch.sigmoid(reason_base_logits), reason_labels)
+        shuffled_ap = _average_precision(torch.sigmoid(reason_shuffled_logits), reason_labels)
+        valid_ap = torch.isfinite(base_ap) & torch.isfinite(shuffled_ap)
+        ap_drop = base_ap[valid_ap] - shuffled_ap[valid_ap]
+        per_reason_shuffle_valid = bool(ap_drop.numel()) and float(ap_drop.mean()) >= 1e-4 and float((ap_drop > 0).float().mean()) >= 0.5
+    except (OSError, RuntimeError, KeyError, ValueError):
+        per_reason_shuffle_valid = False
 
     artifact_hashes = _pilot_artifact_hashes(pilot_dir)
     checks = {
@@ -276,9 +293,10 @@ def _pilot_checks(pilot_dir: Path, expected_identity: dict[str, str]) -> dict[st
         "reliability_noncollapsed": 0.0 < median("explicit_reliability_mean") < 1.0 and median("explicit_reliability_std", 0.0) > 1e-6,
         "reference_not_center_collapsed": median("reference_center_collapse_rate", 1.0) < 0.70,
         "selected_beats_control": float(heldout_counterfactual.get("selected_control_margin", -float("inf"))) > 0.0,
-        "selected_beats_control_action": task_counterfactual_positive("action"),
-        "selected_beats_control_reason": task_counterfactual_positive("reason"),
-        "evidence_shuffle_changes_reason": bool(reason_semantic) and bool(evidence_shuffled) and float(reason_semantic.get("Exp_mAP", 0)) - float(evidence_shuffled.get("Exp_mAP", 0)) >= 1e-4,
+        "selected_beats_control_action": action_cf["weighted_margin"] > 0.0 and action_cf["positive_rate"] >= 0.75,
+        "selected_beats_control_reason": reason_cf["weighted_margin"] > 0.0 and reason_cf["positive_rate"] >= 0.75,
+        "target_counterfactual_coverage": action_cf["valid_targets"] == 4 and reason_cf["valid_targets"] >= 11 and action_cf["dominance"] <= 0.5 and reason_cf["dominance"] <= 0.5,
+        "evidence_shuffle_changes_reason": per_reason_shuffle_valid,
         "annotation_delta_nonzero": all((pilot_dir / f"epoch_{epoch:03d}" / "annotation_gap.json").exists() and json.loads((pilot_dir / f"epoch_{epoch:03d}" / "annotation_gap.json").read_text(encoding="utf-8")).get("annotation_delta_rms", 0) >= 1e-5 for epoch in range(3)),
         "pcvl_artifacts_complete": pcvl_artifacts_valid,
         "pilot_artifacts_hash_bound": bool(artifact_hashes),

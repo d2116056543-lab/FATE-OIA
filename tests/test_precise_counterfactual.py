@@ -121,7 +121,7 @@ def test_packed_intervention_reuses_cached_field_and_backpropagates():
     losses["loss_intervention"].backward()
     assert model.dino.dino_call_count == calls_before
     assert calls > 0
-    assert any(mask is not None and (~mask).any() for mask in enabled_masks)
+    assert all(mask is None for mask in enabled_masks)
     assert 0 < losses["intervention_pair_count"].item() <= 4
     assert 0.0 <= losses["intervention_hard_rate"].item() <= 1.0
     assert 0.0 <= losses["intervention_easy_rate"].item() <= 1.0

@@ -161,12 +161,8 @@ def _task_intervention(model, output, targets: torch.Tensor, task: str, max_pair
     explicit = output["explicit_evidence_tokens"][sample_index]
     reliability = output["evidence_reliability"][sample_index]
     selected_evidence = explicit.clone()
-    selected_reliability = reliability.clone()
     rows = torch.arange(len(positive), device=explicit.device)
-    selected_field_enabled = torch.ones(explicit.shape[:2], dtype=torch.bool, device=explicit.device)
-    selected_field_enabled[rows, field_index] = False
     selected_evidence[rows, field_index] = 0.0
-    selected_reliability[rows, field_index] = 0.0
 
     control_token, _, control_coordinates, valid_control = _candidate_control(
         model, output, sample_index, field_index, control_tolerance, deterministic=deterministic
@@ -179,8 +175,6 @@ def _task_intervention(model, output, targets: torch.Tensor, task: str, max_pair
     explicit = explicit[valid_control]
     reliability = reliability[valid_control]
     selected_evidence = selected_evidence[valid_control]
-    selected_reliability = selected_reliability[valid_control]
-    selected_field_enabled = selected_field_enabled[valid_control]
     control_token = control_token[valid_control]
     control_coordinates = control_coordinates[valid_control]
     rows = torch.arange(len(sample_index), device=explicit.device)
@@ -199,7 +193,9 @@ def _task_intervention(model, output, targets: torch.Tensor, task: str, max_pair
         output["action_field_layers"][sample_index], output["reason_field_layers"][sample_index],
         output["action_logits_direct"][sample_index], output["reason_logits_direct"][sample_index],
     )
-    selected = model.decode_cached_intervention(*common, selected_evidence, selected_reliability, coordinates, output["evidence_part_valid"], latent_delta, field_enabled=selected_field_enabled)[f"{task}_logits"]
+    # Selected and control use the same certificate/reliability operator. Only
+    # the equal-norm token perturbation differs, preventing gate-strength bias.
+    selected = model.decode_cached_intervention(*common, selected_evidence, reliability, coordinates, output["evidence_part_valid"], latent_delta)[f"{task}_logits"]
     control = model.decode_cached_intervention(*common, control_evidence, reliability, control_part_coordinates, output["evidence_part_valid"], latent_delta)[f"{task}_logits"]
     base = base_logits[sample_index]
     selected_effect = base[rows, target_index] - selected[rows, target_index]
