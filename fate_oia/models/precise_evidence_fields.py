@@ -177,7 +177,8 @@ class PRECISEEvidenceFields(nn.Module):
         margin = (normalized * pos.unsqueeze(0)).sum(-1) - (normalized * neg.unsqueeze(0)).sum(-1)
         derived = self._derived_atoms(presence_logits, state_logits, actor_type_probability)
         certificate_probability = self._certificate_probability(derived)
-        reliability = certificate_probability * torch.sigmoid(observability_logits) * torch.sigmoid(margin / self.reliability_tau) * self.view_consistency_ema.view(1, -1)
+        consistency_snapshot = self.view_consistency_ema.detach().clone().view(1, -1)
+        reliability = certificate_probability * torch.sigmoid(observability_logits) * torch.sigmoid(margin / self.reliability_tau) * consistency_snapshot
         field_attention = part_attention.sum(2) / self.part_count.to(tokens).view(1, -1, 1)
         return {
             "explicit_tokens": explicit,
