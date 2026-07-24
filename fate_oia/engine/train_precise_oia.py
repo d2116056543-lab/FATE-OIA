@@ -322,10 +322,22 @@ def load_resume_checkpoint(
         optimizer.load_state_dict(checkpoint["optimizers"][owner])
     for owner, scheduler in schedulers.items():
         scheduler.load_state_dict(checkpoint["schedulers"][owner])
-    torch.set_rng_state(checkpoint["rng_state"])
+    rng_state = checkpoint["rng_state"]
+    if not isinstance(rng_state, torch.Tensor):
+        rng_state = torch.tensor(rng_state, dtype=torch.uint8)
+    else:
+        rng_state = rng_state.detach().to(device="cpu", dtype=torch.uint8)
+    torch.set_rng_state(rng_state)
     random.setstate(checkpoint["python_rng_state"])
     if torch.cuda.is_available() and checkpoint.get("cuda_rng_state") is not None:
-        torch.cuda.set_rng_state_all(checkpoint["cuda_rng_state"])
+        cuda_rng_state = []
+        for state in checkpoint["cuda_rng_state"]:
+            if not isinstance(state, torch.Tensor):
+                state = torch.tensor(state, dtype=torch.uint8)
+            else:
+                state = state.detach().to(device="cpu", dtype=torch.uint8)
+            cuda_rng_state.append(state)
+        torch.cuda.set_rng_state_all(cuda_rng_state)
     if pcvl_probes is not None:
         if "pcvl_probes" not in checkpoint or "pcvl_optimizer" not in checkpoint:
             raise RuntimeError("Pilot resume checkpoint is missing PCVL probe state")
