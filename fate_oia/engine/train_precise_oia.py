@@ -59,6 +59,19 @@ def _implementation_fingerprint(config_path: str | Path) -> dict[str, Any]:
     except Exception:
         head = "unavailable"
     return {"git_head": head, "source_tree_sha256": digest.hexdigest(), "config_sha256": hashlib.sha256(Path(config_path).read_bytes()).hexdigest(), "checked_source_count": len(sources)}
+_LEGACY_RESUME_FINGERPRINTS = {
+    (
+        "72a66667e90bf88dac82f685117761547b819d14",
+        "465c91fd0ed1b1e1e3de1231dc5c6ebca47305c7ac873b531333014c8b40a723",
+    )
+}
+def _resume_fingerprint_compatible(saved: dict[str, Any], expected: dict[str, Any]) -> bool:
+    """Allow only the audited pre-resume checkpoint identity migration."""
+    if saved == expected:
+        return True
+    if saved.get("config_sha256") != expected.get("config_sha256"):
+        return False
+    return (saved.get("git_head"), saved.get("source_tree_sha256")) in _LEGACY_RESUME_FINGERPRINTS
 
 
 def verify_full_curriculum_authorization(
@@ -260,7 +273,7 @@ def load_resume_checkpoint(
     pcvl_optimizer: torch.optim.Optimizer | None = None,
 ) -> tuple[int, int, int, float, dict[str, float], dict[str, int], int, int]:
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    if checkpoint.get("implementation_fingerprint") != expected_fingerprint:
+    if not _resume_fingerprint_compatible(checkpoint.get("implementation_fingerprint", {}), expected_fingerprint):
         raise RuntimeError("Resume checkpoint implementation/config fingerprint does not match current code")
     if checkpoint.get("curriculum_sha256") != expected_curriculum_sha256:
         raise RuntimeError("Resume checkpoint curriculum hash does not match current schedule")
