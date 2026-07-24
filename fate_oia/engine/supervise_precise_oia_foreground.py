@@ -126,6 +126,7 @@ def main() -> None:
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--allow_full_with_embedded_curriculum", action="store_true")
+    parser.add_argument("--resume_checkpoint", default=None)
     args = parser.parse_args()
     if args.mode == "pilot" and args.epochs != 3:
         raise SystemExit("PRECISE pilot epochs != 3; the scientific gate requires exactly three epochs")
@@ -151,11 +152,14 @@ def main() -> None:
         _run([sys.executable, "-m", "fate_oia.engine.audit_precise_oia_implementation", "--config", args.config, "--output_dir", ".review/precise_oia_v1/full_curriculum", "--device", args.device, "--mode", "curriculum", "--write_full_curriculum_ready"])
         verify_review_hash(curriculum_gate, Path(args.config), expected_status="FULL_CURRICULUM_READY")
     run_dir = Path(args.output_dir) / args.mode
-    assert_fresh_run_dir(run_dir)
+    if args.resume_checkpoint is None:
+        assert_fresh_run_dir(run_dir)
     selected_batch, selected_accum = selected_runtime_args(root / ".review/precise_oia_v1/runtime/selected_runtime_profile.json", args.batch_size, args.gradient_accumulation_steps)
     command = [sys.executable, "-u", "-m", "fate_oia.engine.train_precise_oia", "--config", args.config, "--output_dir", str(run_dir), "--epochs", str(args.epochs), "--batch_size", str(selected_batch), "--gradient_accumulation_steps", str(selected_accum), "--num_workers", str(args.num_workers), "--device", args.device, "--mode", args.mode]
     if args.mode == "full":
         command.append("--allow_full_with_embedded_curriculum")
+    if args.resume_checkpoint is not None:
+        command.extend(["--resume_checkpoint", args.resume_checkpoint])
     if args.mode == "pilot":
         command.extend(["--max_test_samples", "512"])
     _run(command)
