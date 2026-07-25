@@ -1,0 +1,54 @@
+schema_version: 1
+counts:
+  entity_control: 12
+  road: 5
+  latent: 3
+  background: 1
+  internal: 21
+  public_explainable: 20
+mask_contract:
+  internal_shape: "[B,21,45,80]"
+  public_shape: "[B,20,45,80]"
+  background_shape: "[B,1,45,80]"
+  normalization_axis: slot
+  background_allowed_in_contribution: false
+  background_allowed_in_explanation: false
+  background_allowed_in_counterfactual: false
+binding:
+  iterations: 2
+  lambda_mask_bias: 0.50
+  patch_competition: true
+  layer_reading: query_conditioned
+global_context:
+  separate_from_public_slots: true
+  separate_from_internal_slot_competition: true
+  contribution_source: global_only
+entity_control_slots:
+  - {id: 0, name: entity_control_00, fixed_instance_identity: false}
+  - {id: 1, name: entity_control_01, fixed_instance_identity: false}
+  - {id: 2, name: entity_control_02, fixed_instance_identity: false}
+  - {id: 3, name: entity_control_03, fixed_instance_identity: false}
+  - {id: 4, name: entity_control_04, fixed_instance_identity: false}
+  - {id: 5, name: entity_control_05, fixed_instance_identity: false}
+  - {id: 6, name: entity_control_06, fixed_instance_identity: false}
+  - {id: 7, name: entity_control_07, fixed_instance_identity: false}
+  - {id: 8, name: entity_control_08, fixed_instance_identity: false}
+  - {id: 9, name: entity_control_09, fixed_instance_identity: false}
+  - {id: 10, name: entity_control_10, fixed_instance_identity: false}
+  - {id: 11, name: entity_control_11, fixed_instance_identity: false}
+road_slots:
+  - {id: 12, name: drivable_left, family: drivable}
+  - {id: 13, name: drivable_center, family: drivable}
+  - {id: 14, name: drivable_right, family: drivable}
+  - {id: 15, name: boundary_left, family: boundary}
+  - {id: 16, name: boundary_right, family: boundary}
+latent_slots:
+  - {id: 17, name: latent_slot_00, human_name: null, explicit_bdd100k_semantics: false, named_evidence: false}
+  - {id: 18, name: latent_slot_01, human_name: null, explicit_bdd100k_semantics: false, named_evidence: false}
+  - {id: 19, name: latent_slot_02, human_name: null, explicit_bdd100k_semantics: false, named_evidence: false}
+background_sink:
+  id: 20
+  name: background_sink
+  contribution_allowed: false
+  explanation_allowed: false
+  counterfactual_allowed: false

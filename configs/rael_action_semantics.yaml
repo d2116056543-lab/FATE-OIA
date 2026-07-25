@@ -1,0 +1,19 @@
+schema_version: 1
+role_application: soft_prior_only
+hard_action_masks: false
+action_order: [forward, stop, left, right]
+actions:
+  - {id: 0, name: forward, query_components: [forward], semantic_reason_access: true}
+  - {id: 1, name: stop, query_components: [stop], semantic_reason_access: true}
+  - {id: 2, name: left, query_components: [side_shared, left], semantic_reason_access: true}
+  - {id: 3, name: right, query_components: [side_shared, right], semantic_reason_access: true}
+bridge:
+  source: semantic_reason_tokens
+  rezero_init: 0.0
+  cap: 0.25
+  reads_reason_logits: false
+  reads_reason_labels: false
+  reads_reason_private: false
+  reads_pu_targets: false
+  reads_bdd100k_geometry: false
+  reads_text_encoder: false

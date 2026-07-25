@@ -1,0 +1,25 @@
+schema_version: 1
+role_application: soft_prior_only
+hard_action_masks: false
+reasons:
+  - {id: 0, name: "Traffic light is green", entity: traffic_control, state: green, sector: upper_control, role: stop_veto, mirror_partner: null, explicit_evidence_families: [traffic_control], pu_eligible: true}
+  - {id: 1, name: "Follow traffic", entity: traffic_flow, state: following, sector: front_center, role: forward_support, mirror_partner: null, explicit_evidence_families: [vehicle, road_context], pu_eligible: true}
+  - {id: 2, name: "Road is clear", entity: road, state: clear, sector: front_center, role: forward_support, mirror_partner: null, explicit_evidence_families: [road, absence], pu_eligible: true}
+  - {id: 3, name: "Traffic light", entity: traffic_control, state: visible, sector: upper_control, role: stop_support, mirror_partner: null, explicit_evidence_families: [traffic_control], pu_eligible: false}
+  - {id: 4, name: "Traffic sign", entity: traffic_sign, state: visible, sector: upper_control, role: neutral_context, mirror_partner: null, explicit_evidence_families: [traffic_sign], pu_eligible: false}
+  - {id: 5, name: "Obstacle: car", entity: vehicle, state: obstructing, sector: front_center, role: forward_veto, mirror_partner: null, explicit_evidence_families: [vehicle], pu_eligible: true}
+  - {id: 6, name: "Obstacle: person", entity: pedestrian, state: obstructing, sector: front_center, role: stop_support, mirror_partner: null, explicit_evidence_families: [pedestrian], pu_eligible: true}
+  - {id: 7, name: "Obstacle: rider", entity: rider, state: obstructing, sector: front_center, role: stop_support, mirror_partner: null, explicit_evidence_families: [rider], pu_eligible: true}
+  - {id: 8, name: "Obstacle: others", entity: obstacle, state: obstructing, sector: front_center, role: forward_veto, mirror_partner: null, explicit_evidence_families: [other_object], pu_eligible: true}
+  - {id: 9, name: "No lane on the left", entity: lane, state: unavailable, sector: left_corridor, role: left_veto, mirror_partner: 15, explicit_evidence_families: [boundary, drivable, absence], pu_eligible: true}
+  - {id: 10, name: "Obstacles on the left lane", entity: vehicle, state: obstructing, sector: left_corridor, role: left_veto, mirror_partner: 16, explicit_evidence_families: [vehicle, drivable], pu_eligible: true}
+  - {id: 11, name: "Solid line on the left", entity: lane_boundary, state: solid, sector: left_corridor, role: left_veto, mirror_partner: 17, explicit_evidence_families: [boundary], pu_eligible: true}
+  - {id: 12, name: "On the left-turn lane", entity: lane, state: turn_available, sector: left_corridor, role: left_support, mirror_partner: 18, explicit_evidence_families: [drivable, boundary], pu_eligible: true}
+  - {id: 13, name: "Traffic light allows left", entity: traffic_control, state: left_allowed, sector: upper_control, role: left_support, mirror_partner: 19, explicit_evidence_families: [traffic_control], pu_eligible: true}
+  - {id: 14, name: "Front car turning left", entity: vehicle, state: turning_left, sector: front_center, role: left_veto, mirror_partner: 20, explicit_evidence_families: [vehicle], pu_eligible: true}
+  - {id: 15, name: "No lane on the right", entity: lane, state: unavailable, sector: right_corridor, role: right_veto, mirror_partner: 9, explicit_evidence_families: [boundary, drivable, absence], pu_eligible: true}
+  - {id: 16, name: "Obstacles on the right lane", entity: vehicle, state: obstructing, sector: right_corridor, role: right_veto, mirror_partner: 10, explicit_evidence_families: [vehicle, drivable], pu_eligible: true}
+  - {id: 17, name: "Solid line on the right", entity: lane_boundary, state: solid, sector: right_corridor, role: right_veto, mirror_partner: 11, explicit_evidence_families: [boundary], pu_eligible: true}
+  - {id: 18, name: "On the right-turn lane", entity: lane, state: turn_available, sector: right_corridor, role: right_support, mirror_partner: 12, explicit_evidence_families: [drivable, boundary], pu_eligible: true}
+  - {id: 19, name: "Traffic light allows right", entity: traffic_control, state: right_allowed, sector: upper_control, role: right_support, mirror_partner: 13, explicit_evidence_families: [traffic_control], pu_eligible: true}
+  - {id: 20, name: "Front car turning right", entity: vehicle, state: turning_right, sector: front_center, role: right_veto, mirror_partner: 14, explicit_evidence_families: [vehicle], pu_eligible: true}
