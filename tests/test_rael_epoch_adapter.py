@@ -120,6 +120,22 @@ def test_each_epoch_runs_formal_counterfactual_audit_before_artifact_builder() -
     assert "required_cases: int = 128" in source
 
 
+def test_epoch_saves_pre_evaluation_state_before_counterfactual_or_test_eval() -> None:
+    source = TRAINER.read_text(encoding="utf-8")
+    method = ast.get_source_segment(
+        source,
+        next(
+            node for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.FunctionDef) and node.name == "train_epoch_and_publish"
+        ),
+    ) or ""
+    assert "pre_evaluation_checkpoint" in method
+    assert method.index("pre_evaluation_checkpoint(") < method.index("run_epoch_counterfactual_audit")
+    supervisor = SUPERVISOR.read_text(encoding="utf-8")
+    assert "checkpoint_pre_test_eval_epoch_" in supervisor
+    assert "checkpoint_latest_pre_test_eval.pth" in supervisor
+
+
 def test_epoch_counterfactual_audit_compares_canonical_case_identity() -> None:
     trainer = TRAINER.read_text(encoding="utf-8")
     assert "case_id = canonicalize_sample_id(handoff.file_names[local_index])" in trainer

@@ -1083,6 +1083,44 @@ def _save_full_checkpoints(
     return flags
 
 
+def _save_pre_evaluation_checkpoint(
+    *,
+    output_dir: Path,
+    runtime: RAELRuntime,
+    epoch: int,
+    last_step_result: Any,
+    step_count: int,
+    transition: Mapping[str, Any],
+) -> None:
+    """Persist the train-complete state before any test evaluation can fail."""
+
+    import tempfile
+    import torch
+
+    if not isinstance(transition, Mapping):
+        raise TypeError("pre-evaluation checkpoint requires the real epoch transition")
+    state = {
+        "checkpoint_schema": "rael-p17-pre-test-eval-v1",
+        "checkpoint_stage": "after_train_calib_before_test_eval",
+        "epoch": int(epoch),
+        "step_count": int(step_count),
+        "last_step_result": last_step_result,
+        "trainer": runtime.trainer.state_dict(),
+        "transition": dict(transition),
+    }
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for name in (f"checkpoint_pre_test_eval_epoch_{int(epoch):03d}.pth", "checkpoint_latest_pre_test_eval.pth"):
+        target = output_dir / name
+        with tempfile.NamedTemporaryFile(prefix=f".{name}.", suffix=".tmp", dir=output_dir, delete=False) as stream:
+            temporary = Path(stream.name)
+        try:
+            torch.save(state, temporary)
+            os.replace(temporary, target)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+
+
 def run_rael_mode(*, mode: str, config_path: str | Path, output_dir: str | Path, device: str, batch_size: int, gradient_accumulation_steps: int, num_workers: int, max_train_samples: int | None = None, max_test_samples: int | None = None, max_optimizer_updates: int | None = None, full_gate: str | Path | None = None, runtime_profile: str | Path | None = None) -> dict[str, Any]:
     repository_root = Path(config_path).resolve().parents[1]
     if mode == "full":
@@ -1201,6 +1239,11 @@ def run_rael_mode(*, mode: str, config_path: str | Path, output_dir: str | Path,
             ),
             case_collector=collector,
             case_export_provenance=case_provenance,
+            pre_evaluation_checkpoint=lambda **values: _save_pre_evaluation_checkpoint(
+                output_dir=root,
+                runtime=runtime,
+                **values,
+            ),
         )
         flags = _save_full_checkpoints(output_dir=root, runtime=runtime, epoch=epoch, evaluation=publication["evaluation"], best=best)
         _append_epoch_run_rows(

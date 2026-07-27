@@ -2454,6 +2454,7 @@ class RAELTrainer:
         on_step_result: Callable[[RAELStepResult], None] | None = None,
         case_collector: object | None = None,
         case_export_provenance: Mapping[str, Any] | None = None,
+        pre_evaluation_checkpoint: Callable[..., None] | None = None,
     ) -> dict[str, Any]:
         """Train one epoch, test-evaluate it, then publish only P18-validated artifacts."""
 
@@ -2488,6 +2489,16 @@ class RAELTrainer:
             raise ValueError("epoch transition omitted the train-calib split hash")
         if not isinstance(pu_audit, Sequence) or isinstance(pu_audit, (str, bytes)) or len(pu_audit) != REASON_COUNT:
             raise ValueError("epoch transition omitted the 21-row fixed train-audit PU result")
+        if pre_evaluation_checkpoint is not None:
+            if not callable(pre_evaluation_checkpoint):
+                raise TypeError("pre_evaluation_checkpoint must be callable")
+            pre_evaluation_checkpoint(
+                trainer=self,
+                epoch=int(epoch),
+                last_step_result=last_step_result,
+                step_count=step_count,
+                transition=transition,
+            )
         if iter(test_batches) is test_batches:
             raise TypeError("epoch publishing requires a re-iterable test loader, never a cached or one-shot generator")
         counterfactual = self.run_epoch_counterfactual_audit(test_batches, epoch=epoch, device=device)
