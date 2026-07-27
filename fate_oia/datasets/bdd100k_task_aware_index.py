@@ -279,6 +279,7 @@ class RAELTaskAwareBDD100KIndex:
         lanes: str | Path | None = None,
         drivable: str | Path | None = None,
         label_directories: Mapping[str, str | Path] | None = None,
+        include_file_names: Iterable[str] | None = None,
     ) -> None:
         self._by_source: dict[str, dict[str, list[dict[str, Any]]]] = {
             source: defaultdict(list) for source in _SOURCE_NAMES
@@ -287,6 +288,12 @@ class RAELTaskAwareBDD100KIndex:
         self._reduced_aliases: dict[str, set[str]] = defaultdict(set)
         self._source_hashes: dict[str, str | None] = {source: None for source in _SOURCE_NAMES}
         self._parse_calls: dict[str, int] = {source: 0 for source in _SOURCE_NAMES}
+        self._include_stems = (
+            None
+            if include_file_names is None
+            else {_candidate_stems(str(name))[1] for name in include_file_names}
+        )
+        self._filtered_file_count = 0
         paths = {"detections": detections, "lanes": lanes, "drivable": drivable}
         for source, path in paths.items():
             if path is not None:
@@ -323,6 +330,9 @@ class RAELTaskAwareBDD100KIndex:
             if not files:
                 raise ValueError(f"BDD100K {split} label directory has no direct JSON files: {directory}")
             for path in files:
+                if self._include_stems is not None and _candidate_stems(path.name)[1] not in self._include_stems:
+                    self._filtered_file_count += 1
+                    continue
                 payload_bytes = path.read_bytes()
                 hashes.append(path.name.encode("utf-8") + b"\0" + hashlib.sha256(payload_bytes).digest())
                 payload = json.loads(payload_bytes.decode("utf-8", errors="strict"))
@@ -425,6 +435,7 @@ class RAELTaskAwareBDD100KIndex:
         payload = {
             "metadata_only": True,
             "feature_cache": False,
+            "filtered_file_count": self._filtered_file_count,
             "parse_calls": dict(self._parse_calls),
             "source_hashes": dict(self._source_hashes),
             "source_alias_policy": _SOURCE_ALIAS_POLICY,

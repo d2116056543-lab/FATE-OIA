@@ -471,24 +471,39 @@ def _audited_bdd100k_layout(sources: Mapping[str, Any]) -> Mapping[str, Path]:
     return layout
 
 
-def _grounding_index(config: Mapping[str, Any]) -> Any:
+def _grounding_index(
+    config: Mapping[str, Any],
+    *,
+    include_file_names: Sequence[str] | None = None,
+) -> Any:
     from fate_oia.datasets.bdd100k_task_aware_index import RAELTaskAwareBDD100KIndex
 
     sources = config.get("grounding_sources")
     if not isinstance(sources, Mapping):
         raise ValueError("grounding_sources must explicitly provide the audited train/val per-frame label directories")
-    return RAELTaskAwareBDD100KIndex(label_directories=_audited_bdd100k_layout(sources))
+    return RAELTaskAwareBDD100KIndex(
+        label_directories=_audited_bdd100k_layout(sources),
+        include_file_names=include_file_names,
+    )
 
 
 class _RealRAELDataset:
     """Wrap official BDD-OIA samples with one image transform and metadata-only grounding."""
 
-    def __init__(self, *, config: Mapping[str, Any], split: str, index: Any, indices: Sequence[int] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        config: Mapping[str, Any],
+        split: str,
+        index: Any,
+        indices: Sequence[int] | None = None,
+        base: Any | None = None,
+    ) -> None:
         from fate_oia.datasets.bdd_oia_multitask import BDDOIAMultiTaskDataset
         from fate_oia.transforms_rael import RAELGroundingTransform
 
         data = config["data"]
-        self.base = BDDOIAMultiTaskDataset(data_root=data["data_root"], raw_root=data["raw_root"], split=split, action_dim=4, reason_dim=21, load_image=False)
+        self.base = base if base is not None else BDDOIAMultiTaskDataset(data_root=data["data_root"], raw_root=data["raw_root"], split=split, action_dim=4, reason_dim=21, load_image=False)
         self.index = index
         self.transform = RAELGroundingTransform(image_height=int(data["image_height"]), image_width=int(data["image_width"]), patch_size=8)
         self.indices = tuple(range(len(self.base))) if indices is None else tuple(int(value) for value in indices)
@@ -592,34 +607,42 @@ def build_rael_runtime(*, config_path: str | Path, device: str, batch_size: int,
 
     config = load_rael_config(config_path)
     root = Path(config_path).resolve().parents[1]
-    index = _grounding_index(config)
     seed = int(config["training"]["seed"])
-    train_all = _RealRAELDataset(config=config, split="train", index=index)
-    audit_count = min(1024, len(train_all))
-    audit_indices = _deterministic_indices(len(train_all), seed=seed, limit=audit_count)
+    from fate_oia.datasets.bdd_oia_multitask import BDDOIAMultiTaskDataset
+
+    data = config["data"]
+    train_base = BDDOIAMultiTaskDataset(data_root=data["data_root"], raw_root=data["raw_root"], split="train", action_dim=4, reason_dim=21, load_image=False)
+    test_base = BDDOIAMultiTaskDataset(data_root=data["data_root"], raw_root=data["raw_root"], split="test", action_dim=4, reason_dim=21, load_image=False)
+    audit_count = min(1024, len(train_base))
+    audit_indices = _deterministic_indices(len(train_base), seed=seed, limit=audit_count)
     # Train representation, fixed train-audit PU admission, and post-hoc
     # train-calib are three disjoint views.  Test data never participates.
     calib_indices = _deterministic_indices(
-        len(train_all),
+        len(train_base),
         seed=seed + 2,
         fraction=float(config["calibration"]["train_calib_fraction"]),
         limit=max_train_samples,
         exclude=set(audit_indices),
     )
     main_indices = _deterministic_indices(
-        len(train_all),
+        len(train_base),
         seed=seed + 1,
         limit=max_train_samples,
         exclude=set(audit_indices).union(calib_indices),
     )
     if set(audit_indices).intersection(calib_indices) or set(audit_indices).intersection(main_indices) or set(calib_indices).intersection(main_indices):
         raise RuntimeError("train representation, fixed audit, and train-calib splits must be disjoint")
-    train_data = _RealRAELDataset(config=config, split="train", index=index, indices=main_indices)
-    train_audit_data = _RealRAELDataset(config=config, split="train", index=index, indices=audit_indices)
-    calib_data = _RealRAELDataset(config=config, split="train", index=index, indices=calib_indices)
-    test_all = _RealRAELDataset(config=config, split="test", index=index)
-    test_indices = _deterministic_indices(len(test_all), seed=seed + 3, limit=max_test_samples)
-    test_data = _RealRAELDataset(config=config, split="test", index=index, indices=test_indices)
+    test_indices = _deterministic_indices(len(test_base), seed=seed + 3, limit=max_test_samples)
+    required_train_indices = sorted(set(main_indices).union(audit_indices).union(calib_indices))
+    required_file_names = [
+        *(str(train_base[index]["file_name"]) for index in required_train_indices),
+        *(str(test_base[index]["file_name"]) for index in test_indices),
+    ]
+    index = _grounding_index(config, include_file_names=required_file_names)
+    train_data = _RealRAELDataset(config=config, split="train", index=index, indices=main_indices, base=train_base)
+    train_audit_data = _RealRAELDataset(config=config, split="train", index=index, indices=audit_indices, base=train_base)
+    calib_data = _RealRAELDataset(config=config, split="train", index=index, indices=calib_indices, base=train_base)
+    test_data = _RealRAELDataset(config=config, split="test", index=index, indices=test_indices, base=test_base)
     # Windows spawn copies each dataset-owned metadata index into every worker.
     # Bound the train pool and keep the three sequential auxiliary loaders in
     # the parent process instead of creating four independent persistent pools.

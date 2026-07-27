@@ -181,8 +181,9 @@ def test_grounding_index_reads_data_scoped_explicit_directories(
     datasets = types.ModuleType("fate_oia.datasets")
     index_module = types.ModuleType("fate_oia.datasets.bdd100k_task_aware_index")
     class Index:
-        def __init__(self, *, label_directories):
+        def __init__(self, *, label_directories, include_file_names=None):
             self.label_directories = label_directories
+            self.include_file_names = include_file_names
     index_module.RAELTaskAwareBDD100KIndex = Index
     monkeypatch.setitem(sys.modules, "fate_oia", package)
     monkeypatch.setitem(sys.modules, "fate_oia.datasets", datasets)

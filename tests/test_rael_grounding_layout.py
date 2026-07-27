@@ -63,3 +63,20 @@ def test_explicit_per_frame_label_directories_split_object_types_and_preserve_su
     assert record.drivable[0]["polygon"] == ((0.0, 0.0), (3.0, 0.0), (3.0, 3.0))
     assert record.lanes[0]["points"] == ((1.0, 1.0), (2.0, 2.0))
     assert all(record.source_complete.values())
+
+
+def test_required_stem_filter_skips_unrelated_per_frame_json(tmp_path: Path) -> None:
+    module = _index_module()
+    train, val = tmp_path / "train", tmp_path / "val"
+    train.mkdir()
+    val.mkdir()
+    _write_frame(train / "keep.json", "keep.jpg")
+    _write_frame(train / "skip.json", "skip.jpg")
+    _write_frame(val / "val.json", "val.jpg")
+    index = module.RAELTaskAwareBDD100KIndex(
+        label_directories={"train": train, "val": val},
+        include_file_names=("keep_1.jpg",),
+    )
+    assert index.lookup("keep_1.jpg").source_complete["detections"] is True
+    assert index.lookup("skip_1.jpg").source_complete["detections"] is False
+    assert index.manifest()["filtered_file_count"] == 2
