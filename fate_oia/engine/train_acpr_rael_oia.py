@@ -45,6 +45,7 @@ from fate_oia.losses.rael_counterfactual_losses import run_feature_intervention
 from fate_oia.losses.rael_pu_losses import (
     REASON_COUNT,
     build_pu_soft_targets,
+    canonicalize_sample_id,
     reason_confidence_weights,
     reason_private_pu_loss,
 )
@@ -1968,11 +1969,33 @@ class RAELTrainer:
             "budget_hit_rates": dict(admission["caps"]),
             "ema_norms": dict(admission["ema_norms"]),
             "pu_lambda_by_label": {str(index): float(self.pu_lambda[index].item()) for index in range(REASON_COUNT)},
-            "analytic_selected_effect": float(counterfactual["analytical_selected_effect"]),
-            "feature_selected_effect": float(counterfactual["selected_effect"]),
-            "control_effect": float(counterfactual["control_effect"]),
-            "wrong_target_effect": float(counterfactual["wrong_effect"]),
-            "sign_consistency": float(counterfactual["sign_consistency"]),
+            "counterfactual_available": bool(counterfactual.get("available", True)),
+            "counterfactual_reason": str(counterfactual.get("reason", "formal_128_case_audit")),
+            "analytic_selected_effect": (
+                float(counterfactual["analytical_selected_effect"])
+                if counterfactual["analytical_selected_effect"] is not None
+                else None
+            ),
+            "feature_selected_effect": (
+                float(counterfactual["selected_effect"])
+                if counterfactual["selected_effect"] is not None
+                else None
+            ),
+            "control_effect": (
+                float(counterfactual["control_effect"])
+                if counterfactual["control_effect"] is not None
+                else None
+            ),
+            "wrong_target_effect": (
+                float(counterfactual["wrong_effect"])
+                if counterfactual["wrong_effect"] is not None
+                else None
+            ),
+            "sign_consistency": (
+                float(counterfactual["sign_consistency"])
+                if counterfactual["sign_consistency"] is not None
+                else None
+            ),
             "valid_action_target_count": float(counterfactual["valid_action_target_count"]),
             "valid_reason_target_count": float(counterfactual["valid_reason_target_count"]),
         }
@@ -2362,14 +2385,18 @@ class RAELTrainer:
                         optimizer_update=local_index + 1,
                         every_optimizer_updates=1,
                     )
-                    case_id = handoff.file_names[local_index]
-                    if result.get("case_id") != case_id:
-                        raise RuntimeError("counterfactual replay selected a different real case")
+                    case_id = canonicalize_sample_id(handoff.file_names[local_index])
                     if case_id in sample_ids:
                         raise RuntimeError("formal counterfactual audit case ids must be unique")
                     sample_ids.append(case_id)
                     if result.get("available") is not True:
                         continue
+                    if result.get("case_id") != case_id:
+                        raise RuntimeError(
+                            "counterfactual replay selected a different real case: "
+                            f"expected={case_id!r}, actual={result.get('case_id')!r}, "
+                            f"local_index={local_index}"
+                        )
                     effects = result.get("effects")
                     if not isinstance(effects, Mapping):
                         raise RuntimeError("available counterfactual is missing real effects")
@@ -2394,17 +2421,16 @@ class RAELTrainer:
             self.model.train(was_training)
         if len(sample_ids) != required_cases:
             raise RuntimeError("formal 128-case audit exhausted the real test loader")
-        if not selected or not control or not wrong:
-            raise RuntimeError("formal 128-case audit has no available real intervention")
+        available = bool(selected and control and wrong)
         payload = {
-            "available": True,
-            "reason": "formal_128_case_audit",
+            "available": available,
+            "reason": "formal_128_case_audit" if available else "no_eligible_control",
             "sample_ids": tuple(sample_ids),
-            "selected_effect": sum(selected) / len(selected),
-            "control_effect": sum(control) / len(control),
-            "wrong_effect": sum(wrong) / len(wrong),
-            "analytical_selected_effect": sum(analytical) / len(analytical),
-            "sign_consistency": selected_beats_control / len(selected),
+            "selected_effect": sum(selected) / len(selected) if available else None,
+            "control_effect": sum(control) / len(control) if available else None,
+            "wrong_effect": sum(wrong) / len(wrong) if available else None,
+            "analytical_selected_effect": sum(analytical) / len(analytical) if available else None,
+            "sign_consistency": selected_beats_control / len(selected) if available else None,
             "valid_action_target_count": valid_action,
             "valid_reason_target_count": valid_reason,
             "epoch": int(epoch),

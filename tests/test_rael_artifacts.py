@@ -490,6 +490,8 @@ def _json_epoch_payload(name: str, *, epoch: int, sample_count: int) -> dict[str
     if name == "counterfactual.json":
         return {
             **base,
+            "available": True,
+            "reason": "formal_128_case_audit",
             "sample_ids": [f"fixed-{index}" for index in range(128)],
             "selected": {"effect": 0.1},
             "control": {"effect": 0.02},
@@ -722,6 +724,8 @@ def _run_jsonl_row(name: str, *, epoch: int = 0, microbatch_step: int = 1):
             "valid_reason_target_count",
         )
         row.update({field: 0.1 for field in scalar_fields})
+        row["counterfactual_available"] = True
+        row["counterfactual_reason"] = "formal_128_case_audit"
         row["dino_call_count"] = 1
         row["optimizer_stepped"] = True
         row["owner_gradient_norms"] = {owner: 0.1 for owner in OWNER_NAMES}
@@ -835,6 +839,43 @@ def test_p18_writes_complete_run_root_and_epoch_transactionally(tmp_path: Path) 
         assert target.is_file()
         assert record["sha256"] == hashlib.sha256(target.read_bytes()).hexdigest()
         assert record["bytes"] == target.stat().st_size
+
+
+def test_p18_records_initial_counterfactual_unavailability_without_fake_effects() -> None:
+    module = _module()
+    counterfactual = _json_epoch_payload("counterfactual.json", epoch=3, sample_count=3)
+    counterfactual.update(
+        {
+            "available": False,
+            "reason": "no_eligible_control",
+            "selected": {"effect": None},
+            "control": {"effect": None},
+            "wrong": {"effect": None},
+            "valid_action_target_count": 0,
+            "valid_reason_target_count": 0,
+        }
+    )
+    module._validate_epoch_json("counterfactual.json", counterfactual, epoch=3)
+    assert counterfactual["available"] is False
+    assert counterfactual["selected"]["effect"] is None
+
+    mechanism = _run_jsonl_row("mechanism_stats.jsonl")
+    mechanism.update(
+        {
+            "counterfactual_available": False,
+            "counterfactual_reason": "no_eligible_control",
+            "analytic_selected_effect": None,
+            "feature_selected_effect": None,
+            "control_effect": None,
+            "wrong_target_effect": None,
+            "sign_consistency": None,
+            "valid_action_target_count": 0.0,
+            "valid_reason_target_count": 0.0,
+        }
+    )
+    module._validate_run_jsonl_row("mechanism_stats.jsonl", mechanism)
+    assert mechanism["counterfactual_available"] is False
+    assert mechanism["feature_selected_effect"] is None
 
 
 def test_p18_epoch_transaction_rolls_back_on_injected_failure(

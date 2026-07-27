@@ -478,9 +478,13 @@ def _validate_epoch_json(name: str, value: Any, *, epoch: int) -> dict[str, Any]
     elif name == "counterfactual.json":
         _require_fields(
             mapping,
-            ("sample_ids", "selected", "control", "wrong", "valid_action_target_count", "valid_reason_target_count"),
+            ("available", "reason", "sample_ids", "selected", "control", "wrong", "valid_action_target_count", "valid_reason_target_count"),
             context=name,
         )
+        if not isinstance(mapping["available"], bool):
+            raise ValueError("counterfactual.json.available must be boolean")
+        if mapping["reason"] not in {"formal_128_case_audit", "no_eligible_control"}:
+            raise ValueError("counterfactual.json.reason is not recognized")
         sample_ids = mapping["sample_ids"]
         if not isinstance(sample_ids, Sequence) or isinstance(sample_ids, (str, bytes, bytearray)) or len(sample_ids) != 128:
             raise ValueError("counterfactual.json.sample_ids must contain exactly 128 fixed cases")
@@ -488,7 +492,13 @@ def _validate_epoch_json(name: str, value: Any, *, epoch: int) -> dict[str, Any]
             raise ValueError("counterfactual.json.sample_ids must be nonempty strings")
         for field in ("selected", "control", "wrong"):
             effect = _require_mapping(mapping[field], context=f"counterfactual.json.{field}")
-            _finite_scalar(effect.get("effect"), context=f"counterfactual.json.{field}.effect")
+            value = effect.get("effect")
+            if mapping["available"]:
+                _finite_scalar(value, context=f"counterfactual.json.{field}.effect")
+            elif value is not None:
+                raise ValueError(f"counterfactual.json.{field}.effect must be null when unavailable")
+        if mapping["available"] != (mapping["reason"] == "formal_128_case_audit"):
+            raise ValueError("counterfactual.json availability and reason disagree")
         for field in ("valid_action_target_count", "valid_reason_target_count"):
             value_count = mapping[field]
             if isinstance(value_count, bool) or not isinstance(value_count, int) or value_count < 0:
@@ -956,8 +966,15 @@ def _validate_run_jsonl_row(name: str, row: Any) -> dict[str, Any]:
             "active_entity_count", "background_mass", "latent_mass", "slot_mask_entropy", "slot_pair_iou", "slot_area_mean", "slot_area_std",
             "entity_type_entropy", "traffic_state_entropy", "road_coverage", "named_contribution_ratio", "latent_contribution_ratio",
             "global_contribution_ratio", "layer_entropy", "positive_weight_mean", "negative_weight_mean", "pu_active_label_count",
-            "pu_soft_positive_count", "semantic_private_norm_ratio", "action_reason_context_norm", "analytic_selected_effect",
-            "feature_selected_effect", "control_effect", "wrong_target_effect", "sign_consistency", "valid_action_target_count", "valid_reason_target_count",
+            "pu_soft_positive_count", "semantic_private_norm_ratio", "action_reason_context_norm",
+            "valid_action_target_count", "valid_reason_target_count",
+        )
+        counterfactual_scalar_fields = (
+            "analytic_selected_effect",
+            "feature_selected_effect",
+            "control_effect",
+            "wrong_target_effect",
+            "sign_consistency",
         )
         mapping_fields = (
             "action_layer_weights", "reason_layer_weights", "slot_layer_weights", "layer_collapse", "slot_cos_action_reason",
@@ -968,7 +985,10 @@ def _validate_run_jsonl_row(name: str, row: Any) -> dict[str, Any]:
             mapping,
             (
                 *scalar_fields,
+                *counterfactual_scalar_fields,
                 *mapping_fields,
+                "counterfactual_available",
+                "counterfactual_reason",
                 "dino_call_count",
                 "optimizer_stepped",
                 "owner_gradient_norms",
@@ -981,6 +1001,20 @@ def _validate_run_jsonl_row(name: str, row: Any) -> dict[str, Any]:
             if field.endswith("_time") or field in {"samples_per_sec", "allocated_gb", "reserved_gb"}:
                 if resolved < 0.0:
                     raise ValueError(f"mechanism_stats.jsonl.{field} must be nonnegative")
+        if not isinstance(mapping["counterfactual_available"], bool):
+            raise ValueError("mechanism_stats.jsonl.counterfactual_available must be boolean")
+        if mapping["counterfactual_reason"] not in {"formal_128_case_audit", "no_eligible_control"}:
+            raise ValueError("mechanism_stats.jsonl.counterfactual_reason is not recognized")
+        for field in counterfactual_scalar_fields:
+            value = mapping[field]
+            if mapping["counterfactual_available"]:
+                _finite_scalar(value, context=f"mechanism_stats.jsonl.{field}")
+            elif value is not None:
+                raise ValueError(f"mechanism_stats.jsonl.{field} must be null when counterfactual is unavailable")
+        if mapping["counterfactual_available"] != (
+            mapping["counterfactual_reason"] == "formal_128_case_audit"
+        ):
+            raise ValueError("mechanism_stats.jsonl counterfactual availability and reason disagree")
         for field in mapping_fields:
             _finite_mapping(mapping[field], context=f"mechanism_stats.jsonl.{field}")
         if mapping["dino_call_count"] != 1:

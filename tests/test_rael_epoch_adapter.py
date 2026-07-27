@@ -118,3 +118,12 @@ def test_each_epoch_runs_formal_counterfactual_audit_before_artifact_builder() -
     body = ast.get_source_segment(source, method) or ""
     assert body.index("run_epoch_counterfactual_audit") < body.index("epoch_artifact_builder(")
     assert "required_cases: int = 128" in source
+
+
+def test_epoch_counterfactual_audit_compares_canonical_case_identity() -> None:
+    trainer = TRAINER.read_text(encoding="utf-8")
+    assert "case_id = canonicalize_sample_id(handoff.file_names[local_index])" in trainer
+    assert 'if result.get("case_id") != case_id:' in trainer
+    assert trainer.index('if result.get("available") is not True:') < trainer.index(
+        'if result.get("case_id") != case_id:'
+    )

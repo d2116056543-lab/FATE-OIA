@@ -27,6 +27,15 @@ def _module():
     return module
 
 
+def test_train_calib_split_hash_uses_the_same_p12_identity_as_calibration() -> None:
+    module = _module()
+    from fate_oia.utils.rael_posthoc_calibration import _source_descriptor
+
+    names = [r"relative\folder\case-a.jpg", r"relative\folder\case-b.jpg"]
+    descriptor = _source_descriptor(stable_ids=names, split_hash=None, batch=2)
+    assert module._split_hash(names) == descriptor["split_hash"]
+
+
 def test_supervisor_exposes_real_yaml_launch_and_runtime_factory() -> None:
     module = _module()
     for name in (
@@ -165,7 +174,10 @@ def test_runtime_profile_loader_consumes_p20_directory_artifacts(tmp_path: Path)
         encoding="utf-8",
     )
     (tmp_path / "runtime_steps.jsonl").write_text(
-        __import__("json").dumps({"elapsed": 1.0}) + "\n",
+        __import__("json").dumps({"candidate": "other", "elapsed": 2.0})
+        + "\n"
+        + __import__("json").dumps({"candidate": "w4", "elapsed": 1.0})
+        + "\n",
         encoding="utf-8",
     )
     profile, selected, steps = module._load_selected_runtime_profile(
@@ -175,6 +187,19 @@ def test_runtime_profile_loader_consumes_p20_directory_artifacts(tmp_path: Path)
     assert profile["candidates"][0]["name"] == "w4"
     assert selected["selected"]["name"] == "w4"
     assert len(steps) == 1
+    assert steps[0]["candidate"] == "w4"
+
+
+def test_full_runtime_rows_cannot_override_current_run_provenance() -> None:
+    source = SUPERVISOR.read_text(encoding="utf-8")
+    assert (
+        'append_run_jsonl("runtime_steps.jsonl", {**row, **provenance})'
+        in source
+    )
+    assert (
+        'append_run_jsonl("runtime_steps.jsonl", {**provenance, **row})'
+        not in source
+    )
 
 
 def test_mechanism_row_uses_observed_dino_count() -> None:

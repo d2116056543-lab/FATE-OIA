@@ -14,6 +14,8 @@ from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 import yaml
 
+from fate_oia.losses.rael_pu_losses import canonicalize_sample_id
+
 
 def _weighted_value(rows: Sequence[Mapping[str, Any]], field: str) -> Any:
     """Average an actual scalar/list diagnostic by the decoded sample count."""
@@ -89,8 +91,8 @@ def build_p18_epoch_artifacts(
     if set(cases) != required_cases or not all(cases[name] for name in required_cases):
         raise ValueError("P18 adapter requires actual failure and evidence case rows")
     cf = counterfactual
-    if not isinstance(cf, Mapping) or cf.get("available") is not True:
-        raise ValueError("P18 adapter requires the real formal counterfactual audit")
+    if not isinstance(cf, Mapping) or not isinstance(cf.get("available"), bool):
+        raise ValueError("P18 adapter requires a truthfully available or unavailable formal counterfactual audit")
     sample_ids = cf.get("sample_ids")
     if not isinstance(sample_ids, Sequence) or isinstance(sample_ids, (str, bytes)) or len(sample_ids) != 128:
         raise ValueError(
@@ -193,7 +195,7 @@ def build_p18_epoch_artifacts(
         "named_latent_global.json": {**common, "named_ratio": float(_weighted_value(rows, "named_ratio")["action"]), "latent_ratio": float(_weighted_value(rows, "latent_ratio")["action"]), "global_ratio": float(1.0 - _weighted_value(rows, "named_ratio")["action"] - _weighted_value(rows, "latent_ratio")["action"]), "per_target": per_target, "overall": {"named": float(_weighted_value(rows, "named_ratio")["action"]), "latent": float(_weighted_value(rows, "latent_ratio")["action"]), "global": float(1.0 - _weighted_value(rows, "named_ratio")["action"] - _weighted_value(rows, "latent_ratio")["action"])}},
         "gradient_admission.json": {**common, **gradient},
         "pu_stats.json": {**common, "labels": [{**dict(pu_audit[index]), "gate": bool(trainer.pu_active_labels[index].item()), "lambda": float(trainer.pu_lambda[index].item()), "soft_positive_count": float(_require_epoch_pu_count(trainer, index))} for index in range(21)]},
-        "counterfactual.json": {**common, "sample_ids": list(sample_ids), "selected": {"effect": float(cf["selected_effect"])}, "control": {"effect": float(cf["control_effect"])}, "wrong": {"effect": float(cf["wrong_effect"])}, "valid_action_target_count": int(cf["valid_action_target_count"]), "valid_reason_target_count": int(cf["valid_reason_target_count"])},
+        "counterfactual.json": {**common, "available": bool(cf.get("available", True)), "reason": str(cf.get("reason", "formal_128_case_audit")), "sample_ids": list(sample_ids), "selected": {"effect": float(cf["selected_effect"]) if cf["selected_effect"] is not None else None}, "control": {"effect": float(cf["control_effect"]) if cf["control_effect"] is not None else None}, "wrong": {"effect": float(cf["wrong_effect"]) if cf["wrong_effect"] is not None else None}, "valid_action_target_count": int(cf["valid_action_target_count"]), "valid_reason_target_count": int(cf["valid_reason_target_count"])},
         "calibration.json": {**common, "candidates": calibration_candidates, "chosen_thresholds": {"action": action_threshold, "reason": reason_threshold}, "temperature": {"action": sum(action_temperature) / len(action_temperature), "reason": sum(reason_temperature) / len(reason_temperature)}, "threshold_rms": {"action": (sum(value * value for value in action_threshold) / len(action_threshold)) ** 0.5, "reason": (sum(value * value for value in reason_threshold) / len(reason_threshold)) ** 0.5}, "raw_map": {"action": evaluation["raw_metrics"]["metrics"]["action"]["mAP"], "reason": evaluation["raw_metrics"]["metrics"]["reason"]["mAP"]}, "deploy_map": {"action": evaluation["deploy_metrics"]["metrics"]["action"]["mAP"], "reason": evaluation["deploy_metrics"]["metrics"]["reason"]["mAP"]}, "fallback": {"used": False, "reason": "train_calib_chosen"}},
         "failure_cases.jsonl": cases["failure_cases.jsonl"],
         "evidence_cases.jsonl": cases["evidence_cases.jsonl"],
@@ -441,7 +443,7 @@ def _git_head(root: Path) -> str:
 
 
 def _split_hash(names: Sequence[str]) -> str:
-    canonical = [str(name).replace("\\", "/") for name in names]
+    canonical = [canonicalize_sample_id(name) for name in names]
     return hashlib.sha256(json.dumps(canonical, ensure_ascii=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
@@ -870,9 +872,19 @@ def _load_selected_runtime_profile(path: str | Path, *, provenance: Mapping[str,
         raise ValueError("P20 runtime profile must contain real nonempty candidates")
     if not isinstance(selected, Mapping) or not isinstance(steps, Sequence) or isinstance(steps, (str, bytes)) or not steps:
         raise ValueError("P20 runtime profile must contain selected profile and real runtime_steps")
+    selected_name = selected.get("name")
+    if not isinstance(selected_name, str) or not selected_name:
+        raise ValueError("P20 selected runtime profile must name one measured candidate")
+    selected_steps = [
+        dict(row)
+        for row in steps
+        if isinstance(row, Mapping) and row.get("candidate") == selected_name
+    ]
+    if not selected_steps:
+        raise ValueError("P20 runtime_steps must contain rows for the selected candidate")
     runtime_profile = {**provenance, "candidates": [dict(row) for row in candidates]}
     selected_profile = {**provenance, "selected": dict(selected), "reason": str(selected_payload.get("reason") or "P20 selected fastest stable measured candidate")}
-    return runtime_profile, selected_profile, tuple(dict(row) for row in steps)
+    return runtime_profile, selected_profile, tuple(selected_steps)
 
 
 def _initialize_full_artifact_root(
@@ -1138,7 +1150,7 @@ def run_rael_mode(*, mode: str, config_path: str | Path, output_dir: str | Path,
         runtime=runtime, writer=writer, command_line=command, runtime_profile_path=runtime_profile
     )
     for row in profile_steps:
-        writer.append_run_jsonl("runtime_steps.jsonl", {**provenance, **row})
+        writer.append_run_jsonl("runtime_steps.jsonl", {**row, **provenance})
     epochs = int(runtime.config["training"]["epochs"])
     best = {
         "deploy_joint": float("-inf"),
