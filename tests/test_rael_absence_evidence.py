@@ -29,6 +29,65 @@ def test_p6_absence_exact_formula_and_clear_reliability() -> None:
     assert output["clear_reliability"].requires_grad is False
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="P6 BF16 contract requires CUDA")
+def test_p6_reliable_absence_is_cuda_bf16_autocast_safe_and_preserves_probability_semantics() -> None:
+    """BF16-rounded softmax probabilities remain valid formal simplex inputs."""
+
+    module = _module()
+    device = torch.device("cuda")
+    torch.manual_seed(17)
+    presence_logits = (torch.randn(4, 12, device=device) * 2.0).requires_grad_()
+    sector_logits = (torch.randn(4, 12, 3, device=device) * 4.0).requires_grad_()
+    visibility_logits = torch.randn(4, 3, device=device, requires_grad=True)
+    q_view_logits = torch.randn(4, 3, device=device, requires_grad=True)
+
+    reference = module.reliable_absence_evidence(
+        torch.sigmoid(presence_logits),
+        torch.softmax(sector_logits, dim=-1),
+        torch.sigmoid(visibility_logits),
+        torch.sigmoid(q_view_logits),
+    )
+
+    presence_logits_bf16 = presence_logits.detach().to(torch.bfloat16).requires_grad_()
+    sector_logits_bf16 = sector_logits.detach().to(torch.bfloat16).requires_grad_()
+    visibility_logits_bf16 = visibility_logits.detach().to(torch.bfloat16).requires_grad_()
+    q_view_logits_bf16 = q_view_logits.detach().to(torch.bfloat16).requires_grad_()
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        actual = module.reliable_absence_evidence(
+            torch.sigmoid(presence_logits_bf16),
+            torch.softmax(sector_logits_bf16, dim=-1),
+            torch.sigmoid(visibility_logits_bf16),
+            torch.sigmoid(q_view_logits_bf16),
+        )
+        loss = actual["occupied"].sum() + actual["clear"].sum()
+    loss.backward()
+
+    for name in ("occupied", "clear", "clear_reliability"):
+        assert torch.isfinite(actual[name]).all()
+        assert torch.allclose(actual[name].float(), reference[name].float(), atol=7.5e-3, rtol=7.5e-3)
+    for gradient in (
+        presence_logits_bf16.grad,
+        sector_logits_bf16.grad,
+        visibility_logits_bf16.grad,
+    ):
+        assert gradient is not None and torch.isfinite(gradient).all()
+    # rho_clear intentionally detaches q_view so reliability cannot reduce its
+    # own supervision weight through the absence-loss path.
+    assert actual["clear_reliability"].requires_grad is False
+    assert q_view_logits_bf16.grad is None
+
+
+def test_p6_reliable_absence_still_rejects_non_simplex_sector_probabilities() -> None:
+    module = _module()
+    with pytest.raises(ValueError, match="sum to one"):
+        module.reliable_absence_evidence(
+            torch.full((1, 2), 0.5),
+            torch.tensor([[[0.8, 0.2, 0.2], [0.8, 0.2, 0.2]]]),
+            torch.full((1, 3), 0.7),
+            torch.full((1, 3), 0.9),
+        )
+
+
 def test_p6_valid_count_zero_is_explicitly_inactive_not_a_fake_grounding_loss() -> None:
     module = _module()
     logits = torch.randn(2, 3, 4, 6, requires_grad=True)

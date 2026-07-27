@@ -10,6 +10,7 @@ never materializes a ``[B, 21, 4, N, D]`` tensor.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 import weakref
@@ -430,6 +431,21 @@ class RAELSlotLedger(nn.Module):
 
         return tuple(name for name, _ in self.named_parameters())
 
+    @staticmethod
+    def _uses_native_cuda_bfloat16(value: Tensor) -> bool:
+        return (
+            value.device.type == "cuda"
+            and value.dtype == torch.bfloat16
+            and torch.cuda.is_available()
+            and torch.cuda.is_bf16_supported()
+        )
+
+    @classmethod
+    def _working_autocast_context(cls, value: Tensor):
+        if cls._uses_native_cuda_bfloat16(value):
+            return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        return nullcontext()
+
     def _working_tensors(self, prepared: Mapping[str, Any]) -> tuple[Tensor, Tensor, Tensor, tuple[int, int]]:
         required = ("keys_by_layer", "values_by_layer", "layer_global_tokens", "grid_hw")
         missing = [key for key in required if key not in prepared]
@@ -457,7 +473,7 @@ class RAELSlotLedger(nn.Module):
             raise ValueError("P3 field tensors must be finite")
 
         parameter_dtype = self.slot_queries.dtype
-        if keys.dtype != parameter_dtype:
+        if keys.dtype != parameter_dtype and not self._uses_native_cuda_bfloat16(keys):
             keys = keys.to(dtype=parameter_dtype)
             values = values.to(dtype=parameter_dtype)
             globals_ = globals_.to(dtype=parameter_dtype)
@@ -469,7 +485,7 @@ class RAELSlotLedger(nn.Module):
         scores = self.layer_score(
             torch.tanh(query.unsqueeze(2) + global_tokens.unsqueeze(1))
         ).squeeze(-1)
-        return torch.softmax(scores, dim=-1)
+        return torch.softmax(scores.float(), dim=-1).to(dtype=scores.dtype)
 
     def _visual_logits(
         self,
@@ -509,7 +525,7 @@ class RAELSlotLedger(nn.Module):
 
         if logits.ndim != 3:
             raise ValueError("competitive logits must be [B,21,N]")
-        return torch.softmax(logits, dim=1)
+        return torch.softmax(logits.float(), dim=1).to(dtype=logits.dtype)
 
     def _pooled_values(self, assignments: Tensor, values_by_layer: Tensor, layer_weights: Tensor) -> Tensor:
         denominator = assignments.sum(dim=-1, keepdim=True).clamp_min(self.eps)
@@ -662,7 +678,8 @@ class RAELSlotLedger(nn.Module):
 
     def _global_context(self, layer_globals: Tensor) -> tuple[Tensor, Tensor]:
         projected = self.global_context_projection(layer_globals)
-        weights = torch.softmax(self.global_context_score(torch.tanh(projected)).squeeze(-1), dim=-1)
+        scores = self.global_context_score(torch.tanh(projected)).squeeze(-1)
+        weights = torch.softmax(scores.float(), dim=-1).to(dtype=scores.dtype)
         context = (weights.unsqueeze(-1) * layer_globals).sum(dim=1)
         return self.global_context_norm(context), weights
 
@@ -673,22 +690,25 @@ class RAELSlotLedger(nn.Module):
         batch = keys.shape[0]
         initial_slots = self.slot_queries.unsqueeze(0).expand(batch, -1, -1)
 
-        visual_logits_one, layer_weights_one = self._visual_logits(initial_slots, keys, layer_globals)
-        assignment_one = self._slot_competition(visual_logits_one)
-        pooled_one = self._pooled_values(assignment_one, values, layer_weights_one)
-        slots_one = self.slot_gru(
-            pooled_one.reshape(-1, self.dim),
-            initial_slots.reshape(-1, self.dim),
-        ).reshape(batch, self.INTERNAL_SLOT_COUNT, self.dim)
+        # Keep full-resolution K/V in their BF16 field storage. CUDA autocast
+        # handles FP32 master weights; only small normalization scores widen.
+        with self._working_autocast_context(keys):
+            visual_logits_one, layer_weights_one = self._visual_logits(initial_slots, keys, layer_globals)
+            assignment_one = self._slot_competition(visual_logits_one)
+            pooled_one = self._pooled_values(assignment_one, values, layer_weights_one)
+            slots_one = self.slot_gru(
+                pooled_one.reshape(-1, self.dim),
+                initial_slots.reshape(-1, self.dim),
+            ).reshape(batch, self.INTERNAL_SLOT_COUNT, self.dim)
 
-        visual_logits_two, layer_weights_two = self._visual_logits(slots_one, keys, layer_globals)
-        logits_two = visual_logits_two + self.mask_bias * torch.log(assignment_one.clamp_min(self.eps))
-        assignment_two = self._slot_competition(logits_two)
-        pooled_two = self._pooled_values(assignment_two, values, layer_weights_two)
-        slots_two = self.slot_gru(
-            pooled_two.reshape(-1, self.dim),
-            slots_one.reshape(-1, self.dim),
-        ).reshape(batch, self.INTERNAL_SLOT_COUNT, self.dim)
+            visual_logits_two, layer_weights_two = self._visual_logits(slots_one, keys, layer_globals)
+            logits_two = visual_logits_two + self.mask_bias * torch.log(assignment_one.clamp_min(self.eps))
+            assignment_two = self._slot_competition(logits_two)
+            pooled_two = self._pooled_values(assignment_two, values, layer_weights_two)
+            slots_two = self.slot_gru(
+                pooled_two.reshape(-1, self.dim),
+                slots_one.reshape(-1, self.dim),
+            ).reshape(batch, self.INTERNAL_SLOT_COUNT, self.dim)
 
         masks = assignment_two.reshape(batch, self.INTERNAL_SLOT_COUNT, grid_hw[0], grid_hw[1])
         geometry = self.geometry_from_masks(masks, eps=self.eps)

@@ -69,6 +69,21 @@ def _require_probability(name: str, value: Tensor) -> None:
         raise ValueError(f"{name} must lie in [0,1]")
 
 
+def _simplex_sum_tolerance(value: Tensor) -> float:
+    """Return the strictest safe sum-to-one tolerance for ``value``'s dtype.
+
+    A softmax represented in BF16/FP16 is already quantized before this loss
+    module sees it.  Comparing that quantized sum against a Float tensor with
+    an FP32-only tolerance rejects valid simplex probabilities under CUDA
+    autocast.  The dtype epsilon bounds one accumulated unit at one, while
+    FP32 keeps the existing 1e-5 contract.
+    """
+
+    if not value.is_floating_point():
+        raise TypeError("simplex probabilities must be floating point")
+    return max(1.0e-5, float(torch.finfo(value.dtype).eps))
+
+
 def _zero_result(reference: Tensor, component_names: tuple[str, ...]) -> GroundingLossResult:
     zero = reference.sum() * 0.0
     return GroundingLossResult(
@@ -139,10 +154,12 @@ def reliable_absence_evidence(
     _require_probability("horizontal_sector_probs", horizontal_sector_probs)
     _require_probability("sector_visibility", sector_visibility)
     _require_probability("q_view", q_view)
+    sector_mass = horizontal_sector_probs.to(dtype=torch.float32).sum(dim=-1)
     if not torch.allclose(
-        horizontal_sector_probs.sum(dim=-1),
-        torch.ones_like(entity_presence),
-        atol=1.0e-5,
+        sector_mass,
+        torch.ones_like(sector_mass),
+        atol=_simplex_sum_tolerance(horizontal_sector_probs),
+        rtol=0.0,
     ):
         raise ValueError("horizontal sector probabilities must sum to one")
 

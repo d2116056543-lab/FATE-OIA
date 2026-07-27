@@ -191,26 +191,83 @@ def _normalise_detection(item: Mapping[str, Any]) -> dict[str, Any] | None:
 
 def _normalise_lane(item: Mapping[str, Any]) -> dict[str, Any] | None:
     points = item.get("points") or item.get("poly2d") or item.get("polygon")
-    if not isinstance(points, (list, tuple)):
+    points = _normalise_poly2d_points(points)
+    if points is None:
         return None
     attributes = item.get("attributes")
     return {
         "category": _normalise_category(item.get("category") or "lane"),
         "side": _normalise_category(item.get("side") or (attributes or {}).get("side")),
-        "points": list(points),
+        "points": points,
         "attributes": dict(attributes) if isinstance(attributes, Mapping) else {},
     }
 
 
 def _normalise_drivable(item: Mapping[str, Any]) -> dict[str, Any] | None:
     polygon = item.get("polygon") or item.get("points") or item.get("poly2d")
-    if not isinstance(polygon, (list, tuple)):
+    polygon = _normalise_poly2d_points(polygon)
+    if polygon is None:
         return None
     return {
         "category": _normalise_category(item.get("category") or "drivable"),
         "side": _normalise_category(item.get("side")),
-        "polygon": list(polygon),
+        "polygon": polygon,
     }
+
+
+def _normalise_poly2d_points(value: Any) -> list[list[float]] | None:
+    """Convert BDD100K ``[x, y, type]`` poly2d values to finite XY points."""
+
+    if not isinstance(value, (list, tuple)) or len(value) < 2:
+        return None
+    points: list[list[float]] = []
+    for raw in value:
+        if isinstance(raw, Mapping):
+            x, y = raw.get("x"), raw.get("y")
+        elif isinstance(raw, (list, tuple)) and len(raw) >= 2:
+            x, y = raw[0], raw[1]
+        else:
+            return None
+        try:
+            point = [float(x), float(y)]
+        except (TypeError, ValueError):
+            return None
+        if not all(math.isfinite(item) for item in point):
+            return None
+        points.append(point)
+    return points
+
+
+def _frame_objects_from_label_file(payload: Any, *, source_path: Path) -> Iterable[tuple[str, list[Mapping[str, Any]]]]:
+    """Yield explicit BDD100K per-frame object lists from one label JSON.
+
+    RAEL accepts only the documented ``{name, frames:[{objects:...}]}``
+    layout here.  It deliberately does not recursively search a BDD100K root
+    or infer alternative metadata formats.
+    """
+
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"BDD100K label file must be a mapping: {source_path}")
+    name = payload.get("name")
+    frames = payload.get("frames")
+    if not isinstance(name, str) or not name or not isinstance(frames, list):
+        raise ValueError(f"BDD100K label file must contain name and frames: {source_path}")
+    for frame in frames:
+        if not isinstance(frame, Mapping):
+            continue
+        objects = frame.get("objects")
+        if not isinstance(objects, list):
+            continue
+        yield name, [item for item in objects if isinstance(item, Mapping)]
+
+
+def _source_for_label_object(item: Mapping[str, Any]) -> str | None:
+    category = _normalise_category(item.get("category") or item.get("type"))
+    if category in {"area", "drivable"} or category.startswith("drivable") or category.startswith("area/drivable"):
+        return "drivable"
+    if category.startswith("lane") or category in {"road_boundary", "lane_marking"}:
+        return "lanes"
+    return "detections" if _box_from(item) is not None else None
 
 
 class RAELTaskAwareBDD100KIndex:
@@ -221,6 +278,7 @@ class RAELTaskAwareBDD100KIndex:
         detections: str | Path | None = None,
         lanes: str | Path | None = None,
         drivable: str | Path | None = None,
+        label_directories: Mapping[str, str | Path] | None = None,
     ) -> None:
         self._by_source: dict[str, dict[str, list[dict[str, Any]]]] = {
             source: defaultdict(list) for source in _SOURCE_NAMES
@@ -233,7 +291,59 @@ class RAELTaskAwareBDD100KIndex:
         for source, path in paths.items():
             if path is not None:
                 self._load_source(source, Path(path))
+        if label_directories is not None:
+            self._load_label_directories(label_directories)
         self._records = self._merge_records()
+
+    def _register_items(self, source: str, name: str, items: Iterable[Mapping[str, Any]]) -> None:
+        exact_stem, reduced_stem = _candidate_stems(name)
+        self._present_stems[source].add(reduced_stem)
+        self._reduced_aliases[reduced_stem].add(exact_stem)
+        normalise = {
+            "detections": _normalise_detection,
+            "lanes": _normalise_lane,
+            "drivable": _normalise_drivable,
+        }[source]
+        for item in items:
+            record = normalise(item)
+            if record is not None:
+                self._by_source[source][reduced_stem].append(record)
+
+    def _load_label_directories(self, label_directories: Mapping[str, str | Path]) -> None:
+        if set(label_directories).difference({"train", "val"}):
+            raise ValueError("label_directories may contain only explicit train/val entries")
+        if not label_directories:
+            raise ValueError("label_directories must not be empty")
+        hashes: list[bytes] = []
+        for split, raw_path in sorted(label_directories.items()):
+            directory = Path(raw_path)
+            if not directory.is_dir():
+                raise FileNotFoundError(f"BDD100K {split} label directory does not exist: {directory}")
+            files = tuple(sorted(directory.glob("*.json")))
+            if not files:
+                raise ValueError(f"BDD100K {split} label directory has no direct JSON files: {directory}")
+            for path in files:
+                payload_bytes = path.read_bytes()
+                hashes.append(path.name.encode("utf-8") + b"\0" + hashlib.sha256(payload_bytes).digest())
+                payload = json.loads(payload_bytes.decode("utf-8", errors="strict"))
+                for name, objects in _frame_objects_from_label_file(payload, source_path=path):
+                    grouped: dict[str, list[Mapping[str, Any]]] = {source: [] for source in _SOURCE_NAMES}
+                    for item in objects:
+                        source = _source_for_label_object(item)
+                        if source is not None:
+                            grouped[source].append(item)
+                    # All three views originate in this explicit, complete
+                    # object list; empty lists are known absence, not an
+                    # unknown external annotation source.
+                    for source in _SOURCE_NAMES:
+                        self._register_items(source, name, grouped[source])
+        directory_hash = hashlib.sha256(b"".join(hashes)).hexdigest()
+        for source in _SOURCE_NAMES:
+            previous = self._source_hashes[source]
+            if previous is not None:
+                raise ValueError("cannot mix aggregate BDD100K sources with label_directories")
+            self._source_hashes[source] = directory_hash
+            self._parse_calls[source] += 1
 
     def _load_source(self, source: str, path: Path) -> None:
         payload_bytes = path.read_bytes()
@@ -249,13 +359,7 @@ class RAELTaskAwareBDD100KIndex:
             name = _frame_name(frame)
             if not name:
                 continue
-            exact_stem, reduced_stem = _candidate_stems(name)
-            self._present_stems[source].add(reduced_stem)
-            self._reduced_aliases[reduced_stem].add(exact_stem)
-            for item in _items(frame, source):
-                record = normalise(item)
-                if record is not None:
-                    self._by_source[source][reduced_stem].append(record)
+            self._register_items(source, name, _items(frame, source))
 
     def _merge_records(self) -> dict[str, RAELGroundingRecord]:
         stems: set[str] = set()

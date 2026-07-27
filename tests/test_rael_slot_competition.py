@@ -51,6 +51,63 @@ def _storage_ptr(tensor: torch.Tensor) -> int:
     return tensor.untyped_storage().data_ptr()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_bfloat16_ledger_reuses_prepared_kv_without_full_fp32_copies() -> None:
+    """P5 must not retain a second full-resolution FP32 K/V field under BF16.
+
+    The assertion combines aliasing/dtype with a peak-allocation bound. Dtype
+    alone would miss a silent FP32 copy and a memory-only assertion would be
+    sensitive to allocator noise.
+    """
+
+    device = torch.device("cuda")
+    batch, dim, height, width = 1, 64, 45, 80
+    field = RAELMultiLayerField(dim=dim, num_layers=4, formal_grid_hw=(height, width)).to(device).eval()
+    ledger = _module().RAELSlotLedger(dim=dim, num_layers=4).to(device).train()
+    patch_tokens = torch.randn(batch, 4, height * width, dim, device=device, dtype=torch.bfloat16)
+    cls_tokens = torch.randn(batch, 4, dim, device=device, dtype=torch.bfloat16)
+    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        prepared = field.precompute(patch_tokens, cls_tokens, grid_hw=(height, width))
+    keys = prepared["keys_by_layer"]
+    values = prepared["values_by_layer"]
+    globals_ = prepared["layer_global_tokens"]
+
+    torch.cuda.synchronize(device)
+    baseline_bytes = torch.cuda.memory_allocated(device)
+    torch.cuda.reset_peak_memory_stats(device)
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        working_keys, working_values, working_globals, working_grid = ledger._working_tensors(prepared)
+    torch.cuda.synchronize(device)
+    peak_delta_bytes = torch.cuda.max_memory_allocated(device) - baseline_bytes
+    prepared_kv_bytes = keys.nbytes + values.nbytes
+
+    assert working_grid == (height, width)
+    assert keys.dtype is torch.bfloat16
+    assert values.dtype is torch.bfloat16
+    assert working_keys.dtype is torch.bfloat16
+    assert working_values.dtype is torch.bfloat16
+    assert working_globals.dtype is globals_.dtype
+    assert _storage_ptr(working_keys) == _storage_ptr(keys)
+    assert _storage_ptr(working_values) == _storage_ptr(values)
+    assert _storage_ptr(working_globals) == _storage_ptr(globals_)
+    # Finite-value validation uses a temporary CUDA workspace.  It stays well
+    # below the two persistent FP32 K/V replicas created by the regressed path.
+    assert peak_delta_bytes < prepared_kv_bytes * 2
+
+    ledger.zero_grad(set_to_none=True)
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        output = ledger(prepared)
+        loss = output["slot_tokens"].float().square().mean() + output["slot_masks"].float().mean()
+    loss.backward()
+
+    assert output["slot_tokens"].shape == (batch, 20, dim)
+    assert output["slot_masks"].shape == (batch, 20, height, width)
+    assert torch.isfinite(output["slot_tokens"]).all()
+    assert torch.isfinite(output["slot_masks"]).all()
+    assert ledger.slot_queries.grad is not None
+    assert torch.isfinite(ledger.slot_queries.grad).all()
+
+
 def test_p5_module_imports_after_green() -> None:
     assert _module().RAELSlotLedger is not None
 

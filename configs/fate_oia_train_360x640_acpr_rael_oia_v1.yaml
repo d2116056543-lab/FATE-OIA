@@ -129,6 +129,12 @@ data:
   action_dim: 4
   reason_dim: 21
 
+grounding_sources:
+  # Explicit host-verified BDD100K per-frame metadata.
+  label_directories:
+    train: E:/sbw/BDD100K/bdd100k_labels/bdd100k/labels/100k/train
+    val: E:/sbw/BDD100K/bdd100k_labels/bdd100k/labels/100k/val
+
 backbone:
   arch: vit_small
   patch_size: 8

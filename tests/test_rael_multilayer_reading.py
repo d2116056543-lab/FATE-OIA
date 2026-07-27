@@ -12,6 +12,7 @@ import inspect
 
 import pytest
 import torch
+import inspect
 from torch import nn
 
 
@@ -254,6 +255,23 @@ def test_eval_finalize_returns_diagnostics_without_mutating_collapse_state(
     assert torch.equal(field._collapse_streak, before["streak"])
     assert torch.equal(field._collapse_fail, before["fail"])
     assert torch.equal(field._last_dominant_layer, before["dominant"])
+
+
+def test_finalize_collapse_has_no_tensor_to_host_sync_in_formal_path() -> None:
+    source = inspect.getsource(RAELMultiLayerField.finalize_batch_collapse)
+    forbidden = (".item(", "bool(dominant_weight", "int(dominant_layer")
+    assert not any(pattern in source for pattern in forbidden)
+
+
+def test_finalize_collapse_duplicate_guard_is_bounded(
+    field: "RAELMultiLayerField", tokens: tuple[torch.Tensor, torch.Tensor]
+) -> None:
+    patch_tokens, cls_tokens = tokens
+    for _ in range(8):
+        prepared = field.precompute(patch_tokens, cls_tokens, grid_hw=(3, 4))
+        reads = field.read(prepared, {"action": torch.randn(2, 3, 8)})
+        field.finalize_batch_collapse(prepared, reads)
+        assert len(field._finalized_collapse_tokens) <= 1
 
 
 def test_collapse_buffers_roundtrip_in_state_dict(

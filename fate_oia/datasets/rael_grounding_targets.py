@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
+
+from PIL import Image, ImageDraw
+import torch
+from torch import Tensor
 
 from fate_oia.datasets.bdd100k_task_aware_index import RAELGroundingRecord
 
@@ -237,6 +241,15 @@ class RoadGroundingTargets:
     coverage: dict[str, int]
 
 
+@dataclass(frozen=True)
+class DynamicGroundingBatch:
+    """Per-forward grounding supervision built from current slot descriptors."""
+
+    entity: tuple[EntityGroundingTargets, ...]
+    road: tuple[RoadGroundingTargets, ...]
+    coverage: dict[str, int]
+
+
 def _coordinates(value: Any) -> list[tuple[float, float]]:
     if isinstance(value, Mapping):
         if isinstance(value.get("x"), (int, float)) and isinstance(value.get("y"), (int, float)):
@@ -317,3 +330,187 @@ def aggregate_grounding_coverage(
         for field in ("drivable_valid_count", "boundary_valid_count"):
             coverage[field] += int(target.coverage.get(field, 0))
     return coverage
+
+
+def build_dynamic_grounding_batch(
+    slot_descriptors_by_sample: Sequence[Iterable[Mapping[str, Any]]],
+    records: Sequence[RAELGroundingRecord],
+    image_sizes: Sequence[tuple[int, int]],
+) -> DynamicGroundingBatch:
+    """Build current-forward Hungarian and road targets without I/O or fallback labels."""
+
+    batch_size = len(slot_descriptors_by_sample)
+    if (
+        batch_size == 0
+        or len(records) != batch_size
+        or len(image_sizes) != batch_size
+    ):
+        raise ValueError(
+            "slot descriptors, records, and image sizes must have the same non-zero batch length"
+        )
+
+    entity_targets: list[EntityGroundingTargets] = []
+    road_targets: list[RoadGroundingTargets] = []
+    for slots, record, image_size in zip(
+        slot_descriptors_by_sample, records, image_sizes
+    ):
+        if not isinstance(record, RAELGroundingRecord):
+            raise TypeError("records must contain RAELGroundingRecord values")
+        if (
+            len(image_size) != 2
+            or not all(isinstance(value, (int, float)) for value in image_size)
+            or not all(math.isfinite(float(value)) and float(value) > 0.0 for value in image_size)
+        ):
+            raise ValueError("image sizes must contain positive finite width and height")
+        size = (int(image_size[0]), int(image_size[1]))
+        entity = build_entity_grounding_targets(slots, record, image_size=size)
+        if any(not math.isfinite(assignment.cost) for assignment in entity.assignments):
+            raise ValueError("dynamic Hungarian assignment produced a non-finite cost")
+        entity_targets.append(entity)
+        road_targets.append(build_road_grounding_targets(record, image_size=size))
+
+    return DynamicGroundingBatch(
+        entity=tuple(entity_targets),
+        road=tuple(road_targets),
+        coverage=aggregate_grounding_coverage(entity_targets, road_targets),
+    )
+
+
+def slot_descriptors_from_predictions(
+    centroids: Tensor,
+    scales: Tensor,
+    type_probabilities: Tensor,
+    horizontal_sector_probabilities: Tensor,
+    image_sizes: Sequence[tuple[int, int]],
+) -> tuple[tuple[dict[str, Any], ...], ...]:
+    """Convert current entity predictions into detached Hungarian descriptors."""
+
+    if (
+        centroids.ndim != 3
+        or centroids.shape[-1] != 2
+        or scales.shape != centroids.shape[:2]
+        or type_probabilities.shape[:2] != centroids.shape[:2]
+        or type_probabilities.shape[-1] != 6
+        or horizontal_sector_probabilities.shape != (*centroids.shape[:2], 3)
+        or centroids.shape[0] != len(image_sizes)
+    ):
+        raise ValueError("slot prediction tensors or image-size batch are inconsistent")
+    values = (centroids, scales, type_probabilities, horizontal_sector_probabilities)
+    if not all(bool(torch.isfinite(value).all()) for value in values):
+        raise ValueError("slot prediction tensors must be finite")
+
+    type_names = ("vehicle", "pedestrian", "rider", "traffic_control", "traffic_sign", "other")
+    sector_names = ("left", "center", "right")
+    centroid_cpu = centroids.detach().float().cpu()
+    scale_cpu = scales.detach().float().cpu().clamp_min(0.0)
+    type_cpu = type_probabilities.detach().float().cpu()
+    sector_cpu = horizontal_sector_probabilities.detach().float().cpu()
+    result: list[tuple[dict[str, Any], ...]] = []
+    for sample, image_size in enumerate(image_sizes):
+        width, height = (float(image_size[0]), float(image_size[1]))
+        if not all(math.isfinite(value) and value > 0.0 for value in (width, height)):
+            raise ValueError("image sizes must contain positive finite width and height")
+        descriptors: list[dict[str, Any]] = []
+        for slot in range(centroid_cpu.shape[1]):
+            center_x = (float(centroid_cpu[sample, slot, 0]) + 1.0) * 0.5 * width
+            center_y = (float(centroid_cpu[sample, slot, 1]) + 1.0) * 0.5 * height
+            extent = float(scale_cpu[sample, slot])
+            half_width = max(0.5, extent * width * 0.5)
+            half_height = max(0.5, extent * height * 0.5)
+            x1, x2 = max(0.0, center_x - half_width), min(width, center_x + half_width)
+            y1, y2 = max(0.0, center_y - half_height), min(height, center_y + half_height)
+            if x2 <= x1:
+                x1, x2 = max(0.0, min(width - 1.0, center_x - 0.5)), min(width, center_x + 0.5)
+            if y2 <= y1:
+                y1, y2 = max(0.0, min(height - 1.0, center_y - 0.5)), min(height, center_y + 0.5)
+            descriptors.append(
+                {
+                    "category": type_names[int(type_cpu[sample, slot].argmax())],
+                    "box": (float(x1), float(y1), float(x2), float(y2)),
+                    "sector": sector_names[int(sector_cpu[sample, slot].argmax())],
+                }
+            )
+        result.append(tuple(descriptors))
+    return tuple(result)
+
+
+def _scaled_points(
+    item: Mapping[str, Any],
+    geometry_key: str,
+    *,
+    image_size: tuple[int, int],
+    output_size: tuple[int, int],
+) -> list[tuple[int, int]]:
+    width, height = image_size
+    output_height, output_width = output_size
+    return [
+        (
+            max(0, min(output_width - 1, round(x / max(width, 1) * (output_width - 1)))),
+            max(0, min(output_height - 1, round(y / max(height, 1) * (output_height - 1)))),
+        )
+        for x, y in _coordinates(item.get(geometry_key))
+    ]
+
+
+def road_grounding_tensor_targets(
+    target: RoadGroundingTargets,
+    *,
+    image_size: tuple[int, int],
+    output_size: tuple[int, int],
+    device: torch.device | str,
+) -> dict[str, Tensor]:
+    """Rasterize transformed road geometry; declared presence alone is insufficient."""
+
+    width, height = image_size
+    output_height, output_width = output_size
+    if min(width, height, output_height, output_width) <= 0:
+        raise ValueError("road target image/output sizes must be positive")
+    drivable = torch.zeros(1, 3, output_height, output_width, dtype=torch.float32)
+    boundary = torch.zeros(1, 2, output_height, output_width, dtype=torch.float32)
+
+    for region in target.drivable:
+        sector = _road_sector(region, "polygon", image_width=float(width))
+        if sector not in {"left", "center", "right"}:
+            continue
+        points = _scaled_points(
+            region, "polygon", image_size=image_size, output_size=output_size
+        )
+        if len(points) < 3:
+            continue
+        image = Image.new("L", (output_width, output_height), 0)
+        ImageDraw.Draw(image).polygon(points, fill=1)
+        values = torch.frombuffer(bytearray(image.tobytes()), dtype=torch.uint8).view(
+            output_height, output_width
+        )
+        channel = {"left": 0, "center": 1, "right": 2}[sector]
+        drivable[0, channel] = torch.maximum(drivable[0, channel], values.float())
+
+    for lane in target.boundaries:
+        sector = _road_sector(lane, "points", image_width=float(width))
+        if sector not in {"left", "right"}:
+            continue
+        points = _scaled_points(
+            lane, "points", image_size=image_size, output_size=output_size
+        )
+        if len(points) < 2:
+            continue
+        image = Image.new("L", (output_width, output_height), 0)
+        ImageDraw.Draw(image).line(points, fill=1, width=1)
+        values = torch.frombuffer(bytearray(image.tobytes()), dtype=torch.uint8).view(
+            output_height, output_width
+        )
+        channel = {"left": 0, "right": 1}[sector]
+        boundary[0, channel] = torch.maximum(boundary[0, channel], values.float())
+
+    drivable_valid = torch.tensor(
+        target.drivable_valid_mask, dtype=torch.bool
+    ).view(1, 3) & drivable.flatten(2).any(dim=-1)
+    boundary_valid = torch.tensor(
+        target.boundary_valid_mask, dtype=torch.bool
+    ).view(1, 2) & boundary.flatten(2).any(dim=-1)
+    return {
+        "drivable_targets": drivable.to(device=device),
+        "drivable_valid_mask": drivable_valid.to(device=device),
+        "boundary_targets": boundary.to(device=device),
+        "boundary_valid_mask": boundary_valid.to(device=device),
+    }

@@ -417,7 +417,7 @@ class RAELMultiLayerField(nn.Module):
 
         weight_sum: Tensor | None = None
         total_queries = 0
-        collapsed_queries = 0
+        collapsed_queries: Tensor | None = None
         for result in results:
             if not isinstance(result, Mapping) or not torch.is_tensor(result.get("layer_weights")):
                 raise TypeError("each group read must contain layer_weights")
@@ -426,32 +426,43 @@ class RAELMultiLayerField(nn.Module):
             summary = flat.sum(dim=(0, 1))
             weight_sum = summary if weight_sum is None else weight_sum + summary
             total_queries += flat.shape[0] * flat.shape[1]
-            collapsed_queries += int((flat.amax(dim=-1) > self.collapse_threshold).sum().item())
+            collapsed = (flat.amax(dim=-1) > self.collapse_threshold).sum()
+            collapsed_queries = (
+                collapsed
+                if collapsed_queries is None
+                else collapsed_queries + collapsed
+            )
         assert weight_sum is not None and total_queries > 0
+        assert collapsed_queries is not None
         aggregate_weights = weight_sum / total_queries
         dominant_weight, dominant_layer = aggregate_weights.max(dim=0)
-        observed = bool(dominant_weight > self.collapse_threshold)
-        collapse_rate = torch.tensor(
-            collapsed_queries / total_queries,
-            device=aggregate_weights.device,
-            dtype=aggregate_weights.dtype,
-        )
+        observed = dominant_weight > self.collapse_threshold
+        collapse_rate = collapsed_queries.to(aggregate_weights.dtype) / total_queries
 
         updated = False
         if self.training:
             if token in self._finalized_collapse_tokens:
                 raise RuntimeError(f"collapse batch token {token} was already finalized")
+            self._finalized_collapse_tokens.clear()
             self._finalized_collapse_tokens.add(token)
             with torch.no_grad():
-                if observed:
-                    if int(dominant_layer) == int(self._last_dominant_layer):
-                        self._collapse_streak.add_(1)
-                    else:
-                        self._collapse_streak.fill_(1)
-                    self._last_dominant_layer.copy_(dominant_layer)
-                else:
-                    self._collapse_streak.zero_()
-                    self._last_dominant_layer.fill_(-1)
+                same_layer = dominant_layer == self._last_dominant_layer
+                next_streak = torch.where(
+                    observed,
+                    torch.where(
+                        same_layer,
+                        self._collapse_streak + 1,
+                        torch.ones_like(self._collapse_streak),
+                    ),
+                    torch.zeros_like(self._collapse_streak),
+                )
+                next_layer = torch.where(
+                    observed,
+                    dominant_layer,
+                    torch.full_like(dominant_layer, -1),
+                )
+                self._collapse_streak.copy_(next_streak)
+                self._last_dominant_layer.copy_(next_layer)
                 self._collapse_fail.copy_(self._collapse_streak >= self.collapse_patience)
             updated = True
 
@@ -461,7 +472,7 @@ class RAELMultiLayerField(nn.Module):
             "layer_collapse_rate": collapse_rate,
             "batch_dominant_layer": dominant_layer.detach(),
             "batch_dominant_weight": dominant_weight.detach(),
-            "batch_collapse_observed": observed,
+            "batch_collapse_observed": observed.detach(),
             "layer_collapse_streak": self._collapse_streak.detach().clone(),
             "layer_collapse_fail": self._collapse_fail.detach().clone(),
         }
