@@ -1238,6 +1238,47 @@ def _ledger_grad_norm(model: torch.nn.Module) -> float:
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="mixed BF16 replay requires CUDA")
+def test_counterfactual_slot_readout_accepts_fp32_frozen_routes_with_bf16_values() -> None:
+    model, _ = _build_model()
+    model = model.cuda()
+    values = torch.randn(1, 4, 3600, 384, device="cuda", dtype=torch.bfloat16)
+    masks = torch.rand(1, 20, 45, 80, device="cuda", dtype=torch.float32)
+    layer_weights = torch.softmax(
+        torch.randn(1, 20, 4, device="cuda", dtype=torch.float32), dim=-1
+    )
+
+    pooled = model._counterfactual_slot_readout(values, masks, layer_weights)
+
+    assert pooled.dtype == torch.bfloat16
+    assert pooled.shape == (1, 20, 384)
+    assert bool(torch.isfinite(pooled).all())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="mixed BF16 replay requires CUDA")
+def test_counterfactual_second_readout_casts_frozen_gru_state_to_bf16_values() -> None:
+    model, _ = _build_model()
+    model = model.cuda()
+    evidence = torch.randn(
+        1, 20, 384, device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+    values = torch.randn(1, 4, 3600, 384, device="cuda", dtype=torch.bfloat16)
+    masks = torch.rand(1, 20, 45, 80, device="cuda", dtype=torch.float32)
+    layer_weights = torch.softmax(
+        torch.randn(1, 20, 4, device="cuda", dtype=torch.float32), dim=-1
+    )
+
+    output = model._counterfactual_second_readout(
+        evidence, values, masks, layer_weights
+    )
+    output.float().sum().backward()
+
+    assert output.dtype == torch.bfloat16
+    assert bool(torch.isfinite(output).all())
+    assert evidence.grad is not None
+    assert float(evidence.grad.float().abs().sum()) > 0.0
+
+
 def _zero_admission(loss: torch.Tensor, evidence: torch.Tensor) -> list[torch.Tensor]:
     observed: list[torch.Tensor] = []
     handle = evidence.register_hook(

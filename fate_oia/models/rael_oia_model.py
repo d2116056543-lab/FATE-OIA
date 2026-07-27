@@ -1269,7 +1269,12 @@ class RAELOIAModel(nn.Module):
             raise ValueError("counterfactual slot_masks must be [B,20,45,80]")
         if layer_weights.shape != (batch, NUM_PUBLIC_SLOTS, 4):
             raise ValueError("counterfactual layer_weights must be [B,20,4]")
-        masks = slot_masks.reshape(batch, NUM_PUBLIC_SLOTS, 45 * 80)
+        masks = slot_masks.to(
+            device=values_by_layer.device, dtype=values_by_layer.dtype
+        ).reshape(batch, NUM_PUBLIC_SLOTS, 45 * 80)
+        layer_weights = layer_weights.to(
+            device=values_by_layer.device, dtype=values_by_layer.dtype
+        )
         denominator = masks.sum(dim=-1, keepdim=True).clamp_min(1.0e-6)
         pooled = torch.zeros(
             batch,
@@ -1314,12 +1319,15 @@ class RAELOIAModel(nn.Module):
             layer_weights,
         )
         frozen_state = {
-            name: parameter.detach()
+            name: parameter.detach().to(device=pooled.device, dtype=pooled.dtype)
             for name, parameter in self.slot_ledger.slot_gru.named_parameters()
         }
         frozen_state.update(
             {
-                name: buffer.detach()
+                name: buffer.detach().to(
+                    device=pooled.device,
+                    dtype=pooled.dtype if buffer.is_floating_point() else buffer.dtype,
+                )
                 for name, buffer in self.slot_ledger.slot_gru.named_buffers()
             }
         )
