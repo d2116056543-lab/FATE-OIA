@@ -82,6 +82,12 @@ class _ImmediateReleaseDino(_FakeDino):
         self.blocks = nn.ModuleList(blocks)
 
 
+class _DynamicProjectionBlock(_RecordingBlock):
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        self.vproj = nn.Linear(tokens.shape[-1], tokens.shape[-1])
+        return super().forward(tokens)
+
+
 def _field(backbone: _FakeDino | None = None) -> RAELDinoFieldExtractor:
     return RAELDinoFieldExtractor(
         arch="vit_small",
@@ -107,6 +113,17 @@ def test_contract_returns_four_frozen_dense_layers_and_single_batch_call() -> No
     assert backbone.prepare_tokens_calls == 1
     assert not output["patch_tokens_by_layer"].requires_grad
     assert not output["cls_tokens_by_layer"].requires_grad
+
+
+def test_transient_dynamic_modules_are_removed_after_forward() -> None:
+    backbone = _FakeDino()
+    backbone.blocks[0] = _DynamicProjectionBlock()
+    field = _field(backbone)
+
+    field(torch.randn(1, 3, 360, 640))
+
+    assert "vproj" not in backbone.blocks[0]._modules
+    assert not hasattr(backbone.blocks[0], "vproj")
 
 
 def test_dino_call_count_is_per_forward_and_lifetime_count_is_monotonic() -> None:

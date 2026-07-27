@@ -762,7 +762,21 @@ def _mechanism_row(result: Any) -> dict[str, Any]:
     observed = result.mechanism_observation.get("dino_call_count")
     if isinstance(observed, bool) or not isinstance(observed, int):
         raise ValueError("smoke requires a real integer dino_call_count observation")
-    return {"dino_call_count": observed, "optimizer_step": int(result.optimizer_step), "finite": all(bool(value.isfinite().all()) for value in result.components.values()), "owner_parameter_delta": {name: float(value) for name, value in result.owner_parameter_delta.items()}, "owner_gradient_norms": {name: float(value) for name, value in result.owner_gradient_norms_pre_clip.items()}}
+    mechanism_keys = (
+        "action_unary_rms_over_global", "action_pairwise_rms_over_global",
+        "reason_unary_rms_over_global", "reason_pairwise_rms_over_global",
+        "gamma_AS", "gamma_RA", "gamma_unary", "gamma_pairwise",
+        "q_view_source_counts", "q_view_bootstrap_count", "rho_nonzero_rate",
+        "slot_feature_dropout_consistency_mean", "active_entity_count",
+        "named_contribution_ratio", "latent_contribution_ratio",
+        "pu_active_label_count", "pu_soft_positive_count",
+    )
+    mechanism = {
+        key: result.mechanism_observation[key]
+        for key in mechanism_keys
+        if key in result.mechanism_observation
+    }
+    return {"dino_call_count": observed, "optimizer_step": int(result.optimizer_step), "finite": all(bool(value.isfinite().all()) for value in result.components.values()), "mechanism": mechanism, "owner_parameter_delta": {name: float(value) for name, value in result.owner_parameter_delta.items()}, "owner_gradient_norms": {name: float(value) for name, value in result.owner_gradient_norms_pre_clip.items()}}
 
 
 def require_mode_gate(mode: str, gate_path: str | Path, *, expected_git_head: str) -> None:

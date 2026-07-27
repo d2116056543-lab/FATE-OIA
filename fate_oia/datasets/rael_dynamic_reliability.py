@@ -21,6 +21,9 @@ class DynamicReliabilityResult:
     rho: Tensor
     q_view_sector: Tensor
     rho_clear: Tensor
+    q_view_source: Tensor
+    q_view_bootstrap_count: int
+    rho_nonzero_rate: float
     ema_state: dict[str, Any]
     source_ids: tuple[tuple[str | None, ...], ...]
 
@@ -106,6 +109,7 @@ def build_dynamic_reliability(
     dtype = observability.dtype
     q_ground = torch.zeros(batch, slots, device=device, dtype=dtype)
     q_view = torch.zeros_like(q_ground)
+    q_view_source = torch.zeros(batch, slots, device=device, dtype=torch.long)
     q_state = torch.ones_like(q_ground)
     source_ids: list[list[str | None]] = [[None] * entity_slots for _ in range(batch)]
     assigned_slots: list[dict[str, int]] = []
@@ -127,6 +131,7 @@ def build_dynamic_reliability(
                     by_id[identity] = slot
                     if identity in object_ema:
                         q_view[sample, slot] = object_ema[identity]
+                        q_view_source[sample, slot] = 1
             elif objectness.reliable:
                 q_ground[sample, slot] = 1.0
         assigned_slots.append(by_id)
@@ -158,6 +163,7 @@ def build_dynamic_reliability(
             key = f"{sample_id}:road:{road_index}"
             if key in road_ema:
                 q_view[sample, entity_slots + road_index] = road_ema[key]
+                q_view_source[sample, entity_slots + road_index] = 1
 
     for pair in mirror_pairs.detach().cpu().tolist():
         left, right = int(pair[0]), int(pair[1])
@@ -174,6 +180,8 @@ def build_dynamic_reliability(
             score = _ema_update(object_ema, identity, 0.5 * (iou + attribute), beta)
             q_view[left, left_slot] = score
             q_view[right, right_slot] = score
+            q_view_source[left, left_slot] = 2
+            q_view_source[right, right_slot] = 2
         permutation = (2, 1, 0, 4, 3)
         for road_index, mirrored_index in enumerate(permutation):
             left_slot = entity_slots + road_index
@@ -185,6 +193,32 @@ def build_dynamic_reliability(
             right_score = _ema_update(road_ema, right_key, score, beta)
             q_view[left, left_slot] = left_score
             q_view[right, right_slot] = right_score
+            q_view_source[left, left_slot] = 2
+            q_view_source[right, right_slot] = 2
+
+    feature_consistency = outputs.get("slot_feature_dropout_consistency")
+    if feature_consistency is not None:
+        if (
+            not isinstance(feature_consistency, Tensor)
+            or feature_consistency.shape != (batch, slots)
+            or not bool(torch.isfinite(feature_consistency).all())
+        ):
+            raise ValueError(
+                "slot_feature_dropout_consistency must be finite [B,20]"
+            )
+        feature_consistency = (
+            feature_consistency.detach().to(device=device, dtype=dtype).clamp(0.0, 1.0)
+        )
+        bootstrap = (
+            (q_view_source == 0)
+            & (q_ground > 0.0)
+            & (observability.detach().to(device=device) > 0.0)
+            & (feature_consistency > 0.0)
+        )
+        q_view = torch.where(bootstrap, feature_consistency, q_view)
+        q_view_source = torch.where(
+            bootstrap, torch.full_like(q_view_source, 3), q_view_source
+        )
 
     q_ground = q_ground.detach()
     q_view = q_view.detach()
@@ -202,6 +236,8 @@ def build_dynamic_reliability(
     if not isinstance(visibility, Tensor) or visibility.shape != (batch, 3):
         raise ValueError("dynamic reliability requires road sector visibility [B,3]")
     rho_clear = (visibility.detach().to(dtype=dtype) * q_view_sector).clamp(0.0, 1.0).detach()
+    q_view_bootstrap_count = int((q_view_source == 3).sum().detach().cpu().item())
+    rho_nonzero_rate = float((rho > 0.0).float().mean().detach().cpu().item())
     state["objects"] = object_ema
     state["roads"] = road_ema
     state["beta"] = float(beta)
@@ -212,6 +248,9 @@ def build_dynamic_reliability(
         rho=rho,
         q_view_sector=q_view_sector,
         rho_clear=rho_clear,
+        q_view_source=q_view_source.detach(),
+        q_view_bootstrap_count=q_view_bootstrap_count,
+        rho_nonzero_rate=rho_nonzero_rate,
         ema_state=state,
         source_ids=tuple(tuple(row) for row in source_ids),
     )

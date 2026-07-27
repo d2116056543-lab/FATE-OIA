@@ -70,6 +70,53 @@ def _outputs() -> dict[str, object]:
     }
 
 
+def test_feature_dropout_bootstraps_only_grounded_observable_slots_without_view_history() -> None:
+    outputs = _outputs()
+    outputs["slot_observability"] = torch.full((2, 20), 0.8, requires_grad=True)
+    consistency = torch.zeros(2, 20)
+    consistency[0, 0] = 0.65
+    consistency[1, 1] = 0.65
+    outputs["slot_feature_dropout_consistency"] = consistency
+    result = build_dynamic_reliability(
+        outputs,
+        _dynamic(),
+        _records(),
+        _road_valid(),
+        mirror_pairs=torch.empty(0, 2, dtype=torch.long),
+        sample_ids=("cold-left", "cold-right"),
+        ema_state={},
+    )
+
+    assert result.q_view[0, 0] == 0.65
+    assert result.q_view[1, 1] == 0.65
+    assert result.rho[0, 0] > 0.0
+    assert result.rho[1, 1] > 0.0
+    assert result.q_view_source[0, 0] == 3
+    assert result.q_view_source[1, 1] == 3
+    assert result.q_view_bootstrap_count == 2
+    assert result.rho_nonzero_rate > 0.0
+    assert result.q_view[0, 2] == 0.0
+
+
+def test_view_history_has_priority_over_feature_dropout_bootstrap() -> None:
+    outputs = _outputs()
+    outputs["slot_feature_dropout_consistency"] = torch.full((2, 20), 0.2)
+    result = build_dynamic_reliability(
+        outputs,
+        _dynamic(),
+        _records(),
+        _road_valid(),
+        mirror_pairs=torch.tensor([[0, 1]]),
+        sample_ids=("case", "case"),
+        ema_state={},
+    )
+
+    assert result.q_view[0, 0] > 0.9
+    assert result.q_view[1, 1] > 0.9
+    assert result.q_view_source[0, 0] == 2
+    assert result.q_view_source[1, 1] == 2
+
+
 def _road_valid() -> dict[str, torch.Tensor]:
     return {
         "drivable_valid_mask": torch.zeros(2, 3, dtype=torch.bool),

@@ -270,6 +270,20 @@ class RAELOIAModel(nn.Module):
             raise ValueError("active_labels must be bool [21]")
         self._pu_active_labels.copy_(active_labels.to(self._pu_active_labels.device))
 
+    def _slot_feature_dropout_consistency(self, slot_tokens: Tensor) -> Tensor:
+        """Measure detached slot stability under two fixed feature-dropout views."""
+        if slot_tokens.ndim != 3 or slot_tokens.shape[-1] != self.dim:
+            raise ValueError("slot_tokens must be [B,S,384]")
+        first = slot_tokens * self._pu_feature_keep_view_one.to(
+            device=slot_tokens.device, dtype=slot_tokens.dtype
+        )
+        second = slot_tokens * self._pu_feature_keep_view_two.to(
+            device=slot_tokens.device, dtype=slot_tokens.dtype
+        )
+        similarity = F.cosine_similarity(first.float(), second.float(), dim=-1)
+        active = slot_tokens.detach().float().norm(dim=-1) > torch.finfo(torch.float32).eps
+        return (((similarity + 1.0) * 0.5).clamp(0.0, 1.0) * active).detach()
+
     def _counted_modules(self) -> dict[str, nn.Module]:
         return {
             "slot_ledger": self.slot_ledger,
@@ -885,6 +899,9 @@ class RAELOIAModel(nn.Module):
         if not torch.is_tensor(field_keys):
             raise ValueError("E04-R2 requires prepared keys_by_layer")
         slot_masks = self._canonical_slot_masks(slot_tokens, field_keys)
+        slot_feature_dropout_consistency = self._slot_feature_dropout_consistency(
+            slot_tokens
+        )
         slot_attributes = self._slot_attributes(
             evidence_slots=slot_tokens,
             canonical_masks=slot_masks,
@@ -1099,6 +1116,7 @@ class RAELOIAModel(nn.Module):
             "slot_reliability": slot_attributes["reliability"],
             "slot_q_ground": slot_attributes["q_ground"],
             "slot_q_view": slot_attributes["q_view"],
+            "slot_feature_dropout_consistency": slot_feature_dropout_consistency,
             "slot_q_state": slot_attributes["q_state"],
             "road_rho_clear": slot_attributes["rho_clear"],
             "action_slot_weights": action_unary["slot_weights"],

@@ -247,8 +247,12 @@ class RAELDinoFieldExtractor(nn.Module):
 
     def _clear_transient_references(self, root: nn.Module | None = None) -> None:
         """Release tensor references cached by third-party attention blocks."""
-        for module in (root or self.backbone).modules():
+        # Snapshot traversal before deleting dynamically registered helpers.
+        for module in tuple((root or self.backbone).modules()):
             for name in self._TRANSIENT_REFERENCE_NAMES:
+                if name in module._modules:
+                    delattr(module, name)
+                    continue
                 if name not in vars(module):
                     continue
                 value = getattr(module, name)

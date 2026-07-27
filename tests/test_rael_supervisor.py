@@ -139,6 +139,30 @@ def test_mechanism_row_uses_observed_dino_count() -> None:
     assert row["dino_call_count"] == 2
 
 
+def test_smoke_mechanism_row_surfaces_component_activation_diagnostics() -> None:
+    module = _module()
+    result = types.SimpleNamespace(
+        optimizer_step=3,
+        components={"total": __import__("torch").tensor(1.0)},
+        owner_parameter_delta={"unary": 0.1},
+        owner_gradient_norms_pre_clip={"unary": 0.2},
+        mechanism_observation={
+            "dino_call_count": 1,
+            "rho_nonzero_rate": 0.4,
+            "q_view_bootstrap_count": 7,
+            "action_unary_rms_over_global": 0.01,
+            "pu_active_label_count": 0.0,
+        },
+    )
+    row = module._mechanism_row(result)
+    assert row["mechanism"] == {
+        "action_unary_rms_over_global": 0.01,
+        "q_view_bootstrap_count": 7,
+        "rho_nonzero_rate": 0.4,
+        "pu_active_label_count": 0.0,
+    }
+
+
 def test_windows_loader_policy_caps_workers_and_keeps_aux_loaders_single_process() -> None:
     source = SUPERVISOR.read_text(encoding="utf-8")
     assert "train_worker_count = min(int(num_workers), 4)" in source

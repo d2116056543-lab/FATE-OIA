@@ -1835,7 +1835,7 @@ class RAELTrainer:
         collapse = diagnostics["collapse"]
         gamma_modules = {
             "gamma_AS": ("action_reason_bridge", "gamma_as_raw"),
-            "gamma_RA": ("reason_private", "gamma_private_raw"),
+            "gamma_RA": ("reason_private", "gamma_ra_raw"),
             "gamma_unary": ("action_unary", "gamma_unary_raw"),
             "gamma_pairwise": ("action_pairwise", "gamma_pair_raw"),
         }
@@ -1844,6 +1844,24 @@ class RAELTrainer:
             parameter = getattr(getattr(self.model, module_name, None), parameter_name, None)
             gammas[name] = self._finite_scalar_from_tensor(parameter, name=f"{module_name}.{parameter_name}")
         positive_weight = self._finite_scalar_from_tensor(bundle.pu_soft_targets, name="pu_soft_targets")
+        dynamic_reliability = self.last_dynamic_reliability
+        q_view_source_counts = {"unavailable": 20 * int(masks.shape[0])}
+        q_view_bootstrap_count = 0
+        rho_nonzero_rate = self._finite_scalar_from_tensor(
+            (outputs["slot_reliability"].detach() > 0.0).float(),
+            name="slot_reliability_nonzero",
+        )
+        if isinstance(dynamic_reliability, DynamicReliabilityResult):
+            q_view_source_counts = {
+                "unavailable": int((dynamic_reliability.q_view_source == 0).sum().item()),
+                "ema": int((dynamic_reliability.q_view_source == 1).sum().item()),
+                "mirror": int((dynamic_reliability.q_view_source == 2).sum().item()),
+                "feature_dropout": int(
+                    (dynamic_reliability.q_view_source == 3).sum().item()
+                ),
+            }
+            q_view_bootstrap_count = int(dynamic_reliability.q_view_bootstrap_count)
+            rho_nonzero_rate = float(dynamic_reliability.rho_nonzero_rate)
         if not math.isfinite(float(data_time)) or float(data_time) < 0.0:
             raise ValueError("P18 mechanism observation requires real nonnegative data_time")
         return {
@@ -1876,6 +1894,13 @@ class RAELTrainer:
             "global_contribution_ratio": float(1.0 - self._finite_scalar_from_tensor(outputs["named_contribution_ratio"]["action"], name="named_ratio") - self._finite_scalar_from_tensor(outputs["latent_contribution_ratio"]["action"], name="latent_ratio")),
             "layer_entropy": layer_entropy, "positive_weight_mean": positive_weight,
             "negative_weight_mean": 1.0 - positive_weight,
+            "q_view_source_counts": q_view_source_counts,
+            "q_view_bootstrap_count": q_view_bootstrap_count,
+            "rho_nonzero_rate": rho_nonzero_rate,
+            "slot_feature_dropout_consistency_mean": self._finite_scalar_from_tensor(
+                outputs["slot_feature_dropout_consistency"],
+                name="slot_feature_dropout_consistency",
+            ),
             "pu_active_label_count": float(self.pu_active_labels.sum().item()),
             "pu_soft_positive_count": float(bundle.pu_soft_targets.detach().float().sum().item()),
             "semantic_private_norm_ratio": self._finite_scalar_from_tensor(outputs["reason_private_delta"], name="reason_private_delta", reduction="rms") / max(1.0e-8, self._finite_scalar_from_tensor(outputs["semantic_reason_tokens"], name="semantic_reason_tokens", reduction="rms")),

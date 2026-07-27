@@ -8,6 +8,7 @@ so the initial RED evidence is collectable rather than a collection error.
 from __future__ import annotations
 
 import copy
+import inspect
 import importlib
 import json
 import math
@@ -1999,3 +2000,9 @@ def test_p17_rezero_bootstrap_enforces_update_zero_one_two_deadlines() -> None:
         failed.observe(1, {"bridge_output": 1.0, "unary_output": 1.0, "pairwise_output": 0.0, "bridge_internal": 1.0, "unary_internal": 1.0, "pairwise_internal": 0.0})
         failed.observe(2, {"bridge_output": 1.0, "unary_output": 1.0, "pairwise_output": 0.0, "bridge_internal": 1.0, "unary_internal": 1.0, "pairwise_internal": 0.0})
         failed.assert_satisfied()
+
+
+def test_p18_observes_the_real_reason_private_rezero_parameter() -> None:
+    source = inspect.getsource(_module().RAELTrainer._mechanism_observation)
+    assert '"gamma_RA": ("reason_private", "gamma_ra_raw")' in source
+    assert "gamma_private_raw" not in source
