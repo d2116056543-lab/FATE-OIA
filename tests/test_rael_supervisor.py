@@ -58,6 +58,56 @@ def test_runner_factory_is_not_a_synthetic_or_placeholder_path() -> None:
     assert "replay_counterfactual_from_encoded_field" in source
 
 
+def test_real_runner_counterfactual_metrics_match_p20_runtime_schema() -> None:
+    torch = pytest.importorskip("torch")
+    module = _module()
+
+    class Trainer:
+        optimizer_step = 7
+
+        @staticmethod
+        def prepare_counterfactual_handoff(batch):
+            return types.SimpleNamespace(file_names=tuple(batch["file_names"]))
+
+        @staticmethod
+        def replay_counterfactual_from_encoded_field(
+            handoff,
+            *,
+            target_family,
+            optimizer_update,
+            every_optimizer_updates,
+        ):
+            assert target_family == "action"
+            assert optimizer_update == 8
+            assert every_optimizer_updates == 1
+            return {
+                "available": True,
+                "loss": torch.tensor(0.125),
+                "replay_dino_call_count": 0,
+            }
+
+    runner = module._RealRuntimeRunner.__new__(module._RealRuntimeRunner)
+    runner.runtime = types.SimpleNamespace(
+        trainer=Trainer(),
+        device=torch.device("cpu"),
+    )
+    runner._next_train_batch = lambda: {
+        "images": torch.zeros(2, 3, 8, 8),
+        "file_names": ("a.jpg", "b.jpg"),
+    }
+
+    metrics = runner.measure_counterfactual_overhead({})
+    assert metrics == {
+        "samples": 2,
+        "counterfactual_executed": True,
+        "available": True,
+        "valid_target_count": 1,
+        "dino_call_count": 0,
+        "finite": True,
+        "loss": pytest.approx(0.125),
+    }
+
+
 def test_foreground_script_calls_supervisor_without_background_mechanisms() -> None:
     script = SCRIPT.read_text(encoding="utf-8")
     assert "fate_oia.engine.supervise_acpr_rael_oia_foreground" in script

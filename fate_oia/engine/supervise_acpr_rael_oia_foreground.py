@@ -724,7 +724,7 @@ class _RealRuntimeRunner:
         }
 
     def measure_counterfactual_overhead(self, context: Mapping[str, Any]) -> Mapping[str, Any]:
-        import time
+        import torch
 
         trainer = self.runtime.trainer
         prepare = getattr(trainer, "prepare_counterfactual_handoff", None)
@@ -733,21 +733,28 @@ class _RealRuntimeRunner:
             raise RuntimeError("P20 requires the P21 public encoded-field replay handoff")
         batch = _device_batch(self._next_train_batch(), self.runtime.device)
         handoff = prepare(batch)
-        began = time.perf_counter()
         result = replay(
             handoff,
             target_family="action",
             optimizer_update=max(1, int(self.runtime.trainer.optimizer_step) + 1),
+            every_optimizer_updates=1,
         )
-        elapsed = time.perf_counter() - began
         if int(result.get("replay_dino_call_count", -1)) != 0:
             raise RuntimeError("counterfactual replay must not issue an additional DINO call")
+        loss = result.get("loss")
+        if not isinstance(loss, torch.Tensor) or loss.numel() != 1:
+            raise RuntimeError("counterfactual replay must return one scalar loss")
+        finite = bool(torch.isfinite(loss.detach()).all().item())
+        available = result.get("available") is True
+        sample_count = len(handoff.file_names)
         return {
-            "counterfactual_replay_executed": True,
-            "valid_target_count": int(result.get("valid_target_count", 0)),
-            "finite": bool(result.get("available", False)),
-            "extra_dino_call_count": 0,
-            "counterfactual_time": elapsed,
+            "samples": int(sample_count),
+            "counterfactual_executed": True,
+            "available": available,
+            "valid_target_count": 1 if available else 0,
+            "dino_call_count": 0,
+            "finite": finite,
+            "loss": float(loss.detach().float().item()),
         }
 
 
