@@ -354,6 +354,7 @@ def _counterfactual_overhead(
         "dino_call_count": None,
         "finite": None,
         "loss": None,
+        "reason": None,
     }
     try:
         metrics, elapsed, _, _ = _measure(
@@ -369,22 +370,34 @@ def _counterfactual_overhead(
         if payload["counterfactual_executed"] is not True:
             raise ValueError("counterfactual_executed must be true")
         payload["available"] = metrics.get("available")
-        if payload["available"] is not True:
-            raise ValueError("available must be true")
-        payload["valid_target_count"] = metrics.get("valid_target_count")
-        if (
-            isinstance(payload["valid_target_count"], bool)
-            or not isinstance(payload["valid_target_count"], int)
-            or payload["valid_target_count"] <= 0
+        payload["reason"] = metrics.get("reason")
+        if payload["available"] is not True and not (
+            payload["available"] is False
+            and payload["reason"] == "no_eligible_control"
         ):
-            raise ValueError("valid_target_count must be a positive integer")
+            raise ValueError(
+                "available must be true unless the real initial-state replay "
+                "reports no_eligible_control"
+            )
+        payload["valid_target_count"] = metrics.get("valid_target_count")
+        expected_valid_count = 1 if payload["available"] is True else 0
+        if payload["valid_target_count"] != expected_valid_count:
+            raise ValueError(
+                "valid_target_count must be positive when available and zero "
+                "for no_eligible_control"
+            )
         payload["dino_call_count"] = metrics.get("dino_call_count")
         if payload["dino_call_count"] != 0:
             raise ValueError("dino_call_count must equal 0")
         payload["finite"] = metrics.get("finite")
         if metrics.get("finite") is not True:
             raise ValueError("counterfactual finite must be true")
-        payload["loss"] = _finite_number(metrics.get("loss"), field="counterfactual loss")
+        if payload["available"] is True:
+            payload["loss"] = _finite_number(
+                metrics.get("loss"), field="counterfactual loss"
+            )
+        elif metrics.get("loss") is not None:
+            raise ValueError("unavailable counterfactual loss must be null")
         payload.update({"elapsed": elapsed, "samples": samples, "samples_per_sec": samples / elapsed})
         return payload, None
     except Exception as error:

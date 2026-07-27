@@ -220,6 +220,29 @@ def test_counterfactual_overhead_is_measured_outside_core_updates(tmp_path: Path
     assert all(not context["counterfactual"] for runner in runners.values() for context in runner.update_contexts)
 
 
+def test_initial_no_eligible_control_is_recorded_without_faking_a_loss(
+    tmp_path: Path,
+) -> None:
+    runners = _runners(
+        counterfactual_overrides={
+            "available": False,
+            "reason": "no_eligible_control",
+            "valid_target_count": 0,
+            "loss": None,
+        }
+    )
+    assert _profile(tmp_path, runners)["name"] == "P0"
+    payload = json.loads(
+        (tmp_path / "runtime_profile.json").read_text(encoding="utf-8")
+    )
+    for item in payload["counterfactual_overhead"]:
+        assert item["counterfactual_executed"] is True
+        assert item["available"] is False
+        assert item["reason"] == "no_eligible_control"
+        assert item["valid_target_count"] == 0
+        assert item["loss"] is None
+
+
 @pytest.mark.parametrize(
     ("counterfactual_overrides", "reason"),
     [

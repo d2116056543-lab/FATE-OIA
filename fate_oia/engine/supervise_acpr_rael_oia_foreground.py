@@ -741,11 +741,15 @@ class _RealRuntimeRunner:
         )
         if int(result.get("replay_dino_call_count", -1)) != 0:
             raise RuntimeError("counterfactual replay must not issue an additional DINO call")
-        loss = result.get("loss")
-        if not isinstance(loss, torch.Tensor) or loss.numel() != 1:
-            raise RuntimeError("counterfactual replay must return one scalar loss")
-        finite = bool(torch.isfinite(loss.detach()).all().item())
         available = result.get("available") is True
+        loss = result.get("loss")
+        if available and (not isinstance(loss, torch.Tensor) or loss.numel() != 1):
+            raise RuntimeError("counterfactual replay must return one scalar loss")
+        finite = (
+            bool(torch.isfinite(loss.detach()).all().item())
+            if isinstance(loss, torch.Tensor)
+            else True
+        )
         sample_count = len(handoff.file_names)
         return {
             "samples": int(sample_count),
@@ -754,7 +758,10 @@ class _RealRuntimeRunner:
             "valid_target_count": 1 if available else 0,
             "dino_call_count": 0,
             "finite": finite,
-            "loss": float(loss.detach().float().item()),
+            "loss": float(loss.detach().float().item())
+            if isinstance(loss, torch.Tensor)
+            else None,
+            "reason": str(result.get("reason") or "unknown"),
         }
 
 

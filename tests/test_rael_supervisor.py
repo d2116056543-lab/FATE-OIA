@@ -105,6 +105,7 @@ def test_real_runner_counterfactual_metrics_match_p20_runtime_schema() -> None:
         "dino_call_count": 0,
         "finite": True,
         "loss": pytest.approx(0.125),
+        "reason": "unknown",
     }
 
 
