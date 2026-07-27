@@ -1239,10 +1239,13 @@ def run_rael_mode(*, mode: str, config_path: str | Path, output_dir: str | Path,
             ),
             case_collector=collector,
             case_export_provenance=case_provenance,
-            pre_evaluation_checkpoint=lambda **values: _save_pre_evaluation_checkpoint(
+            pre_evaluation_checkpoint=lambda *, trainer=None, epoch, last_step_result, step_count, transition, **_ignored: _save_pre_evaluation_checkpoint(
                 output_dir=root,
                 runtime=runtime,
-                **values,
+                epoch=epoch,
+                last_step_result=last_step_result,
+                step_count=step_count,
+                transition=transition,
             ),
         )
         flags = _save_full_checkpoints(output_dir=root, runtime=runtime, epoch=epoch, evaluation=publication["evaluation"], best=best)
