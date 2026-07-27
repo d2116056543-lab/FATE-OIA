@@ -182,6 +182,24 @@ def build_p18_epoch_artifacts(
     reason_temperature = chosen(reason_calibration, "temperature")
     if len(pu_audit) != 21 or not all(isinstance(row, Mapping) for row in pu_audit):
         raise ValueError("P18 adapter requires the 21-row fixed train-audit PU result")
+
+    def pu_label_row(index: int) -> dict[str, Any]:
+        audit = dict(pu_audit[index])
+        raw_score = audit.get("recovery_lcb95")
+        score_available = (
+            isinstance(raw_score, (int, float))
+            and not isinstance(raw_score, bool)
+            and math.isfinite(float(raw_score))
+        )
+        # Ineligible labels have no identifiable recovery score. Keep the
+        # numeric schema finite, and preserve that distinction explicitly.
+        audit["score"] = float(raw_score) if score_available else 0.0
+        audit["score_available"] = score_available
+        audit["gate"] = bool(trainer.pu_active_labels[index].item())
+        audit["lambda"] = float(trainer.pu_lambda[index].item())
+        audit["soft_positive_count"] = float(_require_epoch_pu_count(trainer, index))
+        return audit
+
     return {
         "raw_metrics.json": {**common, **evaluation["raw_metrics"]},
         "deploy_metrics.json": {**common, **evaluation["deploy_metrics"]},
@@ -194,7 +212,7 @@ def build_p18_epoch_artifacts(
         "contribution_stats.json": {**common, "global": diagnostics["global_rms"], "unary": diagnostics["unary_rms"], "pairwise": diagnostics["pairwise_rms"], "positive": diagnostics["positive"], "negative": diagnostics["negative"], "reconstruction_error": diagnostics["reconstruction_error"]},
         "named_latent_global.json": {**common, "named_ratio": float(_weighted_value(rows, "named_ratio")["action"]), "latent_ratio": float(_weighted_value(rows, "latent_ratio")["action"]), "global_ratio": float(1.0 - _weighted_value(rows, "named_ratio")["action"] - _weighted_value(rows, "latent_ratio")["action"]), "per_target": per_target, "overall": {"named": float(_weighted_value(rows, "named_ratio")["action"]), "latent": float(_weighted_value(rows, "latent_ratio")["action"]), "global": float(1.0 - _weighted_value(rows, "named_ratio")["action"] - _weighted_value(rows, "latent_ratio")["action"])}},
         "gradient_admission.json": {**common, **gradient},
-        "pu_stats.json": {**common, "labels": [{**dict(pu_audit[index]), "gate": bool(trainer.pu_active_labels[index].item()), "lambda": float(trainer.pu_lambda[index].item()), "soft_positive_count": float(_require_epoch_pu_count(trainer, index))} for index in range(21)]},
+        "pu_stats.json": {**common, "labels": [pu_label_row(index) for index in range(21)]},
         "counterfactual.json": {**common, "available": bool(cf.get("available", True)), "reason": str(cf.get("reason", "formal_128_case_audit")), "sample_ids": list(sample_ids), "selected": {"effect": float(cf["selected_effect"]) if cf["selected_effect"] is not None else None}, "control": {"effect": float(cf["control_effect"]) if cf["control_effect"] is not None else None}, "wrong": {"effect": float(cf["wrong_effect"]) if cf["wrong_effect"] is not None else None}, "valid_action_target_count": int(cf["valid_action_target_count"]), "valid_reason_target_count": int(cf["valid_reason_target_count"])},
         "calibration.json": {**common, "candidates": calibration_candidates, "chosen_thresholds": {"action": action_threshold, "reason": reason_threshold}, "temperature": {"action": sum(action_temperature) / len(action_temperature), "reason": sum(reason_temperature) / len(reason_temperature)}, "threshold_rms": {"action": (sum(value * value for value in action_threshold) / len(action_threshold)) ** 0.5, "reason": (sum(value * value for value in reason_threshold) / len(reason_threshold)) ** 0.5}, "raw_map": {"action": evaluation["raw_metrics"]["metrics"]["action"]["mAP"], "reason": evaluation["raw_metrics"]["metrics"]["reason"]["mAP"]}, "deploy_map": {"action": evaluation["deploy_metrics"]["metrics"]["action"]["mAP"], "reason": evaluation["deploy_metrics"]["metrics"]["reason"]["mAP"]}, "fallback": {"used": False, "reason": "train_calib_chosen"}},
         "failure_cases.jsonl": cases["failure_cases.jsonl"],

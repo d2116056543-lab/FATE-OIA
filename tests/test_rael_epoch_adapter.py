@@ -47,6 +47,13 @@ def test_full_epoch_publication_requires_real_counterfactual_audit_and_not_defau
     assert 'float("nan")' not in supervisor
 
 
+def test_pu_epoch_artifact_maps_recovery_score_and_preserves_unavailable_state() -> None:
+    source = SUPERVISOR.read_text(encoding="utf-8")
+    assert 'raw_score = audit.get("recovery_lcb95")' in source
+    assert 'audit["score"] = float(raw_score) if score_available else 0.0' in source
+    assert 'audit["score_available"] = score_available' in source
+
+
 def test_no_cycle_loader_cache_and_full_consumes_each_epoch_once() -> None:
     source = SUPERVISOR.read_text(encoding="utf-8")
     assert "itertools.cycle" not in source
