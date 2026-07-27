@@ -552,6 +552,8 @@ def _epoch_payload(*, epoch: int = 3, sample_count: int = 3) -> dict[str, object
                 }
                 if name == "failure_cases.jsonl"
                 else {
+                    "available": True,
+                    "unavailable_reason": None,
                     "target": {"type": "action", "id": 0},
                     "selected_slots": [0],
                     "masks": {"slot_0": [[1.0]]},

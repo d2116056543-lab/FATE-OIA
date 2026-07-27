@@ -660,16 +660,27 @@ def _validate_epoch_jsonl(name: str, value: Any, *, epoch: int) -> dict[str, Any
         else:
             _require_fields(
                 data,
-                ("target", "selected_slots", "masks", "attributes", "contributions"),
+                ("available", "unavailable_reason", "target"),
                 context=f"{name}[{index}].data",
             )
+            if not isinstance(data["available"], bool):
+                raise ValueError(f"{name}[{index}].data availability fields are invalid")
+            reason = data["unavailable_reason"]
+            if reason is not None and (not isinstance(reason, str) or not reason):
+                raise ValueError(f"{name}[{index}].data availability fields are invalid")
             target = _require_mapping(data["target"], context=f"{name}[{index}].data.target")
             _require_fields(target, ("type", "id"), context=f"{name}[{index}].data.target")
             if not isinstance(target["type"], str) or isinstance(target["id"], bool) or not isinstance(target["id"], int):
                 raise ValueError(f"{name}[{index}].data.target must contain type/id")
-            for field in ("selected_slots", "masks", "attributes", "contributions"):
-                if not data[field]:
-                    raise ValueError(f"{name}[{index}].data.{field} must be nonempty")
+            if data["available"]:
+                if reason is not None:
+                    raise ValueError(f"{name}[{index}].data available row cannot have an unavailable reason")
+                _require_fields(data, ("selected_slots", "masks", "attributes", "contributions"), context=f"{name}[{index}].data")
+                for field in ("selected_slots", "masks", "attributes", "contributions"):
+                    if not data[field]:
+                        raise ValueError(f"{name}[{index}].data.{field} must be nonempty")
+            elif reason != "zero_analytical_deletion":
+                raise ValueError(f"{name}[{index}].data unavailable reason is invalid")
         _json_safe(mapping, context=f"{name}[{index}]")
     if canonical_provenance is None:
         raise AssertionError("nonempty epoch JSONL must establish provenance")

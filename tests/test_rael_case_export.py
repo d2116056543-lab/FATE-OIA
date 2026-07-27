@@ -146,7 +146,6 @@ def test_p19_case_export_happy_path_uses_real_model_fields_and_validates_p18() -
     (lambda output: output.pop("slot_area"), "slot_area"),
     (lambda output: output.__setitem__("slot_type_probs", torch.zeros((2, 12, 6))), "sum to one"),
     (lambda output: output["slot_masks"].fill_(float("nan")), "finite"),
-    (lambda output: output["action_analytical_deletion"].zero_(), "deletion"),
     (lambda output: output["action_pairwise_incident_contributions"].add_(0.5), "incident"),
     (lambda output: output["action_global_contribution"].add_(0.5), "reconstruct"),
     (lambda output: output.__setitem__("reason_pair_indices", output["reason_pair_indices"].roll(1, dims=0)), "unordered pair"),
@@ -156,6 +155,23 @@ def test_p19_case_export_rejects_malformed_or_fabricated_real_api_fields(mutatio
     mutation(output)
     with pytest.raises((TypeError, ValueError), match=message):
         _consume(_collector(), output)
+
+
+def test_p19_case_export_records_zero_deletion_as_unavailable() -> None:
+    output = _formal_outputs()
+    output["action_unary_contributions"].zero_()
+    output["action_pairwise_contributions"].zero_()
+    output["action_pairwise_incident_contributions"].zero_()
+    output["action_analytical_deletion"].zero_()
+    output["action_global_contribution"] = output["action_logits_final"].clone()
+    collector = _collector()
+    _consume(collector, output)
+    rows = collector.finalize(_provenance())
+    evidence = rows["evidence_cases.jsonl"][0]["data"]
+    assert evidence["available"] is False
+    assert evidence["unavailable_reason"] == "zero_analytical_deletion"
+    assert evidence["target"]["type"] == "action"
+    _validate_epoch_jsonl("evidence_cases.jsonl", rows["evidence_cases.jsonl"], epoch=3)
 
 
 def test_p19_case_export_requires_all_unordered_pairs_and_matching_action_reason_indices() -> None:

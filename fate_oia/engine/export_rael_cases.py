@@ -361,7 +361,15 @@ class RAELCaseExportCollector:
         deletion = family["deletion"][index, target_id]
         selected_slots = sorted(range(_SLOT_COUNT), key=lambda slot: (-float(deletion[slot].abs()), slot))[: self.top_slots]
         if not selected_slots or float(deletion[selected_slots[0]].abs()) <= 0.0:
-            raise ValueError("evidence export requires real nonzero analytical deletion")
+            return {
+                "file_name": file_name,
+                "case_id": self._case_id("evidence-unavailable", file_name, target_type, target_id),
+                "data": {
+                    "available": False,
+                    "unavailable_reason": "zero_analytical_deletion",
+                    "target": {"type": target_type, "id": target_id, "name": target_name},
+                },
+            }
         masks = {str(slot): self._nested_floats(formal["masks"][index, slot]) for slot in selected_slots}
         attributes = {str(slot): self._slot_attributes(formal["attributes"], index, slot) for slot in selected_slots}
         unary = {str(slot): self._scalar(family["unary"][index, target_id, slot]) for slot in selected_slots}
@@ -379,6 +387,8 @@ class RAELCaseExportCollector:
             "file_name": file_name,
             "case_id": self._case_id("evidence", file_name, target_type, target_id),
             "data": {
+                "available": True,
+                "unavailable_reason": None,
                 "target": {"type": target_type, "id": target_id, "name": target_name},
                 "selected_slots": selected_slots,
                 "masks": masks,
