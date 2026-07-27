@@ -1063,7 +1063,17 @@ def _save_full_checkpoints(
     branches = evaluation.get("branch_metrics", {}).get("branches")
     if not isinstance(branches, Sequence):
         raise ValueError("checkpoint selection requires real diagnostic branch metrics")
-    global_branch = next((row for row in branches if isinstance(row, Mapping) and row.get("name") == "global"), None)
+    # The evaluator's independent global diagnostic is named ``global_only``.
+    # Accept the historical ``global`` spelling as a compatibility alias, but
+    # never fall back to deploy metrics for this checkpoint criterion.
+    global_branch = next(
+        (
+            row
+            for row in branches
+            if isinstance(row, Mapping) and row.get("name") in {"global_only", "global"}
+        ),
+        None,
+    )
     if not isinstance(global_branch, Mapping):
         raise ValueError("checkpoint selection requires the real global diagnostic action branch")
     global_metrics = global_branch.get("metrics")
