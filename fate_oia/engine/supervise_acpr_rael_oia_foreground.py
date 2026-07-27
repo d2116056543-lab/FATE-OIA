@@ -953,6 +953,47 @@ def _initialize_full_artifact_root(
     return provenance, profile_steps
 
 
+def _pu_audit_artifact_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Adapt the real PU recovery audit to the persisted JSONL contract.
+
+    Ineligible labels legitimately have no identifiable AUPRC/recovery
+    statistic.  Persist finite zero sentinels only for that unavailable state
+    and expose the availability explicitly; never manufacture a recovery
+    improvement for the artifact.
+    """
+
+    audit = dict(row)
+
+    def finite_or_zero(name: str) -> tuple[float, bool]:
+        value = audit.get(name)
+        available = (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+        )
+        return (float(value) if available else 0.0), available
+
+    baseline, baseline_available = finite_or_zero("visual_hidden_auprc")
+    recovered, recovered_available = finite_or_zero("recovered_hidden_auprc")
+    delta, delta_available = finite_or_zero("recovery_delta")
+    lcb95, lcb_available = finite_or_zero("recovery_lcb95")
+    audit.update(
+        {
+            "baseline_auprc": baseline,
+            "pu_auprc": recovered,
+            "delta": delta,
+            "lcb95": lcb95,
+            "recovery_metrics_available": bool(
+                baseline_available
+                and recovered_available
+                and delta_available
+                and lcb_available
+            ),
+        }
+    )
+    return audit
+
+
 def _append_epoch_run_rows(
     *,
     writer: Any,
@@ -1015,7 +1056,10 @@ def _append_epoch_run_rows(
     if not isinstance(pu_audit, Sequence) or len(pu_audit) != 21:
         raise ValueError("P18 publication requires per-label real PU audit outputs")
     for row in pu_audit:
-        writer.append_run_jsonl("pu_audit.jsonl", {**provenance, "epoch": int(epoch), **dict(row)})
+        writer.append_run_jsonl(
+            "pu_audit.jsonl",
+            {**provenance, "epoch": int(epoch), **_pu_audit_artifact_row(row)},
+        )
 
 
 def _append_streamed_train_step_rows(

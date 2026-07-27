@@ -350,3 +350,37 @@ def test_full_checkpoint_selector_accepts_evaluator_global_only_branch(tmp_path:
     assert flags["global_action"] is True
     assert (tmp_path / "checkpoint_latest.pth").exists()
     assert (tmp_path / "checkpoint_best_test_global_action.pth").exists()
+
+
+def test_pu_audit_artifact_preserves_unavailable_recovery_state() -> None:
+    module = _module()
+    unavailable = module._pu_audit_artifact_row(
+        {
+            "label_id": 5,
+            "positive_count": 0,
+            "recovery_lcb95": None,
+            "decision": "epoch0_off",
+        }
+    )
+    assert unavailable["baseline_auprc"] == 0.0
+    assert unavailable["pu_auprc"] == 0.0
+    assert unavailable["delta"] == 0.0
+    assert unavailable["lcb95"] == 0.0
+    assert unavailable["recovery_metrics_available"] is False
+
+    available = module._pu_audit_artifact_row(
+        {
+            "label_id": 5,
+            "positive_count": 10,
+            "visual_hidden_auprc": 0.20,
+            "recovered_hidden_auprc": 0.35,
+            "recovery_delta": 0.15,
+            "recovery_lcb95": 0.05,
+            "decision": "active",
+        }
+    )
+    assert available["baseline_auprc"] == 0.20
+    assert available["pu_auprc"] == 0.35
+    assert available["delta"] == 0.15
+    assert available["lcb95"] == 0.05
+    assert available["recovery_metrics_available"] is True
