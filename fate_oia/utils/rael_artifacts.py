@@ -1372,6 +1372,14 @@ def _owner_manifest_from_live_optimizer(
     param_groups = getattr(optimizer, "param_groups", None)
     if not isinstance(param_groups, Sequence) or isinstance(param_groups, (str, bytes, bytearray)):
         raise TypeError("trainer.optimizer_bundle.optimizer.param_groups must be a public sequence")
+    scheduler = getattr(trainer, "scheduler", None)
+    scheduler_lrs = (
+        tuple(float(value) for value in scheduler.get_last_lr())
+        if callable(getattr(scheduler, "get_last_lr", None))
+        else None
+    )
+    if scheduler_lrs is not None and len(scheduler_lrs) != len(param_groups):
+        raise ValueError("scheduler learning-rate groups disagree with optimizer.param_groups")
 
     named_parameters = dict(model.named_parameters())
     expected_names = {name for owner in _OPTIMIZER_OWNER_ORDER for name in owners[owner]}
@@ -1379,11 +1387,25 @@ def _owner_manifest_from_live_optimizer(
         missing = sorted(expected_names.difference(named_parameters))
         raise ValueError(f"trainer owner parameters are absent from model.named_parameters(): {missing}")
     name_by_id = {id(parameter): name for name, parameter in named_parameters.items()}
-    observed: dict[str, tuple[float, float]] = {}
+    observed: dict[str, tuple[float, float, float]] = {}
     for group_index, group in enumerate(param_groups):
         group_mapping = _require_mapping(group, context=f"optimizer.param_groups[{group_index}]")
         _require_fields(group_mapping, ("params", "lr", "weight_decay"), context=f"optimizer.param_groups[{group_index}]")
-        lr = _finite_scalar(group_mapping["lr"], context=f"optimizer.param_groups[{group_index}].lr")
+        current_lr = _finite_scalar(
+            group_mapping["lr"],
+            context=f"optimizer.param_groups[{group_index}].lr",
+        )
+        base_lr = _finite_scalar(
+            group_mapping.get("initial_lr", current_lr),
+            context=f"optimizer.param_groups[{group_index}].initial_lr",
+        )
+        if (
+            scheduler_lrs is not None
+            and current_lr != scheduler_lrs[group_index]
+        ):
+            raise ValueError(
+                "optimizer.param_groups current lr disagrees with live scheduler"
+            )
         decay = _finite_scalar(
             group_mapping["weight_decay"],
             context=f"optimizer.param_groups[{group_index}].weight_decay",
@@ -1399,7 +1421,7 @@ def _owner_manifest_from_live_optimizer(
                 raise ValueError("optimizer.param_groups contains a parameter outside formal owner topology")
             if parameter_name in observed:
                 raise ValueError("optimizer.param_groups assigns a formal parameter more than once")
-            observed[parameter_name] = (lr, decay)
+            observed[parameter_name] = (base_lr, current_lr, decay)
     if set(observed) != expected_names:
         missing = sorted(expected_names.difference(observed))
         raise ValueError(f"optimizer.param_groups does not cover every formal owner parameter: {missing}")
@@ -1416,13 +1438,19 @@ def _owner_manifest_from_live_optimizer(
         parameter_names = owners[owner]
         parameters: list[dict[str, Any]] = []
         for parameter_name in parameter_names:
-            lr, decay = observed[parameter_name]
+            base_lr, _current_lr, decay = observed[parameter_name]
             expected_decay = 0.0 if parameter_name in no_decay else _WEIGHT_DECAY
-            if lr != expected_lr or decay != expected_decay:
+            if base_lr != expected_lr or decay != expected_decay:
                 raise ValueError(
                     f"optimizer.param_groups disagrees with formal owner/lr/decay for {parameter_name}"
                 )
-            parameters.append({"name": parameter_name, "lr": lr, "weight_decay": decay})
+            parameters.append(
+                {
+                    "name": parameter_name,
+                    "lr": base_lr,
+                    "weight_decay": decay,
+                }
+            )
         manifest[owner] = {
             "parameter_names": parameter_names,
             "parameters": parameters,

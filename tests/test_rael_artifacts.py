@@ -1602,6 +1602,22 @@ def test_p18_owner_contract_matches_real_optimizer_parameter_objects(
                 (parameter["lr"], parameter["weight_decay"])
             )
 
+    trainer.scheduler = torch.optim.lr_scheduler.LambdaLR(
+        trainer.optimizer_bundle.optimizer,
+        lr_lambda=lambda _step: 0.5,
+    )
+    scheduled_contract = module.trainer_run_artifact_contract(
+        trainer,
+        artifact_context=_provenance(
+            producer="fate_oia.engine.train_acpr_rael_oia:contract"
+        ),
+    )
+    assert all(
+        owner["lr"]
+        == pytest.approx(0.0003 if name in PRIVATE_OWNER_NAMES else 0.0002)
+        for name, owner in scheduled_contract["optimizer_owners"]["owners"].items()
+    )
+
     trainer.optimizer_bundle.optimizer.param_groups[0]["lr"] = 0.123
     with pytest.raises(ValueError, match="optimizer|learning rate|LR"):
         module.trainer_run_artifact_contract(
