@@ -88,3 +88,12 @@
 - **可报告最终完成：** 尚不可；缺 clean-HEAD real-DINO profile/audit 证据。
 - **允许 pilot：** 尚不可。
 - **允许 full train：** 不可；必须先完成严格 3-epoch pilot 并生成 FULL_TRAIN_READY。
+
+## 9. Final evidence update
+
+- Final clean HEAD: `8e1c066bf026767bd83ee2210b69fa193f6fc966`; GitHub branch HEAD matches.
+- Full repository verification: `156 passed`; one unrelated existing TypedStorage deprecation warning.
+- Real-DINO runtime profile completed with 5 warmup and 20 measured optimizer updates per accepted comparison. Selected batch 6, accumulation 5, workers 4, prefetch 2; peak reserved 42.3652 GB; event-adjusted 10.2270 samples/s.
+- Final real-DINO audit: `pass=true`, `missing_items=[]`, `warnings=[]`; all functional, contract, and dynamic checks passed.
+- `REVIEW_PASS_METER_OIA_V1.txt` and `METER_OIA_V1_PRE_PILOT_READY.json` were generated.
+- Supervisor verdict: implementation and pre-pilot audit closure are complete. Pilot/full training were not started. Full training still requires a strict pilot-generated `FULL_TRAIN_READY`.
