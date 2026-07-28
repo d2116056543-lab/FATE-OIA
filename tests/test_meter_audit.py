@@ -27,6 +27,9 @@ def test_formal_config_requires_matched_null_meta_admission() -> None:
 
 def test_audit_requires_isolated_profile_and_all_event_memory_peaks() -> None:
     source = inspect.getsource(audit_acpr_meter_oia.run_audit)
+    assert source.index("git_head = subprocess.check_output") < source.index(
+        'profile.get("git_head") == git_head'
+    )
     assert '"isolation_pass"' in source
     assert "child_exit_status" in source
     assert "memory_peak_after_ordinary_gb" in source

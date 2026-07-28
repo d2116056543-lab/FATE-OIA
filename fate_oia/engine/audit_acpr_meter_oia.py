@@ -365,6 +365,9 @@ def run_audit(
             for token in ("METER_OIA_V1_FULL_TRAIN_READY.json", "_write_full_train_ready_if_eligible", "4096", "1024", "512")
         ),
     }
+    git_head = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=root, text=True
+    ).strip()
     real_result = {"required": True, "executed": False, "pass": False, "reason": "real-DINO profile not found"}
     profile_path = profile_dir / "runtime_profile.json"
     if real_dino and profile_path.exists():
