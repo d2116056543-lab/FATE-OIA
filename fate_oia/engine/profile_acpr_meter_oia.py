@@ -177,6 +177,14 @@ def profile_one(
         torch.nn.utils.clip_grad_norm_(model.parameters(), float(trial["training"].get("grad_clip", 1.0)))
         optimizer.step()
         _synchronize(device)
+        if device.type == "cuda":
+            reserved_now = torch.cuda.max_memory_reserved(device) / 1024**3
+            hard_limit = float(trial["runtime"]["hard_max_reserved_gb"])
+            if reserved_now >= hard_limit:
+                raise RuntimeError(
+                    "out of memory policy limit: "
+                    f"reserved={reserved_now:.3f}GB >= hard={hard_limit:.3f}GB"
+                )
         if update >= warmup_updates:
             update_durations.append(time.perf_counter() - update_started)
     measured_seconds = sum(update_durations)
@@ -332,6 +340,8 @@ def main() -> None:
         calib_fraction=config["splits"]["calib_fraction"],
         seed=config["splits"]["seed"],
     )
+    output = Path(args.output_dir)
+    output.mkdir(parents=True, exist_ok=True)
     profiles = []
     candidates = [tuple(item) for item in config["runtime"]["profile_candidates"]]
     worker_options = [int(item) for item in config["runtime"]["profile_num_workers"]]
@@ -371,6 +381,34 @@ def main() -> None:
             finally:
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
+            write_json(
+                output / "runtime_profile_partial.json",
+                {
+                    "real_dino": not args.use_mock_dino,
+                    "real_data": True,
+                    "profiles": profiles,
+                    "complete": False,
+                },
+            )
+            latest = profiles[-1]
+            print(
+                json.dumps({
+                    "profile_progress": len(profiles),
+                    "stage": latest.get("search_stage"),
+                    "batch_size": latest.get("batch_size"),
+                    "gradient_accumulation_steps": latest.get(
+                        "gradient_accumulation_steps"
+                    ),
+                    "num_workers": latest.get("num_workers"),
+                    "prefetch_factor": latest.get("prefetch_factor"),
+                    "oom_or_policy_reject": bool(latest.get("oom")),
+                    "reserved_gb": latest.get("reserved_gb"),
+                    "event_adjusted_samples_per_sec": latest.get(
+                        "event_adjusted_samples_per_sec"
+                    ),
+                }, sort_keys=True),
+                flush=True,
+            )
 
     batch_plan = build_two_stage_profile_plan(
         candidates,
@@ -405,8 +443,6 @@ def main() -> None:
         "search_strategy": "two_stage_batch_then_loader",
         "selection_rule": "finite; reserved<45GB; prefer<=42GB; highest event-adjusted throughput; lower memory within 3%",
     }
-    output = Path(args.output_dir)
-    output.mkdir(parents=True, exist_ok=True)
     write_json(output / "runtime_profile.json", report)
     print(json.dumps(report, indent=2, sort_keys=True))
     if selected is None:
