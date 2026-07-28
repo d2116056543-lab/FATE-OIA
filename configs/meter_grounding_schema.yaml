@@ -1,0 +1,22 @@
+schema_version: 1
+grid_hw: [45, 80]
+train_only_bdd100k: true
+test_time_geometry_allowed: false
+source_kinds: [object, lane, drivable, traffic_light_attribute, source_completeness]
+regions: [upper_traffic_region, front_center, left_corridor, right_corridor, bottom_drivable_region]
+conservative_rules:
+  unknown_traffic_light_color: unknown
+  generic_traffic_sign: unknown
+  missing_lane_style: unknown
+  missing_object_annotation: unknown
+  missing_drivable_map: unknown
+  static_box_turn_intent: unknown
+  incomplete_source_for_absence: unknown
+  traffic_color_without_direction_arrow: unknown
+  drivable_presence_without_actor_check: unknown
+support_counter_contract:
+  valid_zero_means: unknown_no_loss
+  missing_is_negative: false
+  counter_requires: explicit_counter_or_complete_observable_absence
+  no_visual_feature_cache: true
+  parse_metadata_lru_only: true
