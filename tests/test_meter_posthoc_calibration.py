@@ -32,3 +32,29 @@ def test_calibration_guard_falls_back_on_train_calib_degradation() -> None:
     assert guarded.fallback_reason == "train_calib_deploy_joint_degradation"
     assert torch.equal(guarded.theta, torch.zeros_like(candidate.theta))
     assert guarded.train_calib_deploy_joint >= guarded.train_calib_raw_joint
+
+
+def test_calibration_guard_checks_ranking_on_logits_before_sigmoid_saturation() -> None:
+    generator = torch.Generator().manual_seed(17)
+    action_logits = torch.randn(512, 1, generator=generator) * 15
+    labels = torch.randint(0, 2, (512, 1), generator=generator).float()
+    reason_logits = action_logits.clone()
+    candidate = METERCalibrationResult(
+        theta=torch.zeros(2),
+        temperature=torch.full((2,), 1.5),
+        model_state_hash_before="state",
+        model_state_hash_after="state",
+        fit_split="train_calib",
+        representation_updated=False,
+    )
+
+    guarded = guard_train_calib_deploy_theta(
+        action_logits,
+        labels,
+        reason_logits,
+        labels,
+        candidate,
+        fallback_on_deploy_degradation=False,
+    )
+
+    assert guarded.map_max_abs_delta == 0.0

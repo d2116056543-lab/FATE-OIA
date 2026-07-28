@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
-from fate_oia.metrics import multilabel_metrics_from_logits
+from fate_oia.metrics import binary_average_precision, multilabel_metrics_from_logits
 
 
 @dataclass(frozen=True)
@@ -113,6 +113,15 @@ def _joint_score(action_logits: Tensor, action_labels: Tensor, reason_logits: Te
     return 0.5 * (float(action.get("Act_mF1", 0.0)) + float(reason.get("Exp_mF1", 0.0)))
 
 
+def _ranking_map(scores: Tensor, labels: Tensor) -> float:
+    per_label = [
+        binary_average_precision(scores[:, index], labels[:, index])
+        for index in range(labels.shape[1])
+    ]
+    finite = [value for value in per_label if torch.isfinite(torch.tensor(value))]
+    return float(sum(finite) / len(finite)) if finite else float("nan")
+
+
 def guard_train_calib_deploy_theta(
     action_logits: Tensor,
     action_labels: Tensor,
@@ -145,21 +154,15 @@ def guard_train_calib_deploy_theta(
         reason_logits / reason_temperature - reason_theta,
         reason_labels,
     )
-    raw_action_metrics = multilabel_metrics_from_logits(action_logits, action_labels, prefix="Act_")
-    raw_reason_metrics = multilabel_metrics_from_logits(reason_logits, reason_labels, prefix="Exp_")
-    deploy_action_metrics = multilabel_metrics_from_logits(
-        action_logits / action_temperature - action_theta,
-        action_labels,
-        prefix="Act_",
-    )
-    deploy_reason_metrics = multilabel_metrics_from_logits(
-        reason_logits / reason_temperature - reason_theta,
-        reason_labels,
-        prefix="Exp_",
-    )
     map_delta = max(
-        abs(float(raw_action_metrics["Act_mAP"]) - float(deploy_action_metrics["Act_mAP"])),
-        abs(float(raw_reason_metrics["Exp_mAP"]) - float(deploy_reason_metrics["Exp_mAP"])),
+        abs(
+            _ranking_map(action_logits, action_labels)
+            - _ranking_map(action_logits / action_temperature - action_theta, action_labels)
+        ),
+        abs(
+            _ranking_map(reason_logits, reason_labels)
+            - _ranking_map(reason_logits / reason_temperature - reason_theta, reason_labels)
+        ),
     )
     if map_delta > 1e-7:
         raise RuntimeError("Post-hoc calibration changed ranking mAP")
