@@ -4,6 +4,7 @@ import torch
 from torch import nn
 
 from fate_oia.utils.meter_artifacts import load_checkpoint, save_checkpoint
+from vision_transformer import Attention
 
 
 def test_checkpoint_restores_model_optimizer_and_scheduler(tmp_path: Path) -> None:
@@ -71,3 +72,12 @@ def test_resume_next_update_matches_continuous_training(tmp_path: Path) -> None:
     torch.testing.assert_close(continuous_loss, resumed_loss)
     for continuous, resumed in zip(model.parameters(), restored.parameters()):
         torch.testing.assert_close(continuous, resumed)
+
+
+def test_dino_attention_projection_reference_is_not_registered_twice() -> None:
+    attention = Attention(dim=8, num_heads=2)
+
+    attention(torch.randn(2, 5, 8))
+
+    assert attention.vproj is attention.proj
+    assert not any(key.startswith("vproj.") for key in attention.state_dict())

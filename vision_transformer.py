@@ -100,9 +100,10 @@ class Attention(nn.Module):
     def get_attention_map(self):
         return self.attention_map
     
-     # below are added by hongbo
+    # below are added by hongbo
     def save_proj(self, vproj):
-        self.vproj = vproj
+        # Keep a diagnostic reference without registering proj a second time.
+        object.__setattr__(self, "vproj", vproj)
     
     # def get_proj(self):
     #     return self.vproj
