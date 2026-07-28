@@ -76,3 +76,40 @@
 ### 11.4 鎵ц璁稿彲
 
 - **鍏佽鎵ц锛?* RED tests -> 浠ｇ爜淇 -> targeted/full tests -> real-DINO profile/audit -> clean exact 3-epoch pilot銆?- **涓嶅厑璁告墽琛岋細** 鐩存帴 full train銆侀檷浣庢垨鏀瑰啓鍘?gate 鏁板€笺€佸己鍒?omega銆佺敤 test 鏇存柊 RMS/meta/mix/calibration銆佷负 coverage 杞鏃犳晥 factor銆?- **full train 鏉′欢锛?* 鏂?clean HEAD 涓婂叏閮ㄥ師璁″垝 gate閫氳繃骞剁敓鎴愬搴?FULL_TRAIN_READY锛涘惁鍒欑户缁繚鎸侀樆鏂€?
+
+## 12. 第四轮：clean HEAD 00954c9 真实 3-epoch pilot 失败归因审查
+
+**复审日期：** 2026-07-29  
+**绑定 HEAD：** `00954c976244e5721ff1d25cae0fae820867f927`  
+**pilot：** `.background_runs/meter_oia_v1_pilot_00954c9`，epoch 000..002  
+**审查类型：** 只读代码/数据流/门槛审查；未修改模型或训练代码，未启动训练，未降低任何 gate。  
+**结论：** `changes_required`；当前不允许 full train。
+
+### 12.1 失败项分类
+
+| 失败项 | 归因 | 证据与结论 |
+|---|---|---|
+| `counterfactual_12_factors` / `counterfactual_all_actions` | **指标覆盖实现错误 + 真实机制稀疏** | 固定 test diagnostic 名义上 `max_samples=128`，但 `train_acpr_meter_oia.py:1661-1681` 每个 batch 只调用一次 `_counterfactual_event`，`sample_index=seen % batch_size`，所以 batch=6 时实际仅约 22 个事件，不是 128 个样本；gate 又在 `:751-752` 只检查最后一轮 diagnostic，而不是三轮有效事件并集。与此同时，训练 51 次事件仅 5 次有效，约 90% 因 `no_signed_support_or_counter_evidence` 跳过，证明上游 signed candidate 也确实稀疏。不能只归咎三轮不足。 |
+| `meta_high_omega_4` / `meta_positive_utility` / `meta_share_rate` | **真实机制失败为主，覆盖不足为次** | 10 次 meta event、40 个 factor evaluation 中 admission score 正值为 0、omega 全 0。实际 utility 多为 `1e-7~1e-6`，LCB 低于 matched-null q99；末次 candidate delta norm 约 `3.89e-4`，但 action-loss effect 仍只有 `1e-7` 量级。`meter_meta_utility.py:424-445` 的 robust LCB/null admission 正确阻止假阳性，`:503-520` 的 streak/omega 逻辑没有误关。三轮导致每 factor 仅 1-2 次 observation，确实不足以形成 streak，但在 admission 从未为正时，单纯延长训练也不会解决。 |
+| `reason_mix_synergy` | **真实机制失败** | E2 global/local/mix Exp_mAP=`0.176779/0.130459/0.176812`，mix 仅比 global 高约 `0.000033`，远低于原门槛 `+0.003`。mix gate mean 从 `0.9068` 升至 `0.9975/0.9980`，std 降至约 `0.00064`，明确塌缩为 global。`meter_reason_decoder.py:117-124` 的 mix 与 detached regret 路径真实调用，`meter_reason_losses.py:100-129` 也真实加权；根因是 local expert 没有形成互补能力，且 mix gate 可能同时收到正式 final 与 regret 的冲突梯度。三轮较短，但 local mAP `0.13047 -> 0.13487 -> 0.13046` 没有持续改善证据。 |
+| `selector_nonconstant` | **真实机制失败** | selector mean/std 从 E0 `0.00995/0.00760` 进一步降到 E2 `0.00121/0.00135`；按 `meter_semantic_action.py:140-141`，selector 是 visual 权重，因此实际塌缩到 semantic transport。不是“还没学会选择”，而是迅速饱和到单一路径。 |
+| `selector_regret_decreased` | **真实优化冲突/目标失效** | regret `0.006586 -> 0.006768 -> 0.008134` 单调恶化。`meter_action_losses.py:95-120` 中 selector regret 虽使用 detached experts，但同一 selector 仍通过 final/two-way loss接收梯度；当前没有证据证明这些梯度与 regret 一致。三轮不足不能解释从第一轮开始的单调塌缩。 |
+
+### 12.2 新发现的指标实现缺陷
+
+`semantic_visual_ratio` gate 在 `train_acpr_meter_oia.py:724` 只检查汇总 `semantic_visual_rms_ratio`。E0 汇总值 `0.1882` 通过，但 per-action actual ratios 为 `[0.3786, 0.1219, 0.2230, 0.1449]`，action 0 已超过原计划上界 `0.30`。这不是建议降低门槛，而是要求按原语义对 **每个 action** 检查 `[0.03,0.30]`，否则汇总会掩盖单 action transport 过强。
+
+### 12.3 不降低门槛的最小根因修复
+
+1. **Counterfactual diagnostic：** 逐样本调用或实现 batch 事件，确保 `max_samples=128` 真正评估 128 个样本；报告单轮和三轮并集两套 coverage，但原 gate 仍须在规定窗口达到 4 actions/12 factors。训练事件改为在合法 signed candidate 内做 action-positive 分层采样，不得以 `abs(contribution)` 或无效 factor 补覆盖。拆分 skip reason 为 no-support、no-counter、nonpositive-attribution、null-dominant。
+2. **Meta：** 保留 LCB > matched-null q99 与 streak 门槛。先做 virtual-update resolution probe，选择仍受约束但能产生可测 action-loss delta 的 `virtual_lr/lambda_m`；扩大固定 paired audit 观测，保证每 factor 有独立重复证据。不得强开 omega，也不得把 `utility_ema>0` 当 admission。
+3. **Selector：** 在修改前先记录 selector 参数上 `final/two_way` 梯度与 `selector_regret` 梯度 cosine。若冲突，formal expert loss 与 selector gate 的梯度所有权分离：专家继续由 direct losses 训练，selector 只由 detached-expert、与正式 ASL 同义的 regret/utility 训练。加入基于 expert advantage 的防塌缩约束，不使用无条件 50/50 entropy 强迫。
+4. **Reason mix：** 先输出每 label/样本 `local_loss < global_loss` 比例和 mix-gate 两类梯度 cosine。若 local 没有互补子集，优先修 local supervision/初始化；若梯度冲突，则 mix gate 只接 detached-expert PU-consistent regret，global/local 保持各自 direct loss。不得强制混合比例，也不得降低 `+0.003` synergy 门槛。
+5. **Gate 实现：** `semantic_visual_ratio` 改为同时要求 aggregate 与四个 per-action ratio 全部满足原区间。
+
+### 12.4 审批状态
+
+- `review_status = changes_required`
+- `execution may proceed = 仅允许 RED tests -> 上述最小修复 -> 全测/profile/audit -> 新 clean HEAD exact 3-epoch pilot`
+- `full train = 不允许`
+- 原因：counterfactual gate 当前受到采样/聚合实现错误污染；meta 的真实 utility 未超过 matched-null；selector 与 reason mix 已出现单调饱和/无互补的机制失败。延长当前 pilot 不能替代根因修复。
