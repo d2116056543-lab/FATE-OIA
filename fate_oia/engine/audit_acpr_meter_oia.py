@@ -233,7 +233,7 @@ def run_audit(
             report["pass"] = False
             report["warnings"].append("Pre-pilot readiness requires a recorded test summary.")
         else:
-            test_summary = json.loads(test_summary_path.read_text(encoding="utf-8"))
+            test_summary = json.loads(test_summary_path.read_text(encoding="utf-8-sig"))
             ready = {
                 "artifact": "METER_OIA_V1_PRE_PILOT_READY",
                 "branch": subprocess.check_output(["git", "branch", "--show-current"], cwd=root, text=True).strip(),
