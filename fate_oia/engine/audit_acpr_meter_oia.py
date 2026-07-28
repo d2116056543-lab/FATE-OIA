@@ -176,6 +176,7 @@ def run_audit(
     contract = {
         "trainer_calls_all_losses": all(token in trainer_text for token in ("meter_action_loss", "meter_reason_loss", "meter_grounding_loss", "meter_counterfactual_loss", "meter_private_pu_loss")),
         "trainer_calls_meta_and_calibration": all(token in trainer_text for token in ("meta.event", "_fit_calibration", "save_epoch_artifacts", "load_checkpoint")),
+        "calibration_guard_called": all(token in trainer_text for token in ("guard_train_calib_deploy_theta", "fallback_on_deploy_degradation", "train_calib")),
         "pu_data_driven_not_fixed_training_zero": "pu_lambda = torch.zeros(reason_target.shape[1]" not in trainer_text and "meter_hidden_positive_audit" in trainer_text,
         "pu_zero_lambda_disabled": dynamic["pu_zero_lambda_disabled"],
         "counterfactual_same_field": all(token in trainer_text for token in ("delete_field", "support_control_mask_full", "counter_control_mask_full", "wrong_output")),
@@ -205,7 +206,7 @@ def run_audit(
         "formal_trainer": (root / "fate_oia/engine/train_acpr_meter_oia.py").exists(),
         "formal_evaluator": (root / "fate_oia/engine/eval_acpr_meter_oia.py").exists(),
         "foreground_supervisor": (root / "scripts/FATE_OIA_acpr_meter_oia_v1_foreground.ps1").exists(),
-        "formal_loss_and_artifact_call_graph": contract["trainer_calls_all_losses"] and contract["trainer_calls_meta_and_calibration"] and contract["diagnostics_from_forward_tensors"],
+        "formal_loss_and_artifact_call_graph": contract["trainer_calls_all_losses"] and contract["trainer_calls_meta_and_calibration"] and contract["calibration_guard_called"] and contract["diagnostics_from_forward_tensors"],
         "runtime_and_resume_contract": contract["resolved_yaml_written"] and contract["resume_state_restored"],
         "counterfactual_contract": contract["counterfactual_same_field"],
         "pu_contract": contract["pu_data_driven_not_fixed_training_zero"] and contract["pu_zero_lambda_disabled"],

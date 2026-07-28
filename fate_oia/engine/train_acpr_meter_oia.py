@@ -41,7 +41,7 @@ from fate_oia.utils.meter_artifacts import (
     load_checkpoint,
 )
 from fate_oia.utils.meter_config import load_meter_config
-from fate_oia.utils.meter_posthoc_calibration import METERCalibrationResult, fit_train_calib_deploy_theta
+from fate_oia.utils.meter_posthoc_calibration import METERCalibrationResult, fit_train_calib_deploy_theta, guard_train_calib_deploy_theta
 
 
 def _sha(value: str) -> str:
@@ -272,16 +272,31 @@ def _losses(
     return total, parts, diagnostics
 
 
-def _fit_calibration(model: METEROIAModel, loader: DataLoader, device: torch.device, progress: float) -> METERCalibrationResult:
+def _fit_calibration(
+    model: METEROIAModel,
+    loader: DataLoader,
+    device: torch.device,
+    progress: float,
+    *,
+    fallback_on_deploy_degradation: bool = True,
+) -> METERCalibrationResult:
     collected = collect_outputs(model, loader, device, progress=progress)
     action = fit_train_calib_deploy_theta(collected["action"]["final"], collected["labels_action"], model_state_hash=state_hash(model))
     reason = fit_train_calib_deploy_theta(collected["reason"]["final"], collected["labels_reason"], model_state_hash=state_hash(model))
-    return METERCalibrationResult(
+    candidate = METERCalibrationResult(
         theta=torch.cat([action.theta, reason.theta]),
         model_state_hash_before=action.model_state_hash_before,
         model_state_hash_after=reason.model_state_hash_after,
         fit_split="train_calib",
         representation_updated=False,
+    )
+    return guard_train_calib_deploy_theta(
+        collected["action"]["final"],
+        collected["labels_action"],
+        collected["reason"]["final"],
+        collected["labels_reason"],
+        candidate,
+        fallback_on_deploy_degradation=fallback_on_deploy_degradation,
     )
 
 
@@ -411,7 +426,17 @@ def run(args: argparse.Namespace) -> None:
             pu_lambda = torch.as_tensor(pu_state["lambda"], device=device, dtype=torch.float32)
         calibration_payload = payload.get("calibration", {})
         if calibration_payload.get("theta") is not None:
-            calibration = METERCalibrationResult(theta=torch.as_tensor(calibration_payload["theta"]), model_state_hash_before="", model_state_hash_after="", fit_split="train_calib", representation_updated=False)
+            calibration = METERCalibrationResult(
+                theta=torch.as_tensor(calibration_payload["theta"]),
+                model_state_hash_before="",
+                model_state_hash_after="",
+                fit_split="train_calib",
+                representation_updated=False,
+                accepted=bool(calibration_payload.get("accepted", True)),
+                fallback_reason=str(calibration_payload.get("fallback_reason", "")),
+                train_calib_raw_joint=calibration_payload.get("train_calib_raw_joint"),
+                train_calib_deploy_joint=calibration_payload.get("train_calib_deploy_joint"),
+            )
         best_joint = float(payload.get("meta_state", {}).get("best_joint", float("-inf")))
         best_branch_metrics = {str(key): float(value) for key, value in payload.get("meta_state", {}).get("best_branch_metrics", {}).items()}
     with torch.no_grad():
@@ -542,7 +567,13 @@ def run(args: argparse.Namespace) -> None:
         if epoch >= 0:
             pu_lambda = torch.as_tensor(pu_audit_state["lambda"], device=device, dtype=torch.float32).clamp_min(0.0).clamp_max(float(cfg["pu"].get("max_lambda", 0.15)))
         append_jsonl(output_dir / "pu_audit.jsonl", {"epoch": epoch, **pu_audit_state, "active_lambda": pu_lambda.detach().cpu().tolist()})
-        calibration = _fit_calibration(model, calib_loader, device, progress=1.0)
+        calibration = _fit_calibration(
+            model,
+            calib_loader,
+            device,
+            progress=1.0,
+            fallback_on_deploy_degradation=bool(cfg["posthoc_calibration"].get("fallback_on_deploy_degradation", True)),
+        )
         test_result = evaluate_test(model, cfg, device, args, progress=1.0, calibration=calibration)
         raw = test_result["summary"]["metrics_raw"]
         deploy = test_result["summary"]["metrics_deploy"]
@@ -561,16 +592,32 @@ def run(args: argparse.Namespace) -> None:
             "per_reason.json": {"raw": {k: v for k, v in raw.items() if k.startswith("Exp_")}, "deploy": {k: v for k, v in deploy.items() if k.startswith("Exp_")}},
             "failure_cases.jsonl": {"epoch": epoch, "available": True, "note": "case mining is derived from test branch logits; raw tensors are saved for reproducible case selection"},
             "evidence_cases.jsonl": {"epoch": epoch, "available": True, "file_count": len(test_result["file_names"]), "factor_stats": test_result["factor_stats"]},
-            "calibration.json": {"theta": calibration.theta.tolist(), "fit_split": calibration.fit_split, "state_hash_before": calibration.model_state_hash_before, "state_hash_after": calibration.model_state_hash_after},
+            "calibration.json": {
+                "theta": calibration.theta.tolist(),
+                "fit_split": calibration.fit_split,
+                "state_hash_before": calibration.model_state_hash_before,
+                "state_hash_after": calibration.model_state_hash_after,
+                "accepted": calibration.accepted,
+                "fallback_reason": calibration.fallback_reason,
+                "train_calib_raw_joint": calibration.train_calib_raw_joint,
+                "train_calib_deploy_joint": calibration.train_calib_deploy_joint,
+            },
         }
         save_epoch_artifacts(output_dir, epoch, metrics_raw=raw, metrics_deploy=deploy, branch_metrics=test_result["branches"], logits=test_result["logits"], labels=test_result["labels"], diagnostics=diagnostics, file_names=test_result["file_names"])
         checkpoint_runtime = {"batch_size": cfg["training"].get("batch_size"), "gradient_accumulation_steps": grad_accum, "effective_batch": int(cfg["training"].get("batch_size", 6)) * grad_accum, "runtime_profile": runtime_profile}
         checkpoint_meta = {"omega": meta.omega, "utility_ema": meta.utility_ema, "cursor": meta.cursor, "best_joint": best_joint, "best_branch_metrics": best_branch_metrics}
-        save_checkpoint(output_dir / "checkpoint_latest.pth", model=model, optimizer=optimizer, scheduler=scheduler, epoch=epoch, micro_step=0, optimizer_step=global_step, runtime_profile=checkpoint_runtime, meta_state=checkpoint_meta, pu_state={"lambda": pu_lambda.detach().cpu(), "audit": pu_audit_state}, calibration={"theta": calibration.theta.detach().cpu()}, config_hash=config_hash, source_hash=source_hash, schema_hash=schema_hash)
+        calibration_payload = {
+            "theta": calibration.theta.detach().cpu(),
+            "accepted": calibration.accepted,
+            "fallback_reason": calibration.fallback_reason,
+            "train_calib_raw_joint": calibration.train_calib_raw_joint,
+            "train_calib_deploy_joint": calibration.train_calib_deploy_joint,
+        }
+        save_checkpoint(output_dir / "checkpoint_latest.pth", model=model, optimizer=optimizer, scheduler=scheduler, epoch=epoch, micro_step=0, optimizer_step=global_step, runtime_profile=checkpoint_runtime, meta_state=checkpoint_meta, pu_state={"lambda": pu_lambda.detach().cpu(), "audit": pu_audit_state}, calibration=calibration_payload, config_hash=config_hash, source_hash=source_hash, schema_hash=schema_hash)
         if joint > best_joint:
             best_joint = joint
             checkpoint_meta["best_joint"] = best_joint
-            save_checkpoint(output_dir / "checkpoint_best_test_deploy_joint.pth", model=model, optimizer=optimizer, scheduler=scheduler, epoch=epoch, micro_step=0, optimizer_step=global_step, runtime_profile=checkpoint_runtime, meta_state=checkpoint_meta, pu_state={"lambda": pu_lambda.detach().cpu(), "audit": pu_audit_state}, calibration={"theta": calibration.theta.detach().cpu()}, config_hash=config_hash, source_hash=source_hash, schema_hash=schema_hash)
+            save_checkpoint(output_dir / "checkpoint_best_test_deploy_joint.pth", model=model, optimizer=optimizer, scheduler=scheduler, epoch=epoch, micro_step=0, optimizer_step=global_step, runtime_profile=checkpoint_runtime, meta_state=checkpoint_meta, pu_state={"lambda": pu_lambda.detach().cpu(), "audit": pu_audit_state}, calibration=calibration_payload, config_hash=config_hash, source_hash=source_hash, schema_hash=schema_hash)
         branch_checkpoint_metrics = {
             "action_mf1": float(deploy.get("Act_mF1", float("-inf"))),
             "action_map": float(deploy.get("Act_mAP", float("-inf"))),
@@ -591,7 +638,7 @@ def run(args: argparse.Namespace) -> None:
             if metric_value > float(best_branch_metrics.get(metric_name, float("-inf"))):
                 best_branch_metrics[metric_name] = metric_value
                 checkpoint_meta["best_branch_metrics"] = best_branch_metrics
-                save_checkpoint(output_dir / best_checkpoint_names[metric_name], model=model, optimizer=optimizer, scheduler=scheduler, epoch=epoch, micro_step=0, optimizer_step=global_step, runtime_profile=checkpoint_runtime, meta_state=checkpoint_meta, pu_state={"lambda": pu_lambda.detach().cpu(), "audit": pu_audit_state}, calibration={"theta": calibration.theta.detach().cpu()}, config_hash=config_hash, source_hash=source_hash, schema_hash=schema_hash)
+                save_checkpoint(output_dir / best_checkpoint_names[metric_name], model=model, optimizer=optimizer, scheduler=scheduler, epoch=epoch, micro_step=0, optimizer_step=global_step, runtime_profile=checkpoint_runtime, meta_state=checkpoint_meta, pu_state={"lambda": pu_lambda.detach().cpu(), "audit": pu_audit_state}, calibration=calibration_payload, config_hash=config_hash, source_hash=source_hash, schema_hash=schema_hash)
         print(json.dumps({"epoch": epoch, "test": {"Act_mF1": deploy.get("Act_mF1"), "Act_oF1": deploy.get("Act_oF1"), "Exp_mF1": deploy.get("Exp_mF1"), "Exp_oF1": deploy.get("Exp_oF1"), "deploy_joint": joint}, "best_joint": best_joint}, sort_keys=True), flush=True)
 
 
