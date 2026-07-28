@@ -13,7 +13,13 @@ import torch
 
 from fate_oia.models.meter_oia_model import METEROIAModel
 from fate_oia.losses.meter_pu_losses import meter_private_pu_loss
-from fate_oia.utils.meter_artifacts import file_hash, state_hash, write_json
+from fate_oia.utils.meter_artifacts import (
+    combined_file_hash,
+    file_hash,
+    python_source_tree_hash,
+    state_hash,
+    write_json,
+)
 from fate_oia.utils.meter_config import load_meter_config
 
 
@@ -358,9 +364,9 @@ def run_audit(
         "real_dino": real_result,
         "config_error": config_error,
         "git_head": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip(),
-        "source_tree_hash": _sha_tree(root),
+        "source_tree_hash": python_source_tree_hash(root),
         "config_hash": file_hash(root / "configs/fate_oia_train_360x640_acpr_meter_oia_v1.yaml"),
-        "schema_hash": _combined_hash(root / "configs/meter_factor_schema.yaml", root / "configs/meter_grounding_schema.yaml"),
+        "schema_hash": combined_file_hash(root / "configs/meter_factor_schema.yaml", root / "configs/meter_grounding_schema.yaml"),
         "warnings": ["No readiness artifact may be issued without real-DINO execution."] if not real_dino else [],
         "clean_head": not bool(clean_status),
         "clean_status": clean_status,
@@ -398,23 +404,6 @@ def run_audit(
             report["pre_pilot_ready_path"] = str(root / ".review/METER_OIA_V1_PRE_PILOT_READY.json")
     write_json(output_dir / "implementation_audit_METER_OIA_V1.json", report)
     return report
-
-
-def _sha_tree(root: Path) -> str:
-    import hashlib
-    digest = hashlib.sha256()
-    for path in sorted(root.glob("fate_oia/**/*.py")):
-        digest.update(str(path.relative_to(root)).encode())
-        digest.update(path.read_bytes())
-    return digest.hexdigest()
-
-
-def _combined_hash(*paths: Path) -> str:
-    digest = hashlib.sha256()
-    for path in paths:
-        digest.update(str(path).encode("utf-8"))
-        digest.update(path.read_bytes())
-    return digest.hexdigest()
 
 
 def main() -> None:

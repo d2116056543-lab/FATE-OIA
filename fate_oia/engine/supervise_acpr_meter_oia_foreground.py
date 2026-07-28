@@ -7,8 +7,13 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
+from fate_oia.engine.train_acpr_meter_oia import validate_training_readiness
+from fate_oia.utils.meter_artifacts import python_source_tree_hash
+
 
 FALLBACK_LADDER = ((16, 2), (12, 3), (8, 4), (6, 5))
+PILOT_READY_NAME = "METER_OIA_V1_PRE_PILOT_READY.json"
+FULL_READY_NAME = "METER_OIA_V1_FULL_TRAIN_READY.json"
 
 
 def run_foreground(command: Sequence[str], *, cwd: str | Path, fallback: Sequence[tuple[int, int]] = FALLBACK_LADDER) -> int:
@@ -61,14 +66,35 @@ def main() -> None:
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
     root = Path.cwd()
-    readiness_name = (
-        "METER_OIA_V1_PRE_PILOT_READY.json"
-        if args.mode == "pilot"
-        else "METER_OIA_V1_FULL_TRAIN_READY.json"
+    epochs = 3 if args.mode == "pilot" else 12
+    git_head = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=root, text=True
+    ).strip()
+    git_branch = subprocess.check_output(
+        ["git", "branch", "--show-current"], cwd=root, text=True
+    ).strip()
+    clean_status = subprocess.check_output(
+        ["git", "status", "--porcelain"], cwd=root, text=True
+    ).strip()
+    remote_line = subprocess.check_output(
+        ["git", "ls-remote", "github", f"refs/heads/{git_branch}"],
+        cwd=root,
+        text=True,
+    ).strip()
+    remote_head = remote_line.split()[0] if remote_line else ""
+    validate_training_readiness(
+        root=root,
+        config_path=(root / args.config).resolve(),
+        epochs=epochs,
+        use_mock_dino=False,
+        git_head=git_head,
+        git_branch=git_branch,
+        remote_head=remote_head,
+        clean_status=clean_status,
+        source_tree_hash=python_source_tree_hash(root),
     )
-    readiness_path = root / ".review" / readiness_name
-    if not readiness_path.exists():
-        raise SystemExit(f"{readiness_name} is required before {args.mode}")
+    readiness_name = PILOT_READY_NAME if args.mode == "pilot" else FULL_READY_NAME
+    print(f"validated readiness: {readiness_name} HEAD={git_head}", flush=True)
     command = [
         sys.executable, "-u", "-m", "fate_oia.engine.train_acpr_meter_oia",
         "--config", args.config, "--output_dir", args.output_dir,
@@ -77,7 +103,7 @@ def main() -> None:
     if args.mode == "pilot":
         command.extend(["--epochs", "3", "--max_train_samples", "4096", "--max_audit_samples", "1024", "--max_calib_samples", "512", "--max_test_samples", "512"])
     else:
-        command.extend(["--epochs", "12"])
+        command.extend(["--epochs", str(epochs)])
     raise SystemExit(run_foreground(command, cwd=root))
 
 

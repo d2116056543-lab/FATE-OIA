@@ -14,6 +14,9 @@ if (-not (Test-Path $Python)) { throw "Missing Python runtime: $Python" }
 if ([string]::IsNullOrWhiteSpace($OutputDir)) {
   $OutputDir = if ($Mode -eq 'pilot') { '.background_runs\meter_oia_v1_pilot' } else { '.background_runs\meter_oia_v1_full' }
 }
+if ($Mode -eq 'full' -and $UseMockDino) {
+  throw 'Full training cannot use mock DINO'
+}
 $ReadyName = if ($Mode -eq 'pilot') { 'METER_OIA_V1_PRE_PILOT_READY.json' } else { 'METER_OIA_V1_FULL_TRAIN_READY.json' }
 $Ready = Join-Path $Root (Join-Path '.review' $ReadyName)
 if (-not (Test-Path $Ready)) { throw "$ReadyName is required before $Mode" }

@@ -10,6 +10,26 @@ import numpy as np
 import torch
 
 
+def combined_file_hash(*paths: str | Path) -> str:
+    """Hash path identity and bytes using the canonical readiness algorithm."""
+    digest = hashlib.sha256()
+    for value in paths:
+        path = Path(value)
+        digest.update(str(path).encode("utf-8"))
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def python_source_tree_hash(root: str | Path) -> str:
+    """Hash every tracked Python source location used by METER readiness."""
+    base = Path(root)
+    digest = hashlib.sha256()
+    for path in sorted(base.glob("fate_oia/**/*.py")):
+        digest.update(str(path.relative_to(base)).encode())
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
 def write_json(path: str | Path, value: Mapping[str, Any]) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)

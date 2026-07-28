@@ -33,7 +33,9 @@ from fate_oia.optim.meter_meta_utility import METERMetaUtility
 from fate_oia.transforms_meter import meter_image_transform
 from fate_oia.utils.meter_artifacts import (
     append_jsonl,
+    combined_file_hash,
     file_hash,
+    python_source_tree_hash,
     save_checkpoint,
     save_epoch_artifacts,
     state_hash,
@@ -42,6 +44,35 @@ from fate_oia.utils.meter_artifacts import (
 )
 from fate_oia.utils.meter_config import load_meter_config
 from fate_oia.utils.meter_posthoc_calibration import METERCalibrationResult, apply_meter_deploy, fit_train_calib_deploy_theta, guard_train_calib_deploy_theta
+
+
+FULL_READY_REQUIRED_CHECKS = {
+    "exact_pilot_protocol",
+    "finite",
+    "all_owner_steps_positive",
+    "peak_reserved_under_45gb",
+    "action_semantic_compatible",
+    "action_final_compatible",
+    "semantic_visual_ratio",
+    "selector_nonconstant",
+    "selector_regret_decreased",
+    "reason_mix_synergy",
+    "reason_final_not_below_calalign",
+    "annotation_residual_range",
+    "factor_shuffle_hurts_12_labels",
+    "meta_high_omega_4",
+    "meta_low_omega_4",
+    "meta_share_rate",
+    "meta_positive_utility",
+    "evidence_not_max_entropy",
+    "support_null_nontrivial",
+    "counter_null_nontrivial",
+    "counterfactual_all_actions",
+    "counterfactual_12_factors",
+    "selected_beats_control",
+    "counter_direction",
+    "github_head_matches",
+}
 
 
 def _sha(value: str) -> str:
@@ -549,6 +580,7 @@ def _write_full_train_ready_if_eligible(
     git_branch: str,
     config_hash: str,
     schema_hash: str,
+    source_tree_hash: str,
     history: list[dict[str, Any]],
 ) -> dict[str, Any]:
     exact_pilot = (
@@ -630,6 +662,7 @@ def _write_full_train_ready_if_eligible(
         "branch": git_branch,
         "config_hash": config_hash,
         "schema_hash": schema_hash,
+        "source_tree_hash": source_tree_hash,
         "checks": checks,
         "history": history,
         "internal_test_selected": True,
@@ -644,6 +677,74 @@ def _write_full_train_ready_if_eligible(
     return report
 
 
+def validate_training_readiness(
+    *,
+    root: Path,
+    config_path: Path,
+    epochs: int,
+    use_mock_dino: bool,
+    git_head: str,
+    git_branch: str,
+    remote_head: str,
+    clean_status: str,
+    source_tree_hash: str,
+) -> dict[str, Any]:
+    """Validate the signed readiness payload, not merely its existence."""
+    is_pilot = int(epochs) <= 3
+    if use_mock_dino:
+        phase = "pilot" if is_pilot else "full"
+        raise RuntimeError(f"{phase} training cannot use mock DINO")
+    readiness_name = (
+        "METER_OIA_V1_PRE_PILOT_READY.json"
+        if is_pilot
+        else "METER_OIA_V1_FULL_TRAIN_READY.json"
+    )
+    expected_artifact = (
+        "METER_OIA_V1_PRE_PILOT_READY"
+        if is_pilot
+        else "METER_OIA_V1_FULL_TRAIN_READY"
+    )
+    ready_path = root / ".review" / readiness_name
+    if not ready_path.exists():
+        raise RuntimeError(f"{readiness_name} is required before training")
+    payload = json.loads(ready_path.read_text(encoding="utf-8-sig"))
+    expected_config_hash = file_hash(config_path)
+    expected_schema_hash = combined_file_hash(
+        root / "configs/meter_factor_schema.yaml",
+        root / "configs/meter_grounding_schema.yaml",
+    )
+    checks = {
+        "artifact": payload.get("artifact") == expected_artifact,
+        "HEAD": payload.get("HEAD") == git_head,
+        "config_hash": payload.get("config_hash") == expected_config_hash,
+        "schema_hash": payload.get("schema_hash") == expected_schema_hash,
+        "source_tree_hash": payload.get("source_tree_hash") == source_tree_hash,
+        "clean_worktree": clean_status == "",
+        "branch": payload.get("branch") == git_branch,
+        "remote_HEAD": remote_head == git_head,
+    }
+    if is_pilot:
+        checks.update({
+            "unresolved": payload.get("unresolved") == [],
+            "real_dino": bool(payload.get("real_dino", {}).get("pass")),
+        })
+    else:
+        gate_checks = payload.get("checks", {})
+        checks.update({
+            "pass=true": payload.get("pass") is True,
+            "required_check_keys": FULL_READY_REQUIRED_CHECKS.issubset(gate_checks),
+            "all_checks": FULL_READY_REQUIRED_CHECKS.issubset(gate_checks)
+            and all(gate_checks[key] is True for key in FULL_READY_REQUIRED_CHECKS),
+            "gate_github_head": payload.get("github_head") == git_head,
+        })
+    failed = [name for name, passed in checks.items() if not passed]
+    if failed:
+        raise RuntimeError(
+            f"{readiness_name} validation failed: {', '.join(failed)}"
+        )
+    return payload
+
+
 def run(args: argparse.Namespace) -> None:
     config_path = Path(args.config)
     cfg = load_meter_config(config_path)
@@ -653,15 +754,39 @@ def run(args: argparse.Namespace) -> None:
     cfg["training"]["gradient_accumulation_steps"] = grad_accum
     if grad_accum < 1:
         raise ValueError("gradient_accumulation_steps must be positive")
-    if args.require_ready:
-        readiness_name = (
-            "METER_OIA_V1_PRE_PILOT_READY.json"
-            if int(args.epochs) <= 3
-            else "METER_OIA_V1_FULL_TRAIN_READY.json"
+    root = Path(args.worktree_root or ".").resolve()
+    try:
+        git_head = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=root, text=True
+        ).strip()
+        git_branch = subprocess.check_output(
+            ["git", "branch", "--show-current"], cwd=root, text=True
+        ).strip()
+        clean_status = subprocess.check_output(
+            ["git", "status", "--porcelain"], cwd=root, text=True
+        ).strip()
+        remote_line = subprocess.check_output(
+            ["git", "ls-remote", "github", f"refs/heads/{git_branch}"],
+            cwd=root,
+            text=True,
+        ).strip()
+        remote_head = remote_line.split()[0] if remote_line else ""
+    except (OSError, subprocess.CalledProcessError):
+        git_head, git_branch, clean_status, remote_head = (
+            "unknown", "unknown", "git-state-unavailable", ""
         )
-        ready = Path(args.worktree_root or ".") / ".review" / readiness_name
-        if not ready.exists():
-            raise RuntimeError(f"{readiness_name} is required before training")
+    current_source_tree_hash = python_source_tree_hash(root)
+    validate_training_readiness(
+        root=root,
+        config_path=config_path.resolve(),
+        epochs=int(args.epochs),
+        use_mock_dino=bool(args.use_mock_dino),
+        git_head=git_head,
+        git_branch=git_branch,
+        remote_head=remote_head,
+        clean_status=clean_status,
+        source_tree_hash=current_source_tree_hash,
+    )
     device = torch.device(args.device)
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = bool(cfg["training"].get("tf32", True))
@@ -702,12 +827,10 @@ def run(args: argparse.Namespace) -> None:
     )
     baseline_hash = str(cfg["audit"]["require_source_sha"])
     config_hash = file_hash(config_path)
-    schema_hash = _sha(Path("configs/meter_factor_schema.yaml").read_text(encoding="utf-8") + Path("configs/meter_grounding_schema.yaml").read_text(encoding="utf-8"))
-    try:
-        git_head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
-        git_branch = subprocess.check_output(["git", "branch", "--show-current"], text=True).strip()
-    except (OSError, subprocess.CalledProcessError):
-        git_head, git_branch = "unknown", "unknown"
+    schema_hash = combined_file_hash(
+        root / "configs/meter_factor_schema.yaml",
+        root / "configs/meter_grounding_schema.yaml",
+    )
     source_hash = git_head
     (output_dir / "config_resolved.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
     write_json(output_dir / "config_resolved.yaml.json", cfg)
@@ -1227,6 +1350,7 @@ def run(args: argparse.Namespace) -> None:
             git_branch=git_branch,
             config_hash=config_hash,
             schema_hash=schema_hash,
+            source_tree_hash=current_source_tree_hash,
             history=pilot_history,
         )
 
