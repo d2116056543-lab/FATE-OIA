@@ -98,6 +98,7 @@ def _dynamic_checks(device: torch.device) -> dict[str, Any]:
     layer_maps = out1_probe["factor_support_maps_by_layer"]
     null = out1_probe["factor_support_null_by_layer"]
     normalization = (layer_maps.sum(-1) + null).mean().item()
+    support_counter_gap = (out1_probe["factor_support_map"] - out1_probe["factor_counter_map"]).abs().mean().item()
     contribution_error = (out1["action_logits_semantic"] - (model.action_peer.semantic_bias.view(1, -1) + out1["action_factor_contributions"].sum(-1))).abs().max().item()
     foundation_error = (out0["action_logits_final"] - foundation["action_logits_calalign"]).abs().max().item()
     reason_error = (out0["reason_logits_final"] - foundation["reason_logits_calalign"]).abs().max().item()
@@ -110,6 +111,8 @@ def _dynamic_checks(device: torch.device) -> dict[str, Any]:
         "shape_ok": shape_ok,
         "map_normalization_mean": normalization,
         "map_normalization_ok": abs(normalization - 1.0) < 1e-4,
+        "support_counter_gap": support_counter_gap,
+        "support_counter_separated": support_counter_gap > 1e-6,
         "semantic_additivity_error": contribution_error,
         "semantic_additivity_ok": contribution_error < 1e-6,
         "progress_zero_action_error": foundation_error,
@@ -186,7 +189,7 @@ def run_audit(
     functional = {
         "dataset_targets": (root / "fate_oia/datasets/meter_signed_targets.py").exists(),
         "dino_field": dynamic["shape_ok"] and dynamic["dino_frozen_ok"],
-        "signed_factor_maps": dynamic["map_normalization_ok"],
+        "signed_factor_maps": dynamic["map_normalization_ok"] and dynamic["support_counter_separated"],
         "semantic_action": dynamic["semantic_additivity_ok"],
         "foundation_equivalence": dynamic["progress_zero_ok"],
         "meta_override_reachable": "factor_parameter_override" in (root / "fate_oia/models/meter_oia_model.py").read_text(encoding="utf-8"),

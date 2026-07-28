@@ -24,13 +24,18 @@ class METERsignedFactors(nn.Module):
         self.dim = int(dim)
         self.factor_dim = int(factor_dim)
         self.num_layers = int(num_layers)
-        self.support_embedding = nn.Parameter(torch.randn(dim) * 0.02)
-        self.counter_embedding = nn.Parameter(torch.randn(dim) * 0.02)
+        # Keep both signed queries trainable and non-zero at initialization.
+        # A 0.02 scale made support/counter maps numerically indistinguishable
+        # on the 384-d frozen field during the first updates.
+        self.support_embedding = nn.Parameter(torch.empty(dim))
+        self.counter_embedding = nn.Parameter(torch.empty(dim))
+        nn.init.normal_(self.support_embedding, mean=0.0, std=0.08)
+        nn.init.normal_(self.counter_embedding, mean=0.0, std=0.08)
         self.query_proj = nn.Linear(dim, dim)
         self.key_proj = nn.ModuleList(nn.Linear(dim, dim) for _ in range(num_layers))
         self.value_proj = nn.ModuleList(nn.Linear(dim, dim) for _ in range(num_layers))
-        self.null_keys = nn.Parameter(torch.randn(2, num_layers, dim) * 0.02)
-        self.null_values = nn.Parameter(torch.randn(2, num_layers, dim) * 0.02)
+        self.null_keys = nn.Parameter(torch.randn(2, num_layers, dim) * 0.04)
+        self.null_values = nn.Parameter(torch.randn(2, num_layers, dim) * 0.04)
         self.layer_delta = nn.Parameter(torch.zeros(factor_dim, num_layers))
         self.evidence_proj = nn.Linear(dim, dim, bias=False)
         self.evidence_norm = nn.LayerNorm(dim)
