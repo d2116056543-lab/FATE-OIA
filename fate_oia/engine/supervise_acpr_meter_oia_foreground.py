@@ -11,7 +11,9 @@ from fate_oia.engine.train_acpr_meter_oia import validate_training_readiness
 from fate_oia.utils.meter_artifacts import python_source_tree_hash
 
 
-FALLBACK_LADDER = ((16, 2), (12, 3), (8, 4), (6, 5))
+# The real-DINO profile selected 6/5. Larger candidates exceeded the
+# reserved-memory limit, so retries may only reduce the physical batch.
+FALLBACK_LADDER = ((6, 5), (4, 8), (3, 11), (2, 16))
 PILOT_READY_NAME = "METER_OIA_V1_PRE_PILOT_READY.json"
 FULL_READY_NAME = "METER_OIA_V1_FULL_TRAIN_READY.json"
 
