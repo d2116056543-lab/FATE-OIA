@@ -5,11 +5,17 @@ import torch.nn.functional as F
 from torch import Tensor
 
 
-def asymmetric_multilabel_loss(logits: Tensor, target: Tensor, gamma_negative: float = 2.0) -> Tensor:
+def asymmetric_multilabel_elements(
+    logits: Tensor, target: Tensor, gamma_negative: float = 2.0
+) -> Tensor:
     probability = torch.sigmoid(logits)
     positive = -target * torch.log(probability.clamp_min(1e-6))
     negative = -(1.0 - target) * probability.pow(gamma_negative) * torch.log((1.0 - probability).clamp_min(1e-6))
-    return (positive + negative).mean()
+    return positive + negative
+
+
+def asymmetric_multilabel_loss(logits: Tensor, target: Tensor, gamma_negative: float = 2.0) -> Tensor:
+    return asymmetric_multilabel_elements(logits, target, gamma_negative).mean()
 
 
 def soft_f1_loss(logits: Tensor, target: Tensor) -> Tensor:
@@ -53,14 +59,19 @@ def meter_action_loss_per_sample(
     cardinality = F.smooth_l1_loss(
         probability.sum(dim=-1), target.sum(dim=-1), reduction="none"
     )
-    peer = F.binary_cross_entropy_with_logits(
-        output["action_logits_peer"], target, reduction="none"
+    peer = asymmetric_multilabel_elements(
+        output.get("action_logits_peer_regret", output["action_logits_peer"]),
+        target,
     )
-    visual_per = F.binary_cross_entropy_with_logits(
-        output["action_logits_visual"].detach(), target, reduction="none"
+    visual_per = asymmetric_multilabel_elements(
+        output["action_logits_visual"].detach(), target
     )
-    semantic_per = F.binary_cross_entropy_with_logits(
-        output["action_logits_semantic"].detach(), target, reduction="none"
+    semantic_per = asymmetric_multilabel_elements(
+        output.get(
+            "action_logits_semantic_transport",
+            output["action_logits_semantic"],
+        ).detach(),
+        target,
     )
     selector_regret = torch.relu(
         peer - torch.minimum(visual_per, semantic_per) + 1e-4
@@ -84,9 +95,20 @@ def meter_action_loss(output: dict[str, Tensor], target: Tensor, weights: dict[s
     two_way = F.binary_cross_entropy_with_logits(output["action_logits_peer"], target)
     soft_f1 = soft_f1_loss(output["action_logits_final"], target)
     cardinality = F.smooth_l1_loss(torch.sigmoid(output["action_logits_final"]).sum(dim=-1), target.sum(dim=-1))
-    peer = F.binary_cross_entropy_with_logits(output["action_logits_peer"], target, reduction="none")
-    visual_per = F.binary_cross_entropy_with_logits(output["action_logits_visual"].detach(), target, reduction="none")
-    semantic_per = F.binary_cross_entropy_with_logits(output["action_logits_semantic"].detach(), target, reduction="none")
+    peer = asymmetric_multilabel_elements(
+        output.get("action_logits_peer_regret", output["action_logits_peer"]),
+        target,
+    )
+    visual_per = asymmetric_multilabel_elements(
+        output["action_logits_visual"].detach(), target
+    )
+    semantic_per = asymmetric_multilabel_elements(
+        output.get(
+            "action_logits_semantic_transport",
+            output["action_logits_semantic"],
+        ).detach(),
+        target,
+    )
     selector_regret = torch.relu(peer - torch.minimum(visual_per, semantic_per) + 1e-4).mean()
     total = (
         weights.get("action_final", 1.0) * final

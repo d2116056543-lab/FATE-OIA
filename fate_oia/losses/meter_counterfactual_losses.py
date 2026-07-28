@@ -13,6 +13,9 @@ def meter_counterfactual_loss(
     *,
     target_action_effect: Tensor | None = None,
     wrong_action_effect: Tensor | None = None,
+    counter_action_effect: Tensor | None = None,
+    counter_control_effect: Tensor | None = None,
+    counter_control_action_effect: Tensor | None = None,
 ) -> dict[str, Tensor]:
     """Enforce selected-vs-control and target-specific same-image effects.
 
@@ -22,10 +25,31 @@ def meter_counterfactual_loss(
     used by the unit tests.
     """
     selected_control = torch.relu(0.02 - selected_effect + control_effect).mean()
+    if counter_control_effect is not None:
+        selected_control = selected_control + torch.relu(
+            0.02 - counter_direction + counter_control_effect
+        ).mean()
     specificity_terms = [torch.relu(0.02 - selected_effect + wrong_target_effect)]
     if target_action_effect is not None and wrong_action_effect is not None:
         specificity_terms.append(torch.relu(0.02 - target_action_effect + wrong_action_effect))
     specificity = torch.stack([term.mean() for term in specificity_terms]).mean()
-    direction = torch.relu(-support_direction).mean() + torch.relu(-counter_direction).mean()
+    direction_terms = [
+        torch.relu(-support_direction).mean(),
+        torch.relu(-counter_direction).mean(),
+    ]
+    if counter_action_effect is not None:
+        direction_terms.append(torch.relu(-counter_action_effect).mean())
+    if (
+        counter_action_effect is not None
+        and counter_control_action_effect is not None
+    ):
+        direction_terms.append(
+            torch.relu(
+                0.02
+                - counter_action_effect
+                + counter_control_action_effect
+            ).mean()
+        )
+    direction = torch.stack(direction_terms).sum()
     total = selected_control + specificity + direction
     return {"selected_control": selected_control, "specificity": specificity, "direction": direction, "total": total}

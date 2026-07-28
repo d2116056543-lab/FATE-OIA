@@ -74,6 +74,9 @@ def _mechanism_stats(mechanism: dict[str, torch.Tensor]) -> dict[str, Any]:
     selector = mechanism["action_selector"]
     visual = mechanism["action_logits_visual"]
     semantic = mechanism["action_logits_semantic"]
+    transport_delta = mechanism.get(
+        "action_semantic_transport_delta", semantic - visual
+    )
     contributions = mechanism["action_factor_contributions"]
     factor_reliability = mechanism["factor_reliability"]
     mix_gate = mechanism["reason_mix_gate"]
@@ -101,7 +104,32 @@ def _mechanism_stats(mechanism: dict[str, torch.Tensor]) -> dict[str, Any]:
         "selector_std": float(selector.std(unbiased=False).item()),
         "selector_min": float(selector.min().item()),
         "selector_max": float(selector.max().item()),
-        "semantic_visual_rms_ratio": float((semantic.float().square().mean().sqrt() / (visual.float().square().mean().sqrt() + 1e-6)).item()),
+        "semantic_visual_rms_ratio": float(
+            (
+                transport_delta.float().square().mean().sqrt()
+                / (visual.float().square().mean().sqrt() + 1e-6)
+            ).item()
+        ),
+        "semantic_transport_actual_ratio_per_action": (
+            transport_delta.float().square().mean(dim=0).sqrt()
+            / visual.float().square().mean(dim=0).sqrt().clamp_min(1e-6)
+        ).tolist(),
+        "semantic_probe_visual_rms_ratio": float(
+            (
+                semantic.float().square().mean().sqrt()
+                / (visual.float().square().mean().sqrt() + 1e-6)
+            ).item()
+        ),
+        "semantic_transport_scale_mean": float(
+            mechanism.get(
+                "semantic_transport_scale", semantic.new_ones(1)
+            ).float().mean().item()
+        ),
+        "semantic_transport_saturation_rate": float(
+            mechanism.get(
+                "semantic_transport_saturation_rate", semantic.new_zeros(1)
+            ).float().mean().item()
+        ),
         "semantic_contribution_rms": float(contributions.float().square().mean().sqrt().item()),
         "visual_logit_rms": float(visual.float().square().mean().sqrt().item()),
         "factor_contribution_sum_error": float((semantic - (mechanism["semantic_bias"] + contributions.sum(-1))).abs().max().item()) if "semantic_bias" in mechanism else None,
@@ -146,8 +174,11 @@ def collect_outputs(model: torch.nn.Module, loader: Iterable[dict[str, Any]], de
             }.get(name, "action_logits_final")
             all_action[name].append(output[key].detach().cpu())
             if name == "final":
-                for key in ("factor_support_map", "factor_counter_map", "factor_support_null", "factor_counter_null", "factor_support_score", "factor_counter_score", "factor_layer_weights", "factor_reliability", "action_selector", "action_factor_contributions", "semantic_bias", "action_logits_visual", "action_logits_semantic"):
-                    mechanism_values.setdefault(key, []).append(output[key].detach().cpu())
+                for key in ("factor_support_map", "factor_counter_map", "factor_support_null", "factor_counter_null", "factor_support_score", "factor_counter_score", "factor_layer_weights", "factor_reliability", "action_selector", "action_factor_contributions", "semantic_bias", "action_logits_visual", "action_logits_semantic", "action_semantic_transport_delta", "semantic_transport_scale", "semantic_transport_saturation_rate"):
+                    if key in output:
+                        mechanism_values.setdefault(key, []).append(
+                            output[key].detach().cpu()
+                        )
         for name, modes in REASON_BRANCHES.items():
             output = outputs_by_modes[modes]
             key = {

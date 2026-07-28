@@ -42,9 +42,17 @@ class METERPrivateReasonDecoder(nn.Module):
             self.global_key.bias.copy_(trunk.key_proj.bias)
             self.global_value.weight.copy_(trunk.value_proj.weight)
             self.global_value.bias.copy_(trunk.value_proj.bias)
+            self.local_proj.weight.copy_(trunk.value_proj.weight)
+            self.local_proj.bias.copy_(trunk.value_proj.bias)
             self.reason_self_attention.load_state_dict(trunk.label_self_attn.state_dict())
             self.global_head.weight.copy_(trunk.logit_head.weight)
             self.global_head.bias.copy_(trunk.logit_head.bias)
+            self.local_head.weight.copy_(trunk.logit_head.weight)
+            self.local_head.bias.copy_(trunk.logit_head.bias)
+            nn.init.zeros_(self.factor_proj.weight)
+            nn.init.zeros_(self.factor_proj.bias)
+            nn.init.zeros_(self.action_proj.weight)
+            nn.init.zeros_(self.action_proj.bias)
 
     @staticmethod
     def _ramp(progress: float) -> float:
@@ -108,6 +116,13 @@ class METERPrivateReasonDecoder(nn.Module):
         )
         mix_gate = torch.sigmoid(self.mix_gate(gate_features).squeeze(-1))
         logits_mix = mix_gate * logits_global + (1.0 - mix_gate) * logits_local
+        mix_gate_regret = torch.sigmoid(
+            self.mix_gate(gate_features.detach()).squeeze(-1)
+        )
+        logits_mix_regret = (
+            mix_gate_regret * logits_global.detach()
+            + (1.0 - mix_gate_regret) * logits_local.detach()
+        )
         annotation_features = torch.cat([global_token, local_token, factor_reliability.detach().unsqueeze(-1), disagreement], dim=-1)
         annotation_delta = 0.5 * torch.tanh(self.annotation_head(annotation_features).squeeze(-1))
         candidate = logits_mix + annotation_delta
@@ -119,10 +134,12 @@ class METERPrivateReasonDecoder(nn.Module):
             "reason_logits_global": logits_global,
             "reason_logits_local": logits_local,
             "reason_logits_mix": logits_mix,
+            "reason_logits_mix_regret": logits_mix_regret,
             "reason_annotation_delta": annotation_delta,
             "reason_logits_candidate": candidate,
             "reason_logits_final": final,
             "reason_mix_gate": mix_gate,
+            "reason_mix_gate_regret": mix_gate_regret,
             "reason_tail_sensitivity": tail.squeeze(-1).abs(),
             "reason_layer_weights": layer_weights,
         }

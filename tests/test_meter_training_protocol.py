@@ -18,6 +18,18 @@ def test_training_protocol_is_test_only_and_has_disjoint_calibration() -> None:
     assert config["splits"]["main_audit_calib_disjoint"] is True
 
 
+def test_new_mechanism_controls_are_resolved_in_config() -> None:
+    config = yaml.safe_load(
+        Path("configs/fate_oia_train_360x640_acpr_meter_oia_v1.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert config["loss_weights"]["reason_mix_regret"] == 0.10
+    assert config["model"]["semantic_transport_target_ratio"] == 0.15
+    assert config["model"]["semantic_transport_rms_momentum"] == 0.95
+    assert config["model"]["semantic_transport_per_action"] is True
+
+
 def _sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 

@@ -252,7 +252,7 @@ def _counterfactual_event(
     if action_target is not None:
         action_target = action_target[event_row : event_row + 1]
 
-    maps = output["factor_support_map"].detach()
+    maps = output["factor_support_attribution"].detach().clamp_min(0.0)
     batch, factors, patches = maps.shape
     contributions = output["action_factor_contributions"].detach()
     if action_target is None:
@@ -265,8 +265,16 @@ def _counterfactual_event(
         target_action_id = torch.where(empty, fallback, action_strength.argmax(dim=1))
     row = torch.arange(batch, device=maps.device)
     target_contributions = contributions[row, target_action_id]
-    factor_priority = target_contributions.abs() * (0.25 + output["factor_reliability"].detach())
-    chosen_factor = factor_priority.argmax(dim=1)
+    choice = _choose_counterfactual_factors(
+        contributions,
+        output["factor_reliability"].detach(),
+        output["factor_support_score"].detach(),
+        output["factor_counter_score"].detach(),
+        target_action_id,
+    )
+    chosen_factor = choice["support_factor"]
+    counter_factor = choice["counter_factor"]
+    factor_priority = choice["support_priority"]
     wrong_factor = factor_priority.argmin(dim=1)
 
     support_mask, support_counts = _select_mass_mask(
@@ -276,9 +284,10 @@ def _counterfactual_event(
         minimum_patches=minimum_patches,
         max_patches=max_patches,
     )
+    counter_maps = output["factor_counter_attribution"].detach().clamp_min(0.0)
     counter_mask, counter_counts = _select_mass_mask(
-        output["factor_counter_map"].detach(),
-        chosen_factor,
+        counter_maps,
+        counter_factor,
         selected_mass=selected_mass,
         minimum_patches=minimum_patches,
         max_patches=max_patches,
@@ -291,8 +300,12 @@ def _counterfactual_event(
         max_patches=max_patches,
     )
     valid = (
-        (output["factor_support_null"].detach()[row, chosen_factor] < 0.90)
-        & (output["factor_counter_null"].detach()[row, chosen_factor] < 0.90)
+        choice["support_valid"]
+        & choice["counter_valid"]
+        & (maps[row, chosen_factor].sum(dim=-1) > 1e-8)
+        & (counter_maps[row, counter_factor].sum(dim=-1) > 1e-8)
+        & (output["factor_support_null"].detach()[row, chosen_factor] < 0.90)
+        & (output["factor_counter_null"].detach()[row, counter_factor] < 0.90)
     )
     if not bool(valid.any()):
         zero = output["factor_support_score"].new_zeros(())
@@ -301,12 +314,12 @@ def _counterfactual_event(
             "selected_effect": zero,
             "control_effect": zero,
             "total": zero,
-            "skip_reason": "high_null_mass",
+            "skip_reason": "no_signed_support_or_counter_evidence",
         }
 
     token_mean = field["patch_tokens_by_layer"].mean(dim=1)
     token_norm = token_mean.float().square().mean(dim=-1).sqrt()
-    response = maps + output["factor_counter_map"].detach()
+    response = maps + counter_maps
     support_control_mask, support_control_relaxed = _matched_control_mask(
         support_mask,
         response,
@@ -316,7 +329,7 @@ def _counterfactual_event(
     counter_control_mask, counter_control_relaxed = _matched_control_mask(
         counter_mask,
         response,
-        chosen_factor,
+        counter_factor,
         token_norm,
     )
 
@@ -340,8 +353,14 @@ def _counterfactual_event(
     selected_effect = output["factor_support_score"][row, factor] - selected_output["factor_support_score"][row, factor]
     control_effect = output["factor_support_score"][row, factor] - control_output["factor_support_score"][row, factor]
     wrong_effect = output["factor_support_score"][row, factor] - wrong_output["factor_support_score"][row, factor]
-    counter_effect = output["factor_counter_score"][row, factor] - counter_output["factor_counter_score"][row, factor]
-    counter_control_effect = output["factor_counter_score"][row, factor] - counter_control_output["factor_counter_score"][row, factor]
+    counter_effect = (
+        output["factor_counter_score"][row, counter_factor]
+        - counter_output["factor_counter_score"][row, counter_factor]
+    )
+    counter_control_effect = (
+        output["factor_counter_score"][row, counter_factor]
+        - counter_control_output["factor_counter_score"][row, counter_factor]
+    )
     action_count = output["action_logits_final"].shape[1]
     target_mask = F.one_hot(target_action_id, num_classes=action_count).to(dtype=torch.bool)
     wrong_action_mask = ~target_mask
@@ -353,6 +372,16 @@ def _counterfactual_event(
     target_action_effect = masked_action_effect(output["action_logits_final"], selected_output["action_logits_final"], target_mask)
     control_action_effect = masked_action_effect(output["action_logits_final"], control_output["action_logits_final"], target_mask)
     wrong_action_effect = masked_action_effect(output["action_logits_final"], selected_output["action_logits_final"], wrong_action_mask)
+    counter_action_effect = masked_action_effect(
+        counter_output["action_logits_final"],
+        output["action_logits_final"],
+        target_mask,
+    )
+    counter_control_action_effect = masked_action_effect(
+        counter_control_output["action_logits_final"],
+        output["action_logits_final"],
+        target_mask,
+    )
     event = meter_counterfactual_loss(
         selected_effect[valid],
         control_effect[valid],
@@ -361,6 +390,9 @@ def _counterfactual_event(
         counter_effect[valid],
         target_action_effect=target_action_effect,
         wrong_action_effect=wrong_action_effect,
+        counter_action_effect=counter_action_effect,
+        counter_control_effect=counter_control_effect[valid],
+        counter_control_action_effect=counter_control_action_effect,
     )
     return {
         **event,
@@ -368,6 +400,7 @@ def _counterfactual_event(
         "sample_index": event_row,
         "target_action_id": int(target_action_id[0].item()),
         "chosen_factor_id": int(chosen_factor[0].item()),
+        "counter_factor_id": int(counter_factor[0].item()),
         "wrong_factor_id": int(wrong_factor[0].item()),
         "selected_patch_count": int(support_counts.sum().item()),
         "counter_patch_count": int(counter_counts.sum().item()),
@@ -378,10 +411,45 @@ def _counterfactual_event(
         "target_action_effect": target_action_effect.detach(),
         "control_action_effect": control_action_effect.detach(),
         "wrong_action_effect": wrong_action_effect.detach(),
+        "counter_action_effect": counter_action_effect.detach(),
+        "counter_control_action_effect": counter_control_action_effect.detach(),
         "selected_control_overlap": int((support_mask & support_control_mask).sum().item()),
         "counter_control_overlap": int((counter_mask & counter_control_mask).sum().item()),
         "support_control_relaxed": int(support_control_relaxed),
         "counter_control_relaxed": int(counter_control_relaxed),
+    }
+
+
+def _choose_counterfactual_factors(
+    contributions: Tensor,
+    reliability: Tensor,
+    support_score: Tensor,
+    counter_score: Tensor,
+    target_action_id: Tensor,
+) -> dict[str, Tensor]:
+    """Choose distinct causal roles from signed target-action contributions."""
+    row = torch.arange(contributions.shape[0], device=contributions.device)
+    target_contributions = contributions[row, target_action_id]
+    reliability_weight = 0.25 + reliability
+    support_priority = (
+        target_contributions.clamp_min(0.0)
+        * reliability_weight
+        * support_score.detach()
+    )
+    counter_priority = (
+        (-target_contributions).clamp_min(0.0)
+        * reliability_weight
+        * counter_score.detach()
+    )
+    support_factor = support_priority.argmax(dim=1)
+    counter_factor = counter_priority.argmax(dim=1)
+    return {
+        "support_factor": support_factor,
+        "counter_factor": counter_factor,
+        "support_priority": support_priority,
+        "counter_priority": counter_priority,
+        "support_valid": support_priority.amax(dim=1) > 0,
+        "counter_valid": counter_priority.amax(dim=1) > 0,
     }
 
 
@@ -667,7 +735,16 @@ def _write_full_train_ready_if_eligible(
         "meta_high_omega_4": sum(float(value) > 0.20 for value in latest["omega"]) >= 4,
         "meta_low_omega_4": sum(float(value) < 0.05 for value in latest["omega"]) >= 4,
         "meta_share_rate": 0.15 <= sum(float(value) > 0 for value in latest["omega"]) / max(len(latest["omega"]), 1) <= 0.60,
-        "meta_positive_utility": any(float(value) > 0 for value in latest["utility_ema"]),
+        "meta_positive_utility": any(
+            float(omega) > 0
+            and float(score) > 0
+            and int(streak) >= 2
+            for omega, score, streak in zip(
+                latest["omega"],
+                latest.get("admission_score_ema", [0.0] * len(latest["omega"])),
+                latest.get("positive_streak", [0] * len(latest["omega"])),
+            )
+        ),
         "evidence_not_max_entropy": float(factor_stats["support_entropy_mean"]) < math.log(float(factor_stats["patch_count"]) + 1.0) - 1e-3,
         "support_null_nontrivial": 0.0 < float(factor_stats["support_null_mean"]) < 1.0,
         "counter_null_nontrivial": 0.0 < float(factor_stats["counter_null_mean"]) < 1.0,
@@ -863,6 +940,9 @@ def run(args: argparse.Namespace) -> None:
         dim=cfg["model"]["dim"], action_dim=cfg["model"]["action_dim"], reason_dim=cfg["model"]["reason_dim"],
         selected_layers=tuple(cfg["backbone"]["selected_layers"]), pretrained_weights=cfg["backbone"]["pretrained_weights"],
         use_mock_dino=args.use_mock_dino, factor_rank=cfg["model"].get("factor_rank", 16),
+        semantic_transport_target_ratio=cfg["model"]["semantic_transport_target_ratio"],
+        semantic_transport_rms_momentum=cfg["model"]["semantic_transport_rms_momentum"],
+        semantic_transport_per_action=cfg["model"]["semantic_transport_per_action"],
     ).to(device)
     model.foundation.dino.eval()
     optimizer = _make_optimizer(model, cfg)
@@ -1085,6 +1165,7 @@ def run(args: argparse.Namespace) -> None:
                     field,
                     progress=progress,
                     collect_timing=collect_timing,
+                    update_semantic_stats=True,
                 )
                 counterfactual = None
                 if is_update and (global_step + 1) % int(cfg["counterfactual"].get("every_optimizer_updates", 8)) == 0:
@@ -1468,6 +1549,8 @@ def run(args: argparse.Namespace) -> None:
             "selector_regret": sum(epoch_selector_regret) / max(len(epoch_selector_regret), 1),
             "omega": meta.omega.tolist(),
             "utility_ema": meta.utility_ema.tolist(),
+            "admission_score_ema": meta.admission_score_ema.tolist(),
+            "positive_streak": meta.positive_streak.tolist(),
             "owner_step_counts": dict(owner_step_counts),
             "owner_zero_gradient_rate": {
                 owner: owner_zero_gradient_counts.get(owner, 0) / max(count, 1)
@@ -1611,6 +1694,10 @@ def _test_counterfactual_diagnostic(model: METEROIAModel, dataset: METERDataset,
         "support_control_effect_mean": mean_value("support_control_effect"),
         "counter_selected_effect_mean": mean_value("counter_selected_effect"),
         "counter_control_effect_mean": mean_value("counter_control_effect"),
+        "counter_action_effect_mean": mean_value("counter_action_effect"),
+        "counter_control_action_effect_mean": mean_value(
+            "counter_control_action_effect"
+        ),
         "target_action_effect_mean": mean_value("target_action_effect"),
         "control_action_effect_mean": mean_value("control_action_effect"),
         "wrong_action_effect_mean": mean_value("wrong_action_effect"),
@@ -1622,9 +1709,14 @@ def _test_counterfactual_diagnostic(model: METEROIAModel, dataset: METERDataset,
             if int(record.get("valid_count", 0)) > 0 and "target_action_id" in record
         }),
         "covered_factor_ids": sorted({
-            int(record["chosen_factor_id"])
+            int(factor_id)
             for record in records
-            if int(record.get("valid_count", 0)) > 0 and "chosen_factor_id" in record
+            if int(record.get("valid_count", 0)) > 0
+            for factor_id in (
+                record.get("chosen_factor_id"),
+                record.get("counter_factor_id"),
+            )
+            if factor_id is not None
         }),
     }
 
@@ -1723,7 +1815,22 @@ def evaluate_test(model: METEROIAModel, cfg: dict[str, Any], device: torch.devic
         "file_names": collected["file_names"],
         "factor_stats": stats,
         "evidence_maps_stats": stats,
-        "selector_stats": {key: stats[key] for key in ("selector_mean", "selector_std", "selector_min", "selector_max", "semantic_visual_rms_ratio", "semantic_contribution_rms", "factor_contribution_sum_error")},
+        "selector_stats": {
+            key: stats[key]
+            for key in (
+                "selector_mean",
+                "selector_std",
+                "selector_min",
+                "selector_max",
+                "semantic_visual_rms_ratio",
+                "semantic_transport_actual_ratio_per_action",
+                "semantic_probe_visual_rms_ratio",
+                "semantic_transport_scale_mean",
+                "semantic_transport_saturation_rate",
+                "semantic_contribution_rms",
+                "factor_contribution_sum_error",
+            )
+        },
         "reason_view_stats": {key: stats[key] for key in ("reason_mix_gate_mean", "reason_mix_gate_std", "reason_annotation_rms", "reason_global_local_rms")},
         "counterfactual_stats": cf,
         "failure_cases": failure_cases,

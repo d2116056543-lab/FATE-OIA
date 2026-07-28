@@ -65,10 +65,13 @@ class METERsignedFactors(nn.Module):
         patches: Tensor,
         sign_index: int,
         progress: float,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+        score_weight: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         maps: list[Tensor] = []
         nulls: list[Tensor] = []
         details: list[Tensor] = []
+        patch_attributions: list[Tensor] = []
+        null_attributions: list[Tensor] = []
         scale = math.sqrt(self.dim)
         for layer in range(self.num_layers):
             key = self.key_proj[layer](patches[:, layer])
@@ -87,10 +90,24 @@ class METERsignedFactors(nn.Module):
             patch_map = (1.0 - null_mass).unsqueeze(-1) * patch_distribution
             detail = torch.einsum("bfn,bnd->bfd", patch_map, value)
             detail = detail + null_mass.unsqueeze(-1) * self.null_values[sign_index, layer].view(1, 1, -1)
+            value_score = torch.einsum("bnd,d->bn", value, score_weight)
+            patch_attributions.append(
+                patch_map * value_score.unsqueeze(1)
+            )
+            null_attributions.append(
+                null_mass
+                * torch.dot(self.null_values[sign_index, layer], score_weight)
+            )
             maps.append(patch_map)
             nulls.append(null_mass)
             details.append(detail)
-        return torch.stack(maps, dim=2), torch.stack(nulls, dim=2), torch.stack(details, dim=2)
+        return (
+            torch.stack(maps, dim=2),
+            torch.stack(nulls, dim=2),
+            torch.stack(details, dim=2),
+            torch.stack(patch_attributions, dim=2),
+            torch.stack(null_attributions, dim=2),
+        )
 
     def forward(
         self,
@@ -109,11 +126,19 @@ class METERsignedFactors(nn.Module):
             raise ValueError("Factor and patch dimensions must agree")
         positive_query = self.query_proj(factor_base_tokens + self.support_embedding.view(1, 1, -1))
         negative_query = self.query_proj(factor_base_tokens + self.counter_embedding.view(1, 1, -1))
-        support_layers, support_null_layers, support_detail_layers = self._read_sign(
-            positive_query, patch_tokens_by_layer, 0, progress
+        support_layers, support_null_layers, support_detail_layers, support_attr_layers, support_null_attr_layers = self._read_sign(
+            positive_query,
+            patch_tokens_by_layer,
+            0,
+            progress,
+            self.support_score_head.weight.squeeze(0),
         )
-        counter_layers, counter_null_layers, counter_detail_layers = self._read_sign(
-            negative_query, patch_tokens_by_layer, 1, progress
+        counter_layers, counter_null_layers, counter_detail_layers, counter_attr_layers, counter_null_attr_layers = self._read_sign(
+            negative_query,
+            patch_tokens_by_layer,
+            1,
+            progress,
+            self.counter_score_head.weight.squeeze(0),
         )
         layer_logits = math.log(1.0 / self.num_layers) + 0.1 * torch.tanh(self.layer_delta)
         layer_weights = torch.softmax(layer_logits, dim=-1)
@@ -123,6 +148,18 @@ class METERsignedFactors(nn.Module):
         counter_null = torch.einsum("fl,bfl->bf", layer_weights, counter_null_layers)
         support_detail = torch.einsum("fl,bfld->bfd", layer_weights, support_detail_layers)
         counter_detail = torch.einsum("fl,bfld->bfd", layer_weights, counter_detail_layers)
+        support_attribution = torch.einsum(
+            "fl,bfln->bfn", layer_weights, support_attr_layers
+        )
+        counter_attribution = torch.einsum(
+            "fl,bfln->bfn", layer_weights, counter_attr_layers
+        )
+        support_null_attribution = torch.einsum(
+            "fl,bfl->bf", layer_weights, support_null_attr_layers
+        )
+        counter_null_attribution = torch.einsum(
+            "fl,bfl->bf", layer_weights, counter_null_attr_layers
+        )
         support_score = F.softplus(self.support_score_head(support_detail).squeeze(-1))
         counter_score = F.softplus(self.counter_score_head(counter_detail).squeeze(-1))
         non_null = 1.0 - 0.5 * (support_null + counter_null)
@@ -158,6 +195,10 @@ class METERsignedFactors(nn.Module):
             "factor_counter_score": counter_score,
             "factor_support_detail": support_detail,
             "factor_counter_detail": counter_detail,
+            "factor_support_attribution": support_attribution,
+            "factor_counter_attribution": counter_attribution,
+            "factor_support_null_attribution": support_null_attribution,
+            "factor_counter_null_attribution": counter_null_attribution,
             "factor_reliability": reliability,
             "factor_uncertainty": uncertainty,
             "factor_layer_weights": layer_weights,

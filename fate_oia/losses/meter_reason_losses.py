@@ -24,6 +24,31 @@ def weighted_reason_asl(
     return (positive + negative).mean()
 
 
+def weighted_reason_asl_elements(
+    logits: Tensor,
+    target: Tensor,
+    evidence: Tensor,
+    observability: Tensor | None = None,
+) -> Tensor:
+    probability = torch.sigmoid(logits)
+    evidence = evidence.detach().clamp(0.0, 1.0)
+    observability = (
+        torch.ones_like(evidence)
+        if observability is None
+        else observability.detach().clamp(0.0, 1.0)
+    )
+    positive_weight = 0.5 + 0.5 * evidence
+    negative_weight = 0.1 + 0.3 * observability * (1.0 - evidence)
+    positive = -positive_weight * target * torch.log(probability.clamp_min(1e-6))
+    negative = (
+        -negative_weight
+        * (1.0 - target)
+        * probability.square()
+        * torch.log((1.0 - probability).clamp_min(1e-6))
+    )
+    return positive + negative
+
+
 def reason_soft_f1(
     logits: Tensor,
     target: Tensor,
@@ -70,6 +95,30 @@ def meter_reason_loss(
     rank = tail_rank_loss(output["reason_logits_final"], target)
     soft_f1 = reason_soft_f1(candidate_logits, target, confidence, observability)
     annotation_delta = output["reason_annotation_delta"].square().mean()
+    if "reason_logits_mix" in output:
+        mix_peer = weighted_reason_asl_elements(
+            output.get("reason_logits_mix_regret", output["reason_logits_mix"]),
+            target,
+            confidence,
+            observability,
+        )
+        global_per = weighted_reason_asl_elements(
+            output["reason_logits_global"].detach(),
+            target,
+            confidence,
+            observability,
+        )
+        local_per = weighted_reason_asl_elements(
+            output["reason_logits_local"].detach(),
+            target,
+            confidence,
+            observability,
+        )
+        mix_regret = torch.relu(
+            mix_peer - torch.minimum(global_per, local_per) + 1e-4
+        ).mean()
+    else:
+        mix_regret = candidate_logits.new_zeros(())
     total = (
         weights.get("reason_final", 1.0) * final
         + weights.get("reason_global", 0.40) * global_view
@@ -77,6 +126,7 @@ def meter_reason_loss(
         + weights.get("reason_rank", 0.05) * rank
         + weights.get("reason_soft_f1", 0.05) * soft_f1
         + weights.get("reason_annotation_delta", 0.02) * annotation_delta
+        + weights.get("reason_mix_regret", 0.10) * mix_regret
     )
     return {
         "final": final,
@@ -85,6 +135,7 @@ def meter_reason_loss(
         "rank": rank,
         "soft_f1": soft_f1,
         "annotation_delta": annotation_delta,
+        "mix_regret": mix_regret,
         "total": total,
     }
 

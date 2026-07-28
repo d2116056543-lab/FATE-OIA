@@ -24,6 +24,9 @@ class METEROIAModel(nn.Module):
         pretrained_weights: str = "ckp/reference/dino_deitsmall8_pretrain.pth",
         use_mock_dino: bool = False,
         factor_rank: int = 16,
+        semantic_transport_target_ratio: float = 0.15,
+        semantic_transport_rms_momentum: float = 0.95,
+        semantic_transport_per_action: bool = True,
     ) -> None:
         super().__init__()
         self.foundation = METERCalAlignFoundation(
@@ -35,7 +38,14 @@ class METEROIAModel(nn.Module):
             use_mock_dino=use_mock_dino,
         )
         self.signed_factors = METERsignedFactors(dim=dim, factor_dim=reason_dim, num_layers=len(selected_layers), rank=factor_rank)
-        self.action_peer = METERSemanticActionPeer(dim=dim, action_dim=action_dim, factor_dim=reason_dim)
+        self.action_peer = METERSemanticActionPeer(
+            dim=dim,
+            action_dim=action_dim,
+            factor_dim=reason_dim,
+            semantic_transport_target_ratio=semantic_transport_target_ratio,
+            semantic_transport_rms_momentum=semantic_transport_rms_momentum,
+            semantic_transport_per_action=semantic_transport_per_action,
+        )
         self.reason_decoder = METERPrivateReasonDecoder(dim=dim, reason_dim=reason_dim, action_dim=action_dim)
         self.reason_decoder.initialize_from_foundation(self.foundation)
         self.register_buffer("meta_share_weight", Tensor().new_zeros(reason_dim), persistent=True)
@@ -52,6 +62,7 @@ class METEROIAModel(nn.Module):
         factor_parameter_override: dict[str, Tensor] | None = None,
         meta_share_weight_override: Tensor | None = None,
         collect_timing: bool = False,
+        update_semantic_stats: bool = False,
     ) -> dict[str, Any]:
         def stamp() -> float:
             if collect_timing and torch.cuda.is_available():
@@ -107,6 +118,7 @@ class METEROIAModel(nn.Module):
             factor_action_tokens,
             factor_reliability,
             progress=progress,
+            update_running_stats=update_semantic_stats,
         )
         after_action = stamp()
         timing["action_time"] = after_action - after_factor
