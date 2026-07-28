@@ -12,6 +12,7 @@ from typing import Any
 import torch
 
 from fate_oia.models.meter_oia_model import METEROIAModel
+from fate_oia.losses.meter_pu_losses import meter_private_pu_loss
 from fate_oia.utils.meter_artifacts import file_hash, state_hash, write_json
 from fate_oia.utils.meter_config import load_meter_config
 
@@ -104,6 +105,12 @@ def _dynamic_checks(device: torch.device) -> dict[str, Any]:
     reason_error = (out0["reason_logits_final"] - foundation["reason_logits_calalign"]).abs().max().item()
     loss = out1["action_logits_final"].square().mean() + out1["reason_logits_final"].square().mean()
     loss.backward()
+    pu_logits = torch.zeros(2, 3, device=device, requires_grad=True)
+    pu_targets = torch.ones(2, 3, device=device)
+    pu_score = torch.ones(2, 3, device=device)
+    pu_zero_loss = meter_private_pu_loss(pu_logits, pu_targets, pu_score, torch.zeros(3, device=device))
+    pu_zero_loss.backward()
+    pu_zero_lambda_disabled = float(pu_zero_loss.detach().cpu()) == 0.0 and bool(torch.equal(pu_logits.grad, torch.zeros_like(pu_logits)))
     dino_grad = max((float(p.grad.abs().max()) for p in model.foundation.dino.parameters() if p.grad is not None), default=0.0)
     downstream_grad = max((float(p.grad.abs().max()) for p in model.action_peer.parameters() if p.grad is not None), default=0.0)
     return {
@@ -122,6 +129,7 @@ def _dynamic_checks(device: torch.device) -> dict[str, Any]:
         "downstream_grad_max": downstream_grad,
         "dino_frozen_ok": dino_grad == 0.0,
         "downstream_grad_ok": downstream_grad > 0.0,
+        "pu_zero_lambda_disabled": pu_zero_lambda_disabled,
         "ordinary_dino_calls": model.foundation.ordinary_dino_calls,
         "factor_off_action_delta": float((out1["action_logits_final"] - factor_off["action_logits_final"]).abs().mean().item()),
         "meta_off_reason_delta": float((out1["reason_logits_final"] - meta_off["reason_logits_final"]).abs().mean().item()),
@@ -169,6 +177,7 @@ def run_audit(
         "trainer_calls_all_losses": all(token in trainer_text for token in ("meter_action_loss", "meter_reason_loss", "meter_grounding_loss", "meter_counterfactual_loss", "meter_private_pu_loss")),
         "trainer_calls_meta_and_calibration": all(token in trainer_text for token in ("meta.event", "_fit_calibration", "save_epoch_artifacts", "load_checkpoint")),
         "pu_data_driven_not_fixed_training_zero": "pu_lambda = torch.zeros(reason_target.shape[1]" not in trainer_text and "meter_hidden_positive_audit" in trainer_text,
+        "pu_zero_lambda_disabled": dynamic["pu_zero_lambda_disabled"],
         "counterfactual_same_field": all(token in trainer_text for token in ("delete_field", "support_control_mask_full", "counter_control_mask_full", "wrong_output")),
         "diagnostics_from_forward_tensors": all(token in eval_text for token in ("_mechanism_stats", "factor_support_map", "action_factor_contributions", "reason_mix_gate")),
         "resolved_yaml_written": all(token in trainer_text for token in ("config_resolved.yaml", "owner_manifest.json", "runtime_profile.json")),
@@ -199,7 +208,7 @@ def run_audit(
         "formal_loss_and_artifact_call_graph": contract["trainer_calls_all_losses"] and contract["trainer_calls_meta_and_calibration"] and contract["diagnostics_from_forward_tensors"],
         "runtime_and_resume_contract": contract["resolved_yaml_written"] and contract["resume_state_restored"],
         "counterfactual_contract": contract["counterfactual_same_field"],
-        "pu_contract": contract["pu_data_driven_not_fixed_training_zero"],
+        "pu_contract": contract["pu_data_driven_not_fixed_training_zero"] and contract["pu_zero_lambda_disabled"],
         "dynamic_finite_and_ablation": contract["all_dynamic_outputs_finite"] and contract["factor_off_effect_observable"],
     }
     clean_status = subprocess.run(["git", "status", "--porcelain"], cwd=root, text=True, capture_output=True, check=False).stdout.strip()

@@ -11,9 +11,22 @@ def meter_pu_score(private_probability: Tensor, factor_probability: Tensor, view
 
 
 def meter_private_pu_loss(logits: Tensor, observed_target: Tensor, pu_score: Tensor, pu_lambda: Tensor) -> Tensor:
+    """Apply PU supervision only to labels admitted by the audit schedule.
+
+    A zero lambda means that a label is not yet evidence-backed, so its PU
+    branch must be exactly inactive.  Positive labels retain weight 1.0 for
+    admitted labels; unlabeled entries use the per-label lambda.
+    """
+    if logits.ndim != 2 or observed_target.shape != logits.shape or pu_score.shape != logits.shape:
+        raise ValueError("METER PU tensors must share shape [B, reason_dim]")
+    if pu_lambda.ndim != 1 or pu_lambda.numel() != logits.shape[1]:
+        raise ValueError("pu_lambda must have shape [reason_dim]")
     soft_target = torch.maximum(observed_target, pu_score.detach())
-    weight = observed_target + (1.0 - observed_target) * pu_lambda.detach().view(1, -1)
-    return torch.nn.functional.binary_cross_entropy_with_logits(logits, soft_target, weight=weight)
+    lambda_by_label = pu_lambda.detach().to(device=logits.device, dtype=logits.dtype).view(1, -1)
+    active = (lambda_by_label > 0.0).to(dtype=logits.dtype)
+    weight = active * (observed_target + (1.0 - observed_target) * lambda_by_label)
+    elementwise = torch.nn.functional.binary_cross_entropy_with_logits(logits, soft_target, reduction="none")
+    return (elementwise * weight).sum() / weight.sum().clamp_min(1.0)
 
 
 def meter_hidden_positive_audit(
