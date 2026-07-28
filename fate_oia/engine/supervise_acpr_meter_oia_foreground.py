@@ -61,13 +61,21 @@ def main() -> None:
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
     root = Path.cwd()
+    readiness_name = (
+        "METER_OIA_V1_PRE_PILOT_READY.json"
+        if args.mode == "pilot"
+        else "METER_OIA_V1_FULL_TRAIN_READY.json"
+    )
+    readiness_path = root / ".review" / readiness_name
+    if not readiness_path.exists():
+        raise SystemExit(f"{readiness_name} is required before {args.mode}")
     command = [
         sys.executable, "-u", "-m", "fate_oia.engine.train_acpr_meter_oia",
         "--config", args.config, "--output_dir", args.output_dir,
         "--device", args.device, "--require_ready", "--worktree_root", str(root),
     ]
     if args.mode == "pilot":
-        command.extend(["--epochs", "3", "--max_train_samples", "2048", "--max_audit_samples", "128", "--max_calib_samples", "128", "--max_test_samples", "128"])
+        command.extend(["--epochs", "3", "--max_train_samples", "4096", "--max_audit_samples", "1024", "--max_calib_samples", "512", "--max_test_samples", "512"])
     else:
         command.extend(["--epochs", "12"])
     raise SystemExit(run_foreground(command, cwd=root))

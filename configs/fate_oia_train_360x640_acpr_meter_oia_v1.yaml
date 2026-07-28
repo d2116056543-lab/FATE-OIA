@@ -69,6 +69,7 @@ training:
   epochs: 12
   batch_size: 6
   gradient_accumulation_steps: 5
+  reference_effective_batch: 32
   optimizer: AdamW
   weight_decay: 0.05
   grad_clip: 1.0
@@ -126,7 +127,7 @@ pu:
 
 counterfactual:
   every_optimizer_updates: 8
-  max_patches: 28
+  max_patches: 128
   minimum_patches: 4
   selected_mass: 0.60
   diagnostic_test_samples: 128

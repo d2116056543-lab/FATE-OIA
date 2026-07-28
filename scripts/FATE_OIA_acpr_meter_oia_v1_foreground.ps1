@@ -14,11 +14,12 @@ if (-not (Test-Path $Python)) { throw "Missing Python runtime: $Python" }
 if ([string]::IsNullOrWhiteSpace($OutputDir)) {
   $OutputDir = if ($Mode -eq 'pilot') { '.background_runs\meter_oia_v1_pilot' } else { '.background_runs\meter_oia_v1_full' }
 }
-$Ready = Join-Path $Root '.review\METER_OIA_V1_PRE_PILOT_READY.json'
-if (-not (Test-Path $Ready)) { throw "PRE_PILOT readiness artifact is required before $Mode" }
+$ReadyName = if ($Mode -eq 'pilot') { 'METER_OIA_V1_PRE_PILOT_READY.json' } else { 'METER_OIA_V1_FULL_TRAIN_READY.json' }
+$Ready = Join-Path $Root (Join-Path '.review' $ReadyName)
+if (-not (Test-Path $Ready)) { throw "$ReadyName is required before $Mode" }
 $args = @('-u','-m','fate_oia.engine.train_acpr_meter_oia','--config',$Config,'--output_dir',$OutputDir,'--device',$Device,'--require_ready','--worktree_root',$Root)
 if ($Mode -eq 'pilot') {
-  $args += @('--epochs','3','--max_train_samples','2048','--max_audit_samples','128','--max_calib_samples','128','--max_test_samples','128')
+  $args += @('--epochs','3','--max_train_samples','4096','--max_audit_samples','1024','--max_calib_samples','512','--max_test_samples','512')
 } else {
   $args += @('--epochs','12')
 }

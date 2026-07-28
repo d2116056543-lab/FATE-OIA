@@ -11,7 +11,11 @@ def test_posthoc_calibration_is_train_calib_only_and_preserves_model_hash() -> N
     assert result.fit_split == "train_calib"
     assert result.representation_updated is False
     assert result.model_state_hash_before == result.model_state_hash_after == "abc"
-    assert torch.allclose(apply_meter_deploy(logits, result), logits - result.theta)
+    assert result.temperature is not None
+    assert torch.allclose(
+        apply_meter_deploy(logits, result),
+        logits / result.temperature - result.theta,
+    )
 
 
 def test_runtime_selection_respects_hard_memory_limit() -> None:

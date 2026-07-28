@@ -106,32 +106,84 @@ class METERMetaUtility:
             gradient_reason = self._gradient(reason_loss_fn, before)
             action_grad_norm = float(torch.sqrt(sum(value.float().square().sum() for value in gradient_action.values())).detach().cpu())
             reason_grad_norm = float(torch.sqrt(sum(value.float().square().sum() for value in gradient_reason.values())).detach().cpu())
-            candidate_action = {
-                name: value - self.virtual_lr * gradient_action[name]
-                for name, value in before.items()
-            }
-            candidate_reason = {
-                name: value - self.virtual_lr * (gradient_action[name] + gradient_reason[name])
-                for name, value in before.items()
-            }
-            candidate_delta_norm = float(torch.sqrt(sum(
-                (candidate_reason[name] - candidate_action[name]).float().square().sum()
-                for name in candidate_reason
-            )).detach().cpu())
             heldout = audit_action_loss_fn or action_loss_fn
-            action_loss = float(heldout(candidate_action).detach().cpu())
-            reason_loss = float(heldout(candidate_reason).detach().cpu())
-            raw_utility = (action_loss - reason_loss) / (abs(action_loss) + 1e-6)
-            utility = torch.as_tensor(raw_utility, dtype=self.utility_ema.dtype)
+            ids = tuple(int(x) for x in factor_ids)
+            if not ids:
+                raise ValueError("Formal meta utility requires at least one factor id")
+            action_losses: list[float] = []
+            reason_losses: list[float] = []
+            utilities: list[Tensor] = []
+            delta_norms: list[Tensor] = []
+            for factor_id in ids:
+                if factor_id < 0 or factor_id >= self.omega.numel():
+                    raise IndexError(f"factor id out of range: {factor_id}")
+                masked_action: dict[str, Tensor] = {}
+                masked_reason: dict[str, Tensor] = {}
+                for name, value in before.items():
+                    if value.ndim == 0 or value.shape[0] != self.omega.numel():
+                        raise ValueError(
+                            f"Meta parameter {name!r} must have factor dimension first"
+                        )
+                    action_gradient = torch.zeros_like(gradient_action[name])
+                    reason_gradient = torch.zeros_like(gradient_reason[name])
+                    action_gradient[factor_id] = gradient_action[name][factor_id]
+                    reason_gradient[factor_id] = gradient_reason[name][factor_id]
+                    masked_action[name] = action_gradient
+                    masked_reason[name] = reason_gradient
+                candidate_action = {
+                    name: value - self.virtual_lr * masked_action[name]
+                    for name, value in before.items()
+                }
+                candidate_reason = {
+                    name: value
+                    - self.virtual_lr
+                    * (masked_action[name] + masked_reason[name])
+                    for name, value in before.items()
+                }
+                action_value = heldout(candidate_action)
+                reason_value = heldout(candidate_reason)
+                action_losses.append(float(action_value.detach().cpu()))
+                reason_losses.append(float(reason_value.detach().cpu()))
+                utilities.append(
+                    (
+                        (action_value - reason_value)
+                        / (action_value.detach().abs() + 1e-6)
+                    )
+                    .detach()
+                    .to(dtype=self.utility_ema.dtype, device="cpu")
+                )
+                delta_norms.append(
+                    torch.sqrt(
+                        sum(
+                            (
+                                candidate_reason[name]
+                                - candidate_action[name]
+                            )
+                            .float()
+                            .square()
+                            .sum()
+                            for name in candidate_reason
+                        )
+                    ).detach()
+                )
+            action_loss = float(sum(action_losses) / len(action_losses))
+            reason_loss = float(sum(reason_losses) / len(reason_losses))
+            utility = torch.stack(utilities)
+            candidate_delta_norm = float(torch.stack(delta_norms).mean().cpu())
 
         ids = tuple(int(x) for x in factor_ids)
         omega_before = self.omega.clone()
-        for factor_id in ids:
+        utility_by_factor = utility.reshape(-1)
+        if utility_by_factor.numel() == 1 and len(ids) > 1:
+            utility_by_factor = utility_by_factor.expand(len(ids))
+        if utility_by_factor.numel() != len(ids):
+            raise ValueError("Meta utility count does not match selected factors")
+        for position, factor_id in enumerate(ids):
             if factor_id < 0 or factor_id >= self.omega.numel():
                 raise IndexError(f"factor id out of range: {factor_id}")
             self.utility_ema[factor_id] = (
                 self.ema_old_weight * self.utility_ema[factor_id]
-                + self.ema_new_weight * utility.detach().cpu()
+                + self.ema_new_weight * utility_by_factor[position].detach().cpu()
             )
             denominator = max(self.upper - self.lower, 1e-6)
             self.omega[factor_id] = (

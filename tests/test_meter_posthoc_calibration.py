@@ -9,15 +9,19 @@ def test_calibration_is_posthoc_and_subtractive() -> None:
     result = fit_train_calib_deploy_theta(logits, labels, model_state_hash="state")
     assert result.fit_split == "train_calib"
     assert result.representation_updated is False
-    assert torch.allclose(apply_meter_deploy(logits, result), logits - result.theta)
+    assert result.temperature is not None
+    assert torch.allclose(
+        apply_meter_deploy(logits, result),
+        logits / result.temperature - result.theta,
+    )
 
 
 def test_calibration_guard_falls_back_on_train_calib_degradation() -> None:
-    action_logits = torch.tensor([[5.0], [-5.0], [5.0], [-5.0]])
-    reason_logits = torch.tensor([[5.0], [-5.0], [5.0], [-5.0]])
+    action_logits = torch.tensor([[5.0], [-0.1], [5.0], [-0.1]])
+    reason_logits = torch.tensor([[5.0], [-0.1], [5.0], [-0.1]])
     labels = torch.tensor([[1.0], [0.0], [1.0], [0.0]])
     candidate = METERCalibrationResult(
-        theta=torch.tensor([-10.0, -10.0]),
+        theta=torch.tensor([-0.2, -0.2]),
         model_state_hash_before="state",
         model_state_hash_after="state",
         fit_split="train_calib",
@@ -27,4 +31,4 @@ def test_calibration_guard_falls_back_on_train_calib_degradation() -> None:
     assert guarded.accepted is False
     assert guarded.fallback_reason == "train_calib_deploy_joint_degradation"
     assert torch.equal(guarded.theta, torch.zeros_like(candidate.theta))
-    assert guarded.train_calib_deploy_joint < guarded.train_calib_raw_joint
+    assert guarded.train_calib_deploy_joint >= guarded.train_calib_raw_joint

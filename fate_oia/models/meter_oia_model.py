@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+import time
 
 import torch
 from torch import Tensor, nn
@@ -50,8 +51,18 @@ class METEROIAModel(nn.Module):
         diagnostic_modes: tuple[str, ...] = (),
         factor_parameter_override: dict[str, Tensor] | None = None,
         meta_share_weight_override: Tensor | None = None,
+        collect_timing: bool = False,
     ) -> dict[str, Any]:
+        def stamp() -> float:
+            if collect_timing and torch.cuda.is_available():
+                torch.cuda.synchronize()
+            return time.perf_counter()
+
+        timing: dict[str, float] = {}
+        start = stamp()
         base = self.foundation.decode_foundation(field)
+        after_foundation = stamp()
+        timing["foundation_time"] = after_foundation - start
         factors = self.signed_factors(
             base["factor_base_nodes"],
             base["patch_tokens_by_layer"],
@@ -59,6 +70,8 @@ class METEROIAModel(nn.Module):
             meta_share_weight=self.meta_share_weight,
             factor_parameter_override=factor_parameter_override,
         )
+        after_factor = stamp()
+        timing["factor_time"] = after_factor - after_foundation
         factor_action_tokens = factors["factor_action_tokens"]
         factor_reliability = factors["factor_reliability"]
         factor_to_reason_tokens = factors["factor_to_reason_tokens"]
@@ -95,6 +108,12 @@ class METEROIAModel(nn.Module):
             factor_reliability,
             progress=progress,
         )
+        after_action = stamp()
+        timing["action_time"] = after_action - after_factor
+        if "selector_visual_only" in diagnostic_modes:
+            action["action_logits_final"] = action["action_logits_visual"]
+        elif "selector_semantic_only" in diagnostic_modes:
+            action["action_logits_final"] = action["action_logits_semantic"]
         reason_action_logits = action["action_logits_final"]
         if "decision_context_off" in diagnostic_modes:
             reason_action_logits = torch.zeros_like(reason_action_logits)
@@ -126,6 +145,23 @@ class METEROIAModel(nn.Module):
             factor_support_null=factors["factor_support_null"].detach(),
             progress=progress,
         )
+        # PU supervision is private by contract.  It shares the private
+        # decoder parameters but receives a value-identical, fully detached
+        # factor context so PU gradients cannot enter the meta adapter.
+        pu_reason = self.reason_decoder(
+            patch_tokens_by_layer=base["patch_tokens_by_layer"].detach(),
+            reason_logits_calalign=base["reason_logits_calalign"].detach(),
+            action_logits_final=reason_action_logits.detach(),
+            action_nodes=base["action_nodes"].detach(),
+            factor_to_reason_tokens=factors["factor_action_tokens"].detach(),
+            factor_support_map=reason_support_map.detach(),
+            factor_counter_map=reason_counter_map.detach(),
+            factor_reliability=factor_reliability.detach(),
+            factor_support_null=factors["factor_support_null"].detach(),
+            progress=progress,
+        )
+        after_reason = stamp()
+        timing["reason_time"] = after_reason - after_action
         if "annotation_off" in diagnostic_modes:
             reason["reason_logits_final"] = base["reason_logits_calalign"] + self.reason_decoder._ramp(progress) * (reason["reason_logits_mix"] - base["reason_logits_calalign"])
         return {
@@ -134,6 +170,7 @@ class METEROIAModel(nn.Module):
             **factors,
             **action,
             **reason,
+            "reason_logits_pu_private": pu_reason["reason_logits_final"],
             "branch_logits": {
                 "action_visual": action["action_logits_visual"],
                 "action_semantic": action["action_logits_semantic"],
@@ -146,6 +183,7 @@ class METEROIAModel(nn.Module):
                 "reason_final": reason["reason_logits_final"],
             },
             "diagnostic_modes": diagnostic_modes,
+            "runtime_timing": timing,
         }
 
     def forward(

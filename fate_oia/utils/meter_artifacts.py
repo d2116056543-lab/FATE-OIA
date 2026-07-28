@@ -156,7 +156,14 @@ def save_epoch_artifacts(
         write_json(directory / "file_names_test.json", {"file_names": list(file_names)})
     for name, value in diagnostics.items():
         if name.endswith(".jsonl"):
-            append_jsonl(directory / name, value if isinstance(value, Mapping) else {"value": value})
+            if isinstance(value, list):
+                for row in value:
+                    append_jsonl(
+                        directory / name,
+                        row if isinstance(row, Mapping) else {"value": row},
+                    )
+            else:
+                append_jsonl(directory / name, value if isinstance(value, Mapping) else {"value": value})
         else:
             write_json(directory / (name if name.endswith(".json") else f"{name}.json"), value if isinstance(value, Mapping) else {"value": value})
     return directory

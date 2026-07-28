@@ -41,9 +41,9 @@ def meter_hidden_positive_audit(
     """Estimate per-label PU usefulness without using test data.
 
     Known positives are deterministically hidden only for the audit report.
-    The score comparison is still against the complete audit labels, while the
-    reported hidden-positive recall documents whether the private/factor
-    product recovers deliberately hidden positives.
+    Deliberately hidden positives are evaluated against originally observed
+    zeros. Visible positives are excluded, so eligibility measures recovery
+    rather than ordinary supervised classification.
     """
     private_probability = private_probability.detach().float().cpu()
     factor_probability = factor_probability.detach().float().cpu()
@@ -61,12 +61,21 @@ def meter_hidden_positive_audit(
         order = torch.randperm(count, generator=generator)
         hidden_count = max(1, int(round(count * float(hidden_fraction))))
         hidden = positive[order[:hidden_count]]
-        baseline_ap = binary_average_precision(factor_probability[:, label], targets[:, label])
-        pu_ap = binary_average_precision(pu_probability[:, label], targets[:, label])
+        visible = positive[order[hidden_count:]]
+        audit_mask = torch.ones(targets.shape[0], dtype=torch.bool)
+        audit_mask[visible] = False
+        audit_target = torch.zeros(int(audit_mask.sum()), dtype=torch.float32)
+        retained_indices = torch.where(audit_mask)[0]
+        hidden_positions = torch.isin(retained_indices, hidden)
+        audit_target[hidden_positions] = 1.0
+        baseline_score = factor_probability[audit_mask, label]
+        pu_score = pu_probability[audit_mask, label]
+        baseline_ap = binary_average_precision(baseline_score, audit_target)
+        pu_ap = binary_average_precision(pu_score, audit_target)
         diff = float(pu_ap - baseline_ap) if pu_ap == pu_ap and baseline_ap == baseline_ap else float("nan")
         # A conservative normal approximation for the lower confidence bound.
         lcb95 = diff - 1.96 * (abs(diff) + 1e-6) / max(count ** 0.5, 1.0)
-        threshold = torch.quantile(pu_probability[:, label], 0.70)
+        threshold = torch.quantile(pu_score, 0.70)
         hidden_recall = float((pu_probability[hidden, label] >= threshold).float().mean().item())
         eligible = bool(diff == diff and lcb95 > 0.0 and count >= int(min_positive_count))
         if eligible:
@@ -76,6 +85,8 @@ def meter_hidden_positive_audit(
             "positive_count": count,
             "hidden_count": hidden_count,
             "hidden_positive_recall": hidden_recall,
+            "hidden_positive_auprc": float(pu_ap),
+            "audit_target": "deliberately_hidden_positive_vs_observed_zero",
             "baseline_auprc": float(baseline_ap),
             "pu_auprc": float(pu_ap),
             "auprc_delta": diff,

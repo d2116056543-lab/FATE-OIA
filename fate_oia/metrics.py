@@ -26,6 +26,19 @@ def binary_average_precision(scores: torch.Tensor, targets: torch.Tensor) -> flo
     return float(ap.item())
 
 
+def binary_roc_auc(scores: torch.Tensor, targets: torch.Tensor) -> float:
+    """Compute binary ROC AUC from pairwise ranking with tie handling."""
+    scores = scores.detach().float().flatten()
+    targets = targets.detach().float().flatten()
+    positive = scores[targets > 0.5]
+    negative = scores[targets <= 0.5]
+    if positive.numel() == 0 or negative.numel() == 0:
+        return float("nan")
+    comparison = positive[:, None] - negative[None, :]
+    auc = (comparison.gt(0).float() + 0.5 * comparison.eq(0).float()).mean()
+    return float(auc.item())
+
+
 def multilabel_confusion(probs: torch.Tensor, targets: torch.Tensor, threshold: float | torch.Tensor = 0.5) -> dict[str, torch.Tensor]:
     if isinstance(threshold, torch.Tensor):
         thr = threshold.to(probs.device).view(1, -1)
@@ -55,14 +68,18 @@ def multilabel_metrics_from_logits(
     valid = torch.isfinite(f1)
     aps = [binary_average_precision(probs[:, i], targets[:, i]) for i in range(targets.shape[1])]
     ap_valid = [x for x in aps if not math.isnan(x)]
+    aucs = [binary_roc_auc(probs[:, i], targets[:, i]) for i in range(targets.shape[1])]
+    auc_valid = [x for x in aucs if not math.isnan(x)]
     exact = ((probs >= (threshold if isinstance(threshold, float) else threshold.view(1, -1))).float() == targets.float()).all(1).float().mean()
     return {
         f"{prefix}mF1": float(f1[valid].mean().item()) if bool(valid.any()) else 0.0,
         f"{prefix}oF1": float((2 * conf["tp"].sum() / (2 * conf["tp"].sum() + conf["fp"].sum() + conf["fn"].sum() + eps)).item()),
         f"{prefix}mAP": float(sum(ap_valid) / len(ap_valid)) if ap_valid else float("nan"),
+        f"{prefix}mAUC": float(sum(auc_valid) / len(auc_valid)) if auc_valid else float("nan"),
         f"{prefix}exact_match": float(exact.item()),
         f"{prefix}per_label_f1": [float(x) for x in f1.detach().cpu()],
         f"{prefix}per_label_precision": [float(x) for x in precision.detach().cpu()],
         f"{prefix}per_label_recall": [float(x) for x in recall.detach().cpu()],
         f"{prefix}per_label_ap": aps,
+        f"{prefix}per_label_auc": aucs,
     }

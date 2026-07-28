@@ -74,25 +74,48 @@ def _ast_placeholders(path: Path) -> list[str]:
     return errors
 
 
-def _dynamic_checks(device: torch.device) -> dict[str, Any]:
-    model = METEROIAModel(use_mock_dino=True).to(device)
-    images = torch.randn(2, 3, 360, 640, device=device)
+def _dynamic_checks(
+    device: torch.device,
+    *,
+    use_mock_dino: bool,
+    config: dict[str, Any] | None,
+) -> dict[str, Any]:
+    batch_size = 2 if use_mock_dino else 1
+    model = METEROIAModel(
+        use_mock_dino=use_mock_dino,
+        pretrained_weights=(
+            config["backbone"]["pretrained_weights"]
+            if config is not None
+            else "ckp/reference/dino_deitsmall8_pretrain.pth"
+        ),
+    ).to(device)
+    images = torch.randn(batch_size, 3, 360, 640, device=device)
     model.eval()
     with torch.no_grad():
         field = model.encode_images(images)
         foundation = model.foundation.decode_foundation(field)
         out0 = model.decode_from_field(field, progress=0.0)
         out1_probe = model.decode_from_field(field, progress=1.0)
+        selector_visual = model.decode_from_field(
+            field,
+            progress=1.0,
+            diagnostic_modes=("selector_visual_only",),
+        )
+        selector_semantic = model.decode_from_field(
+            field,
+            progress=1.0,
+            diagnostic_modes=("selector_semantic_only",),
+        )
     out1 = model.decode_from_field(field, progress=1.0)
     factor_off = model.decode_from_field(field, progress=1.0, diagnostic_modes=("factor_off",))
     meta_off = model.decode_from_field(field, progress=1.0, diagnostic_modes=("meta_off",))
     required_shapes = {
-        "patch_tokens_by_layer": [2, 3, 3600, 384],
-        "label_nodes": [2, 25, 384],
-        "action_logits_final": [2, 4],
-        "reason_logits_final": [2, 21],
-        "factor_support_map": [2, 21, 3600],
-        "action_factor_contributions": [2, 4, 21],
+        "patch_tokens_by_layer": [batch_size, 3, 3600, 384],
+        "label_nodes": [batch_size, 25, 384],
+        "action_logits_final": [batch_size, 4],
+        "reason_logits_final": [batch_size, 21],
+        "factor_support_map": [batch_size, 21, 3600],
+        "action_factor_contributions": [batch_size, 4, 21],
     }
     shape_result = {name: list(out0.get(name, foundation.get(name)).shape) for name in required_shapes}
     shape_ok = all(shape_result[name] == expected for name, expected in required_shapes.items())
@@ -113,6 +136,25 @@ def _dynamic_checks(device: torch.device) -> dict[str, Any]:
     pu_zero_lambda_disabled = float(pu_zero_loss.detach().cpu()) == 0.0 and bool(torch.equal(pu_logits.grad, torch.zeros_like(pu_logits)))
     dino_grad = max((float(p.grad.abs().max()) for p in model.foundation.dino.parameters() if p.grad is not None), default=0.0)
     downstream_grad = max((float(p.grad.abs().max()) for p in model.action_peer.parameters() if p.grad is not None), default=0.0)
+    model.zero_grad(set_to_none=True)
+    pu_output = model.decode_from_field(field, progress=1.0)
+    pu_output["reason_logits_pu_private"].square().mean().backward()
+    pu_meta_grad = max(
+        (
+            float(parameter.grad.abs().max())
+            for parameter in model.signed_factors.meta_adapters.parameters()
+            if parameter.grad is not None
+        ),
+        default=0.0,
+    )
+    pu_private_grad = max(
+        (
+            float(parameter.grad.abs().max())
+            for parameter in model.reason_decoder.parameters()
+            if parameter.grad is not None
+        ),
+        default=0.0,
+    )
     return {
         "shape_result": shape_result,
         "shape_ok": shape_ok,
@@ -130,10 +172,18 @@ def _dynamic_checks(device: torch.device) -> dict[str, Any]:
         "dino_frozen_ok": dino_grad == 0.0,
         "downstream_grad_ok": downstream_grad > 0.0,
         "pu_zero_lambda_disabled": pu_zero_lambda_disabled,
+        "pu_private_firewall_ok": pu_meta_grad == 0.0 and pu_private_grad > 0.0,
+        "selector_visual_only_error": float(
+            (selector_visual["action_logits_final"] - selector_visual["action_logits_visual"]).abs().max()
+        ),
+        "selector_semantic_only_error": float(
+            (selector_semantic["action_logits_final"] - selector_semantic["action_logits_semantic"]).abs().max()
+        ),
         "ordinary_dino_calls": model.foundation.ordinary_dino_calls,
         "factor_off_action_delta": float((out1["action_logits_final"] - factor_off["action_logits_final"]).abs().mean().item()),
         "meta_off_reason_delta": float((out1["reason_logits_final"] - meta_off["reason_logits_final"]).abs().mean().item()),
         "all_required_outputs_finite": all(bool(torch.isfinite(value).all()) for value in (out1["action_logits_final"], out1["reason_logits_final"], out1["factor_support_map"], out1["action_factor_contributions"])),
+        "real_dino_dynamic": not use_mock_dino,
     }
 
 
@@ -170,21 +220,93 @@ def run_audit(
     except Exception as exc:
         config = None
         config_error = repr(exc)
-    dynamic = _dynamic_checks(torch.device(device))
+    dynamic = _dynamic_checks(
+        torch.device(device),
+        use_mock_dino=not real_dino,
+        config=config,
+    )
     trainer_text = (root / "fate_oia/engine/train_acpr_meter_oia.py").read_text(encoding="utf-8") if (root / "fate_oia/engine/train_acpr_meter_oia.py").exists() else ""
     eval_text = (root / "fate_oia/engine/eval_acpr_meter_oia.py").read_text(encoding="utf-8") if (root / "fate_oia/engine/eval_acpr_meter_oia.py").exists() else ""
+    counterfactual_text = (
+        trainer_text.split("def _counterfactual_event(", 1)[1].split("def _make_optimizer(", 1)[0]
+        if "def _counterfactual_event(" in trainer_text and "def _make_optimizer(" in trainer_text
+        else ""
+    )
     contract = {
         "trainer_calls_all_losses": all(token in trainer_text for token in ("meter_action_loss", "meter_reason_loss", "meter_grounding_loss", "meter_counterfactual_loss", "meter_private_pu_loss")),
         "trainer_calls_meta_and_calibration": all(token in trainer_text for token in ("meta.event", "_fit_calibration", "save_epoch_artifacts", "load_checkpoint")),
         "calibration_guard_called": all(token in trainer_text for token in ("guard_train_calib_deploy_theta", "fallback_on_deploy_degradation", "train_calib")),
         "pu_data_driven_not_fixed_training_zero": "pu_lambda = torch.zeros(reason_target.shape[1]" not in trainer_text and "meter_hidden_positive_audit" in trainer_text,
         "pu_zero_lambda_disabled": dynamic["pu_zero_lambda_disabled"],
-        "counterfactual_same_field": all(token in trainer_text for token in ("delete_field", "support_control_mask_full", "counter_control_mask_full", "wrong_output")),
+        "counterfactual_same_field": (
+            all(
+                token in counterfactual_text
+                for token in (
+                    "delete_field",
+                    "_select_mass_mask",
+                    "_matched_control_mask",
+                    "_replace_selected_with_neighbor_mean",
+                    "wrong_output",
+                )
+            )
+            and "encode_images" not in counterfactual_text
+        ),
         "diagnostics_from_forward_tensors": all(token in eval_text for token in ("_mechanism_stats", "factor_support_map", "action_factor_contributions", "reason_mix_gate")),
         "resolved_yaml_written": all(token in trainer_text for token in ("config_resolved.yaml", "owner_manifest.json", "runtime_profile.json")),
-        "resume_state_restored": all(token in trainer_text for token in ("--resume", "meta_state", "pu_state", "load_checkpoint")),
+        "resume_state_restored": all(
+            token in trainer_text
+            for token in (
+                "--resume",
+                "meta_state",
+                "pu_state",
+                "load_checkpoint",
+                "resume_micro_step",
+                "epoch_resume_micro",
+                "micro_step=micro + 1",
+                "torch.Generator().manual_seed",
+            )
+        ),
         "factor_off_effect_observable": dynamic["factor_off_action_delta"] > 0.0,
         "all_dynamic_outputs_finite": dynamic["all_required_outputs_finite"],
+        "grounding_direction_and_mirror": all(
+            token in (root / "fate_oia/losses/meter_grounding_losses.py").read_text(encoding="utf-8")
+            for token in ("signed_direction", "_mirror_balance_loss", "factor_source_conf")
+        ),
+        "per_factor_meta_utility": all(
+            token in (root / "fate_oia/optim/meter_meta_utility.py").read_text(encoding="utf-8")
+            for token in ("factor_ids", "utility = torch.stack(utilities)", "for factor_id in ids", "action_gradient[factor_id]")
+        ),
+        "private_reason_complete": all(
+            token in (root / "fate_oia/models/meter_reason_decoder.py").read_text(encoding="utf-8")
+            for token in ("reason_self_attention", "layer_router", "reason_logits_candidate")
+        ),
+        "observability_reason_weighting": "observability * (1.0 - evidence)" in (
+            root / "fate_oia/losses/meter_reason_losses.py"
+        ).read_text(encoding="utf-8"),
+        "hidden_positive_subset_audit": all(
+            token in (root / "fate_oia/losses/meter_pu_losses.py").read_text(encoding="utf-8")
+            for token in ("deliberately_hidden_positive_vs_observed_zero", "audit_mask", "hidden_positive_auprc")
+        ),
+        "posthoc_search_complete": all(
+            token in (root / "fate_oia/utils/meter_posthoc_calibration.py").read_text(encoding="utf-8")
+            for token in ("label_groups", "group_shrinkage", "temperature", "threshold_rms_ratio", "map_max_abs_delta")
+        ),
+        "optimizer_contract": all(
+            token in trainer_text
+            for token in ("reference_effective_batch", "learning_rate_scale", "weight_decay", "allow_tf32")
+        ),
+        "profiler_contract": all(
+            token in (root / "fate_oia/engine/profile_acpr_meter_oia.py").read_text(encoding="utf-8")
+            for token in ("warmup_updates: int = 5", "measured_updates: int = 20", "optimizer.step()", "meta.event(", "_counterfactual_event(", '"real_data": True')
+        ),
+        "standalone_evaluator": all(
+            token in eval_text
+            for token in ("load_checkpoint(args.checkpoint", "evaluation_summary.json", "METERDataset(")
+        ),
+        "strict_full_readiness": all(
+            token in trainer_text
+            for token in ("METER_OIA_V1_FULL_TRAIN_READY.json", "_write_full_train_ready_if_eligible", "4096", "1024", "512")
+        ),
     }
     real_result = {"required": True, "executed": False, "pass": False, "reason": "real-DINO profile not found"}
     profile_path = profile_dir / "runtime_profile.json"
@@ -211,6 +333,17 @@ def run_audit(
         "counterfactual_contract": contract["counterfactual_same_field"],
         "pu_contract": contract["pu_data_driven_not_fixed_training_zero"] and contract["pu_zero_lambda_disabled"],
         "dynamic_finite_and_ablation": contract["all_dynamic_outputs_finite"] and contract["factor_off_effect_observable"],
+        "grounding_objective": contract["grounding_direction_and_mirror"],
+        "per_factor_meta_utility": contract["per_factor_meta_utility"],
+        "private_reason_decoder": contract["private_reason_complete"],
+        "selective_observation_reason_loss": contract["observability_reason_weighting"],
+        "hidden_positive_pu_audit": contract["hidden_positive_subset_audit"] and dynamic["pu_private_firewall_ok"],
+        "posthoc_calibration": contract["posthoc_search_complete"],
+        "optimizer_protocol": contract["optimizer_contract"],
+        "runtime_profiler": contract["profiler_contract"],
+        "standalone_evaluator": contract["standalone_evaluator"],
+        "strict_full_readiness": contract["strict_full_readiness"],
+        "selector_ablation": dynamic["selector_visual_only_error"] < 1e-7 and dynamic["selector_semantic_only_error"] < 1e-7,
     }
     clean_status = subprocess.run(["git", "status", "--porcelain"], cwd=root, text=True, capture_output=True, check=False).stdout.strip()
     passed = bool(not missing and not forbidden_hits and not placeholder_errors and config is not None and all(functional.values()) and dynamic["downstream_grad_ok"] and real_result["pass"])

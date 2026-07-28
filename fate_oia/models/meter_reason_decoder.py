@@ -15,10 +15,13 @@ class METERPrivateReasonDecoder(nn.Module):
         self.reason_dim = int(reason_dim)
         self.action_dim = int(action_dim)
         self.private_queries = nn.Parameter(torch.randn(reason_dim, dim) * 0.02)
+        self.layer_router = nn.Parameter(torch.zeros(3))
         self.global_query = nn.Linear(dim, dim)
         self.global_key = nn.Linear(dim, dim)
         self.global_value = nn.Linear(dim, dim)
         self.global_norm = nn.LayerNorm(dim)
+        self.reason_self_attention = nn.MultiheadAttention(dim, num_heads=4, batch_first=True)
+        self.reason_self_norm = nn.LayerNorm(dim)
         self.local_proj = nn.Linear(dim, dim)
         self.local_norm = nn.LayerNorm(dim)
         self.factor_proj = nn.Linear(dim, dim)
@@ -39,6 +42,7 @@ class METERPrivateReasonDecoder(nn.Module):
             self.global_key.bias.copy_(trunk.key_proj.bias)
             self.global_value.weight.copy_(trunk.value_proj.weight)
             self.global_value.bias.copy_(trunk.value_proj.bias)
+            self.reason_self_attention.load_state_dict(trunk.label_self_attn.state_dict())
             self.global_head.weight.copy_(trunk.logit_head.weight)
             self.global_head.bias.copy_(trunk.logit_head.bias)
 
@@ -61,16 +65,27 @@ class METERPrivateReasonDecoder(nn.Module):
         progress: float = 1.0,
     ) -> dict[str, Tensor]:
         # Private reason views must not backpropagate into the foundation.
-        patch = patch_tokens_by_layer.detach().mean(dim=1)
+        detached_layers = patch_tokens_by_layer.detach()
+        if detached_layers.shape[1] != self.layer_router.numel():
+            raise ValueError("Private reason layer count does not match layer_router")
+        layer_weights = torch.softmax(self.layer_router, dim=0)
+        patch = torch.einsum("s,bsnd->bnd", layer_weights, detached_layers)
         query = self.global_query(self.private_queries).view(1, self.reason_dim, self.dim)
         key = self.global_key(patch)
         value = self.global_value(patch)
         global_attention = torch.softmax(torch.einsum("brd,bnd->brn", query, key) / math.sqrt(self.dim), dim=-1)
         global_token = self.global_norm(torch.einsum("brn,bnd->brd", global_attention, value))
+        self_context = self.reason_self_attention(
+            global_token,
+            global_token,
+            global_token,
+            need_weights=False,
+        )[0]
+        global_token = self.reason_self_norm(global_token + self_context)
         action_context = torch.einsum("ba,bad->bd", torch.sigmoid(action_logits_final).detach(), action_nodes.detach())
         factor_context = self.factor_proj(factor_to_reason_tokens)
         local_maps = (factor_support_map - factor_counter_map).detach()
-        local_detail = torch.einsum("brn,bsnd->brsd", local_maps, patch_tokens_by_layer).mean(dim=2)
+        local_detail = torch.einsum("brn,bsnd,s->brd", local_maps, detached_layers, layer_weights)
         tail = self.tail_gain.view(1, -1, 1) * (factor_support_map.detach().mean(-1) - factor_counter_map.detach().mean(-1)).unsqueeze(-1)
         local_token = self.local_norm(self.local_proj(local_detail) + factor_context + tail)
         action_term = self.action_proj(action_context).unsqueeze(1).expand(-1, self.reason_dim, -1)
@@ -109,4 +124,5 @@ class METERPrivateReasonDecoder(nn.Module):
             "reason_logits_final": final,
             "reason_mix_gate": mix_gate,
             "reason_tail_sensitivity": tail.squeeze(-1).abs(),
+            "reason_layer_weights": layer_weights,
         }
