@@ -23,3 +23,20 @@ def test_semantic_action_is_additive_and_final_warmup_is_exact() -> None:
     )
     assert full["action_factor_weights"].shape == (2, 4, 21)
     assert full["action_selector"].std() > 0
+
+
+def test_semantic_action_cannot_collapse_into_null_only_bias() -> None:
+    torch.manual_seed(19)
+    module = METERSemanticActionPeer(dim=24, action_dim=4, factor_dim=21)
+    output = module(
+        torch.randn(8, 4),
+        torch.randn(8, 4, 24),
+        torch.randn(8, 21, 24),
+        torch.full((8, 21), 0.5),
+        progress=1.0,
+    )
+
+    assert 0.01 < float(output["action_null_mass"].mean()) < 0.80
+    assert float(output["action_factor_weights"].sum(-1).mean()) > 0.20
+    assert float(output["action_factor_contributions"].square().mean().sqrt()) > 1e-4
+    assert float(output["action_logits_semantic"].std(dim=0).mean()) > 1e-4

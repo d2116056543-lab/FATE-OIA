@@ -21,6 +21,9 @@ class METERSemanticActionPeer(nn.Module):
         self.factor_value = nn.Parameter(torch.empty(action_dim, dim))
         self.semantic_bias = nn.Parameter(torch.zeros(action_dim))
         self.null_key = nn.Parameter(torch.randn(dim) * 0.02)
+        self.null_logit_offset = nn.Parameter(
+            torch.full((action_dim,), math.log(0.10 / 0.90))
+        )
         self.selector = nn.Sequential(
             nn.Linear(dim * 2 + 4, dim // 2),
             nn.GELU(),
@@ -49,12 +52,19 @@ class METERSemanticActionPeer(nn.Module):
         query = self.action_query(action_nodes)
         key = self.factor_key(factor_action_tokens)
         score = torch.einsum("bad,brd->bar", query, key) / math.sqrt(self.dim)
-        null_score = torch.einsum("bad,d->ba", query, self.null_key).unsqueeze(-1)
-        dense = torch.softmax(torch.cat([score, null_score], dim=-1), dim=-1)
-        sparse = entmax15_bisect(torch.cat([score, null_score], dim=-1), dim=-1)
-        distribution = (1.0 - self._ramp(progress)) * dense + self._ramp(progress) * sparse
-        factor_weights = distribution[..., :-1]
-        null_mass = distribution[..., -1]
+        null_score = torch.einsum("bad,d->ba", query, self.null_key)
+        null_mass = torch.sigmoid(
+            null_score
+            - score.mean(dim=-1)
+            + self.null_logit_offset.view(1, -1)
+        )
+        dense = torch.softmax(score, dim=-1)
+        sparse = entmax15_bisect(score, dim=-1)
+        factor_distribution = (
+            (1.0 - self._ramp(progress)) * dense
+            + self._ramp(progress) * sparse
+        )
+        factor_weights = (1.0 - null_mass).unsqueeze(-1) * factor_distribution
         factor_values = torch.einsum("brd,ad->bar", factor_action_tokens, self.factor_value)
         contributions = factor_weights * factor_reliability.unsqueeze(1) * factor_values
         semantic_logits = self.semantic_bias.view(1, -1) + contributions.sum(dim=-1)

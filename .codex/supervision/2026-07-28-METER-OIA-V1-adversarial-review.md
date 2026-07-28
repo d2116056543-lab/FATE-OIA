@@ -97,3 +97,29 @@
 - Final real-DINO audit: `pass=true`, `missing_items=[]`, `warnings=[]`; all functional, contract, and dynamic checks passed.
 - `REVIEW_PASS_METER_OIA_V1.txt` and `METER_OIA_V1_PRE_PILOT_READY.json` were generated.
 - Supervisor verdict: implementation and pre-pilot audit closure are complete. Pilot/full training were not started. Full training still requires a strict pilot-generated `FULL_TRAIN_READY`.
+
+## 10. Pilot 失效后的根因修复复审
+
+**复审日期：** 2026-07-29  
+**监督端：** `019fa909-9501-7a13-9abf-a37411fbf6ee`  
+**复审状态：** 仅批准进入新的 real-DINO smoke/pilot，不批准直接 full train。
+
+严格 pilot 证明视觉主干能够学习，但创新链存在真实失活：support/counter null 为 0、二者 cosine 约 0.99，semantic contribution RMS 为 0，semantic AP 跨 epoch 恒定，selector 接近 0.99 visual，meta utility/omega 为 0，counterfactual 仅覆盖 2 个 action 和 1 个 factor。
+
+执行端按 TDD 修复以下根因：
+
+- signed factor 将 3600 patch 分布与独立可学习 null mass 做联合归一，继续满足 `patch_map.sum(-1) + null_mass = 1`。
+- support/counter query embedding 使用幅度更强且严格相反的初始化，保留 `q+=H+e+`、`q-=H+e-` 合同。
+- semantic action 的 21-factor 分布与独立可学习 null mass 联合归一，避免 entmax 训练后退化为 null-only bias。
+- 保留 softmax 到 entmax 的前 10% progress 过渡、完整 additive semantic expert、selector、meta utility 和 counterfactual 数据流。
+
+监督端代码级结论：
+
+- 修复保持 METER 计划的归一化、稀疏化和 additive contribution 语义。
+- 新 maps/null 真实进入 reliability、semantic action、reason local、meta utility 和 counterfactual。
+- 暂不修改 counterfactual selection；先观察上游贡献恢复后是否自然达到 4 actions / 12 factors，避免为过 gate 伪造覆盖。
+- 若 null、map 分离、semantic contribution 已恢复而 CF 仍长期低覆盖，才允许将其判为独立采样偏置并按 TDD 修复。
+
+**执行端采纳情况：** 全部采纳。  
+**新鲜验证：** 全仓 `164 passed`，另有 1 个与本任务无关的 TypedStorage 弃用警告。  
+**下一门槛：** clean commit/push -> real-DINO audit/readiness -> 真实 smoke/pilot 机制数值验证 -> full train。

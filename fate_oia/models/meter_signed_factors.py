@@ -29,13 +29,18 @@ class METERsignedFactors(nn.Module):
         # on the 384-d frozen field during the first updates.
         self.support_embedding = nn.Parameter(torch.empty(dim))
         self.counter_embedding = nn.Parameter(torch.empty(dim))
-        nn.init.normal_(self.support_embedding, mean=0.0, std=0.08)
-        nn.init.normal_(self.counter_embedding, mean=0.0, std=0.08)
+        signed_seed = torch.randn(dim) * 0.35
+        with torch.no_grad():
+            self.support_embedding.copy_(signed_seed)
+            self.counter_embedding.copy_(-signed_seed)
         self.query_proj = nn.Linear(dim, dim)
         self.key_proj = nn.ModuleList(nn.Linear(dim, dim) for _ in range(num_layers))
         self.value_proj = nn.ModuleList(nn.Linear(dim, dim) for _ in range(num_layers))
         self.null_keys = nn.Parameter(torch.randn(2, num_layers, dim) * 0.04)
         self.null_values = nn.Parameter(torch.randn(2, num_layers, dim) * 0.04)
+        self.null_logit_offset = nn.Parameter(
+            torch.full((2, factor_dim, num_layers), math.log(0.10 / 0.90))
+        )
         self.layer_delta = nn.Parameter(torch.zeros(factor_dim, num_layers))
         self.evidence_proj = nn.Linear(dim, dim, bias=False)
         self.evidence_norm = nn.LayerNorm(dim)
@@ -69,10 +74,17 @@ class METERsignedFactors(nn.Module):
             key = self.key_proj[layer](patches[:, layer])
             value = self.value_proj[layer](patches[:, layer])
             scores = torch.einsum("bfd,bnd->bfn", query, key) / scale
-            null_score = torch.einsum("bfd,d->bf", query, self.null_keys[sign_index, layer]).unsqueeze(-1)
-            distribution = self._patch_distribution(torch.cat([scores, null_score], dim=-1), progress)
-            patch_map = distribution[..., :-1]
-            null_mass = distribution[..., -1]
+            null_score = torch.einsum(
+                "bfd,d->bf", query, self.null_keys[sign_index, layer]
+            )
+            null_logit = (
+                null_score
+                - scores.mean(dim=-1)
+                + self.null_logit_offset[sign_index, :, layer].view(1, -1)
+            )
+            null_mass = torch.sigmoid(null_logit)
+            patch_distribution = self._patch_distribution(scores, progress)
+            patch_map = (1.0 - null_mass).unsqueeze(-1) * patch_distribution
             detail = torch.einsum("bfn,bnd->bfd", patch_map, value)
             detail = detail + null_mass.unsqueeze(-1) * self.null_values[sign_index, layer].view(1, 1, -1)
             maps.append(patch_map)
