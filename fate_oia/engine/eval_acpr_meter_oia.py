@@ -126,8 +126,16 @@ def collect_outputs(model: torch.nn.Module, loader: Iterable[dict[str, Any]], de
             break
         images = batch["image"].to(device, non_blocking=True)
         field = model.encode_images(images)
+        outputs_by_modes = {
+            modes: model.decode_from_field(
+                field,
+                progress=progress,
+                diagnostic_modes=modes,
+            )
+            for modes in set(ACTION_BRANCHES.values()) | set(REASON_BRANCHES.values())
+        }
         for name, modes in ACTION_BRANCHES.items():
-            output = model.decode_from_field(field, progress=progress, diagnostic_modes=modes)
+            output = outputs_by_modes[modes]
             key = {
                 "calalign_visual": "action_logits_visual",
                 "visual": "action_logits_visual",
@@ -141,7 +149,7 @@ def collect_outputs(model: torch.nn.Module, loader: Iterable[dict[str, Any]], de
                 for key in ("factor_support_map", "factor_counter_map", "factor_support_null", "factor_counter_null", "factor_support_score", "factor_counter_score", "factor_layer_weights", "factor_reliability", "action_selector", "action_factor_contributions", "semantic_bias", "action_logits_visual", "action_logits_semantic"):
                     mechanism_values.setdefault(key, []).append(output[key].detach().cpu())
         for name, modes in REASON_BRANCHES.items():
-            output = model.decode_from_field(field, progress=progress, diagnostic_modes=modes)
+            output = outputs_by_modes[modes]
             key = {
                 "calalign_reason": "reason_logits_calalign",
                 "calalign": "reason_logits_calalign",

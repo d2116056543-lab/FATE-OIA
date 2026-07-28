@@ -87,3 +87,53 @@ def meter_reason_loss(
         "annotation_delta": annotation_delta,
         "total": total,
     }
+
+
+def meter_reason_share_loss(
+    output: dict[str, Tensor],
+    target: Tensor,
+    confidence: Tensor,
+    factor_id: int,
+    weights: dict[str, float] | None = None,
+    *,
+    observability: Tensor | None = None,
+) -> dict[str, Tensor]:
+    """Factor-local reason objective used only by the virtual meta update."""
+    if factor_id < 0 or factor_id >= target.shape[1]:
+        raise IndexError(f"factor id out of range: {factor_id}")
+    weights = weights or {}
+    column = slice(factor_id, factor_id + 1)
+    target_r = target[:, column]
+    confidence_r = confidence[:, column]
+    observability_r = None if observability is None else observability[:, column]
+    candidate = output.get("reason_logits_candidate", output["reason_logits_final"])[:, column]
+    final = weighted_reason_asl(candidate, target_r, confidence_r, observability_r)
+    global_view = weighted_reason_asl(
+        output["reason_logits_global"][:, column],
+        target_r,
+        confidence_r,
+        observability_r,
+    )
+    local = weighted_reason_asl(
+        output["reason_logits_local"][:, column],
+        target_r,
+        confidence_r,
+        observability_r,
+    )
+    soft_f1 = reason_soft_f1(candidate, target_r, confidence_r, observability_r)
+    annotation_delta = output["reason_annotation_delta"][:, column].square().mean()
+    total = (
+        weights.get("reason_final", 1.0) * final
+        + weights.get("reason_global", 0.40) * global_view
+        + weights.get("reason_local", 0.40) * local
+        + weights.get("reason_soft_f1", 0.05) * soft_f1
+        + weights.get("reason_annotation_delta", 0.02) * annotation_delta
+    )
+    return {
+        "final": final,
+        "global": global_view,
+        "local": local,
+        "soft_f1": soft_f1,
+        "annotation_delta": annotation_delta,
+        "total": total,
+    }

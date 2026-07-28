@@ -23,11 +23,14 @@ from torch.utils.data import DataLoader, Subset
 from fate_oia.datasets.meter_dataset import METERDataset, fixed_meter_split_indices, meter_split_manifest
 from fate_oia.datasets.meter_grounding_index import METERGroundingIndex
 from fate_oia.engine.eval_acpr_meter_oia import collect_outputs, metrics_summary, branch_metrics, mechanism_stats_from_collected
-from fate_oia.losses.meter_action_losses import meter_action_loss
+from fate_oia.losses.meter_action_losses import (
+    meter_action_loss,
+    meter_action_loss_per_sample,
+)
 from fate_oia.losses.meter_counterfactual_losses import meter_counterfactual_loss
 from fate_oia.losses.meter_grounding_losses import meter_grounding_loss
 from fate_oia.losses.meter_pu_losses import meter_hidden_positive_audit, meter_private_pu_loss, meter_pu_score
-from fate_oia.losses.meter_reason_losses import meter_reason_loss
+from fate_oia.losses.meter_reason_losses import meter_reason_loss, meter_reason_share_loss
 from fate_oia.models.meter_oia_model import METEROIAModel
 from fate_oia.optim.meter_meta_utility import METERMetaUtility
 from fate_oia.transforms_meter import meter_image_transform
@@ -451,6 +454,36 @@ def _make_optimizer(model: METEROIAModel, cfg: dict[str, Any]) -> AdamW:
     return AdamW(groups)
 
 
+def _meta_shadow_optimizer_state(
+    optimizer: AdamW,
+    parameters: dict[str, Tensor],
+) -> dict[str, dict[str, Any]]:
+    """Snapshot AdamW metadata by name without cloning or mutating moments."""
+    group_by_parameter = {
+        id(parameter): group
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    }
+    result: dict[str, dict[str, Any]] = {}
+    for name, parameter in parameters.items():
+        state = optimizer.state.get(parameter, {})
+        if "exp_avg" not in state or "exp_avg_sq" not in state or "step" not in state:
+            raise RuntimeError(f"AdamW state is not initialized for meta parameter {name}")
+        group = group_by_parameter[id(parameter)]
+        result[name] = {
+            "exp_avg": state["exp_avg"].detach(),
+            "exp_avg_sq": state["exp_avg_sq"].detach(),
+            "step": state["step"].detach()
+            if isinstance(state["step"], Tensor)
+            else state["step"],
+            "lr": float(group["lr"]),
+            "betas": tuple(group["betas"]),
+            "eps": float(group["eps"]),
+            "weight_decay": float(group["weight_decay"]),
+        }
+    return result
+
+
 def _losses(
     model: METEROIAModel,
     output: dict[str, Any],
@@ -824,6 +857,17 @@ def run(args: argparse.Namespace) -> None:
         factors=cfg["model"]["reason_dim"], virtual_lr=cfg["meta"]["virtual_lr"],
         ema_old_weight=cfg["meta"]["ema_old_weight"], ema_new_weight=cfg["meta"]["ema_new_weight"],
         lower=cfg["meta"]["utility_lower"], upper=cfg["meta"]["utility_upper"],
+        admission_mode=cfg["meta"].get("admission_mode", "legacy_threshold"),
+        admission_min_consecutive=cfg["meta"].get("admission_min_consecutive", 2),
+        admission_lcb_z=cfg["meta"].get("admission_lcb_z", 1.645),
+        admission_z_scale=cfg["meta"].get("admission_z_scale", 3.0),
+        admission_eps=cfg["meta"].get("admission_eps", 1e-6),
+        admission_min_observations=cfg["meta"].get(
+            "admission_min_observations", 8
+        ),
+        admission_match_tolerance=cfg["meta"].get(
+            "admission_match_tolerance", 1e-4
+        ),
     )
     baseline_hash = str(cfg["audit"]["require_source_sha"])
     config_hash = file_hash(config_path)
@@ -907,6 +951,21 @@ def run(args: argparse.Namespace) -> None:
             meta.omega = torch.as_tensor(meta_state["omega"], dtype=meta.omega.dtype).clone()
         if meta_state.get("utility_ema") is not None:
             meta.utility_ema = torch.as_tensor(meta_state["utility_ema"], dtype=meta.utility_ema.dtype).clone()
+        if meta_state.get("observation_count") is not None:
+            meta.observation_count = torch.as_tensor(
+                meta_state["observation_count"],
+                dtype=meta.observation_count.dtype,
+            ).clone()
+        if meta_state.get("admission_score_ema") is not None:
+            meta.admission_score_ema = torch.as_tensor(
+                meta_state["admission_score_ema"],
+                dtype=meta.admission_score_ema.dtype,
+            ).clone()
+        if meta_state.get("positive_streak") is not None:
+            meta.positive_streak = torch.as_tensor(
+                meta_state["positive_streak"],
+                dtype=meta.positive_streak.dtype,
+            ).clone()
         meta.cursor = int(meta_state.get("cursor", meta.cursor))
         pu_state = payload.get("pu_state", {})
         if pu_state.get("lambda") is not None:
@@ -936,6 +995,22 @@ def run(args: argparse.Namespace) -> None:
         best_branch_metrics = {str(key): float(value) for key, value in payload.get("meta_state", {}).get("best_branch_metrics", {}).items()}
     with torch.no_grad():
         model.meta_share_weight.copy_(meta.omega.to(device=model.meta_share_weight.device, dtype=model.meta_share_weight.dtype))
+        meta_audit_fields: list[Any] = []
+        meta_audit_actions: list[Tensor] = []
+        audit_batch_limit = max(
+            1, int(cfg["meta"].get("admission_audit_batches", 1))
+        )
+        for audit_position, fixed_audit_batch in enumerate(audit_loader):
+            if audit_position >= audit_batch_limit:
+                break
+            meta_audit_fields.append(
+                model.encode_images(
+                    fixed_audit_batch["image"].to(device, non_blocking=True)
+                )
+            )
+            meta_audit_actions.append(fixed_audit_batch["action"].to(device))
+    if not meta_audit_fields:
+        raise RuntimeError("Meta admission requires at least one train-audit batch")
     amp_enabled = bool(cfg["training"].get("bf16", False)) and device.type == "cuda"
     amp_context = lambda: torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled) if device.type in {"cuda", "cpu"} else nullcontext()
     meta_every_updates = int(cfg["meta"].get("pilot_every_updates", 40) if int(args.epochs) <= 3 else cfg["meta"].get("full_every_updates", 100))
@@ -1073,29 +1148,54 @@ def run(args: argparse.Namespace) -> None:
             scheduler.step()
             global_step += 1
             if global_step % max(meta_every_updates, 1) == 0 and audit_indices:
-                audit_batch = next(iter(audit_loader))
-                audit_field = model.encode_images(audit_batch["image"].to(device, non_blocking=True))
                 parameter_map = {"down": model.signed_factors.meta_adapters.down, "up": model.signed_factors.meta_adapters.up}
-                audit_action = audit_batch["action"].to(device)
                 train_action = batch["action"].to(device)
                 factor_count = min(int(cfg["meta"]["factors_per_event"]), model.reason_decoder.reason_dim)
                 factor_ids = tuple((meta.cursor + offset) % model.reason_decoder.reason_dim for offset in range(factor_count))
                 def action_loss_fn(params: dict[str, Tensor]) -> Tensor:
                     virtual = model.decode_from_field(field, progress=progress, factor_parameter_override=params)
                     return meter_action_loss(virtual, train_action, cfg["loss_weights"])["total"]
-                def reason_loss_fn(params: dict[str, Tensor]) -> Tensor:
+                grounding = _move_grounding(batch, device)
+
+                def reason_loss_fn(params: dict[str, Tensor], factor_id: int) -> Tensor:
                     virtual = model.decode_from_field(field, progress=progress, factor_parameter_override=params, meta_share_weight_override=torch.ones(model.reason_decoder.reason_dim, device=device))
-                    return meter_reason_loss(
+                    return meter_reason_share_loss(
                         virtual,
                         batch["reason"].to(device),
                         virtual["factor_reliability"],
+                        factor_id,
                         cfg["loss_weights"],
-                        observability=_move_grounding(batch, device)["factor_observability"],
+                        observability=grounding["factor_observability"],
                     )["total"]
                 def heldout_action(params: dict[str, Tensor]) -> Tensor:
-                    virtual = model.decode_from_field(audit_field, progress=progress, factor_parameter_override=params)
-                    return meter_action_loss(virtual, audit_action, cfg["loss_weights"])["total"]
-                event = meta.event(parameter_map, factor_ids=factor_ids, dino_calls=1, action_loss_fn=action_loss_fn, reason_loss_fn=reason_loss_fn, audit_action_loss_fn=heldout_action)
+                    losses = []
+                    for audit_field, audit_action in zip(
+                        meta_audit_fields, meta_audit_actions
+                    ):
+                        virtual = model.decode_from_field(
+                            audit_field,
+                            progress=progress,
+                            factor_parameter_override=params,
+                        )
+                        losses.append(
+                            meter_action_loss_per_sample(
+                                virtual, audit_action, cfg["loss_weights"]
+                            )
+                        )
+                    return torch.cat(losses)
+                event = meta.event(
+                    parameter_map,
+                    factor_ids=factor_ids,
+                    dino_calls=0,
+                    action_loss_fn=action_loss_fn,
+                    reason_loss_fn=reason_loss_fn,
+                    audit_action_loss_fn=heldout_action,
+                    shadow_optimizer_state=_meta_shadow_optimizer_state(
+                        optimizer,
+                        parameter_map,
+                    ),
+                    lambda_m=float(cfg["meta"].get("lambda_m", 1.0)),
+                )
                 with torch.no_grad():
                     model.meta_share_weight.copy_(meta.omega.to(device=model.meta_share_weight.device, dtype=model.meta_share_weight.dtype))
                 append_jsonl(output_dir / "meta_utility.jsonl", {
@@ -1117,6 +1217,37 @@ def run(args: argparse.Namespace) -> None:
                     "action_grad_norm": event.action_grad_norm,
                     "reason_grad_norm": event.reason_grad_norm,
                     "candidate_delta_norm": event.candidate_delta_norm,
+                    "resolution_failure": event.resolution_failure.tolist(),
+                    "resolution_failure_by_factor": {
+                        str(factor_id): bool(value)
+                        for factor_id, value in zip(
+                            event.factor_ids,
+                            event.resolution_failure.tolist(),
+                        )
+                    },
+                    "observation_count": event.observation_count.tolist(),
+                    "utility_ema_bias_corrected": event.utility_ema_bias_corrected.tolist(),
+                    "utility_samples": event.utility_samples.tolist(),
+                    "null_utility_samples": event.null_utility_samples.tolist(),
+                    "admission_lcb": event.admission_lcb.tolist(),
+                    "null_q99": event.null_q99.tolist(),
+                    "null_mad": event.null_mad.tolist(),
+                    "admission_score": event.admission_score.tolist(),
+                    "admitted": event.admitted.tolist(),
+                    "positive_streak": event.positive_streak.tolist(),
+                    "update_norm_normalized_utility_diagnostic": event.update_norm_normalized_utility.tolist(),
+                    "admission_mode": event.admission_mode,
+                    "actual_delta_norm": event.actual_delta_norm.tolist(),
+                    "null_delta_norm": event.null_delta_norm.tolist(),
+                    "match_relative_error": event.match_relative_error.tolist(),
+                    "control_observations": event.control_observations.tolist(),
+                    "control_type": event.control_type,
+                    "invalid_observation": event.invalid_observation.tolist(),
+                    "shadow_update_used": event.shadow_update_used,
+                    "lambda_m": event.lambda_m,
+                    "audit_field_cache_reused": True,
+                    "audit_field_cache_build_dino_calls": len(meta_audit_fields),
+                    "audit_batches": len(meta_audit_fields),
                     "wall_time_sec": event.wall_time_sec,
                     "dino_calls": event.dino_calls,
                     "train_audit_only": True,
@@ -1196,6 +1327,9 @@ def run(args: argparse.Namespace) -> None:
                     meta_state={
                         "omega": meta.omega,
                         "utility_ema": meta.utility_ema,
+                        "observation_count": meta.observation_count,
+                        "admission_score_ema": meta.admission_score_ema,
+                        "positive_streak": meta.positive_streak,
                         "cursor": meta.cursor,
                         "best_joint": best_joint,
                         "best_branch_metrics": best_branch_metrics,
@@ -1278,7 +1412,14 @@ def run(args: argparse.Namespace) -> None:
             "evidence_maps_stats": test_result["evidence_maps_stats"],
             "selector_stats": test_result["selector_stats"],
             "reason_view_stats": test_result["reason_view_stats"],
-            "meta_stats": {"omega": meta.omega.tolist(), "utility_ema": meta.utility_ema.tolist(), "cursor": meta.cursor},
+            "meta_stats": {
+                "omega": meta.omega.tolist(),
+                "utility_ema": meta.utility_ema.tolist(),
+                "observation_count": meta.observation_count.tolist(),
+                "admission_score_ema": meta.admission_score_ema.tolist(),
+                "positive_streak": meta.positive_streak.tolist(),
+                "cursor": meta.cursor,
+            },
             "pu_stats": pu_audit_state,
             "counterfactual.json": test_result["counterfactual_stats"],
             "per_action.json": {"raw": {k: v for k, v in raw.items() if k.startswith("Act_")}, "deploy": {k: v for k, v in deploy.items() if k.startswith("Act_")}},
@@ -1302,7 +1443,16 @@ def run(args: argparse.Namespace) -> None:
         }
         save_epoch_artifacts(output_dir, epoch, metrics_raw=raw, metrics_deploy=deploy, branch_metrics=test_result["branches"], logits=test_result["logits"], labels=test_result["labels"], diagnostics=diagnostics, file_names=test_result["file_names"])
         checkpoint_runtime = {"batch_size": cfg["training"].get("batch_size"), "gradient_accumulation_steps": grad_accum, "effective_batch": int(cfg["training"].get("batch_size", 6)) * grad_accum, "runtime_profile": runtime_profile}
-        checkpoint_meta = {"omega": meta.omega, "utility_ema": meta.utility_ema, "cursor": meta.cursor, "best_joint": best_joint, "best_branch_metrics": best_branch_metrics}
+        checkpoint_meta = {
+            "omega": meta.omega,
+            "utility_ema": meta.utility_ema,
+            "observation_count": meta.observation_count,
+            "admission_score_ema": meta.admission_score_ema,
+            "positive_streak": meta.positive_streak,
+            "cursor": meta.cursor,
+            "best_joint": best_joint,
+            "best_branch_metrics": best_branch_metrics,
+        }
         calibration_payload = {
             "theta": calibration.theta.detach().cpu(),
             "temperature": None if calibration.temperature is None else calibration.temperature.detach().cpu(),

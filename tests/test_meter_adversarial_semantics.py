@@ -119,9 +119,13 @@ def test_meta_utility_is_computed_per_selected_factor() -> None:
         weight = candidate["weight"].flatten()
         return (weight[0] - 1.0).square() + (weight[1] - 1.0).square()
 
-    def reason_loss(candidate: dict[str, torch.Tensor]) -> torch.Tensor:
+    def reason_loss(
+        candidate: dict[str, torch.Tensor],
+        factor_id: int,
+    ) -> torch.Tensor:
         weight = candidate["weight"].flatten()
-        return (weight[0] - 1.0).square() + (weight[1] + 1.0).square()
+        targets = weight.new_tensor([1.0, -1.0])
+        return (weight[factor_id] - targets[factor_id]).square()
 
     event = utility.event(
         parameters,

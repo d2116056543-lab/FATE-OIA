@@ -116,6 +116,15 @@ meta:
   utility_lower: 0.001
   utility_upper: 0.005
   virtual_lr: 0.00010
+  lambda_m: 1.0
+  admission_mode: matched_null_lcb
+  admission_audit_batches: 3
+  admission_min_consecutive: 2
+  admission_lcb_z: 1.645
+  admission_z_scale: 3.0
+  admission_eps: 0.000001
+  admission_min_observations: 8
+  admission_match_tolerance: 0.0001
   require_train_audit_only: true
 
 pu:

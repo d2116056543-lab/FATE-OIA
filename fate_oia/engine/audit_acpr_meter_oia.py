@@ -238,6 +238,9 @@ def run_audit(
         if "def _counterfactual_event(" in trainer_text and "def _make_optimizer(" in trainer_text
         else ""
     )
+    meta_text = (
+        root / "fate_oia/optim/meter_meta_utility.py"
+    ).read_text(encoding="utf-8")
     contract = {
         "trainer_calls_all_losses": all(token in trainer_text for token in ("meter_action_loss", "meter_reason_loss", "meter_grounding_loss", "meter_counterfactual_loss", "meter_private_pu_loss")),
         "trainer_calls_meta_and_calibration": all(token in trainer_text for token in ("meta.event", "_fit_calibration", "save_epoch_artifacts", "load_checkpoint")),
@@ -279,8 +282,37 @@ def run_audit(
             for token in ("signed_direction", "_mirror_balance_loss", "factor_source_conf")
         ),
         "per_factor_meta_utility": all(
-            token in (root / "fate_oia/optim/meter_meta_utility.py").read_text(encoding="utf-8")
+            token in meta_text
             for token in ("factor_ids", "utility = torch.stack(utilities)", "for factor_id in ids", "action_gradient[factor_id]")
+        ),
+        "matched_null_meta_admission": bool(
+            config is not None
+            and config.get("meta", {}).get("admission_mode")
+            == "matched_null_lcb"
+            and int(config.get("meta", {}).get("admission_audit_batches", 0))
+            >= 2
+            and int(config.get("meta", {}).get("admission_min_consecutive", 0))
+            >= 2
+            and all(
+                token in meta_text
+                for token in (
+                    "_match_delta_norm",
+                    "null_utility_samples",
+                    "admission_lcb",
+                    "null_q99",
+                    "positive_streak",
+                    "update_norm_normalized_utility",
+                )
+            )
+            and all(
+                token in trainer_text
+                for token in (
+                    "meta_audit_fields",
+                    "audit_field_cache_reused",
+                    "admission_score_ema",
+                    "positive_streak",
+                )
+            )
         ),
         "private_reason_complete": all(
             token in (root / "fate_oia/models/meter_reason_decoder.py").read_text(encoding="utf-8")
@@ -303,7 +335,22 @@ def run_audit(
         ),
         "profiler_contract": all(
             token in (root / "fate_oia/engine/profile_acpr_meter_oia.py").read_text(encoding="utf-8")
-            for token in ("warmup_updates: int = 5", "measured_updates: int = 20", "optimizer.step()", "meta.event(", "_counterfactual_event(", '"real_data": True')
+            for token in (
+                "warmup_updates: int = 5",
+                "measured_updates: int = 20",
+                "optimizer.step()",
+                "meta.event(",
+                "_counterfactual_event(",
+                '"real_data": True',
+                '"--single_trial"',
+                "subprocess.run(",
+                "_wait_for_gpu_baseline(",
+                '"isolation_pass"',
+                '"memory_peak_after_ordinary_gb"',
+                '"memory_peak_after_counterfactual_gb"',
+                '"memory_peak_after_meta_gb"',
+                '"memory_peak_after_calibration_gb"',
+            )
         ),
         "standalone_evaluator": all(
             token in eval_text
@@ -321,7 +368,22 @@ def run_audit(
         selected = profile.get("selected") or {}
         real_result = {
             "required": True, "executed": bool(profile.get("real_dino")),
-            "pass": bool(profile.get("real_dino")) and bool(selected.get("finite")) and float(selected.get("reserved_gb", 1e9)) < 45.0,
+            "pass": (
+                bool(profile.get("real_dino"))
+                and bool(selected.get("finite"))
+                and bool(selected.get("isolation_pass"))
+                and int(selected.get("child_exit_status", 1)) == 0
+                and float(selected.get("reserved_gb", 1e9)) < 45.0
+                and all(
+                    field in selected
+                    for field in (
+                        "memory_peak_after_ordinary_gb",
+                        "memory_peak_after_counterfactual_gb",
+                        "memory_peak_after_meta_gb",
+                        "memory_peak_after_calibration_gb",
+                    )
+                )
+            ),
             "profile_path": str(profile_path), "selected": selected,
         }
     functional = {
@@ -341,6 +403,9 @@ def run_audit(
         "dynamic_finite_and_ablation": contract["all_dynamic_outputs_finite"] and contract["factor_off_effect_observable"],
         "grounding_objective": contract["grounding_direction_and_mirror"],
         "per_factor_meta_utility": contract["per_factor_meta_utility"],
+        "matched_null_meta_admission": contract[
+            "matched_null_meta_admission"
+        ],
         "private_reason_decoder": contract["private_reason_complete"],
         "selective_observation_reason_loss": contract["observability_reason_weighting"],
         "hidden_positive_pu_audit": contract["hidden_positive_subset_audit"] and dynamic["pu_private_firewall_ok"],

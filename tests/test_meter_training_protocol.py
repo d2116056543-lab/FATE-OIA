@@ -180,3 +180,9 @@ def test_trainer_run_cannot_bypass_readiness_with_cli_flag() -> None:
     source = inspect.getsource(trainer.run)
     assert "if args.require_ready" not in source
     assert "validate_training_readiness(" in source
+
+
+def test_meta_event_reports_cached_dino_calls_truthfully() -> None:
+    source = inspect.getsource(trainer.run)
+    assert "dino_calls=0" in source
+    assert '"audit_field_cache_build_dino_calls"' in source
