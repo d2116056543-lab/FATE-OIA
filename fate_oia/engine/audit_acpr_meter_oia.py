@@ -350,6 +350,10 @@ def run_audit(
                 '"memory_peak_after_counterfactual_gb"',
                 '"memory_peak_after_meta_gb"',
                 '"memory_peak_after_calibration_gb"',
+                '"git_head"',
+                '"source_tree_hash"',
+                '"config_hash"',
+                '"schema_hash"',
             )
         ),
         "standalone_evaluator": all(
@@ -366,6 +370,32 @@ def run_audit(
     if real_dino and profile_path.exists():
         profile = json.loads(profile_path.read_text(encoding="utf-8"))
         selected = profile.get("selected") or {}
+        recovery_samples = selected.get("physical_recovery_samples_gb") or []
+        baseline_before = float(
+            selected.get("physical_baseline_before_gb", -1.0)
+        )
+        recovery_verified = (
+            len(recovery_samples) >= 3
+            and baseline_before >= 0.0
+            and all(
+                float(sample) <= baseline_before + 0.5
+                for sample in recovery_samples[-3:]
+            )
+        )
+        profile_identity_ok = (
+            int(profile.get("schema_version", 0)) == 1
+            and profile.get("profile_mode")
+            in {"candidate_search", "selected_validation"}
+            and profile.get("git_head") == git_head
+            and profile.get("source_tree_hash") == python_source_tree_hash(root)
+            and profile.get("config_hash")
+            == file_hash(root / "configs/fate_oia_train_360x640_acpr_meter_oia_v1.yaml")
+            and profile.get("schema_hash")
+            == combined_file_hash(
+                root / "configs/meter_factor_schema.yaml",
+                root / "configs/meter_grounding_schema.yaml",
+            )
+        )
         real_result = {
             "required": True, "executed": bool(profile.get("real_dino")),
             "pass": (
@@ -373,6 +403,10 @@ def run_audit(
                 and bool(selected.get("finite"))
                 and bool(selected.get("isolation_pass"))
                 and int(selected.get("child_exit_status", 1)) == 0
+                and int(selected.get("process_id", 0)) > 0
+                and recovery_verified
+                and float(selected.get("physical_peak_delta_gb", -1.0)) >= 0.0
+                and profile_identity_ok
                 and float(selected.get("reserved_gb", 1e9)) < 45.0
                 and all(
                     field in selected
@@ -384,7 +418,10 @@ def run_audit(
                     )
                 )
             ),
-            "profile_path": str(profile_path), "selected": selected,
+            "profile_path": str(profile_path),
+            "selected": selected,
+            "identity_ok": profile_identity_ok,
+            "recovery_verified": recovery_verified,
         }
     functional = {
         "dataset_targets": (root / "fate_oia/datasets/meter_signed_targets.py").exists(),
@@ -417,7 +454,16 @@ def run_audit(
         "selector_ablation": dynamic["selector_visual_only_error"] < 1e-7 and dynamic["selector_semantic_only_error"] < 1e-7,
     }
     clean_status = subprocess.run(["git", "status", "--porcelain"], cwd=root, text=True, capture_output=True, check=False).stdout.strip()
-    passed = bool(not missing and not forbidden_hits and not placeholder_errors and config is not None and all(functional.values()) and dynamic["downstream_grad_ok"] and real_result["pass"])
+    passed = bool(
+        not missing
+        and not forbidden_hits
+        and not placeholder_errors
+        and config is not None
+        and all(functional.values())
+        and dynamic["downstream_grad_ok"]
+        and real_result["pass"]
+        and not clean_status
+    )
     report = {
         "pass": passed,
         "checked_files": checked,

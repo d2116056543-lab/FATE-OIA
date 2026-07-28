@@ -30,7 +30,13 @@ from fate_oia.losses.meter_reason_losses import meter_reason_loss, meter_reason_
 from fate_oia.models.meter_oia_model import METEROIAModel
 from fate_oia.optim.meter_meta_utility import METERMetaUtility
 from fate_oia.transforms_meter import meter_image_transform
-from fate_oia.utils.meter_artifacts import state_hash, write_json
+from fate_oia.utils.meter_artifacts import (
+    combined_file_hash,
+    file_hash,
+    python_source_tree_hash,
+    state_hash,
+    write_json,
+)
 from fate_oia.utils.meter_config import load_meter_config
 from fate_oia.utils.meter_posthoc_calibration import fit_train_calib_deploy_theta
 from fate_oia.utils.meter_runtime import effective_cuda_memory_gb
@@ -469,8 +475,19 @@ def main() -> None:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--use_mock_dino", action="store_true")
     parser.add_argument("--single_trial", default="")
+    parser.add_argument("--selected_only", action="store_true")
     args = parser.parse_args()
     config = load_meter_config(args.config)
+    root = Path.cwd().resolve()
+    git_head = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=root, text=True
+    ).strip()
+    source_tree_hash = python_source_tree_hash(root)
+    config_hash = file_hash(Path(args.config).resolve())
+    schema_hash = combined_file_hash(
+        root / "configs/meter_factor_schema.yaml",
+        root / "configs/meter_grounding_schema.yaml",
+    )
     device = torch.device(args.device)
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = bool(config["training"].get("tf32", True))
@@ -534,6 +551,13 @@ def main() -> None:
     stable_prefetch_factor = int(
         config["data"].get("prefetch_factor", prefetch_options[0])
     )
+    if args.selected_only:
+        candidates = [(
+            int(config["training"]["batch_size"]),
+            int(config["training"]["gradient_accumulation_steps"]),
+        )]
+        worker_options = [stable_num_workers]
+        prefetch_options = [stable_prefetch_factor]
 
     def run_plan(items: list[dict[str, int | str]]) -> None:
         for item in items:
@@ -661,6 +685,14 @@ def main() -> None:
         run_plan(complete_plan[len(batch_plan):])
     selected = _select_profile(profiles, config)
     report = {
+        "schema_version": 1,
+        "git_head": git_head,
+        "source_tree_hash": source_tree_hash,
+        "config_hash": config_hash,
+        "schema_hash": schema_hash,
+        "profile_mode": (
+            "selected_validation" if args.selected_only else "candidate_search"
+        ),
         "real_dino": not args.use_mock_dino,
         "real_data": True,
         "device": str(device),

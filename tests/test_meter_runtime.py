@@ -102,3 +102,12 @@ def test_profiler_runs_each_candidate_in_synchronous_child_process() -> None:
     assert "subprocess.run(" in source
     assert '"--single_trial"' in source
     assert "_wait_for_gpu_baseline(" in source
+    for field in (
+        '"git_head"',
+        '"source_tree_hash"',
+        '"config_hash"',
+        '"schema_hash"',
+        '"schema_version"',
+        '"selected_validation"',
+    ):
+        assert field in source

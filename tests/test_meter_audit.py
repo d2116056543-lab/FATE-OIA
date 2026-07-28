@@ -33,3 +33,6 @@ def test_audit_requires_isolated_profile_and_all_event_memory_peaks() -> None:
     assert "memory_peak_after_counterfactual_gb" in source
     assert "memory_peak_after_meta_gb" in source
     assert "memory_peak_after_calibration_gb" in source
+    assert "recovery_verified" in source
+    assert "profile_identity_ok" in source
+    assert "and not clean_status" in source
