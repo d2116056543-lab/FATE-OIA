@@ -186,3 +186,24 @@ def test_meta_event_reports_cached_dino_calls_truthfully() -> None:
     source = inspect.getsource(trainer.run)
     assert "dino_calls=0" in source
     assert '"audit_field_cache_build_dino_calls"' in source
+
+
+def test_pilot_history_survives_resume_and_replaces_same_epoch(tmp_path: Path) -> None:
+    first = {"epoch": 0, "value": "old"}
+    replacement = {"epoch": 0, "value": "new"}
+    second = {"epoch": 1, "value": "second"}
+
+    trainer._record_pilot_history(tmp_path, first)
+    trainer._record_pilot_history(tmp_path, second)
+    history = trainer._record_pilot_history(tmp_path, replacement)
+
+    assert history == [replacement, second]
+    assert trainer._load_pilot_history(tmp_path) == [replacement, second]
+
+
+def test_trainer_saves_pre_eval_resume_checkpoint() -> None:
+    source = inspect.getsource(trainer.run)
+    pre_eval = source.index('"phase": "pre_eval"')
+    audit = source.index("audit_outputs = collect_outputs", pre_eval)
+
+    assert "micro_step=micro_batches_per_epoch" in source[pre_eval - 500 : audit]

@@ -710,6 +710,29 @@ def _write_full_train_ready_if_eligible(
     return report
 
 
+def _load_pilot_history(output_dir: Path) -> list[dict[str, Any]]:
+    path = output_dir / "pilot_history.json"
+    if not path.exists():
+        return []
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or not isinstance(payload.get("history"), list):
+        raise RuntimeError("pilot_history.json must contain a history list")
+    history = [row for row in payload["history"] if isinstance(row, dict) and "epoch" in row]
+    return sorted(history, key=lambda row: int(row["epoch"]))
+
+
+def _record_pilot_history(output_dir: Path, row: dict[str, Any]) -> list[dict[str, Any]]:
+    history = [
+        existing
+        for existing in _load_pilot_history(output_dir)
+        if int(existing["epoch"]) != int(row["epoch"])
+    ]
+    history.append(row)
+    history.sort(key=lambda existing: int(existing["epoch"]))
+    write_json(output_dir / "pilot_history.json", {"history": history})
+    return history
+
+
 def validate_training_readiness(
     *,
     root: Path,
@@ -1017,7 +1040,7 @@ def run(args: argparse.Namespace) -> None:
     print_every = int(cfg["runtime"].get("print_every_optimizer_updates", 50))
     owner_step_counts: dict[str, int] = {}
     owner_zero_gradient_counts: dict[str, int] = {}
-    pilot_history: list[dict[str, Any]] = []
+    pilot_history = _load_pilot_history(output_dir) if args.resume else []
     for epoch in range(start_epoch, int(args.epochs)):
         model.train()
         model.foundation.dino.eval()
@@ -1352,6 +1375,51 @@ def run(args: argparse.Namespace) -> None:
                     schema_hash=schema_hash,
                 )
         resume_micro_step = 0
+        # Preserve the completed epoch before audit/calibration/test. A failure in
+        # post-train evaluation can then resume at the same epoch without replaying
+        # already-applied optimizer updates.
+        save_checkpoint(
+            output_dir / "checkpoint_latest.pth",
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            epoch=epoch,
+            micro_step=micro_batches_per_epoch,
+            optimizer_step=global_step,
+            runtime_profile={
+                "phase": "pre_eval",
+                "batch_size": cfg["training"].get("batch_size"),
+                "gradient_accumulation_steps": grad_accum,
+                "effective_batch": int(cfg["training"].get("batch_size", 6)) * grad_accum,
+                "runtime_profile": runtime_profile,
+            },
+            meta_state={
+                "omega": meta.omega,
+                "utility_ema": meta.utility_ema,
+                "observation_count": meta.observation_count,
+                "admission_score_ema": meta.admission_score_ema,
+                "positive_streak": meta.positive_streak,
+                "cursor": meta.cursor,
+                "best_joint": best_joint,
+                "best_branch_metrics": best_branch_metrics,
+            },
+            pu_state={
+                "lambda": pu_lambda.detach().cpu(),
+                "audit": pu_audit_state,
+            },
+            calibration={
+                "theta": calibration.theta.detach().cpu(),
+                "temperature": None if calibration.temperature is None else calibration.temperature.detach().cpu(),
+                "strategy": calibration.strategy,
+                "accepted": calibration.accepted,
+                "fallback_reason": calibration.fallback_reason,
+                "train_calib_raw_joint": calibration.train_calib_raw_joint,
+                "train_calib_deploy_joint": calibration.train_calib_deploy_joint,
+            },
+            config_hash=config_hash,
+            source_hash=source_hash,
+            schema_hash=schema_hash,
+        )
         audit_outputs = collect_outputs(model, audit_loader, device, progress=1.0)
         audit_mechanism = audit_outputs.get("mechanism", {})
         pu_audit_state = meter_hidden_positive_audit(
@@ -1381,7 +1449,7 @@ def run(args: argparse.Namespace) -> None:
         joint = float(deploy.get("deploy_joint", 0.0))
         append_jsonl(output_dir / "metrics_summary.jsonl", {"epoch": epoch, "metrics_raw": raw, "metrics_deploy": deploy, "runtime_sec": time.time() - epoch_start, "dino_calls": model.foundation.ordinary_dino_calls})
         append_jsonl(output_dir / "mechanism_stats.jsonl", {"epoch": epoch, "branch_metrics": test_result["branches"], "factor_stats": test_result["factor_stats"], "selector_stats": test_result["selector_stats"], "reason_view_stats": test_result["reason_view_stats"], "factor_reliability_mean": float(test_result["factor_reliability_mean"]), "factor_support_mean": float(test_result["factor_support_mean"]), "pu_active_labels": pu_audit_state["active_labels"]})
-        pilot_history.append({
+        pilot_row = {
             "epoch": epoch,
             "finite": all(
                 value == value and math.isfinite(float(value))
@@ -1406,7 +1474,8 @@ def run(args: argparse.Namespace) -> None:
                 for owner, count in owner_step_counts.items()
             },
             "peak_reserved_gb": torch.cuda.max_memory_reserved(device) / 1024**3 if device.type == "cuda" else 0.0,
-        })
+        }
+        pilot_history = _record_pilot_history(output_dir, pilot_row)
         diagnostics = {
             "factor_stats": test_result["factor_stats"],
             "evidence_maps_stats": test_result["evidence_maps_stats"],

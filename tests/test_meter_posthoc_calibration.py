@@ -1,4 +1,5 @@
 import torch
+import pytest
 
 from fate_oia.utils.meter_posthoc_calibration import apply_meter_deploy, fit_train_calib_deploy_theta, guard_train_calib_deploy_theta, METERCalibrationResult
 
@@ -58,3 +59,51 @@ def test_calibration_guard_checks_ranking_on_logits_before_sigmoid_saturation() 
     )
 
     assert guarded.map_max_abs_delta == 0.0
+
+
+def test_calibration_guard_preserves_near_tied_float32_ranking() -> None:
+    generator = torch.Generator().manual_seed(123)
+    action_logits = torch.randn(2048, 1, generator=generator) * 1e-7
+    labels = torch.randint(0, 2, (2048, 1), generator=generator).float()
+    candidate = METERCalibrationResult(
+        theta=torch.tensor([0.37, 0.37]),
+        temperature=torch.tensor([0.75, 0.75]),
+        model_state_hash_before="state",
+        model_state_hash_after="state",
+        fit_split="train_calib",
+        representation_updated=False,
+    )
+
+    guarded = guard_train_calib_deploy_theta(
+        action_logits,
+        labels,
+        action_logits.clone(),
+        labels,
+        candidate,
+        fallback_on_deploy_degradation=False,
+    )
+
+    assert guarded.map_max_abs_delta == 0.0
+
+
+@pytest.mark.parametrize("temperature", [0.0, -1.0, float("nan"), float("inf")])
+def test_calibration_guard_rejects_invalid_temperature(temperature: float) -> None:
+    logits = torch.randn(16, 1)
+    labels = torch.randint(0, 2, (16, 1)).float()
+    candidate = METERCalibrationResult(
+        theta=torch.zeros(2),
+        temperature=torch.full((2,), temperature),
+        model_state_hash_before="state",
+        model_state_hash_after="state",
+        fit_split="train_calib",
+        representation_updated=False,
+    )
+
+    with pytest.raises(ValueError, match="strictly positive"):
+        guard_train_calib_deploy_theta(
+            logits,
+            labels,
+            logits,
+            labels,
+            candidate,
+        )

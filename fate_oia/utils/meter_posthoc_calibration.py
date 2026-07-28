@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import math
+
 import torch
 from torch import Tensor
 
-from fate_oia.metrics import binary_average_precision, multilabel_metrics_from_logits
+from fate_oia.metrics import multilabel_metrics_from_logits
 
 
 @dataclass(frozen=True)
@@ -113,12 +115,30 @@ def _joint_score(action_logits: Tensor, action_labels: Tensor, reason_logits: Te
     return 0.5 * (float(action.get("Act_mF1", 0.0)) + float(reason.get("Exp_mF1", 0.0)))
 
 
+def _ranking_average_precision(scores: Tensor, targets: Tensor) -> float:
+    scores = scores.detach().double().flatten()
+    targets = targets.detach().double().flatten()
+    positive_count = targets.sum()
+    if positive_count <= 0:
+        return float("nan")
+    order = torch.argsort(scores, descending=True, stable=True)
+    sorted_targets = targets[order]
+    true_positives = torch.cumsum(sorted_targets, dim=0)
+    rank = torch.arange(
+        1,
+        sorted_targets.numel() + 1,
+        device=sorted_targets.device,
+        dtype=torch.float64,
+    )
+    return float(((true_positives / rank) * sorted_targets).sum() / positive_count)
+
+
 def _ranking_map(scores: Tensor, labels: Tensor) -> float:
     per_label = [
-        binary_average_precision(scores[:, index], labels[:, index])
+        _ranking_average_precision(scores[:, index], labels[:, index])
         for index in range(labels.shape[1])
     ]
-    finite = [value for value in per_label if torch.isfinite(torch.tensor(value))]
+    finite = [value for value in per_label if math.isfinite(value)]
     return float(sum(finite) / len(finite)) if finite else float("nan")
 
 
@@ -145,6 +165,12 @@ def guard_train_calib_deploy_theta(
     temperature = candidate.temperature
     if temperature is None:
         temperature = torch.ones_like(candidate.theta)
+    if temperature.ndim != 1 or temperature.numel() != expected:
+        raise ValueError("Calibration temperature must concatenate action and reason temperatures")
+    if not torch.isfinite(temperature).all() or not torch.all(temperature > 0):
+        raise ValueError("Calibration temperature must be finite and strictly positive")
+    if not torch.isfinite(candidate.theta).all():
+        raise ValueError("Calibration theta must be finite")
     action_temperature = temperature[: action_logits.shape[1]].to(action_logits)
     reason_temperature = temperature[action_logits.shape[1] :].to(reason_logits)
     raw_joint = _joint_score(action_logits, action_labels, reason_logits, reason_labels)
@@ -154,14 +180,26 @@ def guard_train_calib_deploy_theta(
         reason_logits / reason_temperature - reason_theta,
         reason_labels,
     )
+    action_ranking_logits = action_logits.detach().double()
+    reason_ranking_logits = reason_logits.detach().double()
+    action_ranking_temperature = action_temperature.detach().double()
+    reason_ranking_temperature = reason_temperature.detach().double()
+    action_ranking_theta = action_theta.detach().double()
+    reason_ranking_theta = reason_theta.detach().double()
     map_delta = max(
         abs(
-            _ranking_map(action_logits, action_labels)
-            - _ranking_map(action_logits / action_temperature - action_theta, action_labels)
+            _ranking_map(action_ranking_logits, action_labels)
+            - _ranking_map(
+                action_ranking_logits / action_ranking_temperature - action_ranking_theta,
+                action_labels,
+            )
         ),
         abs(
-            _ranking_map(reason_logits, reason_labels)
-            - _ranking_map(reason_logits / reason_temperature - reason_theta, reason_labels)
+            _ranking_map(reason_ranking_logits, reason_labels)
+            - _ranking_map(
+                reason_ranking_logits / reason_ranking_temperature - reason_ranking_theta,
+                reason_labels,
+            )
         ),
     )
     if map_delta > 1e-7:
