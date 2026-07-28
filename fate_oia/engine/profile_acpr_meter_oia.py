@@ -32,6 +32,74 @@ def _synchronize(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+def build_two_stage_profile_plan(
+    candidates: list[tuple[int, int]],
+    worker_options: list[int],
+    prefetch_options: list[int],
+    *,
+    stable_num_workers: int,
+    stable_prefetch_factor: int,
+    selected_candidate: tuple[int, int] | None = None,
+) -> list[dict[str, int | str]]:
+    """Build a staged search without repeating the full Cartesian product."""
+    plan = [
+        {
+            "stage": "batch_search",
+            "batch_size": int(batch_size),
+            "gradient_accumulation_steps": int(accumulation),
+            "num_workers": int(stable_num_workers),
+            "prefetch_factor": int(stable_prefetch_factor),
+        }
+        for batch_size, accumulation in candidates
+    ]
+    if selected_candidate is None:
+        return plan
+    selected_batch, selected_accumulation = selected_candidate
+    for num_workers in worker_options:
+        for prefetch_factor in prefetch_options:
+            if (
+                num_workers == stable_num_workers
+                and prefetch_factor == stable_prefetch_factor
+            ):
+                continue
+            plan.append({
+                "stage": "loader_search",
+                "batch_size": int(selected_batch),
+                "gradient_accumulation_steps": int(selected_accumulation),
+                "num_workers": int(num_workers),
+                "prefetch_factor": int(prefetch_factor),
+            })
+    return plan
+
+
+def _select_profile(
+    profiles: list[dict[str, Any]],
+    config: dict[str, Any],
+) -> dict[str, Any] | None:
+    valid = [
+        profile
+        for profile in profiles
+        if not profile.get("oom")
+        and profile.get("finite")
+        and profile.get("reserved_gb", 1e9)
+        < float(config["runtime"]["hard_max_reserved_gb"])
+    ]
+    preferred = [
+        profile
+        for profile in valid
+        if profile["reserved_gb"] <= float(config["runtime"]["target_reserved_gb"])
+    ] or valid
+    if not preferred:
+        return None
+    best_speed = max(profile["event_adjusted_samples_per_sec"] for profile in preferred)
+    near_best = [
+        profile
+        for profile in preferred
+        if profile["event_adjusted_samples_per_sec"] >= 0.97 * best_speed
+    ]
+    return min(near_best, key=lambda profile: profile["reserved_gb"])
+
+
 def profile_one(
     config: dict[str, Any],
     dataset: METERDataset,
@@ -268,64 +336,73 @@ def main() -> None:
     candidates = [tuple(item) for item in config["runtime"]["profile_candidates"]]
     worker_options = [int(item) for item in config["runtime"]["profile_num_workers"]]
     prefetch_options = [int(item) for item in config["runtime"]["profile_prefetch_factor"]]
-    for batch_size, accumulation in candidates:
-        for num_workers in worker_options:
-            for prefetch_factor in prefetch_options:
-                try:
-                    profiles.append(profile_one(
-                        config,
-                        dataset,
-                        split["main"],
-                        device,
-                        batch_size=int(batch_size),
-                        accumulation=int(accumulation),
-                        num_workers=num_workers,
-                        prefetch_factor=prefetch_factor,
-                        use_mock_dino=args.use_mock_dino,
-                    ))
-                except RuntimeError as exc:
-                    if "out of memory" not in str(exc).lower():
-                        raise
-                    if device.type == "cuda":
-                        torch.cuda.empty_cache()
-                    profiles.append({
-                        "batch_size": int(batch_size),
-                        "gradient_accumulation_steps": int(accumulation),
-                        "num_workers": num_workers,
-                        "prefetch_factor": prefetch_factor,
-                        "oom": True,
-                        "error": str(exc),
-                    })
-                finally:
-                    if device.type == "cuda":
-                        torch.cuda.empty_cache()
-    valid = [
-        profile
-        for profile in profiles
-        if not profile.get("oom")
-        and profile.get("finite")
-        and profile.get("reserved_gb", 1e9) < float(config["runtime"]["hard_max_reserved_gb"])
-    ]
-    preferred = [
-        profile
-        for profile in valid
-        if profile["reserved_gb"] <= float(config["runtime"]["target_reserved_gb"])
-    ] or valid
-    selected = max(preferred, key=lambda profile: profile["event_adjusted_samples_per_sec"], default=None)
-    if selected is not None:
-        best_speed = max(profile["event_adjusted_samples_per_sec"] for profile in preferred)
-        near_best = [
-            profile
-            for profile in preferred
-            if profile["event_adjusted_samples_per_sec"] >= 0.97 * best_speed
-        ]
-        selected = min(near_best, key=lambda profile: profile["reserved_gb"])
+    stable_num_workers = int(config["data"].get("num_workers", worker_options[0]))
+    stable_prefetch_factor = int(
+        config["data"].get("prefetch_factor", prefetch_options[0])
+    )
+
+    def run_plan(items: list[dict[str, int | str]]) -> None:
+        for item in items:
+            try:
+                profile = profile_one(
+                    config,
+                    dataset,
+                    split["main"],
+                    device,
+                    batch_size=int(item["batch_size"]),
+                    accumulation=int(item["gradient_accumulation_steps"]),
+                    num_workers=int(item["num_workers"]),
+                    prefetch_factor=int(item["prefetch_factor"]),
+                    use_mock_dino=args.use_mock_dino,
+                )
+                profile["search_stage"] = item["stage"]
+                profiles.append(profile)
+            except RuntimeError as exc:
+                if "out of memory" not in str(exc).lower():
+                    raise
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+                profiles.append({
+                    **item,
+                    "search_stage": item["stage"],
+                    "oom": True,
+                    "error": str(exc),
+                })
+            finally:
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+
+    batch_plan = build_two_stage_profile_plan(
+        candidates,
+        worker_options,
+        prefetch_options,
+        stable_num_workers=stable_num_workers,
+        stable_prefetch_factor=stable_prefetch_factor,
+    )
+    run_plan(batch_plan)
+    selected_batch_profile = _select_profile(profiles, config)
+    if selected_batch_profile is not None:
+        selected_candidate = (
+            int(selected_batch_profile["batch_size"]),
+            int(selected_batch_profile["gradient_accumulation_steps"]),
+        )
+        complete_plan = build_two_stage_profile_plan(
+            candidates,
+            worker_options,
+            prefetch_options,
+            stable_num_workers=stable_num_workers,
+            stable_prefetch_factor=stable_prefetch_factor,
+            selected_candidate=selected_candidate,
+        )
+        run_plan(complete_plan[len(batch_plan):])
+    selected = _select_profile(profiles, config)
     report = {
         "real_dino": not args.use_mock_dino,
         "real_data": True,
         "device": str(device),
         "profiles": profiles,
         "selected": selected,
+        "search_strategy": "two_stage_batch_then_loader",
         "selection_rule": "finite; reserved<45GB; prefer<=42GB; highest event-adjusted throughput; lower memory within 3%",
     }
     output = Path(args.output_dir)
