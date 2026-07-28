@@ -66,6 +66,10 @@ def main() -> None:
     parser.add_argument("--config", required=True)
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--pilot_train_samples", type=int, default=4096)
+    parser.add_argument("--pilot_audit_samples", type=int, default=1024)
+    parser.add_argument("--pilot_calib_samples", type=int, default=512)
+    parser.add_argument("--pilot_test_samples", type=int, default=512)
     args = parser.parse_args()
     root = Path.cwd()
     epochs = 3 if args.mode == "pilot" else 12
@@ -103,7 +107,13 @@ def main() -> None:
         "--device", args.device, "--require_ready", "--worktree_root", str(root),
     ]
     if args.mode == "pilot":
-        command.extend(["--epochs", "3", "--max_train_samples", "4096", "--max_audit_samples", "1024", "--max_calib_samples", "512", "--max_test_samples", "512"])
+        command.extend([
+            "--epochs", "3",
+            "--max_train_samples", str(args.pilot_train_samples),
+            "--max_audit_samples", str(args.pilot_audit_samples),
+            "--max_calib_samples", str(args.pilot_calib_samples),
+            "--max_test_samples", str(args.pilot_test_samples),
+        ])
     else:
         command.extend(["--epochs", str(epochs)])
     raise SystemExit(run_foreground(command, cwd=root))
