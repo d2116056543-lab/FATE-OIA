@@ -411,7 +411,7 @@ class METERMetaUtility:
                 )
                 raw_mean = actual_samples_cpu.mean()
                 utilities.append(
-                    raw_mean.new_tensor(float("nan")) if unresolved else raw_mean
+                    raw_mean.new_zeros(()) if unresolved else raw_mean
                 )
                 if (
                     actual_samples_cpu.numel()

@@ -36,3 +36,4 @@ def test_audit_requires_isolated_profile_and_all_event_memory_peaks() -> None:
     assert "recovery_verified" in source
     assert "profile_identity_ok" in source
     assert "and not clean_status" in source
+    assert 'selected.get("meta_utility_finite")' in source

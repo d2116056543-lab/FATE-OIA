@@ -123,7 +123,8 @@ def test_meta_utility_reports_unresolvable_float32_candidate() -> None:
     )
 
     assert event.resolution_failure.tolist() == [True]
-    assert torch.isnan(event.relative_utility).all()
+    assert torch.equal(event.relative_utility, torch.zeros_like(event.relative_utility))
+    assert torch.isfinite(event.relative_utility).all()
     assert torch.equal(event.omega_before, event.omega_after)
 
 

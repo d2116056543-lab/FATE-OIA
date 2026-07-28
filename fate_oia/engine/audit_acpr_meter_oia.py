@@ -401,6 +401,7 @@ def run_audit(
             "pass": (
                 bool(profile.get("real_dino"))
                 and bool(selected.get("finite"))
+                and bool(selected.get("meta_utility_finite"))
                 and bool(selected.get("isolation_pass"))
                 and int(selected.get("child_exit_status", 1)) == 0
                 and int(selected.get("process_id", 0)) > 0
