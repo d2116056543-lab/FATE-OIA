@@ -193,14 +193,10 @@ def validate_epoch_artifacts(directory: str | Path) -> list[str]:
     root = Path(directory)
     required = [
         "metrics_raw.json", "metrics_deploy.json", "branch_metrics.json",
-        "per_action.json", "per_reason.json", "factor_stats.json",
-        "evidence_maps_stats.json", "selector_stats.json", "reason_view_stats.json",
-        "meta_stats.json", "pu_stats.json", "counterfactual.json", "calibration.json",
+        "typed_evidence.json", "pu_stats.json", "calibration.json", "runtime.json",
         "file_names_test.json",
         "logits_action_final_raw_test.pt", "logits_reason_final_raw_test.pt",
-        "logits_action_visual_test.pt", "logits_action_semantic_test.pt",
-        "logits_action_peer_test.pt", "logits_reason_calalign_test.pt",
-        "logits_reason_global_test.pt", "logits_reason_local_test.pt",
-        "logits_reason_mix_test.pt", "labels_action_test.pt", "labels_reason_test.pt",
+        "logits_action_visual_test.pt", "logits_reason_global_test.pt",
+        "labels_action_test.pt", "labels_reason_test.pt",
     ]
     return [name for name in required if not (root / name).exists()]

@@ -1,13 +1,46 @@
 from __future__ import annotations
 
 import hashlib
+import random
 from pathlib import Path
 from typing import Any
 
+import torch
 from torch.utils.data import Dataset
 
 from .bdd_oia_multitask import BDDOIAMultiTaskDataset
 from .meter_grounding_index import METERGroundingIndex
+
+ACTION_MIRROR_PAIRS = ((2, 3),)
+REASON_MIRROR_PAIRS = ((9, 15), (10, 16), (11, 17), (12, 18), (13, 19), (14, 20))
+
+
+def _swap_pairs(value: torch.Tensor, pairs: tuple[tuple[int, int], ...]) -> torch.Tensor:
+    result = value.clone()
+    for left, right in pairs:
+        result[left], result[right] = value[right].clone(), value[left].clone()
+    return result
+
+
+def mirror_typed_target(target: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    result = {key: value.clone() for key, value in target.items()}
+    for key in (
+        "factor_anchor_map",
+        "factor_anchor_valid",
+        "factor_state_target",
+        "factor_state_valid",
+        "factor_observability",
+        "factor_observability_valid",
+        "factor_source_weight",
+    ):
+        if key not in result:
+            continue
+        result[key] = _swap_pairs(result[key], REASON_MIRROR_PAIRS)
+    if "factor_anchor_map" in result:
+        result["factor_anchor_map"] = torch.flip(
+            result["factor_anchor_map"], dims=[-1]
+        )
+    return result
 
 
 def fixed_meter_split_indices(
@@ -67,6 +100,7 @@ class METERDataset(Dataset):
         transform: Any,
         grounding_index: METERGroundingIndex | None = None,
         include_grounding: bool = False,
+        mirror_probability: float = 0.0,
     ) -> None:
         self.base = BDDOIAMultiTaskDataset(
             data_root=data_root,
@@ -80,8 +114,11 @@ class METERDataset(Dataset):
         self.split = split
         self.grounding_index = grounding_index
         self.include_grounding = bool(include_grounding)
+        self.mirror_probability = float(mirror_probability)
         if self.include_grounding and split != "train":
             raise ValueError("Typed grounding is train-only")
+        if not 0.0 <= self.mirror_probability <= 1.0:
+            raise ValueError("mirror_probability must be in [0,1]")
 
     def __len__(self) -> int:
         return len(self.base)
@@ -94,4 +131,15 @@ class METERDataset(Dataset):
             )
             if target is not None:
                 item["meter_grounding"] = target
+        if self.split == "train" and random.random() < self.mirror_probability:
+            item["image"] = torch.flip(item["image"], dims=[-1])
+            item["action"] = _swap_pairs(item["action"], ACTION_MIRROR_PAIRS)
+            item["reason"] = _swap_pairs(item["reason"], REASON_MIRROR_PAIRS)
+            if "meter_grounding" in item:
+                item["meter_grounding"] = mirror_typed_target(
+                    item["meter_grounding"]
+                )
+            item["meter_mirrored"] = True
+        else:
+            item["meter_mirrored"] = False
         return item

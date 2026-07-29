@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import argparse
-import json
-import math
+import gc
+import time
 from pathlib import Path
 from typing import Any, Iterable
 
 import torch
+from torch import Tensor
 from torch.utils.data import DataLoader, Subset
 
 from fate_oia.datasets.meter_dataset import METERDataset
@@ -15,259 +16,357 @@ from fate_oia.models.meter_oia_model import METEROIAModel
 from fate_oia.transforms_meter import meter_image_transform
 from fate_oia.utils.meter_artifacts import load_checkpoint, write_json
 from fate_oia.utils.meter_config import load_meter_config
-from fate_oia.utils.meter_posthoc_calibration import METERCalibrationResult, apply_meter_deploy
+from fate_oia.utils.meter_posthoc_calibration import (
+    METERCalibrationResult,
+    apply_meter_deploy,
+)
 
 
-ACTION_BRANCHES = {
-    "calalign_visual": (),
-    "visual": (),
-    "semantic": (),
-    "peer_candidate": (),
-    "peer": (),
-    "final": (),
+SEQUENTIAL_MODES: dict[str, tuple[str, ...]] = {
     "factor_off": ("factor_off",),
-    "factor_shuffle": ("factor_shuffle",),
-    "factor_shuffled": ("factor_shuffle",),
-    "support_only": ("support_only",),
-    "counter_only": ("counter_only",),
-    "meta_off": ("meta_off",),
-    "selector_visual_only": ("selector_visual_only",),
-    "selector_semantic_only": ("selector_semantic_only",),
-}
-REASON_BRANCHES = {
-    "calalign_reason": (),
-    "calalign": (),
-    "global_private": (),
-    "global": (),
-    "local_private": (),
-    "local": (),
-    "mix_private": (),
-    "mix": (),
-    "final": (),
-    "annotation_off": ("annotation_off",),
-    "annotation_residual_off": ("annotation_off",),
-    "factor_context_off": ("factor_context_off",),
-    "map_shuffle": ("map_shuffle",),
-    "factor_map_shuffled": ("map_shuffle",),
-    "decision_context_off": ("decision_context_off",),
-    "meta_off": ("meta_off",),
+    "state_off": ("state_off",),
+    "schema_corruption": ("schema_corruption",),
+    "cross_sample_swap": ("cross_sample_swap",),
+    "state_corruption": ("state_corruption",),
+    "reason_correction_off": ("reason_correction_off",),
 }
 
 
-def _cat(values: list[torch.Tensor], dim: int = 0) -> torch.Tensor:
-    return torch.cat(values, dim=dim) if values else torch.empty(0)
+def _cat(rows: list[Tensor]) -> Tensor:
+    return torch.cat(rows) if rows else torch.empty(0)
 
 
-def _entropy(probability: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    return -(probability.clamp_min(1e-8) * probability.clamp_min(1e-8).log()).sum(dim=dim)
+def _release_cuda() -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
 
-def _mechanism_stats(mechanism: dict[str, torch.Tensor]) -> dict[str, Any]:
-    """Reduce real forward tensors into auditable, non-placeholder statistics."""
-    support = mechanism["factor_support_map"]
-    counter = mechanism["factor_counter_map"]
-    support_null = mechanism["factor_support_null"]
-    counter_null = mechanism["factor_counter_null"]
-    support_full = torch.cat([support, support_null.unsqueeze(-1)], dim=-1)
-    counter_full = torch.cat([counter, counter_null.unsqueeze(-1)], dim=-1)
-    layer = mechanism["factor_layer_weights"]
-    selector = mechanism["action_selector"]
-    visual = mechanism["action_logits_visual"]
-    semantic = mechanism["action_logits_semantic"]
-    transport_delta = mechanism.get(
-        "action_semantic_transport_delta", semantic - visual
-    )
-    contributions = mechanism["action_factor_contributions"]
-    factor_reliability = mechanism["factor_reliability"]
-    mix_gate = mechanism["reason_mix_gate"]
-    annotation = mechanism["reason_annotation_delta"]
+def _entropy(probability: Tensor, dim: int = -1) -> Tensor:
+    probability = probability.float().clamp_min(1e-8)
+    return -(probability * probability.log()).sum(dim)
+
+
+def _metric_pair(action: Tensor, reason: Tensor, labels_a: Tensor, labels_r: Tensor) -> dict[str, Any]:
+    action_metrics = multilabel_metrics_from_logits(action, labels_a, prefix="Act_")
+    reason_metrics = multilabel_metrics_from_logits(reason, labels_r, prefix="Exp_")
     return {
-        "factor_count": int(support.shape[1]),
-        "patch_count": int(support.shape[-1]),
-        "support_map_sum_mean": float(support.sum(-1).mean().item()),
-        "counter_map_sum_mean": float(counter.sum(-1).mean().item()),
-        "support_null_mean": float(support_null.mean().item()),
-        "counter_null_mean": float(counter_null.mean().item()),
-        "support_entropy_mean": float(_entropy(support_full).mean().item()),
-        "counter_entropy_mean": float(_entropy(counter_full).mean().item()),
-        "support_counter_cosine_mean": float(torch.nn.functional.cosine_similarity(support, counter, dim=-1).mean().item()),
-        "reliability_mean": float(factor_reliability.mean().item()),
-        "reliability_min": float(factor_reliability.min().item()),
-        "reliability_max": float(factor_reliability.max().item()),
-        "per_factor_support_null": support_null.mean(0).tolist(),
-        "per_factor_counter_null": counter_null.mean(0).tolist(),
-        "per_factor_support_entropy": _entropy(support_full).mean(0).tolist(),
-        "per_factor_counter_entropy": _entropy(counter_full).mean(0).tolist(),
-        "layer_weights": layer.detach().cpu().tolist(),
-        "layer_entropy": _entropy(layer).mean().item(),
-        "selector_mean": float(selector.mean().item()),
-        "selector_std": float(selector.std(unbiased=False).item()),
-        "selector_min": float(selector.min().item()),
-        "selector_max": float(selector.max().item()),
-        "semantic_visual_rms_ratio": float(
-            (
-                transport_delta.float().square().mean().sqrt()
-                / (visual.float().square().mean().sqrt() + 1e-6)
-            ).item()
+        **action_metrics,
+        **reason_metrics,
+        "joint": 0.5
+        * (
+            float(action_metrics.get("Act_mF1", 0.0))
+            + float(reason_metrics.get("Exp_mF1", 0.0))
         ),
-        "semantic_transport_actual_ratio_per_action": (
-            transport_delta.float().square().mean(dim=0).sqrt()
-            / visual.float().square().mean(dim=0).sqrt().clamp_min(1e-6)
-        ).tolist(),
-        "semantic_probe_visual_rms_ratio": float(
-            (
-                semantic.float().square().mean().sqrt()
-                / (visual.float().square().mean().sqrt() + 1e-6)
-            ).item()
-        ),
-        "semantic_transport_scale_mean": float(
-            mechanism.get(
-                "semantic_transport_scale", semantic.new_ones(1)
-            ).float().mean().item()
-        ),
-        "semantic_transport_saturation_rate": float(
-            mechanism.get(
-                "semantic_transport_saturation_rate", semantic.new_zeros(1)
-            ).float().mean().item()
-        ),
-        "semantic_contribution_rms": float(contributions.float().square().mean().sqrt().item()),
-        "visual_logit_rms": float(visual.float().square().mean().sqrt().item()),
-        "factor_contribution_sum_error": float((semantic - (mechanism["semantic_bias"] + contributions.sum(-1))).abs().max().item()) if "semantic_bias" in mechanism else None,
-        "reason_mix_gate_mean": float(mix_gate.mean().item()),
-        "reason_mix_gate_std": float(mix_gate.std(unbiased=False).item()),
-        "reason_annotation_rms": float(annotation.float().square().mean().sqrt().item()),
-        "reason_global_local_rms": float((mechanism["reason_logits_global"] - mechanism["reason_logits_local"]).float().square().mean().sqrt().item()),
     }
 
 
 @torch.no_grad()
-def collect_outputs(model: torch.nn.Module, loader: Iterable[dict[str, Any]], device: torch.device, *, progress: float, max_batches: int | None = None) -> dict[str, Any]:
+def _collect_mode(
+    model: METEROIAModel,
+    loader: Iterable[dict[str, Any]],
+    device: torch.device,
+    *,
+    progress: float,
+    diagnostic_modes: tuple[str, ...] = (),
+    collect_mechanism: bool = False,
+    max_batches: int | None = None,
+) -> dict[str, Any]:
     model.eval()
-    all_action: dict[str, list[torch.Tensor]] = {name: [] for name in ACTION_BRANCHES}
-    all_reason: dict[str, list[torch.Tensor]] = {name: [] for name in REASON_BRANCHES}
-    labels_action: list[torch.Tensor] = []
-    labels_reason: list[torch.Tensor] = []
+    action_visual: list[Tensor] = []
+    action_final: list[Tensor] = []
+    reason_global: list[Tensor] = []
+    reason_final: list[Tensor] = []
+    labels_action: list[Tensor] = []
+    labels_reason: list[Tensor] = []
     file_names: list[str] = []
-    mechanism_values: dict[str, list[torch.Tensor]] = {}
+    mechanism: dict[str, list[Tensor]] = {}
+    mode_seconds = 0.0
+    dino_calls_before = model.foundation.ordinary_dino_calls
+    keys = (
+        "factor_anchor_map",
+        "factor_null_mass",
+        "factor_state_prob",
+        "factor_state_entropy",
+        "factor_observability",
+        "factor_reliability",
+        "factor_layer_weights",
+        "action_evidence_delta",
+        "action_factor_weights",
+        "action_factor_contributions",
+        "action_correction_rms_ratio",
+        "reason_evidence_delta",
+        "reason_groundable_mask",
+    )
     for batch_index, batch in enumerate(loader):
         if max_batches is not None and batch_index >= max_batches:
             break
+        start = time.perf_counter()
         images = batch["image"].to(device, non_blocking=True)
-        field = model.encode_images(images)
-        outputs_by_modes = {
-            modes: model.decode_from_field(
-                field,
-                progress=progress,
-                diagnostic_modes=modes,
-            )
-            for modes in set(ACTION_BRANCHES.values()) | set(REASON_BRANCHES.values())
-        }
-        for name, modes in ACTION_BRANCHES.items():
-            output = outputs_by_modes[modes]
-            key = {
-                "calalign_visual": "action_logits_visual",
-                "visual": "action_logits_visual",
-                "semantic": "action_logits_semantic",
-                "peer_candidate": "action_logits_peer",
-                "peer": "action_logits_peer",
-                "final": "action_logits_final",
-            }.get(name, "action_logits_final")
-            all_action[name].append(output[key].detach().cpu())
-            if name == "final":
-                for key in ("factor_support_map", "factor_counter_map", "factor_support_null", "factor_counter_null", "factor_support_score", "factor_counter_score", "factor_layer_weights", "factor_reliability", "action_selector", "action_factor_contributions", "semantic_bias", "action_logits_visual", "action_logits_semantic", "action_semantic_transport_delta", "semantic_transport_scale", "semantic_transport_saturation_rate"):
-                    if key in output:
-                        mechanism_values.setdefault(key, []).append(
-                            output[key].detach().cpu()
-                        )
-        for name, modes in REASON_BRANCHES.items():
-            output = outputs_by_modes[modes]
-            key = {
-                "calalign_reason": "reason_logits_calalign",
-                "calalign": "reason_logits_calalign",
-                "global_private": "reason_logits_global",
-                "global": "reason_logits_global",
-                "local_private": "reason_logits_local",
-                "local": "reason_logits_local",
-                "mix_private": "reason_logits_mix",
-                "mix": "reason_logits_mix",
-                "final": "reason_logits_final",
-            }.get(name, "reason_logits_final")
-            all_reason[name].append(output[key].detach().cpu())
-            if name == "final":
-                for key in ("reason_mix_gate", "reason_annotation_delta", "reason_logits_global", "reason_logits_local"):
-                    mechanism_values.setdefault(key, []).append(output[key].detach().cpu())
+        output = model(
+            images,
+            progress=progress,
+            diagnostic_modes=diagnostic_modes,
+        )
+        mode_seconds += time.perf_counter() - start
+        action_visual.append(output["action_logits_visual"].detach().cpu())
+        action_final.append(output["action_logits_final"].detach().cpu())
+        reason_global.append(output["reason_logits_global"].detach().cpu())
+        reason_final.append(output["reason_logits_final"].detach().cpu())
         labels_action.append(batch["action"].detach().cpu())
         labels_reason.append(batch["reason"].detach().cpu())
-        file_names.extend([str(x) for x in batch["file_name"]])
+        file_names.extend(str(name) for name in batch["file_name"])
+        if collect_mechanism:
+            for key in keys:
+                value = output.get(key)
+                if isinstance(value, Tensor):
+                    if value.ndim == 1:
+                        value = value.unsqueeze(0)
+                    mechanism.setdefault(key, []).append(value.detach().cpu())
+        del output, images
     return {
-        "action": {name: _cat(values) for name, values in all_action.items()},
-        "reason": {name: _cat(values) for name, values in all_reason.items()},
+        "action_visual": _cat(action_visual),
+        "action_final": _cat(action_final),
+        "reason_global": _cat(reason_global),
+        "reason_final": _cat(reason_final),
         "labels_action": _cat(labels_action),
         "labels_reason": _cat(labels_reason),
         "file_names": file_names,
-        "mechanism": {key: _cat(values) for key, values in mechanism_values.items()},
+        "mechanism": {key: _cat(value) for key, value in mechanism.items()},
+        "eval_mode_time": mode_seconds,
+        "dino_call_count": model.foundation.ordinary_dino_calls - dino_calls_before,
     }
+
+
+@torch.no_grad()
+def collect_outputs(
+    model: METEROIAModel,
+    loader: Iterable[dict[str, Any]],
+    device: torch.device,
+    *,
+    progress: float,
+    max_batches: int | None = None,
+    sequential_modes: bool = True,
+) -> dict[str, Any]:
+    """Collect formal branches, then evaluate corruptions one at a time."""
+    main = _collect_mode(
+        model,
+        loader,
+        device,
+        progress=progress,
+        collect_mechanism=True,
+        max_batches=max_batches,
+    )
+    labels_action = main["labels_action"]
+    labels_reason = main["labels_reason"]
+    modes: dict[str, dict[str, Any]] = {}
+    if sequential_modes:
+        for name, flags in SEQUENTIAL_MODES.items():
+            mode = _collect_mode(
+                model,
+                loader,
+                device,
+                progress=progress,
+                diagnostic_modes=flags,
+                max_batches=max_batches,
+            )
+            modes[name] = {
+                "action_final": mode["action_final"],
+                "reason_final": mode["reason_final"],
+                "metrics": _metric_pair(
+                    mode["action_final"],
+                    mode["reason_final"],
+                    labels_action,
+                    labels_reason,
+                ),
+                "eval_mode_time": mode["eval_mode_time"],
+                "dino_call_count": mode["dino_call_count"],
+            }
+            del mode
+            _release_cuda()
+    return {**main, "modes": modes}
 
 
 def branch_metrics(collected: dict[str, Any]) -> dict[str, Any]:
-    action_labels = collected["labels_action"]
-    reason_labels = collected["labels_reason"]
-    result: dict[str, Any] = {}
-    for name, logits in collected["action"].items():
-        result[f"action_{name}"] = multilabel_metrics_from_logits(logits, action_labels, prefix="Act_")
-    for name, logits in collected["reason"].items():
-        result[f"reason_{name}"] = multilabel_metrics_from_logits(logits, reason_labels, prefix="Exp_")
+    labels_action = collected["labels_action"]
+    labels_reason = collected["labels_reason"]
+    result = {
+        "action_visual": multilabel_metrics_from_logits(
+            collected["action_visual"], labels_action, prefix="Act_"
+        ),
+        "action_final": multilabel_metrics_from_logits(
+            collected["action_final"], labels_action, prefix="Act_"
+        ),
+        "reason_global": multilabel_metrics_from_logits(
+            collected["reason_global"], labels_reason, prefix="Exp_"
+        ),
+        "reason_final": multilabel_metrics_from_logits(
+            collected["reason_final"], labels_reason, prefix="Exp_"
+        ),
+    }
+    result.update(
+        {name: payload["metrics"] for name, payload in collected["modes"].items()}
+    )
     return result
 
 
-def metrics_summary(collected: dict[str, Any], calibration: METERCalibrationResult | None = None) -> dict[str, Any]:
-    action = collected["action"]["final"]
-    reason = collected["reason"]["final"]
-    raw = {
-        **multilabel_metrics_from_logits(action, collected["labels_action"], prefix="Act_"),
-        **multilabel_metrics_from_logits(reason, collected["labels_reason"], prefix="Exp_"),
-    }
+def _split_calibration(
+    calibration: METERCalibrationResult, action_dim: int, reason_dim: int
+) -> tuple[METERCalibrationResult, METERCalibrationResult]:
+    def part(start: int, end: int) -> METERCalibrationResult:
+        return METERCalibrationResult(
+            theta=calibration.theta[start:end],
+            temperature=(
+                None
+                if calibration.temperature is None
+                else calibration.temperature[start:end]
+            ),
+            strategy=calibration.strategy,
+            model_state_hash_before=calibration.model_state_hash_before,
+            model_state_hash_after=calibration.model_state_hash_after,
+            fit_split=calibration.fit_split,
+            representation_updated=False,
+            accepted=calibration.accepted,
+            fallback_reason=calibration.fallback_reason,
+        )
+
+    return part(0, action_dim), part(action_dim, action_dim + reason_dim)
+
+
+def metrics_summary(
+    collected: dict[str, Any],
+    calibration: METERCalibrationResult | None = None,
+) -> dict[str, Any]:
+    raw = _metric_pair(
+        collected["action_final"],
+        collected["reason_final"],
+        collected["labels_action"],
+        collected["labels_reason"],
+    )
+    raw["raw_joint"] = raw.pop("joint")
     deploy = dict(raw)
     if calibration is not None:
-        action_calibration = METERCalibrationResult(
-            theta=calibration.theta[: action.shape[1]],
-            temperature=None if calibration.temperature is None else calibration.temperature[: action.shape[1]],
-            strategy=calibration.strategy,
-            model_state_hash_before=calibration.model_state_hash_before,
-            model_state_hash_after=calibration.model_state_hash_after,
-            fit_split=calibration.fit_split,
-            representation_updated=calibration.representation_updated,
+        action_cal, reason_cal = _split_calibration(
+            calibration,
+            collected["action_final"].shape[1],
+            collected["reason_final"].shape[1],
         )
-        reason_calibration = METERCalibrationResult(
-            theta=calibration.theta[action.shape[1] : action.shape[1] + reason.shape[1]],
-            temperature=None if calibration.temperature is None else calibration.temperature[action.shape[1] : action.shape[1] + reason.shape[1]],
-            strategy=calibration.strategy,
-            model_state_hash_before=calibration.model_state_hash_before,
-            model_state_hash_after=calibration.model_state_hash_after,
-            fit_split=calibration.fit_split,
-            representation_updated=calibration.representation_updated,
+        deploy_action = apply_meter_deploy(collected["action_final"], action_cal)
+        deploy_reason = apply_meter_deploy(collected["reason_final"], reason_cal)
+        deploy = _metric_pair(
+            deploy_action,
+            deploy_reason,
+            collected["labels_action"],
+            collected["labels_reason"],
         )
-        deploy_action = apply_meter_deploy(action, action_calibration)
-        deploy_reason = apply_meter_deploy(reason, reason_calibration)
-        deploy = {
-            **multilabel_metrics_from_logits(deploy_action, collected["labels_action"], prefix="Act_"),
-            **multilabel_metrics_from_logits(deploy_reason, collected["labels_reason"], prefix="Exp_"),
-        }
-    raw["raw_joint"] = 0.5 * (raw.get("Act_mF1", 0.0) + raw.get("Exp_mF1", 0.0))
-    deploy["deploy_joint"] = 0.5 * (deploy.get("Act_mF1", 0.0) + deploy.get("Exp_mF1", 0.0))
+        deploy["deploy_joint"] = deploy.pop("joint")
+    else:
+        deploy["deploy_joint"] = deploy.pop("raw_joint")
     return {"metrics_raw": raw, "metrics_deploy": deploy}
 
 
-def evaluate_checkpoint(model: torch.nn.Module, loader: Iterable[dict[str, Any]], device: torch.device, *, progress: float) -> dict[str, Any]:
-    collected = collect_outputs(model, loader, device, progress=progress)
-    return {"collected": collected, "branches": branch_metrics(collected), "summary": metrics_summary(collected)}
-
-
 def mechanism_stats_from_collected(collected: dict[str, Any]) -> dict[str, Any]:
-    mechanism = collected.get("mechanism", {})
-    if not mechanism:
-        return {"factor_count": 0, "patch_count": 0, "available": False}
-    return _mechanism_stats(mechanism) | {"available": True}
+    value = collected.get("mechanism", {})
+    if not value:
+        return {"available": False}
+    anchor = value["factor_anchor_map"]
+    null = value["factor_null_mass"]
+    full_anchor = torch.cat([anchor, null.unsqueeze(-1)], -1)
+    state = value["factor_state_prob"]
+    visual = collected["action_visual"].float()
+    delta = value["action_evidence_delta"].float()
+    contribution = value["action_factor_contributions"].float()
+    reason_delta = value["reason_evidence_delta"].float()
+    modes = collected.get("modes", {})
+
+    def mode_delta(name: str, branch: str) -> list[float]:
+        if name not in modes:
+            return []
+        clean = collected[branch].float()
+        changed = modes[name][branch].float()
+        return (clean - changed).abs().mean(0).tolist()
+
+    return {
+        "available": True,
+        "anchor_entropy_per_factor": _entropy(full_anchor).mean(0).tolist(),
+        "anchor_null_mass_per_factor": null.mean(0).tolist(),
+        "observability_per_factor": value["factor_observability"].mean(0).tolist(),
+        "reliability_per_factor": value["factor_reliability"].mean(0).tolist(),
+        "state_entropy_per_factor": _entropy(state).mean(0).tolist(),
+        "layer_weights": value["factor_layer_weights"][0].tolist(),
+        "action_correction_rms_ratio_per_action": (
+            delta.square().mean(0).sqrt()
+            / visual.square().mean(0).sqrt().clamp_min(1e-6)
+        ).tolist(),
+        "reason_correction_rms_per_label": reason_delta.square().mean(0).sqrt().tolist(),
+        "factor_contribution_rms_by_action_factor": contribution.square()
+        .mean(0)
+        .sqrt()
+        .tolist(),
+        "factor_weight_mean_by_action_factor": value["action_factor_weights"]
+        .mean(0)
+        .tolist(),
+        "factor_off_delta_per_action": mode_delta("factor_off", "action_final"),
+        "state_off_delta_per_action": mode_delta("state_off", "action_final"),
+        "schema_corruption_delta_per_action": mode_delta(
+            "schema_corruption", "action_final"
+        ),
+        "cross_sample_swap_delta_per_action": mode_delta(
+            "cross_sample_swap", "action_final"
+        ),
+        "state_corruption_delta_per_action": mode_delta(
+            "state_corruption", "action_final"
+        ),
+        "reason_correction_off_delta_per_label": mode_delta(
+            "reason_correction_off", "reason_final"
+        ),
+        "eval_mode_time": {
+            name: payload["eval_mode_time"] for name, payload in modes.items()
+        },
+        "dino_call_count": {
+            "main": collected["dino_call_count"],
+            **{name: payload["dino_call_count"] for name, payload in modes.items()},
+        },
+    }
+
+
+def evaluate_checkpoint(
+    model: METEROIAModel,
+    loader: Iterable[dict[str, Any]],
+    device: torch.device,
+    *,
+    progress: float,
+    calibration: METERCalibrationResult | None = None,
+) -> dict[str, Any]:
+    collected = collect_outputs(model, loader, device, progress=progress)
+    return {
+        "collected": collected,
+        "branches": branch_metrics(collected),
+        "summary": metrics_summary(collected, calibration),
+        "mechanism": mechanism_stats_from_collected(collected),
+    }
+
+
+def _calibration_from_checkpoint(payload: dict[str, Any]) -> METERCalibrationResult | None:
+    value = payload.get("calibration") or {}
+    if value.get("theta") is None:
+        return None
+    return METERCalibrationResult(
+        theta=torch.as_tensor(value["theta"]),
+        temperature=(
+            None
+            if value.get("temperature") is None
+            else torch.as_tensor(value["temperature"])
+        ),
+        strategy=str(value.get("strategy", "per_label")),
+        model_state_hash_before="checkpoint",
+        model_state_hash_after="checkpoint",
+        fit_split="train_calib",
+        representation_updated=False,
+        accepted=bool(value.get("accepted", True)),
+        fallback_reason=str(value.get("fallback_reason", "")),
+    )
 
 
 def main() -> None:
@@ -282,13 +381,13 @@ def main() -> None:
     config = load_meter_config(args.config)
     device = torch.device(args.device)
     model = METEROIAModel(
-        dim=config["model"]["dim"],
-        action_dim=config["model"]["action_dim"],
-        reason_dim=config["model"]["reason_dim"],
+        dim=int(config["model"]["dim"]),
+        action_dim=int(config["model"]["action_dim"]),
+        reason_dim=int(config["model"]["reason_dim"]),
         selected_layers=tuple(config["backbone"]["selected_layers"]),
         pretrained_weights=config["backbone"]["pretrained_weights"],
         use_mock_dino=args.use_mock_dino,
-        factor_rank=config["model"].get("factor_rank", 16),
+        factor_rank=int(config["model"].get("factor_rank", 16)),
     ).to(device)
     payload = load_checkpoint(args.checkpoint, model=model)
     dataset = METERDataset(
@@ -296,51 +395,33 @@ def main() -> None:
         raw_root=config["data"]["raw_root"],
         split="test",
         transform=meter_image_transform(),
-        grounding_index=None,
-        include_grounding=False,
     )
     indices = list(range(len(dataset)))
     if args.max_test_samples:
         indices = indices[: args.max_test_samples]
     workers = int(config["data"].get("num_workers", 4))
-    loader_kwargs: dict[str, Any] = {
-        "batch_size": int(config["training"].get("batch_size", 6)),
+    kwargs: dict[str, Any] = {
+        "batch_size": int(config["training"]["batch_size"]),
         "shuffle": False,
         "num_workers": workers,
         "pin_memory": bool(config["data"].get("pin_memory", True)),
-        "persistent_workers": workers > 0 and bool(config["data"].get("persistent_workers", True)),
+        "persistent_workers": workers > 0,
     }
     if workers > 0:
-        loader_kwargs["prefetch_factor"] = int(config["data"].get("prefetch_factor", 2))
-    loader = DataLoader(Subset(dataset, indices), **loader_kwargs)
-    calibration_payload = payload.get("calibration", {})
-    calibration = None
-    if calibration_payload.get("theta") is not None:
-        calibration = METERCalibrationResult(
-            theta=torch.as_tensor(calibration_payload["theta"]),
-            temperature=(
-                None
-                if calibration_payload.get("temperature") is None
-                else torch.as_tensor(calibration_payload["temperature"])
-            ),
-            strategy=str(calibration_payload.get("strategy", "per_label")),
-            model_state_hash_before="checkpoint",
-            model_state_hash_after="checkpoint",
-            fit_split="train_calib",
-            representation_updated=False,
-        )
-    collected = collect_outputs(model, loader, device, progress=1.0)
-    result = {
-        "summary": metrics_summary(collected, calibration),
-        "branches": branch_metrics(collected),
-        "mechanism": mechanism_stats_from_collected(collected),
-        "checkpoint": str(Path(args.checkpoint).resolve()),
-        "test_samples": len(indices),
-    }
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    write_json(output_dir / "evaluation_summary.json", result)
-    print(json.dumps(result, indent=2, sort_keys=True))
+        kwargs["prefetch_factor"] = int(config["data"].get("prefetch_factor", 2))
+    loader = DataLoader(Subset(dataset, indices), **kwargs)
+    result = evaluate_checkpoint(
+        model,
+        loader,
+        device,
+        progress=1.0,
+        calibration=_calibration_from_checkpoint(payload),
+    )
+    output = Path(args.output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    write_json(output / "metrics_summary.json", result["summary"])
+    write_json(output / "branch_metrics.json", result["branches"])
+    write_json(output / "mechanism_stats.json", result["mechanism"])
 
 
 if __name__ == "__main__":

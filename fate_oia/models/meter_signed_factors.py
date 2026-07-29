@@ -80,6 +80,19 @@ class TypedEvidenceStateHead(nn.Module):
         ramp = self._ramp(progress)
         return dense * (1.0 - ramp) + sparse * ramp
 
+    def compose_typed_token(
+        self,
+        global_token: Tensor,
+        anchor_token: Tensor,
+        state_prob: Tensor,
+    ) -> Tensor:
+        state_token = torch.einsum(
+            "bfs,fsd->bfd", state_prob, self.state_embeddings
+        )
+        return self.typed_norm(
+            global_token + self.anchor_proj(anchor_token) + state_token
+        )
+
     def forward(
         self,
         factor_base_nodes: Tensor,
@@ -91,6 +104,10 @@ class TypedEvidenceStateHead(nn.Module):
             raise ValueError("Expected factor_base_nodes [B,21,D]")
         if patch_tokens_by_layer.ndim != 4:
             raise ValueError("Expected patch_tokens_by_layer [B,S,N,D]")
+        # Typed factors own their parameters. Grounding supervision must not
+        # rewrite the CalAlign-compatible visual foundation.
+        factor_base_nodes = factor_base_nodes.detach()
+        patch_tokens_by_layer = patch_tokens_by_layer.detach()
         query = self.anchor_query(factor_base_nodes)
         layer_weight = torch.softmax(self.layer_router, dim=-1)
         maps: list[Tensor] = []
@@ -151,14 +168,14 @@ class TypedEvidenceStateHead(nn.Module):
         reliability = (
             observability * (1.0 - null_mass) * (1.0 - entropy_norm)
         ).clamp(0.0, 1.0)
-        state_token = torch.einsum("bfs,fsd->bfd", state_prob, self.state_embeddings)
-        typed_token = self.typed_norm(
-            global_token + self.anchor_proj(anchor_token) + state_token
+        typed_token = self.compose_typed_token(
+            global_token, anchor_token, state_prob
         )
         return {
             "factor_anchor_map": anchor_map,
             "factor_null_mass": null_mass,
             "factor_anchor_token": anchor_token,
+            "factor_global_token": global_token,
             "factor_state_logits": state_logits,
             "factor_state_prob": state_prob,
             "factor_state_valid_mask": state_valid_mask,

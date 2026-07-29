@@ -88,19 +88,21 @@ class METEROIAModel(nn.Module):
         if "state_off" in diagnostic_modes:
             uniform = factors["factor_state_valid_mask"].to(state_prob)
             state_prob = uniform / uniform.sum(-1, keepdim=True)
+            factor_token = self.typed_factors.compose_typed_token(
+                factors["factor_global_token"],
+                factors["factor_anchor_token"],
+                state_prob,
+            )
         if "schema_corruption" in diagnostic_modes:
             factor_token = torch.roll(factor_token, 1, 1)
         if "cross_sample_swap" in diagnostic_modes and factor_token.shape[0] > 1:
             factor_token = torch.roll(factor_token, 1, 0)
         if "state_corruption" in diagnostic_modes:
-            factor_token = factor_token - torch.einsum(
-                "bfs,fsd->bfd",
+            state_prob = torch.roll(state_prob, 1, -1)
+            factor_token = self.typed_factors.compose_typed_token(
+                factors["factor_global_token"],
+                factors["factor_anchor_token"],
                 state_prob,
-                self.typed_factors.state_embeddings,
-            ) + torch.einsum(
-                "bfs,fsd->bfd",
-                torch.roll(state_prob, 1, -1),
-                self.typed_factors.state_embeddings,
             )
         after_factor = stamp()
         action = self.action_transport(
@@ -137,6 +139,8 @@ class METEROIAModel(nn.Module):
             **factors,
             **action,
             **reason,
+            "factor_typed_token": factor_token,
+            "factor_state_prob": state_prob,
             "factor_state_prob_effective": state_prob,
             "reason_logits_pu_private": reason["reason_logits_final"],
             "branch_logits": {

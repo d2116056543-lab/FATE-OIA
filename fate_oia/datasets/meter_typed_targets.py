@@ -22,6 +22,17 @@ def _category(obj: dict[str, Any]) -> str:
     return str(obj.get("category", obj.get("name", ""))).lower()
 
 
+def _attribute(obj: dict[str, Any], *names: str) -> str:
+    attributes = obj.get("attributes", {})
+    if not isinstance(attributes, dict):
+        attributes = {}
+    for name in names:
+        value = attributes.get(name, obj.get(name))
+        if value not in (None, "", "unknown", "none"):
+            return str(value).lower()
+    return ""
+
+
 def _box_mask(
     boxes: list[tuple[float, float, float, float]],
     *,
@@ -60,12 +71,16 @@ class METERTypedTargetBuilder:
 
         objects = list(record.get("objects", []))
         groups: dict[str, list[tuple[float, float, float, float]]] = {}
+        grouped_objects: dict[str, list[dict[str, Any]]] = {}
         for obj in objects:
             box = _box(obj)
             if box is not None:
-                groups.setdefault(_category(obj), []).append(box)
+                category = _category(obj)
+                groups.setdefault(category, []).append(box)
+                grouped_objects.setdefault(category, []).append(obj)
 
         category_rules = {
+            0: ("traffic light",),
             3: ("traffic light",),
             4: ("traffic sign",),
             5: ("car", "bus", "truck", "vehicle"),
@@ -84,18 +99,52 @@ class METERTypedTargetBuilder:
             if bool(mask.any()):
                 anchor[factor_id] = mask
                 anchor_valid[factor_id] = True
-                state_target[factor_id] = 0  # present
-                state_valid[factor_id] = True
                 observability[factor_id] = 1.0
                 observability_valid[factor_id] = True
                 source_weight[factor_id] = 1.0
-            elif bool(record.get("source_complete", False)):
+                if factor_id != 0:
+                    state_target[factor_id] = 0  # present
+                    state_valid[factor_id] = True
+            elif bool(record.get("source_complete", False)) and factor_id != 0:
                 # Absence is valid only for complete object sources.
                 state_target[factor_id] = 1
                 state_valid[factor_id] = True
                 observability[factor_id] = 1.0
                 observability_valid[factor_id] = True
                 source_weight[factor_id] = 0.8
+
+        lights = [
+            obj
+            for category, values in grouped_objects.items()
+            if "traffic light" in category
+            for obj in values
+        ]
+        light_colors = {
+            _attribute(obj, "trafficLightColor", "traffic_light_color", "color")
+            for obj in lights
+        }
+        light_colors.discard("")
+        if lights:
+            if "green" in light_colors:
+                state_target[0] = 0
+                state_valid[0] = True
+            elif light_colors & {"red", "yellow", "redyellow", "red_yellow"}:
+                state_target[0] = 1
+                state_valid[0] = True
+            source_weight[0] = 1.0 if state_valid[0] else 0.5
+
+        vehicle_boxes = [
+            box
+            for category, values in groups.items()
+            if any(name in category for name in ("car", "bus", "truck", "vehicle"))
+            for box in values
+        ]
+        if vehicle_boxes:
+            anchor[1] = _box_mask(vehicle_boxes)
+            anchor_valid[1] = True
+            observability[1] = 1.0
+            observability_valid[1] = True
+            source_weight[1] = 0.5
 
         # Corridor/boundary factors receive conservative region anchors only
         # when lane/drivable metadata exists; semantic state remains unknown
@@ -127,6 +176,17 @@ class METERTypedTargetBuilder:
             observability[2] = 1.0
             observability_valid[2] = True
             source_weight[2] = 0.5
+            if vehicle_boxes:
+                left_boxes = [
+                    box for box in vehicle_boxes if (box[0] + box[2]) * 0.5 < 640
+                ]
+                right_boxes = [
+                    box for box in vehicle_boxes if (box[0] + box[2]) * 0.5 >= 640
+                ]
+                for factor_id, boxes in ((10, left_boxes), (16, right_boxes)):
+                    state_target[factor_id] = 0 if boxes else 1
+                    state_valid[factor_id] = bool(record.get("source_complete", False))
+                    source_weight[factor_id] = 0.8
 
         # Normalize valid anchors; invalid rows remain zero and are masked.
         flat = anchor.flatten(1)

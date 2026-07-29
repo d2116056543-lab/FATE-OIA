@@ -67,24 +67,59 @@ def discrimination_and_mirror_loss(
     token = output["factor_typed_token"]
     state = output["factor_state_prob"]
     source = targets["factor_source_weight"].to(token)
+    predicted = output["factor_anchor_map"]
+    target = targets["factor_anchor_map"].to(predicted).flatten(2)
+    valid = targets["factor_anchor_valid"].to(predicted)
     same_type_terms: list[Tensor] = []
+    background_terms: list[Tensor] = []
     for left, right in mirror_pairs:
-        clean = F.cosine_similarity(token[:, left], token[:, left].detach(), dim=-1)
-        wrong = F.cosine_similarity(token[:, left], token[:, right].detach(), dim=-1)
-        weight = torch.minimum(source[:, left], source[:, right])
-        same_type_terms.append(_weighted_mean(torch.relu(0.05 + wrong - clean), weight))
+        for correct, wrong_factor in ((left, right), (right, left)):
+            correct_score = (predicted[:, correct] * target[:, correct]).sum(-1)
+            wrong_score = (predicted[:, wrong_factor] * target[:, correct]).sum(-1)
+            weight = source[:, correct] * valid[:, correct]
+            same_type_terms.append(
+                _weighted_mean(
+                    torch.relu(0.05 + wrong_score - correct_score), weight
+                )
+            )
+    for factor in range(predicted.shape[1]):
+        correct_score = (predicted[:, factor] * target[:, factor]).sum(-1)
+        background = 1.0 - target[:, factor].clamp(0, 1)
+        background_score = (
+            predicted[:, factor] * background
+        ).sum(-1) / background.sum(-1).clamp_min(1.0)
+        weight = source[:, factor] * valid[:, factor]
+        background_terms.append(
+            _weighted_mean(
+                torch.relu(0.02 + background_score - correct_score), weight
+            )
+        )
     discrimination = (
-        torch.stack(same_type_terms).mean()
-        if same_type_terms
+        torch.cat(
+            [
+                torch.stack(same_type_terms),
+                torch.stack(background_terms),
+            ]
+        ).mean()
+        if same_type_terms and background_terms
         else token.new_zeros(())
     )
-    anchor = output["factor_anchor_map"].view(token.shape[0], token.shape[1], 45, 80)
+    anchor = predicted.view(token.shape[0], token.shape[1], 45, 80)
     mirror_terms: list[Tensor] = []
     for left, right in mirror_pairs:
-        map_term = (torch.flip(anchor[:, left], dims=[-1]) - anchor[:, right]).abs().mean((1, 2))
+        target_left = target[:, left].view(-1, 45, 80)
+        target_right = target[:, right].view(-1, 45, 80)
+        map_term = (
+            (anchor[:, left] - target_left).abs().mean((1, 2))
+            + (anchor[:, right] - target_right).abs().mean((1, 2))
+        )
         state_term = (state[:, left] - state[:, right]).abs().mean(-1)
-        weight = torch.minimum(source[:, left], source[:, right])
-        mirror_terms.append(_weighted_mean(map_term + state_term, weight))
+        weight = torch.minimum(source[:, left], source[:, right]) * torch.minimum(
+            valid[:, left], valid[:, right]
+        )
+        mirror_terms.append(
+            _weighted_mean(map_term + 0.1 * state_term, weight)
+        )
     mirror = torch.stack(mirror_terms).mean() if mirror_terms else token.new_zeros(())
     return discrimination, mirror
 
