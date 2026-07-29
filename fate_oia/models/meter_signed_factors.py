@@ -135,6 +135,10 @@ class TypedEvidenceStateHead(nn.Module):
         state_prob: Tensor,
     ) -> Tensor:
         """Compose action routing evidence without the global semantic shortcut."""
+        # Action transport may learn how to read shared evidence, but it must not
+        # rewrite the anchor/state representation used by the reason branch.
+        anchor_token = anchor_token.detach()
+        state_prob = state_prob.detach()
         state_token = torch.einsum(
             "bfs,fsd->bfd", state_prob, self.action_state_embeddings
         )
@@ -144,7 +148,9 @@ class TypedEvidenceStateHead(nn.Module):
 
     def compose_action_value_token(self, anchor_token: Tensor) -> Tensor:
         """Keep the transported action value causally tied to local patches."""
-        return self.action_value_norm(self.action_anchor_proj(anchor_token))
+        return self.action_value_norm(
+            self.action_anchor_proj(anchor_token.detach())
+        )
 
     def forward(
         self,

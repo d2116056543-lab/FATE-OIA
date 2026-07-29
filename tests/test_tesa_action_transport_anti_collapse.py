@@ -208,6 +208,22 @@ def test_action_local_token_excludes_global_semantic_shortcut() -> None:
     assert first.shape == (2, 21, 8)
 
 
+def test_action_local_projection_does_not_rewrite_shared_anchor_or_state() -> None:
+    head = TypedEvidenceStateHead(dim=8, factor_dim=21)
+    anchor = torch.randn(2, 21, 8, requires_grad=True)
+    state_logits = torch.randn(2, 21, 3, requires_grad=True)
+    state = torch.softmax(state_logits, dim=-1)
+    route = head.compose_action_token(anchor, state)
+    value = head.compose_action_value_token(anchor)
+    (route.sum() + value.sum()).backward()
+    assert anchor.grad is None or anchor.grad.eq(0).all()
+    assert state_logits.grad is None or state_logits.grad.eq(0).all()
+    assert head.action_anchor_proj.weight.grad is not None
+    assert head.action_anchor_proj.weight.grad.abs().sum() > 0
+    assert head.action_state_embeddings.grad is not None
+    assert head.action_state_embeddings.grad.abs().sum() > 0
+
+
 def test_action_specific_ownership_blocks_global_factor_monopoly() -> None:
     module = _transport()
     with torch.no_grad():
