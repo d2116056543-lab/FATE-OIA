@@ -1675,7 +1675,15 @@ def run(args: argparse.Namespace) -> None:
 
 @torch.no_grad()
 def _test_counterfactual_diagnostic(model: METEROIAModel, dataset: METERDataset, device: torch.device, *, batch_size: int, num_workers: int, max_samples: int, progress: float, selected_mass: float, max_patches: int, minimum_patches: int) -> dict[str, Any]:
-    loader = DataLoader(Subset(dataset, list(range(min(len(dataset), max_samples)))), batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True, persistent_workers=num_workers > 0, prefetch_factor=2)
+    loader_kwargs: dict[str, Any] = {
+        "batch_size": batch_size,
+        "shuffle": False,
+        "num_workers": num_workers,
+        "pin_memory": True,
+    }
+    if num_workers > 0:
+        loader_kwargs.update({"persistent_workers": True, "prefetch_factor": 2})
+    loader = DataLoader(Subset(dataset, list(range(min(len(dataset), max_samples)))), **loader_kwargs)
     records: list[dict[str, Any]] = []
     seen = 0
     for batch in loader:
@@ -1742,7 +1750,19 @@ def evaluate_test(model: METEROIAModel, cfg: dict[str, Any], device: torch.devic
     indices = list(range(len(dataset)))
     if args.max_test_samples:
         indices = indices[: args.max_test_samples]
-    loader = DataLoader(Subset(dataset, indices), batch_size=int(cfg["training"].get("batch_size", 6)), shuffle=False, num_workers=int(cfg["data"].get("num_workers", 4)), pin_memory=True, persistent_workers=int(cfg["data"].get("num_workers", 4)) > 0, prefetch_factor=int(cfg["data"].get("prefetch_factor", 2)))
+    eval_workers = int(cfg["data"].get("num_workers", 4))
+    eval_loader_kwargs: dict[str, Any] = {
+        "batch_size": int(cfg["training"].get("batch_size", 6)),
+        "shuffle": False,
+        "num_workers": eval_workers,
+        "pin_memory": True,
+    }
+    if eval_workers > 0:
+        eval_loader_kwargs.update({
+            "persistent_workers": True,
+            "prefetch_factor": int(cfg["data"].get("prefetch_factor", 2)),
+        })
+    loader = DataLoader(Subset(dataset, indices), **eval_loader_kwargs)
     collected = collect_outputs(model, loader, device, progress=progress)
     summary = metrics_summary(collected, calibration)
     stats = mechanism_stats_from_collected(collected)
