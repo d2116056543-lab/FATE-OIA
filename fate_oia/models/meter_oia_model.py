@@ -139,6 +139,37 @@ class METEROIAModel(nn.Module):
             progress=progress,
             update_running_stats=update_semantic_stats,
         )
+        targeted_schema_action = next(
+            (
+                int(mode.rsplit("_", 1)[-1])
+                for mode in diagnostic_modes
+                if mode.startswith("schema_target_")
+            ),
+            None,
+        )
+        if targeted_schema_action is not None:
+            if not 0 <= targeted_schema_action < self.foundation.action_dim:
+                raise ValueError("schema_target action index is out of range")
+            selected_factor = action["action_factor_weights"][
+                :, targeted_schema_action
+            ].argmax(-1)
+            corrupted_token = factor_token.clone()
+            rolled_token = torch.roll(factor_token, 1, 1)
+            batch_index = torch.arange(
+                factor_token.shape[0], device=factor_token.device
+            )
+            corrupted_token[batch_index, selected_factor] = rolled_token[
+                batch_index, selected_factor
+            ]
+            action = self.action_transport(
+                base["action_logits_calalign"],
+                base["action_nodes"],
+                corrupted_token,
+                reliability,
+                factors["factor_action_ownership"],
+                progress=progress,
+                update_running_stats=False,
+            )
         after_action = stamp()
         reason = self.reason_decoder(
             patch_tokens_by_layer=base["patch_tokens_by_layer"],

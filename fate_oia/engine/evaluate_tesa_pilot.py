@@ -51,6 +51,31 @@ def _finite(value: Any) -> bool:
     return isinstance(value, (int, float)) and math.isfinite(float(value))
 
 
+def _pu_gate_pass(dynamic: dict[str, Any], pu: dict[str, Any]) -> bool:
+    active = [int(value) for value in pu.get("active_labels", [])]
+    rows = {
+        int(row["label_id"]): row
+        for row in pu.get("labels", [])
+        if isinstance(row, dict) and "label_id" in row
+    }
+    lambdas = pu.get("lambda", [])
+    return (
+        bool(dynamic.get("pu_zero_exact"))
+        and bool(dynamic.get("pu_active_private_only"))
+        and bool(active)
+        and len(lambdas) == 21
+        and all(0.0 <= float(value) <= 0.15 for value in lambdas)
+        and all(label in rows for label in active)
+        and all(
+            bool(rows[label].get("eligible"))
+            and float(rows[label].get("lcb95", 0.0)) > 0.0
+            and float(rows[label].get("lambda", 0.0)) > 0.0
+            and float(lambdas[label]) > 0.0
+            for label in active
+        )
+    )
+
+
 def evaluate_pilot(
     run_dir: str | Path, implementation_audit: str | Path
 ) -> dict[str, Any]:
@@ -97,6 +122,7 @@ def evaluate_pilot(
     identity_wrong = typed.get("identity_wrong_delta", [])
     schema_reason = branches.get("schema_corruption", {})
     schema_reason_ap = schema_reason.get("Exp_per_label_ap", [])
+    reason_identity_delta = typed.get("reason_identity_delta_per_label", [])
     recent = losses[-max(1, min(len(losses), 200)) :]
     gates = {
         "A": (
@@ -147,7 +173,7 @@ def evaluate_pilot(
             and len(identity_target) == 4
             and len(identity_wrong) == 4
             and sum(
-                float(target) > float(wrong)
+                float(target) >= float(wrong) + 0.001
                 for target, wrong in zip(identity_target, identity_wrong)
             )
             >= 3
@@ -160,15 +186,14 @@ def evaluate_pilot(
             >= sum(ground_global) / len(ground_global) + 0.005
             and float(final_reason["Exp_mAP"])
             > float(branches["reason_correction_off"]["Exp_mAP"])
-            and len(schema_reason_ap) == 21
-            and sum(
-                float(final_reason["Exp_per_label_ap"][index])
-                > float(schema_reason_ap[index])
-                for index in GROUNDABLE
-                if _finite(final_reason["Exp_per_label_ap"][index])
-                and _finite(schema_reason_ap[index])
+            and len(reason_identity_delta) == 21
+            and all(
+                _finite(reason_identity_delta[index]) for index in GROUNDABLE
             )
-            >= max(1, len(ground_final) // 2)
+            and all(
+                float(reason_identity_delta[index]) >= 0.001
+                for index in GROUNDABLE
+            )
         ),
         "E": (
             bool(recent)
@@ -198,17 +223,7 @@ def evaluate_pilot(
             and float(patch.get("selected_positive_rate", 0.0)) > 0.5
             and float(patch.get("selected_minus_control_mean", -1.0)) > 0
         ),
-        "G": bool(audit["dynamic_checks"].get("pu_zero_exact"))
-        and bool(audit["dynamic_checks"].get("pu_active_private_only"))
-        and bool(pu.get("active_labels"))
-        and all(0.0 <= float(value) <= 0.15 for value in pu.get("lambda", []))
-        and all(
-            bool(row.get("eligible"))
-            and float(row.get("lcb95", 0.0)) > 0.0
-            and float(row.get("lambda", 0.0)) > 0.0
-            for row in pu.get("labels", [])
-            if int(row.get("label_id", -1)) in pu.get("active_labels", [])
-        ),
+        "G": _pu_gate_pass(audit["dynamic_checks"], pu),
         "H": (
             not protocol_failures
             and

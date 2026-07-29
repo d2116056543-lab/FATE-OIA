@@ -29,6 +29,10 @@ SEQUENTIAL_MODES: dict[str, tuple[str, ...]] = {
     "cross_sample_swap": ("cross_sample_swap",),
     "state_corruption": ("state_corruption",),
     "reason_correction_off": ("reason_correction_off",),
+    **{
+        f"schema_target_{action}": (f"schema_target_{action}",)
+        for action in range(4)
+    },
 }
 
 

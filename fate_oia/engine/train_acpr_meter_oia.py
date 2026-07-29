@@ -477,6 +477,35 @@ def _calibration_payload(value: METERCalibrationResult | None) -> dict[str, Any]
     }
 
 
+def _identity_ap_diagnostics(
+    branches: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    clean = [float(value) for value in branches["action_final"]["Act_per_label_ap"]]
+    matrix: list[list[float]] = []
+    for target in range(4):
+        corrupt = [
+            float(value)
+            for value in branches[f"schema_target_{target}"]["Act_per_label_ap"]
+        ]
+        matrix.append(
+            [round(clean[action] - corrupt[action], 10) for action in range(4)]
+        )
+    target_delta = [matrix[action][action] for action in range(4)]
+    wrong_delta = [
+        round(
+            sum(abs(matrix[target][action]) for action in range(4) if action != target)
+            / 3.0,
+            10,
+        )
+        for target in range(4)
+    ]
+    return {
+        "identity_ap_delta_matrix": matrix,
+        "identity_target_delta": target_delta,
+        "identity_wrong_delta": wrong_delta,
+    }
+
+
 def _update_pu(
     model: METEROIAModel,
     loader: Iterable[dict[str, Any]],
@@ -1045,6 +1074,7 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
         test = collect_outputs(
             model, test_loader, device, progress=progress, sequential_modes=True
         )
+        test_branches = branch_metrics(test)
         mechanism = mechanism_stats_from_collected(test)
         train_audit = _typed_factor_audit(
             model, factor_audit_loader, device, progress
@@ -1095,21 +1125,18 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                     row["dense_wrong_effect_abs"] for row in epoch_rows
                 )
                 / max(len(epoch_rows), 1),
-                "identity_target_delta": [
-                    sum(
-                        row["dense_correct_effect_abs_per_action"][action]
-                        for row in epoch_rows
+                **_identity_ap_diagnostics(test_branches),
+                "reason_identity_delta_per_label": [
+                    round(
+                        float(test_branches["reason_final"]["Exp_per_label_ap"][label])
+                        - float(
+                            test_branches["schema_corruption"]["Exp_per_label_ap"][
+                                label
+                            ]
+                        ),
+                        10,
                     )
-                    / max(len(epoch_rows), 1)
-                    for action in range(4)
-                ],
-                "identity_wrong_delta": [
-                    sum(
-                        row["dense_wrong_effect_abs_per_action"][action]
-                        for row in epoch_rows
-                    )
-                    / max(len(epoch_rows), 1)
-                    for action in range(4)
+                    for label in range(21)
                 ],
                 "factor_off_delta": mechanism.get(
                     "factor_off_delta_per_action", []

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import random
 from pathlib import Path
@@ -31,17 +32,48 @@ def python_source_tree_hash(root: str | Path) -> str:
     return digest.hexdigest()
 
 
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return _json_safe(value.detach().cpu().tolist())
+    if isinstance(value, np.ndarray):
+        return _json_safe(value.tolist())
+    if isinstance(value, np.generic):
+        return _json_safe(value.item())
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, Path):
+        return str(value)
+    return value
+
+
 def write_json(path: str | Path, value: Mapping[str, Any]) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(dict(value), indent=2, sort_keys=True, default=str), encoding="utf-8")
+    target.write_text(
+        json.dumps(
+            _json_safe(dict(value)),
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        ),
+        encoding="utf-8",
+    )
 
 
 def append_jsonl(path: str | Path, value: Mapping[str, Any]) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     with target.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(dict(value), sort_keys=True, default=str) + "\n")
+        handle.write(
+            json.dumps(
+                _json_safe(dict(value)), sort_keys=True, allow_nan=False
+            )
+            + "\n"
+        )
 
 
 def save_meter_tensor(path: str | Path, value: torch.Tensor) -> None:
@@ -271,6 +303,42 @@ def validate_epoch_artifacts(directory: str | Path) -> list[str]:
         isinstance(typed.get(key), list) and len(typed[key]) == length
         for key, length in typed_lengths.items()
     )
+    confusion = typed.get("state_confusion_matrix", [])
+    typed_valid = typed_valid and all(
+        isinstance(matrix, list)
+        and len(matrix) == 3
+        and all(
+            isinstance(row, list)
+            and len(row) == 3
+            and all(
+                isinstance(value, int) and value >= 0 for value in row
+            )
+            for row in matrix
+        )
+        for matrix in confusion
+    )
+    identity_matrix = typed.get("identity_ap_delta_matrix")
+    typed_valid = (
+        typed_valid
+        and isinstance(identity_matrix, list)
+        and len(identity_matrix) == 4
+        and all(isinstance(row, list) and len(row) == 4 for row in identity_matrix)
+    )
+    numeric_vectors = (
+        "identity_target_delta",
+        "identity_wrong_delta",
+        "factor_off_delta",
+        "state_off_delta",
+        "cross_sample_swap_effect",
+    )
+    typed_valid = typed_valid and all(
+        all(
+            isinstance(value, (int, float)) and math.isfinite(float(value))
+            for value in typed[key]
+        )
+        for key in numeric_vectors
+        if isinstance(typed.get(key), list)
+    )
     train_audit = typed.get("train_audit", {})
     patch_audit = typed.get("patch_audit", {})
     typed_valid = (
@@ -282,21 +350,65 @@ def validate_epoch_artifacts(directory: str | Path) -> list[str]:
         and isinstance(patch_audit.get("unique_sample_count"), int)
         and isinstance(patch_audit.get("action_coverage"), list)
         and isinstance(patch_audit.get("factor_coverage"), list)
+        and all(
+            isinstance(value, int) and 0 <= value < 4
+            for value in patch_audit.get("action_coverage", [])
+        )
+        and all(
+            isinstance(value, int) and 0 <= value < 21
+            for value in patch_audit.get("factor_coverage", [])
+        )
     )
     if not typed_valid:
         failures.append("typed_evidence.json:mechanism_schema")
 
     calibration = payloads.get("calibration.json", {})
+    calibration_required = {
+        "theta",
+        "temperature",
+        "strategy",
+        "accepted",
+        "fallback_reason",
+        "fit_split",
+        "representation_updated",
+        "train_calib_raw_joint",
+        "train_calib_deploy_joint",
+    }
     if (
+        not calibration_required.issubset(calibration)
+        or not isinstance(calibration.get("theta"), list)
+        or len(calibration.get("theta", [])) != 25
+        or
         calibration.get("fit_split") != "train_calib"
         or calibration.get("representation_updated") is not False
     ):
         failures.append("calibration.json:train_calib_schema")
 
     runtime = payloads.get("runtime.json", {})
+    runtime_required = {
+        "epoch",
+        "train_rows",
+        "mean_data_time",
+        "mean_dino_time",
+        "peak_reserved_gb",
+        "eval_mode_time",
+        "dino_call_count",
+    }
     if (
+        not runtime_required.issubset(runtime)
+        or
         not isinstance(runtime.get("dino_call_count"), dict)
+        or not isinstance(runtime.get("eval_mode_time"), dict)
         or not isinstance(runtime.get("peak_reserved_gb"), (int, float))
+        or not all(
+            isinstance(runtime.get(key), (int, float))
+            and math.isfinite(float(runtime[key]))
+            for key in (
+                "mean_data_time",
+                "mean_dino_time",
+                "peak_reserved_gb",
+            )
+        )
     ):
         failures.append("runtime.json:profile_schema")
     return failures
