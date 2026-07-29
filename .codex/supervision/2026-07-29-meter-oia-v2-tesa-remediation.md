@@ -73,3 +73,59 @@ mock trainer 首 batch在 mirror loss 中因遍历输出字典并切片 0 维 te
 ## 8. 最终判断
 
 当前不能报告“100% 动态验证完成”。代码级缺口已继续补全，已有单元测试和 CPU 动态 audit 证据，但最新 mirror crash 修复尚未远端复验，real-DINO 与 pilot 也因 NVIDIA driver 不可用而阻塞。
+
+## 9. 后续监督复审轮次
+
+### 第二轮监督
+
+监督结论为 `changes_required`，指出：
+
+1. Gate C identity 字段来自 dense proxy，不是真实 identity-corruption AP。
+2. Gate G 对缺失 active-label row 存在空集合伪通过。
+3. Gate D 没有逐 groundable reason 验证 identity AP drop。
+4. artifact validator 没有深检 nested shape、finite、完整 calibration/runtime。
+
+以上四项全部采纳并修复。新增 per-target schema mismatch 诊断和 4×4 per-action AP drop matrix；PU active label 必须逐项存在；Gate D 要求逐 reason identity delta；JSON tensor 转 list、NaN 转 null，validator 深检 schema。
+
+### 第三轮监督
+
+监督结论仍为 `changes_required`，指出：
+
+1. Gate C 仅要求 3/4 action 通过。
+2. identity matrix 没有验证 finite 及派生向量一致性。
+3. PU active 集合没有与非零 lambda 集合精确相等，row/vector lambda 未核对。
+
+以上三项全部采纳并修复：
+
+- Gate C 改为 4/4 action 全部满足 target delta 至少比 wrong delta 高 `0.001`。
+- validator 要求 4×4 matrix 全 finite，且 target 等于 diagonal、wrong 等于 off-diagonal absolute mean。
+- PU 要求 active IDs 与 `lambda>0` 集合完全相等，row 唯一且 row/vector lambda 一致。
+
+### 最新验证
+
+- HEAD：`52abd9e42a78a1f019e4c91163dc0cbb228e7d21`
+- 远端 full pytest：`179 passed, 1 warning`
+- CPU dynamic audit：`pass=true`
+- NVIDIA driver 已恢复：
+  - RTX 5880 Ada Generation
+  - driver `595.79`
+  - CUDA `13.2`
+- real-DINO tiny smoke：
+  - official DINO weights `All keys matched successfully`
+  - `dino_call_count=1`
+  - peak reserved memory `8.96484375 GB`
+  - finite training losses
+  - dense action coverage `4/4`
+  - paired mirror 和三种 identity 训练路径均执行
+
+2-sample tiny smoke 的部分 label AP 不可定义，因此合法 JSON 中为 `null`，strict artifact validator 按设计拒绝该极小样本 artifact。该结果不能替代计划要求的 512-test、4-epoch pilot，也不生成 REVIEW_PASS。
+
+### 第四轮监督结论
+
+监督端在检查 HEAD `52abd9e` 后返回：
+
+```text
+code_review_status = approved
+```
+
+代码级整改已闭环。监督端同时明确：真实 4-epoch pilot A-H 尚未运行，因此不能生成最终 REVIEW_PASS，也不能启动 full train。
