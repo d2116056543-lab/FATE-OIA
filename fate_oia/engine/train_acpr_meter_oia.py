@@ -1036,7 +1036,7 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
             if (micro_step + 1) % 200 == 0:
                 print("meter_batch " + json.dumps(row, sort_keys=True), flush=True)
             data_start = time.perf_counter()
-            del output, field, total, scaled
+            del output, mirror_output, total, scaled
         progress = min(1.0, optimizer_step / max(total_updates, 1))
         pre_eval_runtime = {
             "epoch": epoch,

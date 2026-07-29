@@ -92,3 +92,8 @@ def test_training_uses_one_encode_call_for_paired_mirror_constraint() -> None:
     assert source.count("model.encode_images(") == 1
     assert "torch.flip(images[:1]" in source
     assert "mirror_output" in source
+
+
+def test_training_loop_does_not_delete_removed_field_local() -> None:
+    source = inspect.getsource(trainer.train)
+    assert "del output, field" not in source
