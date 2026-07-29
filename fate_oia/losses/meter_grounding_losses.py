@@ -178,7 +178,13 @@ def discrimination_and_mirror_loss(
             {
                 key: value[: mirrored_output["action_logits_final"].shape[0]]
                 for key, value in output.items()
-                if isinstance(value, Tensor)
+                if key
+                in {
+                    "factor_anchor_map",
+                    "factor_state_prob",
+                    "action_logits_final",
+                    "reason_logits_final",
+                }
             },
             mirrored_output,
             factor_pairs=mirror_pairs,
