@@ -44,3 +44,12 @@ def test_artifact_validator_checks_shapes_alignment_and_finite(tmp_path) -> None
     torch.save(torch.zeros(1, 21), tmp_path / "labels_reason_test.pt")
     failures = validate_epoch_artifacts(tmp_path)
     assert "labels_reason_test.pt:shape" in failures
+
+
+def test_artifact_validator_rejects_incomplete_tesa_mechanism_schema(tmp_path) -> None:
+    test_artifact_validator_checks_shapes_alignment_and_finite(tmp_path)
+    torch.save(torch.zeros(2, 4), tmp_path / "logits_action_final_raw_test.pt")
+    torch.save(torch.zeros(2, 21), tmp_path / "labels_reason_test.pt")
+
+    failures = validate_epoch_artifacts(tmp_path)
+    assert "typed_evidence.json:mechanism_schema" in failures

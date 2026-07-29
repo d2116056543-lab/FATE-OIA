@@ -79,3 +79,16 @@ def test_training_identity_intervention_includes_reason_corruption() -> None:
     assert "reason_logits_final" in source
     assert '("schema", "cross_sample", "state")' in source
     assert "reason_identity_terms" in source
+
+
+def test_training_adds_dense_necessity_and_specificity_exactly_once() -> None:
+    source = inspect.getsource(trainer._compute_losses)
+    assert 'dense_weight * mechanism_ramp * dense["total"]' in source
+    assert 'dense_weight * mechanism_ramp * dense["necessity"]' not in source
+
+
+def test_training_uses_one_encode_call_for_paired_mirror_constraint() -> None:
+    source = inspect.getsource(trainer._forward_training_batch)
+    assert source.count("model.encode_images(") == 1
+    assert "torch.flip(images[:1]" in source
+    assert "mirror_output" in source

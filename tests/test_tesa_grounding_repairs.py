@@ -51,6 +51,44 @@ def test_geometry_targets_rasterize_real_lane_and_drivable_evidence(tmp_path: Pa
     assert not bool(unknown["factor_state_valid"][2])
 
 
+def test_object_poly2d_lane_and_explicit_style_are_used_conservatively():
+    builder = METERTypedTargetBuilder(
+        "configs/meter_factor_schema.yaml", grid_hw=(6, 8)
+    )
+    record = {
+        "source_complete": True,
+        "objects": [
+            {
+                "category": "lane",
+                "poly2d": [{"vertices": [[2, 11], [3, 8], [4, 5]]}],
+                "attributes": {"laneStyle": "solid"},
+            }
+        ],
+        "image_size": [16, 12],
+    }
+    target = builder.build(record)
+
+    assert target["factor_anchor_valid"][11]
+    assert target["factor_anchor_map"][11].sum() > 0
+    assert target["factor_state_valid"][11]
+    assert target["factor_state_target"][11].item() == 0
+    assert not target["factor_state_valid"][12]
+
+    unknown = builder.build(
+        {
+            "source_complete": True,
+            "objects": [
+                {
+                    "category": "lane",
+                    "poly2d": [{"vertices": [[2, 11], [3, 8], [4, 5]]}],
+                }
+            ],
+            "image_size": [16, 12],
+        }
+    )
+    assert not unknown["factor_state_valid"][11]
+
+
 def test_mirror_equivariance_report_requires_paired_forward_outputs():
     original = {
         "factor_anchor_map": torch.zeros(1, 21, 2, 4),
