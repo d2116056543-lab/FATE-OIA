@@ -134,6 +134,17 @@ def test_null_partition_is_safe_under_bf16_autocast() -> None:
     assert torch.isfinite(null_mass.grad).all()
 
 
+def test_anchor_sparse_distribution_keeps_recovery_gradient_at_full_ramp() -> None:
+    head = TypedEvidenceStateHead(dim=8, factor_dim=21)
+    logits = torch.tensor([[12.0, -12.0, -12.0]], requires_grad=True)
+    distribution = head._distribution(logits, progress=1.0)
+    assert distribution[0, 1] > 0
+    loss = -distribution[0, 1].clamp_min(1e-12).log()
+    loss.backward()
+    assert logits.grad is not None
+    assert logits.grad[0, 1].abs() > 0
+
+
 def test_grounding_weights_are_single_source_and_sum_exactly() -> None:
     torch.manual_seed(1)
     output = {

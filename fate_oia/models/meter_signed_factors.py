@@ -31,6 +31,7 @@ class TypedEvidenceStateHead(nn.Module):
         num_layers: int = 3,
         state_cardinalities: tuple[int, ...] = DEFAULT_STATE_CARDINALITIES,
         schema_path: str | None = None,
+        anchor_exploration_mass: float = 0.05,
     ) -> None:
         super().__init__()
         schema = METERFactorSchema(schema_path) if schema_path else default_meter_factor_schema()
@@ -47,6 +48,9 @@ class TypedEvidenceStateHead(nn.Module):
         self.dim = int(dim)
         self.factor_dim = int(factor_dim)
         self.num_layers = int(num_layers)
+        self.anchor_exploration_mass = float(anchor_exploration_mass)
+        if not 0.0 <= self.anchor_exploration_mass < 1.0:
+            raise ValueError("anchor_exploration_mass must be in [0, 1)")
         self.max_states = max(state_cardinalities)
         self.register_buffer(
             "state_cardinalities",
@@ -99,7 +103,9 @@ class TypedEvidenceStateHead(nn.Module):
         dense = torch.softmax(logits, dim=-1)
         sparse = entmax15_bisect(logits, dim=-1)
         ramp = self._ramp(progress)
-        return dense * (1.0 - ramp) + sparse * ramp
+        scheduled = dense * (1.0 - ramp) + sparse * ramp
+        recovery = self.anchor_exploration_mass * ramp
+        return scheduled * (1.0 - recovery) + dense * recovery
 
     def _partition_calibrated_null(self, patch_logits: Tensor) -> tuple[Tensor, Tensor]:
         """Return null probability relative to the patch log-mean-exp partition."""
