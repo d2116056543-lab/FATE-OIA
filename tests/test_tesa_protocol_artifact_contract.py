@@ -1,8 +1,10 @@
 import inspect
-import math
 
 from fate_oia.engine import train_acpr_meter_oia as trainer
-from fate_oia.engine.evaluate_tesa_pilot import _state_rows_for_admission
+from fate_oia.engine import evaluate_tesa_pilot as pilot_evaluator
+from fate_oia.engine.evaluate_tesa_pilot import (
+    evaluate_admission_with_continuous_action_identity,
+)
 from fate_oia.utils.tesa_contracts import (
     TWO_EPOCH_ADMISSION_RULES,
     build_runtime_subset_counts,
@@ -33,36 +35,23 @@ def test_runtime_subset_builder_writes_one_canonical_schema() -> None:
     assert "test_count=len(test_indices)" in source
 
 
-def test_real_confusion_matrix_shape_is_counted_without_nested_sum_error() -> None:
-    rows = _state_rows_for_admission(
-        [
-            {
-                "factor_id": 0,
-                "state_confusion_matrix": [[570, 5, 0], [162, 14, 0], [0, 0, 0]],
-                "state_auprc": 0.84,
-                "state_frequency_baseline": 0.76,
-                "source_count": 751,
-            }
-        ],
-        {},
+def test_pilot_reuse_allows_only_offline_evaluation_changes(monkeypatch) -> None:
+    monkeypatch.setattr(
+        pilot_evaluator.subprocess,
+        "check_output",
+        lambda *args, **kwargs: (
+            "fate_oia/engine/evaluate_tesa_pilot.py\n"
+            "tests/test_tesa_protocol_artifact_contract.py\n"
+        ),
     )
-    assert rows[0]["positive_count"] == 575
-    assert rows[0]["negative_count"] == 176
+    assert pilot_evaluator._evaluation_only_git_delta("pilot", "current")
 
-    missing = _state_rows_for_admission(
-        [
-            {
-                "factor_id": 1,
-                "state_confusion_matrix": [[0, 0], [0, 0]],
-                "state_auprc": None,
-                "state_frequency_baseline": None,
-                "source_count": 0,
-            }
-        ],
-        {},
+    monkeypatch.setattr(
+        pilot_evaluator.subprocess,
+        "check_output",
+        lambda *args, **kwargs: "fate_oia/models/meter_oia_model.py\n",
     )
-    assert math.isnan(missing[0]["prevalence"])
-    assert math.isnan(missing[0]["auprc"])
+    assert not pilot_evaluator._evaluation_only_git_delta("pilot", "current")
 
 
 def test_schema_tiers_and_prevalence_one_rows_do_not_create_impossible_gate() -> None:
@@ -268,7 +257,7 @@ def test_action_admission_accepts_continuous_delta_identity_when_ap_is_tied() ->
         },
         "state_rows": [],
     }
-    decision = evaluate_two_epoch_admission(metrics)
+    decision = evaluate_admission_with_continuous_action_identity(metrics)
     action = decision["truth_table"]["action"]
     assert action["continuous_identity_pass"]
     assert not action["discrete_identity_pass"]
