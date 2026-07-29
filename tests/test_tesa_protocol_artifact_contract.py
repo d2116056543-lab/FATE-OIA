@@ -1,6 +1,8 @@
 import inspect
+import math
 
 from fate_oia.engine import train_acpr_meter_oia as trainer
+from fate_oia.engine.evaluate_tesa_pilot import _state_rows_for_admission
 from fate_oia.utils.tesa_contracts import (
     TWO_EPOCH_ADMISSION_RULES,
     build_runtime_subset_counts,
@@ -29,6 +31,38 @@ def test_runtime_subset_builder_writes_one_canonical_schema() -> None:
     source = inspect.getsource(trainer.train)
     assert "build_runtime_subset_counts(" in source
     assert "test_count=len(test_indices)" in source
+
+
+def test_real_confusion_matrix_shape_is_counted_without_nested_sum_error() -> None:
+    rows = _state_rows_for_admission(
+        [
+            {
+                "factor_id": 0,
+                "state_confusion_matrix": [[570, 5, 0], [162, 14, 0], [0, 0, 0]],
+                "state_auprc": 0.84,
+                "state_frequency_baseline": 0.76,
+                "source_count": 751,
+            }
+        ],
+        {},
+    )
+    assert rows[0]["positive_count"] == 575
+    assert rows[0]["negative_count"] == 176
+
+    missing = _state_rows_for_admission(
+        [
+            {
+                "factor_id": 1,
+                "state_confusion_matrix": [[0, 0], [0, 0]],
+                "state_auprc": None,
+                "state_frequency_baseline": None,
+                "source_count": 0,
+            }
+        ],
+        {},
+    )
+    assert math.isnan(missing[0]["prevalence"])
+    assert math.isnan(missing[0]["auprc"])
 
 
 def test_schema_tiers_and_prevalence_one_rows_do_not_create_impossible_gate() -> None:

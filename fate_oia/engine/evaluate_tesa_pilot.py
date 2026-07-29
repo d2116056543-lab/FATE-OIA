@@ -224,7 +224,7 @@ def _state_rows_for_admission(
         factor_id = int(row.get("factor_id", -1))
         matrix = row.get("state_confusion_matrix", [])
         if isinstance(matrix, list) and matrix and all(isinstance(item, list) for item in matrix):
-            positive_count = sum(sum(int(value) for value in matrix[0]))
+            positive_count = sum(int(value) for value in matrix[0])
             negative_count = sum(
                 sum(int(value) for value in matrix[index])
                 for index in range(1, len(matrix))
@@ -242,11 +242,15 @@ def _state_rows_for_admission(
             if source_total > 0
             else 0.0
         )
+        prevalence = row.get("state_frequency_baseline")
+        auprc = row.get("state_auprc")
         normalized.append(
             {
                 "factor_id": factor_id,
-                "prevalence": row.get("state_frequency_baseline"),
-                "auprc": row.get("state_auprc"),
+                "prevalence": (
+                    float(prevalence) if _finite(prevalence) else float("nan")
+                ),
+                "auprc": float(auprc) if _finite(auprc) else float("nan"),
                 "positive_count": int(row.get("positive_count", positive_count)),
                 "negative_count": int(row.get("negative_count", negative_count)),
                 "observed_usage_share": float(
