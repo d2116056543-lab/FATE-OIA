@@ -99,6 +99,7 @@ class FactorSpecificActionTransport(nn.Module):
         )
         evidence_delta = contributions.sum(-1)
         final = action_logits_visual + evidence_delta
+        deleted = final.unsqueeze(-1) - contributions
         return {
             "action_logits_visual": action_logits_visual,
             "action_evidence_delta": evidence_delta,
@@ -107,6 +108,7 @@ class FactorSpecificActionTransport(nn.Module):
             "action_null_factor_weight": null_weight,
             "action_factor_values": factor_value,
             "action_factor_contributions": contributions,
+            "action_logits_factor_deleted": deleted,
             "action_factor_raw_contributions": raw_contributions,
             "action_correction_kappa": kappa,
             "action_correction_rms_ratio": evidence_delta.detach().float().square().mean(0).sqrt()

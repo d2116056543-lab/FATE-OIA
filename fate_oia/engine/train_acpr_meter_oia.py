@@ -37,6 +37,7 @@ from fate_oia.losses.meter_action_losses import meter_action_loss
 from fate_oia.losses.meter_counterfactual_losses import (
     dense_factor_intervention_loss,
     identity_corruption_loss,
+    reason_identity_corruption_loss,
 )
 from fate_oia.losses.meter_grounding_losses import meter_grounding_loss
 from fate_oia.losses.meter_pu_losses import (
@@ -219,6 +220,19 @@ def _compute_losses(
         corrupt["action_factor_contributions"],
         action_target,
     )
+    corrupt_reason = model.reason_decoder(
+        patch_tokens_by_layer=output["patch_tokens_by_layer"],
+        reason_logits_calalign=output["reason_logits_calalign"],
+        factor_typed_token=torch.roll(output["factor_typed_token"], 1, 1),
+        factor_reliability=output["factor_reliability"],
+        factor_groundable_mask=output["factor_groundable_mask"],
+        progress=mechanism_ramp,
+    )
+    reason_identity = reason_identity_corruption_loss(
+        output["reason_logits_final"],
+        corrupt_reason["reason_logits_final"],
+        reason_target,
+    )
     output["dense_specificity_loss"] = dense["specificity"] * mechanism_ramp
     output["dense_identity_loss"] = identity * mechanism_ramp
     action = meter_action_loss(output, action_target, config["loss_weights"])
@@ -267,6 +281,9 @@ def _compute_losses(
         + reason["total"]
         + grounding_total
         + dense_weight * mechanism_ramp * dense["necessity"]
+        + float(config["loss_weights"].get("reason_identity", 0.03))
+        * mechanism_ramp
+        * reason_identity
         + pu
     )
     return total, {
@@ -275,6 +292,7 @@ def _compute_losses(
         "grounding": grounding,
         "dense": dense,
         "identity": identity,
+        "reason_identity": reason_identity,
         "pu": pu,
         "pu_score": pu_score,
     }

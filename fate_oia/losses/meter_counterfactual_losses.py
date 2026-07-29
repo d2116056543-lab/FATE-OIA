@@ -53,6 +53,18 @@ def identity_corruption_loss(
     return torch.relu(margin + corrupt_score - clean_score).mean()
 
 
+def reason_identity_corruption_loss(
+    clean_logits: Tensor,
+    corrupt_logits: Tensor,
+    target: Tensor,
+    *,
+    margin: float = 0.02,
+) -> Tensor:
+    clean = asymmetric_multilabel_elements(clean_logits, target).mean(-1)
+    corrupt = asymmetric_multilabel_elements(corrupt_logits, target).mean(-1)
+    return torch.relu(margin + clean - corrupt).mean()
+
+
 def meter_counterfactual_loss(*args: Tensor, **kwargs: Tensor) -> dict[str, Tensor]:
     # Legacy API retained only for old unit-test import compatibility.
     selected_effect, control_effect, wrong_target_effect, support, counter = args[:5]

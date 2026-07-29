@@ -12,6 +12,21 @@ from .meter_semantic_action import FactorSpecificActionTransport
 from .meter_signed_factors import TypedEvidenceStateHead
 
 
+def cross_sample_swap_typed_evidence(
+    evidence: dict[str, Tensor],
+) -> dict[str, Tensor]:
+    keys = (
+        "factor_typed_token",
+        "factor_state_prob",
+        "factor_reliability",
+        "factor_observability",
+    )
+    return {
+        key: torch.roll(value, shifts=1, dims=0) if key in keys else value
+        for key, value in evidence.items()
+    }
+
+
 class METEROIAModel(nn.Module):
     """TESA formal graph with action-owned factors and a hard reason firewall."""
 
@@ -101,7 +116,10 @@ class METEROIAModel(nn.Module):
         if "schema_corruption" in diagnostic_modes:
             factor_token = torch.roll(factor_token, 1, 1)
         if "cross_sample_swap" in diagnostic_modes and factor_token.shape[0] > 1:
-            factor_token = torch.roll(factor_token, 1, 0)
+            swapped = cross_sample_swap_typed_evidence(factors)
+            factor_token = swapped["factor_typed_token"]
+            state_prob = swapped["factor_state_prob"]
+            reliability = swapped["factor_reliability"]
         if "state_corruption" in diagnostic_modes:
             state_prob = torch.roll(state_prob, 1, -1)
             factor_token = self.typed_factors.compose_typed_token(

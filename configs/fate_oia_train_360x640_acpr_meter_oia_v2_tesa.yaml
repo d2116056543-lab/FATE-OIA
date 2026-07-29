@@ -80,6 +80,7 @@ loss_weights:
   action_cardinality: 0.02
   action_specificity: 0.05
   action_identity: 0.03
+  reason_identity: 0.03
   reason_final: 1.00
   reason_global: 0.45
   reason_rank: 0.05

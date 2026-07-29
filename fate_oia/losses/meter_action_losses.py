@@ -61,7 +61,6 @@ def meter_action_loss(
         + weights.get("action_two_way", 0.05) * two_way
         + weights.get("action_soft_f1", 0.03) * soft_f1
         + weights.get("action_cardinality", 0.02) * cardinality
-        + weights.get("action_specificity", 0.05) * specificity
         + weights.get("action_identity", 0.03) * identity
     )
     return {
