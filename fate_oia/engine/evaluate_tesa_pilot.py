@@ -354,7 +354,7 @@ def _state_rows_for_admission(
         factor_id = int(row.get("factor_id", -1))
         matrix = row.get("state_confusion_matrix", [])
         if isinstance(matrix, list) and matrix and all(isinstance(item, list) for item in matrix):
-            positive_count = sum(sum(int(value) for value in matrix[0]))
+            positive_count = sum(int(value) for value in matrix[0])
             negative_count = sum(
                 sum(int(value) for value in matrix[index])
                 for index in range(1, len(matrix))

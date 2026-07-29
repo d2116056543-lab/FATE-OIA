@@ -54,6 +54,27 @@ def test_pilot_reuse_allows_only_offline_evaluation_changes(monkeypatch) -> None
     assert not pilot_evaluator._evaluation_only_git_delta("pilot", "current")
 
 
+def test_state_admission_counts_multiclass_confusion_rows() -> None:
+    rows = pilot_evaluator._state_rows_for_admission(
+        [
+            {
+                "factor_id": 0,
+                "source_count": 751,
+                "state_auprc": 0.85,
+                "state_frequency_baseline": 0.76,
+                "state_confusion_matrix": [
+                    [569, 6, 0],
+                    [169, 7, 0],
+                    [0, 0, 0],
+                ],
+            }
+        ],
+        {"factor_weight_mean_by_action_factor": [[1.0]]},
+    )
+    assert rows[0]["positive_count"] == 575
+    assert rows[0]["negative_count"] == 176
+
+
 def test_schema_tiers_and_prevalence_one_rows_do_not_create_impossible_gate() -> None:
     tiers = factor_groundability_tiers(
         [
