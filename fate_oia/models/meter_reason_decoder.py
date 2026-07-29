@@ -33,8 +33,8 @@ class METERPrivateReasonDecoder(nn.Module):
         trunk = foundation.trunk
         with torch.no_grad():
             self.private_queries.copy_(trunk.label_queries[foundation.action_dim :])
-            self.global_head.weight.copy_(trunk.reason_head.weight)
-            self.global_head.bias.copy_(trunk.reason_head.bias)
+            self.global_head.weight.copy_(trunk.logit_head.weight)
+            self.global_head.bias.copy_(trunk.logit_head.bias)
 
     @staticmethod
     def _ramp(progress: float) -> float:
