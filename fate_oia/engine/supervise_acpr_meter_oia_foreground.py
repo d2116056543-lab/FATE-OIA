@@ -1,122 +1,82 @@
 from __future__ import annotations
 
 import argparse
-import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Sequence
-
-from fate_oia.engine.train_acpr_meter_oia import validate_training_readiness
-from fate_oia.utils.meter_artifacts import python_source_tree_hash
 
 
-# The real-DINO profile selected 6/5. Larger candidates exceeded the
-# reserved-memory limit, so retries may only reduce the physical batch.
-FALLBACK_LADDER = ((6, 5), (4, 8), (3, 11), (2, 16))
-PILOT_READY_NAME = "METER_OIA_V1_PRE_PILOT_READY.json"
-FULL_READY_NAME = "METER_OIA_V1_FULL_TRAIN_READY.json"
+FALLBACK_LADDER = ((6, 5), (5, 6), (4, 8), (3, 10), (2, 15))
 
 
-def run_foreground(command: Sequence[str], *, cwd: str | Path, fallback: Sequence[tuple[int, int]] = FALLBACK_LADDER) -> int:
-    """Run synchronously and retry only on a diagnosed CUDA OOM.
+def _require_gate(path: str | Path, label: str) -> None:
+    if not Path(path).exists():
+        raise FileNotFoundError(f"{label} is required before full training: {path}")
 
-    No detached process, job, scheduler, or hidden window is used;
-    stdout/stderr remain attached to this supervisor's foreground console.
-    """
-    current = list(command)
-    attempts = list(fallback)
-    for index, (batch, accumulation) in enumerate(attempts):
-        replaced = []
-        skip_batch = False
-        skip_accum = False
-        for token in current:
-            if skip_batch:
-                skip_batch = False
-                continue
-            if skip_accum:
-                skip_accum = False
-                continue
-            if token == "--batch_size":
-                replaced.extend([token, str(batch)])
-                skip_batch = True
-            elif token == "--gradient_accumulation_steps":
-                replaced.extend([token, str(accumulation)])
-                skip_accum = True
-            else:
-                replaced.append(token)
-        if "--batch_size" not in replaced:
-            replaced.extend(["--batch_size", str(batch)])
-        if "--gradient_accumulation_steps" not in replaced:
-            replaced.extend(["--gradient_accumulation_steps", str(accumulation)])
-        completed = subprocess.run(replaced, cwd=str(cwd), check=False, env=os.environ.copy())
-        if completed.returncode == 0:
-            return 0
-        if index == len(attempts) - 1:
-            return completed.returncode
-        # The trainer emits METER_OOM_RETRY only for a recoverable OOM.
-        if completed.returncode != 86:
-            return completed.returncode
-    return 1
+
+def _command(
+    args: argparse.Namespace, batch_size: int, grad_accum: int, resume: str
+) -> list[str]:
+    command = [
+        sys.executable,
+        "-u",
+        "-m",
+        "fate_oia.engine.train_acpr_meter_oia",
+        "--config",
+        args.config,
+        "--output_dir",
+        args.output_dir,
+        "--device",
+        args.device,
+        "--epochs",
+        str(args.epochs),
+        "--batch_size",
+        str(batch_size),
+        "--gradient_accumulation_steps",
+        str(grad_accum),
+        "--num_workers",
+        str(args.num_workers),
+        "--test_only",
+        "--no_feature_cache",
+        "--require_no_token_compression",
+    ]
+    if resume:
+        command.extend(["--resume", resume])
+    return command
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=("pilot", "full"), default="pilot")
     parser.add_argument("--config", required=True)
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--pilot_train_samples", type=int, default=4096)
-    parser.add_argument("--pilot_audit_samples", type=int, default=1024)
-    parser.add_argument("--pilot_calib_samples", type=int, default=512)
-    parser.add_argument("--pilot_test_samples", type=int, default=512)
+    parser.add_argument("--epochs", type=int, default=12)
+    parser.add_argument("--batch_size", type=int, default=6)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=5)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--review_pass", required=True)
+    parser.add_argument("--pilot_pass", required=True)
     args = parser.parse_args()
-    root = Path.cwd()
-    epochs = 3 if args.mode == "pilot" else 12
-    git_head = subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], cwd=root, text=True
-    ).strip()
-    git_branch = subprocess.check_output(
-        ["git", "branch", "--show-current"], cwd=root, text=True
-    ).strip()
-    clean_status = subprocess.check_output(
-        ["git", "status", "--porcelain"], cwd=root, text=True
-    ).strip()
-    remote_line = subprocess.check_output(
-        ["git", "ls-remote", "github", f"refs/heads/{git_branch}"],
-        cwd=root,
-        text=True,
-    ).strip()
-    remote_head = remote_line.split()[0] if remote_line else ""
-    validate_training_readiness(
-        root=root,
-        config_path=(root / args.config).resolve(),
-        epochs=epochs,
-        use_mock_dino=False,
-        git_head=git_head,
-        git_branch=git_branch,
-        remote_head=remote_head,
-        clean_status=clean_status,
-        source_tree_hash=python_source_tree_hash(root),
-    )
-    readiness_name = PILOT_READY_NAME if args.mode == "pilot" else FULL_READY_NAME
-    print(f"validated readiness: {readiness_name} HEAD={git_head}", flush=True)
-    command = [
-        sys.executable, "-u", "-m", "fate_oia.engine.train_acpr_meter_oia",
-        "--config", args.config, "--output_dir", args.output_dir,
-        "--device", args.device, "--require_ready", "--worktree_root", str(root),
-    ]
-    if args.mode == "pilot":
-        command.extend([
-            "--epochs", "3",
-            "--max_train_samples", str(args.pilot_train_samples),
-            "--max_audit_samples", str(args.pilot_audit_samples),
-            "--max_calib_samples", str(args.pilot_calib_samples),
-            "--max_test_samples", str(args.pilot_test_samples),
-        ])
-    else:
-        command.extend(["--epochs", str(epochs)])
-    raise SystemExit(run_foreground(command, cwd=root))
+    _require_gate(args.review_pass, "implementation review pass")
+    _require_gate(args.pilot_pass, "TESA pilot gate pass")
+    requested = (args.batch_size, args.gradient_accumulation_steps)
+    ladder = [requested] + [item for item in FALLBACK_LADDER if item != requested]
+    resume = ""
+    for batch_size, grad_accum in ladder:
+        command = _command(args, batch_size, grad_accum, resume)
+        print(
+            f"tesa_supervisor batch={batch_size} accum={grad_accum} "
+            f"resume={resume or 'none'}",
+            flush=True,
+        )
+        completed = subprocess.run(command, check=False)
+        if completed.returncode == 0:
+            return
+        latest = Path(args.output_dir) / "checkpoint_latest.pth"
+        if completed.returncode not in (137, -1073740791) or not latest.exists():
+            raise SystemExit(completed.returncode)
+        resume = str(latest)
+    raise RuntimeError("TESA exhausted the foreground OOM fallback ladder")
 
 
 if __name__ == "__main__":

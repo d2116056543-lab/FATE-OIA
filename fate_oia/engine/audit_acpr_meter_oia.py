@@ -120,7 +120,7 @@ def _gradient_norm(module: torch.nn.Module) -> float:
 
 def _dynamic_checks(device: torch.device) -> dict[str, Any]:
     torch.manual_seed(20260729)
-    model = METEROIAModel(dim=32, use_mock_dino=True).to(device)
+    model = METEROIAModel(dim=384, use_mock_dino=True).to(device)
     images = torch.randn(2, 3, 360, 640, device=device)
     action_target = torch.randint(0, 2, (2, 4), device=device).float()
     reason_target = torch.randint(0, 2, (2, 21), device=device).float()
