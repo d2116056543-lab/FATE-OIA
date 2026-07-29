@@ -152,9 +152,15 @@ def null_partition_calibration_loss(
         raise ValueError("A factor cannot be reliably present and absent together")
     valid = present | absent
     target = absent.to(null_mass)
-    per = F.binary_cross_entropy(
-        null_mass.clamp(1e-6, 1.0 - 1e-6), target, reduction="none"
-    )
+    # Probability-form BCE is intentionally retained for its direct null-mass
+    # gradient semantics, but PyTorch forbids it inside autocast. Compute this
+    # numerically small term in FP32 while preserving the original graph.
+    with torch.autocast(device_type=null_mass.device.type, enabled=False):
+        per = F.binary_cross_entropy(
+            null_mass.float().clamp(1e-6, 1.0 - 1e-6),
+            target.float(),
+            reduction="none",
+        )
     return _weighted_mean(per, valid.to(null_mass) * source_weight.to(null_mass))
 
 

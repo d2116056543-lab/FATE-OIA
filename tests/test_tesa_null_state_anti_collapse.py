@@ -120,6 +120,20 @@ def test_null_is_partition_calibrated_and_unknown_rows_have_zero_gradient() -> N
     assert null_mass.grad[0, 2].eq(0)
 
 
+def test_null_partition_is_safe_under_bf16_autocast() -> None:
+    null_mass = torch.full((1, 3), 0.5, requires_grad=True)
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        loss = null_partition_calibration_loss(
+            null_mass,
+            torch.tensor([[True, False, False]]),
+            torch.tensor([[False, True, False]]),
+            torch.ones(1, 3),
+        )
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert torch.isfinite(null_mass.grad).all()
+
+
 def test_grounding_weights_are_single_source_and_sum_exactly() -> None:
     torch.manual_seed(1)
     output = {
