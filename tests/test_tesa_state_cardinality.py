@@ -1,7 +1,7 @@
 import torch
 
 from fate_oia.models.meter_signed_factors import TypedEvidenceStateHead
-from tests.tesa_helpers import typed_inputs
+from tesa_helpers import typed_inputs
 
 
 def test_state_head_masks_factor_specific_padding() -> None:

@@ -1,7 +1,7 @@
 import torch
 
 from fate_oia.models.meter_signed_factors import TypedEvidenceStateHead
-from tests.tesa_helpers import typed_inputs
+from tesa_helpers import typed_inputs
 
 
 def test_reliability_matches_observability_null_and_entropy() -> None:
