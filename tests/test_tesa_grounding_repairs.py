@@ -12,7 +12,11 @@ from fate_oia.models.meter_signed_factors import TypedEvidenceStateHead
 
 def _schema_copy_with_overrides(tmp_path: Path) -> Path:
     source = Path("configs/meter_factor_schema.yaml").read_text(encoding="utf-8")
-    source = source.replace('action_owned: 1.0, observability_source', 'action_owned: 0.25, observability_source', 1)
+    source = source.replace(
+        "action_owned: 1.0, compatible_actions",
+        "action_owned: 0.25, compatible_actions",
+        1,
+    )
     source = source.replace('groundability: partial, action_owned: 0.5', 'groundability: none, action_owned: 0.5', 1)
     path = tmp_path / "schema.yaml"
     path.write_text(source, encoding="utf-8")
