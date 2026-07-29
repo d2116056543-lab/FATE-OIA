@@ -1,4 +1,5 @@
 import inspect
+import math
 
 from fate_oia.engine import train_acpr_meter_oia as trainer
 from fate_oia.engine import evaluate_tesa_pilot as pilot_evaluator
@@ -67,12 +68,20 @@ def test_state_admission_counts_multiclass_confusion_rows() -> None:
                     [169, 7, 0],
                     [0, 0, 0],
                 ],
-            }
+            },
+            {
+                "factor_id": 1,
+                "source_count": 0,
+                "state_auprc": None,
+                "state_frequency_baseline": None,
+                "state_confusion_matrix": [[0, 0, 0]] * 3,
+            },
         ],
-        {"factor_weight_mean_by_action_factor": [[1.0]]},
+        {"factor_weight_mean_by_action_factor": [[1.0, 0.0]]},
     )
     assert rows[0]["positive_count"] == 575
     assert rows[0]["negative_count"] == 176
+    assert math.isnan(rows[1]["prevalence"])
 
 
 def test_schema_tiers_and_prevalence_one_rows_do_not_create_impossible_gate() -> None:
