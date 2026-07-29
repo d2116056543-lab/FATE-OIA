@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -22,7 +24,7 @@ def mirror_equivariance_loss(
     *,
     factor_pairs: tuple[tuple[int, int], ...] = DEFAULT_MIRROR_PAIRS,
     action_pairs: tuple[tuple[int, int], ...] = DEFAULT_ACTION_MIRROR_PAIRS,
-) -> tuple[Tensor, dict[str, float | bool]]:
+) -> tuple[Tensor, dict[str, Any]]:
     """Compare paired original/mirror forwards, never same-image left/right states."""
     indices = sorted({index for pair in factor_pairs for index in pair})
     mirrored_anchor = torch.flip(
@@ -51,6 +53,18 @@ def mirror_equivariance_loss(
         original["reason_logits_final"][:, indices]
         - mirrored_reason[:, indices]
     ).abs().mean()
+    per_factor_margin: dict[str, float] = {}
+    for left, right in factor_pairs:
+        for factor, partner in ((left, right), (right, left)):
+            correct = (
+                original["factor_anchor_map"][:, factor]
+                - torch.flip(mirrored["factor_anchor_map"][:, partner], dims=[-1])
+            ).abs().mean()
+            wrong = (
+                original["factor_anchor_map"][:, factor]
+                - torch.flip(mirrored["factor_anchor_map"][:, factor], dims=[-1])
+            ).abs().mean()
+            per_factor_margin[str(factor)] = float((wrong - correct).detach())
     loss = anchor_l1 + state_l1 + action_l1 + reason_l1
     return loss, {
         "paired_forward": True,
@@ -58,6 +72,7 @@ def mirror_equivariance_loss(
         "state_l1": float(state_l1.detach()),
         "action_l1": float(action_l1.detach()),
         "reason_l1": float(reason_l1.detach()),
+        "per_factor_margin": per_factor_margin,
     }
 
 

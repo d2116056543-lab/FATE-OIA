@@ -406,13 +406,19 @@ def _typed_factor_audit(
     observability: list[list[float]] = [[] for _ in range(21)]
     observability_target: list[list[float]] = [[] for _ in range(21)]
     source_count = [0] * 21
+    mirror_margin: list[list[float]] = [[] for _ in range(21)]
     mirror_partner = {
         9: 15, 10: 16, 11: 17, 12: 18, 13: 19,
         15: 9, 16: 10, 17: 11, 18: 12, 19: 13,
     }
     for raw_batch in loader:
         batch = _move(raw_batch, device)
-        output = model(batch["image"], progress=progress)
+        mirror_pair = model.forward_mirror_pair(batch["image"], progress=progress)
+        output = mirror_pair["original"]
+        for factor, value in mirror_pair["mirror_equivariance"][
+            "per_factor_margin"
+        ].items():
+            mirror_margin[int(factor)].append(float(value))
         target = batch["meter_grounding"]
         predicted_anchor = output["factor_anchor_map"]
         target_anchor = target["factor_anchor_map"].flatten(2)
@@ -495,6 +501,11 @@ def _typed_factor_audit(
                 ),
                 "observability_auc": (
                     binary_roc_auc(obs_p, obs_y) if obs_p.numel() else None
+                ),
+                "mirror_equivariance": (
+                    sum(mirror_margin[factor]) / len(mirror_margin[factor])
+                    if mirror_margin[factor]
+                    else None
                 ),
             }
         )
@@ -749,6 +760,7 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                 optimizer_step, total_updates
             )
             dino_start = time.perf_counter()
+            dino_calls_before = model._encode_call_count
             with autocast():
                 field = model.encode_images(batch["image"])
                 dino_time = time.perf_counter() - dino_start
@@ -821,7 +833,7 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                     if device.type == "cuda"
                     else 0.0
                 ),
-                "dino_call_count": 1,
+                "dino_call_count": model._encode_call_count - dino_calls_before,
                 "action_correction_rms_ratio": output[
                     "action_correction_rms_ratio"
                 ].detach().cpu().tolist(),
@@ -831,6 +843,13 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                 ),
                 "dense_action_coverage": int(parts["dense"]["action_coverage"]),
                 "dense_factor_coverage": int(parts["dense"]["factor_coverage"]),
+                "dense_correct_effect_abs": float(
+                    parts["dense"]["correct_effect"].abs().mean()
+                ),
+                "dense_wrong_effect_abs": float(
+                    parts["dense"]["wrong_effect"].abs().mean()
+                ),
+                "loss_reason_identity": float(parts["reason_identity"].detach()),
             }
             epoch_rows.append(row)
             append_jsonl(output_dir / "loss_components.jsonl", row)

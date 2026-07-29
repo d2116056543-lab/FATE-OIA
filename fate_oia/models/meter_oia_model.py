@@ -67,12 +67,14 @@ class METEROIAModel(nn.Module):
             dim=dim, reason_dim=reason_dim, action_dim=action_dim
         )
         self.reason_decoder.initialize_from_foundation(self.foundation)
+        self._encode_call_count = 0
 
     @property
     def signed_factors(self) -> TypedEvidenceStateHead:
         return self.typed_factors
 
     def encode_images(self, images: Tensor) -> dict[str, Any]:
+        self._encode_call_count += 1
         return self.foundation.encode_images(images)
 
     def decode_from_field(

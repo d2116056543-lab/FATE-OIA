@@ -147,6 +147,18 @@ def evaluate_pilot(
             and max(int(row.get("dense_action_coverage", 0)) for row in recent) == 4
             and max(int(row.get("dense_factor_coverage", 0)) for row in recent)
             >= 12
+            and sum(
+                float(row.get("dense_correct_effect_abs", 0.0))
+                > float(row.get("dense_wrong_effect_abs", 0.0))
+                for row in recent
+            )
+            / len(recent)
+            >= 0.75
+            and len(typed.get("schema_corruption_delta_per_action", [])) == 4
+            and all(
+                float(value) > 0
+                for value in typed["schema_corruption_delta_per_action"]
+            )
             and float(final["Act_mAP"])
             > float(branches["cross_sample_swap"]["Act_mAP"])
         ),
