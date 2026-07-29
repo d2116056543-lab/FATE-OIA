@@ -37,6 +37,8 @@ TWO_EPOCH_ADMISSION_RULES = {
     "min_action_mean_map_delta": 0.0,
     "min_action_epoch_map_delta": -0.002,
     "min_positive_action_identity_effects": 3,
+    "min_action_delta_auc": 0.55,
+    "min_positive_action_delta_separations": 4,
     "min_action_identity_effect": 0.001,
     "min_reason_ap_delta": 0.001,
     "min_reason_f1_delta": -0.003,
@@ -140,6 +142,10 @@ def evaluate_two_epoch_admission(metrics: Mapping[str, Any]) -> dict[str, Any]:
         if float(row.get("prevalence", 0.0)) >= 1.0
     ]
     transport = [float(value) for value in metrics.get("transport_target_effect", [])]
+    delta_auc = [float(value) for value in metrics.get("action_delta_auc", [])]
+    delta_separation = [
+        float(value) for value in metrics.get("action_delta_separation", [])
+    ]
     correction_ratios = [
         float(value) for value in metrics.get("action_correction_rms_ratio", [])
     ]
@@ -204,6 +210,24 @@ def evaluate_two_epoch_admission(metrics: Mapping[str, Any]) -> dict[str, Any]:
         and bool(metrics.get("no_test_leakage_ok"))
         and int(metrics.get("paired_epoch_count", 0)) == 2
     )
+    discrete_identity_pass = (
+        sum(
+            value > TWO_EPOCH_ADMISSION_RULES["min_action_identity_effect"]
+            for value in transport
+        )
+        >= TWO_EPOCH_ADMISSION_RULES["min_positive_action_identity_effects"]
+    )
+    continuous_identity_pass = (
+        len(delta_auc) == 4
+        and all(
+            value >= TWO_EPOCH_ADMISSION_RULES["min_action_delta_auc"]
+            for value in delta_auc
+        )
+        and sum(value > 0.0 for value in delta_separation)
+        >= TWO_EPOCH_ADMISSION_RULES[
+            "min_positive_action_delta_separations"
+        ]
+    )
     action_pass = (
         len(correction_ratios) == 4
         and all(
@@ -219,11 +243,7 @@ def evaluate_two_epoch_admission(metrics: Mapping[str, Any]) -> dict[str, Any]:
             value >= TWO_EPOCH_ADMISSION_RULES["min_action_epoch_map_delta"]
             for value in action_map_deltas
         )
-        and sum(
-            value > TWO_EPOCH_ADMISSION_RULES["min_action_identity_effect"]
-            for value in transport
-        )
-        >= TWO_EPOCH_ADMISSION_RULES["min_positive_action_identity_effects"]
+        and (discrete_identity_pass or continuous_identity_pass)
     )
     evidence_state_pass = (
         bool(metrics.get("null_semantics_ok"))
@@ -269,6 +289,10 @@ def evaluate_two_epoch_admission(metrics: Mapping[str, Any]) -> dict[str, Any]:
             "correction_rms_ratio": correction_ratios,
             "map_deltas": action_map_deltas,
             "identity_target_effect": transport,
+            "delta_auc": delta_auc,
+            "delta_separation": delta_separation,
+            "discrete_identity_pass": discrete_identity_pass,
+            "continuous_identity_pass": continuous_identity_pass,
             "pass": action_pass,
         },
         "evidence_state": {

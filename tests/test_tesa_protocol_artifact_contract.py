@@ -235,6 +235,47 @@ def test_two_epoch_admission_requires_action_and_two_of_three_mechanism_classes(
     assert decision["pass"]
 
 
+def test_action_admission_accepts_continuous_delta_identity_when_ap_is_tied() -> None:
+    metrics = {
+        "protocol_ok": True,
+        "artifact_ok": True,
+        "numerics_ok": True,
+        "implementation_audit_ok": True,
+        "gradient_ownership_ok": True,
+        "unknown_mask_ok": True,
+        "source_completeness_ok": True,
+        "no_test_leakage_ok": True,
+        "paired_epoch_count": 2,
+        "null_semantics_ok": False,
+        "action_correction_rms_ratio": [0.04, 0.05, 0.03, 0.09],
+        "action_map_deltas": [0.0004, 0.0001],
+        "transport_target_effect": [0.0, 0.0, 0.0, 0.0],
+        "action_delta_auc": [0.80, 0.66, 0.61, 0.58],
+        "action_delta_separation": [0.02, 0.004, 0.004, 0.003],
+        "reason_ap_delta": 0.002,
+        "reason_f1_delta": 0.0,
+        "reason_ap_delta_ci": {
+            "mean": 0.002,
+            "low": 0.001,
+            "high": 0.003,
+            "sample_count": 512,
+        },
+        "deletion_gap_ci": {
+            "mean": 0.01,
+            "low": 0.004,
+            "high": 0.02,
+            "cluster_count": 128,
+        },
+        "state_rows": [],
+    }
+    decision = evaluate_two_epoch_admission(metrics)
+    action = decision["truth_table"]["action"]
+    assert action["continuous_identity_pass"]
+    assert not action["discrete_identity_pass"]
+    assert action["pass"]
+    assert decision["pass"]
+
+
 def test_deletion_and_reason_bootstrap_cannot_pass_on_tiny_sample() -> None:
     decision = evaluate_two_epoch_admission(
         {

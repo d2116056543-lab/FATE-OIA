@@ -9,7 +9,7 @@ from typing import Any
 
 import torch
 
-from fate_oia.metrics import binary_average_precision
+from fate_oia.metrics import binary_average_precision, binary_roc_auc
 from fate_oia.utils.meter_artifacts import validate_epoch_artifacts, write_json
 from fate_oia.utils.tesa_contracts import (
     evaluate_two_epoch_admission,
@@ -177,6 +177,42 @@ def _two_epoch_pairs(epochs: list[Path]) -> dict[str, Any]:
         - float(row["reason_global"]["Exp_mF1"])
         for row in branch_rows
     ]
+    delta_auc_rows: list[list[float]] = []
+    delta_separation_rows: list[list[float]] = []
+    for epoch in selected:
+        final_action = torch.load(
+            epoch / "logits_action_final_raw_test.pt",
+            map_location="cpu",
+            weights_only=True,
+        ).float()
+        visual_action = torch.load(
+            epoch / "logits_action_visual_test.pt",
+            map_location="cpu",
+            weights_only=True,
+        ).float()
+        action_target = torch.load(
+            epoch / "labels_action_test.pt",
+            map_location="cpu",
+            weights_only=True,
+        ).float()
+        delta = final_action - visual_action
+        auc_row: list[float] = []
+        separation_row: list[float] = []
+        for action_id in range(action_target.shape[1]):
+            target = action_target[:, action_id]
+            positive = target > 0.5
+            negative = ~positive
+            auc_row.append(binary_roc_auc(delta[:, action_id], target))
+            separation_row.append(
+                float(
+                    delta[positive, action_id].mean()
+                    - delta[negative, action_id].mean()
+                )
+                if bool(positive.any()) and bool(negative.any())
+                else float("nan")
+            )
+        delta_auc_rows.append(auc_row)
+        delta_separation_rows.append(separation_row)
     return {
         "paired_epoch_count": 2,
         "action_map_deltas": action_map_deltas,
@@ -197,6 +233,12 @@ def _two_epoch_pairs(epochs: list[Path]) -> dict[str, Any]:
             ],
             4,
         ),
+        "action_delta_auc": _mean_vectors(delta_auc_rows, 4),
+        "action_delta_separation": _mean_vectors(
+            delta_separation_rows, 4
+        ),
+        "action_delta_auc_by_epoch": delta_auc_rows,
+        "action_delta_separation_by_epoch": delta_separation_rows,
         "reason_ap_delta": sum(reason_ap_deltas) / len(reason_ap_deltas),
         "reason_f1_delta": sum(reason_f1_deltas) / len(reason_f1_deltas),
         "reason_ap_delta_ci": _paired_reason_map_bootstrap(selected),
@@ -563,6 +605,10 @@ def evaluate_pilot(
             ),
             "action_map_deltas": paired.get("action_map_deltas", []),
             "transport_target_effect": paired.get("transport_target_effect", []),
+            "action_delta_auc": paired.get("action_delta_auc", []),
+            "action_delta_separation": paired.get(
+                "action_delta_separation", []
+            ),
             "reason_ap_delta": paired.get("reason_ap_delta", float("nan")),
             "reason_f1_delta": paired.get("reason_f1_delta", float("nan")),
             "reason_ap_delta_ci": paired.get("reason_ap_delta_ci", {}),
