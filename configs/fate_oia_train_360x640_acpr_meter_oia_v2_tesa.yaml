@@ -65,6 +65,7 @@ training:
   grad_clip: 1.0
   warmup_ratio: 0.05
   mechanism_ramp_ratio: 0.10
+  mirror_training_interval: 8
   lr_foundation: 0.00015
   lr_typed_factor: 0.00020
   lr_action_transport: 0.00020

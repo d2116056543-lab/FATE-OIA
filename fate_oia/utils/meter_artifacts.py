@@ -235,6 +235,7 @@ def validate_epoch_artifacts(directory: str | Path) -> list[str]:
             continue
         if not bool(torch.isfinite(value).all()):
             failures.append(f"{name}:non_finite")
+    payloads: dict[str, dict[str, Any]] = {}
     for name in (
         "metrics_raw.json",
         "metrics_deploy.json",
@@ -251,4 +252,51 @@ def validate_epoch_artifacts(directory: str | Path) -> list[str]:
             continue
         if not isinstance(payload, dict):
             failures.append(f"{name}:schema")
+            continue
+        payloads[name] = payload
+
+    typed = payloads.get("typed_evidence.json", {})
+    typed_lengths = {
+        "state_confusion_matrix": 21,
+        "source_coverage": 21,
+        "same_type_margin": 21,
+        "mirror_equivariance": 21,
+        "identity_target_delta": 4,
+        "identity_wrong_delta": 4,
+        "factor_off_delta": 4,
+        "state_off_delta": 4,
+        "cross_sample_swap_effect": 4,
+    }
+    typed_valid = all(
+        isinstance(typed.get(key), list) and len(typed[key]) == length
+        for key, length in typed_lengths.items()
+    )
+    train_audit = typed.get("train_audit", {})
+    patch_audit = typed.get("patch_audit", {})
+    typed_valid = (
+        typed_valid
+        and isinstance(train_audit, dict)
+        and isinstance(train_audit.get("per_factor"), list)
+        and len(train_audit["per_factor"]) == 21
+        and isinstance(patch_audit, dict)
+        and isinstance(patch_audit.get("unique_sample_count"), int)
+        and isinstance(patch_audit.get("action_coverage"), list)
+        and isinstance(patch_audit.get("factor_coverage"), list)
+    )
+    if not typed_valid:
+        failures.append("typed_evidence.json:mechanism_schema")
+
+    calibration = payloads.get("calibration.json", {})
+    if (
+        calibration.get("fit_split") != "train_calib"
+        or calibration.get("representation_updated") is not False
+    ):
+        failures.append("calibration.json:train_calib_schema")
+
+    runtime = payloads.get("runtime.json", {})
+    if (
+        not isinstance(runtime.get("dino_call_count"), dict)
+        or not isinstance(runtime.get("peak_reserved_gb"), (int, float))
+    ):
+        failures.append("runtime.json:profile_schema")
     return failures

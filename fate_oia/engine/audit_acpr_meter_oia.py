@@ -130,6 +130,10 @@ def _dynamic_checks(device: torch.device) -> dict[str, Any]:
     reason_target = torch.randint(0, 2, (2, 21), device=device).float()
     progress_zero = model(images, progress=0.0)
     progress_one = model(images, progress=1.0)
+    with torch.no_grad():
+        shared_field = model.encode_images(images)
+        foundation_only = model.foundation.decode_foundation(shared_field)
+        zero_from_shared = model.decode_from_field(shared_field, progress=0.0)
     shapes = {
         "action_logits_final": list(progress_one["action_logits_final"].shape),
         "reason_logits_final": list(progress_one["reason_logits_final"].shape),
@@ -143,11 +147,14 @@ def _dynamic_checks(device: torch.device) -> dict[str, Any]:
         (
             progress_one["action_logits_final"]
             - progress_one["action_logits_visual"]
-            - torch.tanh(
-                progress_one["action_factor_contributions"].sum(-1)
-                / progress_one["action_correction_kappa"].view(1, -1)
-            )
-            * progress_one["action_correction_kappa"].view(1, -1)
+            - progress_one["action_factor_contributions"].sum(-1)
+        )
+        .abs()
+        .max()
+    )
+    zero_label_node_error = float(
+        (
+            zero_from_shared["label_nodes"] - foundation_only["label_nodes"]
         )
         .abs()
         .max()
@@ -197,10 +204,31 @@ def _dynamic_checks(device: torch.device) -> dict[str, Any]:
         torch.rand_like(reason_target),
         zero_lambda,
     )
-    pu.backward()
+    pu.backward(retain_graph=True)
     pu_zero = float(pu.detach()) == 0.0 and all(
         parameter.grad is None or float(parameter.grad.abs().max()) == 0.0
         for parameter in model.parameters()
+    )
+    model.zero_grad(set_to_none=True)
+    active_lambda = torch.full((21,), 0.10, device=device)
+    active_pu = meter_private_pu_loss(
+        progress_one["reason_logits_pu_private"],
+        reason_target,
+        torch.rand_like(reason_target),
+        active_lambda,
+    )
+    active_pu.backward()
+    active_pu_grads = {
+        "foundation": _gradient_norm(model.foundation),
+        "factor": _gradient_norm(model.typed_factors),
+        "action": _gradient_norm(model.action_transport),
+        "reason": _gradient_norm(model.reason_decoder),
+    }
+    active_pu_private_only = (
+        active_pu_grads["foundation"] == 0.0
+        and active_pu_grads["factor"] == 0.0
+        and active_pu_grads["action"] == 0.0
+        and active_pu_grads["reason"] > 0.0
     )
     finite = all(
         bool(torch.isfinite(progress_one[key]).all())
@@ -217,10 +245,13 @@ def _dynamic_checks(device: torch.device) -> dict[str, Any]:
         "shapes": shapes,
         "progress_zero_action_error": zero_action_error,
         "progress_zero_reason_error": zero_reason_error,
+        "progress_zero_label_node_error": zero_label_node_error,
         "additive_error": additive_error,
         "action_gradient_ownership": action_grads,
         "reason_gradient_firewall": reason_grads,
         "pu_zero_exact": pu_zero,
+        "pu_active_gradient_ownership": active_pu_grads,
+        "pu_active_private_only": active_pu_private_only,
         "finite": finite,
         "pass": (
             shapes["action_logits_final"] == [2, 4]
@@ -230,6 +261,7 @@ def _dynamic_checks(device: torch.device) -> dict[str, Any]:
             and shapes["action_factor_contributions"] == [2, 4, 21]
             and zero_action_error < 1e-6
             and zero_reason_error < 1e-6
+            and zero_label_node_error < 1e-6
             and additive_error < 1e-5
             and action_grads["reason"] == 0.0
             and reason_grads["foundation"] == 0.0
@@ -237,6 +269,7 @@ def _dynamic_checks(device: torch.device) -> dict[str, Any]:
             and reason_grads["action"] == 0.0
             and reason_grads["reason"] > 0.0
             and pu_zero
+            and active_pu_private_only
             and finite
         ),
     }

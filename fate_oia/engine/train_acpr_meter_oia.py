@@ -116,6 +116,58 @@ def _move(value: Any, device: torch.device) -> Any:
     return value
 
 
+def _slice_encoded_field(
+    field: dict[str, Any], start: int, end: int, encoded_batch: int
+) -> dict[str, Any]:
+    return {
+        key: (
+            value[start:end]
+            if isinstance(value, Tensor)
+            and value.ndim > 0
+            and value.shape[0] == encoded_batch
+            else value
+        )
+        for key, value in field.items()
+    }
+
+
+def _forward_training_batch(
+    model: METEROIAModel,
+    images: Tensor,
+    *,
+    progress: float,
+    mirror_due: bool,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Decode an optional paired mirror while keeping one DINO encode call."""
+    batch_size = images.shape[0]
+    encoded_images = (
+        torch.cat([images, torch.flip(images[:1], dims=[-1])], dim=0)
+        if mirror_due
+        else images
+    )
+    encoded_batch = encoded_images.shape[0]
+    encoded_field = model.encode_images(encoded_images)
+    output = model.decode_from_field(
+        _slice_encoded_field(encoded_field, 0, batch_size, encoded_batch),
+        progress=progress,
+        collect_timing=True,
+        update_semantic_stats=True,
+    )
+    mirror_output = (
+        model.decode_from_field(
+            _slice_encoded_field(
+                encoded_field, batch_size, encoded_batch, encoded_batch
+            ),
+            progress=progress,
+            collect_timing=False,
+            update_semantic_stats=False,
+        )
+        if mirror_due
+        else None
+    )
+    return output, mirror_output
+
+
 def _parameter_groups(
     model: METEROIAModel, config: dict[str, Any]
 ) -> list[dict[str, Any]]:
@@ -226,6 +278,7 @@ def _compute_losses(
     grounding_ramp: float,
     mechanism_ramp: float,
     pu_lambda: Tensor,
+    mirror_output: dict[str, Any] | None = None,
 ) -> tuple[Tensor, dict[str, Any]]:
     action_target = batch["action"]
     reason_target = batch["reason"]
@@ -306,7 +359,12 @@ def _compute_losses(
         pu_lambda,
     )
     if "meter_grounding" in batch:
-        grounding = meter_grounding_loss(output, batch["meter_grounding"])
+        grounding = meter_grounding_loss(
+            output,
+            batch["meter_grounding"],
+            mirrored_output=mirror_output,
+            mirror_pairs=model.typed_factors.mirror_pairs,
+        )
         grounding_total = grounding["total"] * grounding_ramp
     else:
         zero = output["action_logits_final"].new_zeros(())
@@ -327,7 +385,7 @@ def _compute_losses(
         action["total"]
         + reason["total"]
         + grounding_total
-        + dense_weight * mechanism_ramp * dense["necessity"]
+        + dense_weight * mechanism_ramp * dense["total"]
         + float(config["loss_weights"].get("reason_identity", 0.03))
         * mechanism_ramp
         * reason_identity
@@ -455,6 +513,7 @@ def _typed_factor_audit(
     state_target: list[list[float]] = [[] for _ in range(21)]
     observability: list[list[float]] = [[] for _ in range(21)]
     observability_target: list[list[float]] = [[] for _ in range(21)]
+    state_confusion = torch.zeros(21, 3, 3, dtype=torch.long)
     source_count = [0] * 21
     mirror_margin: list[list[float]] = [[] for _ in range(21)]
     mirror_partner = {
@@ -488,6 +547,12 @@ def _typed_factor_audit(
                 wrong_score[factor].extend(wrong[valid_anchor].cpu().tolist())
                 source_count[factor] += int(valid_anchor.sum())
             if bool(valid_state.any()):
+                predicted_state = output["factor_state_prob"][:, factor].argmax(-1)
+                for truth, prediction in zip(
+                    target["factor_state_target"][valid_state, factor].cpu(),
+                    predicted_state[valid_state].cpu(),
+                ):
+                    state_confusion[factor, int(truth), int(prediction)] += 1
                 state_probability[factor].extend(
                     output["factor_state_prob"][valid_state, factor, 0]
                     .cpu()
@@ -549,6 +614,7 @@ def _typed_factor_audit(
                 "state_auc": (
                     binary_roc_auc(state_p, state_y) if state_p.numel() else None
                 ),
+                "state_confusion_matrix": state_confusion[factor].tolist(),
                 "observability_auc": (
                     binary_roc_auc(obs_p, obs_y) if obs_p.numel() else None
                 ),
@@ -562,6 +628,7 @@ def _typed_factor_audit(
     return {
         "per_factor": rows,
         "source_coverage": source_count,
+        "state_confusion_matrix": state_confusion.tolist(),
         "factors_with_anchor_source": sum(count > 0 for count in source_count),
     }
 
@@ -811,15 +878,18 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
             )
             dino_start = time.perf_counter()
             dino_calls_before = model._encode_call_count
+            mirror_interval = int(
+                config["training"].get("mirror_training_interval", 8)
+            )
+            mirror_due = mirror_interval > 0 and micro_step % mirror_interval == 0
             with autocast():
-                field = model.encode_images(batch["image"])
-                dino_time = time.perf_counter() - dino_start
-                output = model.decode_from_field(
-                    field,
+                output, mirror_output = _forward_training_batch(
+                    model,
+                    batch["image"],
                     progress=optimizer_step / max(total_updates, 1),
-                    collect_timing=True,
-                    update_semantic_stats=True,
+                    mirror_due=mirror_due,
                 )
+                dino_time = time.perf_counter() - dino_start
                 total, parts = _compute_losses(
                     model,
                     output,
@@ -830,6 +900,7 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                     pu_lambda=torch.tensor(
                         pu_state["lambda"], device=device, dtype=output["reason_logits_final"].dtype
                     ),
+                    mirror_output=mirror_output,
                 )
                 scaled = total / grad_accum
             backward_start = time.perf_counter()
@@ -899,6 +970,18 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                 "dense_wrong_effect_abs": float(
                     parts["dense"]["wrong_effect"].abs().mean()
                 ),
+                "dense_correct_effect_abs_per_action": parts["dense"][
+                    "correct_effect"
+                ]
+                .abs()
+                .mean(0)
+                .tolist(),
+                "dense_wrong_effect_abs_per_action": parts["dense"][
+                    "wrong_effect"
+                ]
+                .abs()
+                .mean(0)
+                .tolist(),
                 "loss_reason_identity": float(parts["reason_identity"].detach()),
                 "loss_identity_schema": float(
                     parts["identity_terms"]["schema"].detach()
@@ -963,9 +1046,10 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
             model, test_loader, device, progress=progress, sequential_modes=True
         )
         mechanism = mechanism_stats_from_collected(test)
-        mechanism["train_audit"] = _typed_factor_audit(
+        train_audit = _typed_factor_audit(
             model, factor_audit_loader, device, progress
         )
+        mechanism["train_audit"] = train_audit
         patch_audit = run_stratified_patch_audit(
             model,
             test_loader,
@@ -983,6 +1067,75 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
             },
         )
         mechanism["patch_audit"] = patch_audit
+        mechanism.update(
+            {
+                "state_confusion_matrix": train_audit["state_confusion_matrix"],
+                "source_coverage": train_audit["source_coverage"],
+                "same_type_margin": [
+                    row["same_type_margin"] for row in train_audit["per_factor"]
+                ],
+                "mirror_equivariance": [
+                    row["mirror_equivariance"] for row in train_audit["per_factor"]
+                ],
+                "analytic_coverage": {
+                    "actions": max(
+                        (row["dense_action_coverage"] for row in epoch_rows),
+                        default=0,
+                    ),
+                    "factors": max(
+                        (row["dense_factor_coverage"] for row in epoch_rows),
+                        default=0,
+                    ),
+                },
+                "correct_factor_effect": sum(
+                    row["dense_correct_effect_abs"] for row in epoch_rows
+                )
+                / max(len(epoch_rows), 1),
+                "wrong_factor_effect": sum(
+                    row["dense_wrong_effect_abs"] for row in epoch_rows
+                )
+                / max(len(epoch_rows), 1),
+                "identity_target_delta": [
+                    sum(
+                        row["dense_correct_effect_abs_per_action"][action]
+                        for row in epoch_rows
+                    )
+                    / max(len(epoch_rows), 1)
+                    for action in range(4)
+                ],
+                "identity_wrong_delta": [
+                    sum(
+                        row["dense_wrong_effect_abs_per_action"][action]
+                        for row in epoch_rows
+                    )
+                    / max(len(epoch_rows), 1)
+                    for action in range(4)
+                ],
+                "factor_off_delta": mechanism.get(
+                    "factor_off_delta_per_action", []
+                ),
+                "state_off_delta": mechanism.get(
+                    "state_off_delta_per_action", []
+                ),
+                "cross_sample_swap_effect": mechanism.get(
+                    "cross_sample_swap_delta_per_action", []
+                ),
+                "patch_selected_effect": patch_audit.get(
+                    "selected_effect_mean", 0.0
+                ),
+                "patch_control_effect": patch_audit.get(
+                    "control_effect_mean", 0.0
+                ),
+                "unique_sample_count": patch_audit.get(
+                    "unique_sample_count", 0
+                ),
+                "cumulative_unique_count": patch_audit.get(
+                    "cumulative_unique_count", 0
+                ),
+                "action_coverage": patch_audit.get("action_coverage", []),
+                "factor_coverage": patch_audit.get("factor_coverage", []),
+            }
+        )
         runtime = {
             "epoch": epoch,
             "train_rows": len(epoch_rows),

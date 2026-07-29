@@ -174,7 +174,15 @@ def discrimination_and_mirror_loss(
         else token.new_zeros(())
     )
     mirror = (
-        mirror_equivariance_loss(output, mirrored_output, factor_pairs=mirror_pairs)[0]
+        mirror_equivariance_loss(
+            {
+                key: value[: mirrored_output["action_logits_final"].shape[0]]
+                for key, value in output.items()
+                if isinstance(value, Tensor)
+            },
+            mirrored_output,
+            factor_pairs=mirror_pairs,
+        )[0]
         if mirrored_output is not None
         else token.new_zeros(())
     )
@@ -187,6 +195,7 @@ def meter_grounding_loss(
     *,
     observability_tau: Tensor | None = None,
     mirrored_output: dict[str, Tensor] | None = None,
+    mirror_pairs: tuple[tuple[int, int], ...] = DEFAULT_MIRROR_PAIRS,
 ) -> dict[str, Tensor]:
     source = targets["factor_source_weight"].to(output["factor_anchor_map"])
     anchor_nll, anchor_dice = source_weighted_anchor_loss(
@@ -214,7 +223,10 @@ def meter_grounding_loss(
         tau,
     )
     discrimination, mirror = discrimination_and_mirror_loss(
-        output, targets, mirrored_output=mirrored_output
+        output,
+        targets,
+        mirror_pairs=mirror_pairs,
+        mirrored_output=mirrored_output,
     )
     anchor = anchor_nll + anchor_dice
     observability = obs_bce + obs_coverage

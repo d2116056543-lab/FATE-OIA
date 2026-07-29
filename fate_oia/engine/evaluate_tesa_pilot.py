@@ -93,17 +93,29 @@ def evaluate_pilot(
         if _finite(final_reason["Exp_per_label_ap"][index])
     ]
     patch = typed.get("patch_audit", {})
+    identity_target = typed.get("identity_target_delta", [])
+    identity_wrong = typed.get("identity_wrong_delta", [])
+    schema_reason = branches.get("schema_corruption", {})
+    schema_reason_ap = schema_reason.get("Exp_per_label_ap", [])
     recent = losses[-max(1, min(len(losses), 200)) :]
     gates = {
-        "A": bool(audit.get("pass"))
-        and float(
-            audit["dynamic_checks"].get("progress_zero_action_error", 1.0)
-        )
-        < 1e-6
-        and float(
-            audit["dynamic_checks"].get("progress_zero_reason_error", 1.0)
-        )
-        < 1e-6,
+        "A": (
+            bool(audit.get("pass"))
+            and float(
+                audit["dynamic_checks"].get("progress_zero_action_error", 1.0)
+            )
+            < 1e-6
+            and float(
+                audit["dynamic_checks"].get("progress_zero_reason_error", 1.0)
+            )
+            < 1e-6
+            and float(
+                audit["dynamic_checks"].get(
+                    "progress_zero_label_node_error", 1.0
+                )
+            )
+            < 1e-6
+        ),
         "B": (
             bool(factor_rows)
             and min(null) > 0.0
@@ -132,6 +144,13 @@ def evaluate_pilot(
             and all(0.03 <= float(value) <= 0.25 for value in ratios)
             and float(final["Act_mAP"])
             > float(branches["schema_corruption"]["Act_mAP"])
+            and len(identity_target) == 4
+            and len(identity_wrong) == 4
+            and sum(
+                float(target) > float(wrong)
+                for target, wrong in zip(identity_target, identity_wrong)
+            )
+            >= 3
         ),
         "D": (
             float(final_reason["Exp_mAP"])
@@ -141,6 +160,15 @@ def evaluate_pilot(
             >= sum(ground_global) / len(ground_global) + 0.005
             and float(final_reason["Exp_mAP"])
             > float(branches["reason_correction_off"]["Exp_mAP"])
+            and len(schema_reason_ap) == 21
+            and sum(
+                float(final_reason["Exp_per_label_ap"][index])
+                > float(schema_reason_ap[index])
+                for index in GROUNDABLE
+                if _finite(final_reason["Exp_per_label_ap"][index])
+                and _finite(schema_reason_ap[index])
+            )
+            >= max(1, len(ground_final) // 2)
         ),
         "E": (
             bool(recent)
@@ -171,8 +199,16 @@ def evaluate_pilot(
             and float(patch.get("selected_minus_control_mean", -1.0)) > 0
         ),
         "G": bool(audit["dynamic_checks"].get("pu_zero_exact"))
+        and bool(audit["dynamic_checks"].get("pu_active_private_only"))
         and bool(pu.get("active_labels"))
-        and all(0.0 <= float(value) <= 0.15 for value in pu.get("lambda", [])),
+        and all(0.0 <= float(value) <= 0.15 for value in pu.get("lambda", []))
+        and all(
+            bool(row.get("eligible"))
+            and float(row.get("lcb95", 0.0)) > 0.0
+            and float(row.get("lambda", 0.0)) > 0.0
+            for row in pu.get("labels", [])
+            if int(row.get("label_id", -1)) in pu.get("active_labels", [])
+        ),
         "H": (
             not protocol_failures
             and

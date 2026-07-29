@@ -81,6 +81,7 @@ class TypedEvidenceStateHead(nn.Module):
         self.obs_bias = nn.Parameter(torch.zeros(factor_dim))
         self.typed_norm = nn.LayerNorm(dim)
         self.schema_sha256 = schema.sha256
+        self.mirror_pairs = schema.mirror_pairs
 
     @staticmethod
     def _ramp(progress: float) -> float:

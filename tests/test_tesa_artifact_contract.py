@@ -17,11 +17,40 @@ def test_artifact_contract_contains_mechanism_and_calibration_fields() -> None:
 
 
 def test_artifact_validator_checks_shapes_alignment_and_finite(tmp_path) -> None:
-    for name in (
-        "metrics_raw.json", "metrics_deploy.json", "branch_metrics.json",
-        "typed_evidence.json", "pu_stats.json", "calibration.json", "runtime.json",
-    ):
+    for name in ("metrics_raw.json", "metrics_deploy.json", "branch_metrics.json"):
         (tmp_path / name).write_text("{}", encoding="utf-8")
+    typed = {
+        "state_confusion_matrix": [[[0] * 3 for _ in range(3)] for _ in range(21)],
+        "source_coverage": [0] * 21,
+        "same_type_margin": [None] * 21,
+        "mirror_equivariance": [None] * 21,
+        "identity_target_delta": [0.0] * 4,
+        "identity_wrong_delta": [0.0] * 4,
+        "factor_off_delta": [0.0] * 4,
+        "state_off_delta": [0.0] * 4,
+        "cross_sample_swap_effect": [0.0] * 4,
+        "train_audit": {"per_factor": [{} for _ in range(21)]},
+        "patch_audit": {
+            "unique_sample_count": 2,
+            "action_coverage": [0, 1, 2, 3],
+            "factor_coverage": list(range(12)),
+        },
+    }
+    (tmp_path / "typed_evidence.json").write_text(
+        json.dumps(typed), encoding="utf-8"
+    )
+    (tmp_path / "pu_stats.json").write_text(
+        json.dumps({"active_labels": [], "lambda": [0.0] * 21, "labels": []}),
+        encoding="utf-8",
+    )
+    (tmp_path / "calibration.json").write_text(
+        json.dumps({"fit_split": "train_calib", "representation_updated": False}),
+        encoding="utf-8",
+    )
+    (tmp_path / "runtime.json").write_text(
+        json.dumps({"dino_call_count": {"main": 1}, "peak_reserved_gb": 1.0}),
+        encoding="utf-8",
+    )
     (tmp_path / "file_names_test.json").write_text(
         json.dumps({"file_names": ["a.jpg", "b.jpg"]}), encoding="utf-8"
     )
@@ -50,6 +79,7 @@ def test_artifact_validator_rejects_incomplete_tesa_mechanism_schema(tmp_path) -
     test_artifact_validator_checks_shapes_alignment_and_finite(tmp_path)
     torch.save(torch.zeros(2, 4), tmp_path / "logits_action_final_raw_test.pt")
     torch.save(torch.zeros(2, 21), tmp_path / "labels_reason_test.pt")
+    (tmp_path / "typed_evidence.json").write_text("{}", encoding="utf-8")
 
     failures = validate_epoch_artifacts(tmp_path)
     assert "typed_evidence.json:mechanism_schema" in failures

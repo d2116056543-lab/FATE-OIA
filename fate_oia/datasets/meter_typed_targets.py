@@ -124,7 +124,21 @@ class METERTypedTargetBuilder:
     def _geometry_masks(self, record: dict[str, Any]) -> dict[str, Tensor]:
         image_size_raw = record.get("image_size", self.image_size)
         image_size = (int(image_size_raw[0]), int(image_size_raw[1]))
-        polylines = list(record.get("lanes", [])) + list(record.get("polylines", []))
+        object_polylines = [
+            obj
+            for obj in record.get("objects", [])
+            if isinstance(obj, dict)
+            and obj.get("poly2d")
+            and any(
+                name in _category(obj)
+                for name in ("lane", "road marking", "drivable")
+            )
+        ]
+        polylines = (
+            list(record.get("lanes", []))
+            + list(record.get("polylines", []))
+            + object_polylines
+        )
         lane = _polyline_mask(polylines, image_size=image_size, grid_hw=self.grid_hw)
         drivable = torch.zeros(self.grid_hw, dtype=torch.float32)
         if record.get("drivable_map_path"):
@@ -208,6 +222,37 @@ class METERTypedTargetBuilder:
             if bool(geometry[side].any()):
                 anchor[factor_id], anchor_valid[factor_id] = geometry[side], True
                 observability[factor_id], observability_valid[factor_id], source_weight[factor_id] = 1.0, True, 0.8
+        for obj in objects:
+            if not obj.get("poly2d") or not any(
+                name in _category(obj) for name in ("lane", "road marking")
+            ):
+                continue
+            points = _points(obj.get("poly2d"))
+            if not points:
+                continue
+            is_left = sum(point[0] for point in points) / len(points) < image_size[0] / 2.0
+            solid_factor = 11 if is_left else 17
+            turn_factor = 12 if is_left else 18
+            style = _attribute(obj, "laneStyle", "lane_style", "style")
+            if style:
+                if "solid" in style and "dashed" not in style:
+                    state_target[solid_factor] = 0
+                    state_valid[solid_factor] = True
+                elif any(name in style for name in ("dashed", "broken", "double dashed")):
+                    state_target[solid_factor] = 1
+                    state_valid[solid_factor] = True
+                if state_valid[solid_factor]:
+                    source_weight[solid_factor] = 1.0
+            direction = _attribute(
+                obj, "laneDirection", "lane_direction", "direction", "turn"
+            )
+            expected = "left" if is_left else "right"
+            if direction:
+                state_target[turn_factor] = (
+                    0 if expected in direction and "straight" not in direction else 1
+                )
+                state_valid[turn_factor] = True
+                source_weight[turn_factor] = 1.0
         for factor_id, boxes, threshold in (
             (10, [box for box in vehicle_boxes if (box[0] + box[2]) * 0.5 < image_size[0] / 2.0], 0.5),
             (16, [box for box in vehicle_boxes if (box[0] + box[2]) * 0.5 >= image_size[0] / 2.0], 0.5),

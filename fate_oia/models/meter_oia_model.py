@@ -202,7 +202,11 @@ class METEROIAModel(nn.Module):
 
         original = self.forward(images, progress=progress)
         mirrored = self.forward(torch.flip(images, dims=[-1]), progress=progress)
-        loss, report = mirror_equivariance_loss(original, mirrored)
+        loss, report = mirror_equivariance_loss(
+            original,
+            mirrored,
+            factor_pairs=self.typed_factors.mirror_pairs,
+        )
         return {
             "original": original,
             "mirrored": mirrored,
