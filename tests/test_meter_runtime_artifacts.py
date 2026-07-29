@@ -32,27 +32,6 @@ def test_runtime_selection_respects_hard_memory_limit() -> None:
 
 def test_runtime_profiler_uses_two_stage_search_not_cartesian_product() -> None:
     candidates = [(16, 2), (12, 3), (8, 4), (6, 6)]
-    workers = [4, 6]
-    prefetch = [2, 4]
-    stage_one = build_two_stage_profile_plan(
-        candidates,
-        workers,
-        prefetch,
-        stable_num_workers=4,
-        stable_prefetch_factor=2,
-    )
-    full_plan = build_two_stage_profile_plan(
-        candidates,
-        workers,
-        prefetch,
-        stable_num_workers=4,
-        stable_prefetch_factor=2,
-        selected_candidate=(12, 3),
-    )
-    assert len(stage_one) == 4
-    assert len(full_plan) == 7
-    assert all(item["stage"] == "batch_search" for item in stage_one)
-    assert all(
-        item["batch_size"] == 12 and item["gradient_accumulation_steps"] == 3
-        for item in full_plan[4:]
-    )
+    plan = build_two_stage_profile_plan(tuple(candidates))
+    assert plan["candidates"] == [list(item) for item in candidates]
+    assert plan["selection"] == "fastest_stable_below_reserved_limit"

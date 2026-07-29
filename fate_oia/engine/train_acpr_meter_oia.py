@@ -32,6 +32,7 @@ from fate_oia.engine.eval_acpr_meter_oia import (
     mechanism_stats_from_collected,
     metrics_summary,
 )
+from fate_oia.engine.tesa_diagnostics import run_stratified_patch_audit
 from fate_oia.losses.meter_action_losses import meter_action_loss
 from fate_oia.losses.meter_counterfactual_losses import (
     dense_factor_intervention_loss,
@@ -45,6 +46,7 @@ from fate_oia.losses.meter_pu_losses import (
 )
 from fate_oia.losses.meter_reason_losses import meter_reason_loss
 from fate_oia.models.meter_oia_model import METEROIAModel
+from fate_oia.metrics import binary_average_precision, binary_roc_auc
 from fate_oia.transforms_meter import meter_image_transform
 from fate_oia.utils.meter_artifacts import (
     append_jsonl,
@@ -372,6 +374,119 @@ def _update_pu(
     return audit
 
 
+@torch.no_grad()
+def _typed_factor_audit(
+    model: METEROIAModel,
+    loader: Iterable[dict[str, Any]],
+    device: torch.device,
+    progress: float,
+) -> dict[str, Any]:
+    anchor_score: list[list[float]] = [[] for _ in range(21)]
+    wrong_score: list[list[float]] = [[] for _ in range(21)]
+    state_probability: list[list[float]] = [[] for _ in range(21)]
+    state_target: list[list[float]] = [[] for _ in range(21)]
+    observability: list[list[float]] = [[] for _ in range(21)]
+    observability_target: list[list[float]] = [[] for _ in range(21)]
+    source_count = [0] * 21
+    mirror_partner = {
+        9: 15, 10: 16, 11: 17, 12: 18, 13: 19,
+        15: 9, 16: 10, 17: 11, 18: 12, 19: 13,
+    }
+    for raw_batch in loader:
+        batch = _move(raw_batch, device)
+        output = model(batch["image"], progress=progress)
+        target = batch["meter_grounding"]
+        predicted_anchor = output["factor_anchor_map"]
+        target_anchor = target["factor_anchor_map"].flatten(2)
+        for factor in range(21):
+            valid_anchor = target["factor_anchor_valid"][:, factor].bool()
+            valid_state = target["factor_state_valid"][:, factor].bool()
+            valid_obs = target["factor_observability_valid"][:, factor].bool()
+            if bool(valid_anchor.any()):
+                score = (
+                    predicted_anchor[:, factor] * target_anchor[:, factor]
+                ).sum(-1)
+                wrong_factor = mirror_partner.get(factor, (factor + 1) % 21)
+                wrong = (
+                    predicted_anchor[:, wrong_factor] * target_anchor[:, factor]
+                ).sum(-1)
+                anchor_score[factor].extend(score[valid_anchor].cpu().tolist())
+                wrong_score[factor].extend(wrong[valid_anchor].cpu().tolist())
+                source_count[factor] += int(valid_anchor.sum())
+            if bool(valid_state.any()):
+                state_probability[factor].extend(
+                    output["factor_state_prob"][valid_state, factor, 0]
+                    .cpu()
+                    .tolist()
+                )
+                state_target[factor].extend(
+                    (target["factor_state_target"][valid_state, factor] == 0)
+                    .float()
+                    .cpu()
+                    .tolist()
+                )
+            if bool(valid_obs.any()):
+                observability[factor].extend(
+                    output["factor_observability"][valid_obs, factor]
+                    .cpu()
+                    .tolist()
+                )
+                observability_target[factor].extend(
+                    target["factor_observability"][valid_obs, factor]
+                    .cpu()
+                    .tolist()
+                )
+    rows: list[dict[str, Any]] = []
+    for factor in range(21):
+        state_p = torch.tensor(state_probability[factor])
+        state_y = torch.tensor(state_target[factor])
+        obs_p = torch.tensor(observability[factor])
+        obs_y = torch.tensor(observability_target[factor])
+        rows.append(
+            {
+                "factor_id": factor,
+                "source_count": source_count[factor],
+                "anchor_overlap_mean": (
+                    sum(anchor_score[factor]) / len(anchor_score[factor])
+                    if anchor_score[factor]
+                    else None
+                ),
+                "same_type_wrong_overlap_mean": (
+                    sum(wrong_score[factor]) / len(wrong_score[factor])
+                    if wrong_score[factor]
+                    else None
+                ),
+                "same_type_margin": (
+                    (
+                        sum(anchor_score[factor]) / len(anchor_score[factor])
+                        - sum(wrong_score[factor]) / len(wrong_score[factor])
+                    )
+                    if anchor_score[factor] and wrong_score[factor]
+                    else None
+                ),
+                "state_auprc": (
+                    binary_average_precision(state_p, state_y)
+                    if state_p.numel()
+                    else None
+                ),
+                "state_frequency_baseline": (
+                    float(state_y.mean()) if state_y.numel() else None
+                ),
+                "state_auc": (
+                    binary_roc_auc(state_p, state_y) if state_p.numel() else None
+                ),
+                "observability_auc": (
+                    binary_roc_auc(obs_p, obs_y) if obs_p.numel() else None
+                ),
+            }
+        )
+    return {
+        "per_factor": rows,
+        "source_coverage": source_count,
+        "factors_with_anchor_source": sum(count > 0 for count in source_count),
+    }
+
+
 def _save_test_epoch(
     output_dir: Path,
     epoch: int,
@@ -476,6 +591,22 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
     )
     audit_loader = _loader(
         plain_train_dataset,
+        split["audit"],
+        batch_size=batch_size,
+        workers=workers,
+        shuffle=False,
+        config=config,
+    )
+    grounded_audit_dataset = METERDataset(
+        data_root=config["data"]["data_root"],
+        raw_root=config["data"]["raw_root"],
+        split="train",
+        transform=meter_image_transform(),
+        grounding_index=grounding_index,
+        include_grounding=True,
+    )
+    factor_audit_loader = _loader(
+        grounded_audit_dataset,
         split["audit"],
         batch_size=batch_size,
         workers=workers,
@@ -689,6 +820,17 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
             model, test_loader, device, progress=progress, sequential_modes=True
         )
         mechanism = mechanism_stats_from_collected(test)
+        mechanism["train_audit"] = _typed_factor_audit(
+            model, factor_audit_loader, device, progress
+        )
+        patch_audit = run_stratified_patch_audit(
+            model,
+            test_loader,
+            device,
+            progress=progress,
+            max_unique=min(128, len(test_indices)),
+        )
+        mechanism["patch_audit"] = patch_audit
         runtime = {
             "epoch": epoch,
             "train_rows": len(epoch_rows),

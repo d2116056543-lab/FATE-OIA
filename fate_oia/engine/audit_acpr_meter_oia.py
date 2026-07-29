@@ -30,6 +30,10 @@ REQUIRED_FILES = (
     "fate_oia/engine/train_acpr_meter_oia.py",
     "fate_oia/engine/eval_acpr_meter_oia.py",
     "fate_oia/engine/tesa_diagnostics.py",
+    "fate_oia/engine/evaluate_tesa_pilot.py",
+    "fate_oia/engine/profile_acpr_meter_oia.py",
+    "fate_oia/engine/supervise_acpr_meter_oia_foreground.py",
+    "fate_oia/engine/export_meter_cases.py",
     "configs/meter_factor_schema.yaml",
 )
 FORBIDDEN_FORMAL = (

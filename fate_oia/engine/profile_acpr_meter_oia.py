@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import time
 from pathlib import Path
@@ -27,6 +28,14 @@ def build_two_stage_profile_plan(
         "candidates": [list(item) for item in candidates],
         "selection": "fastest_stable_below_reserved_limit",
     }
+
+
+def cleanup_profile_trial(device: torch.device) -> None:
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device)
 
 
 def _profile_candidate(
@@ -75,7 +84,7 @@ def _profile_candidate(
         if device.type == "cuda"
         else 0.0
     )
-    return {
+    result = {
         "batch_size": batch_size,
         "gradient_accumulation_steps": grad_accum,
         "effective_batch": batch_size * grad_accum,
@@ -91,6 +100,9 @@ def _profile_candidate(
         and model.foundation.ordinary_dino_calls == 1
         and reserved < float(config["runtime"]["hard_reserved_gb"]),
     }
+    del model, images, action, reason, output, loss
+    cleanup_profile_trial(device)
+    return result
 
 
 def main() -> None:

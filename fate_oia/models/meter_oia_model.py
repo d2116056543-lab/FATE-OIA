@@ -87,6 +87,7 @@ class METEROIAModel(nn.Module):
             reliability = torch.zeros_like(reliability)
         if "state_off" in diagnostic_modes:
             uniform = factors["factor_state_valid_mask"].to(state_prob)
+            uniform = uniform.unsqueeze(0).expand(state_prob.shape[0], -1, -1)
             state_prob = uniform / uniform.sum(-1, keepdim=True)
             factor_token = self.typed_factors.compose_typed_token(
                 factors["factor_global_token"],
