@@ -37,10 +37,24 @@ def validate_training_readiness(
         raise RuntimeError("Implementation review pass does not match current git HEAD")
     if pilot.get("git_head") != head or pilot.get("pass") is not True:
         raise RuntimeError("TESA pilot pass does not match current git HEAD/pass=true")
-    gates = pilot.get("gates", {})
-    missing = [gate for gate in PILOT_GATES if gates.get(gate) is not True]
-    if missing:
-        raise RuntimeError(f"TESA pilot gates are incomplete: {missing}")
+    admission = pilot.get("two_epoch_admission")
+    if isinstance(admission, dict):
+        truth = admission.get("truth_table", {})
+        rules = admission.get("rules", {})
+        solution2_ok = (
+            admission.get("pass") is True
+            and truth.get("deterministic", {}).get("pass") is True
+            and truth.get("action", {}).get("pass") is True
+            and int(admission.get("mechanism_pass_count", 0))
+            >= int(rules.get("min_mechanism_classes", 2))
+        )
+        if not solution2_ok:
+            raise RuntimeError("TESA solution-2 admission truth table is incomplete")
+    else:
+        gates = pilot.get("gates", {})
+        missing = [gate for gate in PILOT_GATES if gates.get(gate) is not True]
+        if missing:
+            raise RuntimeError(f"TESA pilot gates are incomplete: {missing}")
     return {"git_head": head, "review": review, "pilot": pilot}
 
 

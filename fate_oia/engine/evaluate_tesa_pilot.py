@@ -19,8 +19,10 @@ from fate_oia.utils.tesa_contracts import (
 
 
 DEFAULT_SCHEMA_PATH = Path("configs/meter_factor_schema.yaml")
-EVALUATION_ONLY_PATHS = {
+PILOT_REUSE_SAFE_PATHS = {
     "fate_oia/engine/evaluate_tesa_pilot.py",
+    "fate_oia/engine/supervise_acpr_meter_oia_foreground.py",
+    "tests/test_meter_supervisor.py",
     "tests/test_tesa_protocol_artifact_contract.py",
 }
 MIN_ACTION_DELTA_AUC = 0.55
@@ -58,7 +60,7 @@ def _evaluation_only_git_delta(base_head: str, current_head: str) -> bool:
     except (OSError, subprocess.CalledProcessError):
         return False
     normalized = {path.strip().replace("\\", "/") for path in changed if path.strip()}
-    return bool(normalized) and normalized <= EVALUATION_ONLY_PATHS
+    return bool(normalized) and normalized <= PILOT_REUSE_SAFE_PATHS
 
 
 def _implementation_audit_binding_ok(
