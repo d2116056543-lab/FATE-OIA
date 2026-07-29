@@ -266,7 +266,7 @@ def _compute_losses(
         action["total"]
         + reason["total"]
         + grounding_total
-        + dense_weight * mechanism_ramp * dense["total"]
+        + dense_weight * mechanism_ramp * dense["necessity"]
         + pu
     )
     return total, {
@@ -675,6 +675,8 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
         "git_head": _git_head(),
         "command_line": sys.argv,
         "seed": seed,
+        "use_mock_dino": bool(args.use_mock_dino),
+        "pretrained_weights": config["backbone"]["pretrained_weights"],
         "direct_image": True,
         "one_dino_call_per_ordinary_batch": True,
         "feature_cache_enabled": False,
@@ -703,6 +705,14 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
         "raw_exp_map": -1.0,
         "deploy_exp_mf1": -1.0,
     }
+    cumulative_patch_ids: set[str] = set()
+    cumulative_path = output_dir / "patch_audit_cumulative.json"
+    if cumulative_path.exists():
+        cumulative_patch_ids.update(
+            json.loads(cumulative_path.read_text(encoding="utf-8")).get(
+                "sample_ids", []
+            )
+        )
     precision = str(config["training"].get("precision", "bf16")).lower()
     autocast = (
         lambda: torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -811,6 +821,34 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
             data_start = time.perf_counter()
             del output, field, total, scaled
         progress = min(1.0, optimizer_step / max(total_updates, 1))
+        pre_eval_runtime = {
+            "epoch": epoch,
+            "train_rows": len(epoch_rows),
+            "mean_data_time": sum(row["data_time"] for row in epoch_rows)
+            / max(len(epoch_rows), 1),
+            "mean_dino_time": sum(row["dino_time"] for row in epoch_rows)
+            / max(len(epoch_rows), 1),
+            "peak_reserved_gb": max(
+                (row["reserved_gb"] for row in epoch_rows), default=0.0
+            ),
+            "evaluation_complete": False,
+        }
+        save_checkpoint(
+            output_dir / "checkpoint_pre_eval.pth",
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            epoch=epoch,
+            micro_step=len(train_loader),
+            optimizer_step=optimizer_step,
+            runtime_profile=pre_eval_runtime,
+            meta_state={"training_enabled": False, "audit_only": True},
+            pu_state=pu_state,
+            calibration=_calibration_payload(calibration),
+            config_hash=config_hash,
+            source_hash=source_hash,
+            schema_hash=schema_hash,
+        )
         pu_state = _update_pu(model, audit_loader, device, progress, config)
         calibration_data = _collect_calibration(
             model, calib_loader, device, progress
@@ -829,6 +867,15 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
             device,
             progress=progress,
             max_unique=min(128, len(test_indices)),
+            previous_sample_ids=cumulative_patch_ids,
+        )
+        cumulative_patch_ids.update(patch_audit.get("sample_ids", []))
+        write_json(
+            cumulative_path,
+            {
+                "sample_ids": sorted(cumulative_patch_ids),
+                "cumulative_unique_count": len(cumulative_patch_ids),
+            },
         )
         mechanism["patch_audit"] = patch_audit
         runtime = {

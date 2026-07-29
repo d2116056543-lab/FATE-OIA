@@ -24,6 +24,7 @@ class METEROIAModel(nn.Module):
         pretrained_weights: str = "ckp/reference/dino_deitsmall8_pretrain.pth",
         use_mock_dino: bool = False,
         factor_rank: int = 16,
+        schema_path: str | None = None,
         **_: Any,
     ) -> None:
         super().__init__()
@@ -36,7 +37,10 @@ class METEROIAModel(nn.Module):
             use_mock_dino=use_mock_dino,
         )
         self.typed_factors = TypedEvidenceStateHead(
-            dim=dim, factor_dim=reason_dim, num_layers=len(selected_layers)
+            dim=dim,
+            factor_dim=reason_dim,
+            num_layers=len(selected_layers),
+            schema_path=schema_path,
         )
         self.action_transport = FactorSpecificActionTransport(
             dim=dim,
@@ -166,3 +170,22 @@ class METEROIAModel(nn.Module):
             progress=progress,
             diagnostic_modes=diagnostic_modes,
         )
+
+    def forward_mirror_pair(
+        self,
+        images: Tensor,
+        *,
+        progress: float = 1.0,
+    ) -> dict[str, Any]:
+        """Run original and horizontal-mirror images as one paired audit."""
+        from fate_oia.losses.meter_grounding_losses import mirror_equivariance_loss
+
+        original = self.forward(images, progress=progress)
+        mirrored = self.forward(torch.flip(images, dims=[-1]), progress=progress)
+        loss, report = mirror_equivariance_loss(original, mirrored)
+        return {
+            "original": original,
+            "mirrored": mirrored,
+            "mirror_equivariance_loss": loss,
+            "mirror_equivariance": report,
+        }

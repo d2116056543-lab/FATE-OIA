@@ -63,12 +63,17 @@ def mechanism_ramps(optimizer_step: int, total_updates: int) -> tuple[float, flo
 @dataclass
 class StratifiedPatchAudit:
     max_unique: int = 128
+    previous_ids: set[str] = field(default_factory=set)
     records: list[dict[str, Any]] = field(default_factory=list)
     _unique: set[str] = field(default_factory=set)
 
     @property
     def unique_count(self) -> int:
         return len(self._unique)
+
+    @property
+    def cumulative_unique_count(self) -> int:
+        return len(self.previous_ids | self._unique)
 
     def add(
         self, sample_id: str, *, action_ids: list[int], factor_ids: list[int]
@@ -125,9 +130,13 @@ def run_stratified_patch_audit(
     progress: float,
     max_unique: int = 128,
     patches_per_factor: int = 12,
+    factors_per_action: int = 2,
+    previous_sample_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     """Audit every eligible target for unique samples without re-running DINO."""
-    queue = StratifiedPatchAudit(max_unique=max_unique)
+    queue = StratifiedPatchAudit(
+        max_unique=max_unique, previous_ids=set(previous_sample_ids or ())
+    )
     records: list[dict[str, Any]] = []
     action_coverage: set[int] = set()
     factor_coverage: set[int] = set()
@@ -145,16 +154,15 @@ def run_stratified_patch_audit(
                 continue
             contributions = clean["action_factor_contributions"][sample]
             allowed = clean["factor_action_ownership"].to(contributions) > 0
+            factors_by_action = {
+                int(action): torch.topk(
+                    contributions[action].abs().masked_fill(~allowed, -1),
+                    k=min(int(factors_per_action), int(allowed.sum())),
+                ).indices.tolist()
+                for action in positive_actions
+            }
             factors = sorted(
-                {
-                    int(
-                        contributions[action]
-                        .abs()
-                        .masked_fill(~allowed, -1)
-                        .argmax()
-                    )
-                    for action in positive_actions
-                }
+                {int(factor) for values in factors_by_action.values() for factor in values}
             )
             queue.add(
                 str(sample_id),
@@ -162,8 +170,11 @@ def run_stratified_patch_audit(
                 factor_ids=factors,
             )
             for action in positive_actions:
-                sign = 1.0
-                for factor in factors:
+                for factor in factors_by_action[int(action)]:
+                    contribution = contributions[action, factor]
+                    sign = float(torch.sign(contribution).item())
+                    if sign == 0.0:
+                        continue
                     anchor = clean["factor_anchor_map"][sample, factor]
                     count = min(int(patches_per_factor), anchor.numel() // 2)
                     selected = torch.topk(anchor, k=count).indices
@@ -213,11 +224,15 @@ def run_stratified_patch_audit(
     return {
         "available": bool(records),
         "unique_sample_count": queue.unique_count,
-        "cumulative_unique_count": queue.unique_count,
+        "cumulative_unique_count": queue.cumulative_unique_count,
+        "sample_ids": sorted(queue.previous_ids | queue._unique),
         "action_coverage": sorted(action_coverage),
         "factor_coverage": sorted(factor_coverage),
         "selected_effect_mean": sum(selected) / max(len(selected), 1),
         "control_effect_mean": sum(control) / max(len(control), 1),
         "selected_minus_control_mean": sum(gaps) / max(len(gaps), 1),
+        "selected_positive_rate": (
+            sum(value > 0 for value in selected) / max(len(selected), 1)
+        ),
         "records": records,
     }

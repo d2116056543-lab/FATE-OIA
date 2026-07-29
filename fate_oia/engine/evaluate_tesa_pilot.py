@@ -13,6 +13,26 @@ from fate_oia.utils.meter_artifacts import validate_epoch_artifacts, write_json
 GROUNDABLE = tuple(index for index in range(21) if index not in (14, 20))
 
 
+def validate_pilot_protocol(
+    manifest: dict[str, Any],
+    expected: dict[str, Any],
+    *,
+    completed_epochs: int,
+) -> list[str]:
+    failures: list[str] = []
+    if bool(manifest.get("use_mock_dino", True)):
+        failures.append("mock_dino")
+    if int(manifest.get("seed", -1)) != int(expected["seed"]):
+        failures.append("seed")
+    counts = manifest.get("runtime_subset_counts", {})
+    for name in ("train_main", "train_audit", "train_calib", "test"):
+        if int(counts.get(name, -1)) != int(expected[name]):
+            failures.append(name)
+    if int(completed_epochs) != int(expected["epochs"]):
+        failures.append("epochs")
+    return failures
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -43,6 +63,10 @@ def evaluate_pilot(
     typed = _read_json(latest / "typed_evidence.json")
     pu = _read_json(latest / "pu_stats.json")
     runtime = _read_json(latest / "runtime.json")
+    manifest = _read_json(root / "run_manifest.json")
+    protocol_failures = validate_pilot_protocol(
+        manifest, manifest["config"]["pilot"], completed_epochs=len(epochs)
+    )
     audit = _read_json(Path(implementation_audit))
     losses = _read_jsonl(root / "loss_components.jsonl")
     visual = branches["action_visual"]
@@ -84,16 +108,22 @@ def evaluate_pilot(
             bool(factor_rows)
             and min(null) > 0.0
             and max(null) < 1.0
+            and len(valid_states) >= 12
             and all(
                 float(row["state_auprc"])
                 > float(row["state_frequency_baseline"])
                 for row in valid_states
             )
-            and any(
+            and sum(
                 _finite(row.get("same_type_margin"))
                 and float(row["same_type_margin"]) > 0
                 for row in factor_rows
-            )
+            ) >= 12
+            and sum(
+                _finite(row.get("mirror_equivariance"))
+                and float(row["mirror_equivariance"]) > 0
+                for row in factor_rows
+            ) >= 8
         ),
         "C": (
             float(final["Act_mAP"]) >= float(visual["Act_mAP"]) + 0.005
@@ -125,11 +155,15 @@ def evaluate_pilot(
             >= min(128, len(_read_json(latest / "file_names_test.json")["file_names"]))
             and len(patch.get("action_coverage", [])) == 4
             and len(patch.get("factor_coverage", [])) >= 12
+            and float(patch.get("selected_positive_rate", 0.0)) > 0.5
             and float(patch.get("selected_minus_control_mean", -1.0)) > 0
         ),
         "G": bool(audit["dynamic_checks"].get("pu_zero_exact"))
+        and bool(pu.get("active_labels"))
         and all(0.0 <= float(value) <= 0.15 for value in pu.get("lambda", [])),
         "H": (
+            not protocol_failures
+            and
             not validate_epoch_artifacts(latest)
             and all(int(row.get("dino_call_count", 0)) == 1 for row in recent)
             and float(runtime.get("peak_reserved_gb", 99.0)) < 45.0
@@ -159,6 +193,7 @@ def evaluate_pilot(
             "runtime": runtime,
         },
         "artifact_missing": validate_epoch_artifacts(latest),
+        "protocol_failures": protocol_failures,
     }
     return result
 

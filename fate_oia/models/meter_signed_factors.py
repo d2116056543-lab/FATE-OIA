@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from .acpr_sparse_ops import entmax15_bisect
+from .meter_schema import METERFactorSchema, default_meter_factor_schema
 
 
 DEFAULT_STATE_CARDINALITIES = (3,) * 21
@@ -29,8 +30,18 @@ class TypedEvidenceStateHead(nn.Module):
         factor_dim: int = 21,
         num_layers: int = 3,
         state_cardinalities: tuple[int, ...] = DEFAULT_STATE_CARDINALITIES,
+        schema_path: str | None = None,
     ) -> None:
         super().__init__()
+        schema = METERFactorSchema(schema_path) if schema_path else default_meter_factor_schema()
+        if len(schema.rows) != factor_dim:
+            raise ValueError("METER schema factor count does not match factor_dim")
+        if schema_path is None and state_cardinalities != DEFAULT_STATE_CARDINALITIES:
+            # Preserve the legacy unit-test override; production construction
+            # always uses the YAML schema as the source of truth.
+            state_cardinalities = tuple(state_cardinalities)
+        else:
+            state_cardinalities = schema.state_cardinalities
         if len(state_cardinalities) != factor_dim:
             raise ValueError("One state cardinality is required per factor")
         self.dim = int(dim)
@@ -44,12 +55,12 @@ class TypedEvidenceStateHead(nn.Module):
         )
         self.register_buffer(
             "action_ownership",
-            torch.tensor(DEFAULT_ACTION_OWNERSHIP, dtype=torch.float32),
+            torch.tensor(schema.action_ownership, dtype=torch.float32),
             persistent=True,
         )
         self.register_buffer(
             "groundable_mask",
-            torch.tensor(DEFAULT_GROUNDABLE, dtype=torch.float32),
+            torch.tensor(schema.groundable_mask, dtype=torch.float32),
             persistent=True,
         )
         self.anchor_query = nn.Linear(dim, dim)
@@ -69,6 +80,7 @@ class TypedEvidenceStateHead(nn.Module):
         self.obs_head = nn.Parameter(torch.randn(factor_dim, dim * 2 + 2) * 0.02)
         self.obs_bias = nn.Parameter(torch.zeros(factor_dim))
         self.typed_norm = nn.LayerNorm(dim)
+        self.schema_sha256 = schema.sha256
 
     @staticmethod
     def _ramp(progress: float) -> float:

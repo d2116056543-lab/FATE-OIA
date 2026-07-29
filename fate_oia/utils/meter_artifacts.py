@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import random
 from pathlib import Path
 from typing import Any, Mapping
@@ -120,7 +121,12 @@ def save_checkpoint(
     }
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(payload, target)
+    temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    try:
+        torch.save(payload, temporary)
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def load_checkpoint(
@@ -199,4 +205,50 @@ def validate_epoch_artifacts(directory: str | Path) -> list[str]:
         "logits_action_visual_test.pt", "logits_reason_global_test.pt",
         "labels_action_test.pt", "labels_reason_test.pt",
     ]
-    return [name for name in required if not (root / name).exists()]
+    failures = [name for name in required if not (root / name).exists()]
+    if failures:
+        return failures
+    try:
+        file_names = json.loads(
+            (root / "file_names_test.json").read_text(encoding="utf-8")
+        )["file_names"]
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        failures.append("file_names_test.json:schema")
+        return failures
+    expected_rows = len(file_names)
+    tensor_shapes = {
+        "logits_action_final_raw_test.pt": (expected_rows, 4),
+        "logits_reason_final_raw_test.pt": (expected_rows, 21),
+        "logits_action_visual_test.pt": (expected_rows, 4),
+        "logits_reason_global_test.pt": (expected_rows, 21),
+        "labels_action_test.pt": (expected_rows, 4),
+        "labels_reason_test.pt": (expected_rows, 21),
+    }
+    for name, expected_shape in tensor_shapes.items():
+        try:
+            value = torch.load(root / name, map_location="cpu", weights_only=False)
+        except Exception:
+            failures.append(f"{name}:unreadable")
+            continue
+        if not isinstance(value, torch.Tensor) or tuple(value.shape) != expected_shape:
+            failures.append(f"{name}:shape")
+            continue
+        if not bool(torch.isfinite(value).all()):
+            failures.append(f"{name}:non_finite")
+    for name in (
+        "metrics_raw.json",
+        "metrics_deploy.json",
+        "branch_metrics.json",
+        "typed_evidence.json",
+        "pu_stats.json",
+        "calibration.json",
+        "runtime.json",
+    ):
+        try:
+            payload = json.loads((root / name).read_text(encoding="utf-8"))
+        except (ValueError, json.JSONDecodeError):
+            failures.append(f"{name}:invalid_json")
+            continue
+        if not isinstance(payload, dict):
+            failures.append(f"{name}:schema")
+    return failures

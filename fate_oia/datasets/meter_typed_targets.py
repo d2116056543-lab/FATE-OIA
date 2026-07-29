@@ -5,7 +5,10 @@ from typing import Any
 
 import torch
 import yaml
+from PIL import Image, ImageDraw
 from torch import Tensor
+
+from fate_oia.grounding.mask_builder import drivable_map_to_mask
 
 
 def _box(obj: dict[str, Any]) -> tuple[float, float, float, float] | None:
@@ -36,32 +39,110 @@ def _attribute(obj: dict[str, Any], *names: str) -> str:
 def _box_mask(
     boxes: list[tuple[float, float, float, float]],
     *,
-    grid_hw: tuple[int, int] = (45, 80),
-    image_hw: tuple[int, int] = (720, 1280),
+    grid_hw: tuple[int, int],
+    image_size: tuple[int, int],
 ) -> Tensor:
     height, width = grid_hw
+    image_width, image_height = image_size
     mask = torch.zeros(height, width, dtype=torch.float32)
     for x1, y1, x2, y2 in boxes:
-        gx1 = max(0, min(width - 1, int(x1 / image_hw[1] * width)))
-        gx2 = max(gx1 + 1, min(width, int((x2 + 1) / image_hw[1] * width)))
-        gy1 = max(0, min(height - 1, int(y1 / image_hw[0] * height)))
-        gy2 = max(gy1 + 1, min(height, int((y2 + 1) / image_hw[0] * height)))
+        gx1 = max(0, min(width - 1, int(x1 / max(image_width, 1) * width)))
+        gx2 = max(gx1 + 1, min(width, int((x2 + 1) / max(image_width, 1) * width)))
+        gy1 = max(0, min(height - 1, int(y1 / max(image_height, 1) * height)))
+        gy2 = max(gy1 + 1, min(height, int((y2 + 1) / max(image_height, 1) * height)))
         mask[gy1:gy2, gx1:gx2] = 1.0
     return mask
+
+
+def _points(value: Any) -> list[tuple[float, float]]:
+    if isinstance(value, dict):
+        value = value.get("vertices") or value.get("points") or value.get("verts")
+    if isinstance(value, list) and len(value) == 1 and isinstance(value[0], list):
+        value = value[0]
+    if not isinstance(value, list):
+        return []
+    points: list[tuple[float, float]] = []
+    for item in value:
+        if isinstance(item, dict) and "x" in item and "y" in item:
+            points.append((float(item["x"]), float(item["y"])))
+        elif isinstance(item, dict):
+            points.extend(_points(item.get("vertices") or item.get("points") or item.get("verts")))
+        elif isinstance(item, (list, tuple)) and len(item) >= 2:
+            points.append((float(item[0]), float(item[1])))
+    return points
+
+
+def _polyline_mask(
+    polylines: list[Any],
+    *,
+    image_size: tuple[int, int],
+    grid_hw: tuple[int, int],
+) -> Tensor:
+    image_width, image_height = image_size
+    out_height, out_width = grid_hw
+    image = Image.new("L", (out_width, out_height), 0)
+    draw = ImageDraw.Draw(image)
+    for raw in polylines:
+        if isinstance(raw, dict):
+            raw = raw.get("poly2d") or raw.get("polyline") or raw.get("vertices") or raw.get("points")
+        points = _points(raw)
+        if len(points) < 2:
+            continue
+        scaled = [
+            (
+                max(0, min(out_width - 1, int(round(x / max(image_width, 1) * (out_width - 1))))),
+                max(0, min(out_height - 1, int(round(y / max(image_height, 1) * (out_height - 1))))),
+            )
+            for x, y in points
+        ]
+        draw.line(scaled, fill=1, width=max(1, round(max(out_height, out_width) / 160)))
+    return torch.frombuffer(bytearray(image.tobytes()), dtype=torch.uint8).clone().view(out_height, out_width).float()
+
+
+def _normalise_mask(mask: Tensor) -> Tensor:
+    total = mask.sum()
+    return mask / total.clamp_min(1.0) if bool(total > 0) else mask
 
 
 class METERTypedTargetBuilder:
     """Conservative typed weak targets; unknown never becomes a negative."""
 
-    def __init__(self, schema_path: str | Path) -> None:
-        raw = yaml.safe_load(Path(schema_path).read_text(encoding="utf-8"))
+    def __init__(
+        self,
+        schema_path: str | Path,
+        *,
+        grid_hw: tuple[int, int] = (45, 80),
+        image_size: tuple[int, int] = (1280, 720),
+    ) -> None:
+        raw = yaml.safe_load(Path(schema_path).read_text(encoding="utf-8")) or {}
         self.factors = list(raw["factors"])
         if [int(row["id"]) for row in self.factors] != list(range(21)):
             raise ValueError("TESA schema must contain ordered factor IDs 0..20")
+        self.grid_hw = tuple(int(value) for value in grid_hw)
+        self.image_size = tuple(int(value) for value in image_size)
+
+    def _geometry_masks(self, record: dict[str, Any]) -> dict[str, Tensor]:
+        image_size_raw = record.get("image_size", self.image_size)
+        image_size = (int(image_size_raw[0]), int(image_size_raw[1]))
+        polylines = list(record.get("lanes", [])) + list(record.get("polylines", []))
+        lane = _polyline_mask(polylines, image_size=image_size, grid_hw=self.grid_hw)
+        drivable = torch.zeros(self.grid_hw, dtype=torch.float32)
+        if record.get("drivable_map_path"):
+            try:
+                drivable = drivable_map_to_mask(str(record["drivable_map_path"]), self.grid_hw)
+            except (OSError, ValueError):
+                drivable = torch.zeros(self.grid_hw, dtype=torch.float32)
+        columns = torch.arange(self.grid_hw[1]).view(1, -1).expand(*self.grid_hw)
+        left = columns < self.grid_hw[1] / 2.0
+        return {
+            "lane_left": lane * left,
+            "lane_right": lane * (~left),
+            "drivable": drivable,
+        }
 
     def build(self, record: dict[str, Any]) -> dict[str, Tensor]:
         factor_count = len(self.factors)
-        anchor = torch.zeros(factor_count, 45, 80)
+        anchor = torch.zeros(factor_count, *self.grid_hw)
         anchor_valid = torch.zeros(factor_count, dtype=torch.bool)
         state_target = torch.full((factor_count,), -1, dtype=torch.long)
         state_valid = torch.zeros(factor_count, dtype=torch.bool)
@@ -70,32 +151,23 @@ class METERTypedTargetBuilder:
         source_weight = torch.zeros(factor_count)
 
         objects = list(record.get("objects", []))
+        image_size_raw = record.get("image_size", self.image_size)
+        image_size = (int(image_size_raw[0]), int(image_size_raw[1]))
         groups: dict[str, list[tuple[float, float, float, float]]] = {}
-        grouped_objects: dict[str, list[dict[str, Any]]] = {}
         for obj in objects:
             box = _box(obj)
             if box is not None:
-                category = _category(obj)
-                groups.setdefault(category, []).append(box)
-                grouped_objects.setdefault(category, []).append(obj)
+                groups.setdefault(_category(obj), []).append(box)
 
         category_rules = {
-            0: ("traffic light",),
-            3: ("traffic light",),
-            4: ("traffic sign",),
+            0: ("traffic light",), 3: ("traffic light",), 4: ("traffic sign",),
             5: ("car", "bus", "truck", "vehicle"),
-            6: ("person", "pedestrian"),
-            7: ("rider", "cyclist", "bike", "motor"),
+            6: ("person", "pedestrian"), 7: ("rider", "cyclist", "bike", "motor"),
             8: ("obstacle", "other"),
         }
         for factor_id, categories in category_rules.items():
-            boxes = [
-                box
-                for category, values in groups.items()
-                if any(name in category for name in categories)
-                for box in values
-            ]
-            mask = _box_mask(boxes)
+            boxes = [box for category, values in groups.items() if any(name in category for name in categories) for box in values]
+            mask = _box_mask(boxes, grid_hw=self.grid_hw, image_size=image_size)
             if bool(mask.any()):
                 anchor[factor_id] = mask
                 anchor_valid[factor_id] = True
@@ -103,100 +175,53 @@ class METERTypedTargetBuilder:
                 observability_valid[factor_id] = True
                 source_weight[factor_id] = 1.0
                 if factor_id != 0:
-                    state_target[factor_id] = 0  # present
+                    state_target[factor_id] = 0
                     state_valid[factor_id] = True
             elif bool(record.get("source_complete", False)) and factor_id != 0:
-                # Absence is valid only for complete object sources.
                 state_target[factor_id] = 1
                 state_valid[factor_id] = True
                 observability[factor_id] = 1.0
                 observability_valid[factor_id] = True
                 source_weight[factor_id] = 0.8
 
-        lights = [
-            obj
-            for category, values in grouped_objects.items()
-            if "traffic light" in category
-            for obj in values
-        ]
-        light_colors = {
-            _attribute(obj, "trafficLightColor", "traffic_light_color", "color")
-            for obj in lights
-        }
-        light_colors.discard("")
+        lights = [obj for obj in objects if "traffic light" in _category(obj)]
+        colors = {_attribute(obj, "trafficLightColor", "traffic_light_color", "color") for obj in lights}
+        colors.discard("")
         if lights:
-            if "green" in light_colors:
-                state_target[0] = 0
-                state_valid[0] = True
-            elif light_colors & {"red", "yellow", "redyellow", "red_yellow"}:
-                state_target[0] = 1
-                state_valid[0] = True
+            if "green" in colors:
+                state_target[0], state_valid[0] = 0, True
+            elif colors & {"red", "yellow", "redyellow", "red_yellow"}:
+                state_target[0], state_valid[0] = 1, True
             source_weight[0] = 1.0 if state_valid[0] else 0.5
 
-        vehicle_boxes = [
-            box
-            for category, values in groups.items()
-            if any(name in category for name in ("car", "bus", "truck", "vehicle"))
-            for box in values
-        ]
+        vehicle_boxes = [box for category, values in groups.items() if any(name in category for name in ("car", "bus", "truck", "vehicle")) for box in values]
         if vehicle_boxes:
-            anchor[1] = _box_mask(vehicle_boxes)
-            anchor_valid[1] = True
-            observability[1] = 1.0
-            observability_valid[1] = True
-            source_weight[1] = 0.5
+            mask = _box_mask(vehicle_boxes, grid_hw=self.grid_hw, image_size=image_size)
+            anchor[1], anchor_valid[1] = mask, bool(mask.any())
+            observability[1], observability_valid[1], source_weight[1] = 1.0, bool(mask.any()), 0.5
 
-        # Corridor/boundary factors receive conservative region anchors only
-        # when lane/drivable metadata exists; semantic state remains unknown
-        # unless an explicit style/availability annotation is present.
-        has_lane = bool(record.get("lanes") or record.get("polylines"))
-        has_drivable = bool(record.get("drivable_map_path"))
-        if has_lane or has_drivable:
-            rows = torch.arange(45).view(-1, 1).expand(45, 80)
-            cols = torch.arange(80).view(1, -1).expand(45, 80)
-            regions = {
-                "left": ((cols < 40) & (rows >= 16)).float(),
-                "right": ((cols >= 40) & (rows >= 16)).float(),
-                "center": ((cols >= 24) & (cols < 56) & (rows >= 16)).float(),
-            }
-            for factor_id in (9, 10, 11, 12):
-                anchor[factor_id] = regions["left"]
-                anchor_valid[factor_id] = True
-                observability[factor_id] = 1.0
-                observability_valid[factor_id] = True
-                source_weight[factor_id] = 0.5
-            for factor_id in (15, 16, 17, 18):
-                anchor[factor_id] = regions["right"]
-                anchor_valid[factor_id] = True
-                observability[factor_id] = 1.0
-                observability_valid[factor_id] = True
-                source_weight[factor_id] = 0.5
-            anchor[2] = regions["center"]
-            anchor_valid[2] = True
-            observability[2] = 1.0
-            observability_valid[2] = True
-            source_weight[2] = 0.5
-            if vehicle_boxes:
-                left_boxes = [
-                    box for box in vehicle_boxes if (box[0] + box[2]) * 0.5 < 640
-                ]
-                right_boxes = [
-                    box for box in vehicle_boxes if (box[0] + box[2]) * 0.5 >= 640
-                ]
-                for factor_id, boxes in ((10, left_boxes), (16, right_boxes)):
-                    state_target[factor_id] = 0 if boxes else 1
-                    state_valid[factor_id] = bool(record.get("source_complete", False))
-                    source_weight[factor_id] = 0.8
+        geometry = self._geometry_masks(record)
+        if bool(geometry["drivable"].any()):
+            anchor[2], anchor_valid[2] = geometry["drivable"], True
+            observability[2], observability_valid[2], source_weight[2] = 1.0, True, 0.8
+        for factor_id, side in ((9, "lane_left"), (11, "lane_left"), (12, "lane_left"), (15, "lane_right"), (17, "lane_right"), (18, "lane_right")):
+            if bool(geometry[side].any()):
+                anchor[factor_id], anchor_valid[factor_id] = geometry[side], True
+                observability[factor_id], observability_valid[factor_id], source_weight[factor_id] = 1.0, True, 0.8
+        for factor_id, boxes, threshold in (
+            (10, [box for box in vehicle_boxes if (box[0] + box[2]) * 0.5 < image_size[0] / 2.0], 0.5),
+            (16, [box for box in vehicle_boxes if (box[0] + box[2]) * 0.5 >= image_size[0] / 2.0], 0.5),
+        ):
+            mask = _box_mask(boxes, grid_hw=self.grid_hw, image_size=image_size)
+            if bool(mask.any()):
+                anchor[factor_id], anchor_valid[factor_id] = mask, True
+                observability[factor_id], observability_valid[factor_id], source_weight[factor_id] = 1.0, True, 1.0
+                state_target[factor_id], state_valid[factor_id] = 0, bool(record.get("source_complete", False))
 
-        # Normalize valid anchors; invalid rows remain zero and are masked.
         flat = anchor.flatten(1)
-        flat = torch.where(
-            anchor_valid.unsqueeze(-1),
-            flat / flat.sum(-1, keepdim=True).clamp_min(1.0),
-            flat,
-        )
+        flat = torch.where(anchor_valid.unsqueeze(-1), flat / flat.sum(-1, keepdim=True).clamp_min(1.0), flat)
         return {
-            "factor_anchor_map": flat.view(factor_count, 45, 80),
+            "factor_anchor_map": flat.view(factor_count, *self.grid_hw),
             "factor_anchor_valid": anchor_valid,
             "factor_state_target": state_target,
             "factor_state_valid": state_valid,

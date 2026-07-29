@@ -71,7 +71,7 @@ class FactorSpecificActionTransport(nn.Module):
         low = torch.einsum("brd,rkd->brk", factor_typed_token, self.factor_down)
         projected = torch.einsum("brk,rdk->brd", low, self.factor_up)
         factor_value = torch.einsum("bad,brd->bar", query, projected)
-        contributions = (
+        raw_contributions = (
             owner
             * factor_reliability.unsqueeze(1)
             * factor_weight
@@ -90,11 +90,15 @@ class FactorSpecificActionTransport(nn.Module):
         kappa = (0.20 * self.running_visual_rms).clamp_min(1e-4).to(
             action_logits_visual.dtype
         )
-        raw_sum = contributions.sum(-1)
-        evidence_delta = kappa.view(1, -1) * torch.tanh(
-            raw_sum / kappa.view(1, -1)
+        active_factor_count = allowed.sum(-1).clamp_min(1).to(score.dtype)
+        per_factor_kappa = (
+            kappa.view(1, -1, 1) / active_factor_count.view(1, 1, -1)
         )
-        final = action_logits_visual + ramp * evidence_delta
+        contributions = ramp * per_factor_kappa * torch.tanh(
+            raw_contributions / per_factor_kappa.clamp_min(1e-6)
+        )
+        evidence_delta = contributions.sum(-1)
+        final = action_logits_visual + evidence_delta
         return {
             "action_logits_visual": action_logits_visual,
             "action_evidence_delta": evidence_delta,
@@ -103,6 +107,7 @@ class FactorSpecificActionTransport(nn.Module):
             "action_null_factor_weight": null_weight,
             "action_factor_values": factor_value,
             "action_factor_contributions": contributions,
+            "action_factor_raw_contributions": raw_contributions,
             "action_correction_kappa": kappa,
             "action_correction_rms_ratio": evidence_delta.detach().float().square().mean(0).sqrt()
             / action_logits_visual.detach().float().square().mean(0).sqrt().clamp_min(1e-6),

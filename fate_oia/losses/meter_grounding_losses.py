@@ -6,6 +6,59 @@ from torch import Tensor
 
 
 DEFAULT_MIRROR_PAIRS = ((9, 15), (10, 16), (11, 17), (12, 18), (13, 19))
+DEFAULT_ACTION_MIRROR_PAIRS = ((2, 3),)
+
+
+def _swap_factor_rows(value: Tensor, pairs: tuple[tuple[int, int], ...]) -> Tensor:
+    result = value.clone()
+    for left, right in pairs:
+        result[:, left], result[:, right] = value[:, right].clone(), value[:, left].clone()
+    return result
+
+
+def mirror_equivariance_loss(
+    original: dict[str, Tensor],
+    mirrored: dict[str, Tensor],
+    *,
+    factor_pairs: tuple[tuple[int, int], ...] = DEFAULT_MIRROR_PAIRS,
+    action_pairs: tuple[tuple[int, int], ...] = DEFAULT_ACTION_MIRROR_PAIRS,
+) -> tuple[Tensor, dict[str, float | bool]]:
+    """Compare paired original/mirror forwards, never same-image left/right states."""
+    indices = sorted({index for pair in factor_pairs for index in pair})
+    mirrored_anchor = torch.flip(
+        _swap_factor_rows(mirrored["factor_anchor_map"], factor_pairs), dims=[-1]
+    )
+    mirrored_state = _swap_factor_rows(mirrored["factor_state_prob"], factor_pairs)
+    mirrored_action = mirrored["action_logits_final"].clone()
+    for left, right in action_pairs:
+        mirrored_action[:, left], mirrored_action[:, right] = (
+            mirrored["action_logits_final"][:, right].clone(),
+            mirrored["action_logits_final"][:, left].clone(),
+        )
+    mirrored_reason = _swap_factor_rows(
+        mirrored["reason_logits_final"].unsqueeze(-1), factor_pairs
+    ).squeeze(-1)
+    anchor_l1 = (
+        original["factor_anchor_map"][:, indices]
+        - mirrored_anchor[:, indices]
+    ).abs().mean()
+    state_l1 = (
+        original["factor_state_prob"][:, indices]
+        - mirrored_state[:, indices]
+    ).abs().mean()
+    action_l1 = (original["action_logits_final"] - mirrored_action).abs().mean()
+    reason_l1 = (
+        original["reason_logits_final"][:, indices]
+        - mirrored_reason[:, indices]
+    ).abs().mean()
+    loss = anchor_l1 + state_l1 + action_l1 + reason_l1
+    return loss, {
+        "paired_forward": True,
+        "anchor_l1": float(anchor_l1.detach()),
+        "state_l1": float(state_l1.detach()),
+        "action_l1": float(action_l1.detach()),
+        "reason_l1": float(reason_l1.detach()),
+    }
 
 
 def _weighted_mean(value: Tensor, weight: Tensor) -> Tensor:
@@ -63,6 +116,7 @@ def discrimination_and_mirror_loss(
     output: dict[str, Tensor],
     targets: dict[str, Tensor],
     mirror_pairs: tuple[tuple[int, int], ...] = DEFAULT_MIRROR_PAIRS,
+    mirrored_output: dict[str, Tensor] | None = None,
 ) -> tuple[Tensor, Tensor]:
     token = output["factor_typed_token"]
     state = output["factor_state_prob"]
@@ -104,23 +158,11 @@ def discrimination_and_mirror_loss(
         if same_type_terms and background_terms
         else token.new_zeros(())
     )
-    anchor = predicted.view(token.shape[0], token.shape[1], 45, 80)
-    mirror_terms: list[Tensor] = []
-    for left, right in mirror_pairs:
-        target_left = target[:, left].view(-1, 45, 80)
-        target_right = target[:, right].view(-1, 45, 80)
-        map_term = (
-            (anchor[:, left] - target_left).abs().mean((1, 2))
-            + (anchor[:, right] - target_right).abs().mean((1, 2))
-        )
-        state_term = (state[:, left] - state[:, right]).abs().mean(-1)
-        weight = torch.minimum(source[:, left], source[:, right]) * torch.minimum(
-            valid[:, left], valid[:, right]
-        )
-        mirror_terms.append(
-            _weighted_mean(map_term + 0.1 * state_term, weight)
-        )
-    mirror = torch.stack(mirror_terms).mean() if mirror_terms else token.new_zeros(())
+    mirror = (
+        mirror_equivariance_loss(output, mirrored_output, factor_pairs=mirror_pairs)[0]
+        if mirrored_output is not None
+        else token.new_zeros(())
+    )
     return discrimination, mirror
 
 
@@ -129,6 +171,7 @@ def meter_grounding_loss(
     targets: dict[str, Tensor],
     *,
     observability_tau: Tensor | None = None,
+    mirrored_output: dict[str, Tensor] | None = None,
 ) -> dict[str, Tensor]:
     source = targets["factor_source_weight"].to(output["factor_anchor_map"])
     anchor_nll, anchor_dice = source_weighted_anchor_loss(
@@ -155,7 +198,9 @@ def meter_grounding_loss(
         source,
         tau,
     )
-    discrimination, mirror = discrimination_and_mirror_loss(output, targets)
+    discrimination, mirror = discrimination_and_mirror_loss(
+        output, targets, mirrored_output=mirrored_output
+    )
     anchor = anchor_nll + anchor_dice
     observability = obs_bce + obs_coverage
     total = 0.10 * anchor + 0.10 * state + 0.03 * observability + 0.05 * (
