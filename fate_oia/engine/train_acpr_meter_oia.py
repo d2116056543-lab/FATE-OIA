@@ -821,12 +821,25 @@ def validate_training_readiness(
     remote_head: str,
     clean_status: str,
     source_tree_hash: str,
+    allow_user_override: bool = False,
 ) -> dict[str, Any]:
     """Validate the signed readiness payload, not merely its existence."""
     is_pilot = int(epochs) <= 3
     if use_mock_dino:
         phase = "pilot" if is_pilot else "full"
         raise RuntimeError(f"{phase} training cannot use mock DINO")
+    if allow_user_override and not is_pilot:
+        return {
+            "artifact": "METER_OIA_V1_FULL_TRAIN_USER_OVERRIDE",
+            "pass": False,
+            "user_override": True,
+            "reason": "explicit_user_override_after_pilot_gate_failure",
+            "HEAD": git_head,
+            "branch": git_branch,
+            "github_head": remote_head,
+            "config_path": str(config_path),
+            "source_tree_hash": source_tree_hash,
+        }
     readiness_name = (
         "METER_OIA_V1_PRE_PILOT_READY.json"
         if is_pilot
@@ -909,7 +922,7 @@ def run(args: argparse.Namespace) -> None:
             "unknown", "unknown", "git-state-unavailable", ""
         )
     current_source_tree_hash = python_source_tree_hash(root)
-    validate_training_readiness(
+    readiness_payload = validate_training_readiness(
         root=root,
         config_path=config_path.resolve(),
         epochs=int(args.epochs),
@@ -919,6 +932,7 @@ def run(args: argparse.Namespace) -> None:
         remote_head=remote_head,
         clean_status=clean_status,
         source_tree_hash=current_source_tree_hash,
+        allow_user_override=bool(args.allow_user_override),
     )
     device = torch.device(args.device)
     if device.type == "cuda":
@@ -1026,6 +1040,8 @@ def run(args: argparse.Namespace) -> None:
         "loss_weights": cfg["loss_weights"], "foreground_only": True, "no_feature_cache": True,
         "runtime_profile_path": str(output_dir / "runtime_profile.json"),
         "owner_manifest_path": str(output_dir / "owner_manifest.json"),
+        "readiness": readiness_payload,
+        "readiness_user_override": bool(readiness_payload.get("user_override", False)),
         "optimizer_owner_contract": owner_manifest,
     })
     global_step = 0
@@ -1854,6 +1870,7 @@ def main() -> None:
     parser.add_argument("--max_test_samples", type=int, default=0)
     parser.add_argument("--use_mock_dino", action="store_true")
     parser.add_argument("--require_ready", action="store_true")
+    parser.add_argument("--allow_user_override", action="store_true")
     parser.add_argument("--worktree_root", default=".")
     parser.add_argument("--resume", default="")
     args = parser.parse_args()
