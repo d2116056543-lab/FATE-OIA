@@ -83,7 +83,18 @@ def test_schema_tiers_and_prevalence_one_rows_do_not_create_impossible_gate() ->
             "transport_target_effect": [0.01, 0.02, 0.03, 0.0005],
             "reason_ap_delta": 0.001,
             "reason_f1_delta": -0.001,
-            "deletion_gap_ci": {"mean": 0.02, "low": 0.004, "high": 0.03},
+            "reason_ap_delta_ci": {
+                "mean": 0.001,
+                "low": 0.0001,
+                "high": 0.002,
+                "sample_count": 512,
+            },
+            "deletion_gap_ci": {
+                "mean": 0.02,
+                "low": 0.004,
+                "high": 0.03,
+                "cluster_count": 128,
+            },
             "state_rows": state_rows,
         }
     )
@@ -116,7 +127,18 @@ def test_two_epoch_admission_marks_ci_crossing_zero_as_inconclusive_not_negative
             "transport_target_effect": [0.01, 0.02, 0.03, 0.04],
             "reason_ap_delta": 0.001,
             "reason_f1_delta": 0.0,
-            "deletion_gap_ci": {"mean": 0.02, "low": -0.001, "high": 0.04},
+            "reason_ap_delta_ci": {
+                "mean": 0.001,
+                "low": 0.0001,
+                "high": 0.002,
+                "sample_count": 512,
+            },
+            "deletion_gap_ci": {
+                "mean": 0.02,
+                "low": -0.001,
+                "high": 0.04,
+                "cluster_count": 128,
+            },
             "state_rows": [
                 {
                     "factor_id": factor_id,
@@ -156,7 +178,18 @@ def test_two_epoch_admission_requires_action_and_two_of_three_mechanism_classes(
         "transport_target_effect": [0.002, 0.002, 0.002, 0.0],
         "reason_ap_delta": 0.001,
         "reason_f1_delta": 0.0,
-        "deletion_gap_ci": {"mean": 0.02, "low": 0.001, "high": 0.04},
+        "reason_ap_delta_ci": {
+            "mean": 0.001,
+            "low": 0.0001,
+            "high": 0.002,
+            "sample_count": 512,
+        },
+        "deletion_gap_ci": {
+            "mean": 0.02,
+            "low": 0.001,
+            "high": 0.04,
+            "cluster_count": 128,
+        },
         "state_rows": [],
     }
     decision = evaluate_two_epoch_admission(base)
@@ -166,3 +199,42 @@ def test_two_epoch_admission_requires_action_and_two_of_three_mechanism_classes(
     assert decision["truth_table"]["reason"]["pass"]
     assert decision["truth_table"]["deletion"]["pass"]
     assert decision["pass"]
+
+
+def test_deletion_and_reason_bootstrap_cannot_pass_on_tiny_sample() -> None:
+    decision = evaluate_two_epoch_admission(
+        {
+            "protocol_ok": True,
+            "artifact_ok": True,
+            "numerics_ok": True,
+            "implementation_audit_ok": True,
+            "gradient_ownership_ok": True,
+            "unknown_mask_ok": True,
+            "source_completeness_ok": True,
+            "no_test_leakage_ok": True,
+            "paired_epoch_count": 2,
+            "null_semantics_ok": False,
+            "action_correction_rms_ratio": [0.02, 0.05, 0.10, 0.20],
+            "action_map_deltas": [0.003, 0.001],
+            "transport_target_effect": [0.002, 0.002, 0.002, 0.0],
+            "reason_ap_delta": 0.01,
+            "reason_f1_delta": 0.0,
+            "reason_ap_delta_ci": {
+                "mean": 0.01,
+                "low": 0.009,
+                "high": 0.011,
+                "sample_count": 1,
+            },
+            "deletion_gap_ci": {
+                "mean": 0.02,
+                "low": 0.019,
+                "high": 0.021,
+                "cluster_count": 1,
+            },
+            "state_rows": [],
+        }
+    )
+    assert not decision["truth_table"]["reason"]["pass"]
+    assert decision["truth_table"]["deletion"]["status"] == "insufficient_samples"
+    assert not decision["truth_table"]["deletion"]["pass"]
+    assert not decision["pass"]

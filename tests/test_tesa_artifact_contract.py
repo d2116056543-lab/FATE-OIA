@@ -35,6 +35,17 @@ def test_artifact_validator_checks_shapes_alignment_and_finite(tmp_path) -> None
             "unique_sample_count": 2,
             "action_coverage": [0, 1, 2, 3],
             "factor_coverage": list(range(12)),
+            "eligible_factor_coverage": list(range(12)),
+            "requested_factor_coverage": list(range(12)),
+            "executed_factor_coverage": list(range(12)),
+            "model_top_factor_coverage": list(range(12)),
+            "selected_minus_control_ci": {
+                "mean": 0.01,
+                "low": 0.001,
+                "high": 0.02,
+                "n_bootstrap": 100,
+                "cluster_count": 2,
+            },
         },
     }
     (tmp_path / "typed_evidence.json").write_text(

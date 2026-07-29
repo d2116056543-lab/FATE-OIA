@@ -41,6 +41,8 @@ TWO_EPOCH_ADMISSION_RULES = {
     "min_reason_ap_delta": 0.001,
     "min_reason_f1_delta": -0.003,
     "min_deletion_gap_mean": 0.0,
+    "min_deletion_cluster_count": 128,
+    "min_reason_bootstrap_sample_count": 128,
     "min_mechanism_classes": 2,
 }
 
@@ -112,6 +114,7 @@ def patch_audit_contract_failures(patch: Mapping[str, Any]) -> list[str]:
         )
         and float(ci["low"]) <= float(ci["mean"]) <= float(ci["high"])
         and int(ci.get("n_bootstrap", 0)) >= 1
+        and int(ci.get("cluster_count", 0)) >= 1
     ):
         failures.append("selected_minus_control_ci")
     return failures
@@ -177,7 +180,12 @@ def evaluate_two_epoch_admission(metrics: Mapping[str, Any]) -> dict[str, Any]:
     deletion_high = float(deletion_ci.get("high", float("nan"))) if isinstance(
         deletion_ci, Mapping
     ) else float("nan")
-    if deletion_mean <= TWO_EPOCH_ADMISSION_RULES["min_deletion_gap_mean"]:
+    deletion_cluster_count = int(deletion_ci.get("cluster_count", 0)) if isinstance(
+        deletion_ci, Mapping
+    ) else 0
+    if deletion_cluster_count < TWO_EPOCH_ADMISSION_RULES["min_deletion_cluster_count"]:
+        deletion_status = "insufficient_samples"
+    elif deletion_mean <= TWO_EPOCH_ADMISSION_RULES["min_deletion_gap_mean"]:
         deletion_status = "negative"
     elif deletion_low <= 0.0 <= deletion_high:
         deletion_status = "inconclusive"
@@ -228,11 +236,16 @@ def evaluate_two_epoch_admission(metrics: Mapping[str, Any]) -> dict[str, Any]:
         and factor2_usage_excess
         <= TWO_EPOCH_ADMISSION_RULES["max_factor2_usage_excess"]
     )
+    reason_ci = metrics.get("reason_ap_delta_ci", {})
     reason_pass = (
         float(metrics.get("reason_ap_delta", float("nan")))
         >= TWO_EPOCH_ADMISSION_RULES["min_reason_ap_delta"]
         and float(metrics.get("reason_f1_delta", float("nan")))
         >= TWO_EPOCH_ADMISSION_RULES["min_reason_f1_delta"]
+        and isinstance(reason_ci, Mapping)
+        and int(reason_ci.get("sample_count", 0))
+        >= TWO_EPOCH_ADMISSION_RULES["min_reason_bootstrap_sample_count"]
+        and float(reason_ci.get("low", float("-inf"))) > 0.0
     )
     deletion_pass = deletion_status == "positive"
     truth_table = {
@@ -270,6 +283,7 @@ def evaluate_two_epoch_admission(metrics: Mapping[str, Any]) -> dict[str, Any]:
         "reason": {
             "ap_delta": float(metrics.get("reason_ap_delta", float("nan"))),
             "f1_delta": float(metrics.get("reason_f1_delta", float("nan"))),
+            "ap_delta_ci": dict(reason_ci) if isinstance(reason_ci, Mapping) else {},
             "pass": reason_pass,
         },
         "deletion": {

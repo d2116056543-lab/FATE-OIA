@@ -391,16 +391,8 @@ def validate_epoch_artifacts(directory: str | Path) -> list[str]:
             for value in patch_audit.get("factor_coverage", [])
         )
     )
-    # New artifacts carry separated coverage/CI fields. Historical pilot
-    # artifacts remain readable so the evaluator can diagnose them honestly.
-    if any(name in patch_audit for name in (
-        "eligible_factor_coverage",
-        "requested_factor_coverage",
-        "executed_factor_coverage",
-        "model_top_factor_coverage",
-        "selected_minus_control_ci",
-    )):
-        typed_valid = typed_valid and not patch_contract_failures
+    # Formal TESA artifacts never fall back to the historical weak schema.
+    typed_valid = typed_valid and not patch_contract_failures
     if not typed_valid:
         failures.append("typed_evidence.json:mechanism_schema")
 

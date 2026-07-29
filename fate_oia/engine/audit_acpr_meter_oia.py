@@ -21,7 +21,12 @@ from fate_oia.losses.meter_pu_losses import meter_private_pu_loss
 from fate_oia.losses.meter_reason_losses import meter_reason_loss
 from fate_oia.models.meter_oia_model import METEROIAModel
 from fate_oia.engine.train_acpr_meter_oia import _compute_losses
-from fate_oia.utils.meter_artifacts import write_json
+from fate_oia.utils.meter_artifacts import (
+    combined_file_hash,
+    file_hash,
+    python_source_tree_hash,
+    write_json,
+)
 from fate_oia.utils.meter_config import load_meter_config
 
 
@@ -502,6 +507,9 @@ def run_audit(
     result = {
         "pass": not compile_errors and source["pass"] and dynamic["pass"],
         "git_head": _git_head(),
+        "config_hash": combined_file_hash(config_path),
+        "source_hash": python_source_tree_hash(root),
+        "schema_hash": file_hash(root / "configs/meter_factor_schema.yaml"),
         "compile_errors": compile_errors,
         "source_checks": source,
         "dynamic_checks": dynamic,

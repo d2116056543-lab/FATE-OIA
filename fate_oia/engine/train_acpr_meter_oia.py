@@ -856,6 +856,9 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
         pu_state = dict(payload.get("pu_state") or pu_state)
     manifest = {
         "git_head": _git_head(),
+        "config_hash": config_hash,
+        "source_hash": source_hash,
+        "schema_hash": schema_hash,
         "command_line": sys.argv,
         "seed": seed,
         "use_mock_dino": bool(args.use_mock_dino),

@@ -350,11 +350,7 @@ def run_stratified_patch_audit(
             factors = sorted(
                 {int(factor) for values in factors_by_action.values() for factor in values}
             )
-            queue.add(
-                str(sample_id),
-                action_ids=selected_actions,
-                factor_ids=factors,
-            )
+            record_start = len(records)
             for action in selected_actions:
                 for factor in factors_by_action[int(action)]:
                     contribution = contributions[action, factor]
@@ -403,6 +399,15 @@ def run_stratified_patch_audit(
                         }
                     )
                     action_coverage.add(int(action))
+            if len(records) > record_start:
+                queue.add(
+                    str(sample_id),
+                    action_ids=selected_actions,
+                    factor_ids={
+                        int(record["factor_id"])
+                        for record in records[record_start:]
+                    },
+                )
         del clean, field, images
     summary = build_patch_audit_summary(
         records,

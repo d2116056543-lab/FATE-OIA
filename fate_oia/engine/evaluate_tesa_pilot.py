@@ -7,6 +7,9 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+import torch
+
+from fate_oia.metrics import binary_average_precision
 from fate_oia.utils.meter_artifacts import validate_epoch_artifacts, write_json
 from fate_oia.utils.tesa_contracts import (
     evaluate_two_epoch_admission,
@@ -70,6 +73,88 @@ def _mean_vectors(values: list[list[float]], width: int) -> list[float]:
     return [sum(value[index] for value in values) / len(values) for index in range(width)]
 
 
+def _reason_map_delta(
+    final_logits: torch.Tensor,
+    global_logits: torch.Tensor,
+    labels: torch.Tensor,
+    indices: torch.Tensor,
+) -> float:
+    deltas: list[float] = []
+    for label in range(labels.shape[1]):
+        target = labels[indices, label]
+        final_ap = binary_average_precision(
+            torch.sigmoid(final_logits[indices, label]), target
+        )
+        global_ap = binary_average_precision(
+            torch.sigmoid(global_logits[indices, label]), target
+        )
+        if math.isfinite(final_ap) and math.isfinite(global_ap):
+            deltas.append(final_ap - global_ap)
+    return sum(deltas) / len(deltas) if deltas else float("nan")
+
+
+def _paired_reason_map_bootstrap(
+    epochs: list[Path], *, n_bootstrap: int = 300, seed: int = 20260729
+) -> dict[str, Any]:
+    """Bootstrap paired final-vs-global reason ranking on identical test rows."""
+    if len(epochs) != 2:
+        return {"available": False, "reason": "requires_exactly_two_epochs"}
+    names = [
+        _read_json(epoch / "file_names_test.json").get("file_names", [])
+        for epoch in epochs
+    ]
+    if not names[0] or names[0] != names[1]:
+        return {"available": False, "reason": "test_row_identity_mismatch"}
+    rows = [
+        (
+            torch.load(
+                epoch / "logits_reason_final_raw_test.pt",
+                map_location="cpu",
+                weights_only=True,
+            ).float(),
+            torch.load(
+                epoch / "logits_reason_global_test.pt",
+                map_location="cpu",
+                weights_only=True,
+            ).float(),
+            torch.load(
+                epoch / "labels_reason_test.pt",
+                map_location="cpu",
+                weights_only=True,
+            ).float(),
+        )
+        for epoch in epochs
+    ]
+    sample_count = len(names[0])
+    full_index = torch.arange(sample_count)
+    observed = sum(
+        _reason_map_delta(final, global_, labels, full_index)
+        for final, global_, labels in rows
+    ) / 2.0
+    generator = torch.Generator().manual_seed(seed)
+    bootstrap: list[float] = []
+    for _ in range(int(n_bootstrap)):
+        index = torch.randint(sample_count, (sample_count,), generator=generator)
+        delta = sum(
+            _reason_map_delta(final, global_, labels, index)
+            for final, global_, labels in rows
+        ) / 2.0
+        if math.isfinite(delta):
+            bootstrap.append(delta)
+    if not bootstrap:
+        return {"available": False, "reason": "no_finite_bootstrap"}
+    distribution = torch.tensor(bootstrap)
+    return {
+        "available": True,
+        "mean": observed,
+        "low": float(torch.quantile(distribution, 0.025)),
+        "high": float(torch.quantile(distribution, 0.975)),
+        "n_bootstrap": len(bootstrap),
+        "sample_count": sample_count,
+        "paired_files": True,
+    }
+
+
 def _two_epoch_pairs(epochs: list[Path]) -> dict[str, Any]:
     """Read paired mechanism deltas from exactly the two latest epochs."""
     selected = epochs[-2:]
@@ -114,6 +199,7 @@ def _two_epoch_pairs(epochs: list[Path]) -> dict[str, Any]:
         ),
         "reason_ap_delta": sum(reason_ap_deltas) / len(reason_ap_deltas),
         "reason_f1_delta": sum(reason_f1_deltas) / len(reason_f1_deltas),
+        "reason_ap_delta_ci": _paired_reason_map_bootstrap(selected),
         "reason_ap_deltas": reason_ap_deltas,
         "reason_f1_deltas": reason_f1_deltas,
     }
@@ -241,6 +327,16 @@ def evaluate_pilot(
         manifest, manifest["config"]["pilot"], completed_epochs=len(epochs)
     )
     audit = _read_json(Path(implementation_audit))
+    current_head = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], text=True
+    ).strip()
+    audit_binding_fields = ("git_head", "config_hash", "source_hash", "schema_hash")
+    audit_binding_ok = (
+        all(manifest.get(name) == audit.get(name) for name in audit_binding_fields)
+        and manifest.get("git_head") == current_head
+    )
+    if not audit_binding_ok:
+        protocol_failures.append("implementation_audit_binding")
     losses = _read_jsonl(root / "loss_components.jsonl")
     visual = branches["action_visual"]
     final = branches["action_final"]
@@ -394,7 +490,7 @@ def evaluate_pilot(
             )
         ),
     }
-    head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    head = current_head
     result = {
         "pass": False,
         "git_head": head,
@@ -425,7 +521,8 @@ def evaluate_pilot(
                 for row in recent
             ),
             "paired_epoch_count": paired.get("paired_epoch_count", 0),
-            "implementation_audit_ok": bool(audit.get("pass"))
+            "implementation_audit_ok": audit_binding_ok
+            and bool(audit.get("pass"))
             and bool(audit.get("dynamic_checks", {}).get("pass")),
             "gradient_ownership_ok": all(
                 bool(
@@ -464,6 +561,7 @@ def evaluate_pilot(
             "transport_target_effect": paired.get("transport_target_effect", []),
             "reason_ap_delta": paired.get("reason_ap_delta", float("nan")),
             "reason_f1_delta": paired.get("reason_f1_delta", float("nan")),
+            "reason_ap_delta_ci": paired.get("reason_ap_delta_ci", {}),
             "deletion_gap_ci": patch.get("selected_minus_control_ci", {}),
             "state_rows": admission_state_rows,
         }

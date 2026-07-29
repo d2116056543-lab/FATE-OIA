@@ -278,11 +278,10 @@ def meter_grounding_loss(
         targets["factor_state_valid"],
         source,
     )
-    # Derive training masks from the mirrored state contract. The explicit
-    # present/absent fields are retained for audit, but are not a gradient
-    # source because legacy mirror collation does not yet swap new fields.
-    present_valid = targets["factor_state_valid"] & targets["factor_state_target"].eq(0)
-    absent_valid = targets["factor_state_valid"] & targets["factor_state_target"].eq(1)
+    # Presence is orthogonal to the signed state. A red light or occupied
+    # corridor is present evidence, not a null/absent factor.
+    present_valid = targets["factor_present_valid"].to(torch.bool)
+    absent_valid = targets["factor_absent_valid"].to(torch.bool)
     null = null_partition_calibration_loss(
         output["factor_null_mass"], present_valid, absent_valid, source
     )
