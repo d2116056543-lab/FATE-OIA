@@ -7,52 +7,34 @@ from torch import Tensor, nn
 
 
 class METERPrivateReasonDecoder(nn.Module):
-    """Private reason decoder that reads detached action/factor context only."""
+    """Global private reason predictor plus detached typed-evidence correction."""
 
     def __init__(self, dim: int = 384, reason_dim: int = 21, action_dim: int = 4) -> None:
         super().__init__()
         self.dim = int(dim)
         self.reason_dim = int(reason_dim)
-        self.action_dim = int(action_dim)
         self.private_queries = nn.Parameter(torch.randn(reason_dim, dim) * 0.02)
         self.layer_router = nn.Parameter(torch.zeros(3))
         self.global_query = nn.Linear(dim, dim)
         self.global_key = nn.Linear(dim, dim)
         self.global_value = nn.Linear(dim, dim)
         self.global_norm = nn.LayerNorm(dim)
-        self.reason_self_attention = nn.MultiheadAttention(dim, num_heads=4, batch_first=True)
+        self.reason_self_attention = nn.MultiheadAttention(
+            dim, num_heads=4, batch_first=True
+        )
         self.reason_self_norm = nn.LayerNorm(dim)
-        self.local_proj = nn.Linear(dim, dim)
-        self.local_norm = nn.LayerNorm(dim)
-        self.factor_proj = nn.Linear(dim, dim)
-        self.action_proj = nn.Linear(dim, dim)
         self.global_head = nn.Linear(dim, 1)
-        self.local_head = nn.Linear(dim, 1)
-        self.mix_gate = nn.Sequential(nn.Linear(dim * 2 + 5, dim // 2), nn.GELU(), nn.Linear(dim // 2, 1))
-        self.annotation_head = nn.Sequential(nn.Linear(dim * 2 + 2, dim // 2), nn.GELU(), nn.Linear(dim // 2, 1))
-        self.tail_gain = nn.Parameter(torch.zeros(reason_dim))
+        self.correction_vector = nn.Parameter(torch.randn(reason_dim, dim) * 0.02)
+        self.correction_kappa_raw = nn.Parameter(
+            torch.full((reason_dim,), -2.2521685)
+        )
 
     def initialize_from_foundation(self, foundation: nn.Module) -> None:
         trunk = foundation.trunk
         with torch.no_grad():
             self.private_queries.copy_(trunk.label_queries[foundation.action_dim :])
-            self.global_query.weight.copy_(trunk.query_proj.weight)
-            self.global_query.bias.copy_(trunk.query_proj.bias)
-            self.global_key.weight.copy_(trunk.key_proj.weight)
-            self.global_key.bias.copy_(trunk.key_proj.bias)
-            self.global_value.weight.copy_(trunk.value_proj.weight)
-            self.global_value.bias.copy_(trunk.value_proj.bias)
-            self.local_proj.weight.copy_(trunk.value_proj.weight)
-            self.local_proj.bias.copy_(trunk.value_proj.bias)
-            self.reason_self_attention.load_state_dict(trunk.label_self_attn.state_dict())
-            self.global_head.weight.copy_(trunk.logit_head.weight)
-            self.global_head.bias.copy_(trunk.logit_head.bias)
-            self.local_head.weight.copy_(trunk.logit_head.weight)
-            self.local_head.bias.copy_(trunk.logit_head.bias)
-            nn.init.zeros_(self.factor_proj.weight)
-            nn.init.zeros_(self.factor_proj.bias)
-            nn.init.zeros_(self.action_proj.weight)
-            nn.init.zeros_(self.action_proj.bias)
+            self.global_head.weight.copy_(trunk.reason_head.weight)
+            self.global_head.bias.copy_(trunk.reason_head.bias)
 
     @staticmethod
     def _ramp(progress: float) -> float:
@@ -63,83 +45,52 @@ class METERPrivateReasonDecoder(nn.Module):
         *,
         patch_tokens_by_layer: Tensor,
         reason_logits_calalign: Tensor,
-        action_logits_final: Tensor,
-        action_nodes: Tensor,
-        factor_to_reason_tokens: Tensor,
-        factor_support_map: Tensor,
-        factor_counter_map: Tensor,
+        factor_typed_token: Tensor,
         factor_reliability: Tensor,
-        factor_support_null: Tensor,
+        factor_groundable_mask: Tensor,
         progress: float = 1.0,
     ) -> dict[str, Tensor]:
-        # Private reason views must not backpropagate into the foundation.
         detached_layers = patch_tokens_by_layer.detach()
-        if detached_layers.shape[1] != self.layer_router.numel():
-            raise ValueError("Private reason layer count does not match layer_router")
         layer_weights = torch.softmax(self.layer_router, dim=0)
         patch = torch.einsum("s,bsnd->bnd", layer_weights, detached_layers)
-        query = self.global_query(self.private_queries).view(1, self.reason_dim, self.dim)
+        query = self.global_query(self.private_queries).unsqueeze(0).expand(
+            patch.shape[0], -1, -1
+        )
         key = self.global_key(patch)
         value = self.global_value(patch)
-        global_attention = torch.softmax(torch.einsum("brd,bnd->brn", query, key) / math.sqrt(self.dim), dim=-1)
-        global_token = self.global_norm(torch.einsum("brn,bnd->brd", global_attention, value))
-        self_context = self.reason_self_attention(
-            global_token,
-            global_token,
-            global_token,
-            need_weights=False,
-        )[0]
-        global_token = self.reason_self_norm(global_token + self_context)
-        action_context = torch.einsum("ba,bad->bd", torch.sigmoid(action_logits_final).detach(), action_nodes.detach())
-        factor_context = self.factor_proj(factor_to_reason_tokens)
-        local_maps = (factor_support_map - factor_counter_map).detach()
-        local_detail = torch.einsum("brn,bsnd,s->brd", local_maps, detached_layers, layer_weights)
-        tail = self.tail_gain.view(1, -1, 1) * (factor_support_map.detach().mean(-1) - factor_counter_map.detach().mean(-1)).unsqueeze(-1)
-        local_token = self.local_norm(self.local_proj(local_detail) + factor_context + tail)
-        action_term = self.action_proj(action_context).unsqueeze(1).expand(-1, self.reason_dim, -1)
-        global_token = self.global_norm(global_token + action_term)
-        local_token = self.local_norm(local_token + action_term)
-        logits_global = self.global_head(global_token).squeeze(-1)
-        logits_local = self.local_head(local_token).squeeze(-1)
-        disagreement = (logits_global - logits_local).abs().unsqueeze(-1)
-        gate_features = torch.cat(
-            [
-                global_token,
-                local_token,
-                factor_reliability.detach().unsqueeze(-1),
-                factor_support_null.detach().unsqueeze(-1),
-                disagreement,
-                torch.sigmoid(action_logits_final).detach().mean(dim=-1, keepdim=True).unsqueeze(1).expand(-1, self.reason_dim, -1),
-                local_maps.abs().mean(-1, keepdim=True),
-            ],
+        attention = torch.softmax(
+            torch.einsum("brd,bnd->brn", query, key) / math.sqrt(self.dim),
             dim=-1,
         )
-        mix_gate = torch.sigmoid(self.mix_gate(gate_features).squeeze(-1))
-        logits_mix = mix_gate * logits_global + (1.0 - mix_gate) * logits_local
-        mix_gate_regret = torch.sigmoid(
-            self.mix_gate(gate_features.detach()).squeeze(-1)
+        token = self.global_norm(torch.einsum("brn,bnd->brd", attention, value))
+        context = self.reason_self_attention(token, token, token, need_weights=False)[0]
+        token = self.reason_self_norm(token + context)
+        learned_global = self.global_head(token).squeeze(-1)
+        ramp = self._ramp(progress)
+        global_logits = reason_logits_calalign.detach() + ramp * (
+            learned_global - reason_logits_calalign.detach()
         )
-        logits_mix_regret = (
-            mix_gate_regret * logits_global.detach()
-            + (1.0 - mix_gate_regret) * logits_local.detach()
+        evidence = factor_typed_token.detach()
+        reliability = factor_reliability.detach()
+        groundable = factor_groundable_mask.to(evidence).view(1, -1)
+        raw = torch.einsum("brd,rd->br", evidence, self.correction_vector)
+        kappa = torch.nn.functional.softplus(self.correction_kappa_raw).clamp(
+            0.02, 0.30
         )
-        annotation_features = torch.cat([global_token, local_token, factor_reliability.detach().unsqueeze(-1), disagreement], dim=-1)
-        annotation_delta = 0.5 * torch.tanh(self.annotation_head(annotation_features).squeeze(-1))
-        candidate = logits_mix + annotation_delta
-        base_reason = reason_logits_calalign.detach()
-        final = base_reason + self._ramp(progress) * (candidate - base_reason)
+        correction = (
+            groundable
+            * reliability
+            * kappa.view(1, -1)
+            * torch.tanh(raw / kappa.view(1, -1))
+        )
+        final = global_logits + ramp * correction
         return {
-            "reason_global_tokens": global_token,
-            "reason_local_tokens": local_token,
-            "reason_logits_global": logits_global,
-            "reason_logits_local": logits_local,
-            "reason_logits_mix": logits_mix,
-            "reason_logits_mix_regret": logits_mix_regret,
-            "reason_annotation_delta": annotation_delta,
-            "reason_logits_candidate": candidate,
+            "reason_global_tokens": token,
+            "reason_global_attention": attention,
+            "reason_logits_global": global_logits,
+            "reason_evidence_delta": correction,
             "reason_logits_final": final,
-            "reason_mix_gate": mix_gate,
-            "reason_mix_gate_regret": mix_gate_regret,
-            "reason_tail_sensitivity": tail.squeeze(-1).abs(),
+            "reason_correction_kappa": kappa,
+            "reason_groundable_mask": groundable.squeeze(0),
             "reason_layer_weights": layer_weights,
         }

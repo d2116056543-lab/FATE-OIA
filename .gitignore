@@ -3,7 +3,7 @@
 *.pth
 *.pt
 *.ckpt
-datasets/
+/datasets/
 cache/
 __pycache__/
 .pytest_cache/

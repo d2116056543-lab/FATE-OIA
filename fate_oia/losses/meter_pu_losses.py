@@ -6,8 +6,18 @@ from torch import Tensor
 from fate_oia.metrics import binary_average_precision
 
 
-def meter_pu_score(private_probability: Tensor, factor_probability: Tensor, view_consistency: Tensor, observability: Tensor) -> Tensor:
-    return (private_probability.clamp_min(0.0) * factor_probability.clamp_min(0.0)).sqrt() * view_consistency.detach() * observability.detach()
+def meter_pu_score(
+    global_probability: Tensor,
+    positive_state_probability: Tensor,
+    reliability: Tensor,
+    observability: Tensor | None = None,
+) -> Tensor:
+    score = (
+        global_probability.clamp(0, 1)
+        * positive_state_probability.clamp(0, 1)
+        * reliability.detach().clamp(0, 1)
+    )
+    return score if observability is None else score * observability.detach().clamp(0, 1)
 
 
 def meter_private_pu_loss(logits: Tensor, observed_target: Tensor, pu_score: Tensor, pu_lambda: Tensor) -> Tensor:

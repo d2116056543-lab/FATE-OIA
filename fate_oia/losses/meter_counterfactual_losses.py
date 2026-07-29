@@ -3,53 +3,65 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
+from .meter_action_losses import asymmetric_multilabel_elements
 
-def meter_counterfactual_loss(
-    selected_effect: Tensor,
-    control_effect: Tensor,
-    wrong_target_effect: Tensor,
-    support_direction: Tensor,
-    counter_direction: Tensor,
+
+def dense_factor_intervention_loss(
+    action_logits_final: Tensor,
+    factor_contributions: Tensor,
+    action_target: Tensor,
     *,
-    target_action_effect: Tensor | None = None,
-    wrong_action_effect: Tensor | None = None,
-    counter_action_effect: Tensor | None = None,
-    counter_control_effect: Tensor | None = None,
-    counter_control_action_effect: Tensor | None = None,
+    margin: float = 0.02,
 ) -> dict[str, Tensor]:
-    """Enforce selected-vs-control and target-specific same-image effects.
+    """Dense analytic necessity and target-specificity over every batch."""
+    sign = action_target * 2.0 - 1.0
+    signed = sign.unsqueeze(-1) * factor_contributions
+    correct_index = signed.argmax(-1)
+    wrong_index = signed.argmin(-1)
+    correct = factor_contributions.gather(
+        -1, correct_index.unsqueeze(-1)
+    ).squeeze(-1)
+    wrong = factor_contributions.gather(-1, wrong_index.unsqueeze(-1)).squeeze(-1)
+    base = asymmetric_multilabel_elements(action_logits_final, action_target)
+    deleted = asymmetric_multilabel_elements(
+        action_logits_final - correct, action_target
+    )
+    necessity = torch.relu(margin + base - deleted).mean()
+    specificity = torch.relu(margin + wrong.abs() - correct.abs()).mean()
+    coverage = (factor_contributions.abs() > 1e-6).any(0)
+    return {
+        "necessity": necessity,
+        "specificity": specificity,
+        "correct_effect": correct.detach(),
+        "wrong_effect": wrong.detach(),
+        "action_coverage": coverage.any(-1).sum(),
+        "factor_coverage": coverage.any(0).sum(),
+        "total": necessity + specificity,
+    }
 
-    ``selected_effect`` and ``counter_direction`` are signed score changes after
-    deleting the selected support/counter evidence.  Optional action effects
-    make the loss target-aware without changing the public five-argument API
-    used by the unit tests.
-    """
+
+def identity_corruption_loss(
+    clean_contributions: Tensor,
+    corrupt_contributions: Tensor,
+    target: Tensor,
+    *,
+    margin: float = 0.02,
+) -> Tensor:
+    sign = target.unsqueeze(-1) * 2.0 - 1.0
+    clean_score = (sign * clean_contributions).sum((-1, -2))
+    corrupt_score = (sign * corrupt_contributions).sum((-1, -2))
+    return torch.relu(margin + corrupt_score - clean_score).mean()
+
+
+def meter_counterfactual_loss(*args: Tensor, **kwargs: Tensor) -> dict[str, Tensor]:
+    # Legacy API retained only for old unit-test import compatibility.
+    selected_effect, control_effect, wrong_target_effect, support, counter = args[:5]
     selected_control = torch.relu(0.02 - selected_effect + control_effect).mean()
-    if counter_control_effect is not None:
-        selected_control = selected_control + torch.relu(
-            0.02 - counter_direction + counter_control_effect
-        ).mean()
-    specificity_terms = [torch.relu(0.02 - selected_effect + wrong_target_effect)]
-    if target_action_effect is not None and wrong_action_effect is not None:
-        specificity_terms.append(torch.relu(0.02 - target_action_effect + wrong_action_effect))
-    specificity = torch.stack([term.mean() for term in specificity_terms]).mean()
-    direction_terms = [
-        torch.relu(-support_direction).mean(),
-        torch.relu(-counter_direction).mean(),
-    ]
-    if counter_action_effect is not None:
-        direction_terms.append(torch.relu(-counter_action_effect).mean())
-    if (
-        counter_action_effect is not None
-        and counter_control_action_effect is not None
-    ):
-        direction_terms.append(
-            torch.relu(
-                0.02
-                - counter_action_effect
-                + counter_control_action_effect
-            ).mean()
-        )
-    direction = torch.stack(direction_terms).sum()
-    total = selected_control + specificity + direction
-    return {"selected_control": selected_control, "specificity": specificity, "direction": direction, "total": total}
+    specificity = torch.relu(0.02 - selected_effect + wrong_target_effect).mean()
+    direction = torch.relu(-support).mean() + torch.relu(-counter).mean()
+    return {
+        "selected_control": selected_control,
+        "specificity": specificity,
+        "direction": direction,
+        "total": selected_control + specificity + direction,
+    }
