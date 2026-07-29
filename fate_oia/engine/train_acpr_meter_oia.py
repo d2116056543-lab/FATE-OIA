@@ -137,7 +137,7 @@ def _forward_training_batch(
     *,
     progress: float,
     mirror_due: bool,
-) -> tuple[dict[str, Any], dict[str, Any] | None]:
+) -> tuple[dict[str, Any], dict[str, Any] | None, float]:
     """Decode an optional paired mirror while keeping one DINO encode call."""
     batch_size = images.shape[0]
     encoded_images = (
@@ -146,7 +146,9 @@ def _forward_training_batch(
         else images
     )
     encoded_batch = encoded_images.shape[0]
+    encode_start = time.perf_counter()
     encoded_field = model.encode_images(encoded_images)
+    encode_seconds = time.perf_counter() - encode_start
     output = model.decode_from_field(
         _slice_encoded_field(encoded_field, 0, batch_size, encoded_batch),
         progress=progress,
@@ -165,7 +167,7 @@ def _forward_training_batch(
         if mirror_due
         else None
     )
-    return output, mirror_output
+    return output, mirror_output, encode_seconds
 
 
 def _parameter_groups(
@@ -876,20 +878,18 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
             grounding_ramp, mechanism_ramp = _mechanism_ramps(
                 optimizer_step, total_updates
             )
-            dino_start = time.perf_counter()
             dino_calls_before = model._encode_call_count
             mirror_interval = int(
                 config["training"].get("mirror_training_interval", 8)
             )
             mirror_due = mirror_interval > 0 and micro_step % mirror_interval == 0
             with autocast():
-                output, mirror_output = _forward_training_batch(
+                output, mirror_output, dino_time = _forward_training_batch(
                     model,
                     batch["image"],
                     progress=optimizer_step / max(total_updates, 1),
                     mirror_due=mirror_due,
                 )
-                dino_time = time.perf_counter() - dino_start
                 total, parts = _compute_losses(
                     model,
                     output,
