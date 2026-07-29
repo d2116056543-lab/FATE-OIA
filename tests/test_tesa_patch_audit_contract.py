@@ -126,3 +126,63 @@ def test_patch_audit_uses_source_validity_when_model_observability_is_zero() -> 
     assert result["eligible_factor_coverage"] == [1]
     assert result["requested_factor_coverage"] == [1]
     assert result["executed_factor_coverage"] == [1]
+
+
+def test_patch_audit_uses_current_actions_compatibility_row() -> None:
+    class ActionSpecificModel:
+        def encode_images(self, images: torch.Tensor) -> dict[str, torch.Tensor]:
+            return {
+                "patch_tokens_by_layer": torch.zeros(
+                    images.shape[0], 1, 45 * 80, 2
+                )
+            }
+
+        def decode_from_field(
+            self, field: dict[str, torch.Tensor], *, progress: float
+        ) -> dict[str, torch.Tensor]:
+            batch_size = field["patch_tokens_by_layer"].shape[0]
+            contribution = torch.zeros(batch_size, 4, 21)
+            contribution[:, 2, 1] = 10.0
+            contribution[:, 2, 12] = 1.0
+            ownership = torch.zeros(4, 21)
+            ownership[2, 12] = 1.0
+            action_logits = torch.full((batch_size, 4), -10.0)
+            action_logits[:, 2] = 10.0
+            route = torch.zeros(batch_size, 4, 21)
+            route[:, 2, 12] = 1.0
+            return {
+                "action_factor_contributions": contribution,
+                "factor_action_ownership": ownership,
+                "factor_observability": torch.ones(batch_size, 21),
+                "factor_groundable_mask": torch.ones(21),
+                "factor_anchor_map": torch.arange(45 * 80).view(1, 1, -1)
+                .float()
+                .expand(batch_size, 21, -1),
+                "action_factor_weights": route,
+                "action_logits_final": action_logits,
+            }
+
+    source = torch.zeros(1, 21)
+    source[:, [1, 12]] = 1.0
+    valid = source.bool()
+    batch = {
+        "image": torch.zeros(1, 3, 360, 640),
+        "action": torch.tensor([[0.0, 0.0, 1.0, 0.0]]),
+        "file_name": ["left-action.jpg"],
+        "meter_grounding": {
+            "factor_source_weight": source,
+            "factor_anchor_valid": valid,
+        },
+    }
+    result = run_stratified_patch_audit(
+        ActionSpecificModel(),
+        [batch],
+        torch.device("cpu"),
+        progress=1.0,
+        max_unique=1,
+        patches_per_factor=3,
+        factors_per_action=1,
+    )
+    assert result["requested_factor_coverage"] == [12]
+    assert result["executed_factor_coverage"] == [12]
+    assert all(record["schema_compatible"] for record in result["records"])

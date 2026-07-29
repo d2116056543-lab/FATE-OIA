@@ -33,7 +33,7 @@ def action_transport_anti_monopoly_loss(
     factor_weights: Tensor,
     source_mask: Tensor,
     *,
-    max_share: float = 0.85,
+    max_share: float = 0.70,
 ) -> Tensor:
     """Penalize only avoidable factor monopoly, never sparse valid evidence."""
     available = source_mask.gt(1e-8)
@@ -78,11 +78,14 @@ def meter_action_loss(
     if anti_monopoly is None:
         anti_monopoly = action_transport_anti_monopoly_loss(
             output.get(
-                "action_factor_weights",
-                output["action_logits_final"].new_zeros(
-                    output["action_logits_final"].shape[0],
-                    output["action_logits_final"].shape[1],
-                    1,
+                "action_factor_dense_weights",
+                output.get(
+                    "action_factor_weights",
+                    output["action_logits_final"].new_zeros(
+                        output["action_logits_final"].shape[0],
+                        output["action_logits_final"].shape[1],
+                        1,
+                    ),
                 ),
             ),
             output.get(

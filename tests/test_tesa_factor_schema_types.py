@@ -7,7 +7,7 @@ def test_tesa_factor_schema_is_complete() -> None:
     rows = yaml.safe_load(Path("configs/meter_factor_schema.yaml").read_text())["factors"]
     required = {
         "id", "name", "factor_type", "state_set", "anchor_source",
-        "state_source", "groundability", "action_owned",
+        "state_source", "groundability", "action_owned", "compatible_actions",
         "observability_source", "mirror_partner", "counter_localizable",
     }
     assert [row["id"] for row in rows] == list(range(21))

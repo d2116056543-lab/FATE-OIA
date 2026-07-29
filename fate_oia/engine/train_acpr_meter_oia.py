@@ -245,21 +245,22 @@ def _identity_output(
 ) -> dict[str, Tensor]:
     reliability = output["factor_reliability"]
     factor_source = output["factor_observability"]
+    corrupt_value_token = output["factor_action_value_token"]
     if mode == "schema":
-        corrupt_token = torch.roll(output["factor_typed_token"], 1, 1)
+        corrupt_token = torch.roll(output["factor_action_token"], 1, 1)
+        corrupt_value_token = torch.roll(corrupt_value_token, 1, 1)
     elif mode == "cross_sample":
-        if output["factor_typed_token"].shape[0] < 2:
-            corrupt_token = output["factor_typed_token"]
+        if output["factor_action_token"].shape[0] < 2:
+            corrupt_token = output["factor_action_token"]
         else:
-            corrupt_token = torch.roll(output["factor_typed_token"], 1, 0)
+            corrupt_token = torch.roll(output["factor_action_token"], 1, 0)
+            corrupt_value_token = torch.roll(corrupt_value_token, 1, 0)
             reliability = torch.roll(reliability, 1, 0)
             factor_source = torch.roll(factor_source, 1, 0)
     elif mode == "state":
         corrupt_state = torch.roll(output["factor_state_prob"], 1, -1)
-        corrupt_token = model.typed_factors.compose_typed_token(
-            output["factor_global_token"],
-            output["factor_anchor_token"],
-            corrupt_state,
+        corrupt_token = model.typed_factors.compose_action_token(
+            output["factor_anchor_token"], corrupt_state
         )
     else:
         raise ValueError(f"Unknown identity corruption mode: {mode}")
@@ -269,6 +270,7 @@ def _identity_output(
         corrupt_token,
         reliability,
         output["factor_action_ownership"],
+        factor_value_token=corrupt_value_token,
         factor_source=factor_source,
         progress=progress,
         update_running_stats=False,

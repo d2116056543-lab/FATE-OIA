@@ -81,7 +81,7 @@ loss_weights:
   action_cardinality: 0.02
   action_specificity: 0.05
   action_identity: 0.03
-  action_anti_monopoly: 0.01
+  action_anti_monopoly: 0.05
   action_near_boundary: 0.03
   reason_identity: 0.03
   reason_final: 1.00

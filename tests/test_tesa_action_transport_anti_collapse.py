@@ -3,7 +3,9 @@ import torch
 from fate_oia.losses import meter_action_losses, meter_counterfactual_losses
 from fate_oia.losses.meter_action_losses import meter_action_loss
 from fate_oia.losses.meter_counterfactual_losses import identity_corruption_loss
+from fate_oia.models.meter_schema import default_meter_factor_schema
 from fate_oia.models.meter_semantic_action import FactorSpecificActionTransport
+from fate_oia.models.meter_signed_factors import TypedEvidenceStateHead
 
 
 def _transport() -> FactorSpecificActionTransport:
@@ -178,3 +180,92 @@ def test_action_specificity_resolved_once_and_legacy_default_is_compatible() -> 
     torch.testing.assert_close(result["specificity"], torch.tensor(2.0))
     legacy = meter_action_loss({k: v for k, v in output.items() if k != "action_specificity_loss"}, torch.zeros(2, 4), weights)
     torch.testing.assert_close(legacy["specificity"], torch.zeros(()))
+
+
+def test_schema_exposes_action_specific_factor_ownership() -> None:
+    schema = default_meter_factor_schema()
+    ownership = torch.tensor(schema.action_ownership)
+    assert ownership.shape == (4, 21)
+    # Follow-traffic is meaningful for longitudinal actions, not lateral ones.
+    assert ownership[0, 1] > 0
+    assert ownership[1, 1] > 0
+    assert ownership[2, 1] == 0
+    assert ownership[3, 1] == 0
+    # Directional factors remain available only to their matching action.
+    assert ownership[2, 12] > 0
+    assert ownership[2, 18] == 0
+    assert ownership[3, 18] > 0
+    assert ownership[3, 12] == 0
+
+
+def test_action_local_token_excludes_global_semantic_shortcut() -> None:
+    head = TypedEvidenceStateHead(dim=8, factor_dim=21)
+    anchor = torch.randn(2, 21, 8)
+    state = torch.softmax(torch.randn(2, 21, 3), dim=-1)
+    first = head.compose_action_token(anchor, state)
+    second = head.compose_action_token(anchor, state)
+    torch.testing.assert_close(first, second)
+    assert first.shape == (2, 21, 8)
+
+
+def test_action_specific_ownership_blocks_global_factor_monopoly() -> None:
+    module = _transport()
+    with torch.no_grad():
+        module.action_factor_compatibility.zero_()
+        module.action_factor_compatibility[:, 1] = 30.0
+    ownership = torch.ones(4, 4)
+    ownership[2:, 1] = 0.0
+    output = module(
+        torch.zeros(1, 4),
+        torch.randn(1, 4, 8),
+        torch.randn(1, 4, 8),
+        torch.ones(1, 4),
+        ownership,
+        factor_source=torch.ones(1, 4),
+        progress=1.0,
+    )
+    assert output["action_factor_weights"][0, :2, 1].gt(0).all()
+    assert output["action_factor_weights"][0, 2:, 1].eq(0).all()
+
+
+def test_exploration_floor_preserves_multiple_source_eligible_routes() -> None:
+    module = _transport()
+    with torch.no_grad():
+        module.action_factor_compatibility.fill_(-30.0)
+        module.action_factor_compatibility[:, 0] = 30.0
+    output = module(
+        torch.zeros(1, 4),
+        torch.randn(1, 4, 8),
+        torch.randn(1, 4, 8),
+        torch.ones(1, 4),
+        torch.ones(4, 4),
+        factor_source=torch.ones(1, 4),
+        progress=1.0,
+    )
+    weights = output["action_factor_weights"]
+    assert weights[..., 1:].sum(-1).gt(0.02).all()
+    assert (weights > 0).sum(-1).ge(2).all()
+
+
+def test_pre_sparse_anti_monopoly_restores_gradient_to_alternative_route() -> None:
+    module = _transport()
+    with torch.no_grad():
+        module.action_factor_compatibility.fill_(-12.0)
+        module.action_factor_compatibility[:, 0] = 12.0
+    output = module(
+        torch.zeros(1, 4),
+        torch.randn(1, 4, 8),
+        torch.randn(1, 4, 8),
+        torch.ones(1, 4),
+        torch.ones(4, 4),
+        factor_source=torch.ones(1, 4),
+        progress=1.0,
+    )
+    loss = meter_action_losses.action_transport_anti_monopoly_loss(
+        output["action_factor_dense_weights"],
+        output["action_factor_source_mask"],
+    )
+    loss.backward()
+    assert loss > 0
+    assert module.action_factor_compatibility.grad is not None
+    assert module.action_factor_compatibility.grad[:, 1:].abs().sum() > 0

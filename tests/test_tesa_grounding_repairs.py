@@ -23,7 +23,7 @@ def test_typed_head_uses_runtime_schema_for_ownership_and_groundability(tmp_path
     schema = _schema_copy_with_overrides(tmp_path)
     head = TypedEvidenceStateHead(dim=8, schema_path=schema)
 
-    assert head.action_ownership[0].item() == 0.25
+    assert head.action_ownership[:, 0].max().item() == 0.25
     assert head.groundable_mask[1].item() == 0.0
 
 

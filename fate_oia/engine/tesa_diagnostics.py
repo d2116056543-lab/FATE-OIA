@@ -310,7 +310,10 @@ def run_stratified_patch_audit(
                 predicted_actions = torch.topk(action_logits, k=2).indices
             selected_actions = [int(value) for value in predicted_actions.tolist()]
             contributions = clean["action_factor_contributions"][sample]
+            route_weights = clean.get("action_factor_weights")
             allowed = clean["factor_action_ownership"].to(contributions) > 0
+            if allowed.ndim == 1:
+                allowed = allowed.unsqueeze(0).expand(contributions.shape[0], -1)
             groundable = clean["factor_groundable_mask"].to(contributions) > 0.5
             grounding = batch.get("meter_grounding", {})
             if isinstance(grounding, dict) and {
@@ -330,7 +333,7 @@ def run_stratified_patch_audit(
             )
             factors_by_action: dict[int, list[int]] = {}
             for action in selected_actions:
-                eligible = source_eligible & allowed
+                eligible = source_eligible & allowed[action]
                 top_count = min(int(factors_per_action), int(eligible.sum()))
                 if top_count == 0:
                     factors_by_action[int(action)] = []
@@ -390,6 +393,24 @@ def run_stratified_patch_audit(
                             "selection_mode": "model_top_predicted_action",
                             "clean_action_logit": float(clean_logit),
                             "factor_contribution": float(contribution),
+                            "schema_compatible": bool(allowed[action, factor]),
+                            "source_eligible": bool(source_eligible[factor]),
+                            "pred_observable": float(
+                                clean["factor_observability"][sample, factor]
+                            ),
+                            "route_weight": float(
+                                route_weights[sample, action, factor]
+                                if isinstance(route_weights, Tensor)
+                                else contribution.abs()
+                            ),
+                            "route_nonzero": bool(
+                                (
+                                    route_weights[sample, action, factor]
+                                    if isinstance(route_weights, Tensor)
+                                    else contribution.abs()
+                                )
+                                > 0
+                            ),
                             "selected_effect": float(selected_effect),
                             "control_effect": float(control_effect),
                             "selected_minus_control": float(

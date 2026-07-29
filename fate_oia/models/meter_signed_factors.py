@@ -72,7 +72,11 @@ class TypedEvidenceStateHead(nn.Module):
         self.null_bias = nn.Parameter(torch.zeros(factor_dim))
         self.global_proj = nn.Linear(dim, dim)
         self.anchor_proj = nn.Linear(dim, dim)
+        self.action_anchor_proj = nn.Linear(dim, dim)
         self.state_embeddings = nn.Parameter(
+            torch.randn(factor_dim, self.max_states, dim) * 0.02
+        )
+        self.action_state_embeddings = nn.Parameter(
             torch.randn(factor_dim, self.max_states, dim) * 0.02
         )
         self.state_weight = nn.Parameter(
@@ -82,6 +86,8 @@ class TypedEvidenceStateHead(nn.Module):
         self.obs_head = nn.Parameter(torch.randn(factor_dim, dim * 2 + 2) * 0.02)
         self.obs_bias = nn.Parameter(torch.zeros(factor_dim))
         self.typed_norm = nn.LayerNorm(dim)
+        self.action_route_norm = nn.LayerNorm(dim)
+        self.action_value_norm = nn.LayerNorm(dim)
         self.schema_sha256 = schema.sha256
         self.mirror_pairs = schema.mirror_pairs
 
@@ -116,6 +122,23 @@ class TypedEvidenceStateHead(nn.Module):
         return self.typed_norm(
             global_token + self.anchor_proj(anchor_token) + state_token
         )
+
+    def compose_action_token(
+        self,
+        anchor_token: Tensor,
+        state_prob: Tensor,
+    ) -> Tensor:
+        """Compose action routing evidence without the global semantic shortcut."""
+        state_token = torch.einsum(
+            "bfs,fsd->bfd", state_prob, self.action_state_embeddings
+        )
+        return self.action_route_norm(
+            self.action_anchor_proj(anchor_token) + state_token
+        )
+
+    def compose_action_value_token(self, anchor_token: Tensor) -> Tensor:
+        """Keep the transported action value causally tied to local patches."""
+        return self.action_value_norm(self.action_anchor_proj(anchor_token))
 
     def forward(
         self,
@@ -193,6 +216,8 @@ class TypedEvidenceStateHead(nn.Module):
         typed_token = self.compose_typed_token(
             global_token, anchor_token, state_prob
         )
+        action_token = self.compose_action_token(anchor_token, state_prob)
+        action_value_token = self.compose_action_value_token(anchor_token)
         return {
             "factor_anchor_map": anchor_map,
             "factor_null_mass": null_mass,
@@ -207,6 +232,8 @@ class TypedEvidenceStateHead(nn.Module):
             "factor_observability": observability,
             "factor_reliability": reliability,
             "factor_typed_token": typed_token,
+            "factor_action_token": action_token,
+            "factor_action_value_token": action_value_token,
             "factor_layer_weights": layer_weight,
             "factor_action_ownership": self.action_ownership,
             "factor_groundable_mask": self.groundable_mask,

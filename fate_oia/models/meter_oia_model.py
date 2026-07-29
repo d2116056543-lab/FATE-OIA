@@ -17,6 +17,8 @@ def cross_sample_swap_typed_evidence(
 ) -> dict[str, Tensor]:
     keys = (
         "factor_typed_token",
+        "factor_action_token",
+        "factor_action_value_token",
         "factor_state_prob",
         "factor_reliability",
         "factor_observability",
@@ -102,6 +104,8 @@ class METEROIAModel(nn.Module):
             progress=progress,
         )
         factor_token = factors["factor_typed_token"]
+        factor_action_token = factors["factor_action_token"]
+        factor_action_value_token = factors["factor_action_value_token"]
         reliability = factors["factor_reliability"]
         state_prob = factors["factor_state_prob"]
         if "factor_off" in diagnostic_modes:
@@ -115,11 +119,20 @@ class METEROIAModel(nn.Module):
                 factors["factor_anchor_token"],
                 state_prob,
             )
+            factor_action_token = self.typed_factors.compose_action_token(
+                factors["factor_anchor_token"], state_prob
+            )
         if "schema_corruption" in diagnostic_modes:
             factor_token = torch.roll(factor_token, 1, 1)
+            factor_action_token = torch.roll(factor_action_token, 1, 1)
+            factor_action_value_token = torch.roll(
+                factor_action_value_token, 1, 1
+            )
         if "cross_sample_swap" in diagnostic_modes and factor_token.shape[0] > 1:
             swapped = cross_sample_swap_typed_evidence(factors)
             factor_token = swapped["factor_typed_token"]
+            factor_action_token = swapped["factor_action_token"]
+            factor_action_value_token = swapped["factor_action_value_token"]
             state_prob = swapped["factor_state_prob"]
             reliability = swapped["factor_reliability"]
         if "state_corruption" in diagnostic_modes:
@@ -129,13 +142,17 @@ class METEROIAModel(nn.Module):
                 factors["factor_anchor_token"],
                 state_prob,
             )
+            factor_action_token = self.typed_factors.compose_action_token(
+                factors["factor_anchor_token"], state_prob
+            )
         after_factor = stamp()
         action = self.action_transport(
             base["action_logits_calalign"],
             base["action_nodes"],
-            factor_token,
+            factor_action_token,
             reliability,
             factors["factor_action_ownership"],
+            factor_value_token=factor_action_value_token,
             factor_source=factors["factor_observability"],
             progress=progress,
             update_running_stats=update_semantic_stats,
@@ -154,20 +171,26 @@ class METEROIAModel(nn.Module):
             selected_factor = action["action_factor_weights"][
                 :, targeted_schema_action
             ].argmax(-1)
-            corrupted_token = factor_token.clone()
-            rolled_token = torch.roll(factor_token, 1, 1)
+            corrupted_token = factor_action_token.clone()
+            corrupted_value_token = factor_action_value_token.clone()
+            rolled_token = torch.roll(factor_action_token, 1, 1)
+            rolled_value_token = torch.roll(factor_action_value_token, 1, 1)
             batch_index = torch.arange(
                 factor_token.shape[0], device=factor_token.device
             )
             corrupted_token[batch_index, selected_factor] = rolled_token[
                 batch_index, selected_factor
             ]
+            corrupted_value_token[batch_index, selected_factor] = (
+                rolled_value_token[batch_index, selected_factor]
+            )
             action = self.action_transport(
                 base["action_logits_calalign"],
                 base["action_nodes"],
                 corrupted_token,
                 reliability,
                 factors["factor_action_ownership"],
+                factor_value_token=corrupted_value_token,
                 factor_source=factors["factor_observability"],
                 progress=progress,
                 update_running_stats=False,
@@ -198,6 +221,8 @@ class METEROIAModel(nn.Module):
             **action,
             **reason,
             "factor_typed_token": factor_token,
+            "factor_action_token": factor_action_token,
+            "factor_action_value_token": factor_action_value_token,
             "factor_state_prob": state_prob,
             "factor_state_prob_effective": state_prob,
             "reason_logits_pu_private": reason["reason_logits_final"],

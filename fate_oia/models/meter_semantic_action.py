@@ -17,6 +17,7 @@ class FactorSpecificActionTransport(nn.Module):
         rank: int = 16,
         rms_momentum: float = 0.95,
         reliability_floor: float = 0.10,
+        exploration_mass: float = 0.05,
     ) -> None:
         super().__init__()
         self.dim = int(dim)
@@ -25,8 +26,11 @@ class FactorSpecificActionTransport(nn.Module):
         self.rank = int(rank)
         self.rms_momentum = float(rms_momentum)
         self.reliability_floor = float(reliability_floor)
+        self.exploration_mass = float(exploration_mass)
         if not 0.0 <= self.reliability_floor <= 1.0:
             raise ValueError("reliability_floor must be in [0, 1]")
+        if not 0.0 <= self.exploration_mass < 1.0:
+            raise ValueError("exploration_mass must be in [0, 1)")
         self.action_query = nn.Linear(dim, dim)
         self.factor_key = nn.Parameter(torch.randn(factor_dim, dim, dim) * 0.01)
         self.type_bias = nn.Parameter(torch.zeros(action_dim, factor_dim))
@@ -53,6 +57,7 @@ class FactorSpecificActionTransport(nn.Module):
         factor_reliability: Tensor,
         factor_action_ownership: Tensor,
         *,
+        factor_value_token: Tensor | None = None,
         factor_source: Tensor | None = None,
         progress: float = 1.0,
         update_running_stats: bool = False,
@@ -68,6 +73,8 @@ class FactorSpecificActionTransport(nn.Module):
             1.0 - self.reliability_floor
         ) * reliability
         source_reliability = source * effective_reliability
+        if factor_value_token is None:
+            factor_value_token = factor_typed_token
         query = self.action_query(action_nodes)
         factor_key = torch.einsum(
             "brd,rde->bre", factor_typed_token, self.factor_key
@@ -77,7 +84,12 @@ class FactorSpecificActionTransport(nn.Module):
             + self.type_bias
             + self.action_factor_compatibility
         )
-        owner = factor_action_ownership.to(score).view(1, 1, -1)
+        owner = factor_action_ownership.to(score)
+        if owner.ndim == 1:
+            owner = owner.unsqueeze(0).expand(self.action_dim, -1)
+        if owner.shape != (self.action_dim, self.factor_dim):
+            raise ValueError("factor_action_ownership must be [F] or [A,F]")
+        owner = owner.unsqueeze(0)
         allowed = owner > 0
         source_available = source.gt(0.05).unsqueeze(1)
         allowed = allowed & source_available
@@ -93,9 +105,21 @@ class FactorSpecificActionTransport(nn.Module):
         sparse = entmax15_bisect(full_score, dim=-1)
         ramp = self._ramp(progress)
         full_weight = dense * (1.0 - ramp) + sparse * ramp
+        dense_factor_weight = dense[..., :-1] * allowed.to(score.dtype)
         factor_weight = full_weight[..., :-1] * allowed.to(score.dtype)
         null_weight = full_weight[..., -1]
-        low = torch.einsum("brd,rkd->brk", factor_typed_token, self.factor_down)
+        # Preserve a small source-aware route floor after entmax. This keeps
+        # eligible alternatives trainable without assigning mass to absent or
+        # action-incompatible factors.
+        route_prior = owner * source_reliability.unsqueeze(1)
+        route_prior = route_prior / route_prior.sum(-1, keepdim=True).clamp_min(1e-8)
+        factor_mass = factor_weight.sum(-1, keepdim=True)
+        exploration = self.exploration_mass * ramp
+        factor_weight = (
+            (1.0 - exploration) * factor_weight
+            + exploration * factor_mass * route_prior
+        )
+        low = torch.einsum("brd,rkd->brk", factor_value_token, self.factor_down)
         projected = torch.einsum("brk,rdk->brd", low, self.factor_up)
         factor_value = torch.einsum("bad,brd->bar", query, projected)
         raw_contributions = (
@@ -135,6 +159,7 @@ class FactorSpecificActionTransport(nn.Module):
             "action_evidence_delta": evidence_delta,
             "action_logits_final": final,
             "action_factor_weights": factor_weight,
+            "action_factor_dense_weights": dense_factor_weight,
             "action_null_factor_weight": null_weight,
             "action_factor_values": factor_value,
             "action_factor_contributions": contributions,
