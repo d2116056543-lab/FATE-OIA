@@ -53,24 +53,40 @@ def _finite(value: Any) -> bool:
 
 def _pu_gate_pass(dynamic: dict[str, Any], pu: dict[str, Any]) -> bool:
     active = [int(value) for value in pu.get("active_labels", [])]
+    raw_rows = [
+        row for row in pu.get("labels", []) if isinstance(row, dict)
+    ]
     rows = {
         int(row["label_id"]): row
-        for row in pu.get("labels", [])
-        if isinstance(row, dict) and "label_id" in row
+        for row in raw_rows
+        if "label_id" in row
     }
     lambdas = pu.get("lambda", [])
+    lambda_active = {
+        label
+        for label, value in enumerate(lambdas)
+        if float(value) > 0.0
+    }
     return (
         bool(dynamic.get("pu_zero_exact"))
         and bool(dynamic.get("pu_active_private_only"))
         and bool(active)
         and len(lambdas) == 21
         and all(0.0 <= float(value) <= 0.15 for value in lambdas)
+        and len(active) == len(set(active))
+        and set(active) == lambda_active
+        and len(rows) == len(raw_rows)
         and all(label in rows for label in active)
         and all(
             bool(rows[label].get("eligible"))
             and float(rows[label].get("lcb95", 0.0)) > 0.0
             and float(rows[label].get("lambda", 0.0)) > 0.0
             and float(lambdas[label]) > 0.0
+            and abs(
+                float(rows[label].get("lambda", 0.0))
+                - float(lambdas[label])
+            )
+            < 1e-8
             for label in active
         )
     )
@@ -176,7 +192,7 @@ def evaluate_pilot(
                 float(target) >= float(wrong) + 0.001
                 for target, wrong in zip(identity_target, identity_wrong)
             )
-            >= 3
+            == 4
         ),
         "D": (
             float(final_reason["Exp_mAP"])

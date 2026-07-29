@@ -120,3 +120,18 @@ def test_artifact_validator_rejects_nested_shape_and_nan(tmp_path) -> None:
 
     failures = validate_epoch_artifacts(tmp_path)
     assert "typed_evidence.json:mechanism_schema" in failures
+
+
+def test_artifact_validator_rejects_inconsistent_identity_derivatives(tmp_path) -> None:
+    test_artifact_validator_checks_shapes_alignment_and_finite(tmp_path)
+    torch.save(torch.zeros(2, 4), tmp_path / "logits_action_final_raw_test.pt")
+    torch.save(torch.zeros(2, 21), tmp_path / "labels_reason_test.pt")
+    typed_path = tmp_path / "typed_evidence.json"
+    typed = json.loads(typed_path.read_text(encoding="utf-8"))
+    typed["identity_ap_delta_matrix"][0][0] = 0.5
+    typed_path.write_text(json.dumps(typed), encoding="utf-8")
+
+    assert (
+        "typed_evidence.json:mechanism_schema"
+        in validate_epoch_artifacts(tmp_path)
+    )

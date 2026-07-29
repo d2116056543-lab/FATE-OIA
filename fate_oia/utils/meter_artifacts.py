@@ -323,6 +323,11 @@ def validate_epoch_artifacts(directory: str | Path) -> list[str]:
         and isinstance(identity_matrix, list)
         and len(identity_matrix) == 4
         and all(isinstance(row, list) and len(row) == 4 for row in identity_matrix)
+        and all(
+            isinstance(value, (int, float)) and math.isfinite(float(value))
+            for row in identity_matrix or []
+            for value in row
+        )
     )
     numeric_vectors = (
         "identity_target_delta",
@@ -339,6 +344,30 @@ def validate_epoch_artifacts(directory: str | Path) -> list[str]:
         for key in numeric_vectors
         if isinstance(typed.get(key), list)
     )
+    if typed_valid:
+        expected_target = [
+            float(identity_matrix[action][action]) for action in range(4)
+        ]
+        expected_wrong = [
+            sum(
+                abs(float(identity_matrix[target][action]))
+                for action in range(4)
+                if action != target
+            )
+            / 3.0
+            for target in range(4)
+        ]
+        typed_valid = all(
+            abs(float(actual) - expected) < 1e-8
+            for actual, expected in zip(
+                typed["identity_target_delta"], expected_target
+            )
+        ) and all(
+            abs(float(actual) - expected) < 1e-8
+            for actual, expected in zip(
+                typed["identity_wrong_delta"], expected_wrong
+            )
+        )
     train_audit = typed.get("train_audit", {})
     patch_audit = typed.get("patch_audit", {})
     typed_valid = (

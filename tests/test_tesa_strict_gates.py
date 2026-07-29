@@ -45,6 +45,13 @@ def test_pu_gate_requires_one_valid_record_for_every_active_label():
     )
     assert pilot._pu_gate_pass(dynamic, pu)
 
+    pu["active_labels"] = [3]
+    assert not pilot._pu_gate_pass(dynamic, pu)
+
+    pu["active_labels"] = [3, 7]
+    pu["labels"][1]["lambda"] = 0.02
+    assert not pilot._pu_gate_pass(dynamic, pu)
+
 
 def test_strict_artifact_numbers_must_be_finite():
     assert pilot._finite(0.0)
