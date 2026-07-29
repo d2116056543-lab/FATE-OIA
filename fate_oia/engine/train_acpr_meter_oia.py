@@ -983,6 +983,9 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                 "loss_action_near_boundary": float(
                     parts["action"]["near_boundary"].detach()
                 ),
+                "loss_action_delta_ranking": float(
+                    parts["action"]["delta_ranking"].detach()
+                ),
                 "loss_identity": float(parts["identity"].detach()),
                 "loss_pu": float(parts["pu"].detach()),
                 "grounding_ramp": grounding_ramp,

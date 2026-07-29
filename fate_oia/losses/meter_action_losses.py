@@ -47,6 +47,29 @@ def action_transport_anti_monopoly_loss(
     return dominance[valid].mean()
 
 
+def action_delta_pairwise_ranking_loss(
+    action_evidence_delta: Tensor,
+    target: Tensor,
+    *,
+    margin: float = 0.02,
+) -> Tensor:
+    """Require evidence deltas to rank positives above negatives per action."""
+    terms: list[Tensor] = []
+    for action_id in range(action_evidence_delta.shape[1]):
+        positive = target[:, action_id] > 0.5
+        negative = ~positive
+        if not bool(positive.any()) or not bool(negative.any()):
+            continue
+        difference = (
+            action_evidence_delta[positive, action_id].unsqueeze(1)
+            - action_evidence_delta[negative, action_id].unsqueeze(0)
+        )
+        terms.append(torch.relu(float(margin) - difference).mean())
+    if not terms:
+        return action_evidence_delta.new_zeros(())
+    return torch.stack(terms).mean()
+
+
 def meter_action_loss(
     output: dict[str, Tensor],
     target: Tensor,
@@ -106,6 +129,10 @@ def meter_action_loss(
             output["action_logits_final"] - output["action_logits_visual"],
             target,
         )
+    delta_ranking = action_delta_pairwise_ranking_loss(
+        output["action_logits_final"] - output["action_logits_visual"],
+        target,
+    )
     total = (
         weights.get("action_final", 1.00) * final
         + weights.get("action_visual", 0.35) * visual
@@ -117,6 +144,7 @@ def meter_action_loss(
         + weights.get("action_identity", 0.03) * identity
         + weights.get("action_anti_monopoly", 0.0) * anti_monopoly
         + weights.get("action_near_boundary", 0.0) * near_boundary
+        + weights.get("action_delta_ranking", 0.0) * delta_ranking
     )
     return {
         "final": final,
@@ -129,6 +157,7 @@ def meter_action_loss(
         "identity": identity,
         "anti_monopoly": anti_monopoly,
         "near_boundary": near_boundary,
+        "delta_ranking": delta_ranking,
         "total": total,
     }
 

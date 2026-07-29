@@ -285,3 +285,49 @@ def test_pre_sparse_anti_monopoly_restores_gradient_to_alternative_route() -> No
     assert loss > 0
     assert module.action_factor_compatibility.grad is not None
     assert module.action_factor_compatibility.grad[:, 1:].abs().sum() > 0
+
+
+def test_action_transport_does_not_rewrite_baseline_action_nodes() -> None:
+    module = _transport()
+    action_nodes = torch.randn(4, 4, 8, requires_grad=True)
+    output = module(
+        torch.zeros(4, 4),
+        action_nodes,
+        torch.randn(4, 4, 8),
+        torch.ones(4, 4),
+        torch.ones(4, 4),
+        factor_source=torch.ones(4, 4),
+        progress=1.0,
+    )
+    output["action_evidence_delta"].sum().backward()
+    assert action_nodes.grad is None or action_nodes.grad.eq(0).all()
+    assert module.action_query.weight.grad is not None
+    assert module.action_query.weight.grad.abs().sum() > 0
+
+
+def test_delta_pairwise_ranking_rewards_sample_discrimination() -> None:
+    target = torch.tensor(
+        [
+            [1.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [0.0, 1.0],
+        ]
+    )
+    ranked = torch.tensor(
+        [
+            [0.8, -0.8],
+            [0.6, -0.6],
+            [-0.6, 0.6],
+            [-0.8, 0.8],
+        ]
+    )
+    reversed_delta = -ranked
+    good = meter_action_losses.action_delta_pairwise_ranking_loss(
+        ranked, target
+    )
+    bad = meter_action_losses.action_delta_pairwise_ranking_loss(
+        reversed_delta, target
+    )
+    assert good < 1e-6
+    assert bad > 0.5

@@ -75,7 +75,9 @@ class FactorSpecificActionTransport(nn.Module):
         source_reliability = source * effective_reliability
         if factor_value_token is None:
             factor_value_token = factor_typed_token
-        query = self.action_query(action_nodes)
+        # Transport is an additive action-only reader. Its auxiliary objectives
+        # must not rewrite the baseline visual action representation.
+        query = self.action_query(action_nodes.detach())
         factor_key = torch.einsum(
             "brd,rde->bre", factor_typed_token, self.factor_key
         )
