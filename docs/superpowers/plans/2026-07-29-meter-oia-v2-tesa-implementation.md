@@ -54,3 +54,56 @@
 - The source plan is authoritative.
 - Approximate formulas, placeholder artifacts, aggregate-only factor reports, and source-string-only audits are not acceptable.
 - Any technical deviation must be recorded in the supervision log before implementation and must preserve the same scientific contract.
+
+## Required Test Traceability
+
+| Test | Feature IDs | Hard assertion |
+|---|---|---|
+| `test_tesa_factor_schema_types.py` | F03/F15 | exact IDs/names/types/states/sources/groundability/owners/observability/mirrors/counter flag |
+| `test_tesa_anchor_normalization.py` | F04 | patches+null sum one; finite sparse grad |
+| `test_tesa_state_cardinality.py` | F05 | factor-specific masked cardinality |
+| `test_tesa_unknown_not_negative.py` | F05/F08/F09 | unknown exact-zero CE gradient; source-weighted anchor NLL/Dice |
+| `test_tesa_observability_noncollapse.py` | F06/F08/F10 | exact rho; train-only factor tau; same-region and mirror formulas |
+| `test_tesa_factor_specific_projection.py` | F11 | factor-index rank-16 projections |
+| `test_tesa_additive_action_identity.py` | F11/F12 | exact bounded additive reconstruction |
+| `test_tesa_additive_action_identity.py` | F11/F12 | non-owned weight/contribution/gradient exact zero; no hand-written compatibility mask |
+| `test_tesa_no_selector_in_formal_path.py` | F13 | no selector/regret parameters or outputs |
+| `test_tesa_reason_global_equivalence.py` | F14 | correction-off equals global |
+| `test_tesa_reason_correction_groundability.py` | F14/F15 | rho/mask bounded correction |
+| `test_tesa_latent_reason_no_fake_grounding.py` | F15 | factors 14/20 exact-zero correction |
+| `test_tesa_reason_firewall.py` | F16 | reason/PU cannot reach factor/action |
+| `test_tesa_identity_schema_corruption.py` | F20 | schema-token association corruption |
+| `test_tesa_cross_sample_factor_swap.py` | F20 | same-ID swap retains target query |
+| `test_tesa_state_corruption.py` | F20 | state corrupts with anchor fixed |
+| `test_tesa_dense_intervention_coverage.py` | F19 | three exact objectives and coverage |
+| `test_tesa_patch_audit_all_samples.py` | F21 | all eligible targets per sample |
+| `test_tesa_patch_audit_unique_ids.py` | F21 | exactly 128 unique IDs |
+| `test_tesa_sequential_eval_memory.py` | F24 | fixed order and released tensors |
+| `test_tesa_pu_private_only.py` | F22/F16 | admission and exact gradient ownership |
+| `test_tesa_progress_zero_equivalence.py` | F02/F26 | three errors below 1e-6 |
+| `test_tesa_resume_equivalence.py` | F26/F27 | model/optimizer/ramp equivalence |
+| `test_tesa_artifact_contract.py` | F23/F25/F28/F30 | train-calib-only update; threshold/shrinkage/fallback artifacts; complete fields and gates |
+
+## Required Artifact Fields
+
+Per epoch, save action visual/final logits, per-action F1/AP/AUC, correction
+RMS, per-factor contribution and sparse weight, identity/factor-off/state-off
+deltas; reason global/final logits, per-label F1/AP/AUC, correction RMS,
+groundable/latent metrics, PU state, correction-off and identity deltas; typed
+anchor entropy/null/observability/state entropy/confusion/source coverage/
+wrong-factor margin/mirror; intervention correct/wrong/swap/patch effects,
+latest and cumulative unique IDs and action/factor coverage; and data/DINO/
+foundation/factor/action/reason/backward/eval-mode timings, memory, and DINO
+call count. Aggregate-only factor output is invalid.
+
+Calibration artifacts required by F23/F25/F28 are raw metrics, deploy metrics,
+temperature, threshold vector, train-calib raw/deploy joint,
+group/per-label-shrinkage state, and fallback reason.
+
+F02 additionally freezes label-specific patch retrieval, 25-token
+self-attention, predicate/category interaction, and progress-zero
+action/reason-global/label-node equivalence. Merely preserving 25 query
+parameters is insufficient.
+
+All exact formula, weight, ownership, ramp, augmentation, pilot, gate, and
+full-train values in the frozen design are normative parts of F01-F30.

@@ -2,9 +2,9 @@
 
 **日期：** 2026-07-29  
 **任务：** 基于 METER-OIA V1 clean pilot 实现 V2/TESA，完整覆盖用户计划，禁止部分实现、占位实现和逻辑冲突。  
-**状态：** 规划与监督审查中  
+**状态：** 最终设计复审 `APPROVED`，允许进入 TDD 实现  
 **主执行端：** 当前 Codex 主会话  
-**监督端：** 尚未创建
+**监督端：** `Goodall` (`019face0-6b68-7203-92bb-0101aaa58bb5`)
 
 ## 1. 原始请求
 
@@ -38,7 +38,7 @@
 
 `docs/superpowers/plans/2026-07-29-meter-oia-v2-tesa-implementation.md`
 
-**覆盖结论：** 用户计划中的结构、公式、所有权、训练协议、诊断、测试与 gate 均已有明确实现位置和验证方法。
+**覆盖结论：** 第一轮摘要矩阵不足；现已补齐精确公式、21-factor 语义、梯度所有权、固定权重、ramp、artifact、Gate A-H 数值和 23 项测试映射，等待复审。
 
 ## 5. 用户计划保真矩阵
 
@@ -55,32 +55,36 @@
 | 20-21 full/diagnostics | 是 | F25/F28/F30 | 原样保留 | artifact schema |
 | 22-24 code/tests/order | 是 | 全部 | 原样保留 | coverage matrix 状态 |
 
-**保真结论：** 当前没有简化、替换或跳过用户计划项。
+**保真结论：** 第一轮结论为 `CHANGES_REQUIRED`；补丁完成但复审前仍禁止执行。
 
 ## 6. 监督审查
 
-**是否已发送给监督端：** 否  
-**审查结果：** 等待监督端审查  
-**是否允许进入执行：** 否
+**是否已发送给监督端：** 是  
+**发送内容：** 原始计划、GPTPro 补充文本、冻结设计、实现计划、F01-F30 覆盖矩阵  
+**审查结果：** 最终 `APPROVED`  
+**是否允许进入执行：** 是，仅允许 TDD 实现；full train 仍需全部测试、审计、profile 和 pilot A-H
 
 ## 7. 计划修订
 
-**监督结果是否已传回执行端：** 否  
-**已采纳：** 等待审查  
+**监督结果是否已传回执行端：** 是  
+**已采纳：** 前两轮全部意见及第三轮 4 项全部采纳；第三轮消除人工 action compatibility 歧义，恢复 factor-specific train-only tau，加入 source-weighted grounding masks，并把 grounding/calibration 硬断言映射到测试。  
 **未采纳及理由：** 无
 
 ## 8. 复审轮次
 
 | 轮次 | 发送内容 | 监督结论 | 允许执行 | 剩余问题 |
 |---|---|---|---|---|
-| 1 | 待发送 | 待审查 | 否 | 待审查 |
+| 1 | 原始计划 + 冻结设计 + F01-F30 覆盖矩阵 | CHANGES_REQUIRED | 否 | 公式、权重、所有权、Gate、artifact 和测试映射不足 |
+| 2 | 第一轮全部补丁后的冻结设计与追踪矩阵 | CHANGES_REQUIRED | 否 | ownership mask、完整 schema、grounding、3 个 gate、calibration artifact、foundation 保护 |
+| 3 | 第二轮全部补丁后的冻结设计与追踪矩阵 | CHANGES_REQUIRED | 否 | 人工 compatibility 歧义、tau、source weight、测试映射 |
+| 4 | 第三轮全部补丁后的冻结设计与追踪矩阵 | APPROVED | 是 | 代码实现与动态验证尚未完成 |
 
-**最新监督状态：** 待审查
+**最新监督状态：** 设计与执行计划最终批准；进入 TDD 实现
 
 ## 9. 执行交接
 
-**是否已发送给执行端：** 否  
-**交接内容：** 监督批准后填写。
+**是否已发送给执行端：** 是  
+**交接内容：** 严格按冻结设计、F01-F30 和 23 项测试追踪实现；不得启动训练。
 
 ## 10. 执行合规检查
 
