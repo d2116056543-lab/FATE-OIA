@@ -183,14 +183,34 @@ def _mechanism_ramps(step: int, total_updates: int) -> tuple[float, float]:
 
 
 def _identity_output(
-    model: METEROIAModel, output: dict[str, Any], progress: float
+    model: METEROIAModel,
+    output: dict[str, Any],
+    progress: float,
+    mode: str,
 ) -> dict[str, Tensor]:
-    corrupt_token = torch.roll(output["factor_typed_token"], 1, 1)
+    reliability = output["factor_reliability"]
+    if mode == "schema":
+        corrupt_token = torch.roll(output["factor_typed_token"], 1, 1)
+    elif mode == "cross_sample":
+        if output["factor_typed_token"].shape[0] < 2:
+            corrupt_token = output["factor_typed_token"]
+        else:
+            corrupt_token = torch.roll(output["factor_typed_token"], 1, 0)
+            reliability = torch.roll(reliability, 1, 0)
+    elif mode == "state":
+        corrupt_state = torch.roll(output["factor_state_prob"], 1, -1)
+        corrupt_token = model.typed_factors.compose_typed_token(
+            output["factor_global_token"],
+            output["factor_anchor_token"],
+            corrupt_state,
+        )
+    else:
+        raise ValueError(f"Unknown identity corruption mode: {mode}")
     return model.action_transport(
         output["action_logits_visual"],
         output["action_nodes"],
         corrupt_token,
-        output["factor_reliability"],
+        reliability,
         output["factor_action_ownership"],
         progress=progress,
         update_running_stats=False,
@@ -214,25 +234,52 @@ def _compute_losses(
         output["action_factor_contributions"],
         action_target,
     )
-    corrupt = _identity_output(model, output, mechanism_ramp)
-    identity = identity_corruption_loss(
-        output["action_factor_contributions"],
-        corrupt["action_factor_contributions"],
-        action_target,
-    )
-    corrupt_reason = model.reason_decoder(
-        patch_tokens_by_layer=output["patch_tokens_by_layer"],
-        reason_logits_calalign=output["reason_logits_calalign"],
-        factor_typed_token=torch.roll(output["factor_typed_token"], 1, 1),
-        factor_reliability=output["factor_reliability"],
-        factor_groundable_mask=output["factor_groundable_mask"],
-        progress=mechanism_ramp,
-    )
-    reason_identity = reason_identity_corruption_loss(
-        output["reason_logits_final"],
-        corrupt_reason["reason_logits_final"],
-        reason_target,
-    )
+    identity_terms: dict[str, Tensor] = {}
+    reason_identity_terms: dict[str, Tensor] = {}
+    for mode in ("schema", "cross_sample", "state"):
+        if mode == "cross_sample" and output["factor_typed_token"].shape[0] < 2:
+            zero = output["action_logits_final"].new_zeros(())
+            identity_terms[mode] = zero
+            reason_identity_terms[mode] = zero
+            continue
+        corrupt = _identity_output(model, output, mechanism_ramp, mode)
+        identity_terms[mode] = identity_corruption_loss(
+            output["action_factor_contributions"],
+            corrupt["action_factor_contributions"],
+            action_target,
+        )
+        corrupt_reliability = output["factor_reliability"]
+        if mode == "schema":
+            corrupt_token = torch.roll(output["factor_typed_token"], 1, 1)
+        elif mode == "cross_sample":
+            corrupt_token = (
+                torch.roll(output["factor_typed_token"], 1, 0)
+                if output["factor_typed_token"].shape[0] > 1
+                else output["factor_typed_token"]
+            )
+            if output["factor_typed_token"].shape[0] > 1:
+                corrupt_reliability = torch.roll(corrupt_reliability, 1, 0)
+        else:
+            corrupt_token = model.typed_factors.compose_typed_token(
+                output["factor_global_token"],
+                output["factor_anchor_token"],
+                torch.roll(output["factor_state_prob"], 1, -1),
+            )
+        corrupt_reason = model.reason_decoder(
+            patch_tokens_by_layer=output["patch_tokens_by_layer"],
+            reason_logits_calalign=output["reason_logits_calalign"],
+            factor_typed_token=corrupt_token,
+            factor_reliability=corrupt_reliability,
+            factor_groundable_mask=output["factor_groundable_mask"],
+            progress=mechanism_ramp,
+        )
+        reason_identity_terms[mode] = reason_identity_corruption_loss(
+            output["reason_logits_final"],
+            corrupt_reason["reason_logits_final"],
+            reason_target,
+        )
+    identity = torch.stack(tuple(identity_terms.values())).mean()
+    reason_identity = torch.stack(tuple(reason_identity_terms.values())).mean()
     output["dense_specificity_loss"] = dense["specificity"] * mechanism_ramp
     output["dense_identity_loss"] = identity * mechanism_ramp
     action = meter_action_loss(output, action_target, config["loss_weights"])
@@ -292,7 +339,9 @@ def _compute_losses(
         "grounding": grounding,
         "dense": dense,
         "identity": identity,
+        "identity_terms": identity_terms,
         "reason_identity": reason_identity,
+        "reason_identity_terms": reason_identity_terms,
         "pu": pu,
         "pu_score": pu_score,
     }
@@ -315,6 +364,7 @@ def _collect_calibration(
     return {
         "action_logits": value["action_final"],
         "reason_logits": value["reason_final"],
+        "reason_global_logits": value["reason_global"],
         "action_labels": value["labels_action"],
         "reason_labels": value["labels_reason"],
         "state_probability": value["mechanism"]["factor_state_prob"],
@@ -376,7 +426,7 @@ def _update_pu(
 ) -> dict[str, Any]:
     value = _collect_calibration(model, loader, device, progress)
     audit = meter_hidden_positive_audit(
-        torch.sigmoid(value["reason_logits"]),
+        torch.sigmoid(value["reason_global_logits"]),
         value["state_probability"][..., 0]
         * value["reliability"]
         * value["observability"],
@@ -850,6 +900,24 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                     parts["dense"]["wrong_effect"].abs().mean()
                 ),
                 "loss_reason_identity": float(parts["reason_identity"].detach()),
+                "loss_identity_schema": float(
+                    parts["identity_terms"]["schema"].detach()
+                ),
+                "loss_identity_cross_sample": float(
+                    parts["identity_terms"]["cross_sample"].detach()
+                ),
+                "loss_identity_state": float(
+                    parts["identity_terms"]["state"].detach()
+                ),
+                "loss_reason_identity_schema": float(
+                    parts["reason_identity_terms"]["schema"].detach()
+                ),
+                "loss_reason_identity_cross_sample": float(
+                    parts["reason_identity_terms"]["cross_sample"].detach()
+                ),
+                "loss_reason_identity_state": float(
+                    parts["reason_identity_terms"]["state"].detach()
+                ),
             }
             epoch_rows.append(row)
             append_jsonl(output_dir / "loss_components.jsonl", row)

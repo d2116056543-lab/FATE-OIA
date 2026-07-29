@@ -77,3 +77,5 @@ def test_training_identity_intervention_includes_reason_corruption() -> None:
     source = inspect.getsource(trainer._compute_losses)
     assert "reason_identity_corruption_loss" in source
     assert "reason_logits_final" in source
+    assert '("schema", "cross_sample", "state")' in source
+    assert "reason_identity_terms" in source
