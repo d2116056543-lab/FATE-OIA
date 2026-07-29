@@ -5,6 +5,7 @@ from PIL import Image
 
 from fate_oia.datasets.meter_typed_targets import METERTypedTargetBuilder
 from fate_oia.losses.meter_grounding_losses import mirror_equivariance_loss
+from fate_oia.losses.meter_grounding_losses import discrimination_and_mirror_loss
 from fate_oia.models.meter_signed_factors import TypedEvidenceStateHead
 
 
@@ -119,3 +120,29 @@ def test_mirror_equivariance_report_requires_paired_forward_outputs():
     loss, report = mirror_equivariance_loss(original, mirrored)
     assert float(loss) > 0.0
     assert report["action_l1"] > 0.0
+
+
+def test_paired_mirror_ignores_scalar_diagnostics_in_model_output():
+    output = {
+        "factor_typed_token": torch.zeros(2, 21, 4),
+        "factor_state_prob": torch.zeros(2, 21, 3),
+        "factor_anchor_map": torch.full((2, 21, 8), 1 / 8),
+        "action_logits_final": torch.zeros(2, 4),
+        "reason_logits_final": torch.zeros(2, 21),
+        "scalar_diagnostic": torch.zeros(()),
+    }
+    mirrored = {
+        key: value[:1].clone()
+        for key, value in output.items()
+        if isinstance(value, torch.Tensor) and value.ndim > 0
+    }
+    targets = {
+        "factor_source_weight": torch.ones(2, 21),
+        "factor_anchor_map": torch.full((2, 21, 8), 1 / 8),
+        "factor_anchor_valid": torch.ones(2, 21, dtype=torch.bool),
+    }
+
+    _, mirror = discrimination_and_mirror_loss(
+        output, targets, mirrored_output=mirrored
+    )
+    assert torch.isfinite(mirror)
