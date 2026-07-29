@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import gc
+import random
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 import torch
 from torch import Tensor
+
+from fate_oia.utils.tesa_contracts import PATCH_AUDIT_COVERAGE_FIELDS
 
 
 SEQUENTIAL_EVAL_MODES = (
@@ -37,6 +40,7 @@ REQUIRED_TESA_ARTIFACT_FIELDS = {
     "foundation_time", "factor_time", "action_time", "reason_time",
     "backward_time", "eval_mode_time", "allocated_gb", "reserved_gb",
     "dino_call_count",
+    *PATCH_AUDIT_COVERAGE_FIELDS,
 }
 
 
@@ -121,6 +125,150 @@ def _replace_patches(field: dict[str, Any], sample: int, indices: Tensor) -> dic
     return result
 
 
+def _patch_geometry(index: Tensor, grid_hw: tuple[int, int]) -> tuple[int, int]:
+    height, width = grid_hw
+    rows = torch.div(index, width, rounding_mode="floor")
+    columns = index.remainder(width)
+    side = int((columns.float().mean() * 3.0 / width).floor().clamp(0, 2).item())
+    depth = int((rows.float().mean() * 5.0 / height).floor().clamp(0, 4).item())
+    return side, depth
+
+
+def source_eligible_factor_mask(
+    factor_source_weight: Tensor,
+    factor_anchor_valid: Tensor,
+    factor_groundable_mask: Tensor,
+) -> Tensor:
+    """Return source eligibility without consulting any model prediction."""
+    return (
+        (factor_source_weight > 0)
+        & factor_anchor_valid.bool()
+        & factor_groundable_mask.bool()
+    )
+
+
+def select_geometry_matched_control(
+    anchor: Tensor,
+    selected: Tensor,
+    *,
+    grid_hw: tuple[int, int],
+    valid_mask: Tensor | None = None,
+) -> tuple[Tensor, dict[str, Any]]:
+    """Pick a disjoint control matching count, lateral side, depth, and validity."""
+    height, width = grid_hw
+    if anchor.ndim != 1 or anchor.numel() != height * width:
+        raise ValueError("anchor must be a flattened grid")
+    valid = (
+        valid_mask.to(device=anchor.device, dtype=torch.bool)
+        if valid_mask is not None
+        else torch.ones_like(anchor, dtype=torch.bool)
+    )
+    if valid.shape != anchor.shape:
+        raise ValueError("valid_mask must match anchor")
+    selected_side, selected_depth = _patch_geometry(selected, grid_hw)
+    positions = torch.arange(anchor.numel(), device=anchor.device)
+    rows = torch.div(positions, width, rounding_mode="floor")
+    columns = positions.remainder(width)
+    sides = (columns * 3 // width).clamp_max(2)
+    depths = (rows * 5 // height).clamp_max(4)
+    candidate = valid & (sides == selected_side) & (depths == selected_depth)
+    candidate[selected] = False
+    count = selected.numel()
+    if int(candidate.sum()) < count:
+        raise ValueError("insufficient geometry-matched valid control patches")
+    control = torch.topk(
+        anchor.masked_fill(~candidate, float("inf")), k=count, largest=False
+    ).indices
+    control_side, control_depth = _patch_geometry(control, grid_hw)
+    return control, {
+        "selected_count": int(count),
+        "control_count": int(control.numel()),
+        "selected_side": selected_side,
+        "control_side": control_side,
+        "selected_depth_bin": selected_depth,
+        "control_depth_bin": control_depth,
+        "control_valid_fraction": float(valid[control].float().mean().item()),
+        "overlap_count": int(torch.isin(control, selected).sum().item()),
+    }
+
+
+def _bootstrap_mean_ci(
+    values: list[float], *, samples: int, seed: int
+) -> dict[str, float | int]:
+    if not values:
+        return {"mean": 0.0, "low": 0.0, "high": 0.0, "n_bootstrap": int(samples)}
+    generator = random.Random(seed)
+    means = [
+        sum(values[generator.randrange(len(values))] for _ in values) / len(values)
+        for _ in range(max(1, int(samples)))
+    ]
+    means.sort()
+    return {
+        "mean": sum(values) / len(values),
+        "low": means[int(0.025 * (len(means) - 1))],
+        "high": means[int(0.975 * (len(means) - 1))],
+        "n_bootstrap": len(means),
+    }
+
+
+def _clustered_gap_ci(
+    records: list[dict[str, Any]], *, samples: int, seed: int
+) -> dict[str, float | int]:
+    by_sample: dict[str, list[float]] = {}
+    for row in records:
+        sample_id = str(row.get("sample_id", ""))
+        if not sample_id:
+            raise ValueError("Patch deletion records require sample_id")
+        by_sample.setdefault(sample_id, []).append(
+            float(row["selected_minus_control"])
+        )
+    sample_means = [
+        sum(values) / len(values) for values in by_sample.values()
+    ]
+    result = _bootstrap_mean_ci(sample_means, samples=samples, seed=seed)
+    result["cluster_count"] = len(sample_means)
+    return result
+
+
+def build_patch_audit_summary(
+    records: list[dict[str, Any]],
+    *,
+    sample_ids: set[str],
+    cumulative_sample_ids: set[str],
+    eligible_factor_ids: set[int],
+    requested_factor_ids: set[int],
+    model_top_factor_ids: set[int],
+    bootstrap_samples: int = 1000,
+    bootstrap_seed: int = 20260729,
+) -> dict[str, Any]:
+    """Keep source coverage separate from model-top deletion faithfulness."""
+    selected = [float(row["selected_effect"]) for row in records]
+    control = [float(row["control_effect"]) for row in records]
+    gaps = [float(row["selected_minus_control"]) for row in records]
+    executed = {int(row["factor_id"]) for row in records}
+    actions = {int(row["action_id"]) for row in records}
+    return {
+        "available": bool(records),
+        "unique_sample_count": len(sample_ids),
+        "cumulative_unique_count": len(cumulative_sample_ids),
+        "sample_ids": sorted(cumulative_sample_ids),
+        "action_coverage": sorted(actions),
+        "eligible_factor_coverage": sorted(eligible_factor_ids),
+        "requested_factor_coverage": sorted(requested_factor_ids),
+        "executed_factor_coverage": sorted(executed),
+        "model_top_factor_coverage": sorted(model_top_factor_ids),
+        "factor_coverage": sorted(executed),
+        "selected_effect_mean": sum(selected) / max(len(selected), 1),
+        "control_effect_mean": sum(control) / max(len(control), 1),
+        "selected_minus_control_mean": sum(gaps) / max(len(gaps), 1),
+        "selected_minus_control_ci": _clustered_gap_ci(
+            records, samples=bootstrap_samples, seed=bootstrap_seed
+        ),
+        "selected_positive_rate": sum(value > 0.0 for value in selected) / max(len(selected), 1),
+        "records": records,
+    }
+
+
 @torch.no_grad()
 def run_stratified_patch_audit(
     model: torch.nn.Module,
@@ -139,7 +287,10 @@ def run_stratified_patch_audit(
     )
     records: list[dict[str, Any]] = []
     action_coverage: set[int] = set()
-    factor_coverage: set[int] = set()
+    eligible_factor_coverage: set[int] = set()
+    requested_factor_coverage: set[int] = set()
+    model_top_factor_coverage: set[int] = set()
+    missing_source_count = 0
     for batch in loader:
         if queue.unique_count >= max_unique:
             break
@@ -149,47 +300,79 @@ def run_stratified_patch_audit(
         for sample, sample_id in enumerate(batch["file_name"]):
             if queue.unique_count >= max_unique:
                 break
-            positive_actions = torch.where(batch["action"][sample] > 0.5)[0].tolist()
-            if not positive_actions:
-                continue
+            action_logits = clean["action_logits_final"][sample]
+            predicted_actions = torch.where(torch.sigmoid(action_logits) > 0.5)[
+                0
+            ]
+            if predicted_actions.numel() == 0:
+                predicted_actions = action_logits.argmax().view(1)
+            if predicted_actions.numel() > 2:
+                predicted_actions = torch.topk(action_logits, k=2).indices
+            selected_actions = [int(value) for value in predicted_actions.tolist()]
             contributions = clean["action_factor_contributions"][sample]
             allowed = clean["factor_action_ownership"].to(contributions) > 0
-            factors_by_action = {
-                int(action): torch.topk(
-                    contributions[action].abs().masked_fill(~allowed, -1),
-                    k=min(int(factors_per_action), int(allowed.sum())),
+            groundable = clean["factor_groundable_mask"].to(contributions) > 0.5
+            grounding = batch.get("meter_grounding", {})
+            if isinstance(grounding, dict) and {
+                "factor_source_weight",
+                "factor_anchor_valid",
+            }.issubset(grounding):
+                source_eligible = source_eligible_factor_mask(
+                    grounding["factor_source_weight"][sample].to(contributions),
+                    grounding["factor_anchor_valid"][sample].to(contributions),
+                    groundable,
+                )
+            else:
+                missing_source_count += 1
+                continue
+            eligible_factor_coverage.update(
+                int(value) for value in torch.where(source_eligible)[0].tolist()
+            )
+            factors_by_action: dict[int, list[int]] = {}
+            for action in selected_actions:
+                eligible = source_eligible & allowed
+                top_count = min(int(factors_per_action), int(eligible.sum()))
+                if top_count == 0:
+                    factors_by_action[int(action)] = []
+                    continue
+                top_candidates = torch.topk(
+                    contributions[action].abs().masked_fill(~eligible, -1),
+                    k=top_count,
                 ).indices.tolist()
-                for action in positive_actions
-            }
+                model_top_factor_coverage.update(
+                    int(value) for value in top_candidates
+                )
+                factors_by_action[int(action)] = [
+                    int(factor) for factor in top_candidates
+                ]
+                for factor in top_candidates:
+                    requested_factor_coverage.add(int(factor))
             factors = sorted(
                 {int(factor) for values in factors_by_action.values() for factor in values}
             )
             queue.add(
                 str(sample_id),
-                action_ids=[int(value) for value in positive_actions],
+                action_ids=selected_actions,
                 factor_ids=factors,
             )
-            for action in positive_actions:
+            for action in selected_actions:
                 for factor in factors_by_action[int(action)]:
                     contribution = contributions[action, factor]
-                    sign = float(torch.sign(contribution).item())
-                    if sign == 0.0:
-                        continue
                     anchor = clean["factor_anchor_map"][sample, factor]
                     count = min(int(patches_per_factor), anchor.numel() // 2)
                     selected = torch.topk(anchor, k=count).indices
-                    peak = int(anchor.argmax())
-                    width = 80
-                    sector = min((peak % width) // max(width // 3, 1), 2)
-                    columns = torch.arange(anchor.numel(), device=anchor.device) % width
-                    candidate = (columns // max(width // 3, 1)).clamp_max(2) == sector
-                    candidate[selected] = False
-                    control_score = anchor.masked_fill(~candidate, float("inf"))
-                    if int(candidate.sum()) < count:
-                        candidate = torch.ones_like(candidate)
-                        candidate[selected] = False
-                        control_score = anchor.masked_fill(~candidate, float("inf"))
-                    control = torch.topk(control_score, k=count, largest=False).indices
+                    valid_mask = field.get("valid_patch_mask")
+                    if isinstance(valid_mask, Tensor):
+                        valid_mask = valid_mask[sample]
+                    try:
+                        control, control_match = select_geometry_matched_control(
+                            anchor,
+                            selected,
+                            grid_hw=(45, 80),
+                            valid_mask=valid_mask,
+                        )
+                    except ValueError:
+                        continue
                     selected_output = model.decode_from_field(
                         _replace_patches(field, sample, selected), progress=progress
                     )
@@ -197,10 +380,10 @@ def run_stratified_patch_audit(
                         _replace_patches(field, sample, control), progress=progress
                     )
                     clean_logit = clean["action_logits_final"][sample, action]
-                    selected_effect = sign * (
+                    selected_effect = (
                         clean_logit - selected_output["action_logits_final"][0, action]
                     )
-                    control_effect = sign * (
+                    control_effect = (
                         clean_logit - control_output["action_logits_final"][0, action]
                     )
                     records.append(
@@ -208,31 +391,27 @@ def run_stratified_patch_audit(
                             "sample_id": str(sample_id),
                             "action_id": int(action),
                             "factor_id": int(factor),
+                            "selection_mode": "model_top_predicted_action",
+                            "clean_action_logit": float(clean_logit),
+                            "factor_contribution": float(contribution),
                             "selected_effect": float(selected_effect),
                             "control_effect": float(control_effect),
                             "selected_minus_control": float(
                                 selected_effect - control_effect
                             ),
+                            "control_match": control_match,
                         }
                     )
                     action_coverage.add(int(action))
-                    factor_coverage.add(int(factor))
         del clean, field, images
-    selected = [row["selected_effect"] for row in records]
-    control = [row["control_effect"] for row in records]
-    gaps = [row["selected_minus_control"] for row in records]
-    return {
-        "available": bool(records),
-        "unique_sample_count": queue.unique_count,
-        "cumulative_unique_count": queue.cumulative_unique_count,
-        "sample_ids": sorted(queue.previous_ids | queue._unique),
-        "action_coverage": sorted(action_coverage),
-        "factor_coverage": sorted(factor_coverage),
-        "selected_effect_mean": sum(selected) / max(len(selected), 1),
-        "control_effect_mean": sum(control) / max(len(control), 1),
-        "selected_minus_control_mean": sum(gaps) / max(len(gaps), 1),
-        "selected_positive_rate": (
-            sum(value > 0 for value in selected) / max(len(selected), 1)
-        ),
-        "records": records,
-    }
+    summary = build_patch_audit_summary(
+        records,
+        sample_ids=queue._unique,
+        cumulative_sample_ids=queue.previous_ids | queue._unique,
+        eligible_factor_ids=eligible_factor_coverage,
+        requested_factor_ids=requested_factor_coverage,
+        model_top_factor_ids=model_top_factor_coverage,
+    )
+    summary["action_coverage"] = sorted(action_coverage)
+    summary["missing_source_count"] = missing_source_count
+    return summary

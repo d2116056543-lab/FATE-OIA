@@ -83,8 +83,11 @@ def test_training_identity_intervention_includes_reason_corruption() -> None:
 
 def test_training_adds_dense_necessity_and_specificity_exactly_once() -> None:
     source = inspect.getsource(trainer._compute_losses)
-    assert 'dense_weight * mechanism_ramp * dense["total"]' in source
-    assert 'dense_weight * mechanism_ramp * dense["necessity"]' not in source
+    action_source = inspect.getsource(trainer.meter_action_loss)
+    assert 'dense_weight * mechanism_ramp * dense["necessity"]' in source
+    assert 'dense_weight * mechanism_ramp * dense["total"]' not in source
+    assert 'output["action_specificity_loss"] = dense["specificity"]' in source
+    assert 'weights.get("action_specificity", 0.0) * specificity' in action_source
 
 
 def test_training_uses_one_encode_call_for_paired_mirror_constraint() -> None:

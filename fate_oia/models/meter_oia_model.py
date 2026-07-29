@@ -136,6 +136,7 @@ class METEROIAModel(nn.Module):
             factor_token,
             reliability,
             factors["factor_action_ownership"],
+            factor_source=factors["factor_observability"],
             progress=progress,
             update_running_stats=update_semantic_stats,
         )
@@ -167,6 +168,7 @@ class METEROIAModel(nn.Module):
                 corrupted_token,
                 reliability,
                 factors["factor_action_ownership"],
+                factor_source=factors["factor_observability"],
                 progress=progress,
                 update_running_stats=False,
             )

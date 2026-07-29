@@ -8,9 +8,14 @@ from pathlib import Path
 from typing import Any
 
 from fate_oia.utils.meter_artifacts import validate_epoch_artifacts, write_json
+from fate_oia.utils.tesa_contracts import (
+    evaluate_two_epoch_admission,
+    factor_groundability_tiers,
+    validate_runtime_subset_counts,
+)
 
 
-GROUNDABLE = tuple(index for index in range(21) if index not in (14, 20))
+DEFAULT_SCHEMA_PATH = Path("configs/meter_factor_schema.yaml")
 
 
 def validate_pilot_protocol(
@@ -24,10 +29,11 @@ def validate_pilot_protocol(
         failures.append("mock_dino")
     if int(manifest.get("seed", -1)) != int(expected["seed"]):
         failures.append("seed")
-    counts = manifest.get("runtime_subset_counts", {})
-    for name in ("train_main", "train_audit", "train_calib", "test"):
-        if int(counts.get(name, -1)) != int(expected[name]):
-            failures.append(name)
+    failures.extend(
+        validate_runtime_subset_counts(
+            manifest.get("runtime_subset_counts", {}), expected
+        )
+    )
     if int(completed_epochs) != int(expected["epochs"]):
         failures.append("epochs")
     return failures
@@ -49,6 +55,132 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 def _finite(value: Any) -> bool:
     return isinstance(value, (int, float)) and math.isfinite(float(value))
+
+
+def _schema_tiers() -> dict[str, tuple[int, ...]]:
+    import yaml
+
+    payload = yaml.safe_load(DEFAULT_SCHEMA_PATH.read_text(encoding="utf-8"))
+    return factor_groundability_tiers(payload["factors"])
+
+
+def _mean_vectors(values: list[list[float]], width: int) -> list[float]:
+    if len(values) != 2 or any(len(value) != width for value in values):
+        return []
+    return [sum(value[index] for value in values) / len(values) for index in range(width)]
+
+
+def _two_epoch_pairs(epochs: list[Path]) -> dict[str, Any]:
+    """Read paired mechanism deltas from exactly the two latest epochs."""
+    selected = epochs[-2:]
+    if len(selected) != 2:
+        return {"paired_epoch_count": len(selected)}
+    branch_rows = [_read_json(epoch / "branch_metrics.json") for epoch in selected]
+    typed_rows = [_read_json(epoch / "typed_evidence.json") for epoch in selected]
+    action_map_deltas = [
+        float(row["action_final"]["Act_mAP"])
+        - float(row["action_visual"]["Act_mAP"])
+        for row in branch_rows
+    ]
+    reason_ap_deltas = [
+        float(row["reason_final"]["Exp_mAP"])
+        - float(row["reason_global"]["Exp_mAP"])
+        for row in branch_rows
+    ]
+    reason_f1_deltas = [
+        float(row["reason_final"]["Exp_mF1"])
+        - float(row["reason_global"]["Exp_mF1"])
+        for row in branch_rows
+    ]
+    return {
+        "paired_epoch_count": 2,
+        "action_map_deltas": action_map_deltas,
+        "action_correction_rms_ratio": _mean_vectors(
+            [
+                [
+                    float(value)
+                    for value in row.get("action_correction_rms_ratio_per_action", [])
+                ]
+                for row in typed_rows
+            ],
+            4,
+        ),
+        "transport_target_effect": _mean_vectors(
+            [
+                [float(value) for value in row.get("identity_target_delta", [])]
+                for row in typed_rows
+            ],
+            4,
+        ),
+        "reason_ap_delta": sum(reason_ap_deltas) / len(reason_ap_deltas),
+        "reason_f1_delta": sum(reason_f1_deltas) / len(reason_f1_deltas),
+        "reason_ap_deltas": reason_ap_deltas,
+        "reason_f1_deltas": reason_f1_deltas,
+    }
+
+
+def _state_rows_for_admission(
+    rows: list[dict[str, Any]], typed: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Normalize old and new typed-audit rows without inventing supervision."""
+    weights = typed.get("factor_weight_mean_by_action_factor", [])
+    if isinstance(weights, list) and weights and all(isinstance(row, list) for row in weights):
+        factor_weight = [
+            sum(float(row[index]) for row in weights) / len(weights)
+            for index in range(len(weights[0]))
+        ]
+        total_weight = sum(max(0.0, value) for value in factor_weight)
+    else:
+        factor_weight, total_weight = [], 0.0
+    source_total = sum(max(0, int(row.get("source_count", 0))) for row in rows)
+    normalized: list[dict[str, Any]] = []
+    for row in rows:
+        factor_id = int(row.get("factor_id", -1))
+        matrix = row.get("state_confusion_matrix", [])
+        if isinstance(matrix, list) and matrix and all(isinstance(item, list) for item in matrix):
+            positive_count = sum(sum(int(value) for value in matrix[0]))
+            negative_count = sum(
+                sum(int(value) for value in matrix[index])
+                for index in range(1, len(matrix))
+            )
+        else:
+            positive_count = 0
+            negative_count = 0
+        observed_share = (
+            max(0.0, factor_weight[factor_id]) / total_weight
+            if 0 <= factor_id < len(factor_weight) and total_weight > 0.0
+            else 0.0
+        )
+        opportunity_share = (
+            max(0, int(row.get("source_count", 0))) / source_total
+            if source_total > 0
+            else 0.0
+        )
+        normalized.append(
+            {
+                "factor_id": factor_id,
+                "prevalence": row.get("state_frequency_baseline"),
+                "auprc": row.get("state_auprc"),
+                "positive_count": int(row.get("positive_count", positive_count)),
+                "negative_count": int(row.get("negative_count", negative_count)),
+                "observed_usage_share": float(
+                    row.get("observed_usage_share", observed_share)
+                ),
+                "source_eligible_opportunity_share": float(
+                    row.get("source_eligible_opportunity_share", opportunity_share)
+                ),
+            }
+        )
+    return normalized
+
+
+def _null_semantics_ok(dynamic_checks: dict[str, Any]) -> bool:
+    required = (
+        "null_present_direction_ok",
+        "null_absent_direction_ok",
+        "null_unknown_zero_loss_grad",
+    )
+    return all(bool(dynamic_checks.get(name)) for name in required)
 
 
 def _pu_gate_pass(dynamic: dict[str, Any], pu: dict[str, Any]) -> bool:
@@ -122,15 +254,18 @@ def evaluate_pilot(
         for row in factor_rows
         if _finite(row.get("state_auprc"))
         and _finite(row.get("state_frequency_baseline"))
+        and 0.0 < float(row["state_frequency_baseline"]) < 1.0
     ]
+    tiers = _schema_tiers()
+    full_groundable = tiers["full"]
     ground_global = [
         global_reason["Exp_per_label_ap"][index]
-        for index in GROUNDABLE
+        for index in full_groundable
         if _finite(global_reason["Exp_per_label_ap"][index])
     ]
     ground_final = [
         final_reason["Exp_per_label_ap"][index]
-        for index in GROUNDABLE
+        for index in full_groundable
         if _finite(final_reason["Exp_per_label_ap"][index])
     ]
     patch = typed.get("patch_audit", {})
@@ -140,6 +275,8 @@ def evaluate_pilot(
     schema_reason_ap = schema_reason.get("Exp_per_label_ap", [])
     reason_identity_delta = typed.get("reason_identity_delta_per_label", [])
     recent = losses[-max(1, min(len(losses), 200)) :]
+    paired = _two_epoch_pairs(epochs)
+    admission_state_rows = _state_rows_for_admission(factor_rows, typed)
     gates = {
         "A": (
             bool(audit.get("pass"))
@@ -204,11 +341,11 @@ def evaluate_pilot(
             > float(branches["reason_correction_off"]["Exp_mAP"])
             and len(reason_identity_delta) == 21
             and all(
-                _finite(reason_identity_delta[index]) for index in GROUNDABLE
+                _finite(reason_identity_delta[index]) for index in full_groundable
             )
             and all(
                 float(reason_identity_delta[index]) >= 0.001
-                for index in GROUNDABLE
+                for index in full_groundable
             )
         ),
         "E": (
@@ -235,9 +372,13 @@ def evaluate_pilot(
             int(patch.get("unique_sample_count", 0))
             >= min(128, len(_read_json(latest / "file_names_test.json")["file_names"]))
             and len(patch.get("action_coverage", [])) == 4
-            and len(patch.get("factor_coverage", [])) >= 12
+            and len(patch.get("eligible_factor_coverage", [])) >= 12
+            and len(patch.get("requested_factor_coverage", [])) >= 12
+            and len(patch.get("executed_factor_coverage", [])) >= 12
             and float(patch.get("selected_positive_rate", 0.0)) > 0.5
-            and float(patch.get("selected_minus_control_mean", -1.0)) > 0
+            and float(
+                patch.get("selected_minus_control_ci", {}).get("low", -1.0)
+            ) > 0.0
         ),
         "G": _pu_gate_pass(audit["dynamic_checks"], pu),
         "H": (
@@ -255,7 +396,7 @@ def evaluate_pilot(
     }
     head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     result = {
-        "pass": all(gates.values()),
+        "pass": False,
         "git_head": head,
         "epoch": int(latest.name.split("_")[-1]),
         "gates": gates,
@@ -270,10 +411,66 @@ def evaluate_pilot(
             "patch_audit": patch,
             "pu_active_labels": pu.get("active_labels", []),
             "runtime": runtime,
+            "schema_tiers": {name: list(ids) for name, ids in tiers.items()},
         },
         "artifact_missing": validate_epoch_artifacts(latest),
         "protocol_failures": protocol_failures,
     }
+    result["two_epoch_admission"] = evaluate_two_epoch_admission(
+        {
+            "protocol_ok": not protocol_failures,
+            "artifact_ok": not validate_epoch_artifacts(latest),
+            "numerics_ok": all(
+                _finite(row.get("loss_total")) and _finite(row.get("grad_norm"))
+                for row in recent
+            ),
+            "paired_epoch_count": paired.get("paired_epoch_count", 0),
+            "implementation_audit_ok": bool(audit.get("pass"))
+            and bool(audit.get("dynamic_checks", {}).get("pass")),
+            "gradient_ownership_ok": all(
+                bool(
+                    audit.get("dynamic_checks", {})
+                    .get(name, {})
+                    .get("pass")
+                )
+                for name in (
+                    "grounding_gradient_ownership",
+                    "mirror_gradient_ownership",
+                    "trainer_total_gradient_ownership",
+                )
+            ),
+            "unknown_mask_ok": bool(
+                audit.get("dynamic_checks", {}).get(
+                    "null_unknown_zero_loss_grad"
+                )
+            ),
+            "source_completeness_ok": bool(
+                audit.get("dynamic_checks", {}).get(
+                    "source_completeness_ok"
+                )
+            ),
+            "no_test_leakage_ok": bool(
+                audit.get("source_checks", {})
+                .get("protocol", {})
+                .get("no_test_threshold_leakage")
+            ),
+            "null_semantics_ok": _null_semantics_ok(
+                audit.get("dynamic_checks", {})
+            ),
+            "action_correction_rms_ratio": paired.get(
+                "action_correction_rms_ratio", []
+            ),
+            "action_map_deltas": paired.get("action_map_deltas", []),
+            "transport_target_effect": paired.get("transport_target_effect", []),
+            "reason_ap_delta": paired.get("reason_ap_delta", float("nan")),
+            "reason_f1_delta": paired.get("reason_f1_delta", float("nan")),
+            "deletion_gap_ci": patch.get("selected_minus_control_ci", {}),
+            "state_rows": admission_state_rows,
+        }
+    )
+    result["pass"] = bool(result["two_epoch_admission"]["pass"])
+    result["gate_inputs"]["two_epoch_pairs"] = paired
+    result["gate_inputs"]["admission_state_rows"] = admission_state_rows
     return result
 
 

@@ -9,6 +9,14 @@ from torch import Tensor
 
 DEFAULT_MIRROR_PAIRS = ((9, 15), (10, 16), (11, 17), (12, 18), (13, 19))
 DEFAULT_ACTION_MIRROR_PAIRS = ((2, 3),)
+DEFAULT_GROUNDING_WEIGHTS = {
+    "anchor": 0.10,
+    "state": 0.10,
+    "null": 0.03,
+    "observability": 0.03,
+    "discrimination": 0.05,
+    "mirror": 0.05,
+}
 
 
 def _swap_factor_rows(value: Tensor, pairs: tuple[tuple[int, int], ...]) -> Tensor:
@@ -18,14 +26,14 @@ def _swap_factor_rows(value: Tensor, pairs: tuple[tuple[int, int], ...]) -> Tens
     return result
 
 
-def mirror_equivariance_loss(
+def mirror_equivariance_components(
     original: dict[str, Tensor],
     mirrored: dict[str, Tensor],
     *,
     factor_pairs: tuple[tuple[int, int], ...] = DEFAULT_MIRROR_PAIRS,
     action_pairs: tuple[tuple[int, int], ...] = DEFAULT_ACTION_MIRROR_PAIRS,
-) -> tuple[Tensor, dict[str, Any]]:
-    """Compare paired original/mirror forwards, never same-image left/right states."""
+) -> dict[str, Tensor]:
+    """Return independently auditable mirror objectives by prediction branch."""
     indices = sorted({index for pair in factor_pairs for index in pair})
     mirrored_anchor = torch.flip(
         _swap_factor_rows(mirrored["factor_anchor_map"], factor_pairs), dims=[-1]
@@ -53,6 +61,28 @@ def mirror_equivariance_loss(
         original["reason_logits_final"][:, indices]
         - mirrored_reason[:, indices]
     ).abs().mean()
+    return {
+        "anchor": anchor_l1,
+        "state": state_l1,
+        "action": action_l1,
+        "reason": reason_l1,
+    }
+
+
+def mirror_equivariance_loss(
+    original: dict[str, Tensor],
+    mirrored: dict[str, Tensor],
+    *,
+    factor_pairs: tuple[tuple[int, int], ...] = DEFAULT_MIRROR_PAIRS,
+    action_pairs: tuple[tuple[int, int], ...] = DEFAULT_ACTION_MIRROR_PAIRS,
+) -> tuple[Tensor, dict[str, Any]]:
+    """Compare paired original/mirror forwards, never same-image left/right states."""
+    components = mirror_equivariance_components(
+        original,
+        mirrored,
+        factor_pairs=factor_pairs,
+        action_pairs=action_pairs,
+    )
     per_factor_margin: dict[str, float] = {}
     for left, right in factor_pairs:
         for factor, partner in ((left, right), (right, left)):
@@ -65,13 +95,13 @@ def mirror_equivariance_loss(
                 - torch.flip(mirrored["factor_anchor_map"][:, factor], dims=[-1])
             ).abs().mean()
             per_factor_margin[str(factor)] = float((wrong - correct).detach())
-    loss = anchor_l1 + state_l1 + action_l1 + reason_l1
+    loss = sum(components.values())
     return loss, {
         "paired_forward": True,
-        "anchor_l1": float(anchor_l1.detach()),
-        "state_l1": float(state_l1.detach()),
-        "action_l1": float(action_l1.detach()),
-        "reason_l1": float(reason_l1.detach()),
+        "anchor_l1": float(components["anchor"].detach()),
+        "state_l1": float(components["state"].detach()),
+        "action_l1": float(components["action"].detach()),
+        "reason_l1": float(components["reason"].detach()),
         "per_factor_margin": per_factor_margin,
     }
 
@@ -107,6 +137,37 @@ def conditional_state_ce(
     safe_target = target.clamp_min(0)
     per = F.cross_entropy(logits.transpose(1, 2), safe_target, reduction="none")
     return _weighted_mean(per, valid.to(logits) * source_weight.to(logits))
+
+
+def null_partition_calibration_loss(
+    null_mass: Tensor,
+    present_valid: Tensor,
+    absent_valid: Tensor,
+    source_weight: Tensor,
+) -> Tensor:
+    """Teach null only for reliable present/absent observations, never unknowns."""
+    present = present_valid.to(torch.bool)
+    absent = absent_valid.to(torch.bool)
+    if bool((present & absent).any()):
+        raise ValueError("A factor cannot be reliably present and absent together")
+    valid = present | absent
+    target = absent.to(null_mass)
+    per = F.binary_cross_entropy(
+        null_mass.clamp(1e-6, 1.0 - 1e-6), target, reduction="none"
+    )
+    return _weighted_mean(per, valid.to(null_mass) * source_weight.to(null_mass))
+
+
+def _grounding_weights(weights: dict[str, float] | None) -> dict[str, float]:
+    supplied = {} if weights is None else weights
+    resolved = {
+        key: float(supplied.get(key, default))
+        for key, default in DEFAULT_GROUNDING_WEIGHTS.items()
+    }
+    # Older configs used one discrimination coefficient for both terms.
+    if "mirror" not in supplied:
+        resolved["mirror"] = resolved["discrimination"]
+    return resolved
 
 
 def observability_objective(
@@ -202,6 +263,7 @@ def meter_grounding_loss(
     observability_tau: Tensor | None = None,
     mirrored_output: dict[str, Tensor] | None = None,
     mirror_pairs: tuple[tuple[int, int], ...] = DEFAULT_MIRROR_PAIRS,
+    weights: dict[str, float] | None = None,
 ) -> dict[str, Tensor]:
     source = targets["factor_source_weight"].to(output["factor_anchor_map"])
     anchor_nll, anchor_dice = source_weighted_anchor_loss(
@@ -215,6 +277,14 @@ def meter_grounding_loss(
         targets["factor_state_target"],
         targets["factor_state_valid"],
         source,
+    )
+    # Derive training masks from the mirrored state contract. The explicit
+    # present/absent fields are retained for audit, but are not a gradient
+    # source because legacy mirror collation does not yet swap new fields.
+    present_valid = targets["factor_state_valid"] & targets["factor_state_target"].eq(0)
+    absent_valid = targets["factor_state_valid"] & targets["factor_state_target"].eq(1)
+    null = null_partition_calibration_loss(
+        output["factor_null_mass"], present_valid, absent_valid, source
     )
     tau = (
         torch.full((output["factor_observability"].shape[1],), 0.5, device=source.device)
@@ -236,14 +306,22 @@ def meter_grounding_loss(
     )
     anchor = anchor_nll + anchor_dice
     observability = obs_bce + obs_coverage
-    total = 0.10 * anchor + 0.10 * state + 0.03 * observability + 0.05 * (
-        discrimination + mirror
-    )
+    resolved = _grounding_weights(weights)
+    components = {
+        "anchor": anchor,
+        "state": state,
+        "null": null,
+        "observability": observability,
+        "discrimination": discrimination,
+        "mirror": mirror,
+    }
+    total = sum(resolved[name] * components[name] for name in resolved)
     return {
         "anchor_nll": anchor_nll,
         "anchor_dice": anchor_dice,
         "anchor": anchor,
         "state": state,
+        "null": null,
         "observability_bce": obs_bce,
         "observability_coverage": obs_coverage,
         "observability": observability,

@@ -81,6 +81,8 @@ loss_weights:
   action_cardinality: 0.02
   action_specificity: 0.05
   action_identity: 0.03
+  action_anti_monopoly: 0.01
+  action_near_boundary: 0.03
   reason_identity: 0.03
   reason_final: 1.00
   reason_global: 0.45
@@ -89,8 +91,10 @@ loss_weights:
   reason_evidence_correction: 0.03
   anchor: 0.10
   state: 0.10
+  null: 0.03
   observability: 0.03
   discrimination: 0.05
+  mirror: 0.05
   dense_intervention: 0.05
 
 meta:
@@ -115,7 +119,7 @@ pilot:
   train_audit: 1024
   train_calib: 512
   test: 512
-  epochs: 4
+  epochs: 2
   seed: 20260729
 
 runtime:

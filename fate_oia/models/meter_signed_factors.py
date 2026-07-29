@@ -67,7 +67,9 @@ class TypedEvidenceStateHead(nn.Module):
         self.anchor_key = nn.ModuleList(nn.Linear(dim, dim) for _ in range(num_layers))
         self.anchor_value = nn.ModuleList(nn.Linear(dim, dim) for _ in range(num_layers))
         self.layer_router = nn.Parameter(torch.zeros(factor_dim, num_layers))
-        self.null_bias = nn.Parameter(torch.full((factor_dim,), math.log(0.1 / 0.9)))
+        # The null score is calibrated against each patch partition, not held
+        # at an absolute logit where sparse attention can permanently remove it.
+        self.null_bias = nn.Parameter(torch.zeros(factor_dim))
         self.global_proj = nn.Linear(dim, dim)
         self.anchor_proj = nn.Linear(dim, dim)
         self.state_embeddings = nn.Parameter(
@@ -92,6 +94,15 @@ class TypedEvidenceStateHead(nn.Module):
         sparse = entmax15_bisect(logits, dim=-1)
         ramp = self._ramp(progress)
         return dense * (1.0 - ramp) + sparse * ramp
+
+    def _partition_calibrated_null(self, patch_logits: Tensor) -> tuple[Tensor, Tensor]:
+        """Return null probability relative to the patch log-mean-exp partition."""
+        log_mean_exp = torch.logsumexp(patch_logits, dim=-1) - math.log(
+            patch_logits.shape[-1]
+        )
+        mean = patch_logits.mean(dim=-1)
+        null_logit = self.null_bias.view(1, -1) + mean - log_mean_exp
+        return torch.sigmoid(null_logit), null_logit
 
     def compose_typed_token(
         self,
@@ -133,17 +144,15 @@ class TypedEvidenceStateHead(nn.Module):
             patch_logits = torch.einsum("bfd,bnd->bfn", query, key) / math.sqrt(
                 self.dim
             )
-            null_logits = self.null_bias.view(1, -1, 1).expand(
-                patch_logits.shape[0], -1, 1
-            )
-            full = self._distribution(
-                torch.cat([patch_logits, null_logits], dim=-1), progress
-            )
-            maps.append(full[..., :-1])
-            nulls.append(full[..., -1])
-            tokens.append(torch.einsum("bfn,bnd->bfd", full[..., :-1], value))
+            null_mass, _ = self._partition_calibrated_null(patch_logits)
+            conditional_patch = self._distribution(patch_logits, progress)
+            anchored_patch = (1.0 - null_mass).unsqueeze(-1) * conditional_patch
+            maps.append(anchored_patch)
+            nulls.append(null_mass)
+            tokens.append(torch.einsum("bfn,bnd->bfd", anchored_patch, value))
         anchor_map = torch.einsum("fs,bfsn->bfn", layer_weight, torch.stack(maps, 2))
         null_mass = torch.einsum("fs,bfs->bf", layer_weight, torch.stack(nulls, 2))
+        null_logit = torch.logit(null_mass.clamp(1e-6, 1.0 - 1e-6))
         anchor_token = torch.einsum(
             "fs,bfsd->bfd", layer_weight, torch.stack(tokens, 2)
         )
@@ -187,6 +196,7 @@ class TypedEvidenceStateHead(nn.Module):
         return {
             "factor_anchor_map": anchor_map,
             "factor_null_mass": null_mass,
+            "factor_null_logit": null_logit,
             "factor_anchor_token": anchor_token,
             "factor_global_token": global_token,
             "factor_state_logits": state_logits,

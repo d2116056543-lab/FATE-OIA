@@ -10,11 +10,17 @@ from typing import Any
 import torch
 import yaml
 
+from fate_oia.datasets.meter_typed_targets import METERTypedTargetBuilder
 from fate_oia.losses.meter_action_losses import meter_action_loss
-from fate_oia.losses.meter_grounding_losses import meter_grounding_loss
+from fate_oia.losses.meter_grounding_losses import (
+    meter_grounding_loss,
+    mirror_equivariance_components,
+    null_partition_calibration_loss,
+)
 from fate_oia.losses.meter_pu_losses import meter_private_pu_loss
 from fate_oia.losses.meter_reason_losses import meter_reason_loss
 from fate_oia.models.meter_oia_model import METEROIAModel
+from fate_oia.engine.train_acpr_meter_oia import _compute_losses
 from fate_oia.utils.meter_artifacts import write_json
 from fate_oia.utils.meter_config import load_meter_config
 
@@ -31,9 +37,11 @@ REQUIRED_FILES = (
     "fate_oia/engine/eval_acpr_meter_oia.py",
     "fate_oia/engine/tesa_diagnostics.py",
     "fate_oia/engine/evaluate_tesa_pilot.py",
+    "fate_oia/engine/audit_tesa_source_distribution.py",
     "fate_oia/engine/profile_acpr_meter_oia.py",
     "fate_oia/engine/supervise_acpr_meter_oia_foreground.py",
     "fate_oia/engine/export_meter_cases.py",
+    "fate_oia/utils/tesa_contracts.py",
     "configs/meter_factor_schema.yaml",
 )
 FORBIDDEN_FORMAL = (
@@ -99,6 +107,10 @@ def _source_checks(root: Path, config: dict[str, Any]) -> dict[str, Any]:
         "meta_audit_only": config["meta"]["training_enabled"] is False
         and config["meta"]["audit_only"] is True,
         "sequential_eval": config["runtime"]["sequential_eval"] is True,
+        "no_test_threshold_leakage": (
+            config["posthoc_calibration"]["fit_split"] == "train_calib"
+            and "model, calib_loader, device, progress" in text
+        ),
     }
     return {
         "missing_files": missing,
@@ -120,6 +132,47 @@ def _gradient_norm(module: torch.nn.Module) -> float:
             if parameter.grad is not None
         )
     )
+
+
+def _synthetic_grounding(output: dict[str, Any]) -> dict[str, torch.Tensor]:
+    anchor = output["factor_anchor_map"]
+    batch, factors, patches = anchor.shape
+    return {
+        "factor_anchor_map": torch.full_like(anchor, 1.0 / patches),
+        "factor_anchor_valid": torch.ones(
+            batch, factors, dtype=torch.bool, device=anchor.device
+        ),
+        "factor_state_target": torch.zeros(
+            batch, factors, dtype=torch.long, device=anchor.device
+        ),
+        "factor_state_valid": torch.ones(
+            batch, factors, dtype=torch.bool, device=anchor.device
+        ),
+        "factor_present_valid": torch.ones(
+            batch, factors, dtype=torch.bool, device=anchor.device
+        ),
+        "factor_absent_valid": torch.zeros(
+            batch, factors, dtype=torch.bool, device=anchor.device
+        ),
+        "factor_observability": torch.ones(
+            batch, factors, device=anchor.device
+        ),
+        "factor_observability_valid": torch.ones(
+            batch, factors, dtype=torch.bool, device=anchor.device
+        ),
+        "factor_source_weight": torch.ones(
+            batch, factors, device=anchor.device
+        ),
+    }
+
+
+def _module_gradient_report(model: METEROIAModel) -> dict[str, float]:
+    return {
+        "foundation": _gradient_norm(model.foundation),
+        "factor": _gradient_norm(model.typed_factors),
+        "action": _gradient_norm(model.action_transport),
+        "reason": _gradient_norm(model.reason_decoder),
+    }
 
 
 def _dynamic_checks(device: torch.device) -> dict[str, Any]:
@@ -230,6 +283,135 @@ def _dynamic_checks(device: torch.device) -> dict[str, Any]:
         and active_pu_grads["action"] == 0.0
         and active_pu_grads["reason"] > 0.0
     )
+    model.zero_grad(set_to_none=True)
+    grounding_output = model(images, progress=1.0)
+    grounding_targets = _synthetic_grounding(grounding_output)
+    grounding = meter_grounding_loss(
+        grounding_output,
+        grounding_targets,
+        weights={
+            "anchor": 0.10,
+            "state": 0.10,
+            "null": 0.03,
+            "observability": 0.03,
+            "discrimination": 0.05,
+            "mirror": 0.05,
+        },
+    )
+    grounding["total"].backward()
+    grounding_grads = _module_gradient_report(model)
+    grounding_ownership = (
+        grounding_grads["factor"] > 0.0
+        and grounding_grads["action"] == 0.0
+        and grounding_grads["reason"] == 0.0
+    )
+
+    mirror_component_grads: dict[str, dict[str, float | bool]] = {}
+    for component_name in ("anchor", "state", "action", "reason"):
+        model.zero_grad(set_to_none=True)
+        mirror_original = model(images, progress=1.0)
+        mirror_output = model(torch.flip(images, dims=[-1]), progress=1.0)
+        component = mirror_equivariance_components(
+            mirror_original,
+            mirror_output,
+            factor_pairs=model.typed_factors.mirror_pairs,
+        )[component_name]
+        component.backward()
+        component_grads = _module_gradient_report(model)
+        if component_name in {"anchor", "state"}:
+            component_pass = (
+                component_grads["factor"] > 0.0
+                and component_grads["action"] == 0.0
+                and component_grads["reason"] == 0.0
+            )
+        elif component_name == "action":
+            component_pass = (
+                component_grads["foundation"] > 0.0
+                and component_grads["factor"] > 0.0
+                and component_grads["action"] > 0.0
+                and component_grads["reason"] == 0.0
+            )
+        else:
+            component_pass = (
+                component_grads["foundation"] == 0.0
+                and component_grads["factor"] == 0.0
+                and component_grads["action"] == 0.0
+                and component_grads["reason"] > 0.0
+            )
+        mirror_component_grads[component_name] = {
+            **component_grads,
+            "pass": component_pass,
+        }
+    mirror_ownership = all(
+        bool(report["pass"]) for report in mirror_component_grads.values()
+    )
+
+    model.zero_grad(set_to_none=True)
+    trainer_output = model(images, progress=1.0)
+    trainer_batch = {
+        "action": action_target,
+        "reason": reason_target,
+        "meter_grounding": _synthetic_grounding(trainer_output),
+    }
+    trainer_total, _ = _compute_losses(
+        model,
+        trainer_output,
+        trainer_batch,
+        config={
+            "loss_weights": {
+                "action_final": 1.0,
+                "action_visual": 0.35,
+                "action_correction": 0.20,
+                "action_two_way": 0.05,
+                "action_soft_f1": 0.03,
+                "action_cardinality": 0.02,
+                "action_specificity": 0.05,
+                "action_identity": 0.03,
+                "action_anti_monopoly": 0.01,
+                "action_near_boundary": 0.03,
+                "reason_final": 1.0,
+                "reason_global": 0.45,
+                "reason_rank": 0.05,
+                "reason_soft_f1": 0.05,
+                "reason_evidence_correction": 0.03,
+                "reason_identity": 0.03,
+                "anchor": 0.10,
+                "state": 0.10,
+                "null": 0.03,
+                "observability": 0.03,
+                "discrimination": 0.05,
+                "mirror": 0.05,
+                "dense_intervention": 0.05,
+            }
+        },
+        grounding_ramp=1.0,
+        mechanism_ramp=1.0,
+        pu_lambda=torch.zeros(21, device=device),
+    )
+    trainer_total.backward()
+    trainer_grads = _module_gradient_report(model)
+    trainer_ownership = all(value > 0.0 for value in trainer_grads.values())
+
+    null_probe = torch.full((1, 3), 0.5, device=device, requires_grad=True)
+    null_loss = null_partition_calibration_loss(
+        null_probe,
+        torch.tensor([[True, False, False]], device=device),
+        torch.tensor([[False, True, False]], device=device),
+        torch.ones(1, 3, device=device),
+    )
+    null_loss.backward()
+    null_gradient = null_probe.grad.detach()
+    null_present_direction_ok = float(null_gradient[0, 0]) > 0.0
+    null_absent_direction_ok = float(null_gradient[0, 1]) < 0.0
+    null_unknown_zero_loss_grad = float(null_gradient[0, 2]) == 0.0
+    incomplete_target = METERTypedTargetBuilder(
+        "configs/meter_factor_schema.yaml"
+    ).build({"source_complete": False, "objects": [], "lanes": []})
+    source_completeness_ok = (
+        not bool(incomplete_target["factor_state_valid"].any())
+        and not bool(incomplete_target["factor_absent_valid"].any())
+        and not bool(incomplete_target["factor_source_complete"].any())
+    )
     finite = all(
         bool(torch.isfinite(progress_one[key]).all())
         for key in (
@@ -252,6 +434,22 @@ def _dynamic_checks(device: torch.device) -> dict[str, Any]:
         "pu_zero_exact": pu_zero,
         "pu_active_gradient_ownership": active_pu_grads,
         "pu_active_private_only": active_pu_private_only,
+        "grounding_gradient_ownership": {
+            **grounding_grads,
+            "pass": grounding_ownership,
+        },
+        "mirror_gradient_ownership": {
+            "components": mirror_component_grads,
+            "pass": mirror_ownership,
+        },
+        "trainer_total_gradient_ownership": {
+            **trainer_grads,
+            "pass": trainer_ownership,
+        },
+        "null_present_direction_ok": null_present_direction_ok,
+        "null_absent_direction_ok": null_absent_direction_ok,
+        "null_unknown_zero_loss_grad": null_unknown_zero_loss_grad,
+        "source_completeness_ok": source_completeness_ok,
         "finite": finite,
         "pass": (
             shapes["action_logits_final"] == [2, 4]
@@ -270,6 +468,13 @@ def _dynamic_checks(device: torch.device) -> dict[str, Any]:
             and reason_grads["reason"] > 0.0
             and pu_zero
             and active_pu_private_only
+            and grounding_ownership
+            and mirror_ownership
+            and trainer_ownership
+            and null_present_direction_ok
+            and null_absent_direction_ok
+            and null_unknown_zero_loss_grad
+            and source_completeness_ok
             and finite
         ),
     }

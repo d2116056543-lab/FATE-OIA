@@ -61,6 +61,7 @@ from fate_oia.utils.meter_artifacts import (
     write_json,
 )
 from fate_oia.utils.meter_config import load_meter_config
+from fate_oia.utils.tesa_contracts import build_runtime_subset_counts
 from fate_oia.utils.meter_posthoc_calibration import (
     METERCalibrationResult,
     fit_train_calib_deploy_theta,
@@ -243,6 +244,7 @@ def _identity_output(
     mode: str,
 ) -> dict[str, Tensor]:
     reliability = output["factor_reliability"]
+    factor_source = output["factor_observability"]
     if mode == "schema":
         corrupt_token = torch.roll(output["factor_typed_token"], 1, 1)
     elif mode == "cross_sample":
@@ -251,6 +253,7 @@ def _identity_output(
         else:
             corrupt_token = torch.roll(output["factor_typed_token"], 1, 0)
             reliability = torch.roll(reliability, 1, 0)
+            factor_source = torch.roll(factor_source, 1, 0)
     elif mode == "state":
         corrupt_state = torch.roll(output["factor_state_prob"], 1, -1)
         corrupt_token = model.typed_factors.compose_typed_token(
@@ -266,6 +269,7 @@ def _identity_output(
         corrupt_token,
         reliability,
         output["factor_action_ownership"],
+        factor_source=factor_source,
         progress=progress,
         update_running_stats=False,
     )
@@ -336,6 +340,7 @@ def _compute_losses(
     identity = torch.stack(tuple(identity_terms.values())).mean()
     reason_identity = torch.stack(tuple(reason_identity_terms.values())).mean()
     output["dense_specificity_loss"] = dense["specificity"] * mechanism_ramp
+    output["action_specificity_loss"] = dense["specificity"] * mechanism_ramp
     output["dense_identity_loss"] = identity * mechanism_ramp
     action = meter_action_loss(output, action_target, config["loss_weights"])
     confidence = output["factor_reliability"].detach()
@@ -366,6 +371,7 @@ def _compute_losses(
             batch["meter_grounding"],
             mirrored_output=mirror_output,
             mirror_pairs=model.typed_factors.mirror_pairs,
+            weights=config["loss_weights"],
         )
         grounding_total = grounding["total"] * grounding_ramp
     else:
@@ -387,7 +393,7 @@ def _compute_losses(
         action["total"]
         + reason["total"]
         + grounding_total
-        + dense_weight * mechanism_ramp * dense["total"]
+        + dense_weight * mechanism_ramp * dense["necessity"]
         + float(config["loss_weights"].get("reason_identity", 0.03))
         * mechanism_ramp
         * reason_identity
@@ -516,10 +522,10 @@ def _update_pu(
     value = _collect_calibration(model, loader, device, progress)
     audit = meter_hidden_positive_audit(
         torch.sigmoid(value["reason_global_logits"]),
-        value["state_probability"][..., 0]
-        * value["reliability"]
-        * value["observability"],
+        value["state_probability"][..., 0],
         value["reason_labels"],
+        reliability=value["reliability"],
+        observability=value["observability"],
         min_positive_count=int(config["pu"].get("min_positive_count", 20)),
         seed=int(config["splits"]["seed"]),
     )
@@ -866,9 +872,9 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
         "gradient_accumulation_steps": grad_accum,
         "num_workers": workers,
         "split_manifest": meter_split_manifest(names, full_split),
-        "runtime_subset_counts": {
-            name: len(indices) for name, indices in split.items()
-        },
+        "runtime_subset_counts": build_runtime_subset_counts(
+            split, test_count=len(test_indices)
+        ),
         "config": config,
     }
     write_json(output_dir / "run_manifest.json", manifest)
@@ -957,10 +963,21 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                 "loss_reason": float(parts["reason"]["total"].detach()),
                 "loss_anchor": float(parts["grounding"]["anchor"].detach()),
                 "loss_state": float(parts["grounding"]["state"].detach()),
+                "loss_null": float(parts["grounding"]["null"].detach()),
                 "loss_observability": float(parts["grounding"]["observability"].detach()),
                 "loss_discrimination": float(parts["grounding"]["discrimination"].detach()),
                 "loss_mirror": float(parts["grounding"]["mirror"].detach()),
                 "loss_dense_intervention": float(parts["dense"]["total"].detach()),
+                "loss_dense_necessity": float(parts["dense"]["necessity"].detach()),
+                "loss_action_specificity": float(
+                    parts["action"]["specificity"].detach()
+                ),
+                "loss_action_anti_monopoly": float(
+                    parts["action"]["anti_monopoly"].detach()
+                ),
+                "loss_action_near_boundary": float(
+                    parts["action"]["near_boundary"].detach()
+                ),
                 "loss_identity": float(parts["identity"].detach()),
                 "loss_pu": float(parts["pu"].detach()),
                 "grounding_ramp": grounding_ramp,
@@ -1082,10 +1099,10 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
         mechanism["train_audit"] = train_audit
         patch_audit = run_stratified_patch_audit(
             model,
-            test_loader,
+            factor_audit_loader,
             device,
             progress=progress,
-            max_unique=min(128, len(test_indices)),
+            max_unique=min(128, len(split["audit"])),
             previous_sample_ids=cumulative_patch_ids,
         )
         cumulative_patch_ids.update(patch_audit.get("sample_ids", []))

@@ -44,6 +44,8 @@ def meter_hidden_positive_audit(
     factor_probability: Tensor,
     targets: Tensor,
     *,
+    reliability: Tensor | None = None,
+    observability: Tensor | None = None,
     hidden_fraction: float = 0.30,
     min_positive_count: int = 20,
     seed: int = 20260728,
@@ -58,7 +60,20 @@ def meter_hidden_positive_audit(
     private_probability = private_probability.detach().float().cpu()
     factor_probability = factor_probability.detach().float().cpu()
     targets = targets.detach().float().cpu()
-    pu_probability = (private_probability.clamp(0, 1) * factor_probability.clamp(0, 1)).sqrt()
+    reliability_probability = (
+        torch.ones_like(private_probability)
+        if reliability is None
+        else reliability.detach().float().cpu()
+    )
+    observability_probability = (
+        None if observability is None else observability.detach().float().cpu()
+    )
+    pu_probability = meter_pu_score(
+        private_probability,
+        factor_probability,
+        reliability_probability,
+        observability_probability,
+    )
     generator = torch.Generator().manual_seed(int(seed))
     per_label: list[dict[str, object]] = []
     lambdas = torch.zeros(targets.shape[1], dtype=torch.float32)
@@ -99,9 +114,15 @@ def meter_hidden_positive_audit(
             "audit_target": "deliberately_hidden_positive_vs_observed_zero",
             "baseline_auprc": float(baseline_ap),
             "pu_auprc": float(pu_ap),
+            "pu_score_mean": float(pu_probability[:, label].mean()),
             "auprc_delta": diff,
             "lcb95": float(lcb95),
             "eligible": eligible,
             "lambda": float(lambdas[label]),
         })
-    return {"labels": per_label, "lambda": lambdas.tolist(), "active_labels": [i for i, x in enumerate(lambdas.tolist()) if x > 0.0]}
+    return {
+        "score_semantics": "global_x_state_x_reliability_x_observability",
+        "labels": per_label,
+        "lambda": lambdas.tolist(),
+        "active_labels": [i for i, x in enumerate(lambdas.tolist()) if x > 0.0],
+    }

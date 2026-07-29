@@ -33,13 +33,17 @@ class BDD100KGroundingIndex:
         self.root = Path(bdd100k_root)
         self.label_map = {p.stem: p for p in (self.root / "bdd100k_labels").rglob("*.json")} if (self.root / "bdd100k_labels").exists() else {}
         self.drivable_map = {}
+        drivable_priority: dict[str, int] = {}
         for p in (self.root / "bdd100k_drivable_maps").rglob("*.png") if (self.root / "bdd100k_drivable_maps").exists() else []:
             stem = p.stem
             for suffix in ["_drivable_color", "_drivable_id", "_color", "_id"]:
                 if stem.endswith(suffix):
                     stem = stem[: -len(suffix)]
                     break
-            self.drivable_map.setdefault(stem, p)
+            priority = 0 if p.stem.endswith(("_drivable_id", "_id")) else 1
+            if stem not in self.drivable_map or priority < drivable_priority[stem]:
+                self.drivable_map[stem] = p
+                drivable_priority[stem] = priority
         self.seg_map = {}
         for p in (self.root / "bdd100k_seg").rglob("*.png") if (self.root / "bdd100k_seg").exists() else []:
             stem = p.stem

@@ -16,6 +16,7 @@ class FactorSpecificActionTransport(nn.Module):
         factor_dim: int = 21,
         rank: int = 16,
         rms_momentum: float = 0.95,
+        reliability_floor: float = 0.10,
     ) -> None:
         super().__init__()
         self.dim = int(dim)
@@ -23,9 +24,17 @@ class FactorSpecificActionTransport(nn.Module):
         self.factor_dim = int(factor_dim)
         self.rank = int(rank)
         self.rms_momentum = float(rms_momentum)
+        self.reliability_floor = float(reliability_floor)
+        if not 0.0 <= self.reliability_floor <= 1.0:
+            raise ValueError("reliability_floor must be in [0, 1]")
         self.action_query = nn.Linear(dim, dim)
         self.factor_key = nn.Parameter(torch.randn(factor_dim, dim, dim) * 0.01)
         self.type_bias = nn.Parameter(torch.zeros(action_dim, factor_dim))
+        # This is deliberately action-by-factor, rather than a factor-global gate.
+        # It starts neutral and is learned only through the action objective.
+        self.action_factor_compatibility = nn.Parameter(
+            torch.zeros(action_dim, factor_dim)
+        )
         self.null_bias = nn.Parameter(torch.zeros(action_dim))
         self.factor_down = nn.Parameter(torch.randn(factor_dim, rank, dim) * 0.02)
         self.factor_up = nn.Parameter(torch.randn(factor_dim, dim, rank) * 0.02)
@@ -44,16 +53,34 @@ class FactorSpecificActionTransport(nn.Module):
         factor_reliability: Tensor,
         factor_action_ownership: Tensor,
         *,
+        factor_source: Tensor | None = None,
         progress: float = 1.0,
         update_running_stats: bool = False,
     ) -> dict[str, Tensor]:
+        if factor_source is None:
+            factor_source = torch.ones_like(factor_reliability)
+        source = factor_source.to(factor_reliability).clamp(0.0, 1.0)
+        reliability = factor_reliability.clamp(0.0, 1.0)
+        # Observability answers whether evidence exists. Reliability only
+        # modulates its strength; it must not make the route structurally
+        # unreachable while the state classifier is still high-entropy.
+        effective_reliability = self.reliability_floor + (
+            1.0 - self.reliability_floor
+        ) * reliability
+        source_reliability = source * effective_reliability
         query = self.action_query(action_nodes)
         factor_key = torch.einsum(
             "brd,rde->bre", factor_typed_token, self.factor_key
         )
-        score = torch.einsum("bad,brd->bar", query, factor_key) + self.type_bias
+        score = (
+            torch.einsum("bad,brd->bar", query, factor_key)
+            + self.type_bias
+            + self.action_factor_compatibility
+        )
         owner = factor_action_ownership.to(score).view(1, 1, -1)
         allowed = owner > 0
+        source_available = source.gt(0.05).unsqueeze(1)
+        allowed = allowed & source_available
         masked_score = score.masked_fill(~allowed, -1e9)
         full_score = torch.cat(
             [
@@ -73,7 +100,7 @@ class FactorSpecificActionTransport(nn.Module):
         factor_value = torch.einsum("bad,brd->bar", query, projected)
         raw_contributions = (
             owner
-            * factor_reliability.unsqueeze(1)
+            * source_reliability.unsqueeze(1)
             * factor_weight
             * factor_value
         )
@@ -90,9 +117,12 @@ class FactorSpecificActionTransport(nn.Module):
         kappa = (0.20 * self.running_visual_rms).clamp_min(1e-4).to(
             action_logits_visual.dtype
         )
-        active_factor_count = allowed.sum(-1).clamp_min(1).to(score.dtype)
+        # The cap follows the actual sparse evidence selected for this sample,
+        # rather than the static number of schema-eligible factors.
+        sparse_support = allowed.expand_as(factor_weight) & factor_weight.gt(1e-8)
+        active_factor_count = sparse_support.sum(-1).clamp_min(1).to(score.dtype)
         per_factor_kappa = (
-            kappa.view(1, -1, 1) / active_factor_count.view(1, 1, -1)
+            kappa.view(1, -1, 1) / active_factor_count.unsqueeze(-1)
         )
         contributions = ramp * per_factor_kappa * torch.tanh(
             raw_contributions / per_factor_kappa.clamp_min(1e-6)
@@ -110,6 +140,10 @@ class FactorSpecificActionTransport(nn.Module):
             "action_factor_contributions": contributions,
             "action_logits_factor_deleted": deleted,
             "action_factor_raw_contributions": raw_contributions,
+            "action_factor_effective_reliability": effective_reliability,
+            "action_factor_source_mask": allowed.expand_as(factor_weight).to(score.dtype),
+            "action_effective_support_count": active_factor_count,
+            "action_per_factor_kappa": per_factor_kappa,
             "action_correction_kappa": kappa,
             "action_correction_rms_ratio": evidence_delta.detach().float().square().mean(0).sqrt()
             / action_logits_visual.detach().float().square().mean(0).sqrt().clamp_min(1e-6),

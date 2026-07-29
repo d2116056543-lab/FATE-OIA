@@ -4,6 +4,7 @@ import torch
 from PIL import Image
 
 from fate_oia.datasets.meter_typed_targets import METERTypedTargetBuilder
+from fate_oia.datasets.bdd100k_grounding import BDD100KGroundingIndex
 from fate_oia.losses.meter_grounding_losses import mirror_equivariance_loss
 from fate_oia.losses.meter_grounding_losses import discrimination_and_mirror_loss
 from fate_oia.models.meter_signed_factors import TypedEvidenceStateHead
@@ -50,6 +51,29 @@ def test_geometry_targets_rasterize_real_lane_and_drivable_evidence(tmp_path: Pa
     unknown = builder.build({"source_complete": False, "objects": [], "lanes": []})
     assert not bool(unknown["factor_anchor_valid"][2])
     assert not bool(unknown["factor_state_valid"][2])
+
+
+def test_grounding_index_prefers_drivable_id_over_color_map(tmp_path: Path) -> None:
+    color = (
+        tmp_path
+        / "bdd100k_drivable_maps"
+        / "color_labels"
+        / "sample_drivable_color.png"
+    )
+    label = (
+        tmp_path
+        / "bdd100k_drivable_maps"
+        / "labels"
+        / "sample_drivable_id.png"
+    )
+    color.parent.mkdir(parents=True)
+    label.parent.mkdir(parents=True)
+    Image.new("RGB", (4, 4), (255, 0, 0)).save(color)
+    Image.new("L", (4, 4), 1).save(label)
+
+    index = BDD100KGroundingIndex(tmp_path)
+
+    assert index.lookup("sample_000001.jpg").drivable_map == str(label)
 
 
 def test_object_poly2d_lane_and_explicit_style_are_used_conservatively():

@@ -48,9 +48,28 @@ def identity_corruption_loss(
     margin: float = 0.02,
 ) -> Tensor:
     sign = target.unsqueeze(-1) * 2.0 - 1.0
-    clean_score = (sign * clean_contributions).sum((-1, -2))
-    corrupt_score = (sign * corrupt_contributions).sum((-1, -2))
+    # Keep actions separate: a gain for one action must not cancel another
+    # action whose factor identity became less useful.
+    clean_score = (sign * clean_contributions).sum(-1)
+    corrupt_score = (sign * corrupt_contributions).sum(-1)
     return torch.relu(margin + corrupt_score - clean_score).mean()
+
+
+def near_boundary_delta_ranking_loss(
+    action_logits_visual: Tensor,
+    action_evidence_delta: Tensor,
+    target: Tensor,
+    *,
+    margin: float = 0.02,
+    radius: float = 0.75,
+) -> Tensor:
+    """Reward a target-aligned transport delta most near the decision boundary."""
+    sign = target * 2.0 - 1.0
+    visual_margin = sign * action_logits_visual.detach()
+    boundary_weight = torch.exp(-visual_margin.abs() / float(radius))
+    aligned_delta = sign * action_evidence_delta
+    penalty = torch.relu(float(margin) - aligned_delta)
+    return (boundary_weight * penalty).sum() / boundary_weight.sum().clamp_min(1e-8)
 
 
 def reason_identity_corruption_loss(
