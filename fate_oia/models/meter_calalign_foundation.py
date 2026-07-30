@@ -24,6 +24,7 @@ class METERCalAlignFoundation(nn.Module):
         pretrained_weights: str = "ckp/reference/dino_deitsmall8_pretrain.pth",
         scene_config: str = "configs/acpr_scene_predicates.yaml",
         grammar_path: str = "configs/acpr_reason_predicate_grammar.yaml",
+        action_logit_norm_cap: float = 20.0,
         use_mock_dino: bool = False,
     ) -> None:
         super().__init__()
@@ -45,7 +46,12 @@ class METERCalAlignFoundation(nn.Module):
             dim=dim,
             num_layers=len(selected_layers),
         )
-        self.trunk = ACPRLabelTrunk(dim=dim, action_dim=action_dim, reason_dim=reason_dim)
+        self.trunk = ACPRLabelTrunk(
+            dim=dim,
+            action_dim=action_dim,
+            reason_dim=reason_dim,
+            action_logit_norm_cap=action_logit_norm_cap,
+        )
         self.predicate_reason = ACPRPredicateReasoner(
             dim=dim,
             reason_dim=reason_dim,

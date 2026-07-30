@@ -45,6 +45,7 @@ class METEROIAModel(nn.Module):
         action_correction_fraction: float = 0.20,
         action_max_visual_rms: float = 5.0,
         action_max_delta: float = 1.0,
+        action_logit_norm_cap: float = 20.0,
         **_: Any,
     ) -> None:
         super().__init__()
@@ -54,6 +55,7 @@ class METEROIAModel(nn.Module):
             reason_dim=reason_dim,
             selected_layers=selected_layers,
             pretrained_weights=pretrained_weights,
+            action_logit_norm_cap=action_logit_norm_cap,
             use_mock_dino=use_mock_dino,
         )
         self.typed_factors = TypedEvidenceStateHead(

@@ -12,7 +12,7 @@ class ACPRLabelTrunk(nn.Module):
         dim: int = 384,
         action_dim: int = 4,
         reason_dim: int = 21,
-        action_logit_norm_cap: float = 12.0,
+        action_logit_norm_cap: float = 20.0,
     ) -> None:
         super().__init__()
         self.action_dim = action_dim

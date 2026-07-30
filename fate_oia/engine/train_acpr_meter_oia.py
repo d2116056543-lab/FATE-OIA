@@ -15,7 +15,7 @@ from typing import Any, Iterable
 import numpy as np
 import torch
 import yaml
-from torch import Tensor
+from torch import Tensor, nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, Subset
@@ -84,6 +84,24 @@ def _git_head() -> str:
         ).strip()
     except Exception:
         return "unavailable"
+
+
+def initialize_model_from_checkpoint(
+    model: nn.Module, checkpoint_path: str | Path
+) -> dict[str, Any]:
+    """Load model weights only so a diverged optimizer cannot be revived."""
+    path = Path(checkpoint_path)
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    state_dict = payload.get("model")
+    if not isinstance(state_dict, dict):
+        raise RuntimeError(f"Checkpoint {path} does not contain a model state dict")
+    model.load_state_dict(state_dict, strict=True)
+    return {
+        "mode": "weights_only",
+        "source_epoch": int(payload.get("epoch", -1)),
+        "source_optimizer_step": int(payload.get("optimizer_step", -1)),
+        "path": str(path),
+    }
 
 
 def _loader(
@@ -829,7 +847,15 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
             config["model"].get("action_max_visual_rms", 5.0)
         ),
         action_max_delta=float(config["model"].get("action_max_delta", 1.0)),
+        action_logit_norm_cap=float(
+            config["model"].get("action_logit_norm_cap", 20.0)
+        ),
     ).to(device)
+    initialization: dict[str, Any] | None = None
+    if args.init_model_checkpoint:
+        initialization = initialize_model_from_checkpoint(
+            model, args.init_model_checkpoint
+        )
     optimizer = AdamW(
         _parameter_groups(model, config),
         weight_decay=float(config["training"].get("weight_decay", 0.05)),
@@ -883,6 +909,7 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
         "batch_size": batch_size,
         "gradient_accumulation_steps": grad_accum,
         "num_workers": workers,
+        "initialization": initialization,
         "split_manifest": meter_split_manifest(names, full_split),
         "runtime_subset_counts": build_runtime_subset_counts(
             split, test_count=len(test_indices)
@@ -955,7 +982,19 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
             backward_time = time.perf_counter() - backward_start
             is_update = (micro_step + 1) % grad_accum == 0 or micro_step + 1 == len(train_loader)
             grad_norm = 0.0
+            foundation_grad_norm = 0.0
             if is_update:
+                foundation_grad_norm = float(
+                    torch.nn.utils.clip_grad_norm_(
+                        model.foundation.parameters(),
+                        float(
+                            config["training"].get(
+                                "foundation_grad_clip",
+                                config["training"]["grad_clip"],
+                            )
+                        ),
+                    )
+                )
                 grad_norm = float(
                     torch.nn.utils.clip_grad_norm_(
                         model.parameters(), float(config["training"]["grad_clip"])
@@ -998,6 +1037,7 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                 "grounding_ramp": grounding_ramp,
                 "mechanism_ramp": mechanism_ramp,
                 "grad_norm": grad_norm,
+                "foundation_grad_norm": foundation_grad_norm,
                 "data_time": data_time,
                 "dino_time": dino_time,
                 "foundation_time": timing.get("foundation_time", 0.0),
@@ -1033,6 +1073,9 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                 ),
                 "action_final_logit_abs_max": float(
                     output["action_logits_final"].detach().abs().max()
+                ),
+                "action_direct_preclip_norm_max": float(
+                    output["action_direct_preclip_norm"].detach().max()
                 ),
                 "factor_null_mean": float(output["factor_null_mass"].mean().detach()),
                 "factor_observability_mean": float(
@@ -1308,6 +1351,7 @@ def main() -> None:
     parser.add_argument("--max_calib_samples", type=int, default=0)
     parser.add_argument("--max_test_samples", type=int, default=0)
     parser.add_argument("--resume", default="")
+    parser.add_argument("--init_model_checkpoint", default="")
     parser.add_argument("--use_mock_dino", action="store_true")
     parser.add_argument("--test_only", action="store_true")
     parser.add_argument("--no_feature_cache", action="store_true")

@@ -1,10 +1,15 @@
 from pathlib import Path
 
 import torch
+from torch import nn
 
-from fate_oia.engine.train_acpr_meter_oia import load_meter_config
+from fate_oia.engine.train_acpr_meter_oia import (
+    initialize_model_from_checkpoint,
+    load_meter_config,
+)
 from fate_oia.losses.meter_action_losses import action_delta_pairwise_ranking_loss
 from fate_oia.models.acpr_label_trunk import ACPRLabelTrunk
+from fate_oia.models.meter_calalign_foundation import METERCalAlignFoundation
 from fate_oia.models.meter_semantic_action import FactorSpecificActionTransport
 
 
@@ -69,4 +74,54 @@ def test_action_logit_guard_bounds_pathological_action_head_outputs() -> None:
     output = trunk(torch.randn(3, 2, 9, 8))
 
     assert float(output["action_logits_direct"].norm(dim=-1).max()) <= 0.25001
-    assert float(output["action_direct_preclip_norm"].max()) > 0.25
+    assert float(output["action_visual_preclip_norm"].max()) > 0.25
+
+
+def test_foundation_receives_configured_action_logit_guard() -> None:
+    foundation = METERCalAlignFoundation(
+        dim=384,
+        action_dim=4,
+        reason_dim=21,
+        action_logit_norm_cap=20.0,
+        use_mock_dino=True,
+    )
+
+    assert foundation.trunk.action_logit_norm_cap == 20.0
+
+
+def test_weight_only_checkpoint_initialization_excludes_optimizer_state(tmp_path: Path) -> None:
+    source = nn.Linear(3, 2)
+    checkpoint_path = tmp_path / "epoch1.pth"
+    torch.save(
+        {
+            "epoch": 1,
+            "optimizer_step": 880,
+            "model": source.state_dict(),
+            "optimizer": {"poisoned_momentum": True},
+        },
+        checkpoint_path,
+    )
+    target = nn.Linear(3, 2)
+
+    initialization = initialize_model_from_checkpoint(target, checkpoint_path)
+
+    for actual, expected in zip(target.parameters(), source.parameters()):
+        assert torch.equal(actual, expected)
+    assert initialization == {
+        "mode": "weights_only",
+        "source_epoch": 1,
+        "source_optimizer_step": 880,
+        "path": str(checkpoint_path),
+    }
+
+
+def test_guarded_continuation_defaults_preserve_epoch_one_logit_range() -> None:
+    config = load_meter_config(
+        Path(__file__).parents[1]
+        / "configs"
+        / "fate_oia_train_360x640_acpr_meter_oia_v2_tesa.yaml"
+    )
+
+    assert config["model"]["action_logit_norm_cap"] == 20.0
+    assert config["training"]["foundation_grad_clip"] == 0.25
+    assert config["training"]["lr_foundation"] == 0.00005

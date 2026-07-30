@@ -56,6 +56,7 @@ model:
   action_correction_fraction: 0.20
   action_max_visual_rms: 5.0
   action_max_delta: 1.0
+  action_logit_norm_cap: 20.0
 
 training:
   epochs: 12
@@ -66,10 +67,11 @@ training:
   scheduler: cosine
   weight_decay: 0.05
   grad_clip: 1.0
+  foundation_grad_clip: 0.25
   warmup_ratio: 0.05
   mechanism_ramp_ratio: 0.10
   mirror_training_interval: 8
-  lr_foundation: 0.00015
+  lr_foundation: 0.00005
   lr_typed_factor: 0.00020
   lr_action_transport: 0.00020
   lr_reason_global: 0.00025
