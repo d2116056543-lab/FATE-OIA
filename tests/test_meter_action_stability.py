@@ -4,6 +4,7 @@ import torch
 
 from fate_oia.engine.train_acpr_meter_oia import load_meter_config
 from fate_oia.losses.meter_action_losses import action_delta_pairwise_ranking_loss
+from fate_oia.models.acpr_label_trunk import ACPRLabelTrunk
 from fate_oia.models.meter_semantic_action import FactorSpecificActionTransport
 
 
@@ -56,3 +57,16 @@ def test_config_preserves_the_named_null_loss_weight() -> None:
 
     assert config["loss_weights"]["null"] == 0.03
     assert "None" not in config["loss_weights"]
+
+
+def test_action_logit_guard_bounds_pathological_action_head_outputs() -> None:
+    trunk = ACPRLabelTrunk(
+        dim=8, action_dim=4, reason_dim=2, action_logit_norm_cap=0.25
+    )
+    with torch.no_grad():
+        trunk.action_visual_head[-1].weight.fill_(1.0e5)
+        trunk.reason_to_action.weight.fill_(1.0e5)
+    output = trunk(torch.randn(3, 2, 9, 8))
+
+    assert float(output["action_logits_direct"].norm(dim=-1).max()) <= 0.25001
+    assert float(output["action_direct_preclip_norm"].max()) > 0.25

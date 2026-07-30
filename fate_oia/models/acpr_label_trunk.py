@@ -7,10 +7,19 @@ from .acpr_sparse_ops import entmax15_bisect
 
 
 class ACPRLabelTrunk(nn.Module):
-    def __init__(self, dim: int = 384, action_dim: int = 4, reason_dim: int = 21) -> None:
+    def __init__(
+        self,
+        dim: int = 384,
+        action_dim: int = 4,
+        reason_dim: int = 21,
+        action_logit_norm_cap: float = 12.0,
+    ) -> None:
         super().__init__()
         self.action_dim = action_dim
         self.reason_dim = reason_dim
+        if action_logit_norm_cap <= 0.0:
+            raise ValueError("action_logit_norm_cap must be positive")
+        self.action_logit_norm_cap = float(action_logit_norm_cap)
         self.num_labels = action_dim + reason_dim
         self.label_queries = nn.Parameter(torch.randn(self.num_labels, dim) * 0.02)
         self.key_proj = nn.Linear(dim, dim)
@@ -30,6 +39,16 @@ class ACPRLabelTrunk(nn.Module):
         )
         self.fusion_gate = nn.Linear(dim * 2, action_dim)
 
+    def _bound_action_logits(
+        self, logits: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Keep logit direction but bound ASL under noisy multi-label targets."""
+        raw_norm = logits.float().norm(dim=-1, keepdim=True)
+        scale = (self.action_logit_norm_cap / raw_norm.clamp_min(1e-6)).clamp(
+            max=1.0
+        )
+        return logits * scale.to(logits.dtype), raw_norm.squeeze(-1)
+
     def forward(self, patch_tokens_by_layer: torch.Tensor, predicate_tokens: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
         patch = patch_tokens_by_layer.mean(1)
         b, n, d = patch.shape
@@ -48,16 +67,33 @@ class ACPRLabelTrunk(nn.Module):
         label_logits = self.logit_head(label_nodes).squeeze(-1)
         reason_logits_visual = label_logits[:, self.action_dim:]
         action_nodes = label_nodes[:, : self.action_dim]
-        action_visual_logits = self.action_visual_head(action_nodes).squeeze(-1)
-        action_reason_logits = self.reason_to_action(reason_logits_visual)
+        action_visual_logits_raw = self.action_visual_head(action_nodes).squeeze(-1)
+        action_reason_logits_raw = self.reason_to_action(reason_logits_visual)
+        action_visual_logits, action_visual_preclip_norm = self._bound_action_logits(
+            action_visual_logits_raw
+        )
+        action_reason_logits, action_reason_preclip_norm = self._bound_action_logits(
+            action_reason_logits_raw
+        )
         gate_in = torch.cat([label_nodes[:, : self.action_dim].mean(1), label_nodes[:, self.action_dim:].mean(1)], dim=-1)
         gate = torch.sigmoid(self.fusion_gate(gate_in)).clamp(0.10, 0.90)
-        action_logits_direct = gate * action_visual_logits + (1.0 - gate) * action_reason_logits
+        action_logits_direct_raw = (
+            gate * action_visual_logits + (1.0 - gate) * action_reason_logits
+        )
+        action_logits_direct, action_direct_preclip_norm = self._bound_action_logits(
+            action_logits_direct_raw
+        )
         return {
             "label_nodes": label_nodes,
             "label_attention": attn,
+            "action_visual_logits_raw": action_visual_logits_raw,
             "action_visual_logits": action_visual_logits,
+            "action_reason_logits_raw": action_reason_logits_raw,
             "action_reason_logits": action_reason_logits,
+            "action_logits_direct_raw": action_logits_direct_raw,
+            "action_visual_preclip_norm": action_visual_preclip_norm,
+            "action_reason_preclip_norm": action_reason_preclip_norm,
+            "action_direct_preclip_norm": action_direct_preclip_norm,
             "reason_logits_visual": reason_logits_visual,
             "action_fusion_gate": gate,
             "action_token_norm_mean": action_nodes.norm(dim=-1).mean(),
