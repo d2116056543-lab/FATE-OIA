@@ -4,6 +4,7 @@ import torch
 from torch import nn
 
 from fate_oia.engine.train_acpr_meter_oia import (
+    _diagnostic_due,
     initialize_model_from_checkpoint,
     load_meter_config,
 )
@@ -125,3 +126,10 @@ def test_guarded_continuation_defaults_preserve_epoch_one_logit_range() -> None:
     assert config["model"]["action_logit_norm_cap"] == 20.0
     assert config["training"]["foundation_grad_clip"] == 0.25
     assert config["training"]["lr_foundation"] == 0.00005
+
+
+def test_diagnostic_schedule_keeps_primary_test_fast_and_audits_final_epoch() -> None:
+    assert not _diagnostic_due(epoch=0, total_epochs=5, interval=5)
+    assert not _diagnostic_due(epoch=3, total_epochs=5, interval=5)
+    assert _diagnostic_due(epoch=4, total_epochs=5, interval=5)
+    assert _diagnostic_due(epoch=0, total_epochs=5, interval=1)

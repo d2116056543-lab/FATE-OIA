@@ -137,3 +137,7 @@ runtime:
   sequential_eval: true
   target_reserved_gb: 42.0
   hard_reserved_gb: 45.0
+
+evaluation:
+  diagnostic_interval_epochs: 5
+  patch_audit_max_unique: 16

@@ -255,6 +255,13 @@ def _mechanism_ramps(step: int, total_updates: int) -> tuple[float, float]:
     return 0.25 + 0.75 * r5, r10
 
 
+def _diagnostic_due(epoch: int, total_epochs: int, interval: int) -> bool:
+    """Run expensive branch/deletion audits at a fixed interval and the final epoch."""
+    if total_epochs <= 0:
+        return False
+    return epoch == total_epochs - 1 or (interval > 0 and (epoch + 1) % interval == 0)
+
+
 def _identity_output(
     model: METEROIAModel,
     output: dict[str, Any],
@@ -1161,42 +1168,23 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
             model, calib_loader, device, progress
         )
         calibration = _fit_calibration(model, calibration_data)
+        diagnostic_due = _diagnostic_due(
+            epoch,
+            epochs,
+            int(config.get("evaluation", {}).get("diagnostic_interval_epochs", 5)),
+        )
         test = collect_outputs(
-            model, test_loader, device, progress=progress, sequential_modes=True
+            model,
+            test_loader,
+            device,
+            progress=progress,
+            sequential_modes=diagnostic_due,
         )
         test_branches = branch_metrics(test)
         mechanism = mechanism_stats_from_collected(test)
-        train_audit = _typed_factor_audit(
-            model, factor_audit_loader, device, progress
-        )
-        mechanism["train_audit"] = train_audit
-        patch_audit = run_stratified_patch_audit(
-            model,
-            factor_audit_loader,
-            device,
-            progress=progress,
-            max_unique=min(128, len(split["audit"])),
-            previous_sample_ids=cumulative_patch_ids,
-        )
-        cumulative_patch_ids.update(patch_audit.get("sample_ids", []))
-        write_json(
-            cumulative_path,
-            {
-                "sample_ids": sorted(cumulative_patch_ids),
-                "cumulative_unique_count": len(cumulative_patch_ids),
-            },
-        )
-        mechanism["patch_audit"] = patch_audit
         mechanism.update(
             {
-                "state_confusion_matrix": train_audit["state_confusion_matrix"],
-                "source_coverage": train_audit["source_coverage"],
-                "same_type_margin": [
-                    row["same_type_margin"] for row in train_audit["per_factor"]
-                ],
-                "mirror_equivariance": [
-                    row["mirror_equivariance"] for row in train_audit["per_factor"]
-                ],
+                "diagnostic_due": diagnostic_due,
                 "analytic_coverage": {
                     "actions": max(
                         (row["dense_action_coverage"] for row in epoch_rows),
@@ -1215,44 +1203,81 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                     row["dense_wrong_effect_abs"] for row in epoch_rows
                 )
                 / max(len(epoch_rows), 1),
-                **_identity_ap_diagnostics(test_branches),
-                "reason_identity_delta_per_label": [
-                    round(
-                        float(test_branches["reason_final"]["Exp_per_label_ap"][label])
-                        - float(
-                            test_branches["schema_corruption"]["Exp_per_label_ap"][
-                                label
-                            ]
-                        ),
-                        10,
-                    )
-                    for label in range(21)
-                ],
-                "factor_off_delta": mechanism.get(
-                    "factor_off_delta_per_action", []
-                ),
-                "state_off_delta": mechanism.get(
-                    "state_off_delta_per_action", []
-                ),
-                "cross_sample_swap_effect": mechanism.get(
-                    "cross_sample_swap_delta_per_action", []
-                ),
-                "patch_selected_effect": patch_audit.get(
-                    "selected_effect_mean", 0.0
-                ),
-                "patch_control_effect": patch_audit.get(
-                    "control_effect_mean", 0.0
-                ),
-                "unique_sample_count": patch_audit.get(
-                    "unique_sample_count", 0
-                ),
-                "cumulative_unique_count": patch_audit.get(
-                    "cumulative_unique_count", 0
-                ),
-                "action_coverage": patch_audit.get("action_coverage", []),
-                "factor_coverage": patch_audit.get("factor_coverage", []),
             }
         )
+        if diagnostic_due:
+            train_audit = _typed_factor_audit(
+                model, factor_audit_loader, device, progress
+            )
+            patch_audit = run_stratified_patch_audit(
+                model,
+                factor_audit_loader,
+                device,
+                progress=progress,
+                max_unique=min(
+                    int(config.get("evaluation", {}).get("patch_audit_max_unique", 16)),
+                    len(split["audit"]),
+                ),
+                previous_sample_ids=cumulative_patch_ids,
+            )
+            cumulative_patch_ids.update(patch_audit.get("sample_ids", []))
+            write_json(
+                cumulative_path,
+                {
+                    "sample_ids": sorted(cumulative_patch_ids),
+                    "cumulative_unique_count": len(cumulative_patch_ids),
+                },
+            )
+            mechanism.update(
+                {
+                    "train_audit": train_audit,
+                    "patch_audit": patch_audit,
+                    "state_confusion_matrix": train_audit["state_confusion_matrix"],
+                    "source_coverage": train_audit["source_coverage"],
+                    "same_type_margin": [
+                        row["same_type_margin"] for row in train_audit["per_factor"]
+                    ],
+                    "mirror_equivariance": [
+                        row["mirror_equivariance"] for row in train_audit["per_factor"]
+                    ],
+                    **_identity_ap_diagnostics(test_branches),
+                    "reason_identity_delta_per_label": [
+                        round(
+                            float(test_branches["reason_final"]["Exp_per_label_ap"][label])
+                            - float(
+                                test_branches["schema_corruption"]["Exp_per_label_ap"][
+                                    label
+                                ]
+                            ),
+                            10,
+                        )
+                        for label in range(21)
+                    ],
+                    "factor_off_delta": mechanism.get(
+                        "factor_off_delta_per_action", []
+                    ),
+                    "state_off_delta": mechanism.get(
+                        "state_off_delta_per_action", []
+                    ),
+                    "cross_sample_swap_effect": mechanism.get(
+                        "cross_sample_swap_delta_per_action", []
+                    ),
+                    "patch_selected_effect": patch_audit.get(
+                        "selected_effect_mean", 0.0
+                    ),
+                    "patch_control_effect": patch_audit.get(
+                        "control_effect_mean", 0.0
+                    ),
+                    "unique_sample_count": patch_audit.get(
+                        "unique_sample_count", 0
+                    ),
+                    "cumulative_unique_count": patch_audit.get(
+                        "cumulative_unique_count", 0
+                    ),
+                    "action_coverage": patch_audit.get("action_coverage", []),
+                    "factor_coverage": patch_audit.get("factor_coverage", []),
+                }
+            )
         runtime = {
             "epoch": epoch,
             "train_rows": len(epoch_rows),
@@ -1283,10 +1308,10 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
             "visual_Act_mF1": branches["action_visual"]["Act_mF1"],
             "global_Exp_mAP": branches["reason_global"]["Exp_mAP"],
             "global_Exp_mF1": branches["reason_global"]["Exp_mF1"],
-            "factor_off_Act_mAP": branches["factor_off"]["Act_mAP"],
-            "reason_correction_off_Exp_mAP": branches["reason_correction_off"][
-                "Exp_mAP"
-            ],
+            "factor_off_Act_mAP": test_branches.get("factor_off", {}).get("Act_mAP"),
+            "reason_correction_off_Exp_mAP": test_branches.get(
+                "reason_correction_off", {}
+            ).get("Exp_mAP"),
         }
         append_jsonl(output_dir / "metrics_summary.jsonl", metric_row)
         print("meter_epoch " + json.dumps(metric_row, sort_keys=True), flush=True)
