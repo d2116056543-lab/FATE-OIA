@@ -53,6 +53,9 @@ model:
   use_action_set_final: false
   use_selector: false
   use_formal_meta: false
+  action_correction_fraction: 0.20
+  action_max_visual_rms: 5.0
+  action_max_delta: 1.0
 
 training:
   epochs: 12
@@ -92,7 +95,7 @@ loss_weights:
   reason_evidence_correction: 0.03
   anchor: 0.10
   state: 0.10
-  null: 0.03
+  "null": 0.03
   observability: 0.03
   discrimination: 0.05
   mirror: 0.05

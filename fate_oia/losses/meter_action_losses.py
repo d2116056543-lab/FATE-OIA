@@ -51,20 +51,41 @@ def action_delta_pairwise_ranking_loss(
     action_evidence_delta: Tensor,
     target: Tensor,
     *,
-    margin: float = 0.02,
+    normalizer: Tensor | None = None,
+    margin: float = 0.10,
+    temperature: float = 0.25,
 ) -> Tensor:
-    """Require evidence deltas to rank positives above negatives per action."""
+    """Smooth, bounded ranking for the evidence correction only.
+
+    The normalized correction retains positive-over-negative ordering without
+    allowing an unstable auxiliary branch to dominate the action objective.
+    """
+    if temperature <= 0.0:
+        raise ValueError("temperature must be positive")
+    if normalizer is None:
+        normalizer = action_evidence_delta.detach().abs().amax(0).clamp_min(1.0)
+    normalizer = normalizer.detach().to(action_evidence_delta)
+    if normalizer.ndim == 1:
+        normalizer = normalizer.unsqueeze(0)
+    normalized_delta = torch.tanh(
+        action_evidence_delta / normalizer.clamp_min(1e-6)
+    )
     terms: list[Tensor] = []
-    for action_id in range(action_evidence_delta.shape[1]):
+    for action_id in range(normalized_delta.shape[1]):
         positive = target[:, action_id] > 0.5
         negative = ~positive
         if not bool(positive.any()) or not bool(negative.any()):
             continue
         difference = (
-            action_evidence_delta[positive, action_id].unsqueeze(1)
-            - action_evidence_delta[negative, action_id].unsqueeze(0)
+            normalized_delta[positive, action_id].unsqueeze(1)
+            - normalized_delta[negative, action_id].unsqueeze(0)
         )
-        terms.append(torch.relu(float(margin) - difference).mean())
+        terms.append(
+            (
+                float(temperature)
+                * F.softplus((float(margin) - difference) / float(temperature))
+            ).mean()
+        )
     if not terms:
         return action_evidence_delta.new_zeros(())
     return torch.stack(terms).mean()
@@ -130,8 +151,12 @@ def meter_action_loss(
             target,
         )
     delta_ranking = action_delta_pairwise_ranking_loss(
-        output["action_logits_final"] - output["action_logits_visual"],
+        output.get(
+            "action_evidence_delta",
+            output["action_logits_final"] - output["action_logits_visual"],
+        ),
         target,
+        normalizer=output.get("action_correction_kappa"),
     )
     total = (
         weights.get("action_final", 1.00) * final

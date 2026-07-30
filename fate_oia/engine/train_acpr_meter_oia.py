@@ -822,6 +822,13 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
         pretrained_weights=config["backbone"]["pretrained_weights"],
         use_mock_dino=bool(args.use_mock_dino),
         factor_rank=int(config["model"].get("factor_rank", 16)),
+        action_correction_fraction=float(
+            config["model"].get("action_correction_fraction", 0.20)
+        ),
+        action_max_visual_rms=float(
+            config["model"].get("action_max_visual_rms", 5.0)
+        ),
+        action_max_delta=float(config["model"].get("action_max_delta", 1.0)),
     ).to(device)
     optimizer = AdamW(
         _parameter_groups(model, config),
@@ -1012,6 +1019,21 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                 "action_correction_rms_ratio": output[
                     "action_correction_rms_ratio"
                 ].detach().cpu().tolist(),
+                "action_correction_kappa": output[
+                    "action_correction_kappa"
+                ].detach().cpu().tolist(),
+                "action_correction_reference_rms": output[
+                    "action_correction_reference_rms"
+                ].detach().cpu().tolist(),
+                "action_visual_rms_raw": output[
+                    "action_visual_rms_raw"
+                ].detach().cpu().tolist(),
+                "action_visual_logit_abs_max": float(
+                    output["action_logits_visual"].detach().abs().max()
+                ),
+                "action_final_logit_abs_max": float(
+                    output["action_logits_final"].detach().abs().max()
+                ),
                 "factor_null_mean": float(output["factor_null_mass"].mean().detach()),
                 "factor_observability_mean": float(
                     output["factor_observability"].mean().detach()

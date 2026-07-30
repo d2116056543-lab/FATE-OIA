@@ -18,6 +18,9 @@ class FactorSpecificActionTransport(nn.Module):
         rms_momentum: float = 0.95,
         reliability_floor: float = 0.10,
         exploration_mass: float = 0.05,
+        correction_fraction: float = 0.20,
+        max_visual_rms: float = 5.0,
+        max_action_delta: float = 1.0,
     ) -> None:
         super().__init__()
         self.dim = int(dim)
@@ -27,10 +30,19 @@ class FactorSpecificActionTransport(nn.Module):
         self.rms_momentum = float(rms_momentum)
         self.reliability_floor = float(reliability_floor)
         self.exploration_mass = float(exploration_mass)
+        self.correction_fraction = float(correction_fraction)
+        self.max_visual_rms = float(max_visual_rms)
+        self.max_action_delta = float(max_action_delta)
         if not 0.0 <= self.reliability_floor <= 1.0:
             raise ValueError("reliability_floor must be in [0, 1]")
         if not 0.0 <= self.exploration_mass < 1.0:
             raise ValueError("exploration_mass must be in [0, 1)")
+        if self.correction_fraction <= 0.0:
+            raise ValueError("correction_fraction must be positive")
+        if self.max_visual_rms <= 0.0:
+            raise ValueError("max_visual_rms must be positive")
+        if self.max_action_delta <= 0.0:
+            raise ValueError("max_action_delta must be positive")
         self.action_query = nn.Linear(dim, dim)
         self.factor_key = nn.Parameter(torch.randn(factor_dim, dim, dim) * 0.01)
         self.type_bias = nn.Parameter(torch.zeros(action_dim, factor_dim))
@@ -130,9 +142,13 @@ class FactorSpecificActionTransport(nn.Module):
             * factor_weight
             * factor_value
         )
+        visual_rms_raw = action_logits_visual.detach().float().square().mean(0).sqrt()
         if self.training and update_running_stats:
             with torch.no_grad():
-                current = action_logits_visual.detach().float().square().mean(0).sqrt()
+                # The reference scale is deliberately bounded before the EMA.
+                # Otherwise a diverged visual branch can increase transport
+                # authority and form a positive feedback loop.
+                current = visual_rms_raw.clamp(max=self.max_visual_rms)
                 if int(self.running_updates) == 0:
                     self.running_visual_rms.copy_(current)
                 else:
@@ -140,9 +156,12 @@ class FactorSpecificActionTransport(nn.Module):
                         current * (1.0 - self.rms_momentum)
                     )
                 self.running_updates.add_(1)
-        kappa = (0.20 * self.running_visual_rms).clamp_min(1e-4).to(
-            action_logits_visual.dtype
+        reference_rms = self.running_visual_rms.clamp(
+            min=1e-4, max=self.max_visual_rms
         )
+        kappa = (self.correction_fraction * reference_rms).clamp(
+            min=1e-4, max=self.max_action_delta
+        ).to(action_logits_visual.dtype)
         # The cap follows the actual sparse evidence selected for this sample,
         # rather than the static number of schema-eligible factors.
         sparse_support = allowed.expand_as(factor_weight) & factor_weight.gt(1e-8)
@@ -172,6 +191,8 @@ class FactorSpecificActionTransport(nn.Module):
             "action_effective_support_count": active_factor_count,
             "action_per_factor_kappa": per_factor_kappa,
             "action_correction_kappa": kappa,
+            "action_correction_reference_rms": reference_rms,
+            "action_visual_rms_raw": visual_rms_raw,
             "action_correction_rms_ratio": evidence_delta.detach().float().square().mean(0).sqrt()
             / action_logits_visual.detach().float().square().mean(0).sqrt().clamp_min(1e-6),
         }

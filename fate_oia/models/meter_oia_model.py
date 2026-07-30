@@ -42,6 +42,9 @@ class METEROIAModel(nn.Module):
         use_mock_dino: bool = False,
         factor_rank: int = 16,
         schema_path: str | None = None,
+        action_correction_fraction: float = 0.20,
+        action_max_visual_rms: float = 5.0,
+        action_max_delta: float = 1.0,
         **_: Any,
     ) -> None:
         super().__init__()
@@ -64,6 +67,9 @@ class METEROIAModel(nn.Module):
             action_dim=action_dim,
             factor_dim=reason_dim,
             rank=factor_rank,
+            correction_fraction=action_correction_fraction,
+            max_visual_rms=action_max_visual_rms,
+            max_action_delta=action_max_delta,
         )
         self.reason_decoder = METERPrivateReasonDecoder(
             dim=dim, reason_dim=reason_dim, action_dim=action_dim
