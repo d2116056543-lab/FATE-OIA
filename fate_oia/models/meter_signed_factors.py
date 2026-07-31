@@ -368,4 +368,3 @@ class TypedEvidenceStateHead(nn.Module):
             "factor_groundable_mask": self.groundable_mask,
             "factor_group_ids": self.factor_group_ids,
         }
-
