@@ -33,6 +33,7 @@ def build_tau_from_train_main(
     names = [file_names[index] for index in main_indices]
     metadata = {
         "fit_split": "train_main",
+        "source_split": "train_main",
         "sample_count": len(main_indices),
         "sample_sha256": hashlib.sha256("\n".join(names).encode()).hexdigest(),
         "alpha": 20.0,
@@ -80,6 +81,9 @@ def main() -> None:
         json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8"
     )
     (output / "factor_observability_tau_metadata.json").write_text(
+        json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    (output / "heca_tau_stats.json").write_text(
         json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8"
     )
 
