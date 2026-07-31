@@ -7,6 +7,7 @@ import pytest
 
 from fate_oia.engine.eval_acpr_meter_oia import (
     CHEAP_SAME_FORWARD_MODES,
+    EXPENSIVE_SAME_FORWARD_MODES,
     INDEPENDENT_HECA_ABLATIONS,
     collect_outputs,
 )
@@ -93,6 +94,22 @@ def test_cheap_diagnostics_share_one_dino_encode_per_batch() -> None:
     assert all(payload["dino_call_count"] == 0 for payload in collected["modes"].values())
     assert collected["dino_call_count"] == 2
     assert collected["reason_calalign"].shape == (3, 21)
+
+
+def test_periodic_interventions_reuse_the_same_encoded_field() -> None:
+    model = _CountingModel()
+    collected = collect_outputs(
+        model,
+        _loader(),
+        torch.device("cpu"),
+        progress=1.0,
+        extra_diagnostic_modes=True,
+    )
+
+    assert model.encode_calls == 2
+    for mode in EXPENSIVE_SAME_FORWARD_MODES.values():
+        assert model.decode_calls.count(mode) == 2
+    assert set(EXPENSIVE_SAME_FORWARD_MODES).issubset(collected["modes"])
 
 
 def test_cheap_diagnostics_reject_hidden_extra_backbone_calls() -> None:

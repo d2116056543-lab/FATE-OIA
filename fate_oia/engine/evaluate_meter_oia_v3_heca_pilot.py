@@ -88,6 +88,8 @@ def evaluate_heca_pilot(
             row.get("state_frequency_baseline"),
             row.get("state_auc"),
             row.get("observability_auc"),
+            row.get("observability_mean"),
+            row.get("observability_std"),
         )
         if (
             int(row.get("source_count", 0)) > 0
@@ -95,7 +97,9 @@ def evaluate_heca_pilot(
             and float(row["same_type_margin"]) > 0.0
             and float(row["state_auprc"]) > float(row["state_frequency_baseline"])
             and float(row["state_auc"]) > 0.5
-            and 0.05 < float(row["observability_auc"]) < 0.95
+            and float(row["state_auc"]) > float(row["state_frequency_baseline"])
+            and 0.05 < float(row["observability_mean"]) < 0.95
+            and float(row["observability_std"]) > 0.01
         ):
             quality_ids.append(int(row["factor_id"]))
     tau = tau_stats.get("tau", [])
@@ -124,7 +128,19 @@ def evaluate_heca_pilot(
         visual = current.get("action_visual", {})
         final = current.get("action_final", {})
         factor_off = current.get("factor_off", {})
+        state_uniform = current.get("state_uniform", {})
         ratio = epoch.get("typed", {}).get("action_correction_rms_ratio_mean", [])
+        final_per_action = final.get("Act_per_label_ap", [])
+        uniform_per_action = state_uniform.get("Act_per_label_ap", [])
+        state_sensitive_actions = [
+            action
+            for action, (clean_ap, changed_ap) in enumerate(
+                zip(final_per_action, uniform_per_action)
+            )
+            if _finite(clean_ap)
+            and _finite(changed_ap)
+            and abs(float(clean_ap) - float(changed_ap)) >= 0.001
+        ]
         passed = (
             all(_finite(value) for value in (
                 visual.get("Act_mAP"), final.get("Act_mAP"),
@@ -134,6 +150,7 @@ def evaluate_heca_pilot(
             and float(final["Act_mAP"]) >= float(visual["Act_mAP"]) + 0.005
             and float(final["Act_mF1"]) >= float(visual["Act_mF1"]) + 0.003
             and float(factor_off["Act_mAP"]) < float(final["Act_mAP"])
+            and len(state_sensitive_actions) >= 3
             and isinstance(ratio, list)
             and len(ratio) == 4
             and all(_finite(value) and 0.03 <= float(value) <= 0.20 for value in ratio)
@@ -151,6 +168,7 @@ def evaluate_heca_pilot(
                 else None
             ),
             "credit_rms_ratio": ratio,
+            "state_sensitive_actions": state_sensitive_actions,
         })
     gate_c = _gate("C", all(row["pass"] for row in gate_c_epochs), {"epochs": gate_c_epochs})
 

@@ -25,6 +25,7 @@ class METEROIAModel(nn.Module):
         pretrained_weights: str = "ckp/reference/dino_deitsmall8_pretrain.pth",
         use_mock_dino: bool = False,
         factor_rank: int = 16,
+        state_effect_rank: int = 64,
         schema_path: str | None = None,
         action_correction_fraction: float = 0.20,
         action_max_delta: float = 1.0,
@@ -67,7 +68,7 @@ class METEROIAModel(nn.Module):
             dim=dim,
             action_dim=action_dim,
             factor_dim=reason_dim,
-            rank=factor_rank,
+            rank=state_effect_rank,
             correction_fraction=action_correction_fraction,
             max_action_delta=action_max_delta,
         )
@@ -216,7 +217,7 @@ class METEROIAModel(nn.Module):
             "factor_state_prob_credit": state_prob_credit,
             "factor_measurement_token": measurement_token,
             "action_visual_preclip_norm": action_preclip_norm,
-            "reason_logits_pu_private": reason["reason_logits_final"],
+            "reason_logits_pu_private": adapted["reason_logits_pu_private"],
             "branch_logits": {
                 "action_visual": action["action_logits_visual"],
                 "action_final": action["action_logits_final"],

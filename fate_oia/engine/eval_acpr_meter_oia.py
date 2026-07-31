@@ -27,6 +27,11 @@ CHEAP_SAME_FORWARD_MODES: dict[str, tuple[str, ...]] = {
     "state_uniform": ("state_uniform",),
     "reason_correction_off": ("reason_correction_off",),
 }
+EXPENSIVE_SAME_FORWARD_MODES: dict[str, tuple[str, ...]] = {
+    "schema_corruption": ("schema_corruption",),
+    "cross_sample_swap": ("cross_sample_swap",),
+    "state_corruption": ("state_corruption",),
+}
 
 # B0--B5 alter training or data-assignment semantics.  They must never be
 # reported as a same-forward diagnostic just because they share a checkpoint.
@@ -90,6 +95,7 @@ def heca_ablation_manifest() -> dict[str, Any]:
     """Describe cheap decode probes without mislabelling B0--B5 as them."""
     return {
         "cheap_same_forward": list(CHEAP_SAME_FORWARD_MODES),
+        "periodic_same_forward": list(EXPENSIVE_SAME_FORWARD_MODES),
         "clean_branches": [
             "action_visual",
             "action_final",
@@ -163,12 +169,17 @@ def collect_outputs(
     progress: float,
     max_batches: int | None = None,
     sequential_modes: bool = True,
+    extra_diagnostic_modes: bool = False,
 ) -> dict[str, Any]:
     """Encode once per batch, then decode all cheap HECA interventions."""
     model.eval()
     collectors = {"clean": _new_collector()}
     if sequential_modes:
         collectors.update({name: _new_collector() for name in CHEAP_SAME_FORWARD_MODES})
+    if extra_diagnostic_modes:
+        collectors.update(
+            {name: _new_collector() for name in EXPENSIVE_SAME_FORWARD_MODES}
+        )
     labels_action: list[Tensor] = []
     labels_reason: list[Tensor] = []
     file_names: list[str] = []
@@ -187,7 +198,11 @@ def collect_outputs(
         labels_action.append(batch["action"].detach().cpu())
         labels_reason.append(batch["reason"].detach().cpu())
         file_names.extend(str(name) for name in batch["file_name"])
-        for name, flags in (("clean", ()), *CHEAP_SAME_FORWARD_MODES.items()):
+        selected_modes = {
+            **CHEAP_SAME_FORWARD_MODES,
+            **(EXPENSIVE_SAME_FORWARD_MODES if extra_diagnostic_modes else {}),
+        }
+        for name, flags in (("clean", ()), *selected_modes.items()):
             if name not in collectors:
                 continue
             start = time.perf_counter()
@@ -227,7 +242,7 @@ def collect_outputs(
         }
     )
     modes: dict[str, dict[str, Any]] = {}
-    for name in CHEAP_SAME_FORWARD_MODES:
+    for name in (*CHEAP_SAME_FORWARD_MODES, *EXPENSIVE_SAME_FORWARD_MODES):
         if name not in collectors:
             continue
         mode = _finalize_collector(collectors[name])
@@ -451,6 +466,12 @@ def main() -> None:
     args = parser.parse_args()
     config = load_meter_config(args.config)
     device = torch.device(args.device)
+    tau_path = config["model"].get("observability_tau_path")
+    observability_tau = (
+        torch.load(tau_path, map_location="cpu", weights_only=True)
+        if tau_path and Path(tau_path).exists()
+        else None
+    )
     model = METEROIAModel(
         dim=int(config["model"]["dim"]),
         action_dim=int(config["model"]["action_dim"]),
@@ -459,6 +480,25 @@ def main() -> None:
         pretrained_weights=config["backbone"]["pretrained_weights"],
         use_mock_dino=args.use_mock_dino,
         factor_rank=int(config["model"].get("factor_rank", 16)),
+        state_effect_rank=int(config["model"].get("state_effect_rank", 64)),
+        schema_path="configs/meter_factor_schema.yaml",
+        action_correction_fraction=float(
+            config["model"].get("action_correction_fraction", 0.25)
+        ),
+        action_max_delta=float(config["model"].get("action_max_delta", 1.0)),
+        action_logit_norm_cap=float(
+            config["model"].get("action_logit_norm_cap", 20.0)
+        ),
+        action_measurement_grad_scale=float(
+            config["model"].get("action_measurement_grad_scale", 0.05)
+        ),
+        factor_text_prototype_path=config["model"].get(
+            "factor_text_prototype_path"
+        ),
+        state_text_prototype_path=config["model"].get(
+            "state_text_prototype_path"
+        ),
+        observability_tau=observability_tau,
     ).to(device)
     payload = load_checkpoint(args.checkpoint, model=model)
     dataset = METERDataset(
