@@ -444,6 +444,10 @@ def save_epoch_artifacts(
 
 def validate_epoch_artifacts(directory: str | Path) -> list[str]:
     root = Path(directory)
+    has_heca_sidecar = any(
+        (root / name).exists()
+        for name in (*HECA_SIDECAR_FILES.values(), *(f"HECA_GATE_{letter}.json" for letter in HECA_GATE_NAMES))
+    )
     required = [
         "metrics_raw.json", "metrics_deploy.json", "branch_metrics.json",
         "typed_evidence.json", "pu_stats.json", "calibration.json", "runtime.json",
@@ -454,6 +458,8 @@ def validate_epoch_artifacts(directory: str | Path) -> list[str]:
     ]
     failures = [name for name in required if not (root / name).exists()]
     if failures:
+        if has_heca_sidecar:
+            failures.extend(validate_heca_artifact_sidecar(root))
         return failures
     try:
         file_names = json.loads(
@@ -658,4 +664,6 @@ def validate_epoch_artifacts(directory: str | Path) -> list[str]:
         )
     ):
         failures.append("runtime.json:profile_schema")
+    if has_heca_sidecar:
+        failures.extend(validate_heca_artifact_sidecar(root))
     return failures
