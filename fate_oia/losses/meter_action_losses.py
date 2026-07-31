@@ -54,19 +54,6 @@ def action_delta_pairwise_ranking_loss(
     return torch.stack(terms).mean() if terms else delta.new_zeros(())
 
 
-def action_transport_anti_monopoly_loss(
-    factor_weights: Tensor, source_mask: Tensor, *, max_share: float = 0.70
-) -> Tensor:
-    """Historical diagnostic only; HECA never registers it as a train loss."""
-    available = source_mask.gt(1e-8)
-    count = available.sum(-1)
-    normalized = factor_weights * available.to(factor_weights)
-    normalized = normalized / normalized.sum(-1, keepdim=True).clamp_min(1e-8)
-    value = torch.relu(normalized.max(-1).values - float(max_share))
-    valid = count > 1
-    return value[valid].mean() if bool(valid.any()) else value.new_zeros(())
-
-
 def action_nonregression_loss(
     visual_logits: Tensor,
     final_logits: Tensor,

@@ -369,6 +369,3 @@ class TypedEvidenceStateHead(nn.Module):
             "factor_group_ids": self.factor_group_ids,
         }
 
-
-# Compatibility import name; the implementation is V2 typed evidence.
-METERsignedFactors = TypedEvidenceStateHead

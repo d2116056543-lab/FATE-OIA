@@ -155,9 +155,3 @@ class StateConditionedActionCredit(nn.Module):
             "action_correction_rms_ratio": evidence_delta.detach().float().square().mean(0).sqrt()
             / visual_rms.clamp_min(1e-6),
         }
-
-
-# The old import name remains source-compatible, but resolves to the HECA
-# implementation; no admission or hard action-factor route survives.
-FactorSpecificActionTransport = StateConditionedActionCredit
-METERSemanticActionPeer = StateConditionedActionCredit
