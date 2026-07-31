@@ -44,6 +44,7 @@ class _CountingModel:
         return {
             "action_logits_visual": torch.zeros(batch, 4),
             "action_logits_final": torch.full((batch, 4), offset),
+            "reason_logits_calalign": torch.zeros(batch, 21),
             "reason_logits_global": torch.zeros(batch, 21),
             "reason_logits_final": torch.full((batch, 21), offset),
             "factor_anchor_map": torch.full((batch, 21, 2), 0.5),
@@ -91,6 +92,7 @@ def test_cheap_diagnostics_share_one_dino_encode_per_batch() -> None:
         assert model.decode_calls.count(mode) == 2
     assert all(payload["dino_call_count"] == 0 for payload in collected["modes"].values())
     assert collected["dino_call_count"] == 2
+    assert collected["reason_calalign"].shape == (3, 21)
 
 
 def test_cheap_diagnostics_reject_hidden_extra_backbone_calls() -> None:
