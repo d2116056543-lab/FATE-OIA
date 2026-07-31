@@ -22,18 +22,26 @@ from fate_oia.utils.meter_posthoc_calibration import (
 )
 
 
-SEQUENTIAL_MODES: dict[str, tuple[str, ...]] = {
+CHEAP_SAME_FORWARD_MODES: dict[str, tuple[str, ...]] = {
     "factor_off": ("factor_off",),
-    "state_off": ("state_off",),
-    "schema_corruption": ("schema_corruption",),
-    "cross_sample_swap": ("cross_sample_swap",),
-    "state_corruption": ("state_corruption",),
+    "state_uniform": ("state_uniform",),
     "reason_correction_off": ("reason_correction_off",),
-    **{
-        f"schema_target_{action}": (f"schema_target_{action}",)
-        for action in range(4)
-    },
 }
+
+# B0--B5 alter training or data-assignment semantics.  They must never be
+# reported as a same-forward diagnostic just because they share a checkpoint.
+INDEPENDENT_HECA_ABLATIONS: dict[str, dict[str, str]] = {
+    "B0": {"name": "CalAlign foundation", "execution": "independent_run"},
+    "B1": {"name": "typed measurement only", "execution": "independent_run"},
+    "B2": {"name": "state-conditioned action credit", "execution": "independent_run"},
+    "B3": {"name": "measurement-credit bridge", "execution": "independent_run"},
+    "B4": {"name": "robust reason global", "execution": "independent_run"},
+    "B5": {"name": "evidence-label consistency", "execution": "independent_run"},
+}
+
+# Kept as a compatibility alias for callers that used the old symbol.  The
+# contents intentionally contain only cheap decode-time interventions.
+SEQUENTIAL_MODES = CHEAP_SAME_FORWARD_MODES
 
 
 def _cat(rows: list[Tensor]) -> Tensor:
@@ -66,28 +74,45 @@ def _metric_pair(action: Tensor, reason: Tensor, labels_a: Tensor, labels_r: Ten
     }
 
 
-@torch.no_grad()
-def _collect_mode(
-    model: METEROIAModel,
-    loader: Iterable[dict[str, Any]],
-    device: torch.device,
+def _new_collector() -> dict[str, Any]:
+    return {
+        "action_visual": [],
+        "action_final": [],
+        "reason_global": [],
+        "reason_final": [],
+        "mechanism": {},
+        "eval_mode_time": 0.0,
+    }
+
+
+def heca_ablation_manifest() -> dict[str, Any]:
+    """Describe cheap decode probes without mislabelling B0--B5 as them."""
+    return {
+        "cheap_same_forward": list(CHEAP_SAME_FORWARD_MODES),
+        "clean_branches": [
+            "action_visual",
+            "action_final",
+            "reason_global",
+            "reason_final",
+        ],
+        "independent_runs": INDEPENDENT_HECA_ABLATIONS,
+    }
+
+
+def _append_output(
+    collector: dict[str, Any],
+    output: dict[str, Any],
     *,
-    progress: float,
-    diagnostic_modes: tuple[str, ...] = (),
-    collect_mechanism: bool = False,
-    max_batches: int | None = None,
-) -> dict[str, Any]:
-    model.eval()
-    action_visual: list[Tensor] = []
-    action_final: list[Tensor] = []
-    reason_global: list[Tensor] = []
-    reason_final: list[Tensor] = []
-    labels_action: list[Tensor] = []
-    labels_reason: list[Tensor] = []
-    file_names: list[str] = []
-    mechanism: dict[str, list[Tensor]] = {}
-    mode_seconds = 0.0
-    dino_calls_before = model.foundation.ordinary_dino_calls
+    elapsed: float,
+    collect_mechanism: bool,
+) -> None:
+    collector["eval_mode_time"] += elapsed
+    collector["action_visual"].append(output["action_logits_visual"].detach().cpu())
+    collector["action_final"].append(output["action_logits_final"].detach().cpu())
+    collector["reason_global"].append(output["reason_logits_global"].detach().cpu())
+    collector["reason_final"].append(output["reason_logits_final"].detach().cpu())
+    if not collect_mechanism:
+        return
     keys = (
         "factor_anchor_map",
         "factor_null_mass",
@@ -103,43 +128,25 @@ def _collect_mode(
         "reason_evidence_delta",
         "reason_groundable_mask",
     )
-    for batch_index, batch in enumerate(loader):
-        if max_batches is not None and batch_index >= max_batches:
-            break
-        start = time.perf_counter()
-        images = batch["image"].to(device, non_blocking=True)
-        output = model(
-            images,
-            progress=progress,
-            diagnostic_modes=diagnostic_modes,
-        )
-        mode_seconds += time.perf_counter() - start
-        action_visual.append(output["action_logits_visual"].detach().cpu())
-        action_final.append(output["action_logits_final"].detach().cpu())
-        reason_global.append(output["reason_logits_global"].detach().cpu())
-        reason_final.append(output["reason_logits_final"].detach().cpu())
-        labels_action.append(batch["action"].detach().cpu())
-        labels_reason.append(batch["reason"].detach().cpu())
-        file_names.extend(str(name) for name in batch["file_name"])
-        if collect_mechanism:
-            for key in keys:
-                value = output.get(key)
-                if isinstance(value, Tensor):
-                    if value.ndim == 1:
-                        value = value.unsqueeze(0)
-                    mechanism.setdefault(key, []).append(value.detach().cpu())
-        del output, images
+    mechanism = collector["mechanism"]
+    for key in keys:
+        value = output.get(key)
+        if isinstance(value, Tensor):
+            if value.ndim == 1:
+                value = value.unsqueeze(0)
+            mechanism.setdefault(key, []).append(value.detach().cpu())
+
+
+def _finalize_collector(collector: dict[str, Any]) -> dict[str, Any]:
     return {
-        "action_visual": _cat(action_visual),
-        "action_final": _cat(action_final),
-        "reason_global": _cat(reason_global),
-        "reason_final": _cat(reason_final),
-        "labels_action": _cat(labels_action),
-        "labels_reason": _cat(labels_reason),
-        "file_names": file_names,
-        "mechanism": {key: _cat(value) for key, value in mechanism.items()},
-        "eval_mode_time": mode_seconds,
-        "dino_call_count": model.foundation.ordinary_dino_calls - dino_calls_before,
+        "action_visual": _cat(collector["action_visual"]),
+        "action_final": _cat(collector["action_final"]),
+        "reason_global": _cat(collector["reason_global"]),
+        "reason_final": _cat(collector["reason_final"]),
+        "mechanism": {
+            key: _cat(value) for key, value in collector["mechanism"].items()
+        },
+        "eval_mode_time": float(collector["eval_mode_time"]),
     }
 
 
@@ -153,42 +160,70 @@ def collect_outputs(
     max_batches: int | None = None,
     sequential_modes: bool = True,
 ) -> dict[str, Any]:
-    """Collect formal branches, then evaluate corruptions one at a time."""
-    main = _collect_mode(
-        model,
-        loader,
-        device,
-        progress=progress,
-        collect_mechanism=True,
-        max_batches=max_batches,
-    )
-    labels_action = main["labels_action"]
-    labels_reason = main["labels_reason"]
-    modes: dict[str, dict[str, Any]] = {}
+    """Encode once per batch, then decode all cheap HECA interventions."""
+    model.eval()
+    collectors = {"clean": _new_collector()}
     if sequential_modes:
-        for name, flags in SEQUENTIAL_MODES.items():
-            mode = _collect_mode(
-                model,
-                loader,
-                device,
-                progress=progress,
-                diagnostic_modes=flags,
-                max_batches=max_batches,
+        collectors.update({name: _new_collector() for name in CHEAP_SAME_FORWARD_MODES})
+    labels_action: list[Tensor] = []
+    labels_reason: list[Tensor] = []
+    file_names: list[str] = []
+    encoded_batches = 0
+
+    for batch_index, batch in enumerate(loader):
+        if max_batches is not None and batch_index >= max_batches:
+            break
+        images = batch["image"].to(device, non_blocking=True)
+        # This is the only backbone invocation for this batch.  Every mode
+        # below receives the identical encoded field and only changes decode.
+        field = model.encode_images(images)
+        encoded_batches += 1
+        labels_action.append(batch["action"].detach().cpu())
+        labels_reason.append(batch["reason"].detach().cpu())
+        file_names.extend(str(name) for name in batch["file_name"])
+        for name, flags in (("clean", ()), *CHEAP_SAME_FORWARD_MODES.items()):
+            if name not in collectors:
+                continue
+            start = time.perf_counter()
+            output = model.decode_from_field(
+                field, progress=progress, diagnostic_modes=flags
             )
-            modes[name] = {
-                "action_final": mode["action_final"],
-                "reason_final": mode["reason_final"],
-                "metrics": _metric_pair(
-                    mode["action_final"],
-                    mode["reason_final"],
-                    labels_action,
-                    labels_reason,
-                ),
-                "eval_mode_time": mode["eval_mode_time"],
-                "dino_call_count": mode["dino_call_count"],
-            }
-            del mode
-            _release_cuda()
+            _append_output(
+                collectors[name],
+                output,
+                elapsed=time.perf_counter() - start,
+                collect_mechanism=name == "clean",
+            )
+            del output
+        del field, images
+
+    main = _finalize_collector(collectors["clean"])
+    main.update(
+        {
+            "labels_action": _cat(labels_action),
+            "labels_reason": _cat(labels_reason),
+            "file_names": file_names,
+            "dino_call_count": encoded_batches,
+        }
+    )
+    modes: dict[str, dict[str, Any]] = {}
+    for name in CHEAP_SAME_FORWARD_MODES:
+        if name not in collectors:
+            continue
+        mode = _finalize_collector(collectors[name])
+        modes[name] = {
+            "action_final": mode["action_final"],
+            "reason_final": mode["reason_final"],
+            "metrics": _metric_pair(
+                mode["action_final"],
+                mode["reason_final"],
+                main["labels_action"],
+                main["labels_reason"],
+            ),
+            "eval_mode_time": mode["eval_mode_time"],
+            "dino_call_count": 0,
+            "execution": "same_forward_decode",
+        }
     return {**main, "modes": modes}
 
 
@@ -312,7 +347,14 @@ def mechanism_stats_from_collected(collected: dict[str, Any]) -> dict[str, Any]:
         .mean(0)
         .tolist(),
         "factor_off_delta_per_action": mode_delta("factor_off", "action_final"),
-        "state_off_delta_per_action": mode_delta("state_off", "action_final"),
+        "state_uniform_delta_per_action": mode_delta(
+            "state_uniform", "action_final"
+        ),
+        # Legacy readers consume this key.  It intentionally aliases the
+        # full state-uniform recomputation rather than a state-free shortcut.
+        "state_off_delta_per_action": mode_delta(
+            "state_uniform", "action_final"
+        ),
         "schema_corruption_delta_per_action": mode_delta(
             "schema_corruption", "action_final"
         ),
@@ -332,6 +374,7 @@ def mechanism_stats_from_collected(collected: dict[str, Any]) -> dict[str, Any]:
             "main": collected["dino_call_count"],
             **{name: payload["dino_call_count"] for name, payload in modes.items()},
         },
+        "ablation_manifest": heca_ablation_manifest(),
     }
 
 
@@ -349,6 +392,7 @@ def evaluate_checkpoint(
         "branches": branch_metrics(collected),
         "summary": metrics_summary(collected, calibration),
         "mechanism": mechanism_stats_from_collected(collected),
+        "ablation_manifest": heca_ablation_manifest(),
     }
 
 
@@ -426,6 +470,7 @@ def main() -> None:
     write_json(output / "metrics_summary.json", result["summary"])
     write_json(output / "branch_metrics.json", result["branches"])
     write_json(output / "mechanism_stats.json", result["mechanism"])
+    write_json(output / "heca_ablation_manifest.json", result["ablation_manifest"])
 
 
 if __name__ == "__main__":
