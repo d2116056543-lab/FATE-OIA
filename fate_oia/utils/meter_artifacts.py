@@ -14,6 +14,219 @@ import torch
 from fate_oia.utils.tesa_contracts import patch_audit_contract_failures
 
 
+HECA_SIDECAR_FILES = {
+    "ontology_manifest": "heca_ontology_manifest.json",
+    "tau_stats": "heca_tau_stats.json",
+    "gradient_ownership": "heca_gradient_ownership.jsonl",
+    "loss_wiring": "heca_loss_wiring.json",
+    "component_call_counters": "heca_component_call_counters.json",
+    "contribution_conservation": "heca_contribution_conservation.jsonl",
+    "schedule_state": "heca_schedule_state.json",
+    "ablation_manifest": "heca_ablation_manifest.json",
+}
+HECA_GATE_NAMES = tuple("ABCDEFG")
+HECA_CHEAP_MODE_NAMES = (
+    "factor_off",
+    "state_uniform",
+    "reason_correction_off",
+)
+
+
+def _is_finite_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and math.isfinite(float(value))
+
+
+def _read_json(path: Path) -> dict[str, Any] | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _read_jsonl(path: Path) -> list[dict[str, Any]] | None:
+    try:
+        rows = [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    return rows if rows and all(isinstance(row, dict) for row in rows) else None
+
+
+def write_heca_artifact_sidecar(
+    directory: str | Path,
+    payload: Mapping[str, Any],
+) -> Path:
+    """Write the strict HECA sidecar without inventing missing evidence."""
+    root = Path(directory)
+    root.mkdir(parents=True, exist_ok=True)
+    required = set(HECA_SIDECAR_FILES) | {"gates"}
+    missing = sorted(required.difference(payload))
+    if missing:
+        raise ValueError(f"HECA sidecar missing payloads: {', '.join(missing)}")
+    for key, name in HECA_SIDECAR_FILES.items():
+        value = payload[key]
+        if name.endswith(".jsonl"):
+            if not isinstance(value, list):
+                raise ValueError(f"HECA sidecar {key} must be a JSONL row list")
+            target = root / name
+            target.unlink(missing_ok=True)
+            for row in value:
+                if not isinstance(row, Mapping):
+                    raise ValueError(f"HECA sidecar {key} contains a non-object row")
+                append_jsonl(target, row)
+        else:
+            if not isinstance(value, Mapping):
+                raise ValueError(f"HECA sidecar {key} must be an object")
+            write_json(root / name, value)
+    gates = payload["gates"]
+    if not isinstance(gates, Mapping):
+        raise ValueError("HECA sidecar gates must be an object")
+    for letter in HECA_GATE_NAMES:
+        gate = gates.get(letter)
+        if not isinstance(gate, Mapping):
+            raise ValueError(f"HECA sidecar missing Gate {letter}")
+        write_json(root / f"HECA_GATE_{letter}.json", gate)
+    return root
+
+
+def validate_heca_artifact_sidecar(directory: str | Path) -> list[str]:
+    """Reject incomplete HECA artifacts instead of silently weakening audit."""
+    root = Path(directory)
+    failures: list[str] = []
+    for name in HECA_SIDECAR_FILES.values():
+        if not (root / name).exists():
+            failures.append(f"{name}:missing")
+    for letter in HECA_GATE_NAMES:
+        name = f"HECA_GATE_{letter}.json"
+        if not (root / name).exists():
+            failures.append(f"{name}:missing")
+    if failures:
+        return failures
+
+    ontology = _read_json(root / HECA_SIDECAR_FILES["ontology_manifest"])
+    if not (
+        ontology
+        and isinstance(ontology.get("schema_version"), int)
+        and ontology.get("factor_count") == 21
+        and isinstance(ontology.get("state_count"), int)
+        and ontology["state_count"] >= 1
+        and isinstance(ontology.get("sha256"), str)
+        and ontology["sha256"]
+    ):
+        failures.append("heca_ontology_manifest.json:schema")
+
+    tau = _read_json(root / HECA_SIDECAR_FILES["tau_stats"])
+    tau_values = tau.get("tau") if tau else None
+    if not (
+        tau
+        and tau.get("source_split") == "train_main"
+        and _is_finite_number(tau.get("alpha"))
+        and len(tau_values or []) == 21
+        and all(_is_finite_number(value) and 0.05 <= float(value) <= 0.95 for value in tau_values)
+    ):
+        failures.append("heca_tau_stats.json:schema")
+
+    gradient_rows = _read_jsonl(root / HECA_SIDECAR_FILES["gradient_ownership"])
+    gradient_fields = {
+        "optimizer_step",
+        "action_to_anchor_query",
+        "action_to_state_bridge_ratio",
+        "reason_to_action_credit",
+        "measurement_to_foundation",
+    }
+    if not gradient_rows or not all(
+        gradient_fields.issubset(row)
+        and all(_is_finite_number(row[field]) for field in gradient_fields)
+        for row in gradient_rows
+    ):
+        failures.append("heca_gradient_ownership.jsonl:schema")
+
+    wiring = _read_json(root / HECA_SIDECAR_FILES["loss_wiring"])
+    registry = wiring.get("registry") if wiring else None
+    counts = wiring.get("counts") if wiring else None
+    if not (
+        wiring
+        and isinstance(registry, list)
+        and registry
+        and all(isinstance(name, str) for name in registry)
+        and isinstance(counts, dict)
+        and all(counts.get(name) == 1 for name in registry)
+        and wiring.get("duplicates") == []
+        and wiring.get("pass") is True
+    ):
+        failures.append("heca_loss_wiring.json:schema")
+
+    calls = _read_json(root / HECA_SIDECAR_FILES["component_call_counters"])
+    components = calls.get("components") if calls else None
+    required_components = {
+        "dino_encode",
+        "typed_measurement",
+        "action_credit",
+        "reason_correction",
+    }
+    if not (
+        calls
+        and calls.get("one_dino_encode_per_batch") is True
+        and isinstance(components, dict)
+        and all(isinstance(components.get(name), int) and components[name] >= 1 for name in required_components)
+    ):
+        failures.append("heca_component_call_counters.json:schema")
+
+    conservation_rows = _read_jsonl(root / HECA_SIDECAR_FILES["contribution_conservation"])
+    conservation_fields = {"action", "sum_contribution", "action_credit_sum", "abs_error"}
+    if not conservation_rows or not all(
+        conservation_fields.issubset(row)
+        and isinstance(row["action"], int)
+        and 0 <= row["action"] < 4
+        and all(_is_finite_number(row[field]) for field in conservation_fields - {"action"})
+        and abs(float(row["sum_contribution"]) - float(row["action_credit_sum"])) <= 1e-5
+        and float(row["abs_error"]) <= 1e-5
+        for row in conservation_rows
+    ):
+        failures.append("heca_contribution_conservation.jsonl:schema")
+
+    schedule = _read_json(root / HECA_SIDECAR_FILES["schedule_state"])
+    excess_risk = schedule.get("excess_risk") if schedule else None
+    schedule_fields = {"optimizer_step", "progress", "credit_ramp", "foundation_grad_cap"}
+    if not (
+        schedule
+        and all(_is_finite_number(schedule.get(field)) for field in schedule_fields)
+        and isinstance(excess_risk, dict)
+        and all(_is_finite_number(excess_risk.get(name)) for name in ("action", "reason"))
+    ):
+        failures.append("heca_schedule_state.json:schema")
+
+    ablation = _read_json(root / HECA_SIDECAR_FILES["ablation_manifest"])
+    independent = ablation.get("independent_runs") if ablation else None
+    if not (
+        ablation
+        and set(ablation.get("cheap_same_forward", [])) == set(HECA_CHEAP_MODE_NAMES)
+        and isinstance(independent, dict)
+        and set(independent) == {f"B{index}" for index in range(6)}
+        and all(
+            isinstance(item, dict) and item.get("execution") == "independent_run"
+            for item in independent.values()
+        )
+    ):
+        failures.append("heca_ablation_manifest.json:schema")
+
+    for letter in HECA_GATE_NAMES:
+        gate = _read_json(root / f"HECA_GATE_{letter}.json")
+        if not (
+            gate
+            and gate.get("gate") == letter
+            and isinstance(gate.get("pass"), bool)
+            and isinstance(gate.get("evidence"), dict)
+            and gate["evidence"]
+        ):
+            failures.append(f"HECA_GATE_{letter}.json:schema")
+    return failures
+
+
 def combined_file_hash(*paths: str | Path) -> str:
     """Hash path identity and bytes using the canonical readiness algorithm."""
     digest = hashlib.sha256()
