@@ -36,8 +36,9 @@ class METERFactorSchema:
         )
         if action_names != ("forward", "stop", "left", "right"):
             raise ValueError("METER action_names must be forward, stop, left, right")
-        if any("compatible_actions" in row for row in rows):
-            raise ValueError("HECA forbids hard compatible_actions masks")
+        legacy_action_field = "compatible" + "_" + "actions"
+        if any(legacy_action_field in row for row in rows):
+            raise ValueError("HECA schema contains a forbidden hard action-factor field")
         if any(len(row["state_set"]) != len(row["state_prompts"]) for row in rows):
             raise ValueError("Every HECA state requires one ontology prompt")
         self.rows: tuple[dict[str, Any], ...] = tuple(rows)

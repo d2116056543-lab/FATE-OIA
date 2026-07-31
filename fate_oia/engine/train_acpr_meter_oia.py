@@ -22,6 +22,7 @@ from torch.utils.data import DataLoader, Subset
 
 from fate_oia.datasets.meter_dataset import (
     METERDataset,
+    REASON_MIRROR_PAIRS,
     fixed_meter_split_indices,
     meter_split_manifest,
 )
@@ -47,7 +48,15 @@ from fate_oia.losses.meter_reason_losses import (
     noisy_zero_trust,
 )
 from fate_oia.models.meter_oia_model import METEROIAModel
-from fate_oia.optim.heca_optimization import HECALossRegistry, identity_corruption_mode
+from fate_oia.optim.heca_optimization import (
+    HECAExcessRiskBalancer,
+    HECALossRegistry,
+    HECAScheduleState,
+    ReasonProbabilityEMA,
+    correction_fraction_for_run,
+    identity_corruption_mode,
+    validate_formal_protocol,
+)
 from fate_oia.metrics import binary_average_precision, binary_roc_auc
 from fate_oia.transforms_meter import meter_image_transform
 from fate_oia.utils.meter_artifacts import (
@@ -85,6 +94,16 @@ def _git_head() -> str:
         ).strip()
     except Exception:
         return "unavailable"
+
+
+def _validated_gate_pass(path: str) -> bool:
+    if not path:
+        return False
+    source = Path(path)
+    if not source.exists():
+        return False
+    payload = json.loads(source.read_text(encoding="utf-8"))
+    return payload.get("pass") is True and payload.get("gate") in {"C", "HECA_GATE_C"}
 
 
 def initialize_model_from_checkpoint(
@@ -164,11 +183,19 @@ def _forward_training_batch(
     *,
     progress: float,
     mirror_due: bool,
+    view_kind: str = "mirror",
 ) -> tuple[dict[str, Any], dict[str, Any] | None, float]:
-    """Decode an optional paired mirror while keeping one DINO encode call."""
+    """Decode one paired geometric or light view in the same DINO call."""
     batch_size = images.shape[0]
+    if view_kind not in {"mirror", "light"}:
+        raise ValueError(f"Unknown HECA paired view: {view_kind}")
+    paired = (
+        torch.flip(images, dims=[-1])
+        if view_kind == "mirror"
+        else (images * 0.92 + 0.03).clamp(images.amin(), images.amax())
+    )
     encoded_images = (
-        torch.cat([images, torch.flip(images, dims=[-1])], dim=0)
+        torch.cat([images, paired], dim=0)
         if mirror_due
         else images
     )
@@ -195,6 +222,13 @@ def _forward_training_batch(
         else None
     )
     return output, mirror_output, encode_seconds
+
+
+def _mirror_reason_tensor(value: Tensor) -> Tensor:
+    result = value.clone()
+    for left, right in REASON_MIRROR_PAIRS:
+        result[:, left], result[:, right] = value[:, right], value[:, left]
+    return result
 
 
 def _parameter_groups(
@@ -336,6 +370,7 @@ def _compute_losses(
     pu_lambda: Tensor,
     mirror_output: dict[str, Any] | None = None,
     optimizer_step: int = 0,
+    view_kind: str = "mirror",
 ) -> tuple[Tensor, dict[str, Any]]:
     action_target = batch["action"]
     reason_target = batch["reason"]
@@ -350,13 +385,26 @@ def _compute_losses(
     action = meter_action_loss(output, action_target, config["loss_weights"])
     state_positive = output["factor_state_prob"][..., 0]
     view_consistency = torch.ones_like(state_positive)
+    loss_view_output = mirror_output
     if mirror_output is not None:
+        paired_reason = mirror_output["reason_logits_global"]
+        paired_reliability = mirror_output["factor_reliability"]
+        if view_kind == "mirror":
+            paired_reason = _mirror_reason_tensor(paired_reason)
+            paired_reliability = _mirror_reason_tensor(paired_reliability)
         view_consistency = cross_view_consistency(
             output["reason_logits_global"].detach(),
-            mirror_output["reason_logits_global"].detach(),
+            paired_reason.detach(),
             output["factor_reliability"].detach(),
-            mirror_output["factor_reliability"].detach(),
+            paired_reliability.detach(),
         )
+        loss_view_output = dict(mirror_output)
+        loss_view_output["reason_logits_final"] = (
+            _mirror_reason_tensor(mirror_output["reason_logits_final"])
+            if view_kind == "mirror"
+            else mirror_output["reason_logits_final"]
+        )
+        loss_view_output["factor_reliability"] = paired_reliability
     ema_probability = output.get(
         "reason_ema_probability",
         torch.sigmoid(output["reason_logits_global"].detach()),
@@ -367,14 +415,13 @@ def _compute_losses(
         output["factor_reliability"],
         view_consistency,
     )
-    soft_positive = pu_score * pu_lambda.view(1, -1)
     reason = meter_reason_loss(
         output,
         reason_target,
         pu_score,
         config["loss_weights"],
-        soft_positive_weight=soft_positive,
-        view_output=mirror_output,
+        soft_positive_weight=None,
+        view_output=loss_view_output,
     )
     pu = meter_private_pu_loss(
         output["reason_logits_pu_private"],
@@ -387,7 +434,7 @@ def _compute_losses(
             output,
             batch["meter_grounding"],
             observability_tau=output["factor_observability_tau"],
-            mirrored_output=mirror_output,
+            mirrored_output=mirror_output if view_kind == "mirror" else None,
             mirror_pairs=model.typed_factors.mirror_pairs,
             weights=config["loss_weights"],
         )
@@ -400,8 +447,10 @@ def _compute_losses(
                 "anchor",
                 "state",
                 "observability",
+                "null",
                 "discrimination",
                 "mirror",
+                "ontology_identity",
                 "total",
             )
         }
@@ -430,6 +479,7 @@ def _compute_losses(
         registry.add("observability_null", grounding["observability"] + grounding["null"], config["loss_weights"]["observability_null"] * grounding_ramp, owner="measurement")
         registry.add("discrimination", grounding["discrimination"], config["loss_weights"]["discrimination"] * grounding_ramp, owner="measurement")
         registry.add("mirror", grounding["mirror"], config["loss_weights"]["mirror"] * grounding_ramp, owner="measurement")
+        registry.add("ontology_identity", grounding["ontology_identity"], config["loss_weights"]["ontology_identity"] * grounding_ramp, owner="measurement")
     registry.add("pu_private", pu, 1.0, owner="reason_private")
     total = registry.total()
     return total, {
@@ -844,6 +894,18 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
         shuffle=False,
         config=config,
     )
+    prototype_factor_path = config["model"].get("factor_text_prototype_path")
+    prototype_state_path = config["model"].get("state_text_prototype_path")
+    tau_path = config["model"].get("observability_tau_path")
+    if not args.use_mock_dino:
+        for required in (prototype_factor_path, prototype_state_path, tau_path):
+            if not required or not Path(required).exists():
+                raise FileNotFoundError(f"Missing formal HECA static artifact: {required}")
+    observability_tau = (
+        torch.load(tau_path, map_location="cpu", weights_only=True)
+        if tau_path and Path(tau_path).exists()
+        else None
+    )
     model = METEROIAModel(
         dim=int(config["model"]["dim"]),
         action_dim=int(config["model"]["action_dim"]),
@@ -852,8 +914,9 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
         pretrained_weights=config["backbone"]["pretrained_weights"],
         use_mock_dino=bool(args.use_mock_dino),
         factor_rank=int(config["model"].get("factor_rank", 16)),
-        action_correction_fraction=float(
-            config["model"].get("action_correction_fraction", 0.20)
+        action_correction_fraction=correction_fraction_for_run(
+            args.run_kind,
+            gate_c_pass=_validated_gate_pass(args.gate_c_pass),
         ),
         action_max_visual_rms=float(
             config["model"].get("action_max_visual_rms", 5.0)
@@ -862,6 +925,20 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
         action_logit_norm_cap=float(
             config["model"].get("action_logit_norm_cap", 20.0)
         ),
+        action_measurement_grad_scale=float(
+            config["model"].get("action_measurement_grad_scale", 0.05)
+        ),
+        factor_text_prototype_path=(
+            prototype_factor_path
+            if prototype_factor_path and Path(prototype_factor_path).exists()
+            else None
+        ),
+        state_text_prototype_path=(
+            prototype_state_path
+            if prototype_state_path and Path(prototype_state_path).exists()
+            else None
+        ),
+        observability_tau=observability_tau,
     ).to(device)
     initialization: dict[str, Any] | None = None
     if args.init_model_checkpoint:
@@ -877,6 +954,9 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
     scheduler = _scheduler(
         optimizer, total_updates, float(config["training"]["warmup_ratio"])
     )
+    schedule_state = HECAScheduleState(update=0, total_updates=total_updates)
+    excess_risk = HECAExcessRiskBalancer()
+    reason_probability_ema = ReasonProbabilityEMA(momentum=0.90)
     config_hash = combined_file_hash(args.config)
     source_hash = python_source_tree_hash(Path.cwd())
     schema_hash = file_hash(schema_path)
@@ -901,6 +981,13 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
         start_epoch = int(payload["epoch"]) + 1
         optimizer_step = int(payload["optimizer_step"])
         pu_state = dict(payload.get("pu_state") or pu_state)
+        heca_state = dict((payload.get("meta_state") or {}).get("heca", {}))
+        if heca_state:
+            schedule_state = HECAScheduleState.from_state_dict(heca_state["schedule"])
+            excess_risk.load_state_dict(heca_state["excess_risk"])
+            reason_probability_ema.load_state_dict(heca_state["reason_probability_ema"])
+        if schedule_state.update != optimizer_step:
+            raise RuntimeError("HECA resume optimizer/schedule update mismatch")
     manifest = {
         "git_head": _git_head(),
         "config_hash": config_hash,
@@ -953,6 +1040,9 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
         if device.type == "cuda" and precision == "bf16"
         else nullcontext()
     )
+    shared_parameters = list(model.heca_adapters.shared_adapter.parameters())
+    shared_action_grads = [torch.zeros_like(parameter) for parameter in shared_parameters]
+    shared_reason_grads = [torch.zeros_like(parameter) for parameter in shared_parameters]
     for epoch in range(start_epoch, epochs):
         model.train()
         optimizer.zero_grad(set_to_none=True)
@@ -969,12 +1059,18 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                 config["training"].get("mirror_training_interval", 8)
             )
             mirror_due = mirror_interval > 0 and micro_step % mirror_interval == 0
+            view_kind = "mirror" if optimizer_step % 2 == 0 else "light"
             with autocast():
                 output, mirror_output, dino_time = _forward_training_batch(
                     model,
                     batch["image"],
                     progress=optimizer_step / max(total_updates, 1),
                     mirror_due=mirror_due,
+                    view_kind=view_kind,
+                )
+                reason_fallback = torch.sigmoid(output["reason_logits_global"].detach())
+                output["reason_ema_probability"] = reason_probability_ema.values_for(
+                    [str(name) for name in batch["file_name"]], reason_fallback
                 )
                 total, parts = _compute_losses(
                     model,
@@ -988,23 +1084,68 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                     ),
                     mirror_output=mirror_output,
                     optimizer_step=optimizer_step,
+                    view_kind=view_kind,
                 )
                 scaled = total / grad_accum
+            action_shared = parts["loss_registry"].owner_total({"action"}) / grad_accum
+            reason_shared = parts["loss_registry"].owner_total(
+                {"reason", "reason_private"}
+            ) / grad_accum
+            action_grads = torch.autograd.grad(
+                action_shared, shared_parameters, retain_graph=True, allow_unused=True
+            )
+            reason_grads = torch.autograd.grad(
+                reason_shared, shared_parameters, retain_graph=True, allow_unused=True
+            )
+            for index, (action_grad, reason_grad) in enumerate(zip(action_grads, reason_grads)):
+                if action_grad is not None:
+                    shared_action_grads[index].add_(action_grad.detach())
+                if reason_grad is not None:
+                    shared_reason_grads[index].add_(reason_grad.detach())
             backward_start = time.perf_counter()
             scaled.backward()
+            reason_probability_ema.update(
+                [str(name) for name in batch["file_name"]], reason_fallback
+            )
             backward_time = time.perf_counter() - backward_start
             is_update = (micro_step + 1) % grad_accum == 0 or micro_step + 1 == len(train_loader)
             grad_norm = 0.0
             foundation_grad_norm = 0.0
+            shared_grad_cosine = 0.0
+            foundation_grad_cap = float(config["training"]["foundation_grad_cap_max"])
+            balance = {"action": 0.5, "reason": 0.5}
             if is_update:
+                excess_risk.update_floors(parts["action"]["total"], parts["reason"]["total"])
+                balance = excess_risk.weights(parts["action"]["total"], parts["reason"]["total"])
+                flat_action = torch.cat([gradient.flatten() for gradient in shared_action_grads])
+                flat_reason = torch.cat([gradient.flatten() for gradient in shared_reason_grads])
+                shared_grad_cosine = float(torch.nn.functional.cosine_similarity(
+                    flat_action, flat_reason, dim=0, eps=1e-8
+                ))
+                for parameter, action_grad, reason_grad in zip(
+                    shared_parameters, shared_action_grads, shared_reason_grads
+                ):
+                    parameter.grad = (
+                        balance["action"] * action_grad
+                        + balance["reason"] * reason_grad
+                    )
+                    action_grad.zero_()
+                    reason_grad.zero_()
+                raw_foundation_norm = torch.nn.utils.clip_grad_norm_(
+                    model.foundation.parameters(), float("inf")
+                )
+                schedule_state.foundation_grad_ema = (
+                    0.90 * schedule_state.foundation_grad_ema
+                    + 0.10 * float(raw_foundation_norm)
+                )
+                foundation_grad_cap = schedule_state.foundation_grad_cap(
+                    float(config["training"]["foundation_grad_cap_min"]),
+                    float(config["training"]["foundation_grad_cap_max"]),
+                )
                 foundation_grad_norm = float(
                     torch.nn.utils.clip_grad_norm_(
                         model.foundation.parameters(),
-                        float(
-                            config["training"].get(
-                                "foundation_grad_cap_min", 0.25
-                            )
-                        ),
+                        foundation_grad_cap,
                     )
                 )
                 grad_norm = float(
@@ -1016,6 +1157,32 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 optimizer_step += 1
+                schedule_state.update = optimizer_step
+                schedule_state.corruption_phase = optimizer_step % 3
+                schedule_state.action_floor = excess_risk.action_floor
+                schedule_state.reason_floor = excess_risk.reason_floor
+                visual_rms = output["action_logits_visual"].detach().float().square().mean(0).sqrt()
+                schedule_state.visual_rms_ema = (
+                    0.95 * torch.tensor(schedule_state.visual_rms_ema)
+                    + 0.05 * visual_rms.cpu()
+                ).tolist()
+                logit_rms = float(output["action_logits_visual"].detach().float().square().mean().sqrt())
+                for group, scheduled_lr in zip(optimizer.param_groups, scheduler.get_last_lr()):
+                    if group.get("group_name") == "foundation":
+                        group["lr"] = scheduled_lr * schedule_state.foundation_lr_multiplier(logit_rms=logit_rms)
+                append_jsonl(
+                    output_dir / "heca_gradient_ownership.jsonl",
+                    {
+                        "epoch": epoch,
+                        "optimizer_step": optimizer_step,
+                        "shared_action_weight": balance["action"],
+                        "shared_reason_weight": balance["reason"],
+                        "shared_action_reason_grad_cosine": shared_grad_cosine,
+                        "foundation_grad_norm": foundation_grad_norm,
+                        "foundation_grad_cap": foundation_grad_cap,
+                    },
+                )
+                write_json(output_dir / "heca_schedule_state.json", schedule_state.state_dict())
             timing = output["runtime_timing"]
             row = {
                 "epoch": epoch,
@@ -1043,6 +1210,10 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                 "mechanism_ramp": mechanism_ramp,
                 "grad_norm": grad_norm,
                 "foundation_grad_norm": foundation_grad_norm,
+                "foundation_grad_cap": foundation_grad_cap,
+                "shared_action_weight": balance["action"],
+                "shared_reason_weight": balance["reason"],
+                "shared_action_reason_grad_cosine": shared_grad_cosine,
                 "data_time": data_time,
                 "dino_time": dino_time,
                 "foundation_time": timing.get("foundation_time", 0.0),
@@ -1083,6 +1254,11 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
             }
             epoch_rows.append(row)
             append_jsonl(output_dir / "loss_components.jsonl", row)
+            if not (output_dir / "heca_loss_wiring.json").exists():
+                write_json(
+                    output_dir / "heca_loss_wiring.json",
+                    {"terms": parts["loss_registry"].artifact()},
+                )
             if (micro_step + 1) % 200 == 0:
                 print("meter_batch " + json.dumps(row, sort_keys=True), flush=True)
             data_start = time.perf_counter()
@@ -1109,7 +1285,15 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
             micro_step=len(train_loader),
             optimizer_step=optimizer_step,
             runtime_profile=pre_eval_runtime,
-            meta_state={"training_enabled": False, "audit_only": True},
+            meta_state={
+                "training_enabled": False,
+                "audit_only": True,
+                "heca": {
+                    "schedule": schedule_state.state_dict(),
+                    "excess_risk": excess_risk.state_dict(),
+                    "reason_probability_ema": reason_probability_ema.state_dict(),
+                },
+            },
             pu_state=pu_state,
             calibration=_calibration_payload(calibration),
             config_hash=config_hash,
@@ -1117,6 +1301,11 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
             schema_hash=schema_hash,
         )
         pu_state = _update_pu(model, audit_loader, device, progress, config)
+        active_pu = set(int(index) for index in pu_state.get("active_labels", []))
+        schedule_state.pu_pass_streak = [
+            previous + 1 if index in active_pu else 0
+            for index, previous in enumerate(schedule_state.pu_pass_streak)
+        ]
         calibration_data = _collect_calibration(
             model, calib_loader, device, progress
         )
@@ -1138,24 +1327,14 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
         mechanism.update(
             {
                 "diagnostic_due": diagnostic_due,
-                "analytic_coverage": {
-                    "actions": max(
-                        (row["dense_action_coverage"] for row in epoch_rows),
-                        default=0,
-                    ),
-                    "factors": max(
-                        (row["dense_factor_coverage"] for row in epoch_rows),
-                        default=0,
-                    ),
-                },
-                "correct_factor_effect": sum(
-                    row["dense_correct_effect_abs"] for row in epoch_rows
-                )
-                / max(len(epoch_rows), 1),
-                "wrong_factor_effect": sum(
-                    row["dense_wrong_effect_abs"] for row in epoch_rows
-                )
-                / max(len(epoch_rows), 1),
+                "factor_observability_mean": sum(
+                    row["factor_observability_mean"] for row in epoch_rows
+                ) / max(len(epoch_rows), 1),
+                "action_correction_rms_ratio_mean": [
+                    sum(row["action_correction_rms_ratio"][action] for row in epoch_rows)
+                    / max(len(epoch_rows), 1)
+                    for action in range(4)
+                ],
             }
         )
         if diagnostic_due:
@@ -1276,7 +1455,15 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
             "micro_step": len(train_loader),
             "optimizer_step": optimizer_step,
             "runtime_profile": runtime,
-            "meta_state": {"training_enabled": False, "audit_only": True},
+            "meta_state": {
+                "training_enabled": False,
+                "audit_only": True,
+                "heca": {
+                    "schedule": schedule_state.state_dict(),
+                    "excess_risk": excess_risk.state_dict(),
+                    "reason_probability_ema": reason_probability_ema.state_dict(),
+                },
+            },
             "pu_state": pu_state,
             "calibration": _calibration_payload(calibration),
             "config_hash": config_hash,
@@ -1315,7 +1502,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--config",
-        default="configs/fate_oia_train_360x640_acpr_meter_oia_v2_tesa.yaml",
+        default="configs/fate_oia_train_360x640_acpr_meter_oia_v3_heca.yaml",
     )
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--device", default="cuda")
@@ -1334,12 +1521,22 @@ def main() -> None:
     parser.add_argument("--test_only", action="store_true")
     parser.add_argument("--no_feature_cache", action="store_true")
     parser.add_argument("--require_no_token_compression", action="store_true")
+    parser.add_argument("--run_kind", choices=("pilot", "full"), default="pilot")
+    parser.add_argument("--gate_c_pass", default="")
     args = parser.parse_args()
     config = load_meter_config(args.config)
     if args.require_no_token_compression and config["model"]["token_compression"] != "none":
         raise RuntimeError("Token compression is forbidden")
     if args.no_feature_cache and config["model"]["feature_cache_enabled"]:
         raise RuntimeError("Feature cache is forbidden")
+    if args.run_kind == "full":
+        validate_formal_protocol(
+            {
+                "from_scratch": not bool(args.resume or args.init_model_checkpoint),
+                "epochs": int(args.epochs or config["training"]["epochs"]),
+                "pilot_checkpoint": args.resume or args.init_model_checkpoint,
+            }
+        )
     train(config, args)
 
 

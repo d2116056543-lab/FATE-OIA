@@ -49,6 +49,9 @@ model:
   reason_dim: 21
   factor_rank: 16
   state_effect_rank: 64
+  factor_text_prototype_path: artifacts/heca/factor_text_prototype.pt
+  state_text_prototype_path: artifacts/heca/state_text_prototype.pt
+  observability_tau_path: artifacts/heca/factor_observability_tau.pt
   action_correction_fraction: 0.25
   pilot_action_correction_fraction: 0.20
   action_max_delta: 1.0
@@ -63,6 +66,7 @@ model:
   use_formal_meta: false
 
 training:
+  from_scratch: true
   epochs: 14
   batch_size: 6
   gradient_accumulation_steps: 5
@@ -132,7 +136,7 @@ runtime:
   require_no_token_compression: true
   foreground_only: true
   one_dino_call: true
-  sequential_eval: true
+  sequential_eval: false
   target_reserved_gb: 42.0
   hard_reserved_gb: 45.0
 

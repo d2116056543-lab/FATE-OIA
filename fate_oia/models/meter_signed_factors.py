@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -51,6 +52,8 @@ class TypedEvidenceStateHead(nn.Module):
         anchor_exploration_mass: float = 0.05,
         action_measurement_grad_scale: float = 0.05,
         observability_tau: Tensor | None = None,
+        factor_text_prototype_path: str | None = None,
+        state_text_prototype_path: str | None = None,
     ) -> None:
         super().__init__()
         schema = METERFactorSchema(schema_path) if schema_path else default_meter_factor_schema()
@@ -90,6 +93,29 @@ class TypedEvidenceStateHead(nn.Module):
         self.anchor_query = nn.Linear(dim, dim)
         self.factor_semantic_query = nn.Parameter(torch.randn(factor_dim, dim) * 0.02)
         self.factor_spatial_query = nn.Parameter(torch.randn(factor_dim, dim) * 0.02)
+        factor_text = self._load_prototype(
+            factor_text_prototype_path, (factor_dim,), fallback_dim=dim
+        )
+        group_names = sorted({str(row["factor_group"]) for row in schema.rows})
+        self.register_buffer(
+            "factor_group_ids",
+            torch.tensor(
+                [group_names.index(str(row["factor_group"])) for row in schema.rows],
+                dtype=torch.long,
+            ),
+            persistent=True,
+        )
+        state_text = self._load_prototype(
+            state_text_prototype_path,
+            (factor_dim, self.max_states),
+            fallback_dim=factor_text.shape[-1],
+        )
+        if factor_text.shape[-1] != state_text.shape[-1]:
+            raise ValueError("Factor/state ontology prototype dimensions differ")
+        self.register_buffer("factor_text_prototype", factor_text, persistent=True)
+        self.register_buffer("state_text_prototype", state_text, persistent=True)
+        self.factor_text_proj = nn.Linear(factor_text.shape[-1], dim, bias=False)
+        self.state_text_proj = nn.Linear(state_text.shape[-1], dim, bias=False)
         self.anchor_key = nn.ModuleList(nn.Linear(dim, dim) for _ in range(num_layers))
         self.anchor_value = nn.ModuleList(nn.Linear(dim, dim) for _ in range(num_layers))
         self.layer_router = nn.Parameter(torch.zeros(factor_dim, num_layers))
@@ -125,6 +151,28 @@ class TypedEvidenceStateHead(nn.Module):
         self.mirror_pairs = schema.mirror_pairs
 
     @staticmethod
+    def _load_prototype(
+        path: str | None,
+        leading_shape: tuple[int, ...],
+        *,
+        fallback_dim: int,
+    ) -> Tensor:
+        if path is None:
+            return torch.zeros((*leading_shape, fallback_dim), dtype=torch.float32)
+        source = Path(path)
+        if not source.exists():
+            raise FileNotFoundError(f"Missing offline HECA ontology prototype: {source}")
+        value = torch.load(source, map_location="cpu", weights_only=True)
+        if isinstance(value, dict):
+            value = value.get("prototype")
+        value = torch.as_tensor(value, dtype=torch.float32)
+        if tuple(value.shape[:-1]) != leading_shape:
+            raise ValueError(
+                f"HECA ontology prototype leading shape {tuple(value.shape[:-1])} != {leading_shape}"
+            )
+        return value
+
+    @staticmethod
     def _ramp(progress: float) -> float:
         return float(min(max(progress / 0.20, 0.0), 1.0))
 
@@ -151,9 +199,10 @@ class TypedEvidenceStateHead(nn.Module):
         anchor_token: Tensor,
         state_prob: Tensor,
     ) -> Tensor:
-        state_token = torch.einsum(
-            "bfs,fsd->bfd", state_prob, self.state_embeddings
+        state_basis = self.state_embeddings + 0.20 * self.state_text_proj(
+            self.state_text_prototype
         )
+        state_token = torch.einsum("bfs,fsd->bfd", state_prob, state_basis)
         return self.typed_norm(
             global_token + self.anchor_proj(anchor_token) + state_token
         )
@@ -168,9 +217,10 @@ class TypedEvidenceStateHead(nn.Module):
         # rewrite the anchor/state representation used by the reason branch.
         anchor_token = anchor_token.detach()
         state_prob = state_prob.detach()
-        state_token = torch.einsum(
-            "bfs,fsd->bfd", state_prob, self.action_state_embeddings
+        state_basis = self.action_state_embeddings + 0.20 * self.state_text_proj(
+            self.state_text_prototype
         )
+        state_token = torch.einsum("bfs,fsd->bfd", state_prob, state_basis)
         return self.action_route_norm(
             self.action_anchor_proj(anchor_token) + state_token
         )
@@ -181,9 +231,10 @@ class TypedEvidenceStateHead(nn.Module):
         state_prob: Tensor,
         global_token: Tensor,
     ) -> tuple[Tensor, Tensor]:
-        state_token = torch.einsum(
-            "bfs,fsd->bfd", state_prob, self.action_state_embeddings
+        state_basis = self.action_state_embeddings + 0.20 * self.state_text_proj(
+            self.state_text_prototype
         )
+        state_token = torch.einsum("bfs,fsd->bfd", state_prob, state_basis)
         bridge = selective_credit_bridge(
             anchor_token,
             state_token,
@@ -220,6 +271,7 @@ class TypedEvidenceStateHead(nn.Module):
             factor_base_nodes
             + self.factor_semantic_query.unsqueeze(0)
             + self.factor_spatial_query.unsqueeze(0)
+            + 0.20 * self.factor_text_proj(self.factor_text_prototype).unsqueeze(0)
         )
         query = self.anchor_query(query_source)
         layer_weight = torch.softmax(self.layer_router, dim=-1)
@@ -307,9 +359,14 @@ class TypedEvidenceStateHead(nn.Module):
             "factor_state_prob_credit": state_prob_credit,
             "factor_measurement_token": typed_token,
             "factor_observability_tau": self.factor_observability_tau,
+            "factor_ontology_query": self.factor_semantic_query,
+            "factor_ontology_target": self.factor_text_proj(self.factor_text_prototype),
+            "state_ontology_query": self.state_embeddings,
+            "state_ontology_target": self.state_text_proj(self.state_text_prototype),
             "factor_layer_weights": layer_weight,
             "factor_action_ownership": self.action_ownership,
             "factor_groundable_mask": self.groundable_mask,
+            "factor_group_ids": self.factor_group_ids,
         }
 
 

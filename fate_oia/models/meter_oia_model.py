@@ -30,6 +30,9 @@ class METEROIAModel(nn.Module):
         action_max_delta: float = 1.0,
         action_logit_norm_cap: float = 20.0,
         action_measurement_grad_scale: float = 0.05,
+        factor_text_prototype_path: str | None = None,
+        state_text_prototype_path: str | None = None,
+        observability_tau: Tensor | None = None,
         **_: Any,
     ) -> None:
         super().__init__()
@@ -56,6 +59,9 @@ class METEROIAModel(nn.Module):
             num_layers=len(selected_layers),
             schema_path=schema_path,
             action_measurement_grad_scale=action_measurement_grad_scale,
+            factor_text_prototype_path=factor_text_prototype_path,
+            state_text_prototype_path=state_text_prototype_path,
+            observability_tau=observability_tau,
         )
         self.action_transport = StateConditionedActionCredit(
             dim=dim,
