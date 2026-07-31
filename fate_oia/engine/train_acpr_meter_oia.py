@@ -68,6 +68,7 @@ from fate_oia.utils.meter_artifacts import (
     save_checkpoint,
     save_epoch_artifacts,
     state_hash,
+    validate_heca_pilot_bundle,
     write_json,
 )
 from fate_oia.utils.meter_config import load_meter_config
@@ -100,10 +101,21 @@ def _validated_gate_pass(path: str) -> bool:
     if not path:
         return False
     source = Path(path)
-    if not source.exists():
+    if not source.exists() or source.name != "HECA_GATE_C.json":
+        return False
+    head = _git_head()
+    if validate_heca_pilot_bundle(source.parent, expected_git_head=head):
         return False
     payload = json.loads(source.read_text(encoding="utf-8"))
-    return payload.get("pass") is True and payload.get("gate") in {"C", "HECA_GATE_C"}
+    pilot = json.loads(
+        (source.parent / "HECA_PILOT_PASS.json").read_text(encoding="utf-8")
+    )
+    return (
+        payload.get("pass") is True
+        and payload.get("gate") in {"C", "HECA_GATE_C"}
+        and pilot.get("gate_payloads", {}).get("C") == payload
+        and all(pilot.get("gates", {}).get(letter) is True for letter in "ABCDEFG")
+    )
 
 
 def initialize_model_from_checkpoint(

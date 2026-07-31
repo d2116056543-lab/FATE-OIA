@@ -11,8 +11,10 @@ from fate_oia.engine.eval_acpr_meter_oia import (
     INDEPENDENT_HECA_ABLATIONS,
 )
 from fate_oia.utils.meter_artifacts import (
-    validate_heca_artifact_sidecar,
+    file_hash,
+    validate_heca_pilot_bundle,
     write_heca_artifact_sidecar,
+    write_heca_pilot_evidence_manifest,
     write_json,
 )
 
@@ -363,7 +365,12 @@ def main() -> None:
         "gates": result["gate_payloads"],
     }
     write_heca_artifact_sidecar(root, payload)
-    failures = validate_heca_artifact_sidecar(root)
+    write_heca_pilot_evidence_manifest(root, git_head=git_head)
+    result["evidence_manifest_sha256"] = file_hash(
+        root / "heca_pilot_evidence_manifest.json"
+    )
+    write_json(root / "HECA_PILOT_PASS.json", result)
+    failures = validate_heca_pilot_bundle(root, expected_git_head=git_head)
     result["artifact_failures"] = failures
     result["pass"] = result["pass"] and not failures
     write_json(root / "HECA_PILOT_PASS.json", result)
