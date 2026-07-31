@@ -34,19 +34,20 @@ from fate_oia.engine.eval_acpr_meter_oia import (
 )
 from fate_oia.engine.tesa_diagnostics import run_stratified_patch_audit
 from fate_oia.losses.meter_action_losses import meter_action_loss
-from fate_oia.losses.meter_counterfactual_losses import (
-    dense_factor_intervention_loss,
-    identity_corruption_loss,
-    reason_identity_corruption_loss,
-)
+from fate_oia.losses.meter_counterfactual_losses import identity_corruption_loss
 from fate_oia.losses.meter_grounding_losses import meter_grounding_loss
 from fate_oia.losses.meter_pu_losses import (
     meter_hidden_positive_audit,
     meter_private_pu_loss,
     meter_pu_score,
 )
-from fate_oia.losses.meter_reason_losses import meter_reason_loss
+from fate_oia.losses.meter_reason_losses import (
+    cross_view_consistency,
+    meter_reason_loss,
+    noisy_zero_trust,
+)
 from fate_oia.models.meter_oia_model import METEROIAModel
+from fate_oia.optim.heca_optimization import HECALossRegistry, identity_corruption_mode
 from fate_oia.metrics import binary_average_precision, binary_roc_auc
 from fate_oia.transforms_meter import meter_image_transform
 from fate_oia.utils.meter_artifacts import (
@@ -167,7 +168,7 @@ def _forward_training_batch(
     """Decode an optional paired mirror while keeping one DINO encode call."""
     batch_size = images.shape[0]
     encoded_images = (
-        torch.cat([images, torch.flip(images[:1], dims=[-1])], dim=0)
+        torch.cat([images, torch.flip(images, dims=[-1])], dim=0)
         if mirror_due
         else images
     )
@@ -201,8 +202,9 @@ def _parameter_groups(
 ) -> list[dict[str, Any]]:
     groups: dict[str, list[Tensor]] = {
         "foundation": [],
-        "typed_factor": [],
-        "action_transport": [],
+        "shared_adapter": [],
+        "measurement": [],
+        "action_credit": [],
         "reason_global": [],
         "reason_correction": [],
     }
@@ -210,10 +212,18 @@ def _parameter_groups(
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad or name.startswith("foundation.dino."):
             continue
-        if name.startswith("typed_factors."):
-            owner = "typed_factor"
+        if name.startswith("heca_adapters.shared_adapter."):
+            owner = "shared_adapter"
+        elif name.startswith("heca_adapters.action_private_adapter."):
+            owner = "action_credit"
+        elif name.startswith("heca_adapters.reason_private_adapter."):
+            owner = "reason_global"
+        elif name.startswith("typed_factors.action_bridge_proj."):
+            owner = "action_credit"
+        elif name.startswith("typed_factors."):
+            owner = "measurement"
         elif name.startswith("action_transport."):
-            owner = "action_transport"
+            owner = "action_credit"
         elif name.startswith("reason_decoder.correction_"):
             owner = "reason_correction"
         elif name.startswith("reason_decoder."):
@@ -233,10 +243,18 @@ def _parameter_groups(
     if set(owners) != expected:
         raise RuntimeError("Optimizer ownership does not cover trainable parameters exactly")
     training = config["training"]
+    learning_rates = {
+        "foundation": float(training["foundation_target"]),
+        "shared_adapter": float(training["lr_shared_adapter"]),
+        "measurement": float(training["lr_measurement"]),
+        "action_credit": float(training["lr_action_credit"]),
+        "reason_global": float(training["lr_reason_global"]),
+        "reason_correction": float(training["lr_reason_correction"]),
+    }
     return [
         {
             "params": groups[name],
-            "lr": float(training[f"lr_{name}"]),
+            "lr": learning_rates[name],
             "group_name": name,
         }
         for name in groups
@@ -276,34 +294,32 @@ def _identity_output(
     mode: str,
 ) -> dict[str, Tensor]:
     reliability = output["factor_reliability"]
-    factor_source = output["factor_observability"]
-    corrupt_value_token = output["factor_action_value_token"]
+    bridge = output["factor_action_bridge_token"]
+    state_prob_credit = output["factor_state_prob_credit"]
     if mode == "schema":
-        corrupt_token = torch.roll(output["factor_action_token"], 1, 1)
-        corrupt_value_token = torch.roll(corrupt_value_token, 1, 1)
+        bridge = torch.roll(bridge, 1, 1)
+        state_prob_credit = torch.roll(state_prob_credit, 1, 1)
     elif mode == "cross_sample":
-        if output["factor_action_token"].shape[0] < 2:
-            corrupt_token = output["factor_action_token"]
-        else:
-            corrupt_token = torch.roll(output["factor_action_token"], 1, 0)
-            corrupt_value_token = torch.roll(corrupt_value_token, 1, 0)
+        if bridge.shape[0] > 1:
+            bridge = torch.roll(bridge, 1, 0)
+            state_prob_credit = torch.roll(state_prob_credit, 1, 0)
             reliability = torch.roll(reliability, 1, 0)
-            factor_source = torch.roll(factor_source, 1, 0)
     elif mode == "state":
         corrupt_state = torch.roll(output["factor_state_prob"], 1, -1)
-        corrupt_token = model.typed_factors.compose_action_token(
-            output["factor_anchor_token"], corrupt_state
+        bridge, state_prob_credit = model.typed_factors.compose_action_bridge_token(
+            output["factor_anchor_token"],
+            corrupt_state,
+            output["factor_global_token"],
         )
     else:
         raise ValueError(f"Unknown identity corruption mode: {mode}")
     return model.action_transport(
         output["action_logits_visual"],
         output["action_nodes"],
-        corrupt_token,
+        bridge,
+        state_prob_credit,
         reliability,
         output["factor_action_ownership"],
-        factor_value_token=corrupt_value_token,
-        factor_source=factor_source,
         progress=progress,
         update_running_stats=False,
     )
@@ -319,79 +335,46 @@ def _compute_losses(
     mechanism_ramp: float,
     pu_lambda: Tensor,
     mirror_output: dict[str, Any] | None = None,
+    optimizer_step: int = 0,
 ) -> tuple[Tensor, dict[str, Any]]:
     action_target = batch["action"]
     reason_target = batch["reason"]
-    dense = dense_factor_intervention_loss(
-        output["action_logits_final"],
-        output["action_factor_contributions"],
+    mode = identity_corruption_mode(optimizer_step)
+    corrupt = _identity_output(model, output, mechanism_ramp, mode)
+    identity = identity_corruption_loss(
+        output["action_factor_contribution"],
+        corrupt["action_factor_contribution"],
         action_target,
     )
-    identity_terms: dict[str, Tensor] = {}
-    reason_identity_terms: dict[str, Tensor] = {}
-    for mode in ("schema", "cross_sample", "state"):
-        if mode == "cross_sample" and output["factor_typed_token"].shape[0] < 2:
-            zero = output["action_logits_final"].new_zeros(())
-            identity_terms[mode] = zero
-            reason_identity_terms[mode] = zero
-            continue
-        corrupt = _identity_output(model, output, mechanism_ramp, mode)
-        identity_terms[mode] = identity_corruption_loss(
-            output["action_factor_contributions"],
-            corrupt["action_factor_contributions"],
-            action_target,
-        )
-        corrupt_reliability = output["factor_reliability"]
-        if mode == "schema":
-            corrupt_token = torch.roll(output["factor_typed_token"], 1, 1)
-        elif mode == "cross_sample":
-            corrupt_token = (
-                torch.roll(output["factor_typed_token"], 1, 0)
-                if output["factor_typed_token"].shape[0] > 1
-                else output["factor_typed_token"]
-            )
-            if output["factor_typed_token"].shape[0] > 1:
-                corrupt_reliability = torch.roll(corrupt_reliability, 1, 0)
-        else:
-            corrupt_token = model.typed_factors.compose_typed_token(
-                output["factor_global_token"],
-                output["factor_anchor_token"],
-                torch.roll(output["factor_state_prob"], 1, -1),
-            )
-        corrupt_reason = model.reason_decoder(
-            patch_tokens_by_layer=output["patch_tokens_by_layer"],
-            reason_logits_calalign=output["reason_logits_calalign"],
-            factor_typed_token=corrupt_token,
-            factor_reliability=corrupt_reliability,
-            factor_groundable_mask=output["factor_groundable_mask"],
-            progress=mechanism_ramp,
-        )
-        reason_identity_terms[mode] = reason_identity_corruption_loss(
-            output["reason_logits_final"],
-            corrupt_reason["reason_logits_final"],
-            reason_target,
-        )
-    identity = torch.stack(tuple(identity_terms.values())).mean()
-    reason_identity = torch.stack(tuple(reason_identity_terms.values())).mean()
-    output["dense_specificity_loss"] = dense["specificity"] * mechanism_ramp
-    output["action_specificity_loss"] = dense["specificity"] * mechanism_ramp
-    output["dense_identity_loss"] = identity * mechanism_ramp
+    output["action_specificity_loss"] = identity * mechanism_ramp
     action = meter_action_loss(output, action_target, config["loss_weights"])
-    confidence = output["factor_reliability"].detach()
-    observability = output["factor_observability"].detach()
+    state_positive = output["factor_state_prob"][..., 0]
+    view_consistency = torch.ones_like(state_positive)
+    if mirror_output is not None:
+        view_consistency = cross_view_consistency(
+            output["reason_logits_global"].detach(),
+            mirror_output["reason_logits_global"].detach(),
+            output["factor_reliability"].detach(),
+            mirror_output["factor_reliability"].detach(),
+        )
+    ema_probability = output.get(
+        "reason_ema_probability",
+        torch.sigmoid(output["reason_logits_global"].detach()),
+    )
+    pu_score, negative_weight = noisy_zero_trust(
+        ema_probability,
+        state_positive,
+        output["factor_reliability"],
+        view_consistency,
+    )
+    soft_positive = pu_score * pu_lambda.view(1, -1)
     reason = meter_reason_loss(
         output,
         reason_target,
-        confidence,
+        pu_score,
         config["loss_weights"],
-        observability=observability,
-    )
-    state_positive = output["factor_state_prob"][..., 0]
-    pu_score = meter_pu_score(
-        torch.sigmoid(output["reason_logits_global"]),
-        state_positive,
-        output["factor_reliability"],
-        output["factor_observability"],
+        soft_positive_weight=soft_positive,
+        view_output=mirror_output,
     )
     pu = meter_private_pu_loss(
         output["reason_logits_pu_private"],
@@ -403,6 +386,7 @@ def _compute_losses(
         grounding = meter_grounding_loss(
             output,
             batch["meter_grounding"],
+            observability_tau=output["factor_observability_tau"],
             mirrored_output=mirror_output,
             mirror_pairs=model.typed_factors.mirror_pairs,
             weights=config["loss_weights"],
@@ -422,28 +406,42 @@ def _compute_losses(
             )
         }
         grounding_total = zero
-    dense_weight = float(config["loss_weights"].get("dense_intervention", 0.05))
-    total = (
-        action["total"]
-        + reason["total"]
-        + grounding_total
-        + dense_weight * mechanism_ramp * dense["necessity"]
-        + float(config["loss_weights"].get("reason_identity", 0.03))
-        * mechanism_ramp
-        * reason_identity
-        + pu
-    )
+    registry = HECALossRegistry()
+    action_map = {
+        "action_final": "final", "action_visual": "visual",
+        "action_credit_rank": "credit_rank", "action_necessity": "necessity",
+        "action_specificity": "specificity", "action_nonreg": "nonreg",
+        "action_soft_f1": "soft_f1", "action_cardinality": "cardinality",
+        "action_logit_scale": "logit_scale",
+    }
+    reason_map = {
+        "reason_final": "final", "reason_global": "global",
+        "reason_rank": "rank", "reason_soft_f1": "soft_f1",
+        "reason_correction_sign": "correction_sign",
+        "reason_view_consistency": "view_consistency",
+    }
+    for key, part in action_map.items():
+        registry.add(key, action[part], config["loss_weights"][key], owner="action")
+    for key, part in reason_map.items():
+        registry.add(key, reason[part], config["loss_weights"][key], owner="reason")
+    if "meter_grounding" in batch:
+        registry.add("anchor", grounding["anchor"], config["loss_weights"]["anchor"] * grounding_ramp, owner="measurement")
+        registry.add("state", grounding["state"], config["loss_weights"]["state"] * grounding_ramp, owner="measurement")
+        registry.add("observability_null", grounding["observability"] + grounding["null"], config["loss_weights"]["observability_null"] * grounding_ramp, owner="measurement")
+        registry.add("discrimination", grounding["discrimination"], config["loss_weights"]["discrimination"] * grounding_ramp, owner="measurement")
+        registry.add("mirror", grounding["mirror"], config["loss_weights"]["mirror"] * grounding_ramp, owner="measurement")
+    registry.add("pu_private", pu, 1.0, owner="reason_private")
+    total = registry.total()
     return total, {
         "action": action,
         "reason": reason,
         "grounding": grounding,
-        "dense": dense,
         "identity": identity,
-        "identity_terms": identity_terms,
-        "reason_identity": reason_identity,
-        "reason_identity_terms": reason_identity_terms,
+        "identity_mode": mode,
         "pu": pu,
         "pu_score": pu_score,
+        "negative_weight": negative_weight,
+        "loss_registry": registry,
     }
 
 
@@ -989,6 +987,7 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                         pu_state["lambda"], device=device, dtype=output["reason_logits_final"].dtype
                     ),
                     mirror_output=mirror_output,
+                    optimizer_step=optimizer_step,
                 )
                 scaled = total / grad_accum
             backward_start = time.perf_counter()
@@ -1003,15 +1002,14 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                         model.foundation.parameters(),
                         float(
                             config["training"].get(
-                                "foundation_grad_clip",
-                                config["training"]["grad_clip"],
+                                "foundation_grad_cap_min", 0.25
                             )
                         ),
                     )
                 )
                 grad_norm = float(
                     torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), float(config["training"]["grad_clip"])
+                        model.parameters(), float(config["training"]["grad_clip_global"])
                     )
                 )
                 optimizer.step()
@@ -1032,21 +1030,14 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                 "loss_observability": float(parts["grounding"]["observability"].detach()),
                 "loss_discrimination": float(parts["grounding"]["discrimination"].detach()),
                 "loss_mirror": float(parts["grounding"]["mirror"].detach()),
-                "loss_dense_intervention": float(parts["dense"]["total"].detach()),
-                "loss_dense_necessity": float(parts["dense"]["necessity"].detach()),
                 "loss_action_specificity": float(
                     parts["action"]["specificity"].detach()
                 ),
-                "loss_action_anti_monopoly": float(
-                    parts["action"]["anti_monopoly"].detach()
-                ),
-                "loss_action_near_boundary": float(
-                    parts["action"]["near_boundary"].detach()
-                ),
-                "loss_action_delta_ranking": float(
-                    parts["action"]["delta_ranking"].detach()
-                ),
+                "loss_action_credit_rank": float(parts["action"]["credit_rank"].detach()),
+                "loss_action_nonreg": float(parts["action"]["nonreg"].detach()),
+                "loss_action_logit_scale": float(parts["action"]["logit_scale"].detach()),
                 "loss_identity": float(parts["identity"].detach()),
+                "identity_mode": parts["identity_mode"],
                 "loss_pu": float(parts["pu"].detach()),
                 "grounding_ramp": grounding_ramp,
                 "mechanism_ramp": mechanism_ramp,
@@ -1083,52 +1074,12 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                 "action_final_logit_abs_max": float(
                     output["action_logits_final"].detach().abs().max()
                 ),
-                "action_direct_preclip_norm_max": float(
-                    output["action_direct_preclip_norm"].detach().max()
-                ),
+                "action_visual_preclip_norm_max": float(output["action_visual_preclip_norm"].detach().max()),
                 "factor_null_mean": float(output["factor_null_mass"].mean().detach()),
                 "factor_observability_mean": float(
                     output["factor_observability"].mean().detach()
                 ),
-                "dense_action_coverage": int(parts["dense"]["action_coverage"]),
-                "dense_factor_coverage": int(parts["dense"]["factor_coverage"]),
-                "dense_correct_effect_abs": float(
-                    parts["dense"]["correct_effect"].abs().mean()
-                ),
-                "dense_wrong_effect_abs": float(
-                    parts["dense"]["wrong_effect"].abs().mean()
-                ),
-                "dense_correct_effect_abs_per_action": parts["dense"][
-                    "correct_effect"
-                ]
-                .abs()
-                .mean(0)
-                .tolist(),
-                "dense_wrong_effect_abs_per_action": parts["dense"][
-                    "wrong_effect"
-                ]
-                .abs()
-                .mean(0)
-                .tolist(),
-                "loss_reason_identity": float(parts["reason_identity"].detach()),
-                "loss_identity_schema": float(
-                    parts["identity_terms"]["schema"].detach()
-                ),
-                "loss_identity_cross_sample": float(
-                    parts["identity_terms"]["cross_sample"].detach()
-                ),
-                "loss_identity_state": float(
-                    parts["identity_terms"]["state"].detach()
-                ),
-                "loss_reason_identity_schema": float(
-                    parts["reason_identity_terms"]["schema"].detach()
-                ),
-                "loss_reason_identity_cross_sample": float(
-                    parts["reason_identity_terms"]["cross_sample"].detach()
-                ),
-                "loss_reason_identity_state": float(
-                    parts["reason_identity_terms"]["state"].detach()
-                ),
+                "loss_wiring": parts["loss_registry"].artifact(),
             }
             epoch_rows.append(row)
             append_jsonl(output_dir / "loss_components.jsonl", row)

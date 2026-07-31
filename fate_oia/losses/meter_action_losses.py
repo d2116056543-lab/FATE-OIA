@@ -96,7 +96,10 @@ def meter_action_loss(
     contribution = output["action_factor_contribution"]
     sign = target * 2.0 - 1.0
     necessity = torch.relu(0.05 - sign * output["action_evidence_delta"]).mean()
-    specificity = (contribution.abs().mean(-1) * (1.0 - target)).mean()
+    specificity = output.get(
+        "action_specificity_loss",
+        (contribution.abs().mean(-1) * (1.0 - target)).mean(),
+    )
     nonreg = action_nonregression_loss(
         output["action_logits_visual"], output["action_logits_final"], target
     )

@@ -75,6 +75,7 @@ training:
   foundation_grad_cap_max: 0.75
   warmup_ratio: 0.05
   credit_ramp_ratio: 0.15
+  mirror_training_interval: 1
   foundation_initial: 0.00005
   foundation_target: 0.00010
   lr_shared_adapter: 0.00015
