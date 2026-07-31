@@ -1,0 +1,140 @@
+data_root: E:\sbw\BDD-OIA\data
+raw_root: E:\sbw\BDD-OIA
+bdd100k_root: E:\sbw\BDD100K
+pretrained_weights: E:\sbw\SNNA_repro\SNNA\ckp\reference\dino_deitsmall8_pretrain.pth
+eval_splits: test
+best_selection_split: test
+token_compression: none
+feature_cache_enabled: false
+
+experiment:
+  name: acpr_meter_oia_v3_heca
+  direct_image: true
+  internal_test_selected: true
+  publication_eligible: false
+  no_metric_early_stop: true
+
+data:
+  data_root: E:\sbw\BDD-OIA\data
+  raw_root: E:\sbw\BDD-OIA
+  bdd100k_root: E:\sbw\BDD100K
+  image_height: 360
+  image_width: 640
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+  mirror_probability: 0.25
+  light_brightness_contrast: true
+  strong_hue_jitter: false
+
+splits:
+  seed: 20260801
+  audit_fraction: 0.08
+  calib_fraction: 0.10
+  main_audit_calib_disjoint: true
+
+backbone:
+  arch: vit_small
+  patch_size: 8
+  checkpoint_key: teacher
+  pretrained_weights: E:\sbw\SNNA_repro\SNNA\ckp\reference\dino_deitsmall8_pretrain.pth
+  selected_layers: [3, 7, 11]
+  freeze_backbone: true
+  no_grad_backbone: true
+
+model:
+  dim: 384
+  action_dim: 4
+  reason_dim: 21
+  factor_rank: 16
+  state_effect_rank: 64
+  action_correction_fraction: 0.25
+  pilot_action_correction_fraction: 0.20
+  action_max_delta: 1.0
+  action_logit_norm_cap: 20.0
+  action_measurement_grad_scale: 0.05
+  use_hard_action_factor_mask: false
+  use_admission_gate: false
+  token_compression: none
+  feature_cache_enabled: false
+  use_action_set_final: false
+  use_selector: false
+  use_formal_meta: false
+
+training:
+  epochs: 14
+  batch_size: 6
+  gradient_accumulation_steps: 5
+  precision: bf16
+  optimizer: AdamW
+  scheduler: cosine_by_update
+  weight_decay: 0.05
+  grad_clip_global: 1.0
+  foundation_grad_cap_min: 0.25
+  foundation_grad_cap_max: 0.75
+  warmup_ratio: 0.05
+  credit_ramp_ratio: 0.15
+  foundation_initial: 0.00005
+  foundation_target: 0.00010
+  lr_shared_adapter: 0.00015
+  lr_measurement: 0.00020
+  lr_action_credit: 0.00020
+  lr_reason_global: 0.00020
+  lr_reason_correction: 0.00025
+
+loss_weights:
+  action_final: 1.00
+  action_visual: 0.30
+  action_credit_rank: 0.10
+  action_necessity: 0.05
+  action_specificity: 0.05
+  action_nonreg: 0.05
+  action_soft_f1: 0.03
+  action_cardinality: 0.02
+  action_logit_scale: 0.01
+  reason_final: 1.00
+  reason_global: 0.50
+  reason_rank: 0.08
+  reason_soft_f1: 0.05
+  reason_correction_sign: 0.08
+  reason_view_consistency: 0.05
+  anchor: 0.05
+  state: 0.08
+  observability_null: 0.02
+  discrimination: 0.03
+  mirror: 0.02
+  ontology_identity: 0.02
+
+pu:
+  start_after_epoch: 1
+  min_positive_count: 20
+  hidden_positive_fraction: 0.20
+  min_auprc_lift: 0.02
+  min_view_consistency: 0.50
+  required_pass_streak: 2
+  max_lambda: 0.10
+  private_only: true
+
+pilot:
+  train_main: 4096
+  train_audit: 1024
+  train_calib: 512
+  test: 512
+  epochs: 4
+  seed: 20260801
+  from_scratch: true
+
+runtime:
+  test_only: true
+  no_feature_cache: true
+  require_no_token_compression: true
+  foreground_only: true
+  one_dino_call: true
+  sequential_eval: true
+  target_reserved_gb: 42.0
+  hard_reserved_gb: 45.0
+
+evaluation:
+  cheap_diagnostics_each_epoch: [factor_off, state_uniform, reason_correction_off]
+  patch_deletion_interval_epochs: 4

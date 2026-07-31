@@ -21,6 +21,23 @@ DEFAULT_GROUNDABLE = (
 )
 
 
+def selective_credit_bridge(
+    anchor: Tensor,
+    state: Tensor,
+    global_token: Tensor,
+    *,
+    scale: float = 0.05,
+) -> Tensor:
+    """Expose semantic evidence to action without letting action move anchors."""
+    if not 0.0 <= scale <= 0.10:
+        raise ValueError("HECA measurement bridge scale must be in [0, 0.10]")
+    state_bridge = state.detach() + scale * (state - state.detach())
+    global_bridge = global_token.detach() + scale * (
+        global_token - global_token.detach()
+    )
+    return torch.cat((anchor.detach(), state_bridge, global_bridge), dim=-1)
+
+
 class TypedEvidenceStateHead(nn.Module):
     """Factor-specific anchor, state, observability, and typed evidence."""
 
@@ -32,6 +49,8 @@ class TypedEvidenceStateHead(nn.Module):
         state_cardinalities: tuple[int, ...] = DEFAULT_STATE_CARDINALITIES,
         schema_path: str | None = None,
         anchor_exploration_mass: float = 0.05,
+        action_measurement_grad_scale: float = 0.05,
+        observability_tau: Tensor | None = None,
     ) -> None:
         super().__init__()
         schema = METERFactorSchema(schema_path) if schema_path else default_meter_factor_schema()
@@ -49,6 +68,7 @@ class TypedEvidenceStateHead(nn.Module):
         self.factor_dim = int(factor_dim)
         self.num_layers = int(num_layers)
         self.anchor_exploration_mass = float(anchor_exploration_mass)
+        self.action_measurement_grad_scale = float(action_measurement_grad_scale)
         if not 0.0 <= self.anchor_exploration_mass < 1.0:
             raise ValueError("anchor_exploration_mass must be in [0, 1)")
         self.max_states = max(state_cardinalities)
@@ -68,6 +88,8 @@ class TypedEvidenceStateHead(nn.Module):
             persistent=True,
         )
         self.anchor_query = nn.Linear(dim, dim)
+        self.factor_semantic_query = nn.Parameter(torch.randn(factor_dim, dim) * 0.02)
+        self.factor_spatial_query = nn.Parameter(torch.randn(factor_dim, dim) * 0.02)
         self.anchor_key = nn.ModuleList(nn.Linear(dim, dim) for _ in range(num_layers))
         self.anchor_value = nn.ModuleList(nn.Linear(dim, dim) for _ in range(num_layers))
         self.layer_router = nn.Parameter(torch.zeros(factor_dim, num_layers))
@@ -92,20 +114,27 @@ class TypedEvidenceStateHead(nn.Module):
         self.typed_norm = nn.LayerNorm(dim)
         self.action_route_norm = nn.LayerNorm(dim)
         self.action_value_norm = nn.LayerNorm(dim)
+        self.action_bridge_proj = nn.Linear(dim * 3, dim)
+        tau = (
+            torch.full((factor_dim,), float("nan"), dtype=torch.float32)
+            if observability_tau is None
+            else observability_tau.detach().float().reshape(factor_dim)
+        )
+        self.register_buffer("factor_observability_tau", tau, persistent=True)
         self.schema_sha256 = schema.sha256
         self.mirror_pairs = schema.mirror_pairs
 
     @staticmethod
     def _ramp(progress: float) -> float:
-        return float(min(max(progress / 0.10, 0.0), 1.0))
+        return float(min(max(progress / 0.20, 0.0), 1.0))
 
     def _distribution(self, logits: Tensor, progress: float) -> Tensor:
         dense = torch.softmax(logits, dim=-1)
         sparse = entmax15_bisect(logits, dim=-1)
         ramp = self._ramp(progress)
         scheduled = dense * (1.0 - ramp) + sparse * ramp
-        recovery = self.anchor_exploration_mass * ramp
-        return scheduled * (1.0 - recovery) + dense * recovery
+        exploration = self.anchor_exploration_mass * max(1.0 - progress / 0.20, 0.0)
+        return scheduled * (1.0 - exploration) + dense * exploration
 
     def _partition_calibrated_null(self, patch_logits: Tensor) -> tuple[Tensor, Tensor]:
         """Return null probability relative to the patch log-mean-exp partition."""
@@ -146,6 +175,26 @@ class TypedEvidenceStateHead(nn.Module):
             self.action_anchor_proj(anchor_token) + state_token
         )
 
+    def compose_action_bridge_token(
+        self,
+        anchor_token: Tensor,
+        state_prob: Tensor,
+        global_token: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        state_token = torch.einsum(
+            "bfs,fsd->bfd", state_prob, self.action_state_embeddings
+        )
+        bridge = selective_credit_bridge(
+            anchor_token,
+            state_token,
+            global_token,
+            scale=self.action_measurement_grad_scale,
+        )
+        state_prob_credit = state_prob.detach() + self.action_measurement_grad_scale * (
+            state_prob - state_prob.detach()
+        )
+        return self.action_bridge_proj(bridge), state_prob_credit
+
     def compose_action_value_token(self, anchor_token: Tensor) -> Tensor:
         """Keep the transported action value causally tied to local patches."""
         return self.action_value_norm(
@@ -167,7 +216,12 @@ class TypedEvidenceStateHead(nn.Module):
         # rewrite the CalAlign-compatible visual foundation.
         factor_base_nodes = factor_base_nodes.detach()
         patch_tokens_by_layer = patch_tokens_by_layer.detach()
-        query = self.anchor_query(factor_base_nodes)
+        query_source = (
+            factor_base_nodes
+            + self.factor_semantic_query.unsqueeze(0)
+            + self.factor_spatial_query.unsqueeze(0)
+        )
+        query = self.anchor_query(query_source)
         layer_weight = torch.softmax(self.layer_router, dim=-1)
         maps: list[Tensor] = []
         nulls: list[Tensor] = []
@@ -230,6 +284,9 @@ class TypedEvidenceStateHead(nn.Module):
         )
         action_token = self.compose_action_token(anchor_token, state_prob)
         action_value_token = self.compose_action_value_token(anchor_token)
+        action_bridge_token, state_prob_credit = self.compose_action_bridge_token(
+            anchor_token, state_prob, global_token
+        )
         return {
             "factor_anchor_map": anchor_map,
             "factor_null_mass": null_mass,
@@ -246,6 +303,10 @@ class TypedEvidenceStateHead(nn.Module):
             "factor_typed_token": typed_token,
             "factor_action_token": action_token,
             "factor_action_value_token": action_value_token,
+            "factor_action_bridge_token": action_bridge_token,
+            "factor_state_prob_credit": state_prob_credit,
+            "factor_measurement_token": typed_token,
+            "factor_observability_tau": self.factor_observability_tau,
             "factor_layer_weights": layer_weight,
             "factor_action_ownership": self.action_ownership,
             "factor_groundable_mask": self.groundable_mask,

@@ -8,7 +8,7 @@ import yaml
 
 
 class METERFactorSchema:
-    """Validated runtime source for TESA factor ownership and grounding."""
+    """Validated runtime source for HECA measurement identity and ownership."""
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -18,10 +18,12 @@ class METERFactorSchema:
             raise ValueError("METER factor schema must contain ordered IDs 0..20")
         required = {
             "name",
+            "factor_group",
+            "text_prompt",
             "state_set",
+            "state_prompts",
             "groundability",
             "action_owned",
-            "compatible_actions",
             "mirror_partner",
         }
         if any(not required.issubset(row) for row in rows):
@@ -34,22 +36,18 @@ class METERFactorSchema:
         )
         if action_names != ("forward", "stop", "left", "right"):
             raise ValueError("METER action_names must be forward, stop, left, right")
-        known_actions = set(action_names)
-        compatible = tuple(
-            {str(name) for name in row["compatible_actions"]} for row in rows
-        )
-        if any(not names.issubset(known_actions) for names in compatible):
-            raise ValueError("METER factor schema contains an unknown compatible action")
+        if any("compatible_actions" in row for row in rows):
+            raise ValueError("HECA forbids hard compatible_actions masks")
+        if any(len(row["state_set"]) != len(row["state_prompts"]) for row in rows):
+            raise ValueError("Every HECA state requires one ontology prompt")
         self.rows: tuple[dict[str, Any], ...] = tuple(rows)
         self.action_names = action_names
         self.state_cardinalities = tuple(len(row["state_set"]) for row in rows)
-        self.action_ownership = tuple(
-            tuple(
-                float(row["action_owned"]) if action_name in compatible[index] else 0.0
-                for index, row in enumerate(rows)
-            )
-            for action_name in action_names
-        )
+        self.action_ownership = tuple(float(row["action_owned"]) for row in rows)
+        if self.action_ownership[14] != 0.0 or self.action_ownership[20] != 0.0:
+            raise ValueError("Latent factors 14/20 must be action-owned zero")
+        if self.action_ownership[1] != 0.5:
+            raise ValueError("Factor 1 must use partial action ownership 0.5")
         self.groundable_mask = tuple(
             0.0 if str(row["groundability"]).lower() in {"none", "latent", "unavailable"} else 1.0
             for row in rows
