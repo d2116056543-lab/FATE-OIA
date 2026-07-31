@@ -13,6 +13,7 @@ This audit is fail-closed. Passing means the code implements and invokes HECA; i
 - Require cheap diagnostics to reuse one DINO field. B0-B5 must be independent runs, never aliases for same-forward branches.
 - Reject weak BDD100K targets in test forward and test metrics in threshold, PU, LR, or gate updates.
 - Require all `test_heca_*.py`, py_compile, V3 implementation audit, real-DINO profile, and real 4-epoch pilot Gates A-G.
+- Require the trainer and supervisor to recompute A-G from exactly four epochs of raw branch/typed/runtime/loss evidence plus the bound audit/ontology/tau/gradient inputs. A self-reported or self-hashed Gate C file must never unlock full training.
 - REVIEW_PASS is code/preflight-only. Full training additionally requires clean matching HEAD plus a matching pilot pass and Gate C artifact.
 
 ## Gate C Boundary
