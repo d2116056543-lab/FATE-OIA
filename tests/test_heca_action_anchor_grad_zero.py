@@ -21,10 +21,11 @@ def test_action_credit_cannot_backprop_through_measurement_reliability() -> None
     action_nodes = torch.randn(2, 4, 8)
     bridge = torch.randn(2, 3, 8)
     state = torch.softmax(torch.randn(2, 3, 3), dim=-1)
-    reliability = torch.sigmoid(torch.randn(2, 3, requires_grad=True))
+    reliability_raw = torch.randn(2, 3, requires_grad=True)
+    reliability = torch.sigmoid(reliability_raw)
     owner = torch.ones(3)
 
     output = module(visual, action_nodes, bridge, state, reliability, owner, progress=1.0)
     output["action_logits_final"].sum().backward()
 
-    assert reliability.grad is None or torch.count_nonzero(reliability.grad) == 0
+    assert reliability_raw.grad is None or torch.count_nonzero(reliability_raw.grad) == 0

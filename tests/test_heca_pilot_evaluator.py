@@ -21,7 +21,7 @@ def _epoch() -> dict:
             }
         )
     global_ap = [0.38] * 21
-    final_ap = [0.386] * 12 + [0.38] * 9
+    final_ap = [0.386] * 19 + [0.38] * 2
     return {
         "branches": {
             "action_visual": {"Act_mAP": 0.700, "Act_mF1": 0.700},
@@ -38,7 +38,7 @@ def _epoch() -> dict:
                 "Exp_per_label_ap": global_ap,
             },
             "reason_final": {
-                "Exp_mAP": 0.383,
+                "Exp_mAP": 0.385,
                 "Exp_mF1": 0.36,
                 "Exp_per_label_ap": final_ap,
             },
