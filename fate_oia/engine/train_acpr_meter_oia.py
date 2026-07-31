@@ -594,12 +594,51 @@ def _identity_ap_diagnostics(
     }
 
 
+@torch.no_grad()
+def _apply_pu_gate(
+    audit: dict[str, Any],
+    view_consistency: Tensor,
+    config: dict[str, Any],
+    previous_state: dict[str, Any],
+    epoch: int,
+) -> dict[str, Any]:
+    maximum = float(config["pu"].get("max_lambda", 0.15))
+    minimum_lift = float(config["pu"].get("min_auprc_lift", 0.02))
+    minimum_view = float(config["pu"].get("min_view_consistency", 0.50))
+    required_streak = int(config["pu"].get("required_pass_streak", 2))
+    start_after = int(config["pu"].get("start_after_epoch", 1))
+    previous_streak = list(previous_state.get("pass_streak", [0] * 21))
+    streak: list[int] = []
+    gated_lambda: list[float] = []
+    for index, row in enumerate(audit["labels"]):
+        passed = bool(
+            row.get("eligible") is True
+            and float(row.get("auprc_delta", float("-inf"))) >= minimum_lift
+            and float(view_consistency[index]) >= minimum_view
+        )
+        current_streak = previous_streak[index] + 1 if passed else 0
+        streak.append(current_streak)
+        active = epoch >= start_after and current_streak >= required_streak
+        gated_lambda.append(min(float(audit["lambda"][index]), maximum) if active else 0.0)
+        row["view_consistency"] = float(view_consistency[index])
+        row["pass_streak"] = current_streak
+        row["gate_active"] = active
+    audit["lambda"] = gated_lambda
+    audit["pass_streak"] = streak
+    audit["active_labels"] = [index for index, value in enumerate(gated_lambda) if value > 0]
+    return audit
+
+
+@torch.no_grad()
 def _update_pu(
     model: METEROIAModel,
     loader: Iterable[dict[str, Any]],
     device: torch.device,
     progress: float,
     config: dict[str, Any],
+    *,
+    previous_state: dict[str, Any],
+    epoch: int,
 ) -> dict[str, Any]:
     value = _collect_calibration(model, loader, device, progress)
     audit = meter_hidden_positive_audit(
@@ -611,12 +650,25 @@ def _update_pu(
         min_positive_count=int(config["pu"].get("min_positive_count", 20)),
         seed=int(config["splits"]["seed"]),
     )
-    maximum = float(config["pu"].get("max_lambda", 0.15))
-    audit["lambda"] = [min(float(item), maximum) for item in audit["lambda"]]
-    audit["active_labels"] = [
-        index for index, item in enumerate(audit["lambda"]) if item > 0
-    ]
-    return audit
+    consistency_sum = torch.zeros(21)
+    consistency_rows = 0
+    for raw_batch in loader:
+        images = raw_batch["image"].to(device, non_blocking=True)
+        pair = model.forward_view_pair(
+            images, torch.flip(images, dims=[-1]), progress=progress
+        )
+        mirrored_logits = _mirror_reason_tensor(pair["view"]["reason_logits_global"])
+        mirrored_reliability = _mirror_reason_tensor(pair["view"]["factor_reliability"])
+        consistency = cross_view_consistency(
+            pair["original"]["reason_logits_global"],
+            mirrored_logits,
+            pair["original"]["factor_reliability"],
+            mirrored_reliability,
+        )
+        consistency_sum += consistency.detach().float().cpu().sum(0)
+        consistency_rows += consistency.shape[0]
+    view_consistency = consistency_sum / max(consistency_rows, 1)
+    return _apply_pu_gate(audit, view_consistency, config, previous_state, epoch)
 
 
 @torch.no_grad()
@@ -966,6 +1018,7 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
         "lambda": [0.0] * 21,
         "active_labels": [],
         "labels": [],
+        "pass_streak": [0] * 21,
     }
     calibration: METERCalibrationResult | None = None
     if args.resume:
@@ -1302,12 +1355,16 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
             source_hash=source_hash,
             schema_hash=schema_hash,
         )
-        pu_state = _update_pu(model, audit_loader, device, progress, config)
-        active_pu = set(int(index) for index in pu_state.get("active_labels", []))
-        schedule_state.pu_pass_streak = [
-            previous + 1 if index in active_pu else 0
-            for index, previous in enumerate(schedule_state.pu_pass_streak)
-        ]
+        pu_state = _update_pu(
+            model,
+            audit_loader,
+            device,
+            progress,
+            config,
+            previous_state=pu_state,
+            epoch=epoch,
+        )
+        schedule_state.pu_pass_streak = list(pu_state.get("pass_streak", [0] * 21))
         calibration_data = _collect_calibration(
             model, calib_loader, device, progress
         )
