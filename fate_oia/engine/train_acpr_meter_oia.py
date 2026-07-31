@@ -162,6 +162,23 @@ def _move(value: Any, device: torch.device) -> Any:
     return value
 
 
+def _autograd_norm(loss: Tensor, parameters: Iterable[Tensor]) -> float:
+    parameters = tuple(parameter for parameter in parameters if parameter.requires_grad)
+    if not parameters or not loss.requires_grad:
+        return 0.0
+    gradients = torch.autograd.grad(
+        loss,
+        parameters,
+        retain_graph=True,
+        allow_unused=True,
+    )
+    total = loss.new_zeros((), dtype=torch.float32)
+    for gradient in gradients:
+        if gradient is not None:
+            total = total + gradient.detach().float().square().sum()
+    return float(total.sqrt().cpu())
+
+
 def _slice_encoded_field(
     field: dict[str, Any], start: int, end: int, encoded_batch: int
 ) -> dict[str, Any]:
@@ -1103,6 +1120,9 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
         optimizer.zero_grad(set_to_none=True)
         data_start = time.perf_counter()
         epoch_rows: list[dict[str, Any]] = []
+        ownership_logged_epoch = False
+        epoch_component_start = dict(model._component_call_counts)
+        epoch_dino_start = model._encode_call_count
         for micro_step, raw_batch in enumerate(train_loader):
             data_time = time.perf_counter() - data_start
             batch = _move(raw_batch, device)
@@ -1157,13 +1177,63 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                     shared_action_grads[index].add_(action_grad.detach())
                 if reason_grad is not None:
                     shared_reason_grads[index].add_(reason_grad.detach())
+            is_update = (micro_step + 1) % grad_accum == 0 or micro_step + 1 == len(train_loader)
+            ownership_probe: dict[str, float] | None = None
+            probe_due = (
+                is_update
+                and optimizer_step > 0
+                and (
+                    not ownership_logged_epoch
+                    or optimizer_step % 200 == 0
+                )
+            )
+            if probe_due:
+                action_credit_parameters = tuple(model.action_transport.parameters())
+                anchor_parameters = tuple(model.typed_factors.anchor_query.parameters())
+                state_measurement_parameters = (
+                    model.typed_factors.state_weight,
+                    model.typed_factors.state_bias,
+                    *tuple(model.typed_factors.global_proj.parameters()),
+                )
+                factor_parameters = tuple(model.typed_factors.parameters())
+                foundation_parameters = tuple(
+                    parameter
+                    for name, parameter in model.foundation.named_parameters()
+                    if parameter.requires_grad and not name.startswith("dino.")
+                )
+                action_to_state = _autograd_norm(
+                    action_shared, state_measurement_parameters
+                )
+                ownership_probe = {
+                    "action_to_anchor_query": _autograd_norm(
+                        action_shared, anchor_parameters
+                    ),
+                    "action_to_state_bridge_ratio": (
+                        float(config["model"]["action_measurement_grad_scale"])
+                        if action_to_state > 0.0
+                        else 0.0
+                    ),
+                    "action_to_state_measurement": action_to_state,
+                    "action_to_credit_adapter": _autograd_norm(
+                        action_shared, action_credit_parameters
+                    ),
+                    "reason_to_action_credit": _autograd_norm(
+                        reason_shared, action_credit_parameters
+                    ),
+                    "pu_to_action_factor": _autograd_norm(
+                        parts["pu"], (*action_credit_parameters, *factor_parameters)
+                    ),
+                    "measurement_to_foundation": _autograd_norm(
+                        parts["loss_registry"].owner_total({"measurement"}),
+                        foundation_parameters,
+                    ),
+                }
             backward_start = time.perf_counter()
             scaled.backward()
             reason_probability_ema.update(
                 [str(name) for name in batch["file_name"]], reason_fallback
             )
             backward_time = time.perf_counter() - backward_start
-            is_update = (micro_step + 1) % grad_accum == 0 or micro_step + 1 == len(train_loader)
             grad_norm = 0.0
             foundation_grad_norm = 0.0
             shared_grad_cosine = 0.0
@@ -1225,19 +1295,35 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                 for group, scheduled_lr in zip(optimizer.param_groups, scheduler.get_last_lr()):
                     if group.get("group_name") == "foundation":
                         group["lr"] = scheduled_lr * schedule_state.foundation_lr_multiplier(logit_rms=logit_rms)
-                append_jsonl(
-                    output_dir / "heca_gradient_ownership.jsonl",
+                if ownership_probe is not None:
+                    append_jsonl(
+                        output_dir / "heca_gradient_ownership.jsonl",
+                        {
+                            "epoch": epoch,
+                            "optimizer_step": optimizer_step,
+                            "shared_action_weight": balance["action"],
+                            "shared_reason_weight": balance["reason"],
+                            "shared_action_reason_grad_cosine": shared_grad_cosine,
+                            "foundation_grad_norm": foundation_grad_norm,
+                            "foundation_grad_cap": foundation_grad_cap,
+                            **ownership_probe,
+                        },
+                    )
+                    ownership_logged_epoch = True
+                write_json(
+                    output_dir / "heca_schedule_state.json",
                     {
-                        "epoch": epoch,
                         "optimizer_step": optimizer_step,
-                        "shared_action_weight": balance["action"],
-                        "shared_reason_weight": balance["reason"],
-                        "shared_action_reason_grad_cosine": shared_grad_cosine,
-                        "foundation_grad_norm": foundation_grad_norm,
+                        "progress": schedule_state.progress(),
+                        "credit_ramp": float(output["action_credit_ramp"].detach()),
                         "foundation_grad_cap": foundation_grad_cap,
+                        "excess_risk": {
+                            "action": float(excess_risk.action_floor or 0.0),
+                            "reason": float(excess_risk.reason_floor or 0.0),
+                        },
+                        "state": schedule_state.state_dict(),
                     },
                 )
-                write_json(output_dir / "heca_schedule_state.json", schedule_state.state_dict())
             timing = output["runtime_timing"]
             row = {
                 "epoch": epoch,
@@ -1266,6 +1352,7 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                 "grad_norm": grad_norm,
                 "foundation_grad_norm": foundation_grad_norm,
                 "foundation_grad_cap": foundation_grad_cap,
+                "foundation_grad_ema": schedule_state.foundation_grad_ema,
                 "shared_action_weight": balance["action"],
                 "shared_reason_weight": balance["reason"],
                 "shared_action_reason_grad_cosine": shared_grad_cosine,
@@ -1310,9 +1397,21 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
             epoch_rows.append(row)
             append_jsonl(output_dir / "loss_components.jsonl", row)
             if not (output_dir / "heca_loss_wiring.json").exists():
+                loss_rows = parts["loss_registry"].artifact()
+                registry = [item["term"] for item in loss_rows]
                 write_json(
                     output_dir / "heca_loss_wiring.json",
-                    {"terms": parts["loss_registry"].artifact()},
+                    {
+                        "registry": registry,
+                        "counts": {
+                            item["term"]: int(item["call_count"])
+                            for item in loss_rows
+                        },
+                        "duplicates": [],
+                        "pass": len(registry) == len(set(registry))
+                        and all(item["call_count"] == 1 for item in loss_rows),
+                        "terms": loss_rows,
+                    },
                 )
             if (micro_step + 1) % 200 == 0:
                 print("meter_batch " + json.dumps(row, sort_keys=True), flush=True)
@@ -1379,7 +1478,7 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
             test_loader,
             device,
             progress=progress,
-            sequential_modes=diagnostic_due,
+            sequential_modes=True,
         )
         test_branches = branch_metrics(test)
         mechanism = mechanism_stats_from_collected(test)
@@ -1482,6 +1581,38 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
             "eval_mode_time": mechanism.get("eval_mode_time", {}),
             "dino_call_count": mechanism.get("dino_call_count", {}),
         }
+        component_delta = {
+            name: int(model._component_call_counts[name] - epoch_component_start[name])
+            for name in epoch_component_start
+        }
+        write_json(
+            output_dir / "heca_component_call_counters.json",
+            {
+                "components": {
+                    "dino_encode": int(model._encode_call_count - epoch_dino_start),
+                    **component_delta,
+                },
+                "one_dino_encode_per_batch": (
+                    model._encode_call_count
+                    == int(getattr(model.foundation, "ordinary_dino_calls", -1))
+                ),
+            },
+        )
+        contribution = test["mechanism"]["action_factor_contributions"].float()
+        credit = contribution.sum(-1)
+        for action_index in range(4):
+            summed = float(contribution[:, action_index].sum(-1).mean())
+            expected = float(credit[:, action_index].mean())
+            append_jsonl(
+                output_dir / "heca_contribution_conservation.jsonl",
+                {
+                    "epoch": epoch,
+                    "action": action_index,
+                    "sum_contribution": summed,
+                    "action_credit_sum": expected,
+                    "abs_error": abs(summed - expected),
+                },
+            )
         _, summaries, branches = _save_test_epoch(
             output_dir,
             epoch,

@@ -78,6 +78,7 @@ def _new_collector() -> dict[str, Any]:
     return {
         "action_visual": [],
         "action_final": [],
+        "reason_calalign": [],
         "reason_global": [],
         "reason_final": [],
         "mechanism": {},
@@ -92,6 +93,7 @@ def heca_ablation_manifest() -> dict[str, Any]:
         "clean_branches": [
             "action_visual",
             "action_final",
+            "reason_calalign",
             "reason_global",
             "reason_final",
         ],
@@ -109,6 +111,7 @@ def _append_output(
     collector["eval_mode_time"] += elapsed
     collector["action_visual"].append(output["action_logits_visual"].detach().cpu())
     collector["action_final"].append(output["action_logits_final"].detach().cpu())
+    collector["reason_calalign"].append(output["reason_logits_calalign"].detach().cpu())
     collector["reason_global"].append(output["reason_logits_global"].detach().cpu())
     collector["reason_final"].append(output["reason_logits_final"].detach().cpu())
     if not collect_mechanism:
@@ -141,6 +144,7 @@ def _finalize_collector(collector: dict[str, Any]) -> dict[str, Any]:
     return {
         "action_visual": _cat(collector["action_visual"]),
         "action_final": _cat(collector["action_final"]),
+        "reason_calalign": _cat(collector["reason_calalign"]),
         "reason_global": _cat(collector["reason_global"]),
         "reason_final": _cat(collector["reason_final"]),
         "mechanism": {
@@ -255,6 +259,9 @@ def branch_metrics(collected: dict[str, Any]) -> dict[str, Any]:
         ),
         "reason_global": multilabel_metrics_from_logits(
             collected["reason_global"], labels_reason, prefix="Exp_"
+        ),
+        "reason_calalign": multilabel_metrics_from_logits(
+            collected["reason_calalign"], labels_reason, prefix="Exp_"
         ),
         "reason_final": multilabel_metrics_from_logits(
             collected["reason_final"], labels_reason, prefix="Exp_"

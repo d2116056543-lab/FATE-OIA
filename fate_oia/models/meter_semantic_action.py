@@ -107,7 +107,7 @@ class StateConditionedActionCredit(nn.Module):
         factor_value = weighted_state_values.sum(-1)
         contribution = (
             owner.view(1, 1, -1)
-            * factor_reliability.clamp(0.0, 1.0).unsqueeze(1)
+            * factor_reliability.detach().clamp(0.0, 1.0).unsqueeze(1)
             * factor_weight
             * factor_value
         )
