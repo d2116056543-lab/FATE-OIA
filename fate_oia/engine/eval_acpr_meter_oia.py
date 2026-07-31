@@ -169,6 +169,8 @@ def collect_outputs(
     labels_reason: list[Tensor] = []
     file_names: list[str] = []
     encoded_batches = 0
+    foundation = getattr(model, "foundation", None)
+    backbone_calls_before = getattr(foundation, "ordinary_dino_calls", None)
 
     for batch_index, batch in enumerate(loader):
         if max_batches is not None and batch_index >= max_batches:
@@ -197,13 +199,27 @@ def collect_outputs(
             del output
         del field, images
 
+    backbone_calls_after = getattr(foundation, "ordinary_dino_calls", None)
+    if isinstance(backbone_calls_before, int) and isinstance(backbone_calls_after, int):
+        actual_backbone_calls = backbone_calls_after - backbone_calls_before
+        if actual_backbone_calls != encoded_batches:
+            raise RuntimeError(
+                "DINO call mismatch: cheap diagnostics must use exactly one "
+                f"backbone encode per batch, got {actual_backbone_calls} for "
+                f"{encoded_batches} batches"
+            )
+
     main = _finalize_collector(collectors["clean"])
     main.update(
         {
             "labels_action": _cat(labels_action),
             "labels_reason": _cat(labels_reason),
             "file_names": file_names,
-            "dino_call_count": encoded_batches,
+            "dino_call_count": (
+                encoded_batches
+                if not isinstance(backbone_calls_before, int)
+                else backbone_calls_after - backbone_calls_before
+            ),
         }
     )
     modes: dict[str, dict[str, Any]] = {}
