@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import torch
+import pytest
 
 from fate_oia.engine.eval_acpr_meter_oia import (
     CHEAP_SAME_FORWARD_MODES,
@@ -89,6 +90,21 @@ def test_cheap_diagnostics_share_one_dino_encode_per_batch() -> None:
         assert model.decode_calls.count(mode) == 2
     assert all(payload["dino_call_count"] == 0 for payload in collected["modes"].values())
     assert collected["dino_call_count"] == 2
+
+
+def test_cheap_diagnostics_reject_hidden_extra_backbone_calls() -> None:
+    model = _CountingModel()
+    model.foundation = type("Foundation", (), {"ordinary_dino_calls": 0})()
+    original_encode = model.encode_images
+
+    def hidden_double_encode(images: torch.Tensor) -> dict[str, torch.Tensor]:
+        field = original_encode(images)
+        model.foundation.ordinary_dino_calls += 2
+        return field
+
+    model.encode_images = hidden_double_encode  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="DINO call mismatch"):
+        collect_outputs(model, _loader(), torch.device("cpu"), progress=1.0)
 
 
 def test_b0_b5_are_not_declared_as_same_forward_diagnostics() -> None:
