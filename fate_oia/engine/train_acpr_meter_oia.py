@@ -115,9 +115,6 @@ def initialize_model_from_checkpoint(
 
 
 
-def _bounded_audit_indices(indices: list[int], maximum: int) -> list[int]:
-    """Keep full diagnostics by default while making smoke runs bounded."""
-    return indices if int(maximum) <= 0 else indices[: int(maximum)]
 
 
 def _loader(
@@ -831,12 +828,9 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
         grounding_index=grounding_index,
         include_grounding=True,
     )
-    factor_audit_indices = _bounded_audit_indices(
-        split["audit"], args.max_audit_samples
-    )
     factor_audit_loader = _loader(
         grounded_audit_dataset,
-        factor_audit_indices,
+        split["audit"],
         batch_size=batch_size,
         workers=workers,
         shuffle=False,
@@ -1409,7 +1403,6 @@ def main() -> None:
     parser.add_argument("--max_audit_samples", type=int, default=0)
     parser.add_argument("--max_calib_samples", type=int, default=0)
     parser.add_argument("--max_test_samples", type=int, default=0)
-    parser.add_argument("--max_audit_samples", type=int, default=0)
     parser.add_argument("--resume", default="")
     parser.add_argument("--init_model_checkpoint", default="")
     parser.add_argument("--use_mock_dino", action="store_true")
