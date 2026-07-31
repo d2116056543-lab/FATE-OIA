@@ -41,6 +41,9 @@ def action_delta_pairwise_ranking_loss(
     if normalizer is not None:
         scale = normalizer.detach().to(delta)
         delta = delta / scale.clamp_min(1e-6)
+    # Credit ranking is an ordering objective. Saturating the normalized
+    # credit prevents one runaway sample from dominating the shared update.
+    delta = torch.tanh(delta)
     terms: list[Tensor] = []
     for action_id in range(delta.shape[1]):
         positive = target[:, action_id] > 0.5
