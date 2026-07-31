@@ -77,7 +77,7 @@ class HECAExcessRiskBalancer:
             ]
         )
         raw = torch.softmax(excess / self.temperature, dim=0)
-        action = float(raw[0].clamp(0.45, 0.70))
+        action = min(max(float(raw[0]), 0.45), 0.70)
         return {"action": action, "reason": 1.0 - action}
 
     def state_dict(self) -> dict[str, Any]:
