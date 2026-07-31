@@ -30,6 +30,7 @@ HECA_CHEAP_MODE_NAMES = (
     "state_uniform",
     "reason_correction_off",
 )
+HECA_PILOT_EVIDENCE_MANIFEST = "heca_pilot_evidence_manifest.json"
 
 
 def _is_finite_number(value: Any) -> bool:
@@ -224,6 +225,84 @@ def validate_heca_artifact_sidecar(directory: str | Path) -> list[str]:
             and gate["evidence"]
         ):
             failures.append(f"HECA_GATE_{letter}.json:schema")
+    return failures
+
+
+def write_heca_pilot_evidence_manifest(
+    directory: str | Path, *, git_head: str
+) -> dict[str, Any]:
+    """Bind Gate A-G to the exact pilot evidence files used to derive them."""
+    root = Path(directory)
+    relative_paths = [
+        Path(name)
+        for name in (
+            *HECA_SIDECAR_FILES.values(),
+            *(f"HECA_GATE_{letter}.json" for letter in HECA_GATE_NAMES),
+            "loss_components.jsonl",
+        )
+    ]
+    for epoch in sorted(path for path in root.glob("epoch_*") if path.is_dir()):
+        relative_paths.extend(
+            epoch.relative_to(root) / name
+            for name in ("branch_metrics.json", "typed_evidence.json", "runtime.json")
+        )
+    epoch_branches = [
+        path for path in relative_paths if path.name == "branch_metrics.json"
+    ]
+    missing = [str(path) for path in relative_paths if not (root / path).exists()]
+    if missing or len(epoch_branches) < 2:
+        raise ValueError(
+            "HECA pilot evidence is incomplete: "
+            + (", ".join(missing) if missing else "fewer than two epochs")
+        )
+    payload = {
+        "git_head": str(git_head),
+        "files": {
+            path.as_posix(): file_hash(root / path)
+            for path in sorted(set(relative_paths))
+        },
+    }
+    write_json(root / HECA_PILOT_EVIDENCE_MANIFEST, payload)
+    return payload
+
+
+def validate_heca_pilot_bundle(
+    directory: str | Path, *, expected_git_head: str
+) -> list[str]:
+    """Validate sidecar, current HEAD binding, and every raw evidence hash."""
+    root = Path(directory)
+    failures = validate_heca_artifact_sidecar(root)
+    manifest = _read_json(root / HECA_PILOT_EVIDENCE_MANIFEST)
+    pilot = _read_json(root / "HECA_PILOT_PASS.json")
+    if not manifest:
+        failures.append(f"{HECA_PILOT_EVIDENCE_MANIFEST}:missing_or_invalid")
+        return failures
+    if manifest.get("git_head") != expected_git_head:
+        failures.append(f"{HECA_PILOT_EVIDENCE_MANIFEST}:git_head")
+    files = manifest.get("files")
+    if not isinstance(files, dict) or not files:
+        failures.append(f"{HECA_PILOT_EVIDENCE_MANIFEST}:files")
+    else:
+        epoch_branches = [
+            name for name in files if name.endswith("/branch_metrics.json")
+        ]
+        if len(epoch_branches) < 2:
+            failures.append(f"{HECA_PILOT_EVIDENCE_MANIFEST}:two_epoch_evidence")
+        for name, expected_hash in files.items():
+            path = root / str(name)
+            if not path.exists():
+                failures.append(f"{name}:missing")
+            elif not isinstance(expected_hash, str) or file_hash(path) != expected_hash:
+                failures.append(f"{name}:hash")
+    if not pilot:
+        failures.append("HECA_PILOT_PASS.json:missing_or_invalid")
+    else:
+        if pilot.get("pass") is not True or pilot.get("git_head") != expected_git_head:
+            failures.append("HECA_PILOT_PASS.json:status_or_head")
+        if pilot.get("evidence_manifest_sha256") != file_hash(
+            root / HECA_PILOT_EVIDENCE_MANIFEST
+        ):
+            failures.append("HECA_PILOT_PASS.json:manifest_hash")
     return failures
 
 

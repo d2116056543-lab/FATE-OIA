@@ -6,7 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from fate_oia.utils.meter_artifacts import validate_heca_artifact_sidecar
+from fate_oia.utils.meter_artifacts import validate_heca_pilot_bundle
 
 
 FALLBACK_LADDER = ((6, 5), (5, 6), (4, 8), (3, 10), (2, 15))
@@ -29,7 +29,9 @@ def validate_training_readiness(
         raise RuntimeError("HECA implementation review is missing or stale")
     if pilot.get("pass") is not True or pilot.get("git_head") != head:
         raise RuntimeError("HECA pilot result is missing or stale")
-    artifact_failures = validate_heca_artifact_sidecar(Path(pilot_path).parent)
+    artifact_failures = validate_heca_pilot_bundle(
+        Path(pilot_path).parent, expected_git_head=head
+    )
     if artifact_failures:
         raise RuntimeError(
             "HECA pilot artifacts failed strict validation: "
