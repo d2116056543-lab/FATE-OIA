@@ -18,6 +18,8 @@ def _epoch() -> dict:
                 "state_frequency_baseline": 0.3 if good else None,
                 "state_auc": 0.7 if good else None,
                 "observability_auc": 0.7 if good else None,
+                "observability_mean": 0.5 if good else None,
+                "observability_std": 0.1 if good else None,
             }
         )
     global_ap = [0.38] * 21
@@ -25,8 +27,13 @@ def _epoch() -> dict:
     return {
         "branches": {
             "action_visual": {"Act_mAP": 0.700, "Act_mF1": 0.700},
-            "action_final": {"Act_mAP": 0.706, "Act_mF1": 0.704},
+            "action_final": {
+                "Act_mAP": 0.706,
+                "Act_mF1": 0.704,
+                "Act_per_label_ap": [0.70] * 4,
+            },
             "factor_off": {"Act_mAP": 0.699, "Act_mF1": 0.698},
+            "state_uniform": {"Act_per_label_ap": [0.698, 0.698, 0.698, 0.70]},
             "reason_calalign": {
                 "Exp_mAP": 0.380,
                 "Exp_mF1": 0.35,

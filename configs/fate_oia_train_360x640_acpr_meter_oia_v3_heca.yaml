@@ -143,3 +143,4 @@ runtime:
 evaluation:
   cheap_diagnostics_each_epoch: [factor_off, state_uniform, reason_correction_off]
   patch_deletion_interval_epochs: 4
+  patch_audit_max_unique: 128

@@ -6,6 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from fate_oia.utils.meter_artifacts import validate_heca_artifact_sidecar
+
 
 FALLBACK_LADDER = ((6, 5), (5, 6), (4, 8), (3, 10), (2, 15))
 
@@ -27,12 +29,22 @@ def validate_training_readiness(
         raise RuntimeError("HECA implementation review is missing or stale")
     if pilot.get("pass") is not True or pilot.get("git_head") != head:
         raise RuntimeError("HECA pilot result is missing or stale")
+    artifact_failures = validate_heca_artifact_sidecar(Path(pilot_path).parent)
+    if artifact_failures:
+        raise RuntimeError(
+            "HECA pilot artifacts failed strict validation: "
+            + ", ".join(artifact_failures)
+        )
     gates = pilot.get("gates", {})
     missing = [letter for letter in "ABCDEFG" if gates.get(letter) is not True]
     if missing:
         raise RuntimeError(f"HECA pilot gates are incomplete: {missing}")
     if gate_c.get("pass") is not True or gate_c.get("gate") not in {"C", "HECA_GATE_C"}:
         raise RuntimeError("HECA Gate C artifact is invalid")
+    if Path(gate_c_path).resolve().parent != Path(pilot_path).resolve().parent:
+        raise RuntimeError("HECA Gate C must come from the signed pilot directory")
+    if pilot.get("gate_payloads", {}).get("C") != gate_c:
+        raise RuntimeError("HECA Gate C does not match the signed pilot evidence")
     return {"git_head": head, "review": review, "pilot": pilot, "gate_c": gate_c}
 
 

@@ -30,7 +30,11 @@ class StateConditionedActionCredit(nn.Module):
         self.factor_dim = int(factor_dim)
         self.rank = int(rank)
         self.max_states = int(max_states)
-        self.correction_fraction = float(correction_fraction)
+        self.register_buffer(
+            "correction_fraction",
+            torch.tensor(float(correction_fraction)),
+            persistent=True,
+        )
         self.max_action_delta = float(max_action_delta)
         self.rms_momentum = float(rms_momentum)
         self.action_query = nn.Linear(dim, dim, bias=False)
@@ -126,7 +130,8 @@ class StateConditionedActionCredit(nn.Module):
                     )
                 self.running_updates.add_(1)
         kappa = (
-            self.correction_fraction * self.running_visual_rms
+            self.correction_fraction.to(self.running_visual_rms)
+            * self.running_visual_rms
         ).clamp(0.10, min(1.0, self.max_action_delta)).to(action_logits_visual)
         unramped_delta = kappa * torch.tanh(
             credit_sum / kappa.clamp_min(1e-6)

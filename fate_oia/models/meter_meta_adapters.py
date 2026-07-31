@@ -33,6 +33,7 @@ class HECASharedPrivateAdapters(nn.Module):
         self.shared_adapter = _ZeroInitLowRankResidual(dim, rank)
         self.action_private_adapter = _ZeroInitLowRankResidual(dim, rank)
         self.reason_private_adapter = _ZeroInitLowRankResidual(dim, rank)
+        self.pu_private_head = nn.Linear(dim, 1)
 
     def forward(self, label_nodes: Tensor) -> dict[str, Tensor]:
         if label_nodes.shape[1] != self.action_dim + self.reason_dim:
@@ -40,10 +41,18 @@ class HECASharedPrivateAdapters(nn.Module):
         shared = label_nodes + self.shared_adapter(label_nodes)
         action = shared[:, : self.action_dim]
         reason = shared[:, self.action_dim :]
+        reason_private_delta = self.reason_private_adapter(reason)
+        pu_private_nodes = (
+            reason.detach()
+            + self.reason_private_adapter(reason.detach())
+        )
         return {
             "shared_nodes": shared,
             "action_nodes": action + self.action_private_adapter(action),
-            "reason_nodes": reason + self.reason_private_adapter(reason),
+            "reason_nodes": reason + reason_private_delta,
+            "reason_logits_pu_private": self.pu_private_head(
+                pu_private_nodes
+            ).squeeze(-1),
         }
 
 

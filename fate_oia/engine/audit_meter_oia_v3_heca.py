@@ -33,6 +33,8 @@ REQUIRED_FILES = (
     "fate_oia/engine/eval_acpr_meter_oia.py",
     "fate_oia/engine/evaluate_meter_oia_v3_heca_pilot.py",
     "fate_oia/engine/supervise_meter_oia_v3_heca_foreground.py",
+    "scripts/FATE_OIA_meter_oia_v3_heca_pilot.ps1",
+    "scripts/FATE_OIA_meter_oia_v3_heca_foreground.ps1",
 )
 
 

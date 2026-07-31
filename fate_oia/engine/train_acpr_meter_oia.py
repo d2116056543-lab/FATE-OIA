@@ -269,6 +269,8 @@ def _parameter_groups(
             owner = "action_credit"
         elif name.startswith("heca_adapters.reason_private_adapter."):
             owner = "reason_global"
+        elif name.startswith("heca_adapters.pu_private_head."):
+            owner = "reason_global"
         elif name.startswith("typed_factors.action_bridge_proj."):
             owner = "action_credit"
         elif name.startswith("typed_factors."):
@@ -806,6 +808,12 @@ def _typed_factor_audit(
                 "observability_auc": (
                     binary_roc_auc(obs_p, obs_y) if obs_p.numel() else None
                 ),
+                "observability_mean": (
+                    float(obs_p.mean()) if obs_p.numel() else None
+                ),
+                "observability_std": (
+                    float(obs_p.std(unbiased=False)) if obs_p.numel() else None
+                ),
                 "mirror_equivariance": (
                     sum(mirror_margin[factor]) / len(mirror_margin[factor])
                     if mirror_margin[factor]
@@ -983,6 +991,8 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
         pretrained_weights=config["backbone"]["pretrained_weights"],
         use_mock_dino=bool(args.use_mock_dino),
         factor_rank=int(config["model"].get("factor_rank", 16)),
+        state_effect_rank=int(config["model"].get("state_effect_rank", 64)),
+        schema_path=str(schema_path),
         action_correction_fraction=correction_fraction_for_run(
             args.run_kind,
             gate_c_pass=_validated_gate_pass(args.gate_c_pass),
@@ -1098,6 +1108,12 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
         "raw_exp_map": -1.0,
         "deploy_exp_mf1": -1.0,
     }
+    best_path = output_dir / "best_metrics.json"
+    if best_path.exists():
+        previous_best = json.loads(best_path.read_text(encoding="utf-8"))
+        for name in best:
+            if name in previous_best:
+                best[name] = float(previous_best[name])
     cumulative_patch_ids: set[str] = set()
     cumulative_path = output_dir / "patch_audit_cumulative.json"
     if cumulative_path.exists():
@@ -1120,6 +1136,9 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
         optimizer.zero_grad(set_to_none=True)
         data_start = time.perf_counter()
         epoch_rows: list[dict[str, Any]] = []
+        window_action_loss = 0.0
+        window_reason_loss = 0.0
+        window_microbatches = 0
         ownership_logged_epoch = False
         epoch_component_start = dict(model._component_call_counts)
         epoch_dino_start = model._encode_call_count
@@ -1164,8 +1183,11 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                 scaled = total / grad_accum
             action_shared = parts["loss_registry"].owner_total({"action"}) / grad_accum
             reason_shared = parts["loss_registry"].owner_total(
-                {"reason", "reason_private"}
+                {"reason"}
             ) / grad_accum
+            window_action_loss += float(parts["action"]["total"].detach())
+            window_reason_loss += float(parts["reason"]["total"].detach())
+            window_microbatches += 1
             action_grads = torch.autograd.grad(
                 action_shared, shared_parameters, retain_graph=True, allow_unused=True
             )
@@ -1240,8 +1262,14 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
             foundation_grad_cap = float(config["training"]["foundation_grad_cap_max"])
             balance = {"action": 0.5, "reason": 0.5}
             if is_update:
-                excess_risk.update_floors(parts["action"]["total"], parts["reason"]["total"])
-                balance = excess_risk.weights(parts["action"]["total"], parts["reason"]["total"])
+                window_action = output["action_logits_final"].new_tensor(
+                    window_action_loss / max(window_microbatches, 1)
+                )
+                window_reason = output["reason_logits_final"].new_tensor(
+                    window_reason_loss / max(window_microbatches, 1)
+                )
+                excess_risk.update_floors(window_action, window_reason)
+                balance = excess_risk.weights(window_action, window_reason)
                 flat_action = torch.cat([gradient.flatten() for gradient in shared_action_grads])
                 flat_reason = torch.cat([gradient.flatten() for gradient in shared_reason_grads])
                 shared_grad_cosine = float(torch.nn.functional.cosine_similarity(
@@ -1281,6 +1309,9 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
+                window_action_loss = 0.0
+                window_reason_loss = 0.0
+                window_microbatches = 0
                 optimizer_step += 1
                 schedule_state.update = optimizer_step
                 schedule_state.corruption_phase = optimizer_step % 3
@@ -1440,8 +1471,8 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
             optimizer_step=optimizer_step,
             runtime_profile=pre_eval_runtime,
             meta_state={
-                "training_enabled": False,
-                "audit_only": True,
+                "training_enabled": True,
+                "audit_only": False,
                 "heca": {
                     "schedule": schedule_state.state_dict(),
                     "excess_risk": excess_risk.state_dict(),
@@ -1471,7 +1502,7 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
         diagnostic_due = _diagnostic_due(
             epoch,
             epochs,
-            int(config.get("evaluation", {}).get("diagnostic_interval_epochs", 5)),
+            int(config.get("evaluation", {}).get("patch_deletion_interval_epochs", 4)),
         )
         test = collect_outputs(
             model,
@@ -1479,6 +1510,7 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
             device,
             progress=progress,
             sequential_modes=True,
+            extra_diagnostic_modes=diagnostic_due,
         )
         test_branches = branch_metrics(test)
         mechanism = mechanism_stats_from_collected(test)
@@ -1505,7 +1537,7 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                 device,
                 progress=progress,
                 max_unique=min(
-                    int(config.get("evaluation", {}).get("patch_audit_max_unique", 16)),
+                    int(config.get("evaluation", {}).get("patch_audit_max_unique", 128)),
                     len(split["audit"]),
                 ),
                 previous_sample_ids=cumulative_patch_ids,
@@ -1646,8 +1678,8 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
             "optimizer_step": optimizer_step,
             "runtime_profile": runtime,
             "meta_state": {
-                "training_enabled": False,
-                "audit_only": True,
+                "training_enabled": True,
+                "audit_only": False,
                 "heca": {
                     "schedule": schedule_state.state_dict(),
                     "excess_risk": excess_risk.state_dict(),
@@ -1676,7 +1708,7 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                 )
         write_json(output_dir / "best_metrics.json", best)
     write_json(
-        output_dir / "GOAL_COMPLETED_METER_OIA_V2_TESA.json",
+        output_dir / "GOAL_COMPLETED_METER_OIA_V3_HECA.json",
         {
             "completed": True,
             "epochs": epochs,
