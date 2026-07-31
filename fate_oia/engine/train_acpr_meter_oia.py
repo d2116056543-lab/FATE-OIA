@@ -96,15 +96,9 @@ def initialize_model_from_checkpoint(
     if not isinstance(state_dict, dict):
         raise RuntimeError(f"Checkpoint {path} does not contain a model state dict")
     incompatible = model.load_state_dict(state_dict, strict=False)
-    allowed_missing = {
-        key for key in incompatible.missing_keys
-        if key.endswith("action_evidence_admission.weight")
-        or key.endswith("action_evidence_admission.bias")
-    }
-    forbidden_missing = set(incompatible.missing_keys) - allowed_missing
-    if incompatible.unexpected_keys or forbidden_missing:
+    if incompatible.unexpected_keys or incompatible.missing_keys:
         raise RuntimeError(
-            f"Incompatible checkpoint {path}: missing={sorted(forbidden_missing)}, unexpected={sorted(incompatible.unexpected_keys)}"
+            f"Incompatible checkpoint {path}: missing={sorted(incompatible.missing_keys)}, unexpected={sorted(incompatible.unexpected_keys)}"
         )
     return {
         "mode": "weights_only",
@@ -1000,11 +994,6 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
             backward_start = time.perf_counter()
             scaled.backward()
             backward_time = time.perf_counter() - backward_start
-            admission_grad = model.action_transport.action_evidence_admission.weight.grad
-            action_admission_grad_norm = float(
-                admission_grad.detach().norm()
-            ) if admission_grad is not None else 0.0
-            action_admission_parameter_norm = float(model.action_transport.action_evidence_admission.weight.detach().norm())
             is_update = (micro_step + 1) % grad_accum == 0 or micro_step + 1 == len(train_loader)
             grad_norm = 0.0
             foundation_grad_norm = 0.0
@@ -1044,8 +1033,6 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                 "loss_discrimination": float(parts["grounding"]["discrimination"].detach()),
                 "loss_mirror": float(parts["grounding"]["mirror"].detach()),
                 "loss_dense_intervention": float(parts["dense"]["total"].detach()),
-                "action_admission_grad_norm": action_admission_grad_norm,
-                "action_admission_parameter_norm": action_admission_parameter_norm,
                 "loss_dense_necessity": float(parts["dense"]["necessity"].detach()),
                 "loss_action_specificity": float(
                     parts["action"]["specificity"].detach()
@@ -1089,20 +1076,7 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                 "action_correction_kappa": output[
                     "action_correction_kappa"
                 ].detach().cpu().tolist(),
-                "action_correction_reference_rms": output[
-                    "action_correction_reference_rms"
-                ].detach().cpu().tolist(),
-                "action_visual_rms_raw": output[
-                    "action_visual_rms_raw"
-                ].detach().cpu().tolist(),
-                "action_admission_mean": float(
-                    output["action_evidence_admission_gate"].mean().detach()
-                ),
-                "action_admission_p05_p95": torch.quantile(
-                    output["action_evidence_admission_gate"].detach().flatten(),
-                    torch.tensor([0.05, 0.95], device=device),
-                ).cpu().tolist(),
-                "action_transport_support_mean": float(output["action_transport_support"].mean().detach()),
+                "action_credit_ramp": float(output["action_credit_ramp"].detach()),
                 "action_visual_logit_abs_max": float(
                     output["action_logits_visual"].detach().abs().max()
                 ),
