@@ -31,6 +31,11 @@ HECA_CHEAP_MODE_NAMES = (
     "reason_correction_off",
 )
 HECA_PILOT_EVIDENCE_MANIFEST = "heca_pilot_evidence_manifest.json"
+HECA_PILOT_INPUT_FILES = (
+    "heca_implementation_audit_input.json",
+    "heca_ontology_manifest_input.json",
+    "heca_tau_stats_input.json",
+)
 
 
 def _is_finite_number(value: Any) -> bool:
@@ -237,6 +242,7 @@ def write_heca_pilot_evidence_manifest(
         Path(name)
         for name in (
             *HECA_SIDECAR_FILES.values(),
+            *HECA_PILOT_INPUT_FILES,
             *(f"HECA_GATE_{letter}.json" for letter in HECA_GATE_NAMES),
             "loss_components.jsonl",
         )
@@ -250,10 +256,10 @@ def write_heca_pilot_evidence_manifest(
         path for path in relative_paths if path.name == "branch_metrics.json"
     ]
     missing = [str(path) for path in relative_paths if not (root / path).exists()]
-    if missing or len(epoch_branches) < 2:
+    if missing or len(epoch_branches) != 4:
         raise ValueError(
             "HECA pilot evidence is incomplete: "
-            + (", ".join(missing) if missing else "fewer than two epochs")
+            + (", ".join(missing) if missing else "expected exactly four epochs")
         )
     payload = {
         "git_head": str(git_head),
@@ -286,8 +292,8 @@ def validate_heca_pilot_bundle(
         epoch_branches = [
             name for name in files if name.endswith("/branch_metrics.json")
         ]
-        if len(epoch_branches) < 2:
-            failures.append(f"{HECA_PILOT_EVIDENCE_MANIFEST}:two_epoch_evidence")
+        if len(epoch_branches) != 4:
+            failures.append(f"{HECA_PILOT_EVIDENCE_MANIFEST}:four_epoch_evidence")
         for name, expected_hash in files.items():
             path = root / str(name)
             if not path.exists():
