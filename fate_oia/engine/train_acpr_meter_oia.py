@@ -1009,6 +1009,8 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
         "gradient_accumulation_steps": grad_accum,
         "num_workers": workers,
         "initialization": initialization,
+        "run_kind": args.run_kind,
+        "gate_c_pass": str(args.gate_c_pass),
         "split_manifest": meter_split_manifest(names, full_split),
         "runtime_subset_counts": build_runtime_subset_counts(
             split, test_count=len(test_indices)
@@ -1532,9 +1534,9 @@ def main() -> None:
     if args.run_kind == "full":
         validate_formal_protocol(
             {
-                "from_scratch": not bool(args.resume or args.init_model_checkpoint),
+                "from_scratch": not bool(args.init_model_checkpoint),
                 "epochs": int(args.epochs or config["training"]["epochs"]),
-                "pilot_checkpoint": args.resume or args.init_model_checkpoint,
+                "pilot_checkpoint": args.init_model_checkpoint,
             }
         )
     train(config, args)

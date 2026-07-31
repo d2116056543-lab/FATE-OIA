@@ -56,6 +56,9 @@ def export_prototypes(
     torch.save(factor, factor_path)
     torch.save(state, state_path)
     manifest = {
+        "schema_version": 1,
+        "factor_count": len(rows),
+        "state_count": max_states,
         "encoder_id": encoder_id,
         "offline_only": True,
         "schema_path": str(schema_path),
@@ -70,7 +73,13 @@ def export_prototypes(
         "factor_sha256": _sha256(factor_path),
         "state_sha256": _sha256(state_path),
     }
+    manifest["sha256"] = hashlib.sha256(
+        (manifest["factor_sha256"] + manifest["state_sha256"] + manifest["schema_sha256"]).encode()
+    ).hexdigest()
     (root / "ontology_prototype_manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    (root / "heca_ontology_manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
     )
     return manifest
