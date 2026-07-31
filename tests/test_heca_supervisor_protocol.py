@@ -84,7 +84,13 @@ def test_full_supervisor_requires_clean_matching_a_to_g(monkeypatch, tmp_path) -
         json.dumps({"epoch": 0, "loss_total": 1.0}) + "\n",
         encoding="utf-8",
     )
-    for epoch in range(2):
+    for name, payload in (
+        ("heca_implementation_audit_input.json", {"pass": True, "git_head": "head"}),
+        ("heca_ontology_manifest_input.json", {"factor_count": 21}),
+        ("heca_tau_stats_input.json", {"source_split": "train_main", "tau": [0.5] * 21}),
+    ):
+        (tmp_path / name).write_text(json.dumps(payload), encoding="utf-8")
+    for epoch in range(4):
         epoch_dir = tmp_path / f"epoch_{epoch:03d}"
         epoch_dir.mkdir()
         for name in ("branch_metrics.json", "typed_evidence.json", "runtime.json"):
@@ -102,9 +108,10 @@ def test_full_supervisor_requires_clean_matching_a_to_g(monkeypatch, tmp_path) -
             tmp_path / "heca_pilot_evidence_manifest.json"
         ),
     }), encoding="utf-8")
-    assert supervisor.validate_training_readiness(review, pilot, gate_c)["git_head"] == "head"
     monkeypatch.setattr(trainer, "_git_head", lambda: "head")
-    assert trainer._validated_gate_pass(str(gate_c)) is True
+    assert trainer._validated_gate_pass(str(gate_c)) is False
+    with pytest.raises(RuntimeError, match="recomputation"):
+        supervisor.validate_training_readiness(review, pilot, gate_c)
     loss_path = tmp_path / "loss_components.jsonl"
     original_loss = loss_path.read_text(encoding="utf-8")
     loss_path.write_text(original_loss + json.dumps({"forged": True}) + "\n", encoding="utf-8")
@@ -113,8 +120,3 @@ def test_full_supervisor_requires_clean_matching_a_to_g(monkeypatch, tmp_path) -
     fake_gate = tmp_path / "fake_gate_c.json"
     fake_gate.write_text(json.dumps({"gate": "C", "pass": True}), encoding="utf-8")
     assert trainer._validated_gate_pass(str(fake_gate)) is False
-    payload = json.loads(pilot.read_text(encoding="utf-8"))
-    payload["gates"]["E"] = False
-    pilot.write_text(json.dumps(payload), encoding="utf-8")
-    with pytest.raises(RuntimeError, match="incomplete"):
-        supervisor.validate_training_readiness(review, pilot, gate_c)

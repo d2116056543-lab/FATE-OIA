@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import json
 
-from fate_oia.engine.evaluate_meter_oia_v3_heca_pilot import evaluate_heca_pilot
+import pytest
+
+from fate_oia.engine.evaluate_meter_oia_v3_heca_pilot import (
+    evaluate_heca_pilot,
+    validate_heca_pilot_recomputation,
+)
 
 
 def _epoch() -> dict:
@@ -79,7 +85,7 @@ def _epoch() -> dict:
 
 
 def _inputs() -> tuple[list[dict], dict, dict, dict, list[dict]]:
-    epochs = [_epoch(), _epoch()]
+    epochs = [_epoch() for _ in range(4)]
     audit = {
         "pass": True,
         "git_head": "abc",
@@ -133,7 +139,7 @@ def test_real_pilot_evaluator_requires_all_gate_evidence() -> None:
 def test_pilot_evaluator_fails_closed_when_gate_c_is_not_two_epoch_stable() -> None:
     epochs, audit, ontology, tau, gradients = _inputs()
     broken = deepcopy(epochs)
-    broken[0]["branches"]["action_final"]["Act_mAP"] = 0.701
+    broken[2]["branches"]["action_final"]["Act_mAP"] = 0.701
     result = evaluate_heca_pilot(
         epochs=broken,
         implementation_audit=audit,
@@ -144,3 +150,79 @@ def test_pilot_evaluator_fails_closed_when_gate_c_is_not_two_epoch_stable() -> N
     )
     assert result["pass"] is False
     assert result["gates"]["C"] is False
+
+
+def test_pilot_evaluator_requires_exactly_four_epochs() -> None:
+    epochs, audit, ontology, tau, gradients = _inputs()
+    with pytest.raises(ValueError, match="exactly four"):
+        evaluate_heca_pilot(
+            epochs=epochs[:2],
+            implementation_audit=audit,
+            ontology_manifest=ontology,
+            tau_stats=tau,
+            gradient_rows=gradients,
+            git_head="abc",
+        )
+
+
+def test_pilot_recomputation_rejects_saved_gate_tampering(tmp_path) -> None:
+    epochs, audit, ontology, tau, gradients = _inputs()
+    (tmp_path / "heca_implementation_audit_input.json").write_text(
+        json.dumps(audit), encoding="utf-8"
+    )
+    (tmp_path / "heca_ontology_manifest_input.json").write_text(
+        json.dumps(ontology), encoding="utf-8"
+    )
+    (tmp_path / "heca_tau_stats_input.json").write_text(
+        json.dumps(tau), encoding="utf-8"
+    )
+    (tmp_path / "heca_gradient_ownership.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in gradients) + "\n", encoding="utf-8"
+    )
+    loss_rows = []
+    for index, epoch in enumerate(epochs):
+        epoch_dir = tmp_path / f"epoch_{index:03d}"
+        epoch_dir.mkdir()
+        for name, payload in (
+            ("branch_metrics.json", epoch["branches"]),
+            ("typed_evidence.json", epoch["typed"]),
+            ("runtime.json", epoch["runtime"]),
+        ):
+            (epoch_dir / name).write_text(json.dumps(payload), encoding="utf-8")
+        loss_rows.append(
+            {
+                "epoch": index,
+                "action_final_logit_abs_max": epoch["max_action_logit"],
+                "foundation_grad_ema": epoch["foundation_grad_ema"],
+                "foundation_grad_norm": 0.0,
+                "foundation_grad_cap": 1.0,
+            }
+        )
+    (tmp_path / "loss_components.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in loss_rows) + "\n", encoding="utf-8"
+    )
+    result = evaluate_heca_pilot(
+        epochs=epochs,
+        implementation_audit=audit,
+        ontology_manifest=ontology,
+        tau_stats=tau,
+        gradient_rows=gradients,
+        git_head="abc",
+    )
+    (tmp_path / "HECA_PILOT_PASS.json").write_text(
+        json.dumps(result), encoding="utf-8"
+    )
+    for letter, payload in result["gate_payloads"].items():
+        (tmp_path / f"HECA_GATE_{letter}.json").write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+    assert validate_heca_pilot_recomputation(
+        tmp_path, expected_git_head="abc"
+    ) == []
+    gate_c = tmp_path / "HECA_GATE_C.json"
+    tampered = json.loads(gate_c.read_text(encoding="utf-8"))
+    tampered["evidence"] = {"forged": True}
+    gate_c.write_text(json.dumps(tampered), encoding="utf-8")
+    assert "pilot_recomputation:gate_C_mismatch" in validate_heca_pilot_recomputation(
+        tmp_path, expected_git_head="abc"
+    )

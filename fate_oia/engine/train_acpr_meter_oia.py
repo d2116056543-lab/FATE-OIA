@@ -72,6 +72,9 @@ from fate_oia.utils.meter_artifacts import (
     write_json,
 )
 from fate_oia.utils.meter_config import load_meter_config
+from fate_oia.engine.evaluate_meter_oia_v3_heca_pilot import (
+    validate_heca_pilot_recomputation,
+)
 from fate_oia.utils.tesa_contracts import build_runtime_subset_counts
 from fate_oia.utils.meter_posthoc_calibration import (
     METERCalibrationResult,
@@ -105,6 +108,8 @@ def _validated_gate_pass(path: str) -> bool:
         return False
     head = _git_head()
     if validate_heca_pilot_bundle(source.parent, expected_git_head=head):
+        return False
+    if validate_heca_pilot_recomputation(source.parent, expected_git_head=head):
         return False
     payload = json.loads(source.read_text(encoding="utf-8"))
     pilot = json.loads(

@@ -55,8 +55,8 @@ def evaluate_heca_pilot(
     git_head: str,
 ) -> dict[str, Any]:
     """Evaluate the real four-epoch pilot; missing evidence fails closed."""
-    if len(epochs) < 2:
-        raise ValueError("HECA Gate C requires at least two completed pilot epochs")
+    if len(epochs) != 4:
+        raise ValueError("HECA pilot requires exactly four completed epochs")
     last = epochs[-1]
     branches = last.get("branches", {})
     typed = last.get("typed", {})
@@ -327,6 +327,49 @@ def _epoch_payload(directory: Path) -> dict[str, Any]:
     }
 
 
+def validate_heca_pilot_recomputation(
+    directory: str | Path, *, expected_git_head: str
+) -> list[str]:
+    """Recompute A-G from raw four-epoch evidence instead of trusting self-reports."""
+    root = Path(directory)
+    try:
+        epoch_dirs = sorted(path for path in root.glob("epoch_*") if path.is_dir())
+        if len(epoch_dirs) != 4:
+            return ["pilot_recomputation:expected_exactly_four_epochs"]
+        recomputed = evaluate_heca_pilot(
+            epochs=[_epoch_payload(path) for path in epoch_dirs],
+            implementation_audit=_read_json(
+                root / "heca_implementation_audit_input.json"
+            ),
+            ontology_manifest=_read_json(root / "heca_ontology_manifest_input.json"),
+            tau_stats=_read_json(root / "heca_tau_stats_input.json"),
+            gradient_rows=_read_jsonl(root / "heca_gradient_ownership.jsonl"),
+            git_head=expected_git_head,
+        )
+        saved = _read_json(root / "HECA_PILOT_PASS.json")
+        saved_gates = {
+            letter: _read_json(root / f"HECA_GATE_{letter}.json")
+            for letter in "ABCDEFG"
+        }
+    except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError) as error:
+        return [f"pilot_recomputation:error:{type(error).__name__}"]
+    failures = []
+    if recomputed.get("pass") is not True:
+        failures.append("pilot_recomputation:gates_failed")
+    if recomputed.get("git_head") != expected_git_head:
+        failures.append("pilot_recomputation:git_head")
+    if saved.get("gates") != recomputed.get("gates"):
+        failures.append("pilot_recomputation:gates_mismatch")
+    if saved.get("pass") is not True or saved.get("git_head") != expected_git_head:
+        failures.append("pilot_recomputation:saved_status_or_head")
+    if saved.get("gate_payloads") != recomputed.get("gate_payloads"):
+        failures.append("pilot_recomputation:payload_mismatch")
+    for letter, payload in recomputed.get("gate_payloads", {}).items():
+        if saved_gates.get(letter) != payload:
+            failures.append(f"pilot_recomputation:gate_{letter}_mismatch")
+    return failures
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--pilot_dir", required=True)
@@ -350,6 +393,9 @@ def main() -> None:
         gradient_rows=gradients,
         git_head=git_head,
     )
+    write_json(root / "heca_implementation_audit_input.json", audit)
+    write_json(root / "heca_ontology_manifest_input.json", ontology)
+    write_json(root / "heca_tau_stats_input.json", tau)
     payload = {
         "ontology_manifest": ontology,
         "tau_stats": tau,
@@ -371,6 +417,9 @@ def main() -> None:
     )
     write_json(root / "HECA_PILOT_PASS.json", result)
     failures = validate_heca_pilot_bundle(root, expected_git_head=git_head)
+    failures.extend(
+        validate_heca_pilot_recomputation(root, expected_git_head=git_head)
+    )
     result["artifact_failures"] = failures
     result["pass"] = result["pass"] and not failures
     write_json(root / "HECA_PILOT_PASS.json", result)

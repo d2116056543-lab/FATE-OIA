@@ -7,6 +7,9 @@ import sys
 from pathlib import Path
 
 from fate_oia.utils.meter_artifacts import validate_heca_pilot_bundle
+from fate_oia.engine.evaluate_meter_oia_v3_heca_pilot import (
+    validate_heca_pilot_recomputation,
+)
 
 
 FALLBACK_LADDER = ((6, 5), (5, 6), (4, 8), (3, 10), (2, 15))
@@ -36,6 +39,14 @@ def validate_training_readiness(
         raise RuntimeError(
             "HECA pilot artifacts failed strict validation: "
             + ", ".join(artifact_failures)
+        )
+    recomputation_failures = validate_heca_pilot_recomputation(
+        Path(pilot_path).parent, expected_git_head=head
+    )
+    if recomputation_failures:
+        raise RuntimeError(
+            "HECA pilot gate recomputation failed: "
+            + ", ".join(recomputation_failures)
         )
     gates = pilot.get("gates", {})
     missing = [letter for letter in "ABCDEFG" if gates.get(letter) is not True]
