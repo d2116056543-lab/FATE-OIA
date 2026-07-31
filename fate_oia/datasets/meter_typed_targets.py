@@ -11,6 +11,34 @@ from torch import Tensor
 from fate_oia.grounding.mask_builder import drivable_map_to_mask
 
 
+def compute_factor_observability_tau(
+    observed_count: Tensor,
+    valid_count: Tensor,
+    factor_groups: list[str] | tuple[str, ...],
+    *,
+    alpha: float = 20.0,
+) -> Tensor:
+    """Beta-binomial group shrinkage using train-main source statistics."""
+    observed = observed_count.detach().float().reshape(-1)
+    valid = valid_count.detach().float().reshape(-1)
+    if observed.shape != valid.shape or len(factor_groups) != observed.numel():
+        raise ValueError("One observed/valid/group value is required per factor")
+    if bool((observed < 0).any()) or bool((valid < observed).any()):
+        raise ValueError("Invalid HECA observability counts")
+    group_tau: dict[str, Tensor] = {}
+    for group in sorted(set(factor_groups)):
+        mask = torch.tensor([value == group for value in factor_groups])
+        group_tau[group] = observed[mask].sum() / valid[mask].sum().clamp_min(1.0)
+    tau = torch.stack(
+        [
+            (observed[index] + float(alpha) * group_tau[group])
+            / (valid[index] + float(alpha))
+            for index, group in enumerate(factor_groups)
+        ]
+    )
+    return tau.clamp(0.05, 0.95)
+
+
 def _box(obj: dict[str, Any]) -> tuple[float, float, float, float] | None:
     value = obj.get("box2d") or obj.get("box")
     if not isinstance(value, dict):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import torch
@@ -120,6 +121,7 @@ def source_weighted_anchor_loss(
     target = target.flatten(2)
     target = target / target.sum(-1, keepdim=True).clamp_min(1e-6)
     nll = -(target * predicted.clamp_min(1e-8).log()).sum(-1)
+    nll = nll / math.log(max(predicted.shape[-1], 2))
     intersection = (target * predicted).sum(-1)
     dice = 1.0 - (2.0 * intersection + 1e-6) / (
         target.sum(-1) + predicted.sum(-1) + 1e-6
@@ -292,10 +294,13 @@ def meter_grounding_loss(
         output["factor_null_mass"], present_valid, absent_valid, source
     )
     tau = (
-        torch.full((output["factor_observability"].shape[1],), 0.5, device=source.device)
+        output.get("factor_observability_tau")
         if observability_tau is None
-        else observability_tau.to(source)
+        else observability_tau
     )
+    if tau is None or not bool(torch.isfinite(tau).all()):
+        raise ValueError("HECA requires factor-specific train-main observability tau")
+    tau = tau.to(source)
     obs_bce, obs_coverage = observability_objective(
         output["factor_observability_logit"],
         targets["factor_observability"],
