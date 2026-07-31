@@ -95,7 +95,17 @@ def initialize_model_from_checkpoint(
     state_dict = payload.get("model")
     if not isinstance(state_dict, dict):
         raise RuntimeError(f"Checkpoint {path} does not contain a model state dict")
-    model.load_state_dict(state_dict, strict=True)
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    allowed_missing = {
+        key for key in incompatible.missing_keys
+        if key.endswith("action_evidence_admission.weight")
+        or key.endswith("action_evidence_admission.bias")
+    }
+    forbidden_missing = set(incompatible.missing_keys) - allowed_missing
+    if incompatible.unexpected_keys or forbidden_missing:
+        raise RuntimeError(
+            f"Incompatible checkpoint {path}: missing={sorted(forbidden_missing)}, unexpected={sorted(incompatible.unexpected_keys)}"
+        )
     return {
         "mode": "weights_only",
         "source_epoch": int(payload.get("epoch", -1)),
@@ -1075,6 +1085,14 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                 "action_visual_rms_raw": output[
                     "action_visual_rms_raw"
                 ].detach().cpu().tolist(),
+                "action_admission_mean": float(
+                    output["action_evidence_admission_gate"].mean().detach()
+                ),
+                "action_admission_p05_p95": torch.quantile(
+                    output["action_evidence_admission_gate"].detach().flatten(),
+                    torch.tensor([0.05, 0.95], device=device),
+                ).cpu().tolist(),
+                "action_transport_support_mean": float(output["action_transport_support"].mean().detach()),
                 "action_visual_logit_abs_max": float(
                     output["action_logits_visual"].detach().abs().max()
                 ),

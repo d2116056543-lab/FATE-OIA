@@ -102,7 +102,11 @@ def meter_action_loss(
     sign = target * 2.0 - 1.0
     visual_margin = sign * output["action_logits_visual"].detach()
     final_margin = sign * output["action_logits_final"]
-    correction = torch.relu(0.05 + visual_margin - final_margin).mean()
+    support = output.get("action_transport_support", torch.ones_like(final_margin))
+    admission = output.get("action_evidence_admission_gate", torch.ones_like(final_margin))
+    correction_weight = (support * admission).detach().clamp_min(0.0)
+    correction_terms = torch.relu(visual_margin - final_margin) * correction_weight
+    correction = correction_terms.sum() / correction_weight.sum().clamp_min(1e-6)
     two_way = F.binary_cross_entropy_with_logits(
         output["action_logits_final"], target
     )
@@ -199,11 +203,15 @@ def meter_action_loss_per_sample(
     visual = asymmetric_multilabel_elements(
         output["action_logits_visual"], target
     ).mean(-1)
-    correction = torch.relu(
-        0.05
-        + (target * 2 - 1) * output["action_logits_visual"].detach()
+    correction_weight = (
+        output.get("action_transport_support", torch.ones_like(target))
+        * output.get("action_evidence_admission_gate", torch.ones_like(target))
+    ).detach().clamp_min(0.0)
+    correction_terms = torch.relu(
+        (target * 2 - 1) * output["action_logits_visual"].detach()
         - (target * 2 - 1) * output["action_logits_final"]
-    ).mean(-1)
+    ) * correction_weight
+    correction = correction_terms.sum(-1) / correction_weight.sum(-1).clamp_min(1e-6)
     return (
         weights.get("action_final", 1.0) * final
         + weights.get("action_visual", 0.35) * visual

@@ -8,7 +8,7 @@ from fate_oia.engine.train_acpr_meter_oia import (
     initialize_model_from_checkpoint,
     load_meter_config,
 )
-from fate_oia.losses.meter_action_losses import action_delta_pairwise_ranking_loss
+from fate_oia.losses.meter_action_losses import action_delta_pairwise_ranking_loss, meter_action_loss
 from fate_oia.models.acpr_label_trunk import ACPRLabelTrunk
 from fate_oia.models.meter_calalign_foundation import METERCalAlignFoundation
 from fate_oia.models.meter_semantic_action import FactorSpecificActionTransport
@@ -133,3 +133,45 @@ def test_diagnostic_schedule_keeps_primary_test_fast_and_audits_final_epoch() ->
     assert not _diagnostic_due(epoch=3, total_epochs=5, interval=5)
     assert _diagnostic_due(epoch=4, total_epochs=5, interval=5)
     assert _diagnostic_due(epoch=0, total_epochs=5, interval=1)
+
+def test_transport_admission_starts_as_an_exact_legacy_equivalent() -> None:
+    transport = FactorSpecificActionTransport(dim=8, action_dim=2, factor_dim=3, rank=2)
+    output = transport(
+        torch.randn(2, 2), torch.randn(2, 2, 8), torch.randn(2, 3, 8),
+        torch.ones(2, 3), torch.ones(2, 3), progress=1.0,
+    )
+
+    assert torch.equal(output["action_evidence_admission_gate"], torch.ones(2, 2))
+    assert torch.allclose(
+        output["action_logits_final"],
+        output["action_logits_visual"] + output["action_evidence_delta_pre_admission"],
+    )
+
+
+def test_evidence_free_action_correction_does_not_force_a_delta() -> None:
+    logits = torch.tensor([[0.4, -0.4]])
+    losses = meter_action_loss(
+        {
+            "action_logits_visual": logits,
+            "action_logits_final": logits.clone(),
+            "action_transport_support": torch.zeros_like(logits),
+            "action_evidence_admission_gate": torch.zeros_like(logits),
+        },
+        torch.tensor([[1.0, 0.0]]),
+    )
+
+
+def test_legacy_best_checkpoint_allows_only_new_admission_parameters(tmp_path: Path) -> None:
+    source = FactorSpecificActionTransport(dim=8, action_dim=2, factor_dim=3, rank=2)
+    state = source.state_dict()
+    state.pop("action_evidence_admission.weight")
+    state.pop("action_evidence_admission.bias")
+    checkpoint_path = tmp_path / "legacy-best.pth"
+    torch.save({"epoch": 7, "optimizer_step": 100, "model": state}, checkpoint_path)
+
+    target = FactorSpecificActionTransport(dim=8, action_dim=2, factor_dim=3, rank=2)
+    initialization = initialize_model_from_checkpoint(target, checkpoint_path)
+
+    assert initialization["mode"] == "weights_only"
+    assert torch.equal(target.action_evidence_admission.weight, torch.zeros_like(target.action_evidence_admission.weight))
+    assert torch.equal(target.action_evidence_admission.bias, torch.zeros_like(target.action_evidence_admission.bias))

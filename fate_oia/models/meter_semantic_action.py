@@ -54,6 +54,11 @@ class FactorSpecificActionTransport(nn.Module):
         self.null_bias = nn.Parameter(torch.zeros(action_dim))
         self.factor_down = nn.Parameter(torch.randn(factor_dim, rank, dim) * 0.02)
         self.factor_up = nn.Parameter(torch.randn(factor_dim, dim, rank) * 0.02)
+        # Starts as an exact identity and can suppress unsupported corrections.
+        self.action_evidence_admission = nn.Linear(4, 1)
+        nn.init.zeros_(self.action_evidence_admission.weight)
+        nn.init.zeros_(self.action_evidence_admission.bias)
+
         self.register_buffer("running_visual_rms", torch.ones(action_dim), persistent=True)
         self.register_buffer("running_updates", torch.zeros((), dtype=torch.long), persistent=True)
 
@@ -172,12 +177,38 @@ class FactorSpecificActionTransport(nn.Module):
         contributions = ramp * per_factor_kappa * torch.tanh(
             raw_contributions / per_factor_kappa.clamp_min(1e-6)
         )
-        evidence_delta = contributions.sum(-1)
+        pre_admission_delta = contributions.sum(-1)
+        transport_support = (factor_weight * source_reliability.unsqueeze(1)).sum(-1)
+        selection_mass = factor_weight.sum(-1)
+        base_uncertainty = torch.sigmoid(-action_logits_visual.detach().abs())
+        normalized_delta = torch.tanh(
+            pre_admission_delta.detach() / kappa.view(1, -1).clamp_min(1e-6)
+        )
+        admission_features = torch.stack(
+            (
+                transport_support.detach(),
+                selection_mass.detach(),
+                base_uncertainty,
+                normalized_delta,
+            ),
+            dim=-1,
+        )
+        admission_raw = 2.0 * torch.sigmoid(
+            self.action_evidence_admission(admission_features).squeeze(-1)
+        )
+        absolute_limit = self.max_action_delta / pre_admission_delta.detach().abs().clamp_min(1e-6)
+        admission = torch.minimum(admission_raw, absolute_limit).clamp_min(0.0)
+        evidence_delta = admission * pre_admission_delta
+        contributions = admission.unsqueeze(-1) * contributions
         final = action_logits_visual + evidence_delta
         deleted = final.unsqueeze(-1) - contributions
         return {
             "action_logits_visual": action_logits_visual,
             "action_evidence_delta": evidence_delta,
+            "action_evidence_delta_pre_admission": pre_admission_delta,
+            "action_evidence_admission_gate": admission,
+            "action_evidence_admission_raw": admission_raw,
+            "action_transport_support": transport_support,
             "action_logits_final": final,
             "action_factor_weights": factor_weight,
             "action_factor_dense_weights": dense_factor_weight,
