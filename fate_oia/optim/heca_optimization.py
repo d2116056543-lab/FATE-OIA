@@ -29,6 +29,16 @@ class HECALossRegistry:
             return torch.zeros(())
         return sum(row["weight"] * row["value"] for row in self._rows.values())
 
+    def owner_total(self, owners: set[str]) -> Tensor:
+        rows = [
+            row["weight"] * row["value"]
+            for row in self._rows.values()
+            if row["owner"] in owners
+        ]
+        if not rows:
+            return self.total().new_zeros(())
+        return sum(rows)
+
     def artifact(self) -> list[dict[str, Any]]:
         return [
             {
@@ -87,6 +97,31 @@ class HECAExcessRiskBalancer:
         self.__dict__.update(state)
 
 
+class ReasonProbabilityEMA:
+    """Per-training-sample reason probability EMA; never reads test labels."""
+
+    def __init__(self, momentum: float = 0.90) -> None:
+        self.momentum = float(momentum)
+        self.values: dict[str, Tensor] = {}
+
+    def values_for(self, file_names: list[str], fallback: Tensor) -> Tensor:
+        rows = [self.values.get(str(name), fallback[index].detach().cpu()) for index, name in enumerate(file_names)]
+        return torch.stack(rows).to(device=fallback.device, dtype=fallback.dtype)
+
+    def update(self, file_names: list[str], probability: Tensor) -> None:
+        for name, row in zip(file_names, probability.detach().float().cpu()):
+            key = str(name)
+            previous = self.values.get(key)
+            self.values[key] = row.clone() if previous is None else self.momentum * previous + (1.0 - self.momentum) * row
+
+    def state_dict(self) -> dict[str, Any]:
+        return {"momentum": self.momentum, "values": self.values}
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        self.momentum = float(state.get("momentum", self.momentum))
+        self.values = {str(key): value.detach().cpu() for key, value in dict(state.get("values", {})).items()}
+
+
 def identity_corruption_mode(optimizer_update: int) -> str:
     return ("schema", "cross_sample", "state")[int(optimizer_update) % 3]
 
@@ -136,6 +171,10 @@ class HECAScheduleState:
         if progress <= 0.20:
             return 0.5 + 0.5 * (progress - 0.05) / 0.15
         return 1.0
+
+    def foundation_grad_cap(self, minimum: float, maximum: float) -> float:
+        pressure = min(max(self.foundation_grad_ema / 5.0, 0.0), 1.0)
+        return float(maximum) - (float(maximum) - float(minimum)) * pressure
 
     def state_dict(self) -> dict[str, Any]:
         return asdict(self)

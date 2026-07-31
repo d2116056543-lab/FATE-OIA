@@ -196,6 +196,22 @@ def observability_objective(
     return bce, _weighted_mean(coverage, available.to(logits))
 
 
+def ontology_identity_loss(output: dict[str, Tensor]) -> Tensor:
+    """Align learned identities to frozen offline ontology prototypes."""
+    factor = 1.0 - F.cosine_similarity(
+        output["factor_ontology_query"],
+        output["factor_ontology_target"].detach(),
+        dim=-1,
+    )
+    state = 1.0 - F.cosine_similarity(
+        output["state_ontology_query"],
+        output["state_ontology_target"].detach(),
+        dim=-1,
+    )
+    valid = output["factor_state_valid_mask"].to(state)
+    return factor.mean() + _weighted_mean(state, valid)
+
+
 def discrimination_and_mirror_loss(
     output: dict[str, Tensor],
     targets: dict[str, Tensor],
@@ -220,6 +236,18 @@ def discrimination_and_mirror_loss(
                     torch.relu(0.05 + wrong_score - correct_score), weight
                 )
             )
+    group_ids = output.get("factor_group_ids")
+    if group_ids is not None:
+        for correct in range(predicted.shape[1]):
+            for wrong_factor in range(predicted.shape[1]):
+                if correct == wrong_factor or group_ids[correct] != group_ids[wrong_factor]:
+                    continue
+                correct_score = (predicted[:, correct] * target[:, correct]).sum(-1)
+                wrong_score = (predicted[:, wrong_factor] * target[:, correct]).sum(-1)
+                weight = source[:, correct] * valid[:, correct]
+                same_type_terms.append(
+                    _weighted_mean(torch.relu(0.05 + wrong_score - correct_score), weight)
+                )
     for factor in range(predicted.shape[1]):
         correct_score = (predicted[:, factor] * target[:, factor]).sum(-1)
         background = 1.0 - target[:, factor].clamp(0, 1)
@@ -316,6 +344,7 @@ def meter_grounding_loss(
     )
     anchor = anchor_nll + anchor_dice
     observability = obs_bce + obs_coverage
+    ontology_identity = ontology_identity_loss(output)
     resolved = _grounding_weights(weights)
     components = {
         "anchor": anchor,
@@ -324,6 +353,7 @@ def meter_grounding_loss(
         "observability": observability,
         "discrimination": discrimination,
         "mirror": mirror,
+        "ontology_identity": ontology_identity,
     }
     total = sum(resolved[name] * components[name] for name in resolved)
     return {
@@ -337,5 +367,6 @@ def meter_grounding_loss(
         "observability": observability,
         "discrimination": discrimination,
         "mirror": mirror,
+        "ontology_identity": ontology_identity,
         "total": total,
     }
