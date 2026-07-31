@@ -76,6 +76,11 @@ class METEROIAModel(nn.Module):
         )
         self.reason_decoder.initialize_from_foundation(self.foundation)
         self._encode_call_count = 0
+        self._component_call_counts = {
+            "typed_measurement": 0,
+            "action_credit": 0,
+            "reason_correction": 0,
+        }
 
     @property
     def signed_factors(self) -> TypedEvidenceStateHead:
@@ -127,6 +132,7 @@ class METEROIAModel(nn.Module):
             base["patch_tokens_by_layer"],
             progress=progress,
         )
+        self._component_call_counts["typed_measurement"] += 1
         reliability = factors["factor_reliability"]
         state_prob = factors["factor_state_prob"]
         action_bridge = factors["factor_action_bridge_token"]
@@ -170,6 +176,7 @@ class METEROIAModel(nn.Module):
             progress=progress,
             update_running_stats=update_semantic_stats,
         )
+        self._component_call_counts["action_credit"] += 1
         after_action = stamp()
         reason = self.reason_decoder(
             reason_logits_calalign=base["reason_logits_calalign"],
@@ -179,6 +186,7 @@ class METEROIAModel(nn.Module):
             factor_groundable_mask=factors["factor_groundable_mask"],
             progress=progress,
         )
+        self._component_call_counts["reason_correction"] += 1
         if "reason_correction_off" in diagnostic_modes:
             reason["reason_logits_final"] = reason["reason_logits_global"]
         after_reason = stamp()
@@ -198,6 +206,10 @@ class METEROIAModel(nn.Module):
             **action,
             **reason,
             "action_nodes": adapted["action_nodes"],
+            "label_nodes_base": base["label_nodes"],
+            "label_nodes": torch.cat(
+                [adapted["action_nodes"], adapted["reason_nodes"]], dim=1
+            ),
             "factor_state_prob": state_prob,
             "factor_state_prob_effective": state_prob,
             "factor_action_bridge_token": action_bridge,

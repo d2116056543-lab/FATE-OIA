@@ -31,6 +31,7 @@ REQUIRED_FILES = (
     "fate_oia/engine/prepare_heca_static_artifacts.py",
     "fate_oia/engine/train_acpr_meter_oia.py",
     "fate_oia/engine/eval_acpr_meter_oia.py",
+    "fate_oia/engine/evaluate_meter_oia_v3_heca_pilot.py",
     "fate_oia/engine/supervise_meter_oia_v3_heca_foreground.py",
 )
 
@@ -48,6 +49,7 @@ def _source_checks(root: Path, config: dict[str, Any]) -> dict[str, Any]:
         "fate_oia/models/meter_oia_model.py",
         "fate_oia/engine/train_acpr_meter_oia.py",
         "fate_oia/engine/eval_acpr_meter_oia.py",
+        "fate_oia/engine/evaluate_meter_oia_v3_heca_pilot.py",
     )
     active = "\n".join(
         (root / name).read_text(encoding="utf-8")
@@ -96,6 +98,9 @@ def _dynamic_checks() -> dict[str, Any]:
     checks = {
         "action_progress_zero_equivalence": float((clean["action_logits_final"] - clean["action_logits_visual"]).abs().max()) < 1e-6,
         "reason_progress_zero_equivalence": float((clean["reason_logits_final"] - clean["reason_logits_global"]).abs().max()) < 1e-6,
+        "label_nodes_progress_zero_equivalence": float(
+            (clean["label_nodes"] - clean["label_nodes_base"]).abs().max()
+        ) < 1e-6,
         "factor_off_action_visual": torch.equal(factor_off["action_logits_final"], factor_off["action_logits_visual"]),
         "state_uniform_recomputes_values": not torch.allclose(clean["action_factor_values"], uniform["action_factor_values"]),
         "one_dino_call": model._encode_call_count == 1,
