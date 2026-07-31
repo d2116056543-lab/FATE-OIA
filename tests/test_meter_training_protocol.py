@@ -30,3 +30,8 @@ def test_tesa_trainer_contains_dense_losses_and_no_v1_event_path():
     assert "meter_grounding_loss" in source
     assert "meter_private_pu_loss" in source
     assert "_counterfactual_event" not in inspect.getsource(trainer)
+
+def test_audit_subsampling_keeps_smoke_diagnostics_bounded():
+    indices = list(range(10))
+    assert trainer._bounded_audit_indices(indices, 0) == indices
+    assert trainer._bounded_audit_indices(indices, 3) == [0, 1, 2]

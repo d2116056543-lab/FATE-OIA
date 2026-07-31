@@ -114,6 +114,12 @@ def initialize_model_from_checkpoint(
     }
 
 
+
+def _bounded_audit_indices(indices: list[int], maximum: int) -> list[int]:
+    """Keep full diagnostics by default while making smoke runs bounded."""
+    return indices if int(maximum) <= 0 else indices[: int(maximum)]
+
+
 def _loader(
     dataset: METERDataset,
     indices: list[int],
@@ -825,9 +831,12 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
         grounding_index=grounding_index,
         include_grounding=True,
     )
+    factor_audit_indices = _bounded_audit_indices(
+        split["audit"], args.max_audit_samples
+    )
     factor_audit_loader = _loader(
         grounded_audit_dataset,
-        split["audit"],
+        factor_audit_indices,
         batch_size=batch_size,
         workers=workers,
         shuffle=False,
@@ -997,6 +1006,11 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
             backward_start = time.perf_counter()
             scaled.backward()
             backward_time = time.perf_counter() - backward_start
+            admission_grad = model.action_transport.action_evidence_admission.weight.grad
+            action_admission_grad_norm = float(
+                admission_grad.detach().norm()
+            ) if admission_grad is not None else 0.0
+            action_admission_parameter_norm = float(model.action_transport.action_evidence_admission.weight.detach().norm())
             is_update = (micro_step + 1) % grad_accum == 0 or micro_step + 1 == len(train_loader)
             grad_norm = 0.0
             foundation_grad_norm = 0.0
@@ -1036,6 +1050,8 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                 "loss_discrimination": float(parts["grounding"]["discrimination"].detach()),
                 "loss_mirror": float(parts["grounding"]["mirror"].detach()),
                 "loss_dense_intervention": float(parts["dense"]["total"].detach()),
+                "action_admission_grad_norm": action_admission_grad_norm,
+                "action_admission_parameter_norm": action_admission_parameter_norm,
                 "loss_dense_necessity": float(parts["dense"]["necessity"].detach()),
                 "loss_action_specificity": float(
                     parts["action"]["specificity"].detach()
@@ -1393,6 +1409,7 @@ def main() -> None:
     parser.add_argument("--max_audit_samples", type=int, default=0)
     parser.add_argument("--max_calib_samples", type=int, default=0)
     parser.add_argument("--max_test_samples", type=int, default=0)
+    parser.add_argument("--max_audit_samples", type=int, default=0)
     parser.add_argument("--resume", default="")
     parser.add_argument("--init_model_checkpoint", default="")
     parser.add_argument("--use_mock_dino", action="store_true")
