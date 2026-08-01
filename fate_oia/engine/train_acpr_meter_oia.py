@@ -500,6 +500,7 @@ def _compute_losses(
         reason_target,
         pu_score,
         config["loss_weights"],
+        observability=output["factor_observability"].detach(),
         soft_positive_weight=None,
         view_output=loss_view_output,
     )

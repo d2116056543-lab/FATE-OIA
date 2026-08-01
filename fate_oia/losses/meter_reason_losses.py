@@ -53,7 +53,9 @@ def build_reason_supervision(
 ) -> ReasonSupervision:
     positive = target.gt(0.5)
     unknown = ~positive
-    negative_weight = (1.0 - missing_positive_trust.detach()).clamp(0.10, 1.0)
+    # Zero is meaningful here: an unobservable y=0 is unknown and must not
+    # create an ASL, ranking, or correction-negative gradient.
+    negative_weight = (1.0 - missing_positive_trust.detach()).clamp(0.0, 1.0)
     soft = (
         torch.zeros_like(target)
         if soft_positive_weight is None
@@ -137,23 +139,41 @@ def meter_reason_loss(
     missing_positive_trust: Tensor,
     weights: dict[str, float] | None = None,
     *,
+    observability: Tensor | None = None,
     soft_positive_weight: Tensor | None = None,
     view_output: dict[str, Tensor] | None = None,
 ) -> dict[str, Tensor | ReasonSupervision]:
     weights = weights or {}
+    if observability is None:
+        effective_missing_positive_trust = missing_positive_trust
+    else:
+        if observability.shape != target.shape:
+            raise ValueError("reason observability must match the reason target")
+        # An unobserved negative label is unknown, not an observed absence.
+        # Preserve the existing missing-positive trust where evidence is
+        # visible, and set the negative weight to zero where it is not.
+        visible = observability.detach().to(target).clamp(0.0, 1.0)
+        effective_missing_positive_trust = 1.0 - (
+            1.0 - missing_positive_trust.detach().to(target).clamp(0.0, 1.0)
+        ) * visible
     supervision = build_reason_supervision(
         target,
-        missing_positive_trust,
+        effective_missing_positive_trust,
         soft_positive_weight=soft_positive_weight,
     )
     final = robust_reason_asl(output["reason_logits_final"], supervision)
     global_loss = robust_reason_asl(output["reason_logits_global"], supervision)
     rank = robust_reason_rank_loss(output["reason_logits_final"], supervision)
     soft_f1 = robust_reason_soft_f1(output["reason_logits_final"], supervision)
-    correction = reason_correction_sign_loss(
-        output["reason_evidence_delta"],
-        supervision,
-        margin=float(weights.get("reason_correction_margin", 0.05)),
+    evidence_delta = output.get("reason_evidence_delta")
+    correction = (
+        reason_correction_sign_loss(
+            evidence_delta,
+            supervision,
+            margin=float(weights.get("reason_correction_margin", 0.05)),
+        )
+        if evidence_delta is not None
+        else target.new_zeros(())
     )
     view = output["reason_logits_final"].new_zeros(())
     if view_output is not None:
@@ -180,6 +200,7 @@ def meter_reason_loss(
         "rank": rank,
         "soft_f1": soft_f1,
         "correction_sign": correction,
+        "evidence_correction": correction,
         "view_consistency": view,
         "supervision": supervision,
         "total": total,

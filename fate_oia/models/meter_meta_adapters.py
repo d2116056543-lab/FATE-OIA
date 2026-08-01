@@ -42,6 +42,10 @@ class _ZeroInitLowRankResidual(nn.Module):
         parameter_path = residual(value.detach(), detach_parameters=False)
         return input_path + float(scale) * (parameter_path - parameter_path.detach())
 
+    def parameter_only_residual(self, value: Tensor) -> Tensor:
+        """Keep the residual value while blocking gradients to its input."""
+        return self.forward(value.detach())
+
 
 class HECASharedPrivateAdapters(nn.Module):
     """Zero-effect shared/action/reason adapters after label self-attention."""
@@ -83,6 +87,16 @@ class HECASharedPrivateAdapters(nn.Module):
         action = label_nodes[:, : self.action_dim] + action_delta
         reason = label_nodes[:, self.action_dim :] + reason_delta
         reason_private_delta = self.reason_private_adapter(reason)
+        # This has exactly the same forward value as reason_nodes but only
+        # exposes gradients to the shared/private reason adapter parameters.
+        # It is the input to the private reason decoder, not the foundation.
+        reason_nodes_private = (
+            label_nodes[:, self.action_dim :].detach()
+            + self.shared_adapter.parameter_only_residual(
+                label_nodes[:, self.action_dim :]
+            )
+            + self.reason_private_adapter.parameter_only_residual(reason)
+        )
         pu_private_nodes = (
             reason.detach()
             + self.reason_private_adapter(reason.detach())
@@ -91,6 +105,7 @@ class HECASharedPrivateAdapters(nn.Module):
             "shared_nodes": shared,
             "action_nodes": action + self.action_private_adapter(action),
             "reason_nodes": reason + reason_private_delta,
+            "reason_nodes_private": reason_nodes_private,
             "reason_logits_pu_private": self.pu_private_head(
                 pu_private_nodes
             ).squeeze(-1),

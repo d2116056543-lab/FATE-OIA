@@ -12,6 +12,8 @@ def test_private_reason_loss_does_not_update_foundation_core() -> None:
     loss.backward()
     foundation_grads = [p.grad for p in model.foundation.parameters() if p.requires_grad]
     private_grads = [p.grad for p in model.reason_decoder.parameters() if p.requires_grad]
+    shared_grads = [p.grad for p in model.heca_adapters.shared_adapter.parameters() if p.requires_grad]
     leaking = [name for name, parameter in model.foundation.named_parameters() if parameter.grad is not None and float(parameter.grad.abs().sum()) > 0.0]
     assert not leaking, leaking
     assert any(grad is not None and float(grad.abs().sum()) > 0.0 for grad in private_grads)
+    assert any(grad is not None and float(grad.abs().sum()) > 0.0 for grad in shared_grads)

@@ -195,7 +195,7 @@ class METEROIAModel(nn.Module):
         after_action = stamp()
         reason = self.reason_decoder(
             reason_logits_calalign=base["reason_logits_calalign"],
-            reason_nodes=adapted["reason_nodes"],
+            reason_nodes=adapted["reason_nodes_private"],
             factor_measurement_token=measurement_token,
             factor_reliability=reliability,
             factor_groundable_mask=factors["factor_groundable_mask"],

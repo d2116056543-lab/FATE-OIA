@@ -23,6 +23,8 @@ def test_reason_correction_starts_as_exact_global_anchor_and_receives_gradient()
     output["reason_logits_final"].sum().backward()
     assert decoder.correction_vector.grad is not None
     assert decoder.correction_vector.grad.abs().sum() > 0
+    assert decoder.global_delta_head.weight.grad is not None
+    assert decoder.global_delta_head.weight.grad.abs().sum() > 0
 
 
 def test_reason_correction_sign_balances_observed_positive_against_many_unknowns() -> None:

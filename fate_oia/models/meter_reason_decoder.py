@@ -20,8 +20,13 @@ class METERPrivateReasonDecoder(nn.Module):
         self.dim = int(dim)
         self.reason_dim = int(reason_dim)
         self.global_delta_head = nn.Linear(dim, 1)
-        nn.init.zeros_(self.global_delta_head.weight)
+        # The gate below, rather than this projection, establishes the exact
+        # zero-effect initialization. A live projection lets the adapter-only
+        # input receive a useful first-step gradient.
+        nn.init.xavier_uniform_(self.global_delta_head.weight)
         nn.init.zeros_(self.global_delta_head.bias)
+        self.global_delta_gate_raw = nn.Parameter(torch.zeros(()))
+        self.global_delta_startup_gradient_scale = 0.10
         # A zero evidence residual preserves the calibrated global reason
         # anchor exactly; evidence gradients first update this vector.
         self.correction_vector = nn.Parameter(torch.zeros(reason_dim, dim))
@@ -48,8 +53,22 @@ class METERPrivateReasonDecoder(nn.Module):
         progress: float = 1.0,
         **_: Tensor,
     ) -> dict[str, Tensor]:
-        global_delta = self.global_delta_head(reason_nodes).squeeze(-1)
-        global_logits = reason_logits_calalign + global_delta
+        # The CalAlign predictor is a fixed reason anchor. ``reason_nodes``
+        # is supplied through the adapter-only route, so this head can train
+        # the shared/private reason adapters without rewriting the foundation.
+        raw_global_delta = self.global_delta_head(reason_nodes).squeeze(-1)
+        gate = 0.20 * torch.tanh(self.global_delta_gate_raw)
+        # The subtract-detach term is exactly zero in the forward pass at
+        # startup, yet gives the zero-initialized head and adapter-only input
+        # a bounded first-step gradient. The learned gate alone determines
+        # every deployed logit delta.
+        global_delta = (
+            gate * raw_global_delta
+            + (1.0 - gate)
+            * self.global_delta_startup_gradient_scale
+            * (raw_global_delta - raw_global_delta.detach())
+        )
+        global_logits = reason_logits_calalign.detach() + global_delta
         evidence = factor_measurement_token.detach()
         reliability = factor_reliability.detach().clamp(0.0, 1.0)
         groundable = factor_groundable_mask.to(evidence).view(1, -1)
