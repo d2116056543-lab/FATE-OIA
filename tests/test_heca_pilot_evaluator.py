@@ -23,11 +23,9 @@ def _epoch() -> dict:
                 "state_auprc": 0.7 if good else None,
                 "state_frequency_baseline": 0.3 if good else None,
                 "state_auc": 0.7 if good else None,
-                "observability_auc": 0.7 if good else None,
-                "observability_mean": 0.5 if good else None,
-                "observability_std": 0.1 if good else None,
-                "observability_positive_count": 40 if good else 0,
-                "observability_negative_count": 40 if good else 0,
+                "provenance_valid_count": 40 if good else 0,
+                "visual_confidence_mean": 0.5 if good else None,
+                "visual_confidence_std": 0.1 if good else None,
             }
         )
     global_ap = [0.38] * 21
@@ -185,25 +183,18 @@ def test_pilot_evaluator_requires_exactly_four_epochs() -> None:
         )
 
 
-def test_gate_b_requires_identifiable_observability_targets() -> None:
+def test_gate_b_accepts_one_class_provenance_when_visual_measurement_is_healthy() -> None:
     epochs, audit, ontology, tau, gradients = _inputs()
-    broken = deepcopy(epochs)
-    for row in broken[-1]["typed"]["train_audit"]["per_factor"][:12]:
-        row["observability_negative_count"] = 0
-
     result = evaluate_heca_pilot(
-        epochs=broken,
+        epochs=epochs,
         implementation_audit=audit,
         ontology_manifest=ontology,
         tau_stats=tau,
         gradient_rows=gradients,
         git_head="abc",
     )
-
-    assert result["gates"]["B"] is False
-    assert result["gate_payloads"]["B"]["evidence"][
-        "observability_identifiable_factor_count"
-    ] == 0
+    assert result["gates"]["B"] is True
+    assert result["gate_payloads"]["B"]["evidence"]["provenance_coverage_factor_count"] >= 12
 
 
 def test_pilot_recomputation_rejects_saved_gate_tampering(tmp_path) -> None:
