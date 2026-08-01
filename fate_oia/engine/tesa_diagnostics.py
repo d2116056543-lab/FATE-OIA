@@ -415,6 +415,8 @@ def run_stratified_patch_audit(
                             "action_id": int(action),
                             "factor_id": int(factor),
                             "selection_mode": "model_top_positive_target_contribution",
+                            "selected_patch_count": int(selected.numel()),
+                            "control_patch_count": int(control.numel()),
                             "clean_action_logit": float(clean_logit),
                             "factor_contribution": float(contribution),
                             "schema_compatible": bool(allowed[action, factor]),

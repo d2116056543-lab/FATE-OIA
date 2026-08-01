@@ -151,7 +151,9 @@ def meter_reason_loss(
     rank = robust_reason_rank_loss(output["reason_logits_final"], supervision)
     soft_f1 = robust_reason_soft_f1(output["reason_logits_final"], supervision)
     correction = reason_correction_sign_loss(
-        output["reason_evidence_delta"], supervision
+        output["reason_evidence_delta"],
+        supervision,
+        margin=float(weights.get("reason_correction_margin", 0.05)),
     )
     view = output["reason_logits_final"].new_zeros(())
     if view_output is not None:
