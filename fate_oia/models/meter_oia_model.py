@@ -31,6 +31,7 @@ class METEROIAModel(nn.Module):
         action_max_delta: float = 1.0,
         action_logit_norm_cap: float = 20.0,
         action_measurement_grad_scale: float = 0.05,
+        action_allocation_logit_scale: float = 4.0,
         factor_text_prototype_path: str | None = None,
         state_text_prototype_path: str | None = None,
         **_: Any,
@@ -69,6 +70,7 @@ class METEROIAModel(nn.Module):
             rank=state_effect_rank,
             correction_fraction=action_correction_fraction,
             max_action_delta=action_max_delta,
+            allocation_logit_scale=action_allocation_logit_scale,
         )
         self.reason_decoder = METERPrivateReasonDecoder(
             dim=dim, reason_dim=reason_dim, action_dim=action_dim
@@ -200,6 +202,7 @@ class METEROIAModel(nn.Module):
             factor_reliability=reliability,
             factor_groundable_mask=factors["factor_groundable_mask"],
             progress=progress,
+            update_running_stats=update_semantic_stats,
         )
         self._component_call_counts["reason_correction"] += 1
         if "reason_correction_off" in diagnostic_modes:

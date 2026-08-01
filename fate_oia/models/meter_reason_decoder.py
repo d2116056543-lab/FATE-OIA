@@ -34,6 +34,13 @@ class METERPrivateReasonDecoder(nn.Module):
             torch.full((reason_dim,), -2.2521685)
         )
         self.max_correction = float(max_correction)
+        self.evidence_mean_momentum = 0.95
+        self.register_buffer(
+            "running_evidence_mean", torch.zeros(reason_dim), persistent=True
+        )
+        self.register_buffer(
+            "evidence_mean_updates", torch.zeros((), dtype=torch.long), persistent=True
+        )
 
     def initialize_from_foundation(self, foundation: nn.Module) -> None:
         # The complete foundation predictor remains the explicit anchor. HECA
@@ -51,6 +58,7 @@ class METERPrivateReasonDecoder(nn.Module):
         factor_reliability: Tensor,
         factor_groundable_mask: Tensor,
         progress: float = 1.0,
+        update_running_stats: bool = False,
         **_: Tensor,
     ) -> dict[str, Tensor]:
         # The CalAlign predictor is a fixed reason anchor. ``reason_nodes``
@@ -73,6 +81,20 @@ class METERPrivateReasonDecoder(nn.Module):
         reliability = factor_reliability.detach().clamp(0.0, 1.0)
         groundable = factor_groundable_mask.to(evidence).view(1, -1)
         raw = torch.einsum("brd,rd->br", evidence, self.correction_vector)
+        if self.training and update_running_stats:
+            with torch.no_grad():
+                batch_mean = raw.detach().float().mean(0).to(self.running_evidence_mean)
+                if int(self.evidence_mean_updates) == 0:
+                    self.running_evidence_mean.copy_(batch_mean)
+                else:
+                    self.running_evidence_mean.mul_(self.evidence_mean_momentum).add_(
+                        batch_mean * (1.0 - self.evidence_mean_momentum)
+                    )
+                self.evidence_mean_updates.add_(1)
+        # CalAlign owns static label-level calibration. The private residual
+        # therefore carries only sample-relative factor evidence, which can
+        # improve ranking instead of learning a duplicate threshold shift.
+        centered_raw = raw - self.running_evidence_mean.detach().to(raw)
         kappa = torch.nn.functional.softplus(self.correction_kappa_raw).clamp(
             0.02, self.max_correction
         )
@@ -80,7 +102,7 @@ class METERPrivateReasonDecoder(nn.Module):
             groundable
             * reliability
             * kappa.view(1, -1)
-            * torch.tanh(raw / kappa.view(1, -1).clamp_min(1e-6))
+            * torch.tanh(centered_raw / kappa.view(1, -1).clamp_min(1e-6))
         )
         ramp = heca_credit_ramp(progress)
         final = global_logits + ramp * correction
@@ -91,6 +113,8 @@ class METERPrivateReasonDecoder(nn.Module):
             "reason_view_embedding": reason_nodes,
             "reason_logits_global": global_logits,
             "reason_evidence_delta": correction,
+            "reason_evidence_centered": centered_raw,
+            "reason_evidence_running_mean": self.running_evidence_mean.detach(),
             "reason_logits_final": final,
             "reason_correction_kappa": kappa,
             "reason_groundable_mask": groundable.squeeze(0),
