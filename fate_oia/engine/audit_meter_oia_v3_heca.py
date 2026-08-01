@@ -80,7 +80,18 @@ def _source_checks(root: Path, config: dict[str, Any]) -> dict[str, Any]:
     forbidden = {name: token in active for name, token in forbidden_tokens.items()}
     protocol = {
         "epochs_14": int(config["training"]["epochs"]) == 14,
-        "batch_accum_6x5": int(config["training"]["batch_size"]) == 6 and int(config["training"]["gradient_accumulation_steps"]) == 5,
+        "memory_safe_effective_batch_4x8": (
+            int(config["training"]["batch_size"]) == 4
+            and int(config["training"]["gradient_accumulation_steps"]) == 8
+            and int(config["training"]["effective_batch_size"]) == 32
+        ),
+        "single_backward_next_window_balance": (
+            config["training"].get("shared_gradient_policy") == "next_window_single_backward"
+            and "shared_action_grads" not in active
+            and "shared_reason_grads" not in active
+            and "shared_action_gradient_scale=active_balance[\"action\"]" in active
+            and "shared_reason_gradient_scale=active_balance[\"reason\"]" in active
+        ),
         "bf16": str(config["training"]["precision"]).lower() == "bf16",
         "test_only": config["runtime"]["test_only"] is True,
         "no_cache": config["model"]["feature_cache_enabled"] is False,

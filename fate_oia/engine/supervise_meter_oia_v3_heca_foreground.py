@@ -12,7 +12,9 @@ from fate_oia.engine.evaluate_meter_oia_v3_heca_pilot import (
 )
 
 
-FALLBACK_LADDER = ((6, 5), (5, 6), (4, 8), (3, 10), (2, 15))
+# Gate G rejected 6x5 and 5x6 on the 48 GB target. Every fallback is a
+# pre-probed memory-safe configuration; no supervisor invocation can regress.
+FALLBACK_LADDER = ((4, 8), (3, 10), (2, 15))
 
 
 def _git(*args: str) -> str:
@@ -80,8 +82,8 @@ def main() -> None:
     parser.add_argument("--config", required=True)
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--batch_size", type=int, default=6)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=5)
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--review_pass", required=True)
     parser.add_argument("--pilot_pass", required=True)
@@ -89,7 +91,12 @@ def main() -> None:
     args = parser.parse_args()
     validate_training_readiness(args.review_pass, args.pilot_pass, args.gate_c_pass)
     requested = (args.batch_size, args.gradient_accumulation_steps)
-    ladder = [requested, *(item for item in FALLBACK_LADDER if item != requested)]
+    if requested != FALLBACK_LADDER[0]:
+        raise ValueError(
+            "HECA full training must start at the Gate-G-approved 4x8 setting; "
+            "the supervisor alone may select the pre-probed OOM fallbacks"
+        )
+    ladder = list(FALLBACK_LADDER)
     resume = ""
     for batch, accum in ladder:
         completed = subprocess.run(_command(args, batch, accum, resume), check=False)
