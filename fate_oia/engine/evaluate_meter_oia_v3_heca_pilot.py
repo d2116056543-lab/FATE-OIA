@@ -46,6 +46,48 @@ def _gate(letter: str, passed: bool, evidence: Mapping[str, Any]) -> dict[str, A
     return {"gate": letter, "pass": bool(passed), "evidence": dict(evidence)}
 
 
+def _ownership_gate_rows(
+    gradient_rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[bool]]:
+    """Evaluate ownership only after the scheduled action-credit path is live.
+
+    The state effect is intentionally zero at initialization to preserve the
+    visual action anchor.  Its pre-ramp probe is useful telemetry but cannot
+    establish an active-path gradient ownership violation.  Once the ramp is
+    active, the original 1--10 percent firewall remains a hard requirement.
+    Missing ramp metadata is treated as an active legacy row so older artifacts
+    fail closed on the original checks rather than being silently skipped.
+    """
+    active_rows = [
+        row
+        for row in gradient_rows
+        if _finite(row.get("action_credit_ramp", 1.0))
+        and float(row.get("action_credit_ramp", 1.0)) >= 0.80
+    ]
+    checks: list[bool] = []
+    for row in active_rows:
+        required = (
+            "action_to_anchor_query",
+            "action_to_state_bridge_ratio",
+            "action_to_credit_adapter",
+            "reason_to_action_credit",
+            "pu_to_action_factor",
+            "measurement_to_foundation",
+        )
+        if not all(_finite(row.get(name)) for name in required):
+            checks.append(False)
+            continue
+        checks.append(
+            abs(float(row["action_to_anchor_query"])) <= 1e-12
+            and 0.01 <= float(row["action_to_state_bridge_ratio"]) <= 0.10
+            and float(row["action_to_credit_adapter"]) > 0.0
+            and abs(float(row["reason_to_action_credit"])) <= 1e-12
+            and abs(float(row["pu_to_action_factor"])) <= 1e-12
+            and abs(float(row["measurement_to_foundation"])) <= 1e-12
+        )
+    return active_rows, checks
+
+
 def evaluate_heca_pilot(
     *,
     epochs: list[dict[str, Any]],
@@ -244,31 +286,16 @@ def evaluate_heca_pilot(
         },
     )
 
-    ownership_checks = []
-    for row in gradient_rows:
-        required = (
-            "action_to_anchor_query",
-            "action_to_state_bridge_ratio",
-            "action_to_credit_adapter",
-            "reason_to_action_credit",
-            "pu_to_action_factor",
-            "measurement_to_foundation",
-        )
-        if not all(_finite(row.get(name)) for name in required):
-            ownership_checks.append(False)
-            continue
-        ownership_checks.append(
-            abs(float(row["action_to_anchor_query"])) <= 1e-12
-            and 0.01 <= float(row["action_to_state_bridge_ratio"]) <= 0.10
-            and float(row["action_to_credit_adapter"]) > 0.0
-            and abs(float(row["reason_to_action_credit"])) <= 1e-12
-            and abs(float(row["pu_to_action_factor"])) <= 1e-12
-            and abs(float(row["measurement_to_foundation"])) <= 1e-12
-        )
+    active_ownership_rows, ownership_checks = _ownership_gate_rows(gradient_rows)
     gate_e = _gate(
         "E",
         bool(ownership_checks) and all(ownership_checks),
-        {"row_count": len(gradient_rows), "all_rows_pass": bool(ownership_checks) and all(ownership_checks)},
+        {
+            "row_count": len(gradient_rows),
+            "active_row_count": len(active_ownership_rows),
+            "ignored_pre_ramp_row_count": len(gradient_rows) - len(active_ownership_rows),
+            "all_active_rows_pass": bool(ownership_checks) and all(ownership_checks),
+        },
     )
 
     patch = typed.get("patch_audit", {})

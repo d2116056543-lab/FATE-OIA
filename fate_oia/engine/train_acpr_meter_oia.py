@@ -1389,6 +1389,14 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                         {
                             "epoch": epoch,
                             "optimizer_step": optimizer_step,
+                            "action_credit_ramp": float(
+                                output["action_credit_ramp"].detach()
+                            ),
+                            "action_state_effect_norm": float(
+                                model.action_transport.state_effect_embedding.detach()
+                                .float()
+                                .norm()
+                            ),
                             "shared_action_weight": active_balance["action"],
                             "shared_reason_weight": active_balance["reason"],
                             "next_shared_action_weight": next_balance["action"],
