@@ -71,6 +71,63 @@ def test_credit_rank_focuses_visual_misrankings_without_moving_easy_pairs() -> N
     assert harmful.grad is not None and harmful.grad.abs().sum() > 0
 
 
+def test_credit_rank_uses_the_deployed_raw_residual_not_a_second_normalization() -> None:
+    visual = torch.tensor([[0.0], [-0.05]])
+    target = torch.tensor([[1.0], [0.0]])
+    # A raw residual of 0.10 only closes the deployed gap to 0.15.  Dividing it
+    # by kappa and applying tanh would incorrectly make the pair look solved.
+    delta = torch.tensor([[0.05], [-0.05]], requires_grad=True)
+
+    loss = action_delta_pairwise_ranking_loss(
+        delta,
+        target,
+        visual_logits=visual,
+        normalizer=torch.tensor(0.10),
+        margin=0.20,
+    )
+    loss.backward()
+
+    assert torch.isclose(loss, torch.tensor(0.05))
+    assert delta.grad is not None and delta.grad.abs().sum() > 0
+
+
+def test_credit_rank_excludes_easy_visual_pairs_from_the_residual_gradient() -> None:
+    visual = torch.tensor([[0.60], [-0.60]])
+    target = torch.tensor([[1.0], [0.0]])
+    # The residual is harmful, but this pair was already comfortably separated
+    # by the visual anchor and must not consume the hard-pair learning budget.
+    delta = torch.tensor([[-1.0], [1.0]], requires_grad=True)
+
+    loss = action_delta_pairwise_ranking_loss(
+        delta, target, visual_logits=visual, margin=0.10
+    )
+    loss.backward()
+
+    assert loss.eq(0)
+    assert delta.grad is None or delta.grad.eq(0).all()
+
+
+def test_nonregression_protects_a_correct_negative_at_the_inclusive_zero_threshold() -> None:
+    target = torch.tensor([[0.0, 0.0, 0.0]])
+    visual = torch.tensor([[-0.20, -0.10, -0.30]], requires_grad=True)
+    # Evaluation treats sigmoid(0) as positive.  A correct negative therefore
+    # needs positive final margin, rather than merely non-negative margin.
+    delta = torch.tensor([[0.0, 0.10, 0.0]], requires_grad=True)
+
+    loss = action_nonregression_loss(
+        visual,
+        delta,
+        target,
+        min_margin=0.05,
+        confidence_quantile=1.0,
+    )
+    loss.backward()
+
+    assert loss.item() > 0.0
+    assert visual.grad is None or visual.grad.eq(0).all()
+    assert delta.grad is not None and delta.grad.abs().sum() > 0
+
+
 def test_nonregression_guards_correct_near_boundary_predictions() -> None:
     target = torch.tensor([[1.0, 0.0]])
     visual = torch.tensor([[0.01, -0.01]], requires_grad=True)

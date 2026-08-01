@@ -49,10 +49,10 @@ def action_delta_pairwise_ranking_loss(
     if hard_temperature <= 0.0:
         raise ValueError("hard_temperature must be positive")
     delta = action_evidence_delta
-    if normalizer is not None:
-        scale = normalizer.detach().to(delta)
-        delta = delta / scale.clamp_min(1e-6)
-    delta = torch.tanh(delta)
+    # `action_logits_final` deploys the raw bounded residual directly.  The
+    # legacy kappa argument remains accepted for checkpoint/config compatibility
+    # but must not re-scale the objective into a different logit space.
+    del normalizer
     visual = torch.zeros_like(delta) if visual_logits is None else visual_logits.detach()
     if visual.shape != delta.shape:
         raise ValueError("visual_logits must match action_evidence_delta")
@@ -70,14 +70,16 @@ def action_delta_pairwise_ranking_loss(
                 corrected[positive, action_id, None]
                 - corrected[negative, action_id]
             )
-            # Misranked and close pairs get the learning budget. Easy visual
-            # pairs remain an anchor rather than a target for a global shift.
-            hard_weight = torch.sigmoid(
-                (float(margin) - visual_gap) / float(hard_temperature)
-            ).detach()
-            hinge = torch.relu(float(margin) - corrected_gap)
-            terms.append((hard_weight * hinge).sum() / hard_weight.sum().clamp_min(1e-6))
-    return torch.stack(terms).mean() if terms else delta.new_zeros(())
+            # Only pairs already misranked or inside the visual margin receive
+            # residual credit. This prevents a harmful residual from spending
+            # budget on an already-easy visual pair and becoming a label bias.
+            hard_pair = visual_gap < float(margin)
+            if bool(hard_pair.any()):
+                hinge = torch.relu(float(margin) - corrected_gap[hard_pair])
+                terms.append(hinge.mean())
+    # Keep the zero connected to the residual so an all-easy batch is a valid
+    # no-op backward pass with exactly zero action-credit gradient.
+    return torch.stack(terms).mean() if terms else delta.sum() * 0.0
 
 
 def action_nonregression_loss(
@@ -130,8 +132,12 @@ def action_nonregression_loss(
     # boundary and high-confidence guards already cover their own rows, so the
     # extra term applies only to the former middle-confidence gap.
     middle = correct_visual & ~boundary_mask & ~mask
+    # Fixed-threshold evaluation predicts positive at logit zero. Keep a small
+    # strictly-positive buffer so correct negative middle-margin rows cannot
+    # silently cross that inclusive decision boundary.
+    fixed_threshold_buffer = final_margin.new_tensor(1e-4)
     sign_guard = (
-        torch.relu(-final_margin)[middle].mean()
+        torch.relu(fixed_threshold_buffer - final_margin)[middle].mean()
         if bool(middle.any())
         else action_evidence_delta.new_zeros(())
     )
