@@ -414,6 +414,9 @@ class METERTypedTargetBuilder:
             "factor_present_valid": present_valid,
             "factor_absent_valid": absent_valid,
             "factor_source_complete": source_complete,
+            # Static train-time weak-source eligibility.  This must never be
+            # consumed as a visual classification target or test-forward input.
+            "factor_provenance_valid": observability_valid,
             "factor_observability": observability,
             "factor_observability_valid": observability_valid,
             "factor_source_weight": source_weight,
