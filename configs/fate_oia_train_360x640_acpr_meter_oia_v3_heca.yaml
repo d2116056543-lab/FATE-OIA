@@ -94,7 +94,7 @@ training:
   lr_measurement: 0.00020
   lr_action_credit: 0.00020
   lr_reason_global: 0.00020
-  lr_reason_correction: 0.00040
+  lr_reason_correction: 0.00065
 
 loss_weights:
   action_final: 1.00
@@ -103,14 +103,18 @@ loss_weights:
   action_necessity: 0.05
   action_specificity: 0.05
   action_nonreg: 0.05
-  action_soft_f1: 0.03
+  action_soft_f1: 0.06
   action_cardinality: 0.02
   action_logit_scale: 0.01
+  action_nonreg_min_margin: 0.05
+  action_nonreg_confidence_quantile: 0.75
+  action_nonreg_boundary_margin: 0.02
   reason_final: 1.00
   reason_global: 0.50
   reason_rank: 0.08
   reason_soft_f1: 0.05
-  reason_correction_sign: 0.08
+  reason_correction_sign: 0.14
+  reason_correction_margin: 0.08
   reason_view_consistency: 0.05
   anchor: 0.05
   state: 0.08
@@ -152,3 +156,6 @@ evaluation:
   cheap_diagnostics_each_epoch: [factor_off, state_uniform, reason_correction_off]
   patch_deletion_interval_epochs: 4
   patch_audit_max_unique: 128
+  # Selected and geometry-matched control regions always delete the same area.
+  patch_audit_patches_per_factor: 24
+  patch_audit_factors_per_action: 2

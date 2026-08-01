@@ -1615,6 +1615,16 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                     int(config.get("evaluation", {}).get("patch_audit_max_unique", 128)),
                     len(split["audit"]),
                 ),
+                patches_per_factor=int(
+                    config.get("evaluation", {}).get(
+                        "patch_audit_patches_per_factor", 12
+                    )
+                ),
+                factors_per_action=int(
+                    config.get("evaluation", {}).get(
+                        "patch_audit_factors_per_action", 2
+                    )
+                ),
                 previous_sample_ids=cumulative_patch_ids,
             )
             cumulative_patch_ids.update(patch_audit.get("sample_ids", []))

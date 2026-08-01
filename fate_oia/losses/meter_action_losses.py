@@ -61,23 +61,40 @@ def action_nonregression_loss(
     *,
     min_margin: float = 0.05,
     confidence_quantile: float = 0.75,
+    boundary_margin: float = 0.02,
 ) -> Tensor:
-    """Protect the correct visual anchor without updating that anchor itself."""
+    """Protect both confident and correct near-boundary visual decisions.
+
+    The high-confidence term preserves the visual margin.  The boundary term
+    prevents the evidence residual from turning an already-correct fixed-zero
+    decision into the wrong class, while still allowing it to repair visual
+    errors.  Both terms use a detached visual anchor, so gradients remain
+    confined to the action evidence route.
+    """
     if not 0.0 <= float(confidence_quantile) <= 1.0:
         raise ValueError("confidence_quantile must be in [0, 1]")
+    if float(boundary_margin) < 0.0:
+        raise ValueError("boundary_margin must be non-negative")
     sign = target * 2.0 - 1.0
     visual_margin = sign * visual_logits.detach()
+    final_margin = visual_margin + sign * action_evidence_delta
+    correct_visual = visual_margin >= 0.0
+    boundary = (
+        torch.relu(float(boundary_margin) - final_margin)[correct_visual].mean()
+        if bool(correct_visual.any())
+        else action_evidence_delta.new_zeros(())
+    )
     eligible = visual_margin >= float(min_margin)
     if not bool(eligible.any()):
-        return action_evidence_delta.new_zeros(())
+        return boundary
     threshold = torch.quantile(
         visual_margin[eligible].detach(), float(confidence_quantile)
     ).clamp_min(float(min_margin))
     mask = visual_margin >= threshold
     if not bool(mask.any()):
         return action_evidence_delta.new_zeros(())
-    final_margin = visual_margin + sign * action_evidence_delta
-    return torch.relu(visual_margin - final_margin)[mask].mean()
+    confident = torch.relu(visual_margin - final_margin)[mask].mean()
+    return confident + boundary
 
 
 def meter_action_loss(
@@ -101,7 +118,14 @@ def meter_action_loss(
         (contribution.abs().mean(-1) * (1.0 - target)).mean(),
     )
     nonreg = action_nonregression_loss(
-        output["action_logits_visual"], output["action_evidence_delta"], target
+        output["action_logits_visual"],
+        output["action_evidence_delta"],
+        target,
+        min_margin=float(weights.get("action_nonreg_min_margin", 0.05)),
+        confidence_quantile=float(
+            weights.get("action_nonreg_confidence_quantile", 0.75)
+        ),
+        boundary_margin=float(weights.get("action_nonreg_boundary_margin", 0.02)),
     )
     soft_f1 = soft_f1_loss(output["action_logits_final"], target)
     cardinality = F.smooth_l1_loss(
