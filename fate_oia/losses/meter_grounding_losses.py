@@ -329,21 +329,13 @@ def meter_grounding_loss(
     null = null_partition_calibration_loss(
         output["factor_null_mass"], present_valid, absent_valid, source
     )
-    tau = (
-        output.get("factor_observability_tau")
-        if observability_tau is None
-        else observability_tau
-    )
-    if tau is None or not bool(torch.isfinite(tau).all()):
-        raise ValueError("HECA requires factor-specific train-main observability tau")
-    tau = tau.to(source)
-    obs_bce, obs_coverage = observability_objective(
-        output["factor_observability_logit"],
-        targets["factor_observability"],
-        targets["factor_observability_valid"],
-        source,
-        tau,
-    )
+    # `observability_tau` remains an ignored compatibility argument for older
+    # callers/checkpoints. Provenance marks which weak-source supervision is
+    # usable during training.
+    # It is not a visual target: with source-complete BDD100K records it is
+    # frequently one-class, hence a BCE would only train a source-file detector.
+    zero = output["factor_anchor_map"].new_zeros(())
+    obs_bce, obs_coverage = zero, zero
     discrimination, mirror = discrimination_and_mirror_loss(
         output,
         targets,

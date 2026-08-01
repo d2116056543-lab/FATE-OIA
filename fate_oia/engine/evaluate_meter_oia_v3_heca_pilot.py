@@ -81,26 +81,20 @@ def evaluate_heca_pilot(
 
     per_factor = typed.get("train_audit", {}).get("per_factor", [])
     quality_ids = []
-    observability_identifiable_ids = []
+    provenance_coverage_ids = []
     for row in per_factor if isinstance(per_factor, list) else []:
         if not isinstance(row, dict):
             continue
-        observability_positive_count = int(row.get("observability_positive_count", 0))
-        observability_negative_count = int(row.get("observability_negative_count", 0))
-        observability_identifiable = (
-            observability_positive_count >= 20
-            and observability_negative_count >= 20
-        )
-        if observability_identifiable:
-            observability_identifiable_ids.append(int(row.get("factor_id", -1)))
+        provenance_valid_count = int(row.get("provenance_valid_count", 0))
+        if provenance_valid_count >= 20:
+            provenance_coverage_ids.append(int(row.get("factor_id", -1)))
         values = (
             row.get("same_type_margin"),
             row.get("state_auprc"),
             row.get("state_frequency_baseline"),
             row.get("state_auc"),
-            row.get("observability_auc"),
-            row.get("observability_mean"),
-            row.get("observability_std"),
+            row.get("visual_confidence_mean"),
+            row.get("visual_confidence_std"),
         )
         if (
             int(row.get("source_count", 0)) > 0
@@ -109,32 +103,30 @@ def evaluate_heca_pilot(
             and float(row["state_auprc"]) > float(row["state_frequency_baseline"])
             and float(row["state_auc"]) > 0.5
             and float(row["state_auc"]) > float(row["state_frequency_baseline"])
-            and observability_identifiable
-            and float(row["observability_auc"]) > 0.5
-            and float(row["observability_std"]) > 0.01
+            and provenance_valid_count >= 20
+            and float(row["visual_confidence_std"]) > 0.01
         ):
             quality_ids.append(int(row["factor_id"]))
-    tau = tau_stats.get("tau", [])
-    tau_specific = (
+    provenance_counts = tau_stats.get(
+        "provenance_valid_count", tau_stats.get("valid_count", [])
+    )
+    provenance_stats_valid = (
         tau_stats.get("source_split") == "train_main"
-        and isinstance(tau, list)
-        and len(tau) == 21
-        and all(_finite(value) and 0.05 <= float(value) <= 0.95 for value in tau)
-        and max(float(value) for value in tau) - min(float(value) for value in tau) > 1e-6
+        and isinstance(provenance_counts, list)
+        and len(provenance_counts) == 21
+        and all(_finite(value) and float(value) >= 0.0 for value in provenance_counts)
     )
     gate_b = _gate(
         "B",
         len(quality_ids) >= 12
-        and tau_specific
+        and provenance_stats_valid
         and ontology_manifest.get("factor_count") == 21,
         {
             "quality_factor_ids": quality_ids,
             "quality_factor_count": len(quality_ids),
-            "observability_identifiable_factor_ids": observability_identifiable_ids,
-            "observability_identifiable_factor_count": len(
-                observability_identifiable_ids
-            ),
-            "factor_specific_tau": tau_specific,
+            "provenance_coverage_factor_ids": provenance_coverage_ids,
+            "provenance_coverage_factor_count": len(provenance_coverage_ids),
+            "provenance_stats_valid": provenance_stats_valid,
         },
     )
 

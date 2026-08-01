@@ -106,8 +106,7 @@ def _inputs() -> tuple[list[dict], dict, dict, dict, list[dict]]:
     }
     tau = {
         "source_split": "train_main",
-        "alpha": 20.0,
-        "tau": [0.10 + index * 0.01 for index in range(21)],
+        "provenance_valid_count": [40] * 21,
     }
     gradients = [
         {

@@ -475,7 +475,6 @@ def _compute_losses(
         grounding = meter_grounding_loss(
             output,
             batch["meter_grounding"],
-            observability_tau=output["factor_observability_tau"],
             mirrored_output=mirror_output if view_kind == "mirror" else None,
             mirror_pairs=model.typed_factors.mirror_pairs,
             weights=config["loss_weights"],
@@ -724,8 +723,8 @@ def _typed_factor_audit(
     wrong_score: list[list[float]] = [[] for _ in range(21)]
     state_probability: list[list[float]] = [[] for _ in range(21)]
     state_target: list[list[float]] = [[] for _ in range(21)]
-    observability: list[list[float]] = [[] for _ in range(21)]
-    observability_target: list[list[float]] = [[] for _ in range(21)]
+    visual_confidence: list[list[float]] = [[] for _ in range(21)]
+    provenance_valid_count = [0] * 21
     state_confusion = torch.zeros(21, 3, 3, dtype=torch.long)
     source_count = [0] * 21
     mirror_margin: list[list[float]] = [[] for _ in range(21)]
@@ -747,7 +746,9 @@ def _typed_factor_audit(
         for factor in range(21):
             valid_anchor = target["factor_anchor_valid"][:, factor].bool()
             valid_state = target["factor_state_valid"][:, factor].bool()
-            valid_obs = target["factor_observability_valid"][:, factor].bool()
+            valid_provenance = target.get(
+                "factor_provenance_valid", target["factor_observability_valid"]
+            )[:, factor].bool()
             if bool(valid_anchor.any()):
                 score = (
                     predicted_anchor[:, factor] * target_anchor[:, factor]
@@ -777,14 +778,10 @@ def _typed_factor_audit(
                     .cpu()
                     .tolist()
                 )
-            if bool(valid_obs.any()):
-                observability[factor].extend(
-                    output["factor_observability"][valid_obs, factor]
-                    .cpu()
-                    .tolist()
-                )
-                observability_target[factor].extend(
-                    target["factor_observability"][valid_obs, factor]
+            if bool(valid_provenance.any()):
+                provenance_valid_count[factor] += int(valid_provenance.sum())
+                visual_confidence[factor].extend(
+                    output["factor_visual_confidence"][valid_provenance, factor]
                     .cpu()
                     .tolist()
                 )
@@ -792,8 +789,7 @@ def _typed_factor_audit(
     for factor in range(21):
         state_p = torch.tensor(state_probability[factor])
         state_y = torch.tensor(state_target[factor])
-        obs_p = torch.tensor(observability[factor])
-        obs_y = torch.tensor(observability_target[factor])
+        confidence_p = torch.tensor(visual_confidence[factor])
         rows.append(
             {
                 "factor_id": factor,
@@ -828,24 +824,14 @@ def _typed_factor_audit(
                     binary_roc_auc(state_p, state_y) if state_p.numel() else None
                 ),
                 "state_confusion_matrix": state_confusion[factor].tolist(),
-                "observability_auc": (
-                    binary_roc_auc(obs_p, obs_y) if obs_p.numel() else None
+                "provenance_valid_count": provenance_valid_count[factor],
+                "visual_confidence_mean": (
+                    float(confidence_p.mean()) if confidence_p.numel() else None
                 ),
-                "observability_positive_count": (
-                    int(obs_y.sum().item()) if obs_y.numel() else 0
+                "visual_confidence_std": (
+                    float(confidence_p.std(unbiased=False)) if confidence_p.numel() else None
                 ),
-                "observability_negative_count": (
-                    int(obs_y.numel() - obs_y.sum().item()) if obs_y.numel() else 0
-                ),
-                "observability_target_rate": (
-                    float(obs_y.mean()) if obs_y.numel() else None
-                ),
-                "observability_mean": (
-                    float(obs_p.mean()) if obs_p.numel() else None
-                ),
-                "observability_std": (
-                    float(obs_p.std(unbiased=False)) if obs_p.numel() else None
-                ),
+                "observability_visually_unidentifiable": True,
                 "mirror_equivariance": (
                     sum(mirror_margin[factor]) / len(mirror_margin[factor])
                     if mirror_margin[factor]
@@ -1005,16 +991,11 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
     )
     prototype_factor_path = config["model"].get("factor_text_prototype_path")
     prototype_state_path = config["model"].get("state_text_prototype_path")
-    tau_path = config["model"].get("observability_tau_path")
+    provenance_stats_path = config["model"].get("provenance_stats_path")
     if not args.use_mock_dino:
-        for required in (prototype_factor_path, prototype_state_path, tau_path):
+        for required in (prototype_factor_path, prototype_state_path, provenance_stats_path):
             if not required or not Path(required).exists():
                 raise FileNotFoundError(f"Missing formal HECA static artifact: {required}")
-    observability_tau = (
-        torch.load(tau_path, map_location="cpu", weights_only=True)
-        if tau_path and Path(tau_path).exists()
-        else None
-    )
     model = METEROIAModel(
         dim=int(config["model"]["dim"]),
         action_dim=int(config["model"]["action_dim"]),
@@ -1049,7 +1030,6 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
             if prototype_state_path and Path(prototype_state_path).exists()
             else None
         ),
-        observability_tau=observability_tau,
     ).to(device)
     initialization: dict[str, Any] | None = None
     if args.init_model_checkpoint:
@@ -1462,8 +1442,8 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                     output["action_emergency_cap_active"].float().mean().detach()
                 ),
                 "factor_null_mean": float(output["factor_null_mass"].mean().detach()),
-                "factor_observability_mean": float(
-                    output["factor_observability"].mean().detach()
+                "factor_visual_confidence_mean": float(
+                    output["factor_visual_confidence"].mean().detach()
                 ),
                 "loss_wiring": parts["loss_registry"].artifact(),
             }
@@ -1559,8 +1539,8 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
         mechanism.update(
             {
                 "diagnostic_due": diagnostic_due,
-                "factor_observability_mean": sum(
-                    row["factor_observability_mean"] for row in epoch_rows
+                "factor_visual_confidence_mean": sum(
+                    row["factor_visual_confidence_mean"] for row in epoch_rows
                 ) / max(len(epoch_rows), 1),
                 "action_correction_rms_ratio_mean": [
                     sum(row["action_correction_rms_ratio"][action] for row in epoch_rows)

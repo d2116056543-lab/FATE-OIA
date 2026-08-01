@@ -17,6 +17,7 @@ def test_reliability_is_visual_confidence_not_learned_source_availability() -> N
     torch.testing.assert_close(output["factor_visual_confidence"], expected.clamp(0, 1))
     torch.testing.assert_close(output["factor_reliability"], expected.clamp(0, 1))
     assert not hasattr(head, "obs_head")
+    assert "factor_observability_tau" not in output
 
 
 def test_typed_targets_expose_provenance_without_claiming_visual_label() -> None:
@@ -34,4 +35,7 @@ def test_typed_targets_expose_provenance_without_claiming_visual_label() -> None
 
     assert target["factor_provenance_valid"][5]
     assert target["factor_provenance_valid"][6]
-    assert "factor_observability" not in target
+    # Deprecated aliases may remain for old artifact readers, but they are the
+    # same static provenance bit and are never a learned model target.
+    assert target["factor_observability_valid"][5]
+    assert target["factor_observability"][5].item() == 1.0

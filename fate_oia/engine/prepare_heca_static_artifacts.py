@@ -39,6 +39,13 @@ def build_tau_from_train_main(
         "alpha": 20.0,
         "observed_count": observed.tolist(),
         "valid_count": valid.tolist(),
+        # This is source eligibility for train-time weak supervision, not a
+        # target that the image model is allowed to predict at test time.
+        "provenance_valid_count": valid.tolist(),
+        "provenance_semantics": "train_only_weak_source_eligibility",
+        # Kept solely for legacy artifact readers; this statistic is never
+        # loaded by METEROIAModel or used as a learning/calibration threshold.
+        "legacy_tau_not_used_for_model": True,
         "tau": tau.tolist(),
     }
     return tau, metadata
@@ -78,6 +85,9 @@ def main() -> None:
     output.mkdir(parents=True, exist_ok=True)
     torch.save(tau, output / "factor_observability_tau.pt")
     (output / "factor_source_statistics.json").write_text(
+        json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    (output / "factor_provenance_stats.json").write_text(
         json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8"
     )
     (output / "factor_observability_tau_metadata.json").write_text(

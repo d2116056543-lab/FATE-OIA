@@ -51,7 +51,6 @@ class TypedEvidenceStateHead(nn.Module):
         schema_path: str | None = None,
         anchor_exploration_mass: float = 0.05,
         action_measurement_grad_scale: float = 0.05,
-        observability_tau: Tensor | None = None,
         factor_text_prototype_path: str | None = None,
         state_text_prototype_path: str | None = None,
     ) -> None:
@@ -135,18 +134,10 @@ class TypedEvidenceStateHead(nn.Module):
             torch.randn(factor_dim, self.max_states, dim * 3) * 0.02
         )
         self.state_bias = nn.Parameter(torch.zeros(factor_dim, self.max_states))
-        self.obs_head = nn.Parameter(torch.randn(factor_dim, dim * 2 + 2) * 0.02)
-        self.obs_bias = nn.Parameter(torch.zeros(factor_dim))
         self.typed_norm = nn.LayerNorm(dim)
         self.action_route_norm = nn.LayerNorm(dim)
         self.action_value_norm = nn.LayerNorm(dim)
         self.action_bridge_proj = nn.Linear(dim * 3, dim)
-        tau = (
-            torch.full((factor_dim,), float("nan"), dtype=torch.float32)
-            if observability_tau is None
-            else observability_tau.detach().float().reshape(factor_dim)
-        )
-        self.register_buffer("factor_observability_tau", tau, persistent=True)
         self.schema_sha256 = schema.sha256
         self.mirror_pairs = schema.mirror_pairs
 
@@ -328,14 +319,13 @@ class TypedEvidenceStateHead(nn.Module):
         entropy_norm = entropy / self.state_cardinalities.to(
             state_prob.dtype
         ).log().clamp_min(1e-6).view(1, -1)
-        obs_input = torch.cat(
-            [global_token, anchor_token, null_mass.unsqueeze(-1), entropy.unsqueeze(-1)],
-            dim=-1,
-        )
-        obs_logit = torch.einsum("bfd,fd->bf", obs_input, self.obs_head) + self.obs_bias
-        observability = torch.sigmoid(obs_logit)
-        reliability = (
-            observability * (1.0 - null_mass) * (1.0 - entropy_norm)
+        # BDD100K source availability is a training-only provenance condition.
+        # It is not identifiable from the matched image when a factor's source
+        # label is one-class, so it must not be a learned gate in test forward.
+        # Visual confidence is instead fully determined by image-derived null
+        # evidence and state uncertainty.
+        visual_confidence = (
+            (1.0 - null_mass) * (1.0 - entropy_norm)
         ).clamp(0.0, 1.0)
         typed_token = self.compose_typed_token(
             global_token, anchor_token, state_prob
@@ -357,16 +347,20 @@ class TypedEvidenceStateHead(nn.Module):
             "factor_state_prob_action": action_state_prob,
             "factor_state_valid_mask": state_valid_mask,
             "factor_state_entropy": entropy,
-            "factor_observability_logit": obs_logit,
-            "factor_observability": observability,
-            "factor_reliability": reliability,
+            "factor_visual_confidence": visual_confidence,
+            # Compatibility aliases for legacy readers. These are derived from
+            # visual evidence only and have no learned source-availability head.
+            "factor_observability_logit": torch.logit(
+                visual_confidence.clamp(1e-6, 1.0 - 1e-6)
+            ),
+            "factor_observability": visual_confidence,
+            "factor_reliability": visual_confidence,
             "factor_typed_token": typed_token,
             "factor_action_token": action_token,
             "factor_action_value_token": action_value_token,
             "factor_action_bridge_token": action_bridge_token,
             "factor_state_prob_credit": state_prob_credit,
             "factor_measurement_token": typed_token,
-            "factor_observability_tau": self.factor_observability_tau,
             "factor_ontology_query": self.factor_semantic_query,
             "factor_ontology_target": self.factor_text_proj(self.factor_text_prototype),
             "state_ontology_query": self.state_embeddings,

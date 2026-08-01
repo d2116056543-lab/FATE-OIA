@@ -61,6 +61,12 @@ def _source_checks(root: Path, config: dict[str, Any]) -> dict[str, Any]:
     exporter = (root / "fate_oia/engine/export_heca_ontology_prototypes.py").read_text(
         encoding="utf-8"
     )
+    factor_head = (root / "fate_oia/models/meter_signed_factors.py").read_text(
+        encoding="utf-8"
+    )
+    grounding_loss = (root / "fate_oia/losses/meter_grounding_losses.py").read_text(
+        encoding="utf-8"
+    )
     pilot_script = (root / "scripts/FATE_OIA_meter_oia_v3_heca_pilot.ps1").read_text(
         encoding="utf-8"
     )
@@ -97,6 +103,18 @@ def _source_checks(root: Path, config: dict[str, Any]) -> dict[str, Any]:
         "no_cache": config["model"]["feature_cache_enabled"] is False,
         "no_compression": config["model"]["token_compression"] == "none",
         "same_forward_eval": config["runtime"]["sequential_eval"] is False,
+        "provenance_is_not_learned_visual_target": (
+            "self.obs_head" not in factor_head
+            and "obs_head =" not in factor_head
+            and "obs_bce, obs_coverage = observability_objective(" not in grounding_loss
+            and "factor_provenance_valid" not in (root / "fate_oia/models/meter_oia_model.py").read_text(encoding="utf-8")
+        ),
+        "provenance_stats_are_train_only": (
+            str(config["model"].get("provenance_stats_path", "")).endswith(
+                "factor_provenance_stats.json"
+            )
+            and "observability_tau_path" not in config["model"]
+        ),
         "offline_ontology_export": (
             "local_files_only=True" in exporter
             and "all-MiniLM-L6-v2" not in exporter
@@ -125,7 +143,7 @@ def _dynamic_checks() -> dict[str, Any]:
         uniform = model.decode_from_field(field, progress=0.5, diagnostic_modes=("state_uniform",))
     shapes = {
         key: list(clean[key].shape)
-        for key in ("action_logits_final", "reason_logits_final", "factor_anchor_map", "factor_state_prob", "action_factor_contribution")
+        for key in ("action_logits_final", "reason_logits_final", "factor_anchor_map", "factor_state_prob", "factor_visual_confidence", "action_factor_contribution")
     }
     checks = {
         "action_progress_zero_equivalence": float((clean["action_logits_final"] - clean["action_logits_visual"]).abs().max()) < 1e-6,
@@ -135,10 +153,15 @@ def _dynamic_checks() -> dict[str, Any]:
         ) < 1e-6,
         "factor_off_action_visual": torch.equal(factor_off["action_logits_final"], factor_off["action_logits_visual"]),
         "state_uniform_recomputes_values": not torch.allclose(clean["action_factor_values"], uniform["action_factor_values"]),
+        "visual_confidence_matches_reliability": torch.allclose(
+            clean["factor_visual_confidence"], clean["factor_reliability"]
+        ),
+        "visual_confidence_is_finite": bool(torch.isfinite(clean["factor_visual_confidence"]).all()),
         "one_dino_call": model._encode_call_count == 1,
         "shapes": shapes == {
             "action_logits_final": [2, 4], "reason_logits_final": [2, 21],
             "factor_anchor_map": [2, 21, 3600], "factor_state_prob": [2, 21, 3],
+            "factor_visual_confidence": [2, 21],
             "action_factor_contribution": [2, 4, 21],
         },
     }

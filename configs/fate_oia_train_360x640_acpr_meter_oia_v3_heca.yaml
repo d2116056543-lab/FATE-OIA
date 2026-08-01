@@ -51,7 +51,7 @@ model:
   state_effect_rank: 64
   factor_text_prototype_path: artifacts/heca/factor_text_prototype.pt
   state_text_prototype_path: artifacts/heca/state_text_prototype.pt
-  observability_tau_path: artifacts/heca/factor_observability_tau.pt
+  provenance_stats_path: artifacts/heca/factor_provenance_stats.json
   action_correction_fraction: 0.25
   pilot_action_correction_fraction: 0.20
   action_max_delta: 1.0

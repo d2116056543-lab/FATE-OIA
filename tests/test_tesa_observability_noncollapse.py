@@ -4,12 +4,16 @@ from fate_oia.models.meter_signed_factors import TypedEvidenceStateHead
 from tesa_helpers import typed_inputs
 
 
-def test_reliability_matches_observability_null_and_entropy() -> None:
+def test_reliability_matches_visual_confidence_from_null_and_entropy() -> None:
     nodes, patches = typed_inputs()
-    out = TypedEvidenceStateHead(dim=32)(nodes, patches)
-    cardinality = torch.full((1, 21), 3.0)
-    expected = out["factor_observability"] * (1 - out["factor_null_mass"]) * (
-        1 - out["factor_state_entropy"] / cardinality.log()
+    head = TypedEvidenceStateHead(dim=32)
+    out = head(nodes, patches)
+    cardinality = head.state_cardinalities.to(out["factor_state_entropy"])
+    expected = (1 - out["factor_null_mass"]) * (
+        1 - out["factor_state_entropy"] / cardinality.log().view(1, -1)
     )
     torch.testing.assert_close(out["factor_reliability"], expected.clamp(0, 1))
-    assert out["factor_observability"].std() > 0
+    torch.testing.assert_close(out["factor_visual_confidence"], expected.clamp(0, 1))
+    torch.testing.assert_close(
+        out["factor_observability"], out["factor_visual_confidence"]
+    )
