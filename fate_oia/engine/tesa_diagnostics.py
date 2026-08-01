@@ -71,6 +71,45 @@ def select_target_supporting_factors(
     return [int(index) for index in torch.topk(values, k=count).indices.tolist()]
 
 
+def select_coverage_stratified_supporting_factors(
+    contribution: Tensor,
+    eligible: Tensor,
+    *,
+    factors_per_action: int,
+    execution_counts: dict[int, int],
+) -> list[int]:
+    """Keep a model-top deletion and reserve remaining slots for coverage.
+
+    The audit cannot claim factor coverage if every sample repeats its two
+    largest factors. The primary slot remains the model's strongest positive
+    contribution; additional slots are selected only from source-valid,
+    positive contributions and prioritise factors with the fewest executed
+    deletions. This changes audit sampling only, never the model route.
+    """
+    top = select_target_supporting_factors(
+        contribution, eligible, factors_per_action=factors_per_action
+    )
+    if len(top) <= 1 or factors_per_action <= 1:
+        return top
+
+    supporting = eligible.to(torch.bool) & (contribution > 0)
+    remaining = [
+        int(index)
+        for index in torch.where(supporting)[0].tolist()
+        if int(index) not in top[:1]
+    ]
+    # First preserve the strongest model-selected factor. Then prefer an
+    # unexecuted source-valid factor; contribution only breaks coverage ties.
+    remaining.sort(
+        key=lambda index: (
+            int(execution_counts.get(index, 0)),
+            -float(contribution[index].detach()),
+            index,
+        )
+    )
+    return top[:1] + remaining[: max(0, int(factors_per_action) - 1)]
+
+
 def schema_token_mismatch(token: Tensor) -> Tensor:
     return torch.roll(token, shifts=-1, dims=1)
 
@@ -317,6 +356,7 @@ def run_stratified_patch_audit(
     eligible_factor_coverage: set[int] = set()
     requested_factor_coverage: set[int] = set()
     model_top_factor_coverage: set[int] = set()
+    factor_execution_counts: dict[int, int] = {}
     missing_source_count = 0
     for batch in loader:
         if queue.unique_count >= max_unique:
@@ -369,10 +409,16 @@ def run_stratified_patch_audit(
                 model_top_factor_coverage.update(
                     int(value) for value in top_candidates
                 )
+                selected_candidates = select_coverage_stratified_supporting_factors(
+                    contributions[action],
+                    eligible,
+                    factors_per_action=factors_per_action,
+                    execution_counts=factor_execution_counts,
+                )
                 factors_by_action[int(action)] = [
-                    int(factor) for factor in top_candidates
+                    int(factor) for factor in selected_candidates
                 ]
-                for factor in top_candidates:
+                for factor in selected_candidates:
                     requested_factor_coverage.add(int(factor))
             factors = sorted(
                 {int(factor) for values in factors_by_action.values() for factor in values}
@@ -409,12 +455,17 @@ def run_stratified_patch_audit(
                     control_effect = (
                         clean_logit - control_output["action_logits_final"][0, action]
                     )
+                    is_model_top = int(factor) in top_candidates
                     records.append(
                         {
                             "sample_id": str(sample_id),
                             "action_id": int(action),
                             "factor_id": int(factor),
-                            "selection_mode": "model_top_positive_target_contribution",
+                            "selection_mode": (
+                                "model_top_positive_target_contribution"
+                                if is_model_top
+                                else "coverage_stratified_positive_target_contribution"
+                            ),
                             "selected_patch_count": int(selected.numel()),
                             "control_patch_count": int(control.numel()),
                             "clean_action_logit": float(clean_logit),
@@ -444,6 +495,9 @@ def run_stratified_patch_audit(
                             ),
                             "control_match": control_match,
                         }
+                    )
+                    factor_execution_counts[int(factor)] = (
+                        int(factor_execution_counts.get(int(factor), 0)) + 1
                     )
                     action_coverage.add(int(action))
             if len(records) > record_start:
