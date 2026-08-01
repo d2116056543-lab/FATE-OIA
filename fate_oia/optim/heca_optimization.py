@@ -154,6 +154,8 @@ class HECAScheduleState:
     foundation_grad_ema: float = 0.0
     action_floor: float | None = None
     reason_floor: float | None = None
+    shared_action_weight: float = 0.5
+    shared_reason_weight: float = 0.5
     visual_rms_ema: list[float] = field(default_factory=lambda: [1.0] * 4)
     pu_pass_streak: list[int] = field(default_factory=lambda: [0] * 21)
     foundation_lr_hold: bool = False
@@ -176,6 +178,22 @@ class HECAScheduleState:
     def foundation_grad_cap(self, minimum: float, maximum: float) -> float:
         pressure = min(max(self.foundation_grad_ema / 5.0, 0.0), 1.0)
         return float(maximum) - (float(maximum) - float(minimum)) * pressure
+
+    def shared_balance(self) -> dict[str, float]:
+        total = self.shared_action_weight + self.shared_reason_weight
+        if not 0.0 < self.shared_action_weight < 1.0 or not 0.0 < self.shared_reason_weight < 1.0:
+            raise ValueError("HECA shared gradient weights must lie in (0, 1)")
+        if abs(total - 1.0) > 1e-6:
+            raise ValueError("HECA shared gradient weights must sum to one")
+        return {"action": self.shared_action_weight, "reason": self.shared_reason_weight}
+
+    def set_next_shared_balance(self, balance: dict[str, float]) -> None:
+        action = float(balance["action"])
+        reason = float(balance["reason"])
+        if not 0.0 < action < 1.0 or not 0.0 < reason < 1.0 or abs(action + reason - 1.0) > 1e-6:
+            raise ValueError("Invalid HECA next-window shared gradient balance")
+        self.shared_action_weight = action
+        self.shared_reason_weight = reason
 
     def state_dict(self) -> dict[str, Any]:
         return asdict(self)

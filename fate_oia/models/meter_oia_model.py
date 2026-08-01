@@ -114,6 +114,8 @@ class METEROIAModel(nn.Module):
         diagnostic_modes: tuple[str, ...] = (),
         collect_timing: bool = False,
         update_semantic_stats: bool = False,
+        shared_action_gradient_scale: float = 1.0,
+        shared_reason_gradient_scale: float = 1.0,
         **_: Any,
     ) -> dict[str, Any]:
         def stamp() -> float:
@@ -123,7 +125,11 @@ class METEROIAModel(nn.Module):
 
         start = stamp()
         base = self.foundation.decode_foundation(field)
-        adapted = self.heca_adapters(base["label_nodes"])
+        adapted = self.heca_adapters(
+            base["label_nodes"],
+            shared_action_gradient_scale=shared_action_gradient_scale,
+            shared_reason_gradient_scale=shared_reason_gradient_scale,
+        )
         action_visual, action_preclip_norm = self._visual_action(
             adapted["action_nodes"]
         )
@@ -166,6 +172,14 @@ class METEROIAModel(nn.Module):
             action_bridge, state_prob_credit = self._recompute_state_credit(
                 factors, state_prob
             )
+        schema_targets = [
+            mode.removeprefix("schema_target_")
+            for mode in diagnostic_modes
+            if mode.startswith("schema_target_")
+        ]
+        if len(schema_targets) > 1:
+            raise ValueError("HECA accepts one targeted schema diagnostic at a time")
+        schema_target = int(schema_targets[0]) if schema_targets else None
         after_factor = stamp()
         action = self.action_transport(
             action_visual,
@@ -176,6 +190,7 @@ class METEROIAModel(nn.Module):
             factors["factor_action_ownership"],
             progress=progress,
             update_running_stats=update_semantic_stats,
+            diagnostic_schema_target=schema_target,
         )
         self._component_call_counts["action_credit"] += 1
         after_action = stamp()
@@ -234,11 +249,15 @@ class METEROIAModel(nn.Module):
         *,
         progress: float = 1.0,
         diagnostic_modes: tuple[str, ...] = (),
+        shared_action_gradient_scale: float = 1.0,
+        shared_reason_gradient_scale: float = 1.0,
     ) -> dict[str, Any]:
         return self.decode_from_field(
             self.encode_images(images),
             progress=progress,
             diagnostic_modes=diagnostic_modes,
+            shared_action_gradient_scale=shared_action_gradient_scale,
+            shared_reason_gradient_scale=shared_reason_gradient_scale,
         )
 
     def forward_view_pair(

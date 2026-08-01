@@ -71,6 +71,7 @@ class StateConditionedActionCredit(nn.Module):
         *,
         progress: float = 1.0,
         update_running_stats: bool = False,
+        diagnostic_schema_target: int | None = None,
     ) -> dict[str, Tensor]:
         if factor_action_bridge_token.shape[1:] != (
             self.factor_dim,
@@ -90,6 +91,14 @@ class StateConditionedActionCredit(nn.Module):
             / query.shape[-1] ** 0.5
             + self.learned_action_factor_bias
         )
+        if diagnostic_schema_target is not None:
+            target = int(diagnostic_schema_target)
+            if not 0 <= target < self.action_dim:
+                raise ValueError("HECA schema diagnostic target is out of range")
+            allocation_score = allocation_score.clone()
+            allocation_score[:, target] = torch.roll(
+                allocation_score[:, target], shifts=1, dims=-1
+            )
         # Only latent/non-owned factors are excluded. Every other factor can
         # learn a signed effect for every action.
         allocation_score = allocation_score.masked_fill(

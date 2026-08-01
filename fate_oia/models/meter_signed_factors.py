@@ -252,6 +252,13 @@ class TypedEvidenceStateHead(nn.Module):
             self.action_anchor_proj(anchor_token.detach())
         )
 
+    def _state_posterior(self, state_input: Tensor) -> tuple[Tensor, Tensor]:
+        logits = torch.einsum("bfd,fsd->bfs", state_input, self.state_weight) + self.state_bias
+        state_index = torch.arange(self.max_states, device=logits.device)
+        valid = state_index.view(1, -1) < self.state_cardinalities.view(-1, 1)
+        logits = logits.masked_fill(~valid.unsqueeze(0), float("-inf"))
+        return logits, torch.softmax(logits, dim=-1)
+
     def forward(
         self,
         factor_base_nodes: Tensor,
@@ -307,17 +314,16 @@ class TypedEvidenceStateHead(nn.Module):
             ],
             dim=-1,
         )
-        state_logits = torch.einsum(
-            "bfd,fsd->bfs", state_input, self.state_weight
-        ) + self.state_bias
+        state_logits, state_prob = self._state_posterior(state_input)
+        # Action reads the same posterior values, but its permitted bridge may
+        # train state parameters without changing anchor/global measurement.
+        action_state_logits, action_state_prob = self._state_posterior(
+            state_input.detach()
+        )
         state_index = torch.arange(self.max_states, device=state_logits.device)
         state_valid_mask = state_index.view(1, -1) < self.state_cardinalities.view(
             -1, 1
         )
-        state_logits = state_logits.masked_fill(
-            ~state_valid_mask.unsqueeze(0), float("-inf")
-        )
-        state_prob = torch.softmax(state_logits, dim=-1)
         entropy = -(state_prob.clamp_min(1e-8).log() * state_prob).sum(-1)
         entropy_norm = entropy / self.state_cardinalities.to(
             state_prob.dtype
@@ -337,7 +343,7 @@ class TypedEvidenceStateHead(nn.Module):
         action_token = self.compose_action_token(anchor_token, state_prob)
         action_value_token = self.compose_action_value_token(anchor_token)
         action_bridge_token, state_prob_credit = self.compose_action_bridge_token(
-            anchor_token, state_prob, global_token
+            anchor_token, action_state_prob, global_token
         )
         return {
             "factor_anchor_map": anchor_map,
@@ -347,6 +353,8 @@ class TypedEvidenceStateHead(nn.Module):
             "factor_global_token": global_token,
             "factor_state_logits": state_logits,
             "factor_state_prob": state_prob,
+            "factor_state_logits_action": action_state_logits,
+            "factor_state_prob_action": action_state_prob,
             "factor_state_valid_mask": state_valid_mask,
             "factor_state_entropy": entropy,
             "factor_observability_logit": obs_logit,

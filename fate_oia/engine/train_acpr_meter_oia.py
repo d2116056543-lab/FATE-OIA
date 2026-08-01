@@ -218,6 +218,8 @@ def _forward_training_batch(
     progress: float,
     mirror_due: bool,
     view_kind: str = "mirror",
+    shared_action_gradient_scale: float = 1.0,
+    shared_reason_gradient_scale: float = 1.0,
 ) -> tuple[dict[str, Any], dict[str, Any] | None, float]:
     """Decode one paired geometric or light view in the same DINO call."""
     batch_size = images.shape[0]
@@ -242,6 +244,8 @@ def _forward_training_batch(
         progress=progress,
         collect_timing=True,
         update_semantic_stats=True,
+        shared_action_gradient_scale=shared_action_gradient_scale,
+        shared_reason_gradient_scale=shared_reason_gradient_scale,
     )
     mirror_output = (
         model.decode_from_field(
@@ -251,6 +255,8 @@ def _forward_training_batch(
             progress=progress,
             collect_timing=False,
             update_semantic_stats=False,
+            shared_action_gradient_scale=shared_action_gradient_scale,
+            shared_reason_gradient_scale=shared_reason_gradient_scale,
         )
         if mirror_due
         else None
@@ -375,7 +381,7 @@ def _identity_output(
             state_prob_credit = torch.roll(state_prob_credit, 1, 0)
             reliability = torch.roll(reliability, 1, 0)
     elif mode == "state":
-        corrupt_state = torch.roll(output["factor_state_prob"], 1, -1)
+        corrupt_state = torch.roll(output["factor_state_prob_action"], 1, -1)
         bridge, state_prob_credit = model.typed_factors.compose_action_bridge_token(
             output["factor_anchor_token"],
             corrupt_state,
@@ -1146,8 +1152,9 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
         else nullcontext()
     )
     shared_parameters = list(model.heca_adapters.shared_adapter.parameters())
-    shared_action_grads = [torch.zeros_like(parameter) for parameter in shared_parameters]
-    shared_reason_grads = [torch.zeros_like(parameter) for parameter in shared_parameters]
+    probe_interval = int(config["training"]["gradient_ownership_probe_interval_updates"])
+    if probe_interval <= 0:
+        raise ValueError("HECA gradient ownership probe interval must be positive")
     for epoch in range(start_epoch, epochs):
         model.train()
         optimizer.zero_grad(set_to_none=True)
@@ -1171,6 +1178,7 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
             )
             mirror_due = mirror_interval > 0 and micro_step % mirror_interval == 0
             view_kind = "mirror" if optimizer_step % 2 == 0 else "light"
+            active_balance = schedule_state.shared_balance()
             with autocast():
                 output, mirror_output, dino_time = _forward_training_batch(
                     model,
@@ -1178,6 +1186,8 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                     progress=optimizer_step / max(total_updates, 1),
                     mirror_due=mirror_due,
                     view_kind=view_kind,
+                    shared_action_gradient_scale=active_balance["action"],
+                    shared_reason_gradient_scale=active_balance["reason"],
                 )
                 reason_fallback = torch.sigmoid(output["reason_logits_global"].detach())
                 output["reason_ema_probability"] = reason_probability_ema.values_for(
@@ -1199,24 +1209,9 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                     view_kind=view_kind,
                 )
                 scaled = total / grad_accum
-            action_shared = parts["loss_registry"].owner_total({"action"}) / grad_accum
-            reason_shared = parts["loss_registry"].owner_total(
-                {"reason"}
-            ) / grad_accum
             window_action_loss += float(parts["action"]["total"].detach())
             window_reason_loss += float(parts["reason"]["total"].detach())
             window_microbatches += 1
-            action_grads = torch.autograd.grad(
-                action_shared, shared_parameters, retain_graph=True, allow_unused=True
-            )
-            reason_grads = torch.autograd.grad(
-                reason_shared, shared_parameters, retain_graph=True, allow_unused=True
-            )
-            for index, (action_grad, reason_grad) in enumerate(zip(action_grads, reason_grads)):
-                if action_grad is not None:
-                    shared_action_grads[index].add_(action_grad.detach())
-                if reason_grad is not None:
-                    shared_reason_grads[index].add_(reason_grad.detach())
             is_update = (micro_step + 1) % grad_accum == 0 or micro_step + 1 == len(train_loader)
             ownership_probe: dict[str, float] | None = None
             probe_due = (
@@ -1224,10 +1219,14 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                 and optimizer_step > 0
                 and (
                     not ownership_logged_epoch
-                    or optimizer_step % 200 == 0
+                    or optimizer_step % probe_interval == 0
                 )
             )
             if probe_due:
+                # Ownership probes are expensive but remain exact and run at the
+                # required audit cadence, never on ordinary micro-batches.
+                action_shared = parts["loss_registry"].owner_total({"action"}) / grad_accum
+                reason_shared = parts["loss_registry"].owner_total({"reason"}) / grad_accum
                 action_credit_parameters = tuple(model.action_transport.parameters())
                 anchor_parameters = tuple(model.typed_factors.anchor_query.parameters())
                 state_measurement_parameters = (
@@ -1243,6 +1242,18 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                 )
                 action_to_state = _autograd_norm(
                     action_shared, state_measurement_parameters
+                )
+                action_grads = torch.autograd.grad(
+                    action_shared, shared_parameters, retain_graph=True, allow_unused=True
+                )
+                reason_grads = torch.autograd.grad(
+                    reason_shared, shared_parameters, retain_graph=True, allow_unused=True
+                )
+                flat_action = torch.cat(
+                    [gradient.flatten() for gradient in action_grads if gradient is not None]
+                )
+                flat_reason = torch.cat(
+                    [gradient.flatten() for gradient in reason_grads if gradient is not None]
                 )
                 ownership_probe = {
                     "action_to_anchor_query": _autograd_norm(
@@ -1267,6 +1278,11 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                         parts["loss_registry"].owner_total({"measurement"}),
                         foundation_parameters,
                     ),
+                    "shared_action_reason_grad_cosine": float(
+                        torch.nn.functional.cosine_similarity(
+                            flat_action, flat_reason, dim=0, eps=1e-8
+                        )
+                    ),
                 }
             backward_start = time.perf_counter()
             scaled.backward()
@@ -1279,7 +1295,7 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
             foundation_grad_norm = 0.0
             shared_grad_cosine = 0.0
             foundation_grad_cap = float(config["training"]["foundation_grad_cap_max"])
-            balance = {"action": 0.5, "reason": 0.5}
+            next_balance = active_balance
             if is_update:
                 window_action = output["action_logits_final"].new_tensor(
                     window_action_loss / max(window_microbatches, 1)
@@ -1288,21 +1304,10 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                     window_reason_loss / max(window_microbatches, 1)
                 )
                 excess_risk.update_floors(window_action, window_reason)
-                balance = excess_risk.weights(window_action, window_reason)
-                flat_action = torch.cat([gradient.flatten() for gradient in shared_action_grads])
-                flat_reason = torch.cat([gradient.flatten() for gradient in shared_reason_grads])
-                shared_grad_cosine = float(torch.nn.functional.cosine_similarity(
-                    flat_action, flat_reason, dim=0, eps=1e-8
-                ))
-                for parameter, action_grad, reason_grad in zip(
-                    shared_parameters, shared_action_grads, shared_reason_grads
-                ):
-                    parameter.grad = (
-                        balance["action"] * action_grad
-                        + balance["reason"] * reason_grad
-                    )
-                    action_grad.zero_()
-                    reason_grad.zero_()
+                next_balance = excess_risk.weights(window_action, window_reason)
+                schedule_state.set_next_shared_balance(next_balance)
+                if ownership_probe is not None:
+                    shared_grad_cosine = ownership_probe["shared_action_reason_grad_cosine"]
                 raw_foundation_norm = torch.nn.utils.clip_grad_norm_(
                     model.foundation.parameters(), float("inf")
                 )
@@ -1353,8 +1358,10 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                         {
                             "epoch": epoch,
                             "optimizer_step": optimizer_step,
-                            "shared_action_weight": balance["action"],
-                            "shared_reason_weight": balance["reason"],
+                            "shared_action_weight": active_balance["action"],
+                            "shared_reason_weight": active_balance["reason"],
+                            "next_shared_action_weight": next_balance["action"],
+                            "next_shared_reason_weight": next_balance["reason"],
                             "shared_action_reason_grad_cosine": shared_grad_cosine,
                             "foundation_grad_norm": foundation_grad_norm,
                             "foundation_grad_cap": foundation_grad_cap,
@@ -1405,8 +1412,10 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                 "foundation_grad_norm": foundation_grad_norm,
                 "foundation_grad_cap": foundation_grad_cap,
                 "foundation_grad_ema": schedule_state.foundation_grad_ema,
-                "shared_action_weight": balance["action"],
-                "shared_reason_weight": balance["reason"],
+                "shared_action_weight": active_balance["action"],
+                "shared_reason_weight": active_balance["reason"],
+                "next_shared_action_weight": next_balance["action"],
+                "next_shared_reason_weight": next_balance["reason"],
                 "shared_action_reason_grad_cosine": shared_grad_cosine,
                 "data_time": data_time,
                 "dino_time": dino_time,

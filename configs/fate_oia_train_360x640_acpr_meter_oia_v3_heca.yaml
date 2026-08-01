@@ -71,8 +71,11 @@ artifacts:
 training:
   from_scratch: true
   epochs: 14
-  batch_size: 6
-  gradient_accumulation_steps: 5
+  batch_size: 4
+  gradient_accumulation_steps: 8
+  effective_batch_size: 32
+  shared_gradient_policy: next_window_single_backward
+  gradient_ownership_probe_interval_updates: 200
   precision: bf16
   optimizer: AdamW
   scheduler: cosine_by_update

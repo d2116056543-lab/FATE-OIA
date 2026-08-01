@@ -1,6 +1,6 @@
 param(
-  [int]$BatchSize = 6,
-  [int]$GradAccum = 5,
+  [int]$BatchSize = 4,
+  [int]$GradAccum = 8,
   [int]$NumWorkers = 4,
   [string]$Device = "cuda",
   [string]$OutputDir = ".background_runs\meter_oia_v3_heca_pilot",

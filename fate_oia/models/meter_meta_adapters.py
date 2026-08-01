@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 from torch import Tensor, nn
+from torch.nn import functional as F
 
 
 class _ZeroInitLowRankResidual(nn.Module):
@@ -15,6 +16,31 @@ class _ZeroInitLowRankResidual(nn.Module):
 
     def forward(self, value: Tensor) -> Tensor:
         return self.up(torch.nn.functional.gelu(self.down(self.norm(value))))
+
+    def parameter_scaled_residual(self, value: Tensor, scale: float) -> Tensor:
+        """Preserve input gradients while applying a scale only to this block's parameters."""
+        if not 0.0 <= float(scale) <= 1.0:
+            raise ValueError("HECA shared gradient scale must lie in [0, 1]")
+
+        def residual(input_value: Tensor, *, detach_parameters: bool) -> Tensor:
+            norm_weight = self.norm.weight.detach() if detach_parameters else self.norm.weight
+            norm_bias = self.norm.bias.detach() if detach_parameters else self.norm.bias
+            down_weight = self.down.weight.detach() if detach_parameters else self.down.weight
+            up_weight = self.up.weight.detach() if detach_parameters else self.up.weight
+            normalized = F.layer_norm(
+                input_value,
+                self.norm.normalized_shape,
+                norm_weight,
+                norm_bias,
+                self.norm.eps,
+            )
+            return F.linear(F.gelu(F.linear(normalized, down_weight)), up_weight)
+
+        # The first path contributes the original gradient to label_nodes and
+        # foundation. The second path contributes only parameter gradients.
+        input_path = residual(value, detach_parameters=True)
+        parameter_path = residual(value.detach(), detach_parameters=False)
+        return input_path + float(scale) * (parameter_path - parameter_path.detach())
 
 
 class HECASharedPrivateAdapters(nn.Module):
@@ -35,12 +61,27 @@ class HECASharedPrivateAdapters(nn.Module):
         self.reason_private_adapter = _ZeroInitLowRankResidual(dim, rank)
         self.pu_private_head = nn.Linear(dim, 1)
 
-    def forward(self, label_nodes: Tensor) -> dict[str, Tensor]:
+    def forward(
+        self,
+        label_nodes: Tensor,
+        *,
+        shared_action_gradient_scale: float = 1.0,
+        shared_reason_gradient_scale: float = 1.0,
+    ) -> dict[str, Tensor]:
         if label_nodes.shape[1] != self.action_dim + self.reason_dim:
             raise ValueError("HECA adapters require action+reason label nodes")
-        shared = label_nodes + self.shared_adapter(label_nodes)
-        action = shared[:, : self.action_dim]
-        reason = shared[:, self.action_dim :]
+        # Action/reason scales affect only shared-adapter parameters. The foundation
+        # keeps its unweighted residual input gradient, matching the original policy.
+        action_delta = self.shared_adapter.parameter_scaled_residual(
+            label_nodes[:, : self.action_dim], shared_action_gradient_scale
+        )
+        reason_delta = self.shared_adapter.parameter_scaled_residual(
+            label_nodes[:, self.action_dim :], shared_reason_gradient_scale
+        )
+        shared_delta = torch.cat((action_delta, reason_delta), dim=1)
+        shared = label_nodes + shared_delta
+        action = label_nodes[:, : self.action_dim] + action_delta
+        reason = label_nodes[:, self.action_dim :] + reason_delta
         reason_private_delta = self.reason_private_adapter(reason)
         pu_private_nodes = (
             reason.detach()

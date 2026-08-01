@@ -31,6 +31,10 @@ EXPENSIVE_SAME_FORWARD_MODES: dict[str, tuple[str, ...]] = {
     "schema_corruption": ("schema_corruption",),
     "cross_sample_swap": ("cross_sample_swap",),
     "state_corruption": ("state_corruption",),
+    **{
+        f"schema_target_{action}": (f"schema_target_{action}",)
+        for action in range(4)
+    },
 }
 
 # B0--B5 alter training or data-assignment semantics.  They must never be
