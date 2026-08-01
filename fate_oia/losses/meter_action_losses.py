@@ -79,9 +79,13 @@ def action_nonregression_loss(
     visual_margin = sign * visual_logits.detach()
     final_margin = visual_margin + sign * action_evidence_delta
     correct_visual = visual_margin >= 0.0
+    # The high-confidence branch below already protects margins at or above
+    # min_margin. Restrict the boundary term to correct low-margin examples
+    # so the same regression cannot be penalized twice.
+    boundary_mask = correct_visual & (visual_margin < float(min_margin))
     boundary = (
-        torch.relu(float(boundary_margin) - final_margin)[correct_visual].mean()
-        if bool(correct_visual.any())
+        torch.relu(float(boundary_margin) - final_margin)[boundary_mask].mean()
+        if bool(boundary_mask.any())
         else action_evidence_delta.new_zeros(())
     )
     eligible = visual_margin >= float(min_margin)
