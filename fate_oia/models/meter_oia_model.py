@@ -133,6 +133,7 @@ class METEROIAModel(nn.Module):
         action_visual, action_preclip_norm = self._visual_action(
             adapted["action_nodes"]
         )
+        action_logit_cap = float(self.foundation.trunk.action_logit_norm_cap)
         after_foundation = stamp()
         factors = self.typed_factors(
             base["factor_base_nodes"],
@@ -232,6 +233,7 @@ class METEROIAModel(nn.Module):
             "factor_state_prob_credit": state_prob_credit,
             "factor_measurement_token": measurement_token,
             "action_visual_preclip_norm": action_preclip_norm,
+            "action_emergency_cap_active": action_preclip_norm > action_logit_cap,
             "reason_logits_pu_private": adapted["reason_logits_pu_private"],
             "branch_logits": {
                 "action_visual": action["action_logits_visual"],

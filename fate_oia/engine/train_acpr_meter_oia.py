@@ -831,6 +831,15 @@ def _typed_factor_audit(
                 "observability_auc": (
                     binary_roc_auc(obs_p, obs_y) if obs_p.numel() else None
                 ),
+                "observability_positive_count": (
+                    int(obs_y.sum().item()) if obs_y.numel() else 0
+                ),
+                "observability_negative_count": (
+                    int(obs_y.numel() - obs_y.sum().item()) if obs_y.numel() else 0
+                ),
+                "observability_target_rate": (
+                    float(obs_y.mean()) if obs_y.numel() else None
+                ),
                 "observability_mean": (
                     float(obs_p.mean()) if obs_p.numel() else None
                 ),
@@ -1449,6 +1458,9 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                     output["action_logits_final"].detach().abs().max()
                 ),
                 "action_visual_preclip_norm_max": float(output["action_visual_preclip_norm"].detach().max()),
+                "action_emergency_cap_rate": float(
+                    output["action_emergency_cap_active"].float().mean().detach()
+                ),
                 "factor_null_mean": float(output["factor_null_mass"].mean().detach()),
                 "factor_observability_mean": float(
                     output["factor_observability"].mean().detach()

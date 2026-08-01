@@ -13,8 +13,8 @@ from fate_oia.models.meter_signed_factors import TypedEvidenceStateHead
 def _schema_copy_with_overrides(tmp_path: Path) -> Path:
     source = Path("configs/meter_factor_schema.yaml").read_text(encoding="utf-8")
     source = source.replace(
-        "action_owned: 1.0, compatible_actions",
-        "action_owned: 0.25, compatible_actions",
+        "action_owned: 1.0, observability_source",
+        "action_owned: 0.25, observability_source",
         1,
     )
     source = source.replace('groundability: partial, action_owned: 0.5', 'groundability: none, action_owned: 0.5', 1)
@@ -27,7 +27,9 @@ def test_typed_head_uses_runtime_schema_for_ownership_and_groundability(tmp_path
     schema = _schema_copy_with_overrides(tmp_path)
     head = TypedEvidenceStateHead(dim=8, schema_path=schema)
 
-    assert head.action_ownership[:, 0].max().item() == 0.25
+    # HECA removes the V2 action-by-factor hard mask.  Ownership is one
+    # learnable evidence availability scalar per factor.
+    assert head.action_ownership[0].item() == 0.25
     assert head.groundable_mask[1].item() == 0.0
 
 
@@ -55,6 +57,52 @@ def test_geometry_targets_rasterize_real_lane_and_drivable_evidence(tmp_path: Pa
     unknown = builder.build({"source_complete": False, "objects": [], "lanes": []})
     assert not bool(unknown["factor_anchor_valid"][2])
     assert not bool(unknown["factor_state_valid"][2])
+
+
+def test_complete_object_source_marks_absent_local_factor_observable() -> None:
+    """A complete source observes an absent object as an explicit negative."""
+    builder = METERTypedTargetBuilder("configs/meter_factor_schema.yaml", grid_hw=(6, 8))
+    absent = builder.build(
+        {"source_complete": True, "objects": [], "image_size": [16, 12]}
+    )
+    present = builder.build(
+        {
+            "source_complete": True,
+            "objects": [
+                {
+                    "category": "car",
+                    "box2d": {"x1": 5, "y1": 6, "x2": 10, "y2": 11},
+                }
+            ],
+            "image_size": [16, 12],
+        }
+    )
+
+    # The factor state is ``absent_observable`` rather than unknown: complete
+    # object labels explicitly establish that no car instance is present.
+    assert absent["factor_observability_valid"][5]
+    assert absent["factor_observability"][5].item() == 1.0
+    assert present["factor_observability"][5].item() == 1.0
+
+
+def test_uncoloured_traffic_light_is_unknown_not_observed_negative() -> None:
+    """`light_and_color_visible` requires an explicit light colour."""
+    builder = METERTypedTargetBuilder("configs/meter_factor_schema.yaml", grid_hw=(6, 8))
+    target = builder.build(
+        {
+            "source_complete": True,
+            "objects": [
+                {
+                    "category": "traffic light",
+                    "box2d": {"x1": 5, "y1": 2, "x2": 10, "y2": 7},
+                }
+            ],
+            "image_size": [16, 12],
+        }
+    )
+
+    assert not target["factor_state_valid"][0]
+    assert not target["factor_observability_valid"][0]
 
 
 def test_grounding_index_prefers_drivable_id_over_color_map(tmp_path: Path) -> None:
@@ -146,8 +194,14 @@ def test_mirror_equivariance_report_requires_paired_forward_outputs():
     assert report["paired_forward"] is True
     mirrored["action_logits_final"][0, 2] += 1.0
     loss, report = mirror_equivariance_loss(original, mirrored)
-    assert float(loss) > 0.0
+    # Task-logit mismatch is a diagnostic by default; a measurement-owned
+    # objective must not route this gradient into the foundation.
+    assert float(loss) == 0.0
     assert report["action_l1"] > 0.0
+    task_loss, _ = mirror_equivariance_loss(
+        original, mirrored, include_task_logits=True
+    )
+    assert float(task_loss) > 0.0
 
 
 def test_paired_mirror_ignores_scalar_diagnostics_in_model_output():

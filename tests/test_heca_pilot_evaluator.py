@@ -26,6 +26,8 @@ def _epoch() -> dict:
                 "observability_auc": 0.7 if good else None,
                 "observability_mean": 0.5 if good else None,
                 "observability_std": 0.1 if good else None,
+                "observability_positive_count": 40 if good else 0,
+                "observability_negative_count": 40 if good else 0,
             }
         )
     global_ap = [0.38] * 21
@@ -81,6 +83,7 @@ def _epoch() -> dict:
         "max_action_logit": 20.0,
         "foundation_grad_ema": 2.0,
         "emergency_cap_rate": 0.0,
+        "action_emergency_cap_rate": 0.0,
     }
 
 
@@ -152,6 +155,23 @@ def test_pilot_evaluator_fails_closed_when_gate_c_is_not_two_epoch_stable() -> N
     assert result["gates"]["C"] is False
 
 
+def test_gate_g_uses_action_emergency_cap_not_foundation_gradient_clipping() -> None:
+    epochs, audit, ontology, tau, gradients = _inputs()
+    for epoch in epochs:
+        epoch["emergency_cap_rate"] = 1.0
+        epoch["action_emergency_cap_rate"] = 0.0
+    result = evaluate_heca_pilot(
+        epochs=epochs,
+        implementation_audit=audit,
+        ontology_manifest=ontology,
+        tau_stats=tau,
+        gradient_rows=gradients,
+        git_head="abc",
+    )
+
+    assert result["gates"]["G"] is True
+
+
 def test_pilot_evaluator_requires_exactly_four_epochs() -> None:
     epochs, audit, ontology, tau, gradients = _inputs()
     with pytest.raises(ValueError, match="exactly four"):
@@ -163,6 +183,27 @@ def test_pilot_evaluator_requires_exactly_four_epochs() -> None:
             gradient_rows=gradients,
             git_head="abc",
         )
+
+
+def test_gate_b_requires_identifiable_observability_targets() -> None:
+    epochs, audit, ontology, tau, gradients = _inputs()
+    broken = deepcopy(epochs)
+    for row in broken[-1]["typed"]["train_audit"]["per_factor"][:12]:
+        row["observability_negative_count"] = 0
+
+    result = evaluate_heca_pilot(
+        epochs=broken,
+        implementation_audit=audit,
+        ontology_manifest=ontology,
+        tau_stats=tau,
+        gradient_rows=gradients,
+        git_head="abc",
+    )
+
+    assert result["gates"]["B"] is False
+    assert result["gate_payloads"]["B"]["evidence"][
+        "observability_identifiable_factor_count"
+    ] == 0
 
 
 def test_pilot_recomputation_rejects_saved_gate_tampering(tmp_path) -> None:
@@ -196,6 +237,7 @@ def test_pilot_recomputation_rejects_saved_gate_tampering(tmp_path) -> None:
                 "foundation_grad_ema": epoch["foundation_grad_ema"],
                 "foundation_grad_norm": 0.0,
                 "foundation_grad_cap": 1.0,
+                "action_emergency_cap_rate": epoch["action_emergency_cap_rate"],
             }
         )
     (tmp_path / "loss_components.jsonl").write_text(

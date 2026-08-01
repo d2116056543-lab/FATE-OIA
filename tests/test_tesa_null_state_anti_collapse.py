@@ -134,15 +134,14 @@ def test_null_partition_is_safe_under_bf16_autocast() -> None:
     assert torch.isfinite(null_mass.grad).all()
 
 
-def test_anchor_sparse_distribution_keeps_recovery_gradient_at_full_ramp() -> None:
+def test_anchor_sparse_distribution_is_truly_sparse_after_exploration_decays() -> None:
     head = TypedEvidenceStateHead(dim=8, factor_dim=21)
     logits = torch.tensor([[12.0, -12.0, -12.0]], requires_grad=True)
     distribution = head._distribution(logits, progress=1.0)
-    assert distribution[0, 1] > 0
-    loss = -distribution[0, 1].clamp_min(1e-12).log()
-    loss.backward()
-    assert logits.grad is not None
-    assert logits.grad[0, 1].abs() > 0
+    assert torch.allclose(distribution.sum(-1), torch.ones(1))
+    assert distribution[0, 0] == 1.0
+    assert distribution[0, 1] == 0.0
+    assert distribution[0, 2] == 0.0
 
 
 def test_grounding_weights_are_single_source_and_sum_exactly() -> None:
@@ -152,9 +151,14 @@ def test_grounding_weights_are_single_source_and_sum_exactly() -> None:
         "factor_state_logits": torch.zeros(1, 21, 3),
         "factor_observability_logit": torch.zeros(1, 21),
         "factor_observability": torch.full((1, 21), 0.5),
-        "factor_null_mass": torch.full((1, 21), 0.5),
-        "factor_typed_token": torch.zeros(1, 21, 2),
-        "factor_state_prob": torch.full((1, 21, 3), 1 / 3),
+            "factor_null_mass": torch.full((1, 21), 0.5),
+            "factor_typed_token": torch.zeros(1, 21, 2),
+            "factor_state_prob": torch.full((1, 21, 3), 1 / 3),
+            "factor_ontology_query": torch.zeros(21, 2),
+            "factor_ontology_target": torch.zeros(21, 2),
+            "state_ontology_query": torch.zeros(21, 3, 2),
+            "state_ontology_target": torch.zeros(21, 3, 2),
+            "factor_state_valid_mask": torch.ones(21, 3, dtype=torch.bool),
     }
     targets = {
         "factor_anchor_map": torch.full((1, 21, 2), 0.5),
@@ -168,6 +172,11 @@ def test_grounding_weights_are_single_source_and_sum_exactly() -> None:
         "factor_source_weight": torch.ones(1, 21),
     }
     weights = {"anchor": 0.2, "state": 0.3, "null": 0.4, "observability": 0.5, "discrimination": 0.6, "mirror": 0.7}
-    result = meter_grounding_loss(output, targets, weights=weights)
+    result = meter_grounding_loss(
+        output,
+        targets,
+        observability_tau=torch.full((21,), 0.5),
+        weights=weights,
+    )
     expected = sum(weights[name] * result[name] for name in weights)
     torch.testing.assert_close(result["total"], expected)
