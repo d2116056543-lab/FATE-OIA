@@ -140,7 +140,16 @@ def _dynamic_checks() -> dict[str, Any]:
         field = model.encode_images(image)
         clean = model.decode_from_field(field, progress=0.0)
         factor_off = model.decode_from_field(field, progress=0.0, diagnostic_modes=("factor_off",))
-        uniform = model.decode_from_field(field, progress=0.5, diagnostic_modes=("state_uniform",))
+        # The formal model starts with a zero state effect to preserve the
+        # visual anchor. Seed a deterministic nonzero audit-only effect after
+        # verifying that invariant, then verify the live state recomputation.
+        effect = model.action_transport.state_effect_embedding
+        effect[:, 0, 0] = 0.5
+        effect[:, 1, 0] = -0.5
+        state_clean = model.decode_from_field(field, progress=1.0)
+        uniform = model.decode_from_field(
+            field, progress=1.0, diagnostic_modes=("state_uniform",)
+        )
     shapes = {
         key: list(clean[key].shape)
         for key in ("action_logits_final", "reason_logits_final", "factor_anchor_map", "factor_state_prob", "factor_visual_confidence", "action_factor_contribution")
@@ -152,7 +161,9 @@ def _dynamic_checks() -> dict[str, Any]:
             (clean["label_nodes"] - clean["label_nodes_base"]).abs().max()
         ) < 1e-6,
         "factor_off_action_visual": torch.equal(factor_off["action_logits_final"], factor_off["action_logits_visual"]),
-        "state_uniform_recomputes_values": not torch.allclose(clean["action_factor_values"], uniform["action_factor_values"]),
+        "state_uniform_recomputes_values": not torch.allclose(
+            state_clean["action_factor_values"], uniform["action_factor_values"]
+        ),
         "visual_confidence_matches_reliability": torch.allclose(
             clean["factor_visual_confidence"], clean["factor_reliability"]
         ),
