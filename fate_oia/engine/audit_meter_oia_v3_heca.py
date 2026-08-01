@@ -58,6 +58,12 @@ def _source_checks(root: Path, config: dict[str, Any]) -> dict[str, Any]:
         for name in active_runtime_names
         if (root / name).exists()
     )
+    exporter = (root / "fate_oia/engine/export_heca_ontology_prototypes.py").read_text(
+        encoding="utf-8"
+    )
+    pilot_script = (root / "scripts/FATE_OIA_meter_oia_v3_heca_pilot.ps1").read_text(
+        encoding="utf-8"
+    )
     forbidden_tokens = {
         "hard_action_factor_field": "compatible" + "_" + "actions",
         "admission_parameter": "action_evidence_" + "admission",
@@ -78,6 +84,14 @@ def _source_checks(root: Path, config: dict[str, Any]) -> dict[str, Any]:
         "no_cache": config["model"]["feature_cache_enabled"] is False,
         "no_compression": config["model"]["token_compression"] == "none",
         "same_forward_eval": config["runtime"]["sequential_eval"] is False,
+        "offline_ontology_export": (
+            "local_files_only=True" in exporter
+            and "all-MiniLM-L6-v2" not in exporter
+            and "TextEncoderPath" in pilot_script
+            and config["artifacts"]["offline_text_encoder_path"].endswith(
+                "frozen_bert_base_uncased"
+            )
+        ),
     }
     return {
         "missing_files": missing,
