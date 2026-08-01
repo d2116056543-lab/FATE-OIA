@@ -8,6 +8,9 @@ def test_action_state_posterior_matches_reason_state_but_cannot_update_anchor_qu
     model = METEROIAModel(dim=384, use_mock_dino=True)
     output = model(torch.randn(2, 3, 360, 640), progress=1.0)
     torch.testing.assert_close(
+        output["action_logits_final"], output["action_logits_visual"]
+    )
+    torch.testing.assert_close(
         output["factor_state_prob_action"], output["factor_state_prob"]
     )
     gradients = torch.autograd.grad(

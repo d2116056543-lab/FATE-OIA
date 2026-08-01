@@ -56,17 +56,27 @@ def action_delta_pairwise_ranking_loss(
 
 def action_nonregression_loss(
     visual_logits: Tensor,
-    final_logits: Tensor,
+    action_evidence_delta: Tensor,
     target: Tensor,
     *,
-    margin_threshold: float = 1.0,
+    min_margin: float = 0.05,
+    confidence_quantile: float = 0.75,
 ) -> Tensor:
+    """Protect the correct visual anchor without updating that anchor itself."""
+    if not 0.0 <= float(confidence_quantile) <= 1.0:
+        raise ValueError("confidence_quantile must be in [0, 1]")
     sign = target * 2.0 - 1.0
     visual_margin = sign * visual_logits.detach()
-    final_margin = sign * final_logits
-    mask = visual_margin > float(margin_threshold)
+    eligible = visual_margin >= float(min_margin)
+    if not bool(eligible.any()):
+        return action_evidence_delta.new_zeros(())
+    threshold = torch.quantile(
+        visual_margin[eligible].detach(), float(confidence_quantile)
+    ).clamp_min(float(min_margin))
+    mask = visual_margin >= threshold
     if not bool(mask.any()):
-        return final_logits.new_zeros(())
+        return action_evidence_delta.new_zeros(())
+    final_margin = visual_margin + sign * action_evidence_delta
     return torch.relu(visual_margin - final_margin)[mask].mean()
 
 
@@ -91,7 +101,7 @@ def meter_action_loss(
         (contribution.abs().mean(-1) * (1.0 - target)).mean(),
     )
     nonreg = action_nonregression_loss(
-        output["action_logits_visual"], output["action_logits_final"], target
+        output["action_logits_visual"], output["action_evidence_delta"], target
     )
     soft_f1 = soft_f1_loss(output["action_logits_final"], target)
     cardinality = F.smooth_l1_loss(

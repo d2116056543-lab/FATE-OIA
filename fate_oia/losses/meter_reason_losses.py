@@ -117,9 +117,18 @@ def reason_correction_sign_loss(
 ) -> Tensor:
     positive = supervision.positive_mask.to(correction)
     negative = supervision.unknown_mask.to(correction) * supervision.negative_weight.to(correction)
-    value = positive * torch.relu(float(margin) - correction)
-    value = value + negative * torch.relu(float(margin) + correction)
-    return value.sum() / (positive + negative).sum().clamp_min(1e-6)
+    terms: list[Tensor] = []
+    if bool(positive.gt(0).any()):
+        terms.append(
+            (positive * torch.relu(float(margin) - correction)).sum()
+            / positive.sum().clamp_min(1e-6)
+        )
+    if bool(negative.gt(0).any()):
+        terms.append(
+            (negative * torch.relu(float(margin) + correction)).sum()
+            / negative.sum().clamp_min(1e-6)
+        )
+    return torch.stack(terms).mean() if terms else correction.new_zeros(())
 
 
 def meter_reason_loss(

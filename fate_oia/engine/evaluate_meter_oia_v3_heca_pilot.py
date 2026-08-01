@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import subprocess
 from pathlib import Path
 from typing import Any, Mapping
@@ -81,6 +82,7 @@ def evaluate_heca_pilot(
 
     per_factor = typed.get("train_audit", {}).get("per_factor", [])
     quality_ids = []
+    identifiable_ids = []
     provenance_coverage_ids = []
     for row in per_factor if isinstance(per_factor, list) else []:
         if not isinstance(row, dict):
@@ -96,13 +98,24 @@ def evaluate_heca_pilot(
             row.get("visual_confidence_mean"),
             row.get("visual_confidence_std"),
         )
+        state_positive_count = int(row.get("state_positive_count", 0))
+        state_negative_count = int(row.get("state_negative_count", 0))
+        state_identifiable = (
+            row.get("audit_split") == "train_audit"
+            and row.get("state_identifiable") is True
+            and state_positive_count >= 20
+            and state_negative_count >= 20
+        )
+        if state_identifiable:
+            identifiable_ids.append(int(row.get("factor_id", -1)))
         if (
             int(row.get("source_count", 0)) > 0
+            and state_identifiable
             and all(_finite(value) for value in values)
             and float(row["same_type_margin"]) > 0.0
-            and float(row["state_auprc"]) > float(row["state_frequency_baseline"])
-            and float(row["state_auc"]) > 0.5
-            and float(row["state_auc"]) > float(row["state_frequency_baseline"])
+            and float(row["state_auprc"])
+            > float(row["state_frequency_baseline"]) + 0.001
+            and float(row["state_auc"]) > 0.501
             and provenance_valid_count >= 20
             and float(row["visual_confidence_std"]) > 0.01
         ):
@@ -118,12 +131,18 @@ def evaluate_heca_pilot(
     )
     gate_b = _gate(
         "B",
-        len(quality_ids) >= 12
+        len(identifiable_ids) >= 8
+        and len(quality_ids) >= max(8, math.ceil(0.75 * len(identifiable_ids)))
         and provenance_stats_valid
         and ontology_manifest.get("factor_count") == 21,
         {
             "quality_factor_ids": quality_ids,
             "quality_factor_count": len(quality_ids),
+            "identifiable_factor_ids": identifiable_ids,
+            "identifiable_factor_count": len(identifiable_ids),
+            "required_quality_factor_count": max(
+                8, math.ceil(0.75 * len(identifiable_ids))
+            ),
             "provenance_coverage_factor_ids": provenance_coverage_ids,
             "provenance_coverage_factor_count": len(provenance_coverage_ids),
             "provenance_stats_valid": provenance_stats_valid,

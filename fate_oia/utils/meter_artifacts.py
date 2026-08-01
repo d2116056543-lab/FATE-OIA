@@ -695,6 +695,29 @@ def validate_epoch_artifacts(directory: str | Path) -> list[str]:
             for value in patch_audit.get("factor_coverage", [])
         )
     )
+    factor_rows = train_audit.get("per_factor", []) if isinstance(train_audit, dict) else []
+    heca_rows = [
+        row for row in factor_rows
+        if isinstance(row, dict) and "observability_visually_unidentifiable" in row
+    ]
+    if heca_rows:
+        def _valid_heca_factor_row(row: dict[str, Any]) -> bool:
+            positive = row.get("state_positive_count")
+            negative = row.get("state_negative_count")
+            identifiable = row.get("state_identifiable")
+            return (
+                row.get("audit_split") == "train_audit"
+                and isinstance(positive, int)
+                and isinstance(negative, int)
+                and positive >= 0
+                and negative >= 0
+                and isinstance(identifiable, bool)
+                and identifiable == (positive >= 20 and negative >= 20)
+            )
+
+        typed_valid = typed_valid and len(heca_rows) == 21 and all(
+            _valid_heca_factor_row(row) for row in heca_rows
+        )
     # Formal TESA artifacts never fall back to the historical weak schema.
     typed_valid = typed_valid and not patch_contract_failures
     if not typed_valid:

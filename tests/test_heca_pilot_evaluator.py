@@ -23,6 +23,10 @@ def _epoch() -> dict:
                 "state_auprc": 0.7 if good else None,
                 "state_frequency_baseline": 0.3 if good else None,
                 "state_auc": 0.7 if good else None,
+                "state_positive_count": 40 if good else 0,
+                "state_negative_count": 40 if good else 0,
+                "state_identifiable": good,
+                "audit_split": "train_audit",
                 "provenance_valid_count": 40 if good else 0,
                 "visual_confidence_mean": 0.5 if good else None,
                 "visual_confidence_std": 0.1 if good else None,
@@ -194,6 +198,45 @@ def test_gate_b_accepts_one_class_provenance_when_visual_measurement_is_healthy(
     )
     assert result["gates"]["B"] is True
     assert result["gate_payloads"]["B"]["evidence"]["provenance_coverage_factor_count"] >= 12
+
+
+def test_gate_b_uses_auc_random_baseline_not_prevalence_and_skips_unidentifiable_states() -> None:
+    epochs, audit, ontology, tau, gradients = _inputs()
+    high_prevalence = epochs[-1]["typed"]["train_audit"]["per_factor"][0]
+    high_prevalence.update(
+        state_auprc=0.90,
+        state_frequency_baseline=0.80,
+        state_auc=0.75,
+        state_positive_count=80,
+        state_negative_count=20,
+        state_identifiable=True,
+    )
+    unknown = epochs[-1]["typed"]["train_audit"]["per_factor"][12]
+    unknown.update(
+        source_count=12,
+        same_type_margin=0.20,
+        state_auprc=0.99,
+        state_frequency_baseline=0.01,
+        state_auc=0.99,
+        state_positive_count=0,
+        state_negative_count=100,
+        state_identifiable=False,
+        provenance_valid_count=100,
+        visual_confidence_mean=0.5,
+        visual_confidence_std=0.1,
+    )
+    result = evaluate_heca_pilot(
+        epochs=epochs,
+        implementation_audit=audit,
+        ontology_manifest=ontology,
+        tau_stats=tau,
+        gradient_rows=gradients,
+        git_head="abc",
+    )
+    evidence = result["gate_payloads"]["B"]["evidence"]
+    assert result["gates"]["B"] is True
+    assert 0 in evidence["quality_factor_ids"]
+    assert 12 not in evidence["identifiable_factor_ids"]
 
 
 def test_pilot_recomputation_rejects_saved_gate_tampering(tmp_path) -> None:

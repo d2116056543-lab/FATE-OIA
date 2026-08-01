@@ -22,7 +22,9 @@ class METERPrivateReasonDecoder(nn.Module):
         self.global_delta_head = nn.Linear(dim, 1)
         nn.init.zeros_(self.global_delta_head.weight)
         nn.init.zeros_(self.global_delta_head.bias)
-        self.correction_vector = nn.Parameter(torch.randn(reason_dim, dim) * 0.02)
+        # A zero evidence residual preserves the calibrated global reason
+        # anchor exactly; evidence gradients first update this vector.
+        self.correction_vector = nn.Parameter(torch.zeros(reason_dim, dim))
         self.correction_kappa_raw = nn.Parameter(
             torch.full((reason_dim,), -2.2521685)
         )
