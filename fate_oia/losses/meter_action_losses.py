@@ -32,25 +32,51 @@ def action_delta_pairwise_ranking_loss(
     action_evidence_delta: Tensor,
     target: Tensor,
     *,
+    visual_logits: Tensor | None = None,
     normalizer: Tensor | None = None,
     margin: float = 0.10,
+    hard_temperature: float = 0.20,
     **_: float,
 ) -> Tensor:
-    """HECA credit rank: positive samples require larger signed credit."""
+    """Train credit on visual hard pairs without reoptimising the anchor.
+
+    A residual should repair pairs that the visual branch orders incorrectly or
+    ambiguously. Ranking every positive delta above every negative delta makes
+    the residual a global label bias, which improves neither evidence use nor
+    fixed-threshold stability. The visual branch is detached here so this term
+    updates only the action-credit route.
+    """
+    if hard_temperature <= 0.0:
+        raise ValueError("hard_temperature must be positive")
     delta = action_evidence_delta
     if normalizer is not None:
         scale = normalizer.detach().to(delta)
         delta = delta / scale.clamp_min(1e-6)
-    # Credit ranking is an ordering objective. Saturating the normalized
-    # credit prevents one runaway sample from dominating the shared update.
     delta = torch.tanh(delta)
+    visual = torch.zeros_like(delta) if visual_logits is None else visual_logits.detach()
+    if visual.shape != delta.shape:
+        raise ValueError("visual_logits must match action_evidence_delta")
+    corrected = visual + delta
     terms: list[Tensor] = []
     for action_id in range(delta.shape[1]):
         positive = target[:, action_id] > 0.5
         negative = ~positive
         if bool(positive.any()) and bool(negative.any()):
-            difference = delta[positive, action_id, None] - delta[negative, action_id]
-            terms.append(torch.relu(float(margin) - difference).mean())
+            visual_gap = (
+                visual[positive, action_id, None]
+                - visual[negative, action_id]
+            )
+            corrected_gap = (
+                corrected[positive, action_id, None]
+                - corrected[negative, action_id]
+            )
+            # Misranked and close pairs get the learning budget. Easy visual
+            # pairs remain an anchor rather than a target for a global shift.
+            hard_weight = torch.sigmoid(
+                (float(margin) - visual_gap) / float(hard_temperature)
+            ).detach()
+            hinge = torch.relu(float(margin) - corrected_gap)
+            terms.append((hard_weight * hinge).sum() / hard_weight.sum().clamp_min(1e-6))
     return torch.stack(terms).mean() if terms else delta.new_zeros(())
 
 
@@ -95,10 +121,21 @@ def action_nonregression_loss(
         visual_margin[eligible].detach(), float(confidence_quantile)
     ).clamp_min(float(min_margin))
     mask = visual_margin >= threshold
-    if not bool(mask.any()):
-        return action_evidence_delta.new_zeros(())
-    confident = torch.relu(visual_margin - final_margin)[mask].mean()
-    return confident + boundary
+    confident = (
+        torch.relu(visual_margin - final_margin)[mask].mean()
+        if bool(mask.any())
+        else action_evidence_delta.new_zeros(())
+    )
+    # Protect every already-correct visual prediction from a sign flip. The
+    # boundary and high-confidence guards already cover their own rows, so the
+    # extra term applies only to the former middle-confidence gap.
+    middle = correct_visual & ~boundary_mask & ~mask
+    sign_guard = (
+        torch.relu(-final_margin)[middle].mean()
+        if bool(middle.any())
+        else action_evidence_delta.new_zeros(())
+    )
+    return confident + boundary + sign_guard
 
 
 def meter_action_loss(
@@ -112,6 +149,7 @@ def meter_action_loss(
     credit_rank = action_delta_pairwise_ranking_loss(
         output["action_evidence_delta"],
         target,
+        visual_logits=output["action_logits_visual"],
         normalizer=output.get("action_correction_kappa"),
     )
     contribution = output["action_factor_contribution"]
