@@ -20,6 +20,8 @@ def test_pu_logits_update_reason_private_parameters_only() -> None:
     assert _grad_sum(model.heca_adapters.pu_private_head.parameters()) > 0.0
     assert _grad_sum(model.heca_adapters.shared_adapter.parameters()) == 0.0
     assert _grad_sum(model.typed_factors.parameters()) == 0.0
+    assert _grad_sum(model.heca_adapters.action_private_adapter.parameters()) == 0.0
+    assert _grad_sum(model.typed_factors.action_bridge_proj.parameters()) == 0.0
     assert _grad_sum(model.action_transport.parameters()) == 0.0
     assert _grad_sum(model.foundation.parameters()) == 0.0
 

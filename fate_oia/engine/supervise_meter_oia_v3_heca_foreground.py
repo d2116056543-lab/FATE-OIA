@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from fate_oia.utils.meter_artifacts import validate_heca_pilot_bundle
+from fate_oia.utils.heca_clean_head import worktree_admission_failures
 from fate_oia.engine.evaluate_meter_oia_v3_heca_pilot import (
     validate_heca_pilot_recomputation,
 )
@@ -25,8 +26,14 @@ def validate_training_readiness(
     review_path: str | Path, pilot_path: str | Path, gate_c_path: str | Path
 ) -> dict[str, object]:
     head = _git("rev-parse", "HEAD")
-    if _git("status", "--porcelain", "--untracked-files=no"):
-        raise RuntimeError("HECA full training requires a clean tracked worktree")
+    worktree_failures = worktree_admission_failures(
+        _git("status", "--porcelain", "--untracked-files=all")
+    )
+    if worktree_failures:
+        raise RuntimeError(
+            "HECA full training requires code represented by the audited HEAD: "
+            + ", ".join(worktree_failures)
+        )
     review = json.loads(Path(review_path).read_text(encoding="utf-8"))
     pilot = json.loads(Path(pilot_path).read_text(encoding="utf-8"))
     gate_c = json.loads(Path(gate_c_path).read_text(encoding="utf-8"))

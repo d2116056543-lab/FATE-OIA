@@ -81,6 +81,7 @@ from fate_oia.utils.meter_posthoc_calibration import (
     fit_train_calib_deploy_theta,
     guard_train_calib_deploy_theta,
 )
+from fate_oia.utils.heca_clean_head import worktree_admission_failures
 
 
 def _seed_everything(seed: int) -> None:
@@ -100,8 +101,20 @@ def _git_head() -> str:
         return "unavailable"
 
 
+def _heca_worktree_admission_failures() -> list[str]:
+    try:
+        status = subprocess.check_output(
+            ["git", "status", "--porcelain", "--untracked-files=all"], text=True
+        )
+    except Exception:
+        return ["git_status_unavailable"]
+    return worktree_admission_failures(status)
+
+
 def _validated_gate_pass(path: str) -> bool:
     if not path:
+        return False
+    if _heca_worktree_admission_failures():
         return False
     source = Path(path)
     if not source.exists() or source.name != "HECA_GATE_C.json":
@@ -336,6 +349,31 @@ def _parameter_groups(
         for name in groups
         if groups[name]
     ]
+
+
+def _action_credit_parameters(model: METEROIAModel) -> tuple[Tensor, ...]:
+    """Return the whole action-only optimizer owner for firewall probes."""
+    prefixes = (
+        "heca_adapters.action_private_adapter.",
+        "typed_factors.action_bridge_proj.",
+        "action_transport.",
+    )
+    return tuple(
+        parameter
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad and name.startswith(prefixes)
+    )
+
+
+def _state_measurement_parameters(model: METEROIAModel) -> tuple[Tensor, ...]:
+    """Return every shared typed-state parameter reached by action credit."""
+    return (
+        model.typed_factors.state_weight,
+        model.typed_factors.state_bias,
+        model.typed_factors.action_state_embeddings,
+        *tuple(model.typed_factors.state_text_proj.parameters()),
+        *tuple(model.typed_factors.global_proj.parameters()),
+    )
 
 
 def _scheduler(optimizer: AdamW, total_updates: int, warmup_ratio: float) -> LambdaLR:
@@ -790,6 +828,8 @@ def _typed_factor_audit(
         state_p = torch.tensor(state_probability[factor])
         state_y = torch.tensor(state_target[factor])
         confidence_p = torch.tensor(visual_confidence[factor])
+        state_positive_count = int(state_y.sum()) if state_y.numel() else 0
+        state_negative_count = int(state_y.numel()) - state_positive_count
         rows.append(
             {
                 "factor_id": factor,
@@ -823,6 +863,12 @@ def _typed_factor_audit(
                 "state_auc": (
                     binary_roc_auc(state_p, state_y) if state_p.numel() else None
                 ),
+                "state_positive_count": state_positive_count,
+                "state_negative_count": state_negative_count,
+                "state_identifiable": bool(
+                    state_positive_count >= 20 and state_negative_count >= 20
+                ),
+                "audit_split": "train_audit",
                 "state_confusion_matrix": state_confusion[factor].tolist(),
                 "provenance_valid_count": provenance_valid_count[factor],
                 "visual_confidence_mean": (
@@ -1216,13 +1262,9 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                 # required audit cadence, never on ordinary micro-batches.
                 action_shared = parts["loss_registry"].owner_total({"action"}) / grad_accum
                 reason_shared = parts["loss_registry"].owner_total({"reason"}) / grad_accum
-                action_credit_parameters = tuple(model.action_transport.parameters())
+                action_credit_parameters = _action_credit_parameters(model)
                 anchor_parameters = tuple(model.typed_factors.anchor_query.parameters())
-                state_measurement_parameters = (
-                    model.typed_factors.state_weight,
-                    model.typed_factors.state_bias,
-                    *tuple(model.typed_factors.global_proj.parameters()),
-                )
+                state_measurement_parameters = _state_measurement_parameters(model)
                 factor_parameters = tuple(model.typed_factors.parameters())
                 foundation_parameters = tuple(
                     parameter
@@ -1248,10 +1290,10 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                     "action_to_anchor_query": _autograd_norm(
                         action_shared, anchor_parameters
                     ),
-                    "action_to_state_bridge_ratio": (
-                        float(config["model"]["action_measurement_grad_scale"])
-                        if action_to_state > 0.0
-                        else 0.0
+                    "action_to_state_bridge_ratio": action_to_state
+                    / max(
+                        _autograd_norm(action_shared, action_credit_parameters),
+                        1e-12,
                     ),
                     "action_to_state_measurement": action_to_state,
                     "action_to_credit_adapter": _autograd_norm(

@@ -120,3 +120,23 @@ def test_full_supervisor_requires_clean_matching_a_to_g(monkeypatch, tmp_path) -
     fake_gate = tmp_path / "fake_gate_c.json"
     fake_gate.write_text(json.dumps({"gate": "C", "pass": True}), encoding="utf-8")
     assert trainer._validated_gate_pass(str(fake_gate)) is False
+
+
+def test_full_supervisor_rejects_untracked_runtime_source_before_reading_artifacts(
+    monkeypatch, tmp_path
+) -> None:
+    def fake_git(*args: str) -> str:
+        if args[:2] == ("rev-parse", "HEAD"):
+            return "head"
+        if args[:2] == ("status", "--porcelain"):
+            return "?? fate_oia/engine/rogue_runtime.py"
+        return ""
+
+    monkeypatch.setattr(supervisor, "_git", fake_git)
+
+    with pytest.raises(RuntimeError, match="untracked_runtime_source"):
+        supervisor.validate_training_readiness(
+            tmp_path / "missing_review.json",
+            tmp_path / "missing_pilot.json",
+            tmp_path / "missing_gate.json",
+        )

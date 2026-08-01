@@ -42,11 +42,19 @@ class StateConditionedActionCredit(nn.Module):
         self.learned_action_factor_bias = nn.Parameter(
             torch.zeros(action_dim, factor_dim)
         )
-        self.factor_value_proj = nn.Linear(dim, rank)
-        self.action_value_query = nn.Parameter(torch.randn(action_dim, rank) * 0.02)
+        # V_r keeps each factor's state value semantically distinct, while
+        # U_a turns the current sample's detached action token into a reader.
+        # The state effect starts at zero, preserving the visual action anchor
+        # while still giving the effect tensor a first-step gradient.
+        self.factor_value_weight = nn.Parameter(torch.empty(factor_dim, rank, dim))
+        self.factor_value_bias = nn.Parameter(torch.zeros(factor_dim, rank))
+        self.action_value_weight = nn.Parameter(torch.empty(action_dim, rank, dim))
+        self.action_value_bias = nn.Parameter(torch.zeros(action_dim, rank))
         self.state_effect_embedding = nn.Parameter(
-            torch.randn(factor_dim, max_states, rank) * 0.02
+            torch.zeros(factor_dim, max_states, rank)
         )
+        nn.init.xavier_uniform_(self.factor_value_weight)
+        nn.init.xavier_uniform_(self.action_value_weight)
         self.register_buffer(
             "running_visual_rms", torch.ones(action_dim), persistent=True
         )
@@ -106,13 +114,18 @@ class StateConditionedActionCredit(nn.Module):
         )
         factor_weight = entmax15_bisect(allocation_score, dim=-1)
 
-        base_value = self.factor_value_proj(factor_action_bridge_token)
+        factor_value_embedding = torch.einsum(
+            "bfd,frd->bfr", factor_action_bridge_token, self.factor_value_weight
+        ) + self.factor_value_bias.unsqueeze(0)
+        action_value_query = torch.einsum(
+            "bad,ard->bar", action_nodes.detach(), self.action_value_weight
+        ) + self.action_value_bias.unsqueeze(0)
         state_modulated = (
-            base_value.unsqueeze(2)
+            factor_value_embedding.unsqueeze(2)
             * self.state_effect_embedding.unsqueeze(0)
         )
         raw_state_values = torch.einsum(
-            "bfsr,ar->bafs", state_modulated, self.action_value_query
+            "bar,bfsr->bafs", action_value_query, state_modulated
         )
         weighted_state_values = (
             raw_state_values * factor_state_prob_credit.unsqueeze(1)
