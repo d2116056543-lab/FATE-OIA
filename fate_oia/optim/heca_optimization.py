@@ -122,15 +122,6 @@ class ReasonProbabilityEMA:
         self.values = {str(key): value.detach().cpu() for key, value in dict(state.get("values", {})).items()}
 
 
-def corruption_microbatch_index(
-    epoch: int, micro_step: int, microbatches_per_epoch: int
-) -> int:
-    """Return the resume-stable identity-corruption phase for one batch."""
-    if int(epoch) < 0 or int(micro_step) < 0 or int(microbatches_per_epoch) <= 0:
-        raise ValueError("HECA corruption schedule requires non-negative batch indices")
-    return int(epoch) * int(microbatches_per_epoch) + int(micro_step)
-
-
 def identity_corruption_mode(microbatch_index: int) -> str:
     return ("schema", "cross_sample", "state")[int(microbatch_index) % 3]
 
@@ -159,6 +150,7 @@ class HECAScheduleState:
     update: int
     total_updates: int
     corruption_phase: int = 0
+    corruption_microbatch_index: int = 0
     foundation_grad_ema: float = 0.0
     action_floor: float | None = None
     reason_floor: float | None = None

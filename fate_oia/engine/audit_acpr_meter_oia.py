@@ -392,6 +392,7 @@ def _dynamic_checks(device: torch.device) -> dict[str, Any]:
         grounding_ramp=1.0,
         mechanism_ramp=1.0,
         pu_lambda=torch.zeros(21, device=device),
+        corruption_step=0,
     )
     trainer_total.backward()
     trainer_grads = _module_gradient_report(model)
