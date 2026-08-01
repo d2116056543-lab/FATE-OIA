@@ -53,6 +53,7 @@ from fate_oia.optim.heca_optimization import (
     HECALossRegistry,
     HECAScheduleState,
     ReasonProbabilityEMA,
+    corruption_microbatch_index,
     correction_fraction_for_run,
     identity_corruption_mode,
     validate_formal_protocol,
@@ -406,11 +407,14 @@ def _compute_losses(
     pu_lambda: Tensor,
     mirror_output: dict[str, Any] | None = None,
     optimizer_step: int = 0,
+    corruption_step: int | None = None,
     view_kind: str = "mirror",
 ) -> tuple[Tensor, dict[str, Any]]:
     action_target = batch["action"]
     reason_target = batch["reason"]
-    mode = identity_corruption_mode(optimizer_step)
+    mode = identity_corruption_mode(
+        optimizer_step if corruption_step is None else corruption_step
+    )
     corrupt = _identity_output(model, output, mechanism_ramp, mode)
     identity = identity_corruption_loss(
         output["action_factor_contribution"],
@@ -1183,6 +1187,9 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                 output["reason_ema_probability"] = reason_probability_ema.values_for(
                     [str(name) for name in batch["file_name"]], reason_fallback
                 )
+                corruption_step = corruption_microbatch_index(
+                    epoch, micro_step, len(train_loader)
+                )
                 total, parts = _compute_losses(
                     model,
                     output,
@@ -1195,6 +1202,7 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                     ),
                     mirror_output=mirror_output,
                     optimizer_step=optimizer_step,
+                    corruption_step=corruption_step,
                     view_kind=view_kind,
                 )
                 scaled = total / grad_accum
@@ -1331,7 +1339,7 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                 window_microbatches = 0
                 optimizer_step += 1
                 schedule_state.update = optimizer_step
-                schedule_state.corruption_phase = optimizer_step % 3
+                schedule_state.corruption_phase = (corruption_step + 1) % 3
                 schedule_state.action_floor = excess_risk.action_floor
                 schedule_state.reason_floor = excess_risk.reason_floor
                 visual_rms = output["action_logits_visual"].detach().float().square().mean(0).sqrt()
