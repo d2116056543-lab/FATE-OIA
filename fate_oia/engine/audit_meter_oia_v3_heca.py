@@ -64,6 +64,8 @@ def _source_checks(root: Path, config: dict[str, Any]) -> dict[str, Any]:
     pilot_script = (root / "scripts/FATE_OIA_meter_oia_v3_heca_pilot.ps1").read_text(
         encoding="utf-8"
     )
+    offline_encoder_path = str(config["artifacts"]["offline_text_encoder_path"])
+    offline_encoder_script_path = offline_encoder_path.replace("/", "\\")
     forbidden_tokens = {
         "hard_action_factor_field": "compatible" + "_" + "actions",
         "admission_parameter": "action_evidence_" + "admission",
@@ -87,10 +89,10 @@ def _source_checks(root: Path, config: dict[str, Any]) -> dict[str, Any]:
         "offline_ontology_export": (
             "local_files_only=True" in exporter
             and "all-MiniLM-L6-v2" not in exporter
-            and "TextEncoderPath" in pilot_script
-            and config["artifacts"]["offline_text_encoder_path"].endswith(
-                "frozen_bert_base_uncased"
-            )
+            and "[string]$TextEncoderPath" not in pilot_script
+            and f'$TextEncoderPath = "{offline_encoder_script_path}"' in pilot_script
+            and '"--encoder_id", $TextEncoderPath' in pilot_script
+            and offline_encoder_path.endswith("frozen_bert_base_uncased")
         ),
     }
     return {
