@@ -48,6 +48,28 @@ def test_heca_reason_evidence_residual_removes_constant_label_offset() -> None:
     )
 
 
+def test_heca_global_reason_residual_is_bounded_against_calalign_anchor() -> None:
+    decoder = METERPrivateReasonDecoder(
+        dim=4, reason_dim=2, action_dim=4, max_global_delta=0.05
+    )
+    with torch.no_grad():
+        decoder.global_delta_gate_raw.fill_(10.0)
+        decoder.global_delta_head.weight.fill_(10.0)
+        decoder.global_delta_head.bias.fill_(10.0)
+    anchor = torch.zeros(2, 2)
+    output = decoder(
+        reason_logits_calalign=anchor,
+        reason_nodes=torch.ones(2, 2, 4),
+        factor_measurement_token=torch.zeros(2, 2, 4),
+        factor_reliability=torch.ones(2, 2),
+        factor_groundable_mask=torch.ones(2),
+        progress=1.0,
+    )
+
+    deployed_delta = output["reason_logits_global"] - anchor
+    assert deployed_delta.abs().max() <= 0.050001
+
+
 def test_heca_root_cause_guard_config_matches_pilot_fix() -> None:
     config = yaml.safe_load(
         Path("configs/fate_oia_train_360x640_acpr_meter_oia_v3_heca.yaml").read_text(encoding="utf-8")
@@ -55,3 +77,4 @@ def test_heca_root_cause_guard_config_matches_pilot_fix() -> None:
     assert config["model"]["action_measurement_grad_scale"] == 0.20
     assert config["loss_weights"]["action_nonreg"] == 0.15
     assert config["loss_weights"]["action_nonreg_boundary_margin"] == 0.05
+    assert config["model"]["reason_global_delta_cap"] == 0.05
