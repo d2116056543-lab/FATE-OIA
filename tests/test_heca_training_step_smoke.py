@@ -29,7 +29,7 @@ def test_heca_real_loss_graph_one_update_is_finite() -> None:
         mechanism_ramp=0.5,
         pu_lambda=torch.zeros(21),
         mirror_output=view,
-        optimizer_step=1,
+        corruption_step=1,
         view_kind="mirror",
     )
     action_shared = parts["loss_registry"].owner_total({"action"})
