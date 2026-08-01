@@ -1361,6 +1361,13 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                         model.parameters(), float(config["training"]["grad_clip_global"])
                     )
                 )
+                # Keep this with the probe's pre-step gradients, not the
+                # updated weights produced by optimizer.step().
+                action_state_effect_norm = float(
+                    model.action_transport.state_effect_embedding.detach()
+                    .float()
+                    .norm()
+                )
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -1392,11 +1399,7 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                             "action_credit_ramp": float(
                                 output["action_credit_ramp"].detach()
                             ),
-                            "action_state_effect_norm": float(
-                                model.action_transport.state_effect_embedding.detach()
-                                .float()
-                                .norm()
-                            ),
+                            "action_state_effect_norm": action_state_effect_norm,
                             "shared_action_weight": active_balance["action"],
                             "shared_reason_weight": active_balance["reason"],
                             "next_shared_action_weight": next_balance["action"],

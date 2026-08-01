@@ -30,8 +30,8 @@ def selective_credit_bridge(
     scale: float = 0.05,
 ) -> Tensor:
     """Expose semantic evidence to action without letting action move anchors."""
-    if not 0.0 <= scale <= 0.10:
-        raise ValueError("HECA measurement bridge scale must be in [0, 0.10]")
+    if not 0.0 <= scale <= 0.20:
+        raise ValueError("HECA measurement bridge scale must be in [0, 0.20]")
     state_bridge = state.detach() + scale * (state - state.detach())
     global_bridge = global_token.detach() + scale * (
         global_token - global_token.detach()
