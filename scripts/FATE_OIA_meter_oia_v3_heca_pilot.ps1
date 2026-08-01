@@ -3,7 +3,6 @@ param(
   [int]$GradAccum = 5,
   [int]$NumWorkers = 4,
   [string]$Device = "cuda",
-  [string]$TextEncoderPath = "artifacts\heca\frozen_bert_base_uncased",
   [string]$OutputDir = ".background_runs\meter_oia_v3_heca_pilot",
   [string]$PreflightDir = ".background_runs\meter_oia_v3_heca_preflight"
 )
@@ -11,6 +10,7 @@ param(
 $ErrorActionPreference = "Stop"
 $Python = "E:\Anaconda\envs\sbw39\python.exe"
 $Config = "configs\fate_oia_train_360x640_acpr_meter_oia_v3_heca.yaml"
+$TextEncoderPath = "artifacts\heca\frozen_bert_base_uncased"
 
 $ExportArgs = @("-m", "fate_oia.engine.export_heca_ontology_prototypes", "--schema", "configs\meter_factor_schema.yaml", "--output_dir", "artifacts\heca", "--encoder_id", $TextEncoderPath)
 & $Python @ExportArgs
