@@ -56,7 +56,9 @@ model:
   pilot_action_correction_fraction: 0.20
   action_max_delta: 1.0
   action_logit_norm_cap: 20.0
-  action_measurement_grad_scale: 0.05
+  # Calibrated to produce a measured 1--10% action-to-state gradient ratio
+  # while preserving the zero-init visual action anchor.
+  action_measurement_grad_scale: 0.16
   use_hard_action_factor_mask: false
   use_admission_gate: false
   token_compression: none
@@ -92,7 +94,7 @@ training:
   lr_measurement: 0.00020
   lr_action_credit: 0.00020
   lr_reason_global: 0.00020
-  lr_reason_correction: 0.00025
+  lr_reason_correction: 0.00040
 
 loss_weights:
   action_final: 1.00

@@ -73,6 +73,8 @@ class TypedEvidenceStateHead(nn.Module):
         self.action_measurement_grad_scale = float(action_measurement_grad_scale)
         if not 0.0 <= self.anchor_exploration_mass < 1.0:
             raise ValueError("anchor_exploration_mass must be in [0, 1)")
+        if not 0.0 <= self.action_measurement_grad_scale <= 0.20:
+            raise ValueError("action_measurement_grad_scale must be in [0, 0.20]")
         self.max_states = max(state_cardinalities)
         self.register_buffer(
             "state_cardinalities",

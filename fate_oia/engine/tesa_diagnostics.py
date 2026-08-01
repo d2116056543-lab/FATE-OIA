@@ -44,6 +44,33 @@ REQUIRED_TESA_ARTIFACT_FIELDS = {
 }
 
 
+def select_target_supporting_factors(
+    contribution: Tensor,
+    eligible: Tensor,
+    *,
+    factors_per_action: int,
+) -> list[int]:
+    """Select only factors that raise the predicted target logit.
+
+    The deletion audit asks whether removing *supporting* evidence lowers a
+    target action.  Ranking by absolute contribution would also select a
+    strongly negative factor, whose deletion should increase that action and
+    would turn a valid directional audit into self-cancelling noise.
+    """
+    if contribution.ndim != 1 or eligible.ndim != 1:
+        raise ValueError("contribution and eligible must be rank-1 tensors")
+    if contribution.shape != eligible.shape:
+        raise ValueError("contribution and eligible must have identical shapes")
+    if factors_per_action <= 0:
+        return []
+    supporting = eligible.to(torch.bool) & (contribution > 0)
+    count = min(int(factors_per_action), int(supporting.sum()))
+    if count == 0:
+        return []
+    values = contribution.masked_fill(~supporting, float("-inf"))
+    return [int(index) for index in torch.topk(values, k=count).indices.tolist()]
+
+
 def schema_token_mismatch(token: Tensor) -> Tensor:
     return torch.roll(token, shifts=-1, dims=1)
 
@@ -334,14 +361,11 @@ def run_stratified_patch_audit(
             factors_by_action: dict[int, list[int]] = {}
             for action in selected_actions:
                 eligible = source_eligible & allowed[action]
-                top_count = min(int(factors_per_action), int(eligible.sum()))
-                if top_count == 0:
-                    factors_by_action[int(action)] = []
-                    continue
-                top_candidates = torch.topk(
-                    contributions[action].abs().masked_fill(~eligible, -1),
-                    k=top_count,
-                ).indices.tolist()
+                top_candidates = select_target_supporting_factors(
+                    contributions[action],
+                    eligible,
+                    factors_per_action=factors_per_action,
+                )
                 model_top_factor_coverage.update(
                     int(value) for value in top_candidates
                 )
@@ -390,7 +414,7 @@ def run_stratified_patch_audit(
                             "sample_id": str(sample_id),
                             "action_id": int(action),
                             "factor_id": int(factor),
-                            "selection_mode": "model_top_predicted_action",
+                            "selection_mode": "model_top_positive_target_contribution",
                             "clean_action_logit": float(clean_logit),
                             "factor_contribution": float(contribution),
                             "schema_compatible": bool(allowed[action, factor]),
