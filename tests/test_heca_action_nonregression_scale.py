@@ -128,6 +128,22 @@ def test_nonregression_protects_a_correct_negative_at_the_inclusive_zero_thresho
     assert delta.grad is not None and delta.grad.abs().sum() > 0
 
 
+def test_nonregression_does_not_penalize_a_correct_positive_at_the_zero_threshold() -> None:
+    target = torch.tensor([[1.0, 1.0, 1.0]])
+    visual = torch.tensor([[0.20, 0.10, 0.30]], requires_grad=True)
+    delta = torch.tensor([[0.0, -0.10, 0.0]], requires_grad=True)
+
+    loss = action_nonregression_loss(
+        visual,
+        delta,
+        target,
+        min_margin=0.05,
+        confidence_quantile=1.0,
+    )
+
+    assert loss.eq(0)
+
+
 def test_nonregression_guards_correct_near_boundary_predictions() -> None:
     target = torch.tensor([[1.0, 0.0]])
     visual = torch.tensor([[0.01, -0.01]], requires_grad=True)

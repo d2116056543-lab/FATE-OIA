@@ -132,10 +132,14 @@ def action_nonregression_loss(
     # boundary and high-confidence guards already cover their own rows, so the
     # extra term applies only to the former middle-confidence gap.
     middle = correct_visual & ~boundary_mask & ~mask
-    # Fixed-threshold evaluation predicts positive at logit zero. Keep a small
-    # strictly-positive buffer so correct negative middle-margin rows cannot
-    # silently cross that inclusive decision boundary.
-    fixed_threshold_buffer = final_margin.new_tensor(1e-4)
+    # Fixed-threshold evaluation predicts positive at logit zero. Only a
+    # negative target needs a strictly-positive buffer: a positive target at
+    # zero is already a correct prediction under the deployed rule.
+    fixed_threshold_buffer = torch.where(
+        target < 0.5,
+        final_margin.new_tensor(1e-4),
+        final_margin.new_zeros(()),
+    )
     sign_guard = (
         torch.relu(fixed_threshold_buffer - final_margin)[middle].mean()
         if bool(middle.any())
