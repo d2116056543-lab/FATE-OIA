@@ -10,6 +10,7 @@ def _row(*, ramp: float, ratio: float) -> dict[str, float]:
         "pu_to_action_factor": 0.0,
         "measurement_to_foundation": 0.0,
         "action_credit_ramp": ramp,
+        "action_state_effect_norm": 0.02,
     }
 
 
@@ -26,4 +27,14 @@ def test_ownership_gate_rejects_active_state_bridge_below_floor() -> None:
     eligible, checks = _ownership_gate_rows([_row(ramp=1.0, ratio=0.003)])
 
     assert len(eligible) == 1
+    assert checks == [False]
+
+
+def test_ownership_gate_fails_closed_when_active_ramp_telemetry_is_missing() -> None:
+    row = _row(ramp=1.0, ratio=0.02)
+    row.pop("action_credit_ramp")
+
+    eligible, checks = _ownership_gate_rows([row])
+
+    assert eligible == []
     assert checks == [False]

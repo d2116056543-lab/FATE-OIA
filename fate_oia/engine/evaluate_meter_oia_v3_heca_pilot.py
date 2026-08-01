@@ -55,17 +55,26 @@ def _ownership_gate_rows(
     visual action anchor.  Its pre-ramp probe is useful telemetry but cannot
     establish an active-path gradient ownership violation.  Once the ramp is
     active, the original 1--10 percent firewall remains a hard requirement.
-    Missing ramp metadata is treated as an active legacy row so older artifacts
-    fail closed on the original checks rather than being silently skipped.
+    Every row must contain finite ramp and state-effect telemetry.  Rows before
+    the scheduled ramp are excluded only after that evidence is present; old or
+    malformed artifacts fail closed rather than inheriting an active default.
     """
-    active_rows = [
-        row
-        for row in gradient_rows
-        if _finite(row.get("action_credit_ramp", 1.0))
-        and float(row.get("action_credit_ramp", 1.0)) >= 0.80
-    ]
+    active_rows: list[dict[str, Any]] = []
     checks: list[bool] = []
-    for row in active_rows:
+    for row in gradient_rows:
+        ramp = row.get("action_credit_ramp")
+        state_effect_norm = row.get("action_state_effect_norm")
+        if (
+            not _finite(ramp)
+            or not _finite(state_effect_norm)
+            or not 0.0 <= float(ramp) <= 1.0
+            or float(state_effect_norm) < 0.0
+        ):
+            checks.append(False)
+            continue
+        if float(ramp) < 0.80:
+            continue
+        active_rows.append(row)
         required = (
             "action_to_anchor_query",
             "action_to_state_bridge_ratio",
@@ -289,12 +298,19 @@ def evaluate_heca_pilot(
     active_ownership_rows, ownership_checks = _ownership_gate_rows(gradient_rows)
     gate_e = _gate(
         "E",
-        bool(ownership_checks) and all(ownership_checks),
+        len(active_ownership_rows) >= 2
+        and len(ownership_checks) == len(active_ownership_rows)
+        and all(ownership_checks),
         {
             "row_count": len(gradient_rows),
             "active_row_count": len(active_ownership_rows),
             "ignored_pre_ramp_row_count": len(gradient_rows) - len(active_ownership_rows),
-            "all_active_rows_pass": bool(ownership_checks) and all(ownership_checks),
+            "all_active_rows_pass": (
+                len(ownership_checks) == len(active_ownership_rows)
+                and bool(ownership_checks)
+                and all(ownership_checks)
+            ),
+            "minimum_active_rows": 2,
         },
     )
 

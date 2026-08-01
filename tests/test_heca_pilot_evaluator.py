@@ -114,7 +114,9 @@ def _inputs() -> tuple[list[dict], dict, dict, dict, list[dict]]:
     }
     gradients = [
         {
-            "optimizer_step": 1,
+            "optimizer_step": step,
+            "action_credit_ramp": 1.0,
+            "action_state_effect_norm": 0.02,
             "action_to_anchor_query": 0.0,
             "action_to_state_bridge_ratio": 0.05,
             "action_to_credit_adapter": 1.0,
@@ -122,6 +124,7 @@ def _inputs() -> tuple[list[dict], dict, dict, dict, list[dict]]:
             "pu_to_action_factor": 0.0,
             "measurement_to_foundation": 0.0,
         }
+        for step in (1, 2)
     ]
     return epochs, audit, ontology, tau, gradients
 
