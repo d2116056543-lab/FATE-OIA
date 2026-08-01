@@ -496,6 +496,9 @@ def main() -> None:
         action_measurement_grad_scale=float(
             config["model"].get("action_measurement_grad_scale", 0.05)
         ),
+        action_allocation_logit_scale=float(
+            config["model"].get("action_allocation_logit_scale", 4.0)
+        ),
         factor_text_prototype_path=config["model"].get(
             "factor_text_prototype_path"
         ),

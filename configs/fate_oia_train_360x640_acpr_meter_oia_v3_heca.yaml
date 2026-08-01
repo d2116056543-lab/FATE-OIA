@@ -58,7 +58,8 @@ model:
   action_logit_norm_cap: 20.0
   # Calibrated to produce a measured 1--10% action-to-state gradient ratio
   # while preserving the zero-init visual action anchor.
-  action_measurement_grad_scale: 0.16
+  action_measurement_grad_scale: 0.20
+  action_allocation_logit_scale: 4.0
   use_hard_action_factor_mask: false
   use_admission_gate: false
   token_compression: none
@@ -102,13 +103,13 @@ loss_weights:
   action_credit_rank: 0.10
   action_necessity: 0.05
   action_specificity: 0.05
-  action_nonreg: 0.05
+  action_nonreg: 0.15
   action_soft_f1: 0.06
   action_cardinality: 0.02
   action_logit_scale: 0.01
   action_nonreg_min_margin: 0.05
   action_nonreg_confidence_quantile: 0.75
-  action_nonreg_boundary_margin: 0.02
+  action_nonreg_boundary_margin: 0.05
   reason_final: 1.00
   reason_global: 0.50
   reason_rank: 0.08

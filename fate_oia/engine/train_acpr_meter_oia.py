@@ -1067,6 +1067,9 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
         action_measurement_grad_scale=float(
             config["model"].get("action_measurement_grad_scale", 0.05)
         ),
+        action_allocation_logit_scale=float(
+            config["model"].get("action_allocation_logit_scale", 4.0)
+        ),
         factor_text_prototype_path=(
             prototype_factor_path
             if prototype_factor_path and Path(prototype_factor_path).exists()

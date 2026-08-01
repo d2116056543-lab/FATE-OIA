@@ -24,6 +24,7 @@ class StateConditionedActionCredit(nn.Module):
         correction_fraction: float = 0.20,
         max_action_delta: float = 1.0,
         rms_momentum: float = 0.95,
+        allocation_logit_scale: float = 4.0,
     ) -> None:
         super().__init__()
         self.action_dim = int(action_dim)
@@ -37,6 +38,7 @@ class StateConditionedActionCredit(nn.Module):
         )
         self.max_action_delta = float(max_action_delta)
         self.rms_momentum = float(rms_momentum)
+        self.allocation_logit_scale = float(allocation_logit_scale)
         self.action_query = nn.Linear(dim, dim, bias=False)
         self.factor_key = nn.Linear(dim, dim, bias=False)
         self.learned_action_factor_bias = nn.Parameter(
@@ -92,11 +94,18 @@ class StateConditionedActionCredit(nn.Module):
         ):
             raise ValueError("Expected HECA state probabilities [B,F,S]")
         owner = self._ownership(factor_action_ownership, action_logits_visual)
-        query = self.action_query(action_nodes.detach())
-        key = self.factor_key(factor_action_bridge_token)
+        # The route should reflect query-key alignment, not the arbitrary
+        # magnitude of an individual factor token. Cosine scores prevent a
+        # high-norm factor from monopolizing every action allocation.
+        query = torch.nn.functional.normalize(
+            self.action_query(action_nodes.detach()), dim=-1, eps=1e-6
+        )
+        key = torch.nn.functional.normalize(
+            self.factor_key(factor_action_bridge_token), dim=-1, eps=1e-6
+        )
         allocation_score = (
             torch.einsum("bad,bfd->baf", query, key)
-            / query.shape[-1] ** 0.5
+            * self.allocation_logit_scale
             + self.learned_action_factor_bias
         )
         if diagnostic_schema_target is not None:
