@@ -3,10 +3,14 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import torch
 import yaml
+
+
+DEFAULT_OFFLINE_TEXT_ENCODER = "artifacts/heca/frozen_bert_base_uncased"
 
 
 def _sha256(path: Path) -> str:
@@ -18,16 +22,22 @@ def export_prototypes(
     schema_path: str | Path,
     output_dir: str | Path,
     *,
-    encoder_id: str = "sentence-transformers/all-MiniLM-L6-v2",
+    encoder_id: str = DEFAULT_OFFLINE_TEXT_ENCODER,
 ) -> dict[str, object]:
     # The text tower exists only in this offline command. Runtime model files
     # contain no tokenizer/model imports and only load the emitted tensors.
+    # This environment includes an incompatible optional TensorFlow install;
+    # explicitly selecting the PyTorch backend keeps the one-time export local.
+    os.environ.setdefault("USE_TF", "0")
+    os.environ.setdefault("USE_TORCH", "1")
     from transformers import AutoModel, AutoTokenizer
 
     schema = yaml.safe_load(Path(schema_path).read_text(encoding="utf-8"))
     rows = list(schema["factors"])
-    tokenizer = AutoTokenizer.from_pretrained(encoder_id)
-    encoder = AutoModel.from_pretrained(encoder_id).eval()
+    # Ontology text is a one-time, reproducible offline artifact. A network
+    # fallback would make Gate results depend on host connectivity.
+    tokenizer = AutoTokenizer.from_pretrained(encoder_id, local_files_only=True)
+    encoder = AutoModel.from_pretrained(encoder_id, local_files_only=True).eval()
     for parameter in encoder.parameters():
         parameter.requires_grad = False
 
@@ -61,6 +71,7 @@ def export_prototypes(
         "state_count": max_states,
         "encoder_id": encoder_id,
         "offline_only": True,
+        "local_files_only": True,
         "schema_path": str(schema_path),
         "schema_sha256": _sha256(Path(schema_path)),
         "factor_prompts": factor_prompts,
@@ -89,7 +100,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--schema", default="configs/meter_factor_schema.yaml")
     parser.add_argument("--output_dir", default="artifacts/heca")
-    parser.add_argument("--encoder_id", default="sentence-transformers/all-MiniLM-L6-v2")
+    parser.add_argument("--encoder_id", default=DEFAULT_OFFLINE_TEXT_ENCODER)
     args = parser.parse_args()
     print(json.dumps(export_prototypes(args.schema, args.output_dir, encoder_id=args.encoder_id), indent=2))
 

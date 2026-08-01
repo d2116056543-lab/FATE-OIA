@@ -1,5 +1,6 @@
 .review/
 .background_runs/
+/artifacts/
 *.pth
 *.pt
 *.ckpt

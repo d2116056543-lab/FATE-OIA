@@ -65,6 +65,9 @@ model:
   use_selector: false
   use_formal_meta: false
 
+artifacts:
+  offline_text_encoder_path: artifacts/heca/frozen_bert_base_uncased
+
 training:
   from_scratch: true
   epochs: 14
