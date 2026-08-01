@@ -354,6 +354,56 @@ class METERTypedTargetBuilder:
         present_valid |= anchor_valid
         absent_valid &= ~anchor_valid
 
+        # Observability is factor-local evidence availability, not whether an
+        # annotation file happened to exist.  A complete source can therefore
+        # supervise an observed-negative row when the named local factor is
+        # absent.  This keeps the learned observability posterior informative
+        # instead of teaching every factor to predict one.
+        drivable_path = record.get("drivable_map_path")
+        has_drivable_source = bool(drivable_path) and Path(str(drivable_path)).is_file()
+        has_lane_source = bool(record.get("lanes") or record.get("polylines")) or any(
+            obj.get("poly2d")
+            and any(name in _category(obj) for name in ("lane", "road marking"))
+            for obj in objects
+        )
+        observability.zero_()
+        observability_valid.zero_()
+
+        def set_observability(factor_id: int, valid: bool, observed: bool) -> None:
+            observability_valid[factor_id] = bool(valid)
+            observability[factor_id] = float(bool(observed)) if valid else 0.0
+
+        # Factor 0 is a color attribute. A missing colour is unknown even when
+        # an object detector found a light, because `light_and_color_visible`
+        # has not been established. A complete object source alone cannot
+        # fabricate a red/green observation.
+        set_observability(0, bool(state_valid[0]), bool(state_valid[0]))
+        # Object-presence factors are observed whenever the source is complete:
+        # no instance is an explicit `absent_observable` state, not an unknown
+        # label. Observability therefore represents source visibility, whereas
+        # state/null represent factor presence and localized evidence.
+        for factor_id in (1, 3, 4, 5, 6, 7, 8):
+            set_observability(factor_id, detection_complete, detection_complete)
+        # Corridor occupancy depends on both a usable drivable map and the
+        # complete object source.  Clear corridors are observable through their
+        # local corridor anchor, while a missing corridor is an observed-zero.
+        for factor_id in (2, 10, 16):
+            set_observability(
+                factor_id,
+                detection_complete and has_drivable_source,
+                detection_complete and has_drivable_source,
+            )
+        # Lane/boundary factors use a lane source when present.  No lane source
+        # remains unknown rather than being fabricated as a negative.
+        for factor_id in (9, 11, 12, 15, 17, 18):
+            set_observability(factor_id, has_lane_source, has_lane_source)
+        # Directional-light factors are observable only with an explicit
+        # directional state.  Their absent light case is a valid observed-zero.
+        for factor_id in (13, 19):
+            set_observability(  # explicit directional color is the only target
+                factor_id, detection_complete, bool(state_valid[factor_id])
+            )
+
         flat = anchor.flatten(1)
         flat = torch.where(anchor_valid.unsqueeze(-1), flat / flat.sum(-1, keepdim=True).clamp_min(1.0), flat)
         return {

@@ -81,9 +81,18 @@ def evaluate_heca_pilot(
 
     per_factor = typed.get("train_audit", {}).get("per_factor", [])
     quality_ids = []
+    observability_identifiable_ids = []
     for row in per_factor if isinstance(per_factor, list) else []:
         if not isinstance(row, dict):
             continue
+        observability_positive_count = int(row.get("observability_positive_count", 0))
+        observability_negative_count = int(row.get("observability_negative_count", 0))
+        observability_identifiable = (
+            observability_positive_count >= 20
+            and observability_negative_count >= 20
+        )
+        if observability_identifiable:
+            observability_identifiable_ids.append(int(row.get("factor_id", -1)))
         values = (
             row.get("same_type_margin"),
             row.get("state_auprc"),
@@ -100,7 +109,8 @@ def evaluate_heca_pilot(
             and float(row["state_auprc"]) > float(row["state_frequency_baseline"])
             and float(row["state_auc"]) > 0.5
             and float(row["state_auc"]) > float(row["state_frequency_baseline"])
-            and 0.05 < float(row["observability_mean"]) < 0.95
+            and observability_identifiable
+            and float(row["observability_auc"]) > 0.5
             and float(row["observability_std"]) > 0.01
         ):
             quality_ids.append(int(row["factor_id"]))
@@ -120,6 +130,10 @@ def evaluate_heca_pilot(
         {
             "quality_factor_ids": quality_ids,
             "quality_factor_count": len(quality_ids),
+            "observability_identifiable_factor_ids": observability_identifiable_ids,
+            "observability_identifiable_factor_count": len(
+                observability_identifiable_ids
+            ),
             "factor_specific_tau": tau_specific,
         },
     )
@@ -283,7 +297,11 @@ def evaluate_heca_pilot(
         "G",
         all(_finite(epoch.get("max_action_logit")) and float(epoch["max_action_logit"]) < 30.0 for epoch in epochs)
         and all(_finite(epoch.get("foundation_grad_ema")) and float(epoch["foundation_grad_ema"]) < 10.0 for epoch in epochs)
-        and all(_finite(epoch.get("emergency_cap_rate")) and float(epoch["emergency_cap_rate"]) <= 0.01 for epoch in epochs)
+        and all(
+            _finite(epoch.get("action_emergency_cap_rate"))
+            and float(epoch["action_emergency_cap_rate"]) <= 0.01
+            for epoch in epochs
+        )
         and _finite(runtime.get("peak_reserved_gb"))
         and float(runtime["peak_reserved_gb"]) < 45.0
         and isinstance(dino, dict)
@@ -292,7 +310,11 @@ def evaluate_heca_pilot(
         {
             "max_action_logit": max(float(epoch["max_action_logit"]) for epoch in epochs if _finite(epoch.get("max_action_logit"))),
             "max_foundation_grad_ema": max(float(epoch["foundation_grad_ema"]) for epoch in epochs if _finite(epoch.get("foundation_grad_ema"))),
-            "max_emergency_cap_rate": max(float(epoch["emergency_cap_rate"]) for epoch in epochs if _finite(epoch.get("emergency_cap_rate"))),
+            "max_action_emergency_cap_rate": max(
+                float(epoch["action_emergency_cap_rate"])
+                for epoch in epochs
+                if _finite(epoch.get("action_emergency_cap_rate"))
+            ),
             "peak_reserved_gb": runtime.get("peak_reserved_gb"),
             "dino_call_count": dino,
         },
@@ -314,16 +336,16 @@ def _epoch_payload(directory: Path) -> dict[str, Any]:
     epoch_rows = [row for row in rows if int(row.get("epoch", -1)) == epoch_index]
     if not epoch_rows:
         raise ValueError(f"No loss rows for {directory.name}")
+    action_cap_rates = [row.get("action_emergency_cap_rate") for row in epoch_rows]
+    if not all(_finite(value) for value in action_cap_rates):
+        raise ValueError(f"Missing action emergency-cap telemetry for {directory.name}")
     return {
         "branches": _read_json(directory / "branch_metrics.json"),
         "typed": _read_json(directory / "typed_evidence.json"),
         "runtime": _read_json(directory / "runtime.json"),
         "max_action_logit": max(float(row["action_final_logit_abs_max"]) for row in epoch_rows),
         "foundation_grad_ema": max(float(row.get("foundation_grad_ema", 0.0)) for row in epoch_rows),
-        "emergency_cap_rate": sum(
-            float(row.get("foundation_grad_norm", 0.0)) > float(row.get("foundation_grad_cap", 1.0))
-            for row in epoch_rows
-        ) / len(epoch_rows),
+        "action_emergency_cap_rate": sum(map(float, action_cap_rates)) / len(epoch_rows),
     }
 
 

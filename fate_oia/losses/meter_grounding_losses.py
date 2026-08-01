@@ -76,6 +76,7 @@ def mirror_equivariance_loss(
     *,
     factor_pairs: tuple[tuple[int, int], ...] = DEFAULT_MIRROR_PAIRS,
     action_pairs: tuple[tuple[int, int], ...] = DEFAULT_ACTION_MIRROR_PAIRS,
+    include_task_logits: bool = False,
 ) -> tuple[Tensor, dict[str, Any]]:
     """Compare paired original/mirror forwards, never same-image left/right states."""
     components = mirror_equivariance_components(
@@ -96,7 +97,13 @@ def mirror_equivariance_loss(
                 - torch.flip(mirrored["factor_anchor_map"][:, factor], dims=[-1])
             ).abs().mean()
             per_factor_margin[str(factor)] = float((wrong - correct).detach())
-    loss = sum(components.values())
+    # Mirror grounding is owned by typed measurement.  Task-logit mirror
+    # disagreement remains reportable, but it must not backpropagate into the
+    # CalAlign foundation through the measurement loss owner.
+    loss_components = components.values() if include_task_logits else (
+        components["anchor"], components["state"]
+    )
+    loss = sum(loss_components)
     return loss, {
         "paired_forward": True,
         "anchor_l1": float(components["anchor"].detach()),
@@ -285,6 +292,7 @@ def discrimination_and_mirror_loss(
             },
             mirrored_output,
             factor_pairs=mirror_pairs,
+            include_task_logits=False,
         )[0]
         if mirrored_output is not None
         else token.new_zeros(())
