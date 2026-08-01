@@ -15,6 +15,7 @@ class METERPrivateReasonDecoder(nn.Module):
         reason_dim: int = 21,
         action_dim: int = 4,
         max_correction: float = 0.50,
+        max_global_delta: float = 0.05,
     ) -> None:
         super().__init__()
         self.dim = int(dim)
@@ -34,6 +35,12 @@ class METERPrivateReasonDecoder(nn.Module):
             torch.full((reason_dim,), -2.2521685)
         )
         self.max_correction = float(max_correction)
+        if float(max_global_delta) <= 0.0:
+            raise ValueError("HECA max_global_delta must be positive")
+        # CalAlign owns static label calibration. The private global reader is
+        # therefore permitted to resolve only small, sample-specific ranking
+        # errors; an unrestricted residual becomes a second threshold head.
+        self.max_global_delta = float(max_global_delta)
         self.evidence_mean_momentum = 0.95
         self.register_buffer(
             "running_evidence_mean", torch.zeros(reason_dim), persistent=True
@@ -70,11 +77,14 @@ class METERPrivateReasonDecoder(nn.Module):
         # startup, yet gives the zero-initialized head and adapter-only input
         # a bounded first-step gradient. The learned gate alone determines
         # every deployed logit delta.
-        global_delta = (
+        unbounded_global_delta = (
             gate * raw_global_delta
             + (1.0 - gate)
             * self.global_delta_startup_gradient_scale
             * (raw_global_delta - raw_global_delta.detach())
+        )
+        global_delta = self.max_global_delta * torch.tanh(
+            unbounded_global_delta / self.max_global_delta
         )
         global_logits = reason_logits_calalign.detach() + global_delta
         evidence = factor_measurement_token.detach()
@@ -112,6 +122,10 @@ class METERPrivateReasonDecoder(nn.Module):
             "reason_global_tokens": reason_nodes,
             "reason_view_embedding": reason_nodes,
             "reason_logits_global": global_logits,
+            "reason_global_delta": global_delta,
+            "reason_global_delta_cap": reason_logits_calalign.new_tensor(
+                self.max_global_delta
+            ),
             "reason_evidence_delta": correction,
             "reason_evidence_centered": centered_raw,
             "reason_evidence_running_mean": self.running_evidence_mean.detach(),

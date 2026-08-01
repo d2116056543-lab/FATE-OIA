@@ -499,6 +499,9 @@ def main() -> None:
         action_allocation_logit_scale=float(
             config["model"].get("action_allocation_logit_scale", 4.0)
         ),
+        reason_global_delta_cap=float(
+            config["model"].get("reason_global_delta_cap", 0.05)
+        ),
         factor_text_prototype_path=config["model"].get(
             "factor_text_prototype_path"
         ),

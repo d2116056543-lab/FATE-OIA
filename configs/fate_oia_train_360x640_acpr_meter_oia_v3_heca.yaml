@@ -60,6 +60,7 @@ model:
   # while preserving the zero-init visual action anchor.
   action_measurement_grad_scale: 0.20
   action_allocation_logit_scale: 4.0
+  reason_global_delta_cap: 0.05
   use_hard_action_factor_mask: false
   use_admission_gate: false
   token_compression: none
