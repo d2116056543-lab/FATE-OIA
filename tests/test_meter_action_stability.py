@@ -73,6 +73,37 @@ def test_heca_credit_trust_region_uses_current_not_historical_visual_scale() -> 
     )
 
 
+def test_heca_credit_bf16_rounding_cannot_exceed_live_trust_boundary() -> None:
+    """The logged float32 ratio must respect 0.20 after BF16 application."""
+    torch.manual_seed(7)
+    dtype = torch.bfloat16
+    module = StateConditionedActionCredit(
+        dim=8,
+        action_dim=2,
+        factor_dim=3,
+        rank=2,
+        correction_fraction=0.20,
+        max_action_delta=1.0,
+        max_rms_ratio=0.20,
+    ).to(dtype)
+    with torch.no_grad():
+        module.state_effect_embedding.fill_(12.0)
+
+    visual = torch.tensor([[0.20, -0.30], [0.25, -0.35]], dtype=dtype)
+    output = module(
+        visual,
+        torch.ones(2, 2, 8, dtype=dtype),
+        torch.ones(2, 3, 8, dtype=dtype),
+        torch.tensor([[[1.0, 0.0, 0.0]] * 3] * 2, dtype=dtype),
+        torch.ones(2, 3, dtype=dtype),
+        torch.ones(3, dtype=dtype),
+        progress=1.0,
+        update_running_stats=False,
+    )
+
+    assert float(output["action_correction_rms_ratio"].max()) <= 0.20 + 1e-6
+
+
 def test_heca_final_action_is_exact_visual_anchor_plus_bounded_credit() -> None:
     _, output = _credit(torch.randn(2, 2))
 

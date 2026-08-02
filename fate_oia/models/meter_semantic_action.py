@@ -176,7 +176,13 @@ class StateConditionedActionCredit(nn.Module):
             self.correction_fraction.to(visual_scale),
             visual_scale.new_tensor(self.max_rms_ratio),
         )
-        kappa = (correction_ratio * visual_scale).clamp_max(
+        # ``kappa`` is applied in the active autocast dtype.  BF16 can round
+        # an exact 0.20 cap upward, which made the measured trust ratio exceed
+        # the formal boundary by a few 1e-4.  Reserve two dtype ulps so the
+        # *realized* delta remains inside the float32-audited trust region.
+        dtype_eps = torch.finfo(action_logits_visual.dtype).eps
+        rounding_safe_ratio = correction_ratio * (1.0 - 2.0 * dtype_eps)
+        kappa = (rounding_safe_ratio * visual_scale).clamp_max(
             min(1.0, self.max_action_delta)
         ).to(action_logits_visual)
         unramped_delta = kappa * torch.tanh(
