@@ -47,11 +47,22 @@ def identity_corruption_loss(
     *,
     margin: float = 0.02,
 ) -> Tensor:
-    sign = target.unsqueeze(-1) * 2.0 - 1.0
-    # Keep actions separate: a gain for one action must not cancel another
-    # action whose factor identity became less useful.
-    clean_score = (sign * clean_contributions).sum(-1)
-    corrupt_score = (sign * corrupt_contributions).sum(-1)
+    if clean_contributions.shape != corrupt_contributions.shape:
+        raise ValueError("clean and corrupt identity tensors must have the same shape")
+    if clean_contributions.shape == target.shape:
+        # Final-route intervention: compare the actual bounded action delta,
+        # rather than a proxy sum of raw factor contributions.
+        sign = target * 2.0 - 1.0
+        clean_score = sign * clean_contributions
+        corrupt_score = sign * corrupt_contributions
+    elif clean_contributions.shape[:2] == target.shape:
+        sign = target.unsqueeze(-1) * 2.0 - 1.0
+        # Legacy factor-space path retained for diagnostics that inspect the
+        # exact factor decomposition directly.
+        clean_score = (sign * clean_contributions).sum(-1)
+        corrupt_score = (sign * corrupt_contributions).sum(-1)
+    else:
+        raise ValueError("identity tensors must be [B,A] or [B,A,F]")
     return torch.relu(margin + corrupt_score - clean_score).mean()
 
 

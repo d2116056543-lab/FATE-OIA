@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 
 from fate_oia.losses.meter_action_losses import action_target_effectiveness_loss
+from fate_oia.losses.meter_counterfactual_losses import identity_corruption_loss
 
 
 def _inputs(*, grounded: bool = True) -> dict[str, torch.Tensor]:
@@ -97,3 +98,14 @@ def test_target_effectiveness_prefers_clean_target_aligned_credit() -> None:
     )
 
     assert good_loss < bad_loss
+
+
+def test_identity_corruption_accepts_actual_action_route_deltas() -> None:
+    target = torch.tensor([[1.0, 0.0]])
+    clean = torch.tensor([[0.04, -0.04]])
+    control = torch.zeros_like(clean)
+
+    aligned = identity_corruption_loss(clean, control, target, margin=0.05)
+    reversed_effect = identity_corruption_loss(control, clean, target, margin=0.05)
+
+    assert aligned < reversed_effect
