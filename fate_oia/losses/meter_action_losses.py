@@ -326,6 +326,9 @@ def meter_action_loss(
             "support_mean": necessity.detach(),
             "required_margin_mean": necessity.detach(),
             "target_effect_mean": necessity.detach(),
+            "directional_effect_mean": necessity.detach(),
+            "contrastive_loss": necessity.detach(),
+            "directional_loss": necessity.detach(),
         }
     else:
         necessity, necessity_stats = action_target_effectiveness_loss(

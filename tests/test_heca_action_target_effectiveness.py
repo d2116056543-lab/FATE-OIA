@@ -39,6 +39,11 @@ def test_target_effectiveness_uses_only_hard_grounded_action_routes() -> None:
     # and negative action routes both receive direct selected-vs-control loss.
     assert torch.isclose(stats["active_fraction"], torch.tensor(0.5))
     assert torch.isclose(stats["active_count"], torch.tensor(2.0))
+    # A target-aligned delta may already satisfy the directional margin, so
+    # zero is the desired hinge value. The wrong-sign comparison below proves
+    # the constraint itself remains active.
+    assert torch.isfinite(stats["directional_loss"])
+    assert stats["directional_effect_mean"] > 0
     loss.backward()
     assert value["action_delta"].grad is not None
     assert value["action_delta"].grad[0].abs().sum() > 0

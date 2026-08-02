@@ -1474,6 +1474,15 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                 "action_target_effect_mean": float(
                     parts["action"]["necessity_target_effect_mean"].detach()
                 ),
+                "action_target_directional_effect_mean": float(
+                    parts["action"]["necessity_directional_effect_mean"].detach()
+                ),
+                "loss_action_target_contrastive": float(
+                    parts["action"]["necessity_contrastive_loss"].detach()
+                ),
+                "loss_action_target_directional": float(
+                    parts["action"]["necessity_directional_loss"].detach()
+                ),
                 "loss_action_nonreg": float(parts["action"]["nonreg"].detach()),
                 "loss_action_logit_scale": float(parts["action"]["logit_scale"].detach()),
                 "loss_identity": float(parts["identity"].detach()),
