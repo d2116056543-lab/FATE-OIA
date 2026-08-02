@@ -111,6 +111,11 @@ loss_weights:
   action_nonreg_min_margin: 0.05
   action_nonreg_confidence_quantile: 0.75
   action_nonreg_boundary_margin: 0.05
+  # Same-image target-effectiveness supervision for the action credit route.
+  # It is active only for groundable, factor-supported near-boundary decisions.
+  action_necessity_margin: 0.02
+  action_necessity_visual_hard_margin: 0.25
+  action_necessity_min_support: 0.10
   reason_final: 1.00
   reason_global: 0.50
   reason_rank: 0.08

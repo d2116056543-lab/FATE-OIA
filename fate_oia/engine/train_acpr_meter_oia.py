@@ -447,6 +447,7 @@ def _compute_losses(
     config: dict[str, Any],
     grounding_ramp: float,
     mechanism_ramp: float,
+    forward_progress: float,
     pu_lambda: Tensor,
     mirror_output: dict[str, Any] | None = None,
     corruption_step: int,
@@ -455,12 +456,15 @@ def _compute_losses(
     action_target = batch["action"]
     reason_target = batch["reason"]
     mode = identity_corruption_mode(corruption_step)
-    corrupt = _identity_output(model, output, mechanism_ramp, mode)
+    corrupt = _identity_output(model, output, forward_progress, mode)
     identity = identity_corruption_loss(
-        output["action_factor_contribution"],
-        corrupt["action_factor_contribution"],
+        output["action_evidence_delta"],
+        corrupt["action_evidence_delta"].detach(),
         action_target,
     )
+    # The target-effectiveness term receives this same-image intervention as a
+    # detached control. It cannot improve the loss by damaging the control.
+    output["action_counterfactual_delta"] = corrupt["action_evidence_delta"].detach()
     output["action_specificity_loss"] = identity * mechanism_ramp
     action = meter_action_loss(output, action_target, config["loss_weights"])
     state_positive = output["factor_state_prob"][..., 0]
@@ -1243,6 +1247,7 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                     config=config,
                     grounding_ramp=grounding_ramp,
                     mechanism_ramp=mechanism_ramp,
+                    forward_progress=optimizer_step / max(total_updates, 1),
                     pu_lambda=torch.tensor(
                         pu_state["lambda"], device=device, dtype=output["reason_logits_final"].dtype
                     ),
@@ -1450,6 +1455,19 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                     parts["action"]["specificity"].detach()
                 ),
                 "loss_action_credit_rank": float(parts["action"]["credit_rank"].detach()),
+                "loss_action_necessity": float(parts["action"]["necessity"].detach()),
+                "action_target_effect_active_count": float(
+                    parts["action"]["necessity_active_count"].detach()
+                ),
+                "action_target_effect_active_fraction": float(
+                    parts["action"]["necessity_active_fraction"].detach()
+                ),
+                "action_target_effect_support_mean": float(
+                    parts["action"]["necessity_support_mean"].detach()
+                ),
+                "action_target_effect_mean": float(
+                    parts["action"]["necessity_target_effect_mean"].detach()
+                ),
                 "loss_action_nonreg": float(parts["action"]["nonreg"].detach()),
                 "loss_action_logit_scale": float(parts["action"]["logit_scale"].detach()),
                 "loss_identity": float(parts["identity"].detach()),
