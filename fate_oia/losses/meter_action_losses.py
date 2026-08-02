@@ -159,6 +159,9 @@ def action_target_effectiveness_loss(
     factor_groundable_mask: Tensor,
     *,
     margin: float = 0.02,
+    relative_margin_fraction: float | None = None,
+    min_margin: float = 0.002,
+    max_margin: float = 0.02,
     hard_visual_margin: float = 0.25,
     min_support: float = 0.10,
 ) -> tuple[Tensor, dict[str, Tensor]]:
@@ -188,8 +191,16 @@ def action_target_effectiveness_loss(
         raise ValueError("factor_action_ownership must be [F]")
     if factor_groundable_mask.reshape(-1).shape[0] != factor_count:
         raise ValueError("factor_groundable_mask must be [F]")
-    if margin < 0.0 or hard_visual_margin < 0.0 or min_support < 0.0:
+    if (
+        margin < 0.0
+        or min_margin < 0.0
+        or max_margin < min_margin
+        or hard_visual_margin < 0.0
+        or min_support < 0.0
+    ):
         raise ValueError("target-effectiveness thresholds must be non-negative")
+    if relative_margin_fraction is not None and relative_margin_fraction < 0.0:
+        raise ValueError("relative_margin_fraction must be non-negative")
 
     support = (
         action_factor_weights.detach()
@@ -209,8 +220,17 @@ def action_target_effectiveness_loss(
         visual_logits.detach() + counterfactual_action_delta.detach()
     )
     target_effect = selected_margin - control_margin
+    if relative_margin_fraction is None:
+        required_margin = target_effect.new_full(target_effect.shape, float(margin))
+    else:
+        visual_rms = visual_logits.detach().float().square().mean(0).sqrt()
+        required_margin = (
+            float(relative_margin_fraction) * visual_rms
+        ).clamp(float(min_margin), float(max_margin)).to(target_effect).unsqueeze(0)
     if bool(active.any()):
-        loss = torch.relu(float(margin) - target_effect[active]).mean()
+        loss = torch.relu(
+            required_margin.expand_as(target_effect)[active] - target_effect[active]
+        ).mean()
     else:
         # Preserve a valid no-op backward path for batches with no certified
         # factor support rather than inventing a global action prior.
@@ -219,6 +239,7 @@ def action_target_effectiveness_loss(
         "active_count": active.sum().to(action_evidence_delta.dtype),
         "active_fraction": active.float().mean(),
         "support_mean": support.mean(),
+        "required_margin_mean": required_margin.mean().detach(),
         "target_effect_mean": (
             target_effect[active].mean().detach()
             if bool(active.any())
@@ -252,6 +273,7 @@ def meter_action_loss(
             "active_count": necessity.detach(),
             "active_fraction": necessity.detach(),
             "support_mean": necessity.detach(),
+            "required_margin_mean": necessity.detach(),
             "target_effect_mean": necessity.detach(),
         }
     else:
@@ -265,6 +287,11 @@ def meter_action_loss(
             output["factor_action_ownership"],
             output["factor_groundable_mask"],
             margin=float(weights.get("action_necessity_margin", 0.02)),
+            relative_margin_fraction=float(
+                weights.get("action_necessity_relative_margin_fraction", 0.05)
+            ),
+            min_margin=float(weights.get("action_necessity_min_margin", 0.002)),
+            max_margin=float(weights.get("action_necessity_max_margin", 0.02)),
             hard_visual_margin=float(
                 weights.get("action_necessity_visual_hard_margin", 0.25)
             ),

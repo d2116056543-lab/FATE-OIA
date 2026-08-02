@@ -100,6 +100,25 @@ def test_target_effectiveness_prefers_clean_target_aligned_credit() -> None:
     assert good_loss < bad_loss
 
 
+def test_target_effectiveness_can_use_a_visual_scale_relative_margin() -> None:
+    value = _inputs()
+    _, stats = action_target_effectiveness_loss(
+        value["visual_logits"],
+        value["action_delta"],
+        value["control_delta"],
+        value["target"],
+        value["factor_weights"],
+        value["reliability"],
+        value["ownership"],
+        value["groundable"],
+        relative_margin_fraction=0.05,
+        min_margin=0.002,
+        max_margin=0.02,
+    )
+
+    assert 0.002 <= stats["required_margin_mean"].item() <= 0.02
+
+
 def test_identity_corruption_accepts_actual_action_route_deltas() -> None:
     target = torch.tensor([[1.0, 0.0]])
     clean = torch.tensor([[0.04, -0.04]])

@@ -32,6 +32,7 @@ class METEROIAModel(nn.Module):
         action_logit_norm_cap: float = 20.0,
         action_measurement_grad_scale: float = 0.05,
         action_allocation_logit_scale: float = 4.0,
+        action_max_rms_ratio: float = 0.20,
         reason_global_delta_cap: float = 0.05,
         factor_text_prototype_path: str | None = None,
         state_text_prototype_path: str | None = None,
@@ -72,6 +73,7 @@ class METEROIAModel(nn.Module):
             correction_fraction=action_correction_fraction,
             max_action_delta=action_max_delta,
             allocation_logit_scale=action_allocation_logit_scale,
+            max_rms_ratio=action_max_rms_ratio,
         )
         self.reason_decoder = METERPrivateReasonDecoder(
             dim=dim,

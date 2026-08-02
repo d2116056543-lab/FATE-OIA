@@ -43,6 +43,16 @@ def test_heca_credit_keeps_absolute_delta_cap_when_visual_logits_explode() -> No
     assert torch.isfinite(output["action_logits_final"]).all()
 
 
+def test_heca_credit_kappa_respects_the_action_visual_trust_region() -> None:
+    visual = torch.tensor([[0.02, -0.04], [0.03, -0.05]])
+    _, output = _credit(visual)
+    visual_rms = visual.square().mean(0).sqrt()
+
+    assert torch.all(
+        output["action_correction_kappa"].squeeze(0) <= 0.20 * visual_rms + 1e-6
+    )
+
+
 def test_heca_final_action_is_exact_visual_anchor_plus_bounded_credit() -> None:
     _, output = _credit(torch.randn(2, 2))
 

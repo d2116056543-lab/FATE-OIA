@@ -499,6 +499,9 @@ def main() -> None:
         action_allocation_logit_scale=float(
             config["model"].get("action_allocation_logit_scale", 4.0)
         ),
+        action_max_rms_ratio=float(
+            config["model"].get("action_max_rms_ratio", 0.20)
+        ),
         reason_global_delta_cap=float(
             config["model"].get("reason_global_delta_cap", 0.05)
         ),

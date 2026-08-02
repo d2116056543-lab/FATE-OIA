@@ -1074,6 +1074,9 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
         action_allocation_logit_scale=float(
             config["model"].get("action_allocation_logit_scale", 4.0)
         ),
+        action_max_rms_ratio=float(
+            config["model"].get("action_max_rms_ratio", 0.20)
+        ),
         reason_global_delta_cap=float(
             config["model"].get("reason_global_delta_cap", 0.05)
         ),
@@ -1464,6 +1467,9 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                 ),
                 "action_target_effect_support_mean": float(
                     parts["action"]["necessity_support_mean"].detach()
+                ),
+                "action_target_effect_required_margin_mean": float(
+                    parts["action"]["necessity_required_margin_mean"].detach()
                 ),
                 "action_target_effect_mean": float(
                     parts["action"]["necessity_target_effect_mean"].detach()

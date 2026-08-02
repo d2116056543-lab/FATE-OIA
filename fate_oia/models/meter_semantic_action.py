@@ -25,6 +25,7 @@ class StateConditionedActionCredit(nn.Module):
         max_action_delta: float = 1.0,
         rms_momentum: float = 0.95,
         allocation_logit_scale: float = 4.0,
+        max_rms_ratio: float = 0.20,
     ) -> None:
         super().__init__()
         self.action_dim = int(action_dim)
@@ -39,6 +40,9 @@ class StateConditionedActionCredit(nn.Module):
         self.max_action_delta = float(max_action_delta)
         self.rms_momentum = float(rms_momentum)
         self.allocation_logit_scale = float(allocation_logit_scale)
+        self.max_rms_ratio = float(max_rms_ratio)
+        if not 0.0 < self.max_rms_ratio <= 1.0:
+            raise ValueError("max_rms_ratio must be in (0, 1]")
         self.action_query = nn.Linear(dim, dim, bias=False)
         self.factor_key = nn.Linear(dim, dim, bias=False)
         self.learned_action_factor_bias = nn.Parameter(
@@ -160,10 +164,18 @@ class StateConditionedActionCredit(nn.Module):
                         visual_rms * (1.0 - self.rms_momentum)
                     )
                 self.running_updates.add_(1)
-        kappa = (
-            self.correction_fraction.to(self.running_visual_rms)
-            * self.running_visual_rms
-        ).clamp(0.10, min(1.0, self.max_action_delta)).to(action_logits_visual)
+        # Keep bounded credit inside an action-wise visual trust region. A
+        # fixed 0.10 floor can dwarf early low-logit action anchors, despite
+        # HECA's 3--20 percent credit-ratio requirement. The tanh route is
+        # still trainable at zero without that floor.
+        visual_scale = self.running_visual_rms.clamp_min(1e-3)
+        correction_ratio = torch.minimum(
+            self.correction_fraction.to(visual_scale),
+            visual_scale.new_tensor(self.max_rms_ratio),
+        )
+        kappa = (correction_ratio * visual_scale).clamp_max(
+            min(1.0, self.max_action_delta)
+        ).to(action_logits_visual)
         unramped_delta = kappa * torch.tanh(
             credit_sum / kappa.clamp_min(1e-6)
         )
