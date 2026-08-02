@@ -1056,6 +1056,7 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
         action_correction_fraction=correction_fraction_for_run(
             args.run_kind,
             gate_c_pass=_validated_gate_pass(args.gate_c_pass),
+            numeric_qualified=bool(args.numeric_qualified),
         ),
         action_max_visual_rms=float(
             config["model"].get("action_max_visual_rms", 5.0)
@@ -1156,6 +1157,7 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
         "initialization": initialization,
         "run_kind": args.run_kind,
         "gate_c_pass": str(args.gate_c_pass),
+        "numeric_qualified": bool(args.numeric_qualified),
         "split_manifest": meter_split_manifest(names, full_split),
         "runtime_subset_counts": build_runtime_subset_counts(
             split, test_count=len(test_indices)
@@ -1837,6 +1839,7 @@ def main() -> None:
     parser.add_argument("--require_no_token_compression", action="store_true")
     parser.add_argument("--run_kind", choices=("pilot", "full"), default="pilot")
     parser.add_argument("--gate_c_pass", default="")
+    parser.add_argument("--numeric_qualified", action="store_true")
     args = parser.parse_args()
     config = load_meter_config(args.config)
     if args.require_no_token_compression and config["model"]["token_compression"] != "none":
