@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 import torch
 from PIL import Image, ImageOps
 
@@ -17,9 +18,11 @@ def audit_image_size(image: Image.Image) -> dict[str, tuple[int, int]]:
 
 
 def _to_tensor(image: Image.Image) -> torch.Tensor:
-    data = torch.ByteTensor(torch.ByteStorage.from_buffer(image.tobytes()))
-    h, w = image.height, image.width
-    tensor = data.view(h, w, len(image.getbands())).permute(2, 0, 1).float() / 255.0
+    # ``np.array(..., copy=True)`` creates a writable RGB buffer. This avoids
+    # the deprecated TypedStorage route without changing pixel layout or
+    # normalization semantics for PIL images.
+    data = np.array(image, dtype=np.uint8, copy=True)
+    tensor = torch.from_numpy(data).permute(2, 0, 1).float() / 255.0
     return tensor
 
 
