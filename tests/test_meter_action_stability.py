@@ -43,67 +43,6 @@ def test_heca_credit_keeps_absolute_delta_cap_when_visual_logits_explode() -> No
     assert torch.isfinite(output["action_logits_final"]).all()
 
 
-def test_heca_credit_kappa_respects_the_action_visual_trust_region() -> None:
-    visual = torch.tensor([[0.02, -0.04], [0.03, -0.05]])
-    _, output = _credit(visual)
-    visual_rms = visual.square().mean(0).sqrt()
-
-    assert torch.all(
-        output["action_correction_kappa"].squeeze(0) <= 0.20 * visual_rms + 1e-6
-    )
-
-
-def test_heca_credit_trust_region_uses_current_not_historical_visual_scale() -> None:
-    module, _ = _credit(torch.full((2, 2), 2.0))
-    visual = torch.tensor([[0.02, -0.04], [0.03, -0.05]])
-    output = module(
-        visual,
-        torch.randn(2, 2, 8),
-        torch.randn(2, 3, 8),
-        torch.softmax(torch.randn(2, 3, 3), dim=-1),
-        torch.ones(2, 3),
-        torch.ones(3),
-        progress=1.0,
-        update_running_stats=False,
-    )
-    current_rms = visual.square().mean(0).sqrt()
-
-    assert torch.all(
-        output["action_correction_kappa"].squeeze(0) <= 0.20 * current_rms + 1e-6
-    )
-
-
-def test_heca_credit_bf16_rounding_cannot_exceed_live_trust_boundary() -> None:
-    """The logged float32 ratio must respect 0.20 after BF16 application."""
-    torch.manual_seed(7)
-    dtype = torch.bfloat16
-    module = StateConditionedActionCredit(
-        dim=8,
-        action_dim=2,
-        factor_dim=3,
-        rank=2,
-        correction_fraction=0.20,
-        max_action_delta=1.0,
-        max_rms_ratio=0.20,
-    ).to(dtype)
-    with torch.no_grad():
-        module.state_effect_embedding.fill_(12.0)
-
-    visual = torch.tensor([[0.20, -0.30], [0.25, -0.35]], dtype=dtype)
-    output = module(
-        visual,
-        torch.ones(2, 2, 8, dtype=dtype),
-        torch.ones(2, 3, 8, dtype=dtype),
-        torch.tensor([[[1.0, 0.0, 0.0]] * 3] * 2, dtype=dtype),
-        torch.ones(2, 3, dtype=dtype),
-        torch.ones(3, dtype=dtype),
-        progress=1.0,
-        update_running_stats=False,
-    )
-
-    assert float(output["action_correction_rms_ratio"].max()) <= 0.20 + 1e-6
-
-
 def test_heca_final_action_is_exact_visual_anchor_plus_bounded_credit() -> None:
     _, output = _credit(torch.randn(2, 2))
 

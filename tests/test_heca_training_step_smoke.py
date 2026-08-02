@@ -27,7 +27,6 @@ def test_heca_real_loss_graph_one_update_is_finite() -> None:
         config=load_meter_config("configs/fate_oia_train_360x640_acpr_meter_oia_v3_heca.yaml"),
         grounding_ramp=0.5,
         mechanism_ramp=0.5,
-        forward_progress=0.1,
         pu_lambda=torch.zeros(21),
         mirror_output=view,
         corruption_step=1,

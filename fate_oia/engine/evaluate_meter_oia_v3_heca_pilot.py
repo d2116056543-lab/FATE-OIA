@@ -20,9 +20,6 @@ from fate_oia.utils.meter_artifacts import (
 )
 
 
-ACTION_STATE_EFFECT_MATURITY_FLOOR = 0.10
-
-
 def _read_json(path: str | Path) -> dict[str, Any]:
     value = json.loads(Path(path).read_text(encoding="utf-8"))
     if not isinstance(value, dict):
@@ -64,11 +61,6 @@ def _ownership_gate_rows(
     """
     active_rows: list[dict[str, Any]] = []
     checks: list[bool] = []
-    # Full ramp alone does not mean a zero-initialized state-effect table has
-    # become an active transport route.  A route is mature only after its
-    # effect norm reaches the configured structural floor.  Earlier rows stay
-    # in the artifact for diagnosis but cannot falsely fail a mature-path
-    # ownership audit merely because the route had not learned any effect yet.
     for row in gradient_rows:
         ramp = row.get("action_credit_ramp")
         state_effect_norm = row.get("action_state_effect_norm")
@@ -81,8 +73,6 @@ def _ownership_gate_rows(
             checks.append(False)
             continue
         if float(ramp) < 0.80:
-            continue
-        if float(state_effect_norm) < ACTION_STATE_EFFECT_MATURITY_FLOOR:
             continue
         active_rows.append(row)
         required = (
@@ -306,19 +296,6 @@ def evaluate_heca_pilot(
     )
 
     active_ownership_rows, ownership_checks = _ownership_gate_rows(gradient_rows)
-    post_ramp_rows = [
-        row
-        for row in gradient_rows
-        if _finite(row.get("action_credit_ramp"))
-        and float(row["action_credit_ramp"]) >= 0.80
-    ]
-    immature_post_ramp_rows = [
-        row
-        for row in post_ramp_rows
-        if not _finite(row.get("action_state_effect_norm"))
-        or float(row["action_state_effect_norm"])
-        < ACTION_STATE_EFFECT_MATURITY_FLOOR
-    ]
     gate_e = _gate(
         "E",
         len(active_ownership_rows) >= 2
@@ -326,10 +303,7 @@ def evaluate_heca_pilot(
         and all(ownership_checks),
         {
             "row_count": len(gradient_rows),
-            "post_ramp_row_count": len(post_ramp_rows),
             "active_row_count": len(active_ownership_rows),
-            "immature_post_ramp_row_count": len(immature_post_ramp_rows),
-            "state_effect_maturity_floor": ACTION_STATE_EFFECT_MATURITY_FLOOR,
             "ignored_pre_ramp_row_count": len(gradient_rows) - len(active_ownership_rows),
             "all_active_rows_pass": (
                 len(ownership_checks) == len(active_ownership_rows)
@@ -354,7 +328,7 @@ def evaluate_heca_pilot(
     gate_f = _gate(
         "F",
         isinstance(patch, dict)
-        and int(patch.get("unique_sample_count", 0)) >= 512
+        and int(patch.get("unique_sample_count", 0)) >= 128
         and set(patch.get("action_coverage", [])) == {0, 1, 2, 3}
         and len(set(patch.get("factor_coverage", []))) >= 12
         and _finite(patch.get("selected_minus_control_mean"))

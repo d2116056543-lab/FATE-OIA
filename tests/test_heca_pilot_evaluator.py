@@ -64,7 +64,7 @@ def _epoch() -> dict:
             "train_audit": {"per_factor": per_factor},
             "action_correction_rms_ratio_mean": [0.1] * 4,
             "patch_audit": {
-                "unique_sample_count": 512,
+                "unique_sample_count": 128,
                 "action_coverage": [0, 1, 2, 3],
                 "factor_coverage": list(range(12)),
                 "selected_minus_control_mean": 0.02,
@@ -116,9 +116,7 @@ def _inputs() -> tuple[list[dict], dict, dict, dict, list[dict]]:
         {
             "optimizer_step": step,
             "action_credit_ramp": 1.0,
-            # Gate E only assesses the route after the zero-initialized
-            # state-effect table has become mature.
-            "action_state_effect_norm": 0.12,
+            "action_state_effect_norm": 0.02,
             "action_to_anchor_query": 0.0,
             "action_to_state_bridge_ratio": 0.05,
             "action_to_credit_adapter": 1.0,

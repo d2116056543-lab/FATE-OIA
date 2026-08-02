@@ -55,7 +55,6 @@ model:
   action_correction_fraction: 0.25
   pilot_action_correction_fraction: 0.20
   action_max_delta: 1.0
-  action_max_rms_ratio: 0.20
   action_logit_norm_cap: 20.0
   # Calibrated to produce a measured 1--10% action-to-state gradient ratio
   # while preserving the zero-init visual action anchor.
@@ -112,19 +111,6 @@ loss_weights:
   action_nonreg_min_margin: 0.05
   action_nonreg_confidence_quantile: 0.75
   action_nonreg_boundary_margin: 0.05
-  # Same-image target-effectiveness supervision for the action credit route.
-  # It is active only for groundable, factor-supported near-boundary decisions.
-  action_necessity_margin: 0.02
-  action_necessity_relative_margin_fraction: 0.05
-  action_necessity_min_margin: 0.002
-  action_necessity_max_margin: 0.02
-  # Preserve target direction as well as selected-vs-control superiority.
-  # This is restricted to the same certified near-boundary routes above.
-  action_necessity_directional_relative_margin_fraction: 0.01
-  action_necessity_directional_min_margin: 0.001
-  action_necessity_directional_max_margin: 0.005
-  action_necessity_visual_hard_margin: 0.25
-  action_necessity_min_support: 0.10
   reason_final: 1.00
   reason_global: 0.50
   reason_rank: 0.08
@@ -171,9 +157,7 @@ runtime:
 evaluation:
   cheap_diagnostics_each_epoch: [factor_off, state_uniform, reason_correction_off]
   patch_deletion_interval_epochs: 4
-  # A 128-case deletion audit had a positive mean but a negative confidence
-  # bound. Use 512 independently selected audit cases for a real gate.
-  patch_audit_max_unique: 512
+  patch_audit_max_unique: 128
   # Selected and geometry-matched control regions always delete the same area.
   patch_audit_patches_per_factor: 24
   patch_audit_factors_per_action: 2

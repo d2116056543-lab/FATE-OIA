@@ -148,158 +148,6 @@ def action_nonregression_loss(
     return confident + boundary + sign_guard
 
 
-def action_target_effectiveness_loss(
-    visual_logits: Tensor,
-    action_evidence_delta: Tensor,
-    counterfactual_action_delta: Tensor,
-    target: Tensor,
-    action_factor_weights: Tensor,
-    factor_reliability: Tensor,
-    factor_action_ownership: Tensor,
-    factor_groundable_mask: Tensor,
-    *,
-    margin: float = 0.02,
-    relative_margin_fraction: float | None = None,
-    min_margin: float = 0.002,
-    max_margin: float = 0.02,
-    directional_relative_margin_fraction: float = 0.01,
-    directional_min_margin: float = 0.001,
-    directional_max_margin: float = 0.005,
-    hard_visual_margin: float = 0.25,
-    min_support: float = 0.10,
-) -> tuple[Tensor, dict[str, Tensor]]:
-    """Require selected evidence to improve a supported hard action decision.
-
-    This is intentionally a *route comparison*, not a label-signed penalty on
-    every residual.  The corrupted route is a detached control constructed
-    from the same image, so the loss can only improve the selected action
-    transport route.  Both visual logits and support gates are detached: the
-    objective cannot win by modifying the visual anchor or by hiding support.
-    """
-    if action_evidence_delta.shape != target.shape:
-        raise ValueError("action_evidence_delta must match action target")
-    if visual_logits.shape != target.shape:
-        raise ValueError("visual_logits must match action target")
-    if counterfactual_action_delta.shape != target.shape:
-        raise ValueError("counterfactual_action_delta must match action target")
-    if action_factor_weights.shape[:2] != target.shape:
-        raise ValueError("action_factor_weights must be [B,A,F]")
-    if factor_reliability.shape != (
-        target.shape[0],
-        action_factor_weights.shape[-1],
-    ):
-        raise ValueError("factor_reliability must be [B,F]")
-    factor_count = action_factor_weights.shape[-1]
-    if factor_action_ownership.reshape(-1).shape[0] != factor_count:
-        raise ValueError("factor_action_ownership must be [F]")
-    if factor_groundable_mask.reshape(-1).shape[0] != factor_count:
-        raise ValueError("factor_groundable_mask must be [F]")
-    if (
-        margin < 0.0
-        or min_margin < 0.0
-        or max_margin < min_margin
-        or directional_relative_margin_fraction < 0.0
-        or directional_min_margin < 0.0
-        or directional_max_margin < directional_min_margin
-        or hard_visual_margin < 0.0
-        or min_support < 0.0
-    ):
-        raise ValueError("target-effectiveness thresholds must be non-negative")
-    if relative_margin_fraction is not None and relative_margin_fraction < 0.0:
-        raise ValueError("relative_margin_fraction must be non-negative")
-
-    support = (
-        action_factor_weights.detach()
-        * factor_reliability.detach().clamp(0.0, 1.0).unsqueeze(1)
-        * factor_action_ownership.detach().to(action_factor_weights).reshape(1, 1, -1).clamp(0.0, 1.0)
-        * factor_groundable_mask.detach().to(action_factor_weights).reshape(1, 1, -1).clamp(0.0, 1.0)
-    ).sum(-1)
-    sign = target * 2.0 - 1.0
-    visual_margin = sign * visual_logits.detach()
-    # A bounded residual is credible only near the visual decision boundary;
-    # easy anchor decisions are protected by the non-regression objective.
-    active = (
-        visual_margin.abs() <= float(hard_visual_margin)
-    ) & (support >= float(min_support))
-    selected_margin = sign * (visual_logits.detach() + action_evidence_delta)
-    control_margin = sign * (
-        visual_logits.detach() + counterfactual_action_delta.detach()
-    )
-    target_effect = selected_margin - control_margin
-    visual_rms = visual_logits.detach().float().square().mean(0).sqrt()
-    if relative_margin_fraction is None:
-        required_margin = target_effect.new_full(target_effect.shape, float(margin))
-    else:
-        required_margin = (
-            float(relative_margin_fraction) * visual_rms
-        ).clamp(float(min_margin), float(max_margin)).to(target_effect).unsqueeze(0)
-    if bool(active.any()):
-        contrastive_loss = torch.relu(
-            required_margin.expand_as(target_effect)[active] - target_effect[active]
-        ).mean()
-
-        # A selected route can be less harmful than its corruption while still
-        # moving a positive action in the wrong direction.  The old relative
-        # objective allowed exactly that failure mode.  On the same certified,
-        # near-boundary route, require the selected delta itself to agree with
-        # the action target.  Positive and negative active examples are
-        # averaged per action first so common negative labels cannot turn this
-        # into a global suppression bias.
-        directional_margin = (
-            float(directional_relative_margin_fraction) * visual_rms
-        ).clamp(
-            float(directional_min_margin), float(directional_max_margin)
-        ).to(action_evidence_delta).unsqueeze(0)
-        directional_effect = sign * action_evidence_delta
-        directional_terms: list[Tensor] = []
-        for action_id in range(target.shape[1]):
-            for is_positive in (False, True):
-                class_active = active[:, action_id] & (
-                    (target[:, action_id] > 0.5) == is_positive
-                )
-                if bool(class_active.any()):
-                    directional_terms.append(
-                        torch.relu(
-                            directional_margin[:, action_id].expand_as(
-                                directional_effect[:, action_id]
-                            )[class_active]
-                            - directional_effect[:, action_id][class_active]
-                        ).mean()
-                    )
-        directional_loss = (
-            torch.stack(directional_terms).mean()
-            if directional_terms
-            else action_evidence_delta.sum() * 0.0
-        )
-        loss = contrastive_loss + directional_loss
-    else:
-        # Preserve a valid no-op backward path for batches with no certified
-        # factor support rather than inventing a global action prior.
-        loss = action_evidence_delta.sum() * 0.0
-        contrastive_loss = loss
-        directional_loss = loss
-        directional_effect = sign * action_evidence_delta
-    stats = {
-        "active_count": active.sum().to(action_evidence_delta.dtype),
-        "active_fraction": active.float().mean(),
-        "support_mean": support.mean(),
-        "required_margin_mean": required_margin.mean().detach(),
-        "target_effect_mean": (
-            target_effect[active].mean().detach()
-            if bool(active.any())
-            else action_evidence_delta.new_zeros(())
-        ),
-        "directional_effect_mean": (
-            directional_effect[active].mean().detach()
-            if bool(active.any())
-            else action_evidence_delta.new_zeros(())
-        ),
-        "contrastive_loss": contrastive_loss.detach(),
-        "directional_loss": directional_loss.detach(),
-    }
-    return loss, stats
-
-
 def meter_action_loss(
     output: dict[str, Tensor],
     target: Tensor,
@@ -315,51 +163,8 @@ def meter_action_loss(
         normalizer=output.get("action_correction_kappa"),
     )
     contribution = output["action_factor_contribution"]
-    counterfactual_delta = output.get("action_counterfactual_delta")
-    if counterfactual_delta is None:
-        # Audits that invoke the isolated loss graph still receive a connected
-        # zero, but production training must supply a real same-image control.
-        necessity = output["action_evidence_delta"].sum() * 0.0
-        necessity_stats = {
-            "active_count": necessity.detach(),
-            "active_fraction": necessity.detach(),
-            "support_mean": necessity.detach(),
-            "required_margin_mean": necessity.detach(),
-            "target_effect_mean": necessity.detach(),
-            "directional_effect_mean": necessity.detach(),
-            "contrastive_loss": necessity.detach(),
-            "directional_loss": necessity.detach(),
-        }
-    else:
-        necessity, necessity_stats = action_target_effectiveness_loss(
-            output["action_logits_visual"],
-            output["action_evidence_delta"],
-            counterfactual_delta,
-            target,
-            output["action_factor_weights"],
-            output["factor_reliability"],
-            output["factor_action_ownership"],
-            output["factor_groundable_mask"],
-            margin=float(weights.get("action_necessity_margin", 0.02)),
-            relative_margin_fraction=float(
-                weights.get("action_necessity_relative_margin_fraction", 0.05)
-            ),
-            min_margin=float(weights.get("action_necessity_min_margin", 0.002)),
-            max_margin=float(weights.get("action_necessity_max_margin", 0.02)),
-            directional_relative_margin_fraction=float(
-                weights.get("action_necessity_directional_relative_margin_fraction", 0.01)
-            ),
-            directional_min_margin=float(
-                weights.get("action_necessity_directional_min_margin", 0.001)
-            ),
-            directional_max_margin=float(
-                weights.get("action_necessity_directional_max_margin", 0.005)
-            ),
-            hard_visual_margin=float(
-                weights.get("action_necessity_visual_hard_margin", 0.25)
-            ),
-            min_support=float(weights.get("action_necessity_min_support", 0.10)),
-        )
+    sign = target * 2.0 - 1.0
+    necessity = torch.relu(0.05 - sign * output["action_evidence_delta"]).mean()
     specificity = output.get(
         "action_specificity_loss",
         (contribution.abs().mean(-1) * (1.0 - target)).mean(),
@@ -406,7 +211,7 @@ def meter_action_loss(
             ("logit_scale", "action_logit_scale", 0.01),
         )
     )
-    return {**terms, **{f"necessity_{key}": value for key, value in necessity_stats.items()}, "total": total}
+    return {**terms, "total": total}
 
 
 def meter_action_loss_per_sample(

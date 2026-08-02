@@ -447,7 +447,6 @@ def _compute_losses(
     config: dict[str, Any],
     grounding_ramp: float,
     mechanism_ramp: float,
-    forward_progress: float,
     pu_lambda: Tensor,
     mirror_output: dict[str, Any] | None = None,
     corruption_step: int,
@@ -456,15 +455,12 @@ def _compute_losses(
     action_target = batch["action"]
     reason_target = batch["reason"]
     mode = identity_corruption_mode(corruption_step)
-    corrupt = _identity_output(model, output, forward_progress, mode)
+    corrupt = _identity_output(model, output, mechanism_ramp, mode)
     identity = identity_corruption_loss(
-        output["action_evidence_delta"],
-        corrupt["action_evidence_delta"].detach(),
+        output["action_factor_contribution"],
+        corrupt["action_factor_contribution"],
         action_target,
     )
-    # The target-effectiveness term receives this same-image intervention as a
-    # detached control. It cannot improve the loss by damaging the control.
-    output["action_counterfactual_delta"] = corrupt["action_evidence_delta"].detach()
     output["action_specificity_loss"] = identity * mechanism_ramp
     action = meter_action_loss(output, action_target, config["loss_weights"])
     state_positive = output["factor_state_prob"][..., 0]
@@ -1060,6 +1056,7 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
         action_correction_fraction=correction_fraction_for_run(
             args.run_kind,
             gate_c_pass=_validated_gate_pass(args.gate_c_pass),
+            numeric_qualified=bool(args.numeric_qualified),
         ),
         action_max_visual_rms=float(
             config["model"].get("action_max_visual_rms", 5.0)
@@ -1073,9 +1070,6 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
         ),
         action_allocation_logit_scale=float(
             config["model"].get("action_allocation_logit_scale", 4.0)
-        ),
-        action_max_rms_ratio=float(
-            config["model"].get("action_max_rms_ratio", 0.20)
         ),
         reason_global_delta_cap=float(
             config["model"].get("reason_global_delta_cap", 0.05)
@@ -1163,6 +1157,7 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
         "initialization": initialization,
         "run_kind": args.run_kind,
         "gate_c_pass": str(args.gate_c_pass),
+        "numeric_qualified": bool(args.numeric_qualified),
         "split_manifest": meter_split_manifest(names, full_split),
         "runtime_subset_counts": build_runtime_subset_counts(
             split, test_count=len(test_indices)
@@ -1250,7 +1245,6 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                     config=config,
                     grounding_ramp=grounding_ramp,
                     mechanism_ramp=mechanism_ramp,
-                    forward_progress=optimizer_step / max(total_updates, 1),
                     pu_lambda=torch.tensor(
                         pu_state["lambda"], device=device, dtype=output["reason_logits_final"].dtype
                     ),
@@ -1458,31 +1452,6 @@ def train(config: dict[str, Any], args: argparse.Namespace) -> None:
                     parts["action"]["specificity"].detach()
                 ),
                 "loss_action_credit_rank": float(parts["action"]["credit_rank"].detach()),
-                "loss_action_necessity": float(parts["action"]["necessity"].detach()),
-                "action_target_effect_active_count": float(
-                    parts["action"]["necessity_active_count"].detach()
-                ),
-                "action_target_effect_active_fraction": float(
-                    parts["action"]["necessity_active_fraction"].detach()
-                ),
-                "action_target_effect_support_mean": float(
-                    parts["action"]["necessity_support_mean"].detach()
-                ),
-                "action_target_effect_required_margin_mean": float(
-                    parts["action"]["necessity_required_margin_mean"].detach()
-                ),
-                "action_target_effect_mean": float(
-                    parts["action"]["necessity_target_effect_mean"].detach()
-                ),
-                "action_target_directional_effect_mean": float(
-                    parts["action"]["necessity_directional_effect_mean"].detach()
-                ),
-                "loss_action_target_contrastive": float(
-                    parts["action"]["necessity_contrastive_loss"].detach()
-                ),
-                "loss_action_target_directional": float(
-                    parts["action"]["necessity_directional_loss"].detach()
-                ),
                 "loss_action_nonreg": float(parts["action"]["nonreg"].detach()),
                 "loss_action_logit_scale": float(parts["action"]["logit_scale"].detach()),
                 "loss_identity": float(parts["identity"].detach()),
@@ -1870,6 +1839,7 @@ def main() -> None:
     parser.add_argument("--require_no_token_compression", action="store_true")
     parser.add_argument("--run_kind", choices=("pilot", "full"), default="pilot")
     parser.add_argument("--gate_c_pass", default="")
+    parser.add_argument("--numeric_qualified", action="store_true")
     args = parser.parse_args()
     config = load_meter_config(args.config)
     if args.require_no_token_compression and config["model"]["token_compression"] != "none":

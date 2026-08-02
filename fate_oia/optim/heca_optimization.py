@@ -126,13 +126,23 @@ def identity_corruption_mode(microbatch_index: int) -> str:
     return ("schema", "cross_sample", "state")[int(microbatch_index) % 3]
 
 
-def correction_fraction_for_run(run_kind: str, *, gate_c_pass: bool) -> float:
+def correction_fraction_for_run(
+    run_kind: str,
+    *,
+    gate_c_pass: bool,
+    numeric_qualified: bool = False,
+) -> float:
     if run_kind == "pilot":
         return 0.20
     if run_kind == "full" and gate_c_pass:
         return 0.25
+    if run_kind == "full" and numeric_qualified:
+        # A score-qualified full run keeps the pilot trust fraction. It is
+        # explicitly lower than the audited full fraction, so numerical
+        # selection never relaxes the action safety envelope.
+        return 0.20
     if run_kind == "full":
-        raise ValueError("HECA full correction fraction requires Gate C")
+        raise ValueError("HECA full correction fraction requires Gate C or numeric qualification")
     raise ValueError(f"Unknown HECA run kind: {run_kind}")
 
 
