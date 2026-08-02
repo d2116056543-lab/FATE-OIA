@@ -53,6 +53,26 @@ def test_heca_credit_kappa_respects_the_action_visual_trust_region() -> None:
     )
 
 
+def test_heca_credit_trust_region_uses_current_not_historical_visual_scale() -> None:
+    module, _ = _credit(torch.full((2, 2), 2.0))
+    visual = torch.tensor([[0.02, -0.04], [0.03, -0.05]])
+    output = module(
+        visual,
+        torch.randn(2, 2, 8),
+        torch.randn(2, 3, 8),
+        torch.softmax(torch.randn(2, 3, 3), dim=-1),
+        torch.ones(2, 3),
+        torch.ones(3),
+        progress=1.0,
+        update_running_stats=False,
+    )
+    current_rms = visual.square().mean(0).sqrt()
+
+    assert torch.all(
+        output["action_correction_kappa"].squeeze(0) <= 0.20 * current_rms + 1e-6
+    )
+
+
 def test_heca_final_action_is_exact_visual_anchor_plus_bounded_credit() -> None:
     _, output = _credit(torch.randn(2, 2))
 

@@ -168,7 +168,10 @@ class StateConditionedActionCredit(nn.Module):
         # fixed 0.10 floor can dwarf early low-logit action anchors, despite
         # HECA's 3--20 percent credit-ratio requirement. The tanh route is
         # still trainable at zero without that floor.
-        visual_scale = self.running_visual_rms.clamp_min(1e-3)
+        # The cap must follow the current batch, not an EMA. Otherwise a
+        # falling visual RMS can make a previously safe historical kappa
+        # violate the live action-credit ratio gate.
+        visual_scale = visual_rms.clamp_min(1e-3).to(self.running_visual_rms)
         correction_ratio = torch.minimum(
             self.correction_fraction.to(visual_scale),
             visual_scale.new_tensor(self.max_rms_ratio),
