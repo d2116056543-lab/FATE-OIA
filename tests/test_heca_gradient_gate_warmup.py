@@ -1,7 +1,7 @@
 from fate_oia.engine.evaluate_meter_oia_v3_heca_pilot import _ownership_gate_rows
 
 
-def _row(*, ramp: float, ratio: float) -> dict[str, float]:
+def _row(*, ramp: float, ratio: float, state_effect_norm: float = 0.12) -> dict[str, float]:
     return {
         "action_to_anchor_query": 0.0,
         "action_to_state_bridge_ratio": ratio,
@@ -10,7 +10,7 @@ def _row(*, ramp: float, ratio: float) -> dict[str, float]:
         "pu_to_action_factor": 0.0,
         "measurement_to_foundation": 0.0,
         "action_credit_ramp": ramp,
-        "action_state_effect_norm": 0.02,
+        "action_state_effect_norm": state_effect_norm,
     }
 
 
@@ -28,6 +28,18 @@ def test_ownership_gate_rejects_active_state_bridge_below_floor() -> None:
 
     assert len(eligible) == 1
     assert checks == [False]
+
+
+def test_ownership_gate_ignores_full_ramp_rows_before_state_effect_matures() -> None:
+    rows = [
+        _row(ramp=1.0, ratio=0.003, state_effect_norm=0.02),
+        _row(ramp=1.0, ratio=0.02, state_effect_norm=0.12),
+    ]
+
+    eligible, checks = _ownership_gate_rows(rows)
+
+    assert len(eligible) == 1
+    assert checks == [True]
 
 
 def test_ownership_gate_fails_closed_when_active_ramp_telemetry_is_missing() -> None:

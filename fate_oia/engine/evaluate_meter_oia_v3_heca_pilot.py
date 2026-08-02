@@ -61,6 +61,12 @@ def _ownership_gate_rows(
     """
     active_rows: list[dict[str, Any]] = []
     checks: list[bool] = []
+    # Full ramp alone does not mean a zero-initialized state-effect table has
+    # become an active transport route.  A route is mature only after its
+    # effect norm reaches the configured structural floor.  Earlier rows stay
+    # in the artifact for diagnosis but cannot falsely fail a mature-path
+    # ownership audit merely because the route had not learned any effect yet.
+    maturity_floor = 0.10
     for row in gradient_rows:
         ramp = row.get("action_credit_ramp")
         state_effect_norm = row.get("action_state_effect_norm")
@@ -73,6 +79,8 @@ def _ownership_gate_rows(
             checks.append(False)
             continue
         if float(ramp) < 0.80:
+            continue
+        if float(state_effect_norm) < maturity_floor:
             continue
         active_rows.append(row)
         required = (
@@ -328,7 +336,7 @@ def evaluate_heca_pilot(
     gate_f = _gate(
         "F",
         isinstance(patch, dict)
-        and int(patch.get("unique_sample_count", 0)) >= 128
+        and int(patch.get("unique_sample_count", 0)) >= 512
         and set(patch.get("action_coverage", [])) == {0, 1, 2, 3}
         and len(set(patch.get("factor_coverage", []))) >= 12
         and _finite(patch.get("selected_minus_control_mean"))

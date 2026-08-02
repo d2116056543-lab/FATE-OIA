@@ -162,6 +162,9 @@ def action_target_effectiveness_loss(
     relative_margin_fraction: float | None = None,
     min_margin: float = 0.002,
     max_margin: float = 0.02,
+    directional_relative_margin_fraction: float = 0.01,
+    directional_min_margin: float = 0.001,
+    directional_max_margin: float = 0.005,
     hard_visual_margin: float = 0.25,
     min_support: float = 0.10,
 ) -> tuple[Tensor, dict[str, Tensor]]:
@@ -195,6 +198,9 @@ def action_target_effectiveness_loss(
         margin < 0.0
         or min_margin < 0.0
         or max_margin < min_margin
+        or directional_relative_margin_fraction < 0.0
+        or directional_min_margin < 0.0
+        or directional_max_margin < directional_min_margin
         or hard_visual_margin < 0.0
         or min_support < 0.0
     ):
@@ -220,21 +226,59 @@ def action_target_effectiveness_loss(
         visual_logits.detach() + counterfactual_action_delta.detach()
     )
     target_effect = selected_margin - control_margin
+    visual_rms = visual_logits.detach().float().square().mean(0).sqrt()
     if relative_margin_fraction is None:
         required_margin = target_effect.new_full(target_effect.shape, float(margin))
     else:
-        visual_rms = visual_logits.detach().float().square().mean(0).sqrt()
         required_margin = (
             float(relative_margin_fraction) * visual_rms
         ).clamp(float(min_margin), float(max_margin)).to(target_effect).unsqueeze(0)
     if bool(active.any()):
-        loss = torch.relu(
+        contrastive_loss = torch.relu(
             required_margin.expand_as(target_effect)[active] - target_effect[active]
         ).mean()
+
+        # A selected route can be less harmful than its corruption while still
+        # moving a positive action in the wrong direction.  The old relative
+        # objective allowed exactly that failure mode.  On the same certified,
+        # near-boundary route, require the selected delta itself to agree with
+        # the action target.  Positive and negative active examples are
+        # averaged per action first so common negative labels cannot turn this
+        # into a global suppression bias.
+        directional_margin = (
+            float(directional_relative_margin_fraction) * visual_rms
+        ).clamp(
+            float(directional_min_margin), float(directional_max_margin)
+        ).to(action_evidence_delta).unsqueeze(0)
+        directional_effect = sign * action_evidence_delta
+        directional_terms: list[Tensor] = []
+        for action_id in range(target.shape[1]):
+            for is_positive in (False, True):
+                class_active = active[:, action_id] & (
+                    (target[:, action_id] > 0.5) == is_positive
+                )
+                if bool(class_active.any()):
+                    directional_terms.append(
+                        torch.relu(
+                            directional_margin[:, action_id].expand_as(
+                                directional_effect[:, action_id]
+                            )[class_active]
+                            - directional_effect[:, action_id][class_active]
+                        ).mean()
+                    )
+        directional_loss = (
+            torch.stack(directional_terms).mean()
+            if directional_terms
+            else action_evidence_delta.sum() * 0.0
+        )
+        loss = contrastive_loss + directional_loss
     else:
         # Preserve a valid no-op backward path for batches with no certified
         # factor support rather than inventing a global action prior.
         loss = action_evidence_delta.sum() * 0.0
+        contrastive_loss = loss
+        directional_loss = loss
+        directional_effect = sign * action_evidence_delta
     stats = {
         "active_count": active.sum().to(action_evidence_delta.dtype),
         "active_fraction": active.float().mean(),
@@ -245,6 +289,13 @@ def action_target_effectiveness_loss(
             if bool(active.any())
             else action_evidence_delta.new_zeros(())
         ),
+        "directional_effect_mean": (
+            directional_effect[active].mean().detach()
+            if bool(active.any())
+            else action_evidence_delta.new_zeros(())
+        ),
+        "contrastive_loss": contrastive_loss.detach(),
+        "directional_loss": directional_loss.detach(),
     }
     return loss, stats
 
@@ -292,6 +343,15 @@ def meter_action_loss(
             ),
             min_margin=float(weights.get("action_necessity_min_margin", 0.002)),
             max_margin=float(weights.get("action_necessity_max_margin", 0.02)),
+            directional_relative_margin_fraction=float(
+                weights.get("action_necessity_directional_relative_margin_fraction", 0.01)
+            ),
+            directional_min_margin=float(
+                weights.get("action_necessity_directional_min_margin", 0.001)
+            ),
+            directional_max_margin=float(
+                weights.get("action_necessity_directional_max_margin", 0.005)
+            ),
             hard_visual_margin=float(
                 weights.get("action_necessity_visual_hard_margin", 0.25)
             ),

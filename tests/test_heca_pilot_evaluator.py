@@ -64,7 +64,7 @@ def _epoch() -> dict:
             "train_audit": {"per_factor": per_factor},
             "action_correction_rms_ratio_mean": [0.1] * 4,
             "patch_audit": {
-                "unique_sample_count": 128,
+                "unique_sample_count": 512,
                 "action_coverage": [0, 1, 2, 3],
                 "factor_coverage": list(range(12)),
                 "selected_minus_control_mean": 0.02,

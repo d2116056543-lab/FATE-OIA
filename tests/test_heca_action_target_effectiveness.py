@@ -100,6 +100,42 @@ def test_target_effectiveness_prefers_clean_target_aligned_credit() -> None:
     assert good_loss < bad_loss
 
 
+def test_target_effectiveness_rejects_wrong_direction_even_if_control_is_worse() -> None:
+    """Relative superiority alone must not reward a wrong-sign action delta."""
+    value = _inputs()
+    # For the positive action, -0.01 is less harmful than the -0.04 control,
+    # so a relative-only objective would call it better. Directional safety
+    # must still prefer the positive selected delta.
+    wrong_sign_loss, _ = action_target_effectiveness_loss(
+        value["visual_logits"],
+        torch.tensor([[-0.01, 0.01], [0.0, 0.0]]),
+        torch.tensor([[-0.04, 0.04], [0.0, 0.0]]),
+        value["target"],
+        value["factor_weights"],
+        value["reliability"],
+        value["ownership"],
+        value["groundable"],
+        margin=0.01,
+        hard_visual_margin=0.20,
+        min_support=0.10,
+    )
+    aligned_loss, _ = action_target_effectiveness_loss(
+        value["visual_logits"],
+        torch.tensor([[0.01, -0.01], [0.0, 0.0]]),
+        torch.tensor([[-0.04, 0.04], [0.0, 0.0]]),
+        value["target"],
+        value["factor_weights"],
+        value["reliability"],
+        value["ownership"],
+        value["groundable"],
+        margin=0.01,
+        hard_visual_margin=0.20,
+        min_support=0.10,
+    )
+
+    assert aligned_loss < wrong_sign_loss
+
+
 def test_target_effectiveness_can_use_a_visual_scale_relative_margin() -> None:
     value = _inputs()
     _, stats = action_target_effectiveness_loss(

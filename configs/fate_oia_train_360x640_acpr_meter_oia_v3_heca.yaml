@@ -118,6 +118,11 @@ loss_weights:
   action_necessity_relative_margin_fraction: 0.05
   action_necessity_min_margin: 0.002
   action_necessity_max_margin: 0.02
+  # Preserve target direction as well as selected-vs-control superiority.
+  # This is restricted to the same certified near-boundary routes above.
+  action_necessity_directional_relative_margin_fraction: 0.01
+  action_necessity_directional_min_margin: 0.001
+  action_necessity_directional_max_margin: 0.005
   action_necessity_visual_hard_margin: 0.25
   action_necessity_min_support: 0.10
   reason_final: 1.00
@@ -166,7 +171,9 @@ runtime:
 evaluation:
   cheap_diagnostics_each_epoch: [factor_off, state_uniform, reason_correction_off]
   patch_deletion_interval_epochs: 4
-  patch_audit_max_unique: 128
+  # A 128-case deletion audit had a positive mean but a negative confidence
+  # bound. Use 512 independently selected audit cases for a real gate.
+  patch_audit_max_unique: 512
   # Selected and geometry-matched control regions always delete the same area.
   patch_audit_patches_per_factor: 24
   patch_audit_factors_per_action: 2
