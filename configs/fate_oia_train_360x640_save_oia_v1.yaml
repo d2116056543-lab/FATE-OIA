@@ -13,8 +13,10 @@ experiment:
   no_metric_early_stop: true
 
 data:
-  data_root: data/bdd-oia
-  raw_root: data/bdd-oia
+  # BDD-OIA JSON files and RGB images live directly under this audited
+  # remote root; a relative placeholder would silently make formal runs fail.
+  data_root: E:/sbw/BDD-OIA
+  raw_root: E:/sbw/BDD-OIA
   bdd100k_root: E:/sbw/BDD100K
   image_height: 360
   image_width: 640
