@@ -297,6 +297,27 @@ def main() -> None:
                 prediction = plan["utility_teacher_prediction"].detach().float().flatten().cpu()
                 for target_value, prediction_value in zip(target.tolist(), prediction.tolist()):
                     teacher_rows.append({"epoch": epoch, "target": float(target_value), "prediction": float(prediction_value)})
+        # Persist the completed optimizer state before test evaluation so an
+        # evaluation failure never discards a finished training epoch.
+        save_checkpoint(
+            output / "checkpoint_pre_eval.pth",
+            model=runtime["model"],
+            optimizer=optimizer,
+            scheduler=scheduler,
+            optimizer_step=state.optimizer_step,
+            epoch=epoch,
+            micro_step=state.micro_step,
+            action_rms_ema=state.action_rms_ema,
+            view_consistency_ema=state.view_consistency_ema,
+            utility_cadence={"phase": state.optimizer_step % 4},
+            pu_lambda=state.pu_lambda,
+            split_manifest=manifest,
+            git_head=runtime["bindings"]["git_head"],
+            config_hash=runtime["bindings"]["config_hash"],
+            source_tree_hash=runtime["bindings"]["source_tree_hash"],
+            schema_hash=runtime["bindings"]["schema_hash"],
+            file_order_hash=hash_value({"epoch": epoch, "status": "pre_eval"}),
+        )
         result = evaluate_save_oia(runtime["model"], test_loader, device=device)
         if epoch == 0:
             pu_admission = _admit_pu(runtime["model"], audit_loader, device=device, seed=args.seed)

@@ -2,7 +2,10 @@ import inspect
 
 import torch
 
-from fate_oia.models.save_utility_bridge import select_matched_control_patches
+from fate_oia.models.save_utility_bridge import (
+    build_sparse_counterfactual_teacher,
+    select_matched_control_patches,
+)
 
 
 def test_matched_control_is_disjoint_equal_sized_and_nonrandom() -> None:
@@ -80,3 +83,27 @@ def test_matched_control_requires_equal_count_in_each_selected_sector() -> None:
         assert "insufficient exact matched controls" in str(error)
     else:
         raise AssertionError("control sector counts must exactly match selected sector counts")
+
+
+def test_counterfactual_teacher_skips_unmatchable_candidate_without_fallback() -> None:
+    """A strict teacher may abstain, but it must never crash or randomize control."""
+    patches = 32
+    plan = build_sparse_counterfactual_teacher(
+        base_action_logits=torch.zeros(1, 2),
+        action_targets=torch.tensor([[1.0, 0.0]]),
+        candidate_weight=torch.ones(1, 2, 1),
+        predicate_reliability=torch.ones(1, 1),
+        base_predicate_overlap=torch.ones(1, 2, 1),
+        detail_field=torch.ones(1, patches, 4),
+        # Every patch has identical predicate content, so an exact low-overlap
+        # control does not exist for the selected evidence.
+        predicate_map=torch.ones(1, 1, patches),
+        action_contribution=torch.zeros(1, 2, patches),
+        grid_hw=(4, 8),
+        teacher_decoder=lambda *args, **kwargs: {"action_logits": torch.zeros(1, 2)},
+    )
+
+    assert plan["available"] is False
+    assert plan["utility_teacher_target"] is None
+    assert plan["sample_indices"].numel() == 0
+    assert plan["unmatched_control_count"] > 0

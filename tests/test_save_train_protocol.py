@@ -1,3 +1,6 @@
+import inspect
+
+from fate_oia.engine import train_save_oia
 from fate_oia.engine.train_save_oia import build_save_splits, is_utility_cadence, save_ramps, utility_update_for_microbatch
 
 
@@ -22,3 +25,9 @@ def test_train_only_utility_cadence_runs_once_per_four_completed_updates():
     ]
     assert active == [31]
     assert utility_update_for_microbatch(micro_step=31, optimizer_step=3, grad_accum=8) == 4
+
+
+def test_training_writes_recovery_checkpoint_before_epoch_evaluation() -> None:
+    source = inspect.getsource(train_save_oia.main)
+    assert "checkpoint_pre_eval.pth" in source
+    assert source.index("checkpoint_pre_eval.pth") < source.index("evaluate_save_oia(")

@@ -830,17 +830,13 @@ def build_sparse_counterfactual_teacher(
         )
         if tuple(utility_logit.shape) != expected:
             raise ValueError(f"utility_logit must have shape {expected}")
-        plan["utility_teacher_prediction"] = utility_logit[
-            plan["sample_indices"],
-            plan["action_indices"],
-            plan["factor_indices"],
-        ]
-    else:
-        plan["utility_teacher_prediction"] = None
     records: list[dict[str, Any]] = []
     teacher_targets: list[Tensor] = []
+    teacher_predictions: list[Tensor] = []
     selected_margins: list[Tensor] = []
     control_margins: list[Tensor] = []
+    accepted_positions: list[int] = []
+    rejected_controls: list[dict[str, Any]] = []
     for position in range(int(plan["factor_indices"].numel())):
         sample = int(plan["sample_indices"][position].item())
         action = int(plan["action_indices"][position].item())
@@ -851,13 +847,30 @@ def build_sparse_counterfactual_teacher(
             torch.tensor([factor], device=predicate_map.device),
             candidate_scores=score.reshape(1),
         )
-        control, metadata = select_matched_control_patches(
-            detail_field[sample],
-            selected,
-            grid_hw=grid_hw,
-            predicate_map=predicate_map[sample],
-            action_contribution=action_contribution[sample, action],
-        )
+        try:
+            control, metadata = select_matched_control_patches(
+                detail_field[sample],
+                selected,
+                grid_hw=grid_hw,
+                predicate_map=predicate_map[sample],
+                action_contribution=action_contribution[sample, action],
+            )
+        except ValueError as error:
+            # Strict matched controls are a validity condition, not a reason to
+            # terminate the primary training update.  An unmatchable candidate
+            # is excluded from this sparse teacher pass; it is never replaced
+            # by a random or relaxed control.
+            if "insufficient exact matched controls" not in str(error):
+                raise
+            rejected_controls.append(
+                {
+                    "sample_index": sample,
+                    "action_index": action,
+                    "factor_index": factor,
+                    "reason": "insufficient_exact_matched_controls",
+                }
+            )
+            continue
         if selected.numel() != control.numel() or bool(torch.isin(control, selected).any()):
             raise RuntimeError("counterfactual teacher produced self-selected or unequal control")
         field = detail_field[sample : sample + 1]
@@ -897,6 +910,9 @@ def build_sparse_counterfactual_teacher(
         selected_margins.append(selected_margin.detach())
         control_margins.append(control_margin.detach())
         teacher_targets.append(target.detach())
+        if utility_logit is not None:
+            teacher_predictions.append(utility_logit[sample, action, factor])
+        accepted_positions.append(position)
         record: dict[str, Any] = {
             "sample_index": sample,
             "action_index": action,
@@ -909,13 +925,66 @@ def build_sparse_counterfactual_teacher(
             "utility_teacher_target": target.detach(),
         }
         records.append(record)
-    if len(teacher_targets) != int(plan["factor_indices"].numel()):
-        raise RuntimeError("counterfactual teacher did not produce one target per factor")
+    candidate_count = int(plan["factor_indices"].numel())
+    if not accepted_positions:
+        empty_long = plan["factor_indices"].new_empty((0,))
+        empty_value = base_action_logits.new_empty((0,))
+        for key in (
+            "sample_indices",
+            "action_indices",
+            "factor_indices",
+            "teacher_sample_indices",
+            "teacher_action_indices",
+            "teacher_factor_indices",
+        ):
+            plan[key] = empty_long
+        for key in (
+            "candidate_scores",
+            "selected_candidate_weight",
+            "selected_reliability",
+            "selected_base_overlap",
+            "selected_deletion_margin",
+            "control_margin",
+        ):
+            plan[key] = empty_value
+        plan["utility_teacher_target"] = None
+        plan["utility_teacher_prediction"] = None
+        plan["records"] = []
+        plan["selected_control_calls"] = 0
+        plan["available"] = False
+        plan["candidate_count"] = candidate_count
+        plan["matched_control_count"] = 0
+        plan["unmatched_control_count"] = len(rejected_controls)
+        plan["rejected_controls"] = rejected_controls
+        return plan
+
+    keep = torch.tensor(accepted_positions, device=plan["factor_indices"].device)
+    for key in (
+        "sample_indices",
+        "action_indices",
+        "factor_indices",
+        "candidate_scores",
+        "selected_candidate_weight",
+        "selected_reliability",
+        "selected_base_overlap",
+        "teacher_sample_indices",
+        "teacher_action_indices",
+        "teacher_factor_indices",
+    ):
+        plan[key] = plan[key].index_select(0, keep)
     plan["selected_deletion_margin"] = torch.stack(selected_margins)
     plan["control_margin"] = torch.stack(control_margins)
     plan["utility_teacher_target"] = torch.stack(teacher_targets)
+    plan["utility_teacher_prediction"] = (
+        torch.stack(teacher_predictions) if teacher_predictions else None
+    )
     plan["records"] = records
     plan["selected_control_calls"] = 2 * len(records)
+    plan["available"] = True
+    plan["candidate_count"] = candidate_count
+    plan["matched_control_count"] = len(records)
+    plan["unmatched_control_count"] = len(rejected_controls)
+    plan["rejected_controls"] = rejected_controls
     return plan
 
 
