@@ -31,3 +31,10 @@ def test_training_writes_recovery_checkpoint_before_epoch_evaluation() -> None:
     source = inspect.getsource(train_save_oia.main)
     assert "checkpoint_pre_eval.pth" in source
     assert source.index("checkpoint_pre_eval.pth") < source.index("evaluate_save_oia(")
+
+
+def test_training_can_resume_the_pre_evaluation_checkpoint() -> None:
+    source = inspect.getsource(train_save_oia.main)
+    assert 'parser.add_argument("--resume")' in source
+    assert "load_checkpoint(" in source
+    assert "start_epoch = int(payload[\"epoch\"]) + 1" in source

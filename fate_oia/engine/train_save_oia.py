@@ -35,7 +35,7 @@ from fate_oia.metrics import binary_roc_auc
 from fate_oia.models.save_oia_model import SAVEOIAModel
 from fate_oia.transforms_meter import meter_image_transform
 from fate_oia.utils.save_artifacts import (
-    append_jsonl, hash_value, save_checkpoint, save_epoch_artifacts,
+    append_jsonl, hash_value, load_checkpoint, save_checkpoint, save_epoch_artifacts,
     save_source_tree_hash, write_json,
 )
 from fate_oia.utils.save_contracts import validate_save_config, validate_save_factor_schema
@@ -266,6 +266,7 @@ def main() -> None:
     parser.add_argument("--run-kind", choices=("pilot", "full"), required=True); parser.add_argument("--epochs", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=0); parser.add_argument("--gradient-accumulation-steps", type=int, default=0); parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--max-train-samples", type=int, default=0); parser.add_argument("--max-audit-samples", type=int, default=0); parser.add_argument("--max-calib-samples", type=int, default=0); parser.add_argument("--max-test-samples", type=int, default=0); parser.add_argument("--seed", type=int, default=20260803)
+    parser.add_argument("--resume")
     args = parser.parse_args(); _seed(args.seed); device = torch.device(args.device)
     runtime = _make_runtime(args.config, device, batch_size=1, workers=args.num_workers)
     config = runtime["config"]; batch = args.batch_size or int(config["training"]["batch_size"]); accum = args.gradient_accumulation_steps or int(config["training"]["gradient_accumulation_steps"]); epochs = args.epochs or (4 if args.run_kind == "pilot" else int(config["training"]["epochs"]))
@@ -278,10 +279,36 @@ def main() -> None:
     groups = build_save_optimizer_groups(runtime["model"]); optimizer = AdamW(groups); validate_optimizer_groups(optimizer, runtime["model"])
     updates = max(1, math.ceil(len(loader) / accum) * epochs); scheduler = LambdaLR(optimizer, lambda step: min(1., (step + 1) / max(1, int(.05 * updates))) * .5 * (1 + math.cos(math.pi * min(1., step / updates))))
     state = SAVETrainState(); output = Path(args.output_dir); output.mkdir(parents=True, exist_ok=True); write_json(output / "split_manifest.json", manifest)
+    start_epoch = 0
+    if args.resume:
+        payload = load_checkpoint(
+            args.resume,
+            model=runtime["model"],
+            optimizer=optimizer,
+            scheduler=scheduler,
+            expected_git_head=runtime["bindings"]["git_head"],
+            expected_config_hash=runtime["bindings"]["config_hash"],
+            expected_source_tree_hash=runtime["bindings"]["source_tree_hash"],
+            expected_schema_hash=runtime["bindings"]["schema_hash"],
+            expected_split_hash=hash_value(manifest),
+        )
+        state.optimizer_step = int(payload["optimizer_step"])
+        state.micro_step = int(payload["micro_step"])
+        state.action_rms_ema = dict(payload["action_rms_ema"])
+        state.view_consistency_ema = float(payload["view_consistency_ema"])
+        restored_pu = payload.get("pu_lambda")
+        state.pu_lambda = restored_pu.to(device) if isinstance(restored_pu, Tensor) else None
+        start_epoch = int(payload["epoch"]) + 1
+        if start_epoch >= epochs:
+            raise ValueError("resume checkpoint already reached the requested epoch count")
     best = {"deploy_joint": -float("inf"), "raw_action_mAP": -float("inf"), "raw_action_mF1": -float("inf"), "raw_exp_mAP": -float("inf"), "deploy_exp_mF1": -float("inf")}
     pilot_epochs: list[dict[str, Any]] = []; teacher_rows: list[dict[str, Any]] = []
     owner_norm_history: list[dict[str, float]] = []; gradient_probe_history: list[dict[str, float]] = []
-    for epoch in range(epochs):
+    if start_epoch > 0 and state.pu_lambda is None:
+        pu_admission = _admit_pu(runtime["model"], audit_loader, device=device, seed=args.seed)
+        state.pu_lambda = torch.tensor(pu_admission["lambda"], device=device)
+        write_json(output / "pu_train_audit_admission.json", pu_admission)
+    for epoch in range(start_epoch, epochs):
         runtime["model"].train(); start = time.perf_counter()
         for index, raw_batch in enumerate(loader):
             batch_data = _move(raw_batch, device); progress = (epoch * len(loader) + index) / max(1, epochs * len(loader))
