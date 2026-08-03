@@ -15,6 +15,7 @@ from fate_oia.losses.save_loss_registry import (
     validate_save_firewall_contract,
     validate_save_parameter_ownership,
 )
+from fate_oia.models.save_oia_model import SAVEOIAModel
 
 
 EXPECTED_REGISTRATION_OWNERS = {
@@ -167,6 +168,18 @@ def test_save_optimizer_rejects_trainable_posthoc_threshold_or_temperature() -> 
 
     with pytest.raises(ValueError, match="POSTHOC_PARAMETER_INCLUDED"):
         build_save_optimizer_groups(model)
+
+
+def test_save_predicate_measurement_temperature_is_not_misclassified_as_posthoc() -> None:
+    """The frozen CalAlign predicate measurement temperature is not a deploy calibrator."""
+    model = SAVEOIAModel(use_mock_dino=True)
+    groups = build_save_optimizer_groups(model)
+    grouped_names = {
+        group["group_name"]: {id(parameter) for parameter in group["params"]}
+        for group in groups
+    }
+    parameter = dict(model.named_parameters())["foundation.predicate_head.temperature"]
+    assert id(parameter) in grouped_names["predicate_measurement"]
 
 
 def test_save_loss_registration_and_gradient_owner_tables_are_exact() -> None:

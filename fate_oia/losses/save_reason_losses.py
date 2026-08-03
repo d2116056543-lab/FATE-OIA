@@ -277,6 +277,7 @@ def save_reason_loss(
     positive_prototypes: Tensor | None = None,
     negative_prototypes: Tensor | None = None,
     view_output: Mapping[str, Any] | None = None,
+    pu_lambda: Tensor | None = None,
     weights: Mapping[str, float] | None = None,
 ) -> dict[str, Tensor]:
     """Single-owner reason loss implementing the exact section 16.2 composition."""
@@ -349,7 +350,9 @@ def save_reason_loss(
     if pu is None:
         pu_logits = _optional(output, benchmark, "reason_logits_pu_private")
         if pu_logits is not None:
-            pu = private_pu_reason_loss(pu_logits, target, reliability)
+            pu = private_pu_reason_loss(
+                pu_logits, target, reliability, pu_lambda=pu_lambda
+            )
     if pu is None:
         pu = benchmark.new_zeros(())
     else:

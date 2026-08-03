@@ -6,6 +6,7 @@ from fate_oia.losses.save_loss_registry import (
     SAVE_LOSS_WEIGHTS,
     SAVELossRegistry,
     SAVELossRuntime,
+    build_save_loss_registry,
 )
 
 
@@ -72,3 +73,12 @@ def test_save_loss_registry_exposes_a_single_backward_contract() -> None:
 
     with pytest.raises(ValueError, match="BACKWARD_DUPLICATED"):
         registry.backward()
+
+
+def test_bundle_totals_are_skipped_and_raw_terms_are_registered_once() -> None:
+    action = {name.removeprefix("action_"): torch.tensor(1.0) for name in SAVE_LOSS_TERM_NAMES if name.startswith("action_")}
+    reason = {name.removeprefix("reason_"): torch.tensor(1.0) for name in SAVE_LOSS_TERM_NAMES if name.startswith("reason_")}
+    measurement = {name.removeprefix("measurement_"): torch.tensor(1.0) for name in SAVE_LOSS_TERM_NAMES if name.startswith("measurement_")}
+    action["total"] = torch.tensor(999.0); reason["total"] = torch.tensor(999.0); measurement["total"] = torch.tensor(999.0)
+    registry = build_save_loss_registry(action=action, reason=reason, measurement=measurement)
+    assert all(count == 1 for count in registry.runtime_call_counts().values())

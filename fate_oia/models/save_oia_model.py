@@ -88,6 +88,32 @@ class SAVEOIAModel(nn.Module):
         self.foundation.dino.eval()
         return self
 
+    @property
+    def save_parameter_owner_map(self) -> dict[str, str]:
+        """Exact, disjoint optimizer ownership for the SAVE trainable path."""
+        owners: dict[str, str] = {}
+        for name, parameter in self.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            if name == "foundation.predicate_head.temperature":
+                owner = "predicate_measurement"
+            elif name.startswith(("foundation.", "multiscale_field.")):
+                owner = "foundation_joint"
+            elif name.startswith("predicate_measurement."):
+                owner = "predicate_measurement"
+            elif name.startswith("action_evidence."):
+                owner = "action_multi_inquiry"
+            elif name.startswith("utility_bridge."):
+                owner = "utility_bridge"
+            elif name.startswith("reason_decoder.clean_reason"):
+                owner = "clean_reason_adapter"
+            elif name.startswith("reason_decoder."):
+                owner = "private_reason"
+            else:
+                raise RuntimeError(f"SAVE parameter has no owner: {name}")
+            owners[name] = owner
+        return owners
+
     def encode_images(self, images: Tensor) -> dict[str, Any]:
         """Encode images exactly once through the frozen DINO field."""
         if not isinstance(images, Tensor):
@@ -240,6 +266,7 @@ class SAVEOIAModel(nn.Module):
         optimizer_update: int | None,
         action_targets: Tensor | None,
         run_teacher: bool | None,
+        utility_neutral: bool = False,
     ) -> tuple[dict[str, Tensor], dict[str, Any]]:
         # The order is contractual: global read, utility, then detail read.
         global_read = self.action_evidence.read_global(action_nodes, global_field)
@@ -286,6 +313,18 @@ class SAVEOIAModel(nn.Module):
             run_teacher=run_teacher,
             teacher_decoder=teacher_decoder,
         )
+        if utility_neutral:
+            # This is a same-field counterfactual: the detail reader retains
+            # its image evidence but receives only its explicit null candidate.
+            # A vector of zeros is not a valid candidate distribution and
+            # would turn an ablation into an invalid decoder state.
+            utility = dict(utility)
+            neutral_candidate = torch.zeros_like(utility["predicate_candidate_weight"])
+            if neutral_candidate.shape[-1] <= self.reason_dim:
+                neutral_candidate.fill_(1.0 / neutral_candidate.shape[-1])
+            else:
+                neutral_candidate[..., -1] = 1.0
+            utility["predicate_candidate_weight"] = neutral_candidate
         detail_read = self.action_evidence.read_detail(
             global_read,
             detail_field,
@@ -385,7 +424,9 @@ class SAVEOIAModel(nn.Module):
         optimizer_update: int | None = None,
         action_targets: Tensor | None = None,
         run_teacher: bool | None = None,
+        intervention: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
+        intervention = dict(intervention or {})
         patch_tokens = self._field_value(field, "patch_tokens_by_layer")
         decoded = self.foundation.decode_foundation(field)
         visual = self.multiscale_field(patch_tokens)
@@ -394,6 +435,33 @@ class SAVEOIAModel(nn.Module):
             patch_tokens,
             progress,
         )
+        if intervention.get("predicate_prior_off"):
+            predicate = dict(predicate)
+            for name in (
+                "predicate_map_action",
+                "predicate_token_action",
+                "predicate_state_prob_action",
+            ):
+                if isinstance(predicate.get(name), Tensor):
+                    predicate[name] = torch.zeros_like(predicate[name])
+        permutation = intervention.get("factor_permutation")
+        if permutation is not None:
+            permutation = torch.as_tensor(
+                permutation, device=patch_tokens.device, dtype=torch.long
+            )
+            if permutation.shape != (self.reason_dim,):
+                raise ValueError("SAVE factor identity permutation must have 21 entries")
+            predicate = dict(predicate)
+            for name in (
+                "predicate_map_action",
+                "predicate_token_action",
+                "predicate_state_prob_action",
+                "predicate_reliability_action",
+                "predicate_named_mask",
+            ):
+                if isinstance(predicate.get(name), Tensor):
+                    factor_dim = 0 if predicate[name].ndim == 1 else 1
+                    predicate[name] = predicate[name].index_select(factor_dim, permutation)
         evidence, staged = self._staged_action_evidence(
             action_nodes=decoded["action_nodes"],
             action_logits_base=decoded["action_logits_calalign"],
@@ -405,6 +473,7 @@ class SAVEOIAModel(nn.Module):
             optimizer_update=optimizer_update,
             action_targets=action_targets,
             run_teacher=run_teacher,
+            utility_neutral=bool(intervention.get("utility_neutral", False)),
         )
         reason = self.reason_decoder(
             reason_logits_calalign=decoded["reason_logits_calalign"],
@@ -468,6 +537,7 @@ class SAVEOIAModel(nn.Module):
                 "evidence_order": ("read_global", "utility_bridge", "read_detail"),
                 "evidence_forward_called": False,
                 "diagnostic_modes": tuple(diagnostic_modes),
+                "intervention": intervention,
             },
             "utility_teacher_plan": evidence.get("teacher_plan"),
             "counterfactual_teacher": evidence.get("teacher_plan"),

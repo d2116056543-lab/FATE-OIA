@@ -13,9 +13,15 @@ experiment:
   no_metric_early_stop: true
 
 data:
+  data_root: data/bdd-oia
+  raw_root: data/bdd-oia
+  bdd100k_root: E:/sbw/BDD100K
   image_height: 360
   image_width: 640
   num_workers: 4
+  prefetch_factor: 2
+  pin_memory: true
+  persistent_workers: true
   mirror_probability: 0.25
 
 splits:
@@ -61,7 +67,14 @@ training:
   scheduler: cosine_by_update
   weight_decay: 0.05
   grad_clip_global: 1.0
+  grad_clip_foundation_initial: 0.25
+  grad_clip_foundation_max: 0.75
   warmup_ratio: 0.05
+  mechanism_ramp_ratio: 0.10
+  grounding_ramp_ratio: 0.05
+  utility_teacher_interval_updates: 4
+  paired_view_interval_updates: 4
+  seed: 20260803
 
 pilot:
   train_main: 4096

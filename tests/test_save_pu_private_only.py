@@ -7,6 +7,7 @@ from fate_oia.losses.save_pu_losses import (
     private_pu_loss,
     pu_score,
 )
+from fate_oia.losses.save_reason_losses import save_reason_loss
 
 
 def test_pu_admission_is_continuous_and_train_audit_only() -> None:
@@ -78,3 +79,17 @@ def test_pu_loss_backpropagates_to_private_reason_only() -> None:
     assert clean.grad is None
     assert foundation.grad is None
     assert predicate.grad is None
+
+
+def test_reason_bundle_forwards_continuous_pu_lambda_to_private_loss() -> None:
+    output = {
+        "reason_logits_final": torch.zeros(2, 2),
+        "reason_logits_private_direct": torch.zeros(2, 2),
+        "reason_logits_pu_private": torch.full((2, 2), 3.0),
+        "reason_logits_clean": torch.zeros(2, 2),
+        "reason_reliability": torch.ones(2, 2),
+    }
+    target = torch.zeros(2, 2)
+    off = save_reason_loss(output, target, pu_lambda=torch.zeros(2))
+    on = save_reason_loss(output, target, pu_lambda=torch.full((2,), 0.1))
+    assert float(on["pu_private"]) > float(off["pu_private"])

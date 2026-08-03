@@ -754,7 +754,11 @@ def register_save_loss_bundles(
     ):
         for local_name, value in bundle.items():
             if str(local_name).lower().endswith("total"):
-                raise ValueError("LOSS_DOUBLE_WEIGHTED: bundle totals are not registry terms")
+                # Category builders expose a convenience total for callers
+                # that do not use SAVE's single-owner registry.  It is never
+                # registered here; the raw named terms below remain the sole
+                # objective and are still checked for duplicates/weights.
+                continue
             canonical = keys.get(str(local_name), _canonical_loss_name(local_name))
             if canonical not in keys.values():
                 raise ValueError("LOSS_UNKNOWN: " + str(local_name))
@@ -825,7 +829,14 @@ def _named_parameter_items(source: Any) -> List[Tuple[str, Tensor]]:
 
 
 def _is_posthoc_parameter(name: str) -> bool:
-    return _POSTHOC_PARAMETER_RE.search(str(name)) is not None
+    # The source CalAlign predicate head has a per-predicate attention
+    # temperature. It is part of visual measurement, not a deployment
+    # threshold/temperature calibrator, and must remain trainable in SAVE.
+    # All other threshold/temperature parameters stay post-hoc and excluded.
+    value = str(name)
+    if value == "foundation.predicate_head.temperature":
+        return False
+    return _POSTHOC_PARAMETER_RE.search(value) is not None
 
 
 def _is_dino_parameter(name: str) -> bool:
