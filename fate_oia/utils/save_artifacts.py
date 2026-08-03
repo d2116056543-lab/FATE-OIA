@@ -173,7 +173,8 @@ def save_tensor(path: str | Path, value: torch.Tensor) -> Path:
 save_meter_tensor = save_tensor
 
 
-def _hash_named_tensors(values: Mapping[str, torch.Tensor]) -> str:
+def hash_named_tensors(values: Mapping[str, torch.Tensor]) -> str:
+    """Return a stable binary hash for a named collection of tensors."""
     digest = hashlib.sha256()
     for name in sorted(values):
         if not isinstance(values[name], torch.Tensor):
@@ -185,6 +186,11 @@ def _hash_named_tensors(values: Mapping[str, torch.Tensor]) -> str:
         digest.update(len(payload).to_bytes(8, "big"))
         digest.update(payload)
     return digest.hexdigest()
+
+
+# Keep the private name for existing artifact readers while exposing the
+# collection hash to training code that builds bound run manifests.
+_hash_named_tensors = hash_named_tensors
 
 
 def _hash_file_order(file_order: Iterable[str]) -> str:
@@ -638,6 +644,7 @@ __all__ = [
     "append_jsonl",
     "capture_rng_state",
     "file_hash",
+    "hash_named_tensors",
     "hash_value",
     "load_checkpoint",
     "restore_rng_state",

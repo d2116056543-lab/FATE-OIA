@@ -3,7 +3,12 @@ from pathlib import Path
 import pytest
 import torch
 
-from fate_oia.utils.save_artifacts import save_epoch_artifacts, save_source_tree_hash, validate_epoch_artifacts
+from fate_oia.utils.save_artifacts import (
+    hash_named_tensors,
+    save_epoch_artifacts,
+    save_source_tree_hash,
+    validate_epoch_artifacts,
+)
 
 
 def _kwargs():
@@ -28,6 +33,15 @@ def test_epoch_artifact_hash_chain_is_validated(tmp_path: Path):
     (directory / "file_order.json").write_text('{"file_order":["b.jpg","a.jpg"]}', encoding="utf-8")
     with pytest.raises(ValueError, match="file_order_hash mismatch"):
         validate_epoch_artifacts(directory)
+
+
+def test_named_tensor_hash_is_binary_safe_and_content_sensitive():
+    first = {"action": torch.tensor([[1.0, 2.0]])}
+    same = {"action": torch.tensor([[1.0, 2.0]])}
+    changed = {"action": torch.tensor([[1.0, 3.0]])}
+
+    assert hash_named_tensors(first) == hash_named_tensors(same)
+    assert hash_named_tensors(first) != hash_named_tensors(changed)
 
 
 def test_epoch_artifact_requires_all_mechanism_groups(tmp_path: Path):

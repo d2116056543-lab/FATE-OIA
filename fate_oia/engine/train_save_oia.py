@@ -35,8 +35,8 @@ from fate_oia.metrics import binary_roc_auc
 from fate_oia.models.save_oia_model import SAVEOIAModel
 from fate_oia.transforms_meter import meter_image_transform
 from fate_oia.utils.save_artifacts import (
-    append_jsonl, hash_value, load_checkpoint, save_checkpoint, save_epoch_artifacts,
-    save_source_tree_hash, write_json,
+    append_jsonl, file_hash, hash_named_tensors, hash_value, load_checkpoint,
+    save_checkpoint, save_epoch_artifacts, save_source_tree_hash, write_json,
 )
 from fate_oia.utils.save_contracts import validate_save_config, validate_save_factor_schema
 
@@ -394,7 +394,10 @@ def main() -> None:
             write_json(output / "pu_train_audit_admission.json", pu_admission)
         raw = result["metrics"]; deploy = raw; joint = float(raw["joint"])
         checkpoint = save_checkpoint(output / "checkpoint_latest.pth", model=runtime["model"], optimizer=optimizer, scheduler=scheduler, optimizer_step=state.optimizer_step, epoch=epoch, micro_step=state.micro_step, action_rms_ema=state.action_rms_ema, view_consistency_ema=state.view_consistency_ema, utility_cadence={"phase": state.optimizer_step % 4}, pu_lambda=state.pu_lambda, split_manifest=manifest, git_head=runtime["bindings"]["git_head"], config_hash=runtime["bindings"]["config_hash"], source_tree_hash=runtime["bindings"]["source_tree_hash"], schema_hash=runtime["bindings"]["schema_hash"], file_order_hash=hash_value(result["file_names"]))
-        runtime["bindings"]["checkpoint_hash"] = hash_value(checkpoint.read_bytes()); runtime["bindings"]["logits_hash"] = hash_value({k: v for k,v in result["logits"].items()}); runtime["bindings"]["labels_hash"] = hash_value({k: v for k,v in result["labels"].items()}); runtime["bindings"]["file_order_hash"] = hash_value(result["file_names"])
+        runtime["bindings"]["checkpoint_hash"] = file_hash(checkpoint)
+        runtime["bindings"]["logits_hash"] = hash_named_tensors(result["logits"])
+        runtime["bindings"]["labels_hash"] = hash_named_tensors(result["labels"])
+        runtime["bindings"]["file_order_hash"] = hash_value(result["file_names"])
         save_epoch_artifacts(output, epoch, metrics_raw=raw, metrics_deploy=deploy, branch_metrics=result["branch_metrics"], logits=result["logits"], labels=result["labels"], file_names=result["file_names"], mechanism={"base_to_final_joint": joint - float(result["branch_metrics"]["base"]["joint"])}, utility={"fixed_audit": result["fixed_audit"]}, faithfulness={"fixed_audit": result["fixed_audit"]}, gradient={"owner": {}}, runtime={"epoch_seconds": time.perf_counter()-start, "dino_calls": result["dino_calls"]}, hashes=runtime["bindings"], checkpoint_path=checkpoint, split_manifest=manifest)
         summary = {"epoch": epoch, "metrics_raw": raw, "metrics_deploy": deploy, "branch_metrics": result["branch_metrics"], "bindings": runtime["bindings"]}; append_jsonl(output / "metrics_summary.jsonl", summary)
         clean = result["branch_metrics"]["reason_clean"]; private = result["branch_metrics"]["reason_private_direct"]
