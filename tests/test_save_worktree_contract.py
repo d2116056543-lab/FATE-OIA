@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from fate_oia.utils.save_contracts import (
+    SAVE_LOCAL_MIRROR_SUFFIX,
     L08_WRITE_SET,
     SAVE_TARGET_WORKTREE_SUFFIX,
     validate_save_worktree,
@@ -11,7 +12,8 @@ from fate_oia.utils.save_contracts import (
 
 def test_save_worktree_and_l08_write_set_are_explicit() -> None:
     root = Path(__file__).resolve().parents[1]
-    assert root.name.endswith(SAVE_TARGET_WORKTREE_SUFFIX)
+    assert SAVE_TARGET_WORKTREE_SUFFIX == "fate_oia_acpr_save_oia_v1_worktree"
+    assert root.name in {SAVE_TARGET_WORKTREE_SUFFIX, SAVE_LOCAL_MIRROR_SUFFIX}
     assert validate_save_worktree(root)
     assert L08_WRITE_SET == frozenset(
         {

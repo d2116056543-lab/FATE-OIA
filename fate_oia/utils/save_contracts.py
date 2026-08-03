@@ -9,7 +9,8 @@ import yaml
 
 SAVE_SOURCE_HEAD = "b8669c4951f58d3c6b6831e0ae7fb5b2c7827db6"
 SAVE_TARGET_BRANCH = "acpr_save_oia_v1_direct_image"
-SAVE_TARGET_WORKTREE_SUFFIX = "save_oia_v1_sync_worktree"
+SAVE_TARGET_WORKTREE_SUFFIX = "fate_oia_acpr_save_oia_v1_worktree"
+SAVE_LOCAL_MIRROR_SUFFIX = "fate_oia_acpr_save_oia_v1_sync_worktree"
 
 L08_WRITE_SET = frozenset(
     {
@@ -91,10 +92,13 @@ def validate_save_source_head(root: str | Path, *, head: str | None = None) -> b
 def validate_save_worktree(root: str | Path) -> bool:
     """Validate the dedicated L08 worktree without requiring a clean tree."""
     worktree = _repo_root(root)
-    if not worktree.name.endswith(SAVE_TARGET_WORKTREE_SUFFIX):
+    if worktree.name not in {
+        SAVE_TARGET_WORKTREE_SUFFIX,
+        SAVE_LOCAL_MIRROR_SUFFIX,
+    }:
         raise ValueError(
-            "SAVE L08 must run in a dedicated worktree ending in "
-            f"{SAVE_TARGET_WORKTREE_SUFFIX!r}"
+            "SAVE L08 must run in the planned worktree or its local sync mirror: "
+            f"{SAVE_TARGET_WORKTREE_SUFFIX!r}, {SAVE_LOCAL_MIRROR_SUFFIX!r}"
         )
     top_level = Path(_git(worktree, "rev-parse", "--show-toplevel")).resolve()
     if top_level != worktree:
@@ -185,6 +189,7 @@ __all__ = [
     "SAVE_SOURCE_HEAD",
     "SAVE_TARGET_BRANCH",
     "SAVE_TARGET_WORKTREE_SUFFIX",
+    "SAVE_LOCAL_MIRROR_SUFFIX",
     "validate_save_config",
     "validate_save_factor_schema",
     "validate_save_source_head",
