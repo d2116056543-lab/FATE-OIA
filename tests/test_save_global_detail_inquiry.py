@@ -1,6 +1,7 @@
 import torch
 
 from fate_oia.models.save_action_evidence import SAVEActionEvidence, evidence_ramp
+from fate_oia.models.save_utility_bridge import SAVEUtilityBridge
 
 
 def _inputs(batch: int = 1, actions: int = 4, patches: int = 3600, dim: int = 16):
@@ -11,6 +12,134 @@ def _inputs(batch: int = 1, actions: int = 4, patches: int = 3600, dim: int = 16
     base_logits = torch.randn(batch, actions)
     base_attention = torch.full((batch, actions, patches), 1.0 / patches)
     return nodes, global_field, detail_field, base_logits, base_attention
+
+
+def test_staged_global_output_is_read_only_bridge_input_before_detail_read():
+    nodes, global_field, detail_field, _, base_attention = _inputs()
+    model = SAVEActionEvidence(dim=16, action_dim=4, num_heads=4)
+    bridge = SAVEUtilityBridge(dim=16, action_dim=4, factor_dim=21)
+    inquiry_calls = {"global": 0, "detail": 0}
+    global_hook = model.global_inquiry.register_forward_hook(
+        lambda *_: inquiry_calls.__setitem__("global", inquiry_calls["global"] + 1)
+    )
+    detail_hook = model.detail_query.register_forward_hook(
+        lambda *_: inquiry_calls.__setitem__("detail", inquiry_calls["detail"] + 1)
+    )
+
+    predicate_token = torch.randn(1, 21, 16)
+    predicate_state_summary = torch.randn(1, 21, 16)
+    predicate_reliability = torch.ones(1, 21)
+    base_predicate_overlap = torch.rand(1, 4, 21)
+    global_detail_similarity = torch.rand(1, 4, 21)
+
+    global_read = model.read_global(nodes, global_field)
+    frozen_global_read = {
+        key: value.detach().clone() for key, value in global_read.items()
+    }
+    assert inquiry_calls == {"global": 1, "detail": 0}
+
+    # The bridge consumes the tensor-level global token, not the whole mapping.
+    # Its candidate score is an independent, read-only stage before detail read.
+    bridge_output = bridge(
+        action_global_token=global_read["action_global_token"],
+        predicate_token=predicate_token,
+        predicate_state_summary=predicate_state_summary,
+        predicate_reliability=predicate_reliability,
+        base_predicate_overlap=base_predicate_overlap,
+        global_detail_query_similarity=global_detail_similarity,
+    )
+    assert bridge_output["predicate_candidate_weight"].shape == (1, 4, 22)
+    for key, before in frozen_global_read.items():
+        torch.testing.assert_close(global_read[key], before, atol=0, rtol=0)
+    assert inquiry_calls == {"global": 1, "detail": 0}
+
+    detail_read = model.read_detail(
+        global_read,
+        detail_field,
+        calalign_action_attention=base_attention,
+        predicate_map=torch.rand(1, 21, 3600),
+        predicate_candidate_weight=bridge_output["predicate_candidate_weight"],
+        predicate_reliability=predicate_reliability,
+    )
+
+    assert inquiry_calls == {"global": 1, "detail": 1}
+    assert detail_read["action_detail_token"].shape == (1, 4, 16)
+    assert detail_read["action_detail_attention"].shape == (1, 4, 3600)
+    global_hook.remove()
+    detail_hook.remove()
+
+
+def test_staged_global_and_detail_reads_are_separate_and_legacy_forward_composes_once(
+    monkeypatch,
+):
+    nodes, global_field, detail_field, base_logits, base_attention = _inputs()
+    model = SAVEActionEvidence(dim=16, action_dim=4, num_heads=4)
+    calls = {"global": 0, "detail": 0}
+    inquiry_calls = {"global": 0, "detail": 0}
+    original_global = model.read_global
+    original_detail = model.read_detail
+
+    global_hook = model.global_inquiry.register_forward_hook(
+        lambda *_: inquiry_calls.__setitem__("global", inquiry_calls["global"] + 1)
+    )
+    detail_hook = model.detail_query.register_forward_hook(
+        lambda *_: inquiry_calls.__setitem__("detail", inquiry_calls["detail"] + 1)
+    )
+
+    def counted_global(*args, **kwargs):
+        calls["global"] += 1
+        return original_global(*args, **kwargs)
+
+    def counted_detail(*args, **kwargs):
+        calls["detail"] += 1
+        return original_detail(*args, **kwargs)
+
+    monkeypatch.setattr(model, "read_global", counted_global)
+    monkeypatch.setattr(model, "read_detail", counted_detail)
+    global_read = model.read_global(nodes, global_field)
+
+    assert calls == {"global": 1, "detail": 0}
+    assert inquiry_calls == {"global": 1, "detail": 0}
+    assert global_read["action_global_token"].shape == (1, 4, 16)
+    assert global_read["action_global_attention"].shape == (1, 4, 3600)
+
+    detail_read = model.read_detail(
+        global_read,
+        detail_field,
+        calalign_action_attention=base_attention,
+    )
+    assert calls == {"global": 1, "detail": 1}
+    assert inquiry_calls == {"global": 1, "detail": 1}
+    assert detail_read["action_detail_token"].shape == (1, 4, 16)
+    assert detail_read["action_detail_attention"].shape == (1, 4, 3600)
+
+    calls["global"] = 0
+    calls["detail"] = 0
+    inquiry_calls["global"] = 0
+    inquiry_calls["detail"] = 0
+    output = model(
+        nodes,
+        global_field,
+        detail_field,
+        base_logits,
+        calalign_action_attention=base_attention,
+    )
+    assert calls == {"global": 1, "detail": 1}
+    assert inquiry_calls == {"global": 1, "detail": 1}
+    for key in (
+        "action_global_token",
+        "action_global_attention",
+        "action_global_bypass",
+        "action_detail_token",
+        "action_detail_attention",
+        "action_patch_value",
+        "action_patch_contribution",
+        "action_evidence_raw",
+        "predicate_prior",
+    ):
+        torch.testing.assert_close(output[key], detail_read[key], atol=0, rtol=0)
+    global_hook.remove()
+    detail_hook.remove()
 
 
 def test_save_reads_global_and_detail_fields_with_distinct_full_patch_inquiries():

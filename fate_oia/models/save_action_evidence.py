@@ -63,8 +63,8 @@ def build_predicate_soft_prior(
 ) -> dict[str, Tensor]:
     """Build finite named and unnamed soft priors for the detail read.
 
-    The last candidate may be a null candidate, so only the first ``R``
-    candidate weights can name the ``R`` predicate maps.  The unnamed term is
+    ``predicate_candidate_weight`` is an entmax distribution. The final
+    candidate may be null, so it has no named-map mass. The unnamed term is
     additive rather than normalized away, which keeps every patch reachable.
     """
     if action_global_attention.ndim != 3:
@@ -105,9 +105,26 @@ def build_predicate_soft_prior(
                     "predicate candidate dimension must match predicate_map "
                     "or include one final null candidate"
                 )
-            candidate_weights = torch.softmax(
-                predicate_candidate_weight.to(maps), dim=-1
+            candidate_weights = predicate_candidate_weight.to(maps)
+            if not torch.isfinite(candidate_weights).all():
+                raise ValueError("predicate_candidate_weight must be finite")
+            if (candidate_weights < 0).any():
+                raise ValueError(
+                    "predicate_candidate_weight must be an entmax distribution"
+                )
+            tolerance = max(
+                1e-5,
+                2.0 * candidate_dim * torch.finfo(candidate_weights.dtype).eps,
             )
+            if not torch.allclose(
+                candidate_weights.sum(dim=-1),
+                torch.ones_like(candidate_weights[..., 0]),
+                atol=tolerance,
+                rtol=0.0,
+            ):
+                raise ValueError(
+                    "predicate_candidate_weight must be an entmax distribution"
+                )
             weights = candidate_weights[..., :factor_dim]
         if predicate_reliability is None:
             reliability = maps.new_ones(batch, factor_dim)
@@ -168,6 +185,73 @@ def _direction_preserving_cap(
     raw_norm = logits.float().norm(dim=-1, keepdim=True)
     scale = (cap / raw_norm.clamp_min(1e-6)).clamp(max=1.0)
     return logits * scale.to(logits.dtype)
+
+
+class _FoundationFirewalledEvidence(torch.autograd.Function):
+    """Reuse the formal forward value while routing auxiliary gradients safely."""
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        formal_evidence: Tensor,
+        action_nodes_base: Tensor,
+        global_field: Tensor,
+        detail_field: Tensor,
+        calalign_action_attention: Tensor | None,
+        predicate_map: Tensor | None,
+        predicate_candidate_weight: Tensor | None,
+        predicate_reliability: Tensor | None,
+        predicate_gain: Tensor | None,
+        module: "SAVEActionEvidence",
+        *parameters: Tensor,
+    ) -> Tensor:
+        ctx.module = module
+        ctx.options = tuple(
+            None if value is None else value.detach()
+            for value in (
+                calalign_action_attention,
+                predicate_map,
+                predicate_candidate_weight,
+                predicate_reliability,
+                predicate_gain,
+            )
+        )
+        ctx.save_for_backward(
+            action_nodes_base.detach(),
+            global_field.detach(),
+            detail_field.detach(),
+            *parameters,
+        )
+        return formal_evidence.detach()
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: Tensor) -> tuple[Tensor | None, ...]:
+        action_nodes_base, global_field, detail_field, *parameters = ctx.saved_tensors
+        (
+            calalign_action_attention,
+            predicate_map,
+            predicate_candidate_weight,
+            predicate_reliability,
+            predicate_gain,
+        ) = ctx.options
+        with torch.enable_grad():
+            global_read = ctx.module._read_global(action_nodes_base, global_field)
+            detail_read = ctx.module._read_detail(
+                global_read,
+                detail_field,
+                calalign_action_attention=calalign_action_attention,
+                predicate_map=predicate_map,
+                predicate_candidate_weight=predicate_candidate_weight,
+                predicate_reliability=predicate_reliability,
+                predicate_gain=predicate_gain,
+            )
+            parameter_gradients = torch.autograd.grad(
+                detail_read["action_evidence_raw"],
+                parameters,
+                grad_outputs=grad_output,
+                allow_unused=True,
+            )
+        return (None,) * 10 + parameter_gradients
 
 
 class SAVEActionEvidence(nn.Module):
@@ -306,10 +390,84 @@ class SAVEActionEvidence(nn.Module):
             .to(dtype=action_logits_base.dtype)
         )
 
-    def _read_evidence(
+    def _validate_global_read_inputs(
         self,
         action_nodes_base: Tensor,
         global_field: Tensor,
+    ) -> None:
+        if not isinstance(action_nodes_base, Tensor):
+            raise TypeError("action_nodes_base must be a tensor")
+        if action_nodes_base.ndim != 3:
+            raise ValueError("action_nodes_base must be [B,A,D]")
+        batch, actions, dim = action_nodes_base.shape
+        if (actions, dim) != (self.action_dim, self.dim):
+            raise ValueError(
+                f"action_nodes_base must be [B,{self.action_dim},{self.dim}]"
+            )
+        if tuple(global_field.shape) != (batch, self.num_patches, self.dim):
+            raise ValueError(
+                f"global_field must be [B,{self.num_patches},{self.dim}], "
+                f"got {tuple(global_field.shape)}"
+            )
+
+    def _validate_detail_read_inputs(
+        self,
+        global_read: Mapping[str, Tensor],
+        detail_field: Tensor,
+    ) -> None:
+        try:
+            action_global_token = global_read["action_global_token"]
+            global_attention = global_read["action_global_attention"]
+            global_bypass = global_read["action_global_bypass"]
+        except KeyError as error:
+            raise ValueError("global_read is missing a required global output") from error
+        if action_global_token.ndim != 3 or tuple(action_global_token.shape[1:]) != (
+            self.action_dim,
+            self.dim,
+        ):
+            raise ValueError("global_read action_global_token has an invalid shape")
+        batch = int(action_global_token.shape[0])
+        if tuple(global_attention.shape) != (batch, self.action_dim, self.num_patches):
+            raise ValueError("global_read action_global_attention has an invalid shape")
+        if tuple(global_bypass.shape) != (batch, self.action_dim, self.dim):
+            raise ValueError("global_read action_global_bypass has an invalid shape")
+        if tuple(detail_field.shape) != (batch, self.num_patches, self.dim):
+            raise ValueError(
+                f"detail_field must be [B,{self.num_patches},{self.dim}], "
+                f"got {tuple(detail_field.shape)}"
+            )
+
+    def _read_global(
+        self,
+        action_nodes_base: Tensor,
+        global_field: Tensor,
+    ) -> dict[str, Tensor]:
+        """Run only the global inquiry over the complete global field."""
+        global_update, global_attention = self.global_inquiry(
+            action_nodes_base,
+            global_field,
+            global_field,
+            need_weights=True,
+            average_attn_weights=True,
+        )
+        return {
+            "action_global_token": self.global_norm(action_nodes_base + global_update),
+            "action_global_attention": global_attention,
+            "action_global_bypass": action_nodes_base,
+        }
+
+    def read_global(
+        self,
+        action_nodes_base: Tensor,
+        global_field: Tensor,
+    ) -> dict[str, Tensor]:
+        """Read the [B,3600,D] global field without invoking detail inquiry."""
+        self._validate_global_read_inputs(action_nodes_base, global_field)
+        return self._read_global(action_nodes_base, global_field)
+
+    def _read_detail(
+        self,
+        global_read: Mapping[str, Tensor],
         detail_field: Tensor,
         *,
         calalign_action_attention: Tensor | None,
@@ -318,14 +476,8 @@ class SAVEActionEvidence(nn.Module):
         predicate_reliability: Tensor | None,
         predicate_gain: Tensor | None,
     ) -> dict[str, Tensor]:
-        global_update, global_attention = self.global_inquiry(
-            action_nodes_base,
-            global_field,
-            global_field,
-            need_weights=True,
-            average_attn_weights=True,
-        )
-        action_global_token = self.global_norm(action_nodes_base + global_update)
+        action_global_token = global_read["action_global_token"]
+        global_attention = global_read["action_global_attention"]
         prior = build_predicate_soft_prior(
             global_attention,
             calalign_action_attention=calalign_action_attention,
@@ -365,9 +517,7 @@ class SAVEActionEvidence(nn.Module):
         action_patch_contribution = detail_attention * action_patch_value
         action_evidence_raw = action_patch_contribution.sum(dim=-1)
         return {
-            "action_global_token": action_global_token,
-            "action_global_attention": global_attention,
-            "action_global_bypass": action_nodes_base,
+            **global_read,
             "action_detail_token": action_detail_token,
             "action_detail_attention": detail_attention,
             "action_detail_scores": detail_scores,
@@ -379,9 +529,46 @@ class SAVEActionEvidence(nn.Module):
             **prior,
         }
 
+    def read_detail(
+        self,
+        global_read: Mapping[str, Tensor],
+        detail_field: Tensor,
+        *,
+        calalign_action_attention: Tensor | None = None,
+        predicate_map: Tensor | None = None,
+        predicate_candidate_weight: Tensor | None = None,
+        predicate_reliability: Tensor | None = None,
+        predicate_gain: Tensor | None = None,
+    ) -> dict[str, Tensor]:
+        """Read the [B,3600,D] detail field from a completed global inquiry."""
+        self._validate_detail_read_inputs(global_read, detail_field)
+        return self._read_detail(
+            global_read,
+            detail_field,
+            calalign_action_attention=calalign_action_attention,
+            predicate_map=predicate_map,
+            predicate_candidate_weight=predicate_candidate_weight,
+            predicate_reliability=predicate_reliability,
+            predicate_gain=predicate_gain,
+        )
+
     @staticmethod
     def _detach_optional(value: Tensor | None) -> Tensor | None:
         return None if value is None else value.detach()
+
+    def _evidence_parameters(self) -> tuple[Tensor, ...]:
+        return (
+            self.global_inquiry.in_proj_weight,
+            self.global_inquiry.in_proj_bias,
+            self.global_inquiry.out_proj.weight,
+            self.global_inquiry.out_proj.bias,
+            self.detail_query.weight,
+            self.detail_key.weight,
+            self.detail_value.weight,
+            self.detail_output.weight,
+            self.patch_action_value.weight,
+            self.patch_value.weight,
+        )
 
     def forward(
         self,
@@ -452,9 +639,9 @@ class SAVEActionEvidence(nn.Module):
         if base_action_attention is not None:
             calalign_action_attention = base_action_attention
 
-        evidence = self._read_evidence(
-            action_nodes_base,
-            global_field,
+        global_read = self.read_global(action_nodes_base, global_field)
+        evidence = self.read_detail(
+            global_read,
             detail_field,
             calalign_action_attention=calalign_action_attention,
             predicate_map=predicate_map,
@@ -478,20 +665,21 @@ class SAVEActionEvidence(nn.Module):
             ramp=ramp,
             cap=self.action_logit_cap,
         )
-        auxiliary = self._read_evidence(
-            action_nodes_base.detach(),
-            global_field.detach(),
-            detail_field.detach(),
-            calalign_action_attention=self._detach_optional(calalign_action_attention),
-            predicate_map=self._detach_optional(predicate_map),
-            predicate_candidate_weight=self._detach_optional(
-                predicate_candidate_weight
-            ),
-            predicate_reliability=self._detach_optional(predicate_reliability),
-            predicate_gain=self._detach_optional(predicate_gain),
+        auxiliary_raw = _FoundationFirewalledEvidence.apply(
+            evidence["action_evidence_raw"],
+            action_nodes_base,
+            global_field,
+            detail_field,
+            calalign_action_attention,
+            predicate_map,
+            predicate_candidate_weight,
+            predicate_reliability,
+            predicate_gain,
+            self,
+            *self._evidence_parameters(),
         )
         auxiliary_bounded = kappa.view(1, -1) * torch.tanh(
-            auxiliary["action_evidence_raw"]
+            auxiliary_raw
             / kappa.view(1, -1).clamp_min(torch.finfo(action_logits_base.dtype).tiny)
         )
         action_logits_evidence_aux = action_logits_base.detach() + auxiliary_bounded
@@ -505,7 +693,7 @@ class SAVEActionEvidence(nn.Module):
             "action_evidence_delta": action_evidence_delta,
             "action_logits_evidence_aux": action_logits_evidence_aux,
             "action_logits_evidence_auxiliary": action_logits_evidence_aux,
-            "action_evidence_aux_raw": auxiliary["action_evidence_raw"],
+            "action_evidence_aux_raw": auxiliary_raw,
             "action_evidence_aux_bounded": auxiliary_bounded,
             "action_logits_final": action_logits_final,
             "action_correction_kappa": kappa.view(1, -1),
