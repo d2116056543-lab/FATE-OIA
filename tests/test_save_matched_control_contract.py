@@ -110,6 +110,26 @@ def test_counterfactual_teacher_skips_unmatchable_candidate_without_fallback() -
     assert plan["unmatched_control_count"] > 0
 
 
+def test_counterfactual_teacher_abstains_when_no_candidate_is_reliable() -> None:
+    plan = build_sparse_counterfactual_teacher(
+        base_action_logits=torch.zeros(1, 2),
+        action_targets=torch.tensor([[1.0, 0.0]]),
+        candidate_weight=torch.zeros(1, 2, 1),
+        predicate_reliability=torch.ones(1, 1),
+        base_predicate_overlap=torch.ones(1, 2, 1),
+        detail_field=torch.ones(1, 32, 4),
+        predicate_map=torch.zeros(1, 1, 32),
+        action_contribution=torch.zeros(1, 2, 32),
+        grid_hw=(4, 8),
+        teacher_decoder=lambda *args, **kwargs: {"action_logits": torch.zeros(1, 2)},
+    )
+
+    assert plan["available"] is False
+    assert plan["candidate_count"] == 0
+    assert plan["utility_teacher_target"] is None
+    assert plan["selected_control_calls"] == 0
+
+
 def test_faithfulness_loss_abstains_when_strict_teacher_has_no_controls() -> None:
     losses = save_faithfulness_losses(
         {

@@ -806,6 +806,44 @@ def build_sparse_counterfactual_teacher(
         predicate_reliability,
         base_predicate_overlap,
     )
+    if plan["factor_indices"].numel() == 0:
+        # A strict teacher may abstain when no reliable factor/action proposal
+        # exists. This must not halt the primary action/reason update or create
+        # a synthetic fallback control.
+        empty_long = torch.empty(0, dtype=torch.long, device=base_action_logits.device)
+        empty_value = base_action_logits.new_empty((0,))
+        for key in (
+            "sample_indices",
+            "action_indices",
+            "factor_indices",
+            "teacher_sample_indices",
+            "teacher_action_indices",
+            "teacher_factor_indices",
+        ):
+            plan[key] = empty_long
+        for key in (
+            "candidate_scores",
+            "selected_candidate_weight",
+            "selected_reliability",
+            "selected_base_overlap",
+            "selected_deletion_margin",
+            "control_margin",
+        ):
+            plan[key] = empty_value
+        plan.update(
+            {
+                "utility_teacher_target": None,
+                "utility_teacher_prediction": None,
+                "records": [],
+                "selected_control_calls": 0,
+                "available": False,
+                "candidate_count": 0,
+                "matched_control_count": 0,
+                "unmatched_control_count": 0,
+                "rejected_controls": [],
+            }
+        )
+        return plan
     detail_field = _require_tensor(detail_field, "detail_field", 3)
     predicate_map = _require_tensor(predicate_map, "predicate_map", 3)
     action_contribution = _require_tensor(action_contribution, "action_contribution", 3)
@@ -819,8 +857,6 @@ def build_sparse_counterfactual_teacher(
         raise ValueError("predicate_map patch count must match detail_field")
     if action_contribution.shape[-1] != detail_field.shape[1]:
         raise ValueError("action_contribution patch count must match detail_field")
-    if plan["factor_indices"].numel() == 0:
-        raise RuntimeError("counterfactual teacher has no valid factor candidates")
     if utility_logit is not None:
         utility_logit = _require_tensor(utility_logit, "utility_logit", 3)
         expected = (
