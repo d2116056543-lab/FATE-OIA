@@ -1,21 +1,3 @@
-# Full-run identity (2026-08-02 through 2026-08-03)
-#
-# This is the V3-HECA ``globalcap`` full-data configuration, not the earlier
-# METER V2-TESA path and not a pilot.  The executed remote source HEAD was
-# ``a6dd96a171998b38e7d654ba44907ef64589cb27``; the code-equivalent GitHub
-# branch is ``acpr_meter_oia_v3_heca_globalcap_full``.  The exact invocation
-# and the non-negotiable action/reason boundaries are documented in
-# ``docs/METER_OIA_V3_HECA_GLOBALCAP_FULL_RUN.md``.
-#
-# Runtime arguments used: --epochs 14 --batch_size 4
-# --gradient_accumulation_steps 8 --num_workers 4 --device cuda --test_only
-# --no_feature_cache --require_no_token_compression --run_kind full
-# --numeric_qualified --seed 20260801.
-#
-# Important semantics: action final = visual anchor + bounded HECA credit;
-# reason final = CalAlign anchor + bounded private global/evidence residual.
-# Reason losses never write an action-logit residual. Calibration is fitted
-# only on train_calib and test is used only for epoch evaluation/best selection.
 data_root: E:\sbw\BDD-OIA\data
 raw_root: E:\sbw\BDD-OIA
 bdd100k_root: E:\sbw\BDD100K
