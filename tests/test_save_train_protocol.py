@@ -1,4 +1,4 @@
-from fate_oia.engine.train_save_oia import build_save_splits, is_utility_cadence, save_ramps
+from fate_oia.engine.train_save_oia import build_save_splits, is_utility_cadence, save_ramps, utility_update_for_microbatch
 
 
 def test_splits_are_deterministic_and_disjoint():
@@ -21,3 +21,4 @@ def test_train_only_utility_cadence_runs_once_per_four_completed_updates():
         if is_utility_cadence(micro_step=micro, optimizer_step=micro // 8, grad_accum=8)
     ]
     assert active == [31]
+    assert utility_update_for_microbatch(micro_step=31, optimizer_step=3, grad_accum=8) == 4

@@ -77,6 +77,11 @@ def is_utility_cadence(*, micro_step: int, optimizer_step: int, grad_accum: int)
     return (micro_step + 1) % grad_accum == 0 and (optimizer_step + 1) % 4 == 0
 
 
+def utility_update_for_microbatch(*, micro_step: int, optimizer_step: int, grad_accum: int) -> int:
+    """Expose the update being completed to the once-per-update teacher."""
+    return optimizer_step + int((micro_step + 1) % grad_accum == 0)
+
+
 def build_save_splits(names: list[str], *, seed: int, max_train: int = 0, max_audit: int = 0, max_calib: int = 0) -> dict[str, list[int]]:
     split = fixed_meter_split_indices(names, audit_fraction=.08, calib_fraction=.10, seed=seed)
     if max_train: split["main"] = split["main"][:max_train]
@@ -171,14 +176,19 @@ def train_microbatch(
         optimizer_step=state.optimizer_step,
         grad_accum=grad_accum,
     )
+    utility_update = utility_update_for_microbatch(
+        micro_step=state.micro_step,
+        optimizer_step=state.optimizer_step,
+        grad_accum=grad_accum,
+    )
     autocast = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if device.type == "cuda" else nullcontext()
     with autocast:
-        output = model(batch["image"], progress=ramps["mechanism"], action_targets=batch["action"], optimizer_update=state.optimizer_step, run_teacher=cadence)
+        output = model(batch["image"], progress=ramps["mechanism"], action_targets=batch["action"], optimizer_update=utility_update, run_teacher=True if cadence else None)
         view_output = None
         if cadence:
             # A paired horizontal view is a train-only stability probe. It does
             # not alter test forward and is scheduled with the CF teacher.
-            view_output = model(torch.flip(batch["image"], dims=[-1]), progress=ramps["mechanism"], action_targets=batch["action"], optimizer_update=state.optimizer_step, run_teacher=False)
+            view_output = model(torch.flip(batch["image"], dims=[-1]), progress=ramps["mechanism"], action_targets=batch["action"], optimizer_update=None, run_teacher=None)
         registry, raw = _losses(output, batch, state, view_output=view_output)
         total = registry.total() / grad_accum
     gradient_probe = _gradient_ownership_probe(model, raw) if cadence else {}

@@ -108,6 +108,7 @@ def profile_candidate(
         optimizer_update = microbatch // gradient_accumulation_steps
         closes_update = (microbatch + 1) % gradient_accumulation_steps == 0
         cadence = closes_update and ((optimizer_update + 1) % 4 == 0)
+        utility_update = optimizer_update + int(closes_update)
         if microbatch == warmup_microbatches:
             torch.cuda.synchronize(device)
             measured_start = time.perf_counter()
@@ -116,9 +117,9 @@ def profile_candidate(
             output = model(
                 images,
                 progress=0.5,
-                optimizer_update=optimizer_update,
+                optimizer_update=utility_update,
                 action_targets=action,
-                run_teacher=cadence,
+                run_teacher=True if cadence else None,
             )
             ordinary_calls += _dino_calls(model) - before_ordinary
             core_seen["predicate"] = core_seen["predicate"] or (
@@ -137,9 +138,9 @@ def profile_candidate(
                 paired_output = model(
                     paired_images,
                     progress=0.5,
-                    optimizer_update=optimizer_update,
+                    optimizer_update=None,
                     action_targets=action,
-                    run_teacher=False,
+                    run_teacher=None,
                 )
                 core_seen["paired_view_cadence"] = True
             loss = _profile_registry(output, batch, view_output=paired_output).total()
