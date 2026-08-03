@@ -52,6 +52,10 @@ class METERCalAlignFoundation(nn.Module):
             reason_dim=reason_dim,
             action_logit_norm_cap=action_logit_norm_cap,
         )
+        # SAVE's private reason decoder copies the full CalAlign primitive
+        # set.  Keep this identity at the foundation boundary so older
+        # CalAlign checkpoints remain loadable without changing V3 outputs.
+        self.trunk.reason_norm = nn.LayerNorm(dim)
         self.predicate_reason = ACPRPredicateReasoner(
             dim=dim,
             reason_dim=reason_dim,
@@ -65,6 +69,11 @@ class METERCalAlignFoundation(nn.Module):
         own = self.state_dict()
         compatible = {name: value for name, value in state_dict.items() if name in own and own[name].shape == value.shape}
         missing, unexpected = self.load_state_dict(compatible, strict=False)
+        optional_missing = {
+            "trunk.reason_norm.weight",
+            "trunk.reason_norm.bias",
+        }
+        missing = [name for name in missing if name not in optional_missing]
         if missing:
             raise RuntimeError(f"Missing CalAlign-compatible foundation keys: {missing}")
         if unexpected:

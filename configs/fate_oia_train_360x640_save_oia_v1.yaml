@@ -1,0 +1,85 @@
+# SAVE-OIA V1 direct-image contract. All learned paths start from scratch;
+# the only fixed external representation is the frozen DINO field.
+data_root: data/bdd-oia
+raw_root: data/bdd-oia
+pretrained_weights: ckp/reference/dino_deitsmall8_pretrain.pth
+eval_splits: test
+best_selection_split: test
+
+experiment:
+  name: save_oia_v1
+  direct_image: true
+  from_scratch: true
+  no_metric_early_stop: true
+
+data:
+  image_height: 360
+  image_width: 640
+  num_workers: 4
+  mirror_probability: 0.25
+
+splits:
+  seed: 20260803
+  audit_fraction: 0.08
+  calib_fraction: 0.10
+  main_audit_calib_disjoint: true
+
+backbone:
+  arch: vit_small
+  patch_size: 8
+  pretrained_weights: ckp/reference/dino_deitsmall8_pretrain.pth
+  selected_layers: [3, 7, 11]
+  freeze_backbone: true
+  no_grad_backbone: true
+
+model:
+  dim: 384
+  action_dim: 4
+  reason_dim: 21
+  selected_layers: [3, 7, 11]
+  factor_rank: 16
+  utility_rank: 32
+  action_max_delta: 1.0
+  action_logit_norm_cap: 20.0
+  predicate_action_bridge_scale: 0.05
+  use_hard_action_factor_mask: false
+  trainable_threshold: false
+  use_pair_memory: false
+  use_graph: false
+  use_pmi: false
+  use_selector: false
+  use_formal_meta: false
+
+training:
+  from_scratch: true
+  epochs: 12
+  batch_size: 4
+  gradient_accumulation_steps: 8
+  effective_batch_size: 32
+  precision: bf16
+  optimizer: AdamW
+  scheduler: cosine_by_update
+  weight_decay: 0.05
+  grad_clip_global: 1.0
+  warmup_ratio: 0.05
+
+pilot:
+  train_main: 4096
+  train_audit: 1024
+  train_calib: 512
+  test: 512
+  epochs: 4
+  seed: 20260803
+  from_scratch: true
+
+runtime:
+  test_only: true
+  feature_cache_enabled: false
+  no_feature_cache: true
+  token_compression: none
+  require_no_token_compression: true
+  one_dino_call: true
+  foreground_only: true
+  sequential_eval: false
+  target_reserved_gb: 42.0
+  hard_reserved_gb: 45.0
