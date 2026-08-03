@@ -1,3 +1,10 @@
+# HECA GlobalCap full run contract (2026-08-03).
+# The executed source is a6dd96a; the GitHub branch records that source plus
+# docs/METER_OIA_V3_HECA_GLOBALCAP_FULL_RUN.md. This config is the direct-image,
+# frozen-DINO, test-only, no-cache and no-compression full-training configuration.
+# Final action is visual action plus bounded HECA action credit. Final reason is
+# a detached CalAlign global anchor plus bounded grounded private correction.
+# Calibration is fit on train_calib only; test thresholds never update the model.
 data_root: E:\sbw\BDD-OIA\data
 raw_root: E:\sbw\BDD-OIA
 bdd100k_root: E:\sbw\BDD100K
