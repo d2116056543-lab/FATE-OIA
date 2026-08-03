@@ -321,6 +321,9 @@ def save_faithfulness_losses(
     if teacher_plan is None:
         value = output.get("teacher_plan")
         teacher_plan = value if isinstance(value, Mapping) else None
+    teacher_available = not isinstance(teacher_plan, Mapping) or bool(
+        teacher_plan.get("available", True)
+    )
     if utility_teacher_target_value is None:
         utility_teacher_target_value = teacher_target
     if utility_teacher_target_value is None and teacher_plan is not None:
@@ -354,7 +357,7 @@ def save_faithfulness_losses(
                 factor_indices=factor_indices,
             )
         )
-    elif teacher_plan is not None:
+    elif teacher_plan is not None and teacher_available:
         raise RuntimeError("counterfactual teacher plan is missing utility targets")
     named = output.get("action_named_contribution")
     dense_loss = utility_logit.new_zeros(())

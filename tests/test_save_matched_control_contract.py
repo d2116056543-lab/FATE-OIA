@@ -2,6 +2,7 @@ import inspect
 
 import torch
 
+from fate_oia.losses.save_faithfulness_losses import save_faithfulness_losses
 from fate_oia.models.save_utility_bridge import (
     build_sparse_counterfactual_teacher,
     select_matched_control_patches,
@@ -107,3 +108,16 @@ def test_counterfactual_teacher_skips_unmatchable_candidate_without_fallback() -
     assert plan["utility_teacher_target"] is None
     assert plan["sample_indices"].numel() == 0
     assert plan["unmatched_control_count"] > 0
+
+
+def test_faithfulness_loss_abstains_when_strict_teacher_has_no_controls() -> None:
+    losses = save_faithfulness_losses(
+        {
+            "utility_logit": torch.zeros(1, 2, 3),
+            "teacher_plan": {"available": False, "unmatched_control_count": 2},
+        },
+        torch.tensor([[1.0, 0.0]]),
+    )
+
+    assert torch.isfinite(losses["loss_utility_cf"])
+    assert losses["loss_utility_cf"].item() == 0.0
