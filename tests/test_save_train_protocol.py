@@ -1,7 +1,13 @@
 import inspect
 
 from fate_oia.engine import train_save_oia
-from fate_oia.engine.train_save_oia import build_save_splits, is_utility_cadence, save_ramps, utility_update_for_microbatch
+from fate_oia.engine.train_save_oia import (
+    build_save_split_manifest,
+    build_save_splits,
+    is_utility_cadence,
+    save_ramps,
+    utility_update_for_microbatch,
+)
 
 
 def test_splits_are_deterministic_and_disjoint():
@@ -10,6 +16,19 @@ def test_splits_are_deterministic_and_disjoint():
     assert first == second
     assert not (set(first["main"]) & set(first["audit"]))
     assert not (set(first["main"]) & set(first["calib"]))
+
+
+def test_pilot_manifest_binds_full_partition_and_active_subset() -> None:
+    names = [f"{index}.jpg" for index in range(100)]
+    full = build_save_splits(names, seed=7)
+    active = build_save_splits(names, seed=7, max_train=12, max_audit=4, max_calib=5)
+    manifest = build_save_split_manifest(names, full_split=full, active_split=active)
+
+    assert manifest["universe_partition"]["disjoint"] is True
+    assert manifest["active_subset"]["main"]["count"] == 12
+    assert manifest["active_subset"]["audit"]["count"] == 4
+    assert manifest["active_subset"]["calib"]["count"] == 5
+    assert manifest["active_subset"]["is_full_partition"] is False
 
 
 def test_ramps_follow_save_schedule():

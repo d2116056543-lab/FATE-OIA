@@ -92,6 +92,31 @@ def build_save_splits(names: list[str], *, seed: int, max_train: int = 0, max_au
     return split
 
 
+def build_save_split_manifest(
+    names: list[str], *, full_split: Mapping[str, list[int]], active_split: Mapping[str, list[int]]
+) -> dict[str, Any]:
+    """Bind the complete deterministic partition and a reproducible run subset."""
+    universe = meter_split_manifest(names, dict(full_split))
+    owners: dict[int, str] = {}
+    active: dict[str, Any] = {}
+    for name in ("main", "audit", "calib"):
+        indices = [int(index) for index in active_split[name]]
+        if any(index < 0 or index >= len(names) for index in indices):
+            raise ValueError("SAVE active split contains an out-of-range index")
+        if any(index in owners for index in indices):
+            raise ValueError("SAVE active split partitions overlap")
+        owners.update({index: name for index in indices})
+        selected_names = [str(names[index]) for index in indices]
+        active[name] = {
+            "count": len(indices),
+            "sha256": hash_value(selected_names),
+            "first": selected_names[:3],
+        }
+    active["disjoint"] = True
+    active["is_full_partition"] = len(owners) == len(names)
+    return {"universe_partition": universe, "active_subset": active}
+
+
 @dataclass
 class SAVETrainState:
     optimizer_step: int = 0
@@ -270,8 +295,9 @@ def main() -> None:
     args = parser.parse_args(); _seed(args.seed); device = torch.device(args.device)
     runtime = _make_runtime(args.config, device, batch_size=1, workers=args.num_workers)
     config = runtime["config"]; batch = args.batch_size or int(config["training"]["batch_size"]); accum = args.gradient_accumulation_steps or int(config["training"]["gradient_accumulation_steps"]); epochs = args.epochs or (4 if args.run_kind == "pilot" else int(config["training"]["epochs"]))
+    full_split = build_save_splits(runtime["names"], seed=args.seed)
     split = build_save_splits(runtime["names"], seed=args.seed, max_train=args.max_train_samples, max_audit=args.max_audit_samples, max_calib=args.max_calib_samples)
-    manifest = meter_split_manifest(runtime["names"], split); runtime["bindings"]["split_hash"] = hash_value(manifest)
+    manifest = build_save_split_manifest(runtime["names"], full_split=full_split, active_split=split); runtime["bindings"]["split_hash"] = hash_value(manifest)
     loader = _loader(runtime["train"], split["main"], batch=batch, workers=args.num_workers, shuffle=True, config=config)
     test_indices = list(range(min(len(runtime["test"]), args.max_test_samples or len(runtime["test"]))))
     test_loader = _loader(runtime["test"], test_indices, batch=batch, workers=args.num_workers, shuffle=False, config=config)
