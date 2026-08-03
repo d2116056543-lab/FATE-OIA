@@ -1,10 +1,13 @@
 import inspect
 
+import torch
+
 from fate_oia.engine import train_save_oia
 from fate_oia.engine.train_save_oia import (
     build_save_split_manifest,
     build_save_splits,
     is_utility_cadence,
+    reason_positive_state_probability,
     save_ramps,
     utility_update_for_microbatch,
 )
@@ -29,6 +32,16 @@ def test_pilot_manifest_binds_full_partition_and_active_subset() -> None:
     assert manifest["active_subset"]["audit"]["count"] == 4
     assert manifest["active_subset"]["calib"]["count"] == 5
     assert manifest["active_subset"]["is_full_partition"] is False
+
+
+def test_pu_admission_uses_positive_state_slot_per_reason() -> None:
+    state_probability = torch.tensor(
+        [[[0.7, 0.2, 0.1], [0.1, 0.8, 0.1]]]
+    )
+    positive = reason_positive_state_probability(state_probability, reason_dim=2)
+
+    assert positive.shape == (1, 2)
+    assert torch.allclose(positive, torch.tensor([[0.7, 0.1]]))
 
 
 def test_ramps_follow_save_schedule():

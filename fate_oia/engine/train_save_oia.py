@@ -82,6 +82,18 @@ def utility_update_for_microbatch(*, micro_step: int, optimizer_step: int, grad_
     return optimizer_step + int((micro_step + 1) % grad_accum == 0)
 
 
+def reason_positive_state_probability(state_probability: Tensor, *, reason_dim: int) -> Tensor:
+    """Project factor-state posteriors to their schema-defined positive state."""
+    if state_probability.ndim != 3 or state_probability.shape[1] != reason_dim:
+        raise ValueError("predicate state probability must have shape [batch, reason_dim, states]")
+    if state_probability.shape[-1] < 1:
+        raise ValueError("predicate state probability must include the positive state slot")
+    # SAVE schema state_set[0] is the factor-positive proposition.  Slots 1+
+    # are explicit contradiction/unknown states and must not be averaged into
+    # a PU positive-observation score.
+    return state_probability[..., 0].clamp(0.0, 1.0)
+
+
 def build_save_splits(names: list[str], *, seed: int, max_train: int = 0, max_audit: int = 0, max_calib: int = 0) -> dict[str, list[int]]:
     split = fixed_meter_split_indices(names, audit_fraction=.08, calib_fraction=.10, seed=seed)
     if max_train: split["main"] = split["main"][:max_train]
@@ -238,7 +250,11 @@ def _admit_pu(model: SAVEOIAModel, loader: DataLoader, *, device: torch.device, 
         batch = _move(source, device)
         output = model(batch["image"], progress=1.0, optimizer_update=None, run_teacher=False)
         clean_rows.append(output["reason_logits_clean"].detach().cpu())
-        state_rows.append(output["predicate_state_prob_action"].detach().cpu())
+        state_rows.append(
+            reason_positive_state_probability(
+                output["predicate_state_prob_action"], reason_dim=clean_rows[-1].shape[-1]
+            ).detach().cpu()
+        )
         rel_rows.append(output["reason_reliability"].detach().cpu())
         target_rows.append(batch["reason"].detach().cpu())
     scores = pu_score(torch.cat(clean_rows), torch.cat(state_rows), torch.cat(rel_rows))
