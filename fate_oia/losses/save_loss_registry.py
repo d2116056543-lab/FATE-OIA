@@ -739,6 +739,22 @@ _MEASUREMENT_BUNDLE_KEYS = {
 }
 
 
+def select_save_measurement_registry_terms(
+    measurement: Mapping[str, Tensor],
+) -> dict[str, Tensor]:
+    """Keep the six contracted grounding scalars, not diagnostic subterms.
+
+    ``save_grounding_loss`` exposes anchor NLL/Dice and aliases for analysis.
+    Registering them would double weight the aggregate objectives or reject a
+    real BDD100K batch. The registry receives exactly the plan-level terms.
+    """
+    required = ("anchor", "state", "null", "matched_background", "mirror", "identity")
+    missing = [name for name in required if name not in measurement]
+    if missing:
+        raise ValueError("LOSS_UNKNOWN: measurement missing " + missing[0])
+    return {name: measurement[name] for name in required}
+
+
 def register_save_loss_bundles(
     registry: SAVELossRegistry,
     *,
@@ -778,7 +794,7 @@ def build_save_loss_registry(
         registry,
         action=action,
         reason=reason,
-        measurement=measurement,
+        measurement=select_save_measurement_registry_terms(measurement),
     )
 
 
@@ -1125,6 +1141,7 @@ __all__ = [
     "optimizer_for_save",
     "parameter_owner_sets",
     "register_save_loss_bundles",
+    "select_save_measurement_registry_terms",
     "save_parameter_owner_sets",
     "selective_predicate_bridge",
     "validate_loss_gradient_owners",

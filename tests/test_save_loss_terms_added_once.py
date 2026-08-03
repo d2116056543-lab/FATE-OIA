@@ -82,3 +82,13 @@ def test_bundle_totals_are_skipped_and_raw_terms_are_registered_once() -> None:
     action["total"] = torch.tensor(999.0); reason["total"] = torch.tensor(999.0); measurement["total"] = torch.tensor(999.0)
     registry = build_save_loss_registry(action=action, reason=reason, measurement=measurement)
     assert all(count == 1 for count in registry.runtime_call_counts().values())
+
+
+def test_grounding_diagnostics_do_not_double_register_plan_level_terms() -> None:
+    action = {name.removeprefix("action_"): torch.tensor(1.0) for name in SAVE_LOSS_TERM_NAMES if name.startswith("action_")}
+    reason = {name.removeprefix("reason_"): torch.tensor(1.0) for name in SAVE_LOSS_TERM_NAMES if name.startswith("reason_")}
+    measurement = {name.removeprefix("measurement_"): torch.tensor(1.0) for name in SAVE_LOSS_TERM_NAMES if name.startswith("measurement_")}
+    measurement.update({"anchor_nll": torch.tensor(1.0), "anchor_dice": torch.tensor(1.0), "observability": torch.tensor(1.0), "discrimination": torch.tensor(1.0), "ontology_identity": torch.tensor(1.0)})
+    registry = build_save_loss_registry(action=action, reason=reason, measurement=measurement)
+    assert registry.runtime_call_counts()["measurement_anchor"] == 1
+    assert registry.runtime_call_counts()["measurement_null"] == 1
