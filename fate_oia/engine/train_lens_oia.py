@@ -38,6 +38,13 @@ def mechanism_progress(update: int, total_updates: int, ramp_fraction: float) ->
     return float(max(0.0, min(1.0, update / ramp_updates)))
 
 
+def should_run_synthetic_flip_audit(epoch: int, total_epochs: int, interval: int) -> bool:
+    """Keep first/final audit coverage while avoiding redundant direct-image passes."""
+    if interval < 1:
+        raise ValueError("synthetic_flip_audit_interval must be at least one")
+    return epoch == 0 or epoch == total_epochs - 1 or epoch % interval == 0
+
+
 def _slice_field(field: dict[str, Any], start: int, end: int, full_batch: int) -> dict[str, Any]:
     return {key: (value[start:end] if torch.is_tensor(value) and value.ndim and value.shape[0] == full_batch else value) for key, value in field.items()}
 
@@ -204,7 +211,9 @@ def main() -> None:
       after_calibration_hash=model_state_hash(model)
       if before_calibration_hash != after_calibration_hash: raise RuntimeError("post-hoc calibration mutated model state")
       metrics,store=evaluate_lens(model,test_loader,device,progress=progress,action_threshold=action_threshold,reason_threshold=reason_threshold,diagnostic_samples=int(cfg.get("runtime",{}).get("fixed_test_audit_samples",128))); append_jsonl(output/"metrics_summary.jsonl",{"epoch":epoch,**metrics})
-      append_jsonl(output/"synthetic_flip_audit.jsonl",synthetic_flip_audit(model,audit_loader,device,progress,epoch))
+      audit_interval=int(cfg.get("runtime",{}).get("synthetic_flip_audit_interval",1))
+      if should_run_synthetic_flip_audit(epoch,epochs,audit_interval):
+        append_jsonl(output/"synthetic_flip_audit.jsonl",synthetic_flip_audit(model,audit_loader,device,progress,epoch))
       append_jsonl(output/"grounding_stats.jsonl",{"epoch":epoch,**grounding_counts,"known_rate":grounding_counts["known"]/max(1,grounding_counts["total"]),"map_rate":grounding_counts["map"]/max(1,grounding_counts["total"]),"complete_rate":grounding_counts["complete"]/max(1,grounding_counts["total"])})
       append_jsonl(output/"owner_stats.jsonl",{"epoch":epoch,"parameter_delta":{name:snapshot_delta(module,owner_initial[name]) for name,module in owner_modules.items()},"last_grad_norm":last_grad_stats})
       append_jsonl(output/"branch_metrics.jsonl",{"epoch":epoch,**metrics["branch_metrics"]})

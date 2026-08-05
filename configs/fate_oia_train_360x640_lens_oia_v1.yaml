@@ -58,6 +58,7 @@ eval:
   publication_eligible: false
 runtime:
   fixed_test_audit_samples: 128
+  synthetic_flip_audit_interval: 3
 loss_weights:
   action_final: 1.00
   action_base: 0.35

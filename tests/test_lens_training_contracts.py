@@ -18,6 +18,13 @@ def test_update_schedule_uses_optimizer_updates_not_epochs():
     assert mechanism_progress(10, 100, 0.10) == 1.0
 
 
+def test_synthetic_flip_audit_runs_first_periodic_and_final_epochs():
+    from fate_oia.engine.train_lens_oia import should_run_synthetic_flip_audit
+
+    observed = [epoch for epoch in range(14) if should_run_synthetic_flip_audit(epoch, 14, 3)]
+    assert observed == [0, 3, 6, 9, 12, 13]
+
+
 def test_optimizer_groups_are_not_consumed_by_duplicate_check():
     from fate_oia.engine.train_lens_oia import make_optimizer
     from fate_oia.models.lens_oia_model import LENSOIAModel
