@@ -13,7 +13,11 @@ import yaml
 from fate_oia.models.lens_oia_model import LENSOIAModel
 from fate_oia.utils.lens_artifacts import write_json
 from fate_oia.utils.lens_contracts import assert_lens_forward_contract
-from fate_oia.losses.lens_latent_losses import conflict_safe_reason_logits
+from fate_oia.losses.lens_latent_losses import (
+    conflict_discounted_responsibility,
+    conflict_safe_reason_logits,
+)
+from fate_oia.models.lens_annotation_emission import LENSAnnotationEmission
 from fate_oia.engine.train_lens_oia import mechanism_progress, should_optimizer_step
 
 
@@ -51,6 +55,17 @@ def main() -> None:
         functional["progress_zero_exact"] = bool(torch.equal(out["action_logits_final"],out["action_logits_source"]) and torch.equal(out["reason_logits_formal"],out["reason_logits_source"]))
         functional["no_dino_grad"] = all(not parameter.requires_grad for parameter in model.foundation.dino.parameters())
         functional["emission_ordered"] = bool(torch.all(out["emission_prob"][:,2] > out["emission_prob"][:,1]) and torch.all(out["emission_prob"][:,1] > out["emission_prob"][:,0]))
+        axis_emission = LENSAnnotationEmission(reason_dim=1, group_ids=torch.tensor([0], device=args.device)).to(args.device)
+        one_hot_states = torch.eye(3, device=args.device).view(3, 1, 3)
+        axis_result = axis_emission(one_hot_states, torch.zeros(3, 1, device=args.device), progress=0.0)
+        functional["emission_axis_contract"] = bool(torch.allclose(axis_result["reason_prob_latent"].flatten(), torch.tensor([1.0 - 1e-6, 1e-6, 0.5], device=args.device), atol=2e-6))
+        axis_resp = conflict_discounted_responsibility(
+            torch.tensor([[[0.70, 0.20, 0.10]]], device=args.device),
+            torch.tensor([[0.05, 0.50, 0.95]], device=args.device),
+            torch.ones(1, 1, device=args.device), torch.zeros(1, 1, 3, 4, device=args.device),
+            torch.zeros(1, 4, device=args.device), 1.0,
+        )
+        functional["responsibility_axis_contract"] = bool(torch.allclose(axis_resp["gamma_state_order"], axis_resp["gamma_emission_order"][..., [2, 0, 1]]))
         functional["contribution_exact"] = float(out["contribution_reconstruction_error"]) < 1e-6
         functional["one_dino_call"] = calls["count"] == 1
         # Formal reason supervision may update shared evidence/state, but never the action rereader nor action-only head.

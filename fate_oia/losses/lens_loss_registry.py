@@ -49,8 +49,8 @@ class LENSLossRegistry:
             zero = out["state_prob"].sum() * 0.0
             raw.update({"state": zero, "emission": zero})
         else:
-            raw["state"] = state_loss(out["state_prob"], responsibilities["gamma"])
-            raw["emission"] = emission_loss(out.get("emission_prob_learned",out["emission_prob"]), reason, responsibilities["gamma"])
+            raw["state"] = state_loss(out["state_prob"], responsibilities["gamma_state_order"])
+            raw["emission"] = emission_loss(out.get("emission_prob_learned",out["emission_prob"]), reason, responsibilities["gamma_emission_order"])
         structured = batch.get("structured")
         if structured is None:
             zero = out["evidence_map"].sum() * 0.0

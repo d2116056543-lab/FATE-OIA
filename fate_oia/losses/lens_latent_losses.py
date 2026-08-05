@@ -5,6 +5,11 @@ import math
 import torch
 import torch.nn.functional as F
 
+from fate_oia.models.lens_annotation_emission import (
+    emission_to_state_order,
+    state_to_emission_order,
+)
+
 
 def conflict_safe_reason_logits(
     state_prob: torch.Tensor,
@@ -28,7 +33,8 @@ def conflict_safe_reason_logits(
     share_weight = floor + (1.0 - floor) * raw_weight
     state_safe = state_prob.detach() + share_weight.unsqueeze(-1) * (state_prob - state_prob.detach())
     source_safe = source_reason.detach() + share_weight * (source_reason - source_reason.detach())
-    latent_prob = torch.einsum("brs,rs->br", state_safe, emission_prob).clamp(1e-6, 1.0 - 1e-6)
+    state_safe_emission_order = state_to_emission_order(state_safe)
+    latent_prob = torch.einsum("brs,rs->br", state_safe_emission_order, emission_prob).clamp(1e-6, 1.0 - 1e-6)
     latent_logits = torch.logit(latent_prob)
     alpha = float(max(0.0, min(1.0, alpha_reason)))
     formal_train = (1.0 - alpha) * source_safe + alpha * latent_logits
@@ -37,6 +43,7 @@ def conflict_safe_reason_logits(
         "reason_logits_latent_train": latent_logits,
         "share_weight": share_weight,
         "state_prob_safe": state_safe,
+        "state_prob_safe_emission_order": state_safe_emission_order,
         "source_reason_safe": source_safe,
     }
 
@@ -44,18 +51,31 @@ def conflict_safe_reason_logits(
 def conflict_discounted_responsibility(state_prob: torch.Tensor, emission_prob: torch.Tensor, observed_reason: torch.Tensor, action_state_logits: torch.Tensor, action_targets: torch.Tensor, lambda_action: float) -> dict[str, torch.Tensor]:
     annotation = torch.where(observed_reason.unsqueeze(-1) > 0.5, emission_prob.unsqueeze(0), 1.0 - emission_prob.unsqueeze(0))
     annotation = annotation / annotation.sum(-1, keepdim=True).clamp_min(1e-8)
-    visual = state_prob
+    visual = state_to_emission_order(state_prob)
     kl_vr = (visual.clamp_min(1e-8) * (visual.clamp_min(1e-8).log() - annotation.clamp_min(1e-8).log())).sum(-1)
     kl_rv = (annotation.clamp_min(1e-8) * (annotation.clamp_min(1e-8).log() - visual.clamp_min(1e-8).log())).sum(-1)
     mixture = 0.5 * (visual + annotation)
     js = 0.5 * ((visual * (visual.clamp_min(1e-8).log() - mixture.clamp_min(1e-8).log())).sum(-1) + (annotation * (annotation.clamp_min(1e-8).log() - mixture.clamp_min(1e-8).log())).sum(-1)) / math.log(2.0)
     # action logits are [B,R,3,4]
     loss_by_state = F.binary_cross_entropy_with_logits(action_state_logits, action_targets[:, None, None, :].expand_as(action_state_logits), reduction="none").mean(-1)
-    action = torch.softmax(-lambda_action * loss_by_state, dim=-1)
-    discounted_annotation = (1 - js).unsqueeze(-1) * annotation + js.unsqueeze(-1) * torch.tensor([0.0, 0.0, 1.0], device=state_prob.device, dtype=state_prob.dtype)
-    gamma = visual * discounted_annotation * action
-    gamma = (gamma / gamma.sum(-1, keepdim=True).clamp_min(1e-8)).detach()
-    return {"gamma": gamma, "conflict": js, "annotation_likelihood": annotation, "action_state_utility": action, "kl_visual_annotation": kl_vr + kl_rv}
+    action_state_order = torch.softmax(-lambda_action * loss_by_state, dim=-1)
+    action = state_to_emission_order(action_state_order)
+    # Disagreement is assigned to the unknown axis, index 1 in emission order.
+    unknown_emission = torch.tensor([0.0, 1.0, 0.0], device=state_prob.device, dtype=state_prob.dtype)
+    discounted_annotation = (1 - js).unsqueeze(-1) * annotation + js.unsqueeze(-1) * unknown_emission
+    gamma_emission_order = visual * discounted_annotation * action
+    gamma_emission_order = (gamma_emission_order / gamma_emission_order.sum(-1, keepdim=True).clamp_min(1e-8)).detach()
+    gamma_state_order = emission_to_state_order(gamma_emission_order)
+    return {
+        "gamma": gamma_state_order,
+        "gamma_state_order": gamma_state_order,
+        "gamma_emission_order": gamma_emission_order,
+        "conflict": js,
+        "annotation_likelihood": annotation,
+        "action_state_utility": action_state_order,
+        "action_state_utility_emission_order": action,
+        "kl_visual_annotation": kl_vr + kl_rv,
+    }
 
 
 def state_loss(state_prob: torch.Tensor, gamma: torch.Tensor) -> torch.Tensor:
