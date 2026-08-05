@@ -1,0 +1,4 @@
+groups:
+  0: {name: directly_observable, description: explicit image evidence can support or counter the label}
+  1: {name: partially_observable, description: image evidence is incomplete and absence is not a counter}
+  2: {name: temporal_or_latent, description: single-frame evidence is normally unknown}

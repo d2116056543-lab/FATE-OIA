@@ -1,0 +1,63 @@
+seed: 3407
+data_root: E:/sbw/BDD-OIA/data
+raw_root: E:/sbw/BDD-OIA/data
+bdd100k_root: E:/sbw/BDD100K
+pretrained_weights: ckp/reference/dino_deitsmall8_pretrain.pth
+image_height: 360
+image_width: 640
+patch_size: 8
+feature_cache_enabled: false
+token_compression: none
+model:
+  selected_layers: [3, 7, 11]
+  use_mock_dino: false
+  factor_chunk_size: 21
+training:
+  epochs: 14
+  batch_size: 6
+  gradient_accumulation_steps: 5
+  num_workers: 4
+  prefetch_factor: 4
+  persistent_workers: true
+  pin_memory: true
+  bf16: true
+  lr_foundation: 0.0002
+  lr_adaptive_evidence: 0.0003
+  lr_latent_state: 0.0003
+  lr_action_reread: 0.0003
+  lr_annotation_emission: 0.0002
+  weight_decay: 0.05
+  warmup_update_fraction: 0.05
+  min_lr_ratio: 0.10
+  foundation_grad_cap: 0.25
+  global_grad_clip: 1.0
+  action_logit_norm_cap: 20.0
+splits:
+  train_main_fraction: 0.90
+  train_audit_fraction: 0.05
+  train_calib_fraction: 0.05
+  seed: 3407
+eval:
+  eval_splits: [test]
+  best_selection_split: test
+  best_selection_metric: deploy_joint
+  internal_test_selected: true
+  publication_eligible: false
+loss_weights:
+  action_final: 1.00
+  action_base: 0.35
+  action_factor_aux: 0.15
+  action_soft_f1: 0.03
+  action_cardinality: 0.02
+  reason_formal: 1.00
+  reason_latent_aux: 0.35
+  reason_rank: 0.08
+  reason_soft_f1: 0.03
+  state: 0.20
+  emission: 0.10
+  emission_prior: 0.01
+  map_anchor: 0.06
+  state_anchor: 0.05
+  view_consistency: 0.03
+  unknown_prior: 0.02
+  route_sparsity: 0.01
