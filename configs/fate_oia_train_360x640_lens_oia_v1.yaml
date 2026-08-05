@@ -1,6 +1,6 @@
 seed: 3407
 data_root: E:/sbw/BDD-OIA/data
-raw_root: E:/sbw/BDD-OIA/data
+raw_root: E:/sbw/BDD-OIA
 bdd100k_root: E:/sbw/BDD100K
 pretrained_weights: ckp/reference/dino_deitsmall8_pretrain.pth
 image_height: 360
