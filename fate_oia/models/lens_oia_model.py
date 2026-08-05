@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import torch
 from torch import Tensor, nn
 
 from .lens_action_reread import LENSActionReread
@@ -33,16 +34,27 @@ class LENSOIAModel(nn.Module):
             evidence["evidence_null_mass"], evidence["evidence_entropy"], evidence["evidence_snr"], progress=progress,
         )
         emission = self.annotation_emission(latent["state_prob"], source["reason_logits_source"], progress=progress)
+        # The action base consumes observable latent log-odds, never the annotation-emission branch.
+        clean_log_odds = (1.0 - latent["state_unknown_prob"]) * torch.log(
+            latent["state_positive_prob"].clamp_min(1e-8) / latent["state_counter_prob"].clamp_min(1e-8)
+        )
+        action_reason_latent = self.foundation.trunk.reason_to_action(clean_log_odds)
+        action_logits_base = source["action_logits_source"] if float(progress) == 0.0 else (
+            source["action_fusion_gate_source"] * source["action_visual_source"]
+            + (1.0 - source["action_fusion_gate_source"]) * action_reason_latent
+        )
         action_reread = self.action_reread(
             action_nodes=source["action_nodes_source"], detail_tokens=source["patch_tokens_by_layer"][:, -1],
             source_action_attention=source["label_attention_source"][:, :4], evidence_map=evidence["evidence_map"],
             evidence_token=evidence["evidence_token"], state_prob=latent["state_prob"], state_token=latent["state_token"],
-            action_logits_base=source["action_logits_source"], progress=progress,
+            action_logits_base=action_logits_base, progress=progress,
         )
         if mechanism_ablation in {"reread_off", "latent_state_off", "emission_identity"}:
             action_reread["action_logits_final"] = source["action_logits_source"]
         out = {**source, **evidence, **latent, **emission, **action_reread}
-        out["action_logits_base"] = source["action_logits_source"]
+        out["clean_observable_log_odds"] = clean_log_odds
+        out["action_reason_latent"] = action_reason_latent
+        out["action_logits_base"] = action_logits_base
         out["reason_prob_formal"] = out["reason_logits_formal"].sigmoid()
         if not return_state_variants:
             out.pop("action_logits_state_substitution")
