@@ -6,6 +6,41 @@ import torch
 import torch.nn.functional as F
 
 
+def conflict_safe_reason_logits(
+    state_prob: torch.Tensor,
+    source_reason: torch.Tensor,
+    emission_prob: torch.Tensor,
+    observed_reason: torch.Tensor,
+    gamma: torch.Tensor,
+    conflict: torch.Tensor,
+    alpha_reason: float,
+    positive_floor: float = 0.25,
+    zero_floor: float = 0.05,
+) -> dict[str, torch.Tensor]:
+    """Keep formal logits unchanged while attenuating only shared-visual gradients."""
+    identifiable = gamma[..., 0] + gamma[..., 1]
+    raw_weight = (1.0 - conflict.detach()).clamp(0.0, 1.0) * identifiable.detach()
+    floor = torch.where(
+        observed_reason > 0.5,
+        raw_weight.new_full((), positive_floor),
+        raw_weight.new_full((), zero_floor),
+    )
+    share_weight = floor + (1.0 - floor) * raw_weight
+    state_safe = state_prob.detach() + share_weight.unsqueeze(-1) * (state_prob - state_prob.detach())
+    source_safe = source_reason.detach() + share_weight * (source_reason - source_reason.detach())
+    latent_prob = torch.einsum("brs,rs->br", state_safe, emission_prob).clamp(1e-6, 1.0 - 1e-6)
+    latent_logits = torch.logit(latent_prob)
+    alpha = float(max(0.0, min(1.0, alpha_reason)))
+    formal_train = (1.0 - alpha) * source_safe + alpha * latent_logits
+    return {
+        "reason_logits_formal_train": formal_train,
+        "reason_logits_latent_train": latent_logits,
+        "share_weight": share_weight,
+        "state_prob_safe": state_safe,
+        "source_reason_safe": source_safe,
+    }
+
+
 def conflict_discounted_responsibility(state_prob: torch.Tensor, emission_prob: torch.Tensor, observed_reason: torch.Tensor, action_state_logits: torch.Tensor, action_targets: torch.Tensor, lambda_action: float) -> dict[str, torch.Tensor]:
     annotation = torch.where(observed_reason.unsqueeze(-1) > 0.5, emission_prob.unsqueeze(0), 1.0 - emission_prob.unsqueeze(0))
     annotation = annotation / annotation.sum(-1, keepdim=True).clamp_min(1e-8)

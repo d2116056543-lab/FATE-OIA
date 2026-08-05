@@ -34,3 +34,19 @@ def test_lens_action_base_uses_clean_latent_log_odds_after_progress_zero():
     expected_reason = model.foundation.trunk.reason_to_action(out["clean_observable_log_odds"])
     expected = out["action_fusion_gate_source"] * out["action_visual_source"] + (1 - out["action_fusion_gate_source"]) * expected_reason
     assert torch.allclose(out["action_logits_base"], expected)
+
+
+def test_all_diagnostic_branches_share_one_encoded_field():
+    from fate_oia.models.lens_oia_model import LENSOIAModel
+
+    model=LENSOIAModel(use_mock_dino=True)
+    calls=0; original=model.foundation.dino.forward
+    def counted(*args,**kwargs):
+        nonlocal calls
+        calls+=1
+        return original(*args,**kwargs)
+    model.foundation.dino.forward=counted
+    field=model.encode_images(torch.randn(1,3,360,640))
+    branches=model.decode_branches_from_field(field,progress=1.0)
+    assert calls==1
+    assert set(branches)=={"source_calalign","lens_base","lens_final","factor_only","reread_off","latent_state_off","unknown_off","emission_identity","evidence_map_shuffle","wrong_factor"}

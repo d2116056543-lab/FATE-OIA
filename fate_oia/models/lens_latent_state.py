@@ -32,4 +32,5 @@ class LENSLatentState(nn.Module):
             "state_observability": 1.0 - unknown,
             "state_support_logit": support,
             "state_token": state_token,
+            "state_embeddings": self.state_embedding,
         }

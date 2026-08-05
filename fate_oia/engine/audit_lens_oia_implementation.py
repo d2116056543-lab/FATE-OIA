@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import hashlib
+import subprocess
 from pathlib import Path
 
 import torch
@@ -11,6 +13,8 @@ import yaml
 from fate_oia.models.lens_oia_model import LENSOIAModel
 from fate_oia.utils.lens_artifacts import write_json
 from fate_oia.utils.lens_contracts import assert_lens_forward_contract
+from fate_oia.losses.lens_latent_losses import conflict_safe_reason_logits
+from fate_oia.engine.train_lens_oia import mechanism_progress, should_optimizer_step
 
 
 REQUIRED = [
@@ -61,12 +65,22 @@ def main() -> None:
         reread_grad = sum(float((p.grad.abs().sum() if p.grad is not None else 0.0)) for p in model.action_reread.parameters())
         emission_grad = sum(float((p.grad.abs().sum() if p.grad is not None else 0.0)) for p in model.annotation_emission.parameters())
         functional["action_owner_path"] = evidence_grad > 0.0 and reread_grad > 0.0 and emission_grad == 0.0
+        state_logits=torch.randn(2,21,3,device=args.device,requires_grad=True); state=state_logits.softmax(-1); source=torch.randn(2,21,device=args.device,requires_grad=True); gamma=torch.softmax(torch.randn(2,21,3,device=args.device),-1); observed=torch.zeros(2,21,device=args.device)
+        safe=conflict_safe_reason_logits(state,source,full["emission_prob"],observed,gamma,torch.full((2,21),0.95,device=args.device),1.0)
+        safe["reason_logits_formal_train"].sum().backward(); high_conflict_grad=float(state_logits.grad.norm()+source.grad.norm())
+        functional["conflict_changes_shared_gradient"] = high_conflict_grad > 0.0 and float(safe["share_weight"].min()) >= 0.05
+        functional["accumulation_tail_flush"] = should_optimizer_step(0,1,5) and should_optimizer_step(5,6,5)
+        functional["update_based_ramp"] = mechanism_progress(5,100,0.10)==0.5
+        functional["state_specific_reread"] = hasattr(model.action_reread,"named_weight") and not torch.allclose(full["factor_contribution_state"][...,0],-full["factor_contribution_state"][...,1])
     except Exception as exc:
         failures.append(repr(exc)); functional["forward"] = False
     protocol = config.get("eval",{}).get("best_selection_split")=="test" and config.get("feature_cache_enabled") is False and config.get("token_compression")=="none"
     real_dino = not bool(args.allow_mock_dino)
-    status="REVIEW_PASS" if not missing and not forbidden and not failures and all(functional.values()) and protocol and real_dino else "REVIEW_FAIL"
-    payload={"status":status,"checked_files":REQUIRED,"missing_files":missing,"forbidden_paths":forbidden,"functional_checks":functional,"protocol_ok":protocol,"real_dino":real_dino,"failures":failures,"warnings":[] if real_dino else ["Mock-DINO audit cannot issue REVIEW_PASS."]}
+    passed=not missing and not forbidden and not failures and all(functional.values()) and protocol and real_dino
+    status="REVIEW_PASS" if passed else "REVIEW_FAIL"
+    git_head=subprocess.check_output(["git","rev-parse","HEAD"],text=True).strip()
+    config_hash=hashlib.sha256(Path(args.config).read_bytes()).hexdigest(); schema_path=Path(config.get("reason_state_schema","configs/lens_reason_state_schema.yaml")); schema_hash=hashlib.sha256(schema_path.read_bytes()).hexdigest()
+    payload={"pass":passed,"status":status,"git_head":git_head,"config_hash":config_hash,"schema_hash":schema_hash,"split_seed":config.get("splits",{}).get("seed"),"checked_files":REQUIRED,"missing_files":missing,"forbidden_paths":forbidden,"functional_checks":functional,"protocol_ok":protocol,"real_dino":real_dino,"failures":failures,"warnings":[] if real_dino else ["Mock-DINO audit cannot issue REVIEW_PASS."]}
     output=Path(args.output_dir); output.mkdir(parents=True,exist_ok=True); write_json(output/"LENS_IMPLEMENTATION_REVIEW.json",payload)
     print(json.dumps(payload,ensure_ascii=False))
 

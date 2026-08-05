@@ -9,10 +9,11 @@ from torch import Tensor, nn
 class LENSAdaptiveEvidence(nn.Module):
     """Reason-specific, null-aware evidence pooling without factor-by-token-by-channel materialization."""
 
-    def __init__(self, dim: int = 384, reason_dim: int = 21, layer_count: int = 3, tau_min: float = 0.35, tau_max: float = 2.0) -> None:
+    def __init__(self, dim: int = 384, reason_dim: int = 21, layer_count: int = 3, tau_min: float = 0.35, tau_max: float = 2.0, topk: int = 32, region_bias_abs_max: float = 2.0) -> None:
         super().__init__()
         self.reason_dim, self.layer_count = reason_dim, layer_count
         self.tau_min, self.tau_max = tau_min, tau_max
+        self.topk,self.region_bias_abs_max=topk,region_bias_abs_max
         self.layer_router = nn.Parameter(torch.zeros(reason_dim, layer_count))
         self.layer_proj = nn.ModuleList(nn.Linear(dim, dim) for _ in range(layer_count))
         self.query_proj = nn.Linear(dim, dim)
@@ -35,10 +36,10 @@ class LENSAdaptiveEvidence(nn.Module):
         if soft_region_prior is not None:
             if soft_region_prior.shape != (b, self.reason_dim, n):
                 raise ValueError("soft_region_prior must be [B,21,N]")
-            score = score + soft_region_prior.clamp(-2.0, 2.0)
+            score = score + soft_region_prior.clamp(-self.region_bias_abs_max,self.region_bias_abs_max)
         mean = score.mean(-1)
         std = score.std(-1, unbiased=False).clamp_min(1e-6)
-        topk = score.topk(min(32, n), dim=-1).values.mean(-1)
+        topk = score.topk(min(self.topk, n), dim=-1).values.mean(-1)
         snr = (topk - mean) / std
         temperature_input = torch.cat([reason_nodes_source, snr.unsqueeze(-1), std.unsqueeze(-1)], dim=-1)
         temperature = self.tau_min + (self.tau_max - self.tau_min) * torch.sigmoid(self.temperature_mlp(temperature_input).squeeze(-1))

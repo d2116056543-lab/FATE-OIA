@@ -27,10 +27,14 @@ class LENSAnnotationEmission(nn.Module):
         unknown = torch.maximum(freq, minus + 0.05).clamp(max=0.60)
         positive = (0.90 + 0.08 * (1.0 - freq)).clamp(0.90, 0.995)
         logits = torch.logit(torch.stack([minus, unknown, positive], -1))
+        def inverse_softplus(value: Tensor) -> Tensor:
+            return torch.log(torch.expm1(value.clamp_min(1e-6)))
+        target_raw=torch.stack([logits[:,0],inverse_softplus(logits[:,1]-logits[:,0]),inverse_softplus(logits[:,2]-logits[:,1])],-1)
         with torch.no_grad():
-            group_mean = torch.stack([logits[self.group_ids == group].mean(0) for group in range(3)])
+            group_mean = torch.stack([target_raw[self.group_ids == group].mean(0) for group in range(3)])
             self.group_base.copy_(group_mean)
-            self.label_delta.zero_()
+            centered=(target_raw-group_mean[self.group_ids])/self.label_delta_scale
+            self.label_delta.copy_(torch.atanh(centered.clamp(-0.999,0.999)))
 
     def forward(self, state_prob: Tensor, source_reason: Tensor, *, progress: float) -> dict[str, Tensor]:
         alpha = float(max(0.0, min(1.0, progress)))
@@ -42,6 +46,7 @@ class LENSAnnotationEmission(nn.Module):
         formal = source_reason if alpha == 0.0 else (1.0 - alpha) * source_reason + alpha * latent_logits
         return {
             "emission_prob": effective,
+            "emission_prob_learned": learned,
             "emission_order_margin": torch.stack([effective[:, 1] - effective[:, 0], effective[:, 2] - effective[:, 1]], dim=-1),
             "emission_order_margin_1": effective[:, 1] - effective[:, 0],
             "emission_order_margin_2": effective[:, 2] - effective[:, 1],
