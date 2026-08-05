@@ -24,3 +24,13 @@ def test_lens_action_does_not_depend_on_emission_parameters():
             parameter.add_(torch.randn_like(parameter) * 10.0)
     after = model(image, progress=1.0)["action_logits_final"]
     assert torch.allclose(before, after, atol=1e-6, rtol=0.0)
+
+
+def test_lens_action_base_uses_clean_latent_log_odds_after_progress_zero():
+    from fate_oia.models.lens_oia_model import LENSOIAModel
+
+    model = LENSOIAModel(use_mock_dino=True)
+    out = model(torch.randn(1, 3, 360, 640), progress=1.0)
+    expected_reason = model.foundation.trunk.reason_to_action(out["clean_observable_log_odds"])
+    expected = out["action_fusion_gate_source"] * out["action_visual_source"] + (1 - out["action_fusion_gate_source"]) * expected_reason
+    assert torch.allclose(out["action_logits_base"], expected)
