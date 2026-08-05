@@ -144,18 +144,14 @@ def write_jsonl(path: str | Path, rows: Iterable[Any]) -> Path:
 
 def append_jsonl(path: str | Path, value: Any) -> Path:
     target = Path(path)
-    rows: list[Any] = []
-    if target.exists():
-        try:
-            rows = [
-                json.loads(line)
-                for line in target.read_text(encoding="utf-8").splitlines()
-                if line.strip()
-            ]
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
-            raise ValueError(f"invalid JSONL artifact: {target}") from exc
-    rows.append(value)
-    return write_jsonl(target, rows)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # Batch logs are append-only. Rewriting the entire history for every
+    # micro-batch makes runtime quadratic and also races atomic replacement.
+    with target.open("a", encoding="utf-8", newline="\n") as handle:
+        handle.write(_json_bytes(value).decode("utf-8"))
+        handle.write("\n")
+        handle.flush()
+    return target
 
 
 def _torch_bytes(value: Any) -> bytes:
