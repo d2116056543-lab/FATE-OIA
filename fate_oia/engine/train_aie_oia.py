@@ -27,6 +27,8 @@ from fate_oia.losses.aie_losses import (
     counterfactual_necessity_loss,
     evidence_censored_reason_asl_loss,
     predicate_map_compactness_loss,
+    predicate_masked_asl_loss,
+    predicate_reason_alignment_pu_loss,
     predicate_map_loss,
     probe_duplicate_loss,
     reason_negative_weight,
@@ -197,15 +199,18 @@ def compute_losses(
 ) -> tuple[torch.Tensor, list[dict[str, float | str]], dict[str, float], torch.Tensor]:
     registry = AIELossRegistry(cfg["loss_weights"])
     action, reason = batch["action"], batch["reason"]
+    counter_confidence = compute_counter_confidence(output, structured, reason, cfg["counter_evidence"])
+    reason_weights = reason_negative_weight(reason, counter_confidence, float(cfg["counter_evidence"]["zero_negative_floor"]))
     registry.add("primary_action", "primary", asymmetric_loss_with_logits(output["action_logits_primary"], action))
     registry.add("primary_action_visual", "primary", asymmetric_loss_with_logits(output["action_visual_logits_primary"], action))
     registry.add("primary_action_reason", "primary", asymmetric_loss_with_logits(output["action_reason_logits_primary"], action))
     registry.add("primary_reason_partial", "primary", base_losses.partial_label_reason_loss(
         output["reason_logits_primary"], reason, output["contradiction_score"]
     ))
-    registry.add("primary_reason_soft_f1", "primary", base_losses.reason_soft_f1_loss(output["reason_logits_primary"], reason))
-    registry.add("predicate_cls", "primary", float(grounding_scale) * base_losses.predicate_weak_bce_mil_loss(
-        output["predicate_logits"], structured["predicate_target"], structured["predicate_target_mask"], structured["predicate_reliability"]
+    registry.add("primary_reason_soft_f1", "primary", soft_f1_loss(output["reason_logits_primary"], reason, reason_weights))
+    registry.add("predicate_cls", "primary", float(grounding_scale) * predicate_masked_asl_loss(
+        output["predicate_logits"], structured["predicate_target"], structured["predicate_target_mask"],
+        structured["predicate_counter_mask"], structured["predicate_reliability"]
     ))
     registry.add("predicate_map", "primary", float(grounding_scale) * predicate_map_loss(
         output["predicate_attention"], structured["predicate_map_target"], structured["predicate_map_mask"]
@@ -215,15 +220,13 @@ def compute_losses(
     if pos_mask is None:
         pos_mask = output["predicate_probs"].new_tensor(output["_positive_mask"])
         neg_mask = output["predicate_probs"].new_tensor(output["_negative_mask"])
-    registry.add("predicate_reason_align", "primary", float(grounding_scale) * base_losses.predicate_reason_alignment_loss(
-        output["predicate_probs"], reason, pos_mask, neg_mask
+    registry.add("predicate_reason_align", "primary", float(grounding_scale) * predicate_reason_alignment_pu_loss(
+        output["predicate_probs"], reason, pos_mask, neg_mask, reason_weights
     ))
     registry.add("predicate_compactness", "primary", float(grounding_scale) * predicate_map_compactness_loss(output["predicate_attention"]))
     registry.add("final_action", "action_contribution", asymmetric_loss_with_logits(output["action_logits_final_train"], action))
     registry.add("final_action_soft_f1", "action_contribution", soft_f1_loss(output["action_logits_final_train"], action))
     registry.add("final_action_cardinality", "action_contribution", action_cardinality_loss(output["action_logits_final_train"], action))
-    counter_confidence = compute_counter_confidence(output, structured, reason, cfg["counter_evidence"])
-    reason_weights = reason_negative_weight(reason, counter_confidence, float(cfg["counter_evidence"]["zero_negative_floor"]))
     registry.add("final_reason", "reason_private", evidence_censored_reason_asl_loss(output["reason_logits_final_train"], reason, counter_confidence))
     registry.add(
         "final_reason_rank",
@@ -304,7 +307,11 @@ def collect_logits(
             take = min(images.shape[0], audit_limit - audit_seen)
             _append_cpu(audit_tensors, "evidence_map", output["evidence_map"], take)
             _append_cpu(audit_tensors, "contribution", output["bounded_contribution"], take)
-            for key in ("name_id", "name_confidence", "name_margin", "reason_action_evidence_attention", "reason_private_attention"):
+            for key in (
+                "name_id", "name_confidence", "name_margin", "name_quality", "name_spatial_soft_iou",
+                "name_compatibility", "predicate_probs", "reason_action_evidence_attention", "reason_action_prior",
+                "reason_predicate_prior", "reason_private_attention", "reason_delta",
+            ):
                 _append_cpu(audit_tensors, key, output[key], take)
             for variant, kwargs in {
                 "primary_only": None,
@@ -568,6 +575,9 @@ def main() -> None:
                         "action_delta_rms": float(output["action_delta"].float().square().mean().sqrt().detach().cpu()), "reason_delta_rms": float(output["reason_delta"].float().square().mean().sqrt().detach().cpu()),
                         "primary_action_logit_rms": _rms(output["action_logits_primary"]), "final_action_logit_rms": _rms(output["action_logits_final"]),
                         "primary_reason_logit_rms": _rms(output["reason_logits_primary"]), "final_reason_logit_rms": _rms(output["reason_logits_final"]),
+                        "reason_visual_score_rms": float(output["reason_visual_score_rms"].detach().cpu()),
+                        "reason_action_prior_bias_rms": float(output["reason_action_prior_bias_rms"].detach().cpu()),
+                        "reason_predicate_prior_bias_rms": float(output["reason_predicate_prior_bias_rms"].detach().cpu()),
                         "predicate_bias_strength_mean": float(output["predicate_bias_strength"].mean().detach().cpu()),
                         "predicate_compatibility_entropy": float(compatibility_entropy.detach().cpu()),
                         "named_coverage": float(output["named_coverage"].detach().cpu()),

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import math
-
 import torch
 from torch import Tensor, nn
 
@@ -50,7 +48,6 @@ class AIEPredicateNaming(nn.Module):
         soft_iou = spatial_soft_iou(evidence_map[..., None, :], predicate_map[:, None, None, :, :])
         compatibility = torch.sigmoid(
             torch.einsum("bakd,pd->bakp", self.evidence_projection(evidence_token), self.predicate_keys)
-            / math.sqrt(self.predicate_keys.shape[-1])
         )
         quality = soft_iou * compatibility * predicate_presence[:, None, None, :]
         if cf_effect is not None:
@@ -75,4 +72,3 @@ class AIEPredicateNaming(nn.Module):
             "name_compatibility": compatibility,
             "named_coverage": valid.float().mean(),
         }
-

@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
 from .acpr_reason_grammar import ACPRReasonGrammar
@@ -83,21 +84,28 @@ class AIEReasonRereader(nn.Module):
         predicate_prior = torch.einsum("brp,bpn->brn", signed, pattn).clamp_min(0)
         predicate_prior = predicate_prior / predicate_prior.sum(-1, keepdim=True).clamp_min(1e-8)
         field = patch_tokens_by_layer.detach()
-        q = self.reason_query(reason_nodes)
+        # The bounded spatial priors can only condition rereading when Q/K scale is
+        # controlled. Parameter-free normalization preserves the planned dot product
+        # while preventing raw field magnitude from saturating the softmax.
+        q = F.layer_norm(self.reason_query(reason_nodes), (self.dim,))
         layer_mix = torch.softmax(self.layer_logits, dim=-1)
         layer_scores, layer_values = [], []
         for layer in range(self.num_layers):
-            key = self.field_keys[layer](field[:, layer])
+            key = F.layer_norm(self.field_keys[layer](field[:, layer]), (self.dim,))
             value = self.field_values[layer](field[:, layer])
             layer_scores.append(torch.einsum("brd,bnd->brn", q, key) / math.sqrt(self.dim))
             layer_values.append(value)
         score = torch.stack(layer_scores, dim=2)
+        action_bias = score.new_zeros(action_prior.shape[0], self.reason_dim, 1, action_prior.shape[-1])
         if action_prior_enabled:
             strength = self.action_prior_max * torch.sigmoid(self.action_prior_strength)[None, :, None, None]
-            score = score + strength * action_prior.clamp_min(1e-8).log()[:, :, None, :].clamp(min=-1.5)
+            action_bias = strength * action_prior.clamp_min(1e-8).log()[:, :, None, :].clamp(min=-1.5)
+            score = score + action_bias
+        predicate_bias = score.new_zeros(predicate_prior.shape[0], self.reason_dim, 1, predicate_prior.shape[-1])
         if predicate_prior_enabled:
             strength = self.predicate_prior_max * torch.sigmoid(self.predicate_prior_strength)[None, :, None, None]
-            score = score + strength * predicate_prior.clamp_min(1e-8).log()[:, :, None, :].clamp(min=-1.5)
+            predicate_bias = strength * predicate_prior.clamp_min(1e-8).log()[:, :, None, :].clamp(min=-1.5)
+            score = score + predicate_bias
         score = score + layer_mix[None, :, :, None].clamp_min(1e-8).log()
         attention = torch.softmax(score.flatten(2), dim=-1).view_as(score)
         private = sum(torch.einsum("brn,bnd->brd", attention[:, :, layer], layer_values[layer]) for layer in range(self.num_layers))
@@ -112,8 +120,10 @@ class AIEReasonRereader(nn.Module):
             "reason_predicate_prior": predicate_prior,
             "reason_private_attention": attention,
             "reason_private_token": private,
+            "reason_visual_score_rms": torch.stack(layer_scores, dim=2).float().square().mean().sqrt(),
+            "reason_action_prior_bias_rms": action_bias.float().square().mean().sqrt(),
+            "reason_predicate_prior_bias_rms": predicate_bias.float().square().mean().sqrt(),
             "reason_delta": delta,
             "reason_logits_final": final,
             "reason_logits_final_train": final_train,
         }
-

@@ -56,6 +56,39 @@ def predicate_masked_bce(logits: Tensor, target: Tensor, mask: Tensor) -> Tensor
     return (raw * mask).sum() / mask.sum().clamp_min(1.0)
 
 
+def predicate_masked_asl_loss(
+    logits: Tensor,
+    positive_target: Tensor,
+    positive_mask: Tensor,
+    counter_mask: Tensor,
+    reliability: Tensor,
+) -> Tensor:
+    """Masked predicate ASL with explicit counters and fail-closed unknowns."""
+    observed = positive_mask.bool() | counter_mask.bool()
+    target = positive_target.float()
+    raw = asymmetric_loss_with_logits(logits, target, reduction="none")
+    positive_weight = reliability.detach().clamp(0.1, 1.0)
+    weight = torch.where(positive_mask.bool(), positive_weight, torch.ones_like(positive_weight))
+    weight = weight * observed.float()
+    return (raw * weight).sum() / weight.sum().clamp_min(1.0)
+
+
+def predicate_reason_alignment_pu_loss(
+    predicate_probs: Tensor,
+    reason_targets: Tensor,
+    grammar_positive_matrix: Tensor,
+    grammar_contradiction_matrix: Tensor,
+    negative_weight: Tensor,
+) -> Tensor:
+    pos_support = predicate_probs @ grammar_positive_matrix.t().to(predicate_probs.device, predicate_probs.dtype)
+    neg_support = predicate_probs @ grammar_contradiction_matrix.t().to(predicate_probs.device, predicate_probs.dtype)
+    support = (pos_support - neg_support).clamp(-1, 1)
+    positive = reason_targets.float()
+    weights = torch.where(positive > 0.5, torch.ones_like(positive), negative_weight.detach())
+    raw = positive * F.softplus(-support) + (1 - positive) * F.softplus(support)
+    return (raw * weights).sum() / weights.sum().clamp_min(1.0)
+
+
 def predicate_map_loss(attention: Tensor, target_map: Tensor, map_mask: Tensor) -> Tensor:
     target = target_map / target_map.sum(-1, keepdim=True).clamp_min(1e-8)
     prediction = attention / attention.sum(-1, keepdim=True).clamp_min(1e-8)
