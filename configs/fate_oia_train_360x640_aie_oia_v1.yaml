@@ -55,6 +55,7 @@ reason_private:
   predicate_prior_max: 0.75
   reason_kappa: 4.0
   reason_scale_start: 0.10
+  reason_scale_max: 0.60
   reason_scale_ramp_ratio: 0.10
   zero_negative_floor: 0.25
 counterfactual:
