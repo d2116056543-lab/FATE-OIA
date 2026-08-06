@@ -56,6 +56,20 @@ def current_git_head() -> str:
     return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
 
 
+def canonical_model_state_dict(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Remove the legacy DINO projection alias after proving it is redundant."""
+    clean: dict[str, torch.Tensor] = {}
+    for key, value in state.items():
+        if ".attn.vproj." not in key:
+            clean[key] = value
+            continue
+        canonical = key.replace(".attn.vproj.", ".attn.proj.")
+        counterpart = state.get(canonical)
+        if counterpart is None or counterpart.shape != value.shape or not torch.equal(counterpart, value):
+            raise RuntimeError(f"unmatched DINO vproj alias: {key}")
+    return clean
+
+
 def collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "image": torch.stack([row["image"] for row in batch]),
@@ -478,7 +492,8 @@ def main() -> None:
         mismatches = {key: (checkpoint.get(key), value) for key, value in expected_hashes.items() if checkpoint.get(key) != value}
         if mismatches:
             raise RuntimeError(f"Resume contract mismatch: {mismatches}")
-        model.load_state_dict(checkpoint["model"]); optimizer.load_state_dict(checkpoint["optimizer"])
+        model.load_state_dict(canonical_model_state_dict(checkpoint["model"]), strict=True)
+        optimizer.load_state_dict(checkpoint["optimizer"])
         start_epoch = int(checkpoint["epoch"]) + 1; optimizer_update = int(checkpoint["optimizer_update"]); best = checkpoint.get("best", {})
         restore_rng_state(checkpoint["rng_state"])
     structured_builder = AIEStructuredEvidenceBuilder(cfg["primary"]["scene_predicates"], data_cfg["bdd100k_root"])
@@ -656,7 +671,7 @@ def main() -> None:
             if value >= best.get(key, float("-inf")):
                 best[key] = value; improved.append(key)
         checkpoint = {
-            "model": model.state_dict(), "optimizer": optimizer.state_dict(), "scheduler_update": optimizer_update,
+            "model": canonical_model_state_dict(model.state_dict()), "optimizer": optimizer.state_dict(), "scheduler_update": optimizer_update,
             "epoch": epoch, "micro_step": len(train_loader), "optimizer_update": optimizer_update, "best": dict(best),
             "rng_state": capture_rng_state(), "metrics": metrics, "calibration": metrics["calibration_thresholds"],
             "manifest": manifest, "manifest_hash": object_sha256(manifest), "split_manifest_hash": manifest["split_manifest_hash"],
