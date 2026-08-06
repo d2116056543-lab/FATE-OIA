@@ -1,0 +1,34 @@
+predicates:
+  - {id: 0, name: traffic_light_red, group: traffic_control, region: upper_traffic_region, supervision: explicit_color_only}
+  - {id: 1, name: traffic_light_green, group: traffic_control, region: upper_traffic_region, supervision: explicit_color_only}
+  - {id: 2, name: stop_sign_present, group: traffic_control, region: upper_traffic_region, supervision: explicit_category_only}
+  - {id: 3, name: front_vehicle_close, group: front_object, region: front_center, supervision: geometry_high}
+  - {id: 4, name: front_vehicle_far, group: front_object, region: front_center, supervision: geometry_low}
+  - {id: 5, name: pedestrian_front, group: front_object, region: front_center, supervision: object_box}
+  - {id: 6, name: cyclist_front, group: front_object, region: front_center, supervision: object_box}
+  - {id: 7, name: obstacle_front, group: front_object, region: front_center, supervision: object_box}
+  - {id: 8, name: lane_left_available, group: lane, region: left_corridor, supervision: explicit_geometry}
+  - {id: 9, name: lane_right_available, group: lane, region: right_corridor, supervision: explicit_geometry}
+  - {id: 10, name: left_turn_region, group: lane, region: left_corridor, supervision: explicit_turn_attribute_only}
+  - {id: 11, name: right_turn_region, group: lane, region: right_corridor, supervision: explicit_turn_attribute_only}
+  - {id: 12, name: drivable_center, group: drivable, region: bottom_drivable_region, supervision: drivable_map}
+  - {id: 13, name: drivable_left, group: drivable, region: left_corridor, supervision: drivable_map_region}
+  - {id: 14, name: drivable_right, group: drivable, region: right_corridor, supervision: drivable_map_region}
+  - {id: 15, name: road_clear, group: road, region: front_center, supervision: complete_object_source_only}
+  - {id: 16, name: road_crowded, group: road, region: front_center, supervision: object_count}
+  - {id: 17, name: parked_vehicle_left, group: object, region: left_corridor, supervision: explicit_parked_attribute_only}
+  - {id: 18, name: parked_vehicle_right, group: object, region: right_corridor, supervision: explicit_parked_attribute_only}
+  - {id: 19, name: vehicle_left, group: object, region: left_corridor, supervision: object_box}
+  - {id: 20, name: vehicle_right, group: object, region: right_corridor, supervision: object_box}
+  - {id: 21, name: traffic_light_visible, group: traffic_control, region: upper_traffic_region, supervision: object_box}
+  - {id: 22, name: traffic_sign_visible, group: traffic_control, region: upper_traffic_region, supervision: object_box}
+  - {id: 23, name: crosswalk_region, group: road, region: front_center, supervision: explicit_category}
+  - {id: 24, name: intersection_region, group: road, region: front_center, supervision: explicit_category}
+  - {id: 25, name: merging_left_context, group: lane, region: left_corridor, supervision: explicit_merge_attribute_only}
+  - {id: 26, name: merging_right_context, group: lane, region: right_corridor, supervision: explicit_merge_attribute_only}
+  - {id: 27, name: ego_lane_centered, group: road, region: bottom_drivable_region, supervision: lane_geometry}
+  - {id: 28, name: low_front_visibility, group: global, region: front_center, supervision: explicit_weather_attribute_only}
+  - {id: 29, name: open_left_gap, group: lane, region: left_corridor, supervision: drivable_geometry}
+  - {id: 30, name: open_right_gap, group: lane, region: right_corridor, supervision: drivable_geometry}
+  - {id: 31, name: global_scene_context, group: global, region: front_center, supervision: unsupervised}
+

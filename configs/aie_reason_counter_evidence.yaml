@@ -1,0 +1,7 @@
+zero_negative_floor: 0.25
+contradictory_predicate_weight: 0.60
+source_completeness_weight: 0.25
+region_observability_weight: 0.15
+detach_counter_confidence: true
+allow_online_pseudo_label: false
+
