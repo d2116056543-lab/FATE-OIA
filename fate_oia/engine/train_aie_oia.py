@@ -26,6 +26,7 @@ from fate_oia.losses.aie_losses import (
     contribution_effect_loss,
     counterfactual_necessity_loss,
     evidence_censored_reason_asl_loss,
+    naming_alignment_loss,
     predicate_map_compactness_loss,
     predicate_masked_asl_loss,
     predicate_reason_alignment_pu_loss,
@@ -239,16 +240,30 @@ def compute_losses(
         registry.add("cf_necessity", "action_evidence", float(cf_scale) * counterfactual_necessity_loss(cf["selected_drop"], cf["control_drop"], valid))
         registry.add("cf_effect", "action_contribution", float(cf_scale) * contribution_effect_loss(cf["supportive_contribution"], cf["selected_minus_control"], valid))
         registry.add("cf_sufficiency", "action_evidence", float(cf_scale) * (cf["sufficiency_loss_raw"] * valid).sum() / valid.sum().clamp_min(1))
-        name_terms = []
+        event_valid = torch.zeros_like(output["bounded_contribution"], dtype=torch.bool)
+        event_supportive = torch.zeros_like(event_valid)
+        event_gap = torch.zeros_like(output["bounded_contribution"])
+        sample_by_name = {name: index for index, name in enumerate(batch["file_name"])}
         for index, case in enumerate(cf["cases"]):
-            sample, action_id, probe_id = batch["file_name"].index(case["file_name"]), case["action_id"], case["probe_id"]
-            reliable = (structured["predicate_map_mask"][sample] > 0) & (structured["predicate_target"][sample] > 0)
-            if bool(reliable.any()) and float(cf["supportive_contribution"][index].detach()) > 0 and float(cf["selected_minus_control"][index].detach()) > 0:
-                quality = output["name_quality"][sample, action_id, probe_id]
-                correct = output["name_spatial_soft_iou"][sample, action_id, probe_id].masked_fill(~reliable, -1).argmax()
-                wrong = quality.masked_fill(torch.nn.functional.one_hot(correct, quality.numel()).bool(), -1).max()
-                name_terms.append(1 - output["name_spatial_soft_iou"][sample, action_id, probe_id, correct] + torch.relu(0.08 + wrong - quality[correct]))
-        registry.add("naming", "action_evidence", float(cf_scale) * (torch.stack(name_terms).mean() if name_terms else _zero(output)))
+            sample = sample_by_name[case["file_name"]]
+            action_id, probe_id = case["action_id"], case["probe_id"]
+            event_valid[sample, action_id, probe_id] = cf["valid_mask"][index].detach() > 0
+            event_supportive[sample, action_id, probe_id] = cf["supportive_contribution"][index].detach() > 0
+            event_gap[sample, action_id, probe_id] = cf["selected_minus_control"][index].detach()
+        reliable_positive = (structured["predicate_map_mask"] > 0) & (structured["predicate_target"] > 0)
+        registry.add(
+            "naming",
+            "action_evidence",
+            float(cf_scale) * naming_alignment_loss(
+                output["evidence_map"],
+                output["name_quality"],
+                structured["predicate_map_target"],
+                reliable_positive,
+                event_supportive,
+                event_gap,
+                event_valid,
+            ),
+        )
     else:
         for name, owner in (("cf_necessity", "action_evidence"), ("cf_effect", "action_contribution"), ("cf_sufficiency", "action_evidence"), ("naming", "action_evidence")):
             registry.add(name, owner, _zero(output))

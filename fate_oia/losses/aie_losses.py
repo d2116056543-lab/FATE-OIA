@@ -42,6 +42,22 @@ def reason_ranking_loss(
     positive = target > 0.5
     negative = ~positive
     weights = torch.ones_like(target) if negative_weight is None else negative_weight.detach()
+    # Exp mAP ranks examples independently for each reason label. Preserve the
+    # single-example fallback used by unit probes, but optimize that actual
+    # label-wise ordering whenever the batch contains both classes.
+    label_losses = []
+    for label in range(logits.shape[1]):
+        if positive[:, label].any() and negative[:, label].any():
+            raw = F.relu(
+                float(margin)
+                - logits[positive[:, label], label][:, None]
+                + logits[negative[:, label], label][None]
+            )
+            pair_weight = weights[negative[:, label], label][None].expand_as(raw)
+            label_losses.append((raw * pair_weight).sum() / pair_weight.sum().clamp_min(1e-8))
+    if label_losses:
+        return torch.stack(label_losses).mean()
+
     losses = []
     for row in range(logits.shape[0]):
         if positive[row].any() and negative[row].any():
