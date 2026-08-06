@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import statistics
 import subprocess
 import time
 from pathlib import Path
@@ -35,6 +36,7 @@ def main() -> None:
         measured = []; data_samples = []; allocated_samples = []; cf_events = 0; cf_seconds = 0.0; cf_valid = 0
         try:
             for step in range(args.warmup + args.measure):
+                cf = None
                 torch.cuda.synchronize(); start = time.perf_counter()
                 batch_data = next(iterator)
                 images = batch_data["image"].to(device, non_blocking=True)
@@ -64,6 +66,10 @@ def main() -> None:
                         torch.cuda.synchronize(); cf_seconds += time.perf_counter() - cf_start
                 (loss / accum).backward()
                 if (step + 1) % accum == 0: optimizer.step(); optimizer.zero_grad(set_to_none=True)
+                # CF produces several same-field intervention graphs. They are
+                # transient by contract and must not contaminate the steady-state
+                # allocation measurement after backward has consumed them.
+                cf = None
                 torch.cuda.synchronize()
                 if step >= args.warmup:
                     measured.append(time.perf_counter() - start)
@@ -72,6 +78,11 @@ def main() -> None:
         except torch.cuda.OutOfMemoryError as exc:
             failed = str(exc); optimizer.zero_grad(set_to_none=True)
         reserved = torch.cuda.max_memory_reserved() / 2**30
+        window = min(5, len(allocated_samples) // 2)
+        steady_growth = (
+            statistics.median(allocated_samples[-window:]) - statistics.median(allocated_samples[:window])
+            if window else None
+        )
         rows.append({"batch_size": batch, "gradient_accumulation_steps": accum, "probe_chunk_size": chunk, "oom": failed is not None,
             "reserved_gb": reserved, "samples_per_second": (batch * len(measured) / sum(measured)) if measured else 0.0,
             "num_workers": 8, "official_dino": True, "dino_calls_per_ordinary_batch": 1, "dino_calls_per_cf_event": 0,
@@ -79,12 +90,18 @@ def main() -> None:
             "allocated_gb_first": allocated_samples[0] if allocated_samples else None,
             "allocated_gb_last": allocated_samples[-1] if allocated_samples else None,
             "allocated_growth_gb": (allocated_samples[-1] - allocated_samples[0]) if allocated_samples else None,
+            "steady_state_growth_gb": steady_growth,
+            "memory_growth_tolerance_gb": 0.25,
             "mean_data_seconds": (sum(data_samples) / len(data_samples)) if data_samples else None,
             "mean_step_seconds": (sum(measured) / len(measured)) if measured else None})
         del model, optimizer, loader, iterator, dataset, images, action_target, out, loss
         if "cf" in locals():
             del cf
-    valid = [row for row in rows if not row["oom"] and row["reserved_gb"] < float(cfg["runtime"]["max_reserved_memory_gb"]) and row["cf_events"] >= 2]
+    valid = [row for row in rows if not row["oom"]
+        and row["reserved_gb"] < float(cfg["runtime"]["max_reserved_memory_gb"])
+        and row["cf_events"] >= 2
+        and row["steady_state_growth_gb"] is not None
+        and row["steady_state_growth_gb"] <= row["memory_growth_tolerance_gb"]]
     if not valid: raise RuntimeError("No AIE runtime profile candidate satisfies memory contract")
     best_speed = max(row["samples_per_second"] for row in valid)
     near = [row for row in valid if row["samples_per_second"] >= best_speed * 0.97]
