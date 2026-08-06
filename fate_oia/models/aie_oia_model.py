@@ -132,10 +132,10 @@ class AIEOIAModel(nn.Module):
             evidence["evidence_token"], primary["action_logits_primary"], action_scale=action_scale
         )
         naming = self.predicate_naming(
+            evidence["evidence_token"],
             evidence["evidence_map"],
             primary["predicate_attention"],
             primary["predicate_probs"],
-            evidence["predicate_compatibility_raw"],
         )
         reason_start = stamp()
         reason = self.reason_private(

@@ -130,6 +130,7 @@ class AIEEvidenceInterface(nn.Module):
         pred_prob = predicate_probs.detach().clamp(0, 1)
         compatibility = torch.sigmoid(
             torch.einsum("bakd,pd->bakp", self.probe_predicate_projection(probes), self.predicate_keys)
+            / math.sqrt(self.predicate_keys.shape[-1])
         )
         weighted_compat = compatibility * pred_prob[:, None, None, :]
         normalized_compat = weighted_compat / weighted_compat.sum(-1, keepdim=True).clamp_min(1e-8)
@@ -160,7 +161,6 @@ class AIEEvidenceInterface(nn.Module):
             "sampling_offsets": local_out["sampling_offsets"],
             "sampling_weights": local_out["sampling_weights"],
             "predicate_compatibility": normalized_compat,
-            "predicate_compatibility_raw": compatibility,
             "predicate_bias_strength": strength if predicate_bias_enabled else torch.zeros_like(strength),
         }
         if profile:
