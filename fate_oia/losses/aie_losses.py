@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from .asymmetric_loss import asymmetric_loss_with_logits
+from fate_oia.models.aie_predicate_naming import spatial_soft_iou
 
 
 def reason_negative_weight(target: Tensor, counter_confidence: Tensor, floor: float = 0.25) -> Tensor:
@@ -32,13 +33,21 @@ def action_cardinality_loss(logits: Tensor, target: Tensor) -> Tensor:
     return (torch.sigmoid(logits).sum(-1) - target.sum(-1)).square().mean()
 
 
-def reason_ranking_loss(logits: Tensor, target: Tensor, margin: float = 0.2) -> Tensor:
+def reason_ranking_loss(
+    logits: Tensor,
+    target: Tensor,
+    negative_weight: Tensor | None = None,
+    margin: float = 0.2,
+) -> Tensor:
     positive = target > 0.5
     negative = ~positive
+    weights = torch.ones_like(target) if negative_weight is None else negative_weight.detach()
     losses = []
     for row in range(logits.shape[0]):
         if positive[row].any() and negative[row].any():
-            losses.append(F.relu(float(margin) - logits[row][positive[row]][:, None] + logits[row][negative[row]][None]).mean())
+            raw = F.relu(float(margin) - logits[row][positive[row]][:, None] + logits[row][negative[row]][None])
+            pair_weight = weights[row][negative[row]][None].expand_as(raw)
+            losses.append((raw * pair_weight).sum() / pair_weight.sum().clamp_min(1e-8))
     return torch.stack(losses).mean() if losses else logits.sum() * 0
 
 
@@ -100,10 +109,7 @@ def naming_alignment_loss(
     eligible = valid.bool() & supportive.bool() & (selected_minus_control > 0)
     if not bool(eligible.any()) or not bool(reliable_positive.any()):
         return evidence_map.sum() * 0
-    target = predicate_map_target / predicate_map_target.sum(-1, keepdim=True).clamp_min(1e-8)
-    intersection = torch.einsum("bakn,bpn->bakp", evidence_map, target)
-    union = evidence_map.sum(-1, keepdim=True) + target.sum(-1)[:, None, None, :] - intersection
-    iou = intersection / union.clamp_min(1e-8)
+    iou = spatial_soft_iou(evidence_map[..., None, :], predicate_map_target[:, None, None, :, :])
     masked_iou = iou.masked_fill(~reliable_positive[:, None, None, :].bool(), -1)
     correct_id = masked_iou.argmax(-1)
     correct_iou = masked_iou.gather(-1, correct_id[..., None]).squeeze(-1).clamp_min(0)
@@ -113,4 +119,3 @@ def naming_alignment_loss(
     ).max(-1).values
     raw = 1 - correct_iou + torch.relu(float(margin) + wrong_quality - correct_quality)
     return (raw * eligible).sum() / eligible.sum().clamp_min(1)
-

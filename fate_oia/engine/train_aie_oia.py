@@ -225,7 +225,11 @@ def compute_losses(
     counter_confidence = compute_counter_confidence(output, structured, reason, cfg["counter_evidence"])
     reason_weights = reason_negative_weight(reason, counter_confidence, float(cfg["counter_evidence"]["zero_negative_floor"]))
     registry.add("final_reason", "reason_private", evidence_censored_reason_asl_loss(output["reason_logits_final_train"], reason, counter_confidence))
-    registry.add("final_reason_rank", "reason_private", reason_ranking_loss(output["reason_logits_final_train"], reason))
+    registry.add(
+        "final_reason_rank",
+        "reason_private",
+        reason_ranking_loss(output["reason_logits_final_train"], reason, negative_weight=reason_weights),
+    )
     registry.add("final_reason_soft_f1", "reason_private", soft_f1_loss(output["reason_logits_final_train"], reason, reason_weights))
     if cf and cf["cf_valid_count"] > 0:
         valid = cf["valid_mask"]

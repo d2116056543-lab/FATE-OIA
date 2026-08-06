@@ -33,7 +33,8 @@ class AIEEvidenceInterface(nn.Module):
         self.role_embeddings = nn.Parameter(torch.empty(probes_per_action, dim))
         nn.init.orthogonal_(self.role_embeddings)
         with torch.no_grad():
-            self.role_embeddings.mul_(0.20)
+            # Keep the four initialization roles visible beside a unit-variance action token.
+            self.role_embeddings.mul_(0.50 * math.sqrt(dim))
         self.probe_query_norm = nn.LayerNorm(dim)
         self.layer_projections = nn.ModuleList(nn.Linear(dim, dim) for _ in range(num_layers))
         self.layer_norms = nn.ModuleList(nn.RMSNorm(dim) for _ in range(num_layers))

@@ -1,6 +1,6 @@
 import torch
 
-from fate_oia.losses.aie_losses import evidence_censored_reason_asl_loss, reason_negative_weight
+from fate_oia.losses.aie_losses import evidence_censored_reason_asl_loss, reason_negative_weight, reason_ranking_loss
 
 
 def test_reason_negative_weight_preserves_positive_and_bounds_zero():
@@ -12,4 +12,13 @@ def test_reason_negative_weight_preserves_positive_and_bounds_zero():
     loss.backward()
     assert counter.grad is None
 
+
+def test_reason_ranking_uses_evidence_censored_negative_weights():
+    logits = torch.tensor([[0.0, 2.0, 0.5]], requires_grad=True)
+    target = torch.tensor([[1.0, 0.0, 0.0]])
+    negative_weight = torch.tensor([[1.0, 0.25, 1.0]], requires_grad=True)
+    loss = reason_ranking_loss(logits, target, negative_weight=negative_weight, margin=0.2)
+    torch.testing.assert_close(loss, torch.tensor(1.0))
+    loss.backward()
+    assert negative_weight.grad is None
 

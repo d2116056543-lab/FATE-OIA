@@ -6,6 +6,19 @@ import torch
 from torch import Tensor, nn
 
 
+def spatial_soft_iou(left: Tensor, right: Tensor, eps: float = 1e-8) -> Tensor:
+    """Soft IoU over above-background saliency rather than probability mass."""
+    left_support = torch.relu(left - left.mean(dim=-1, keepdim=True))
+    right_support = torch.relu(right - right.mean(dim=-1, keepdim=True))
+    left_peak = left_support.amax(dim=-1, keepdim=True)
+    right_peak = right_support.amax(dim=-1, keepdim=True)
+    left_support = torch.where(left_peak > eps, left_support / left_peak.clamp_min(eps), torch.zeros_like(left_support))
+    right_support = torch.where(right_peak > eps, right_support / right_peak.clamp_min(eps), torch.zeros_like(right_support))
+    intersection = torch.minimum(left_support, right_support).sum(dim=-1)
+    union = torch.maximum(left_support, right_support).sum(dim=-1)
+    return torch.where(union > eps, intersection / union.clamp_min(eps), torch.zeros_like(union))
+
+
 class AIEPredicateNaming(nn.Module):
     """Names evidence atoms without introducing a competing null class."""
 
@@ -34,9 +47,7 @@ class AIEPredicateNaming(nn.Module):
     ) -> dict[str, Tensor]:
         predicate_map = predicate_attention.detach().clamp_min(0)
         predicate_presence = predicate_probs.detach().clamp(0, 1)
-        intersection = torch.einsum("bakn,bpn->bakp", evidence_map, predicate_map)
-        union = evidence_map.sum(-1, keepdim=True) + predicate_map.sum(-1)[:, None, None, :] - intersection
-        soft_iou = intersection / union.clamp_min(1e-8)
+        soft_iou = spatial_soft_iou(evidence_map[..., None, :], predicate_map[:, None, None, :, :])
         compatibility = torch.sigmoid(
             torch.einsum("bakd,pd->bakp", self.evidence_projection(evidence_token), self.predicate_keys)
             / math.sqrt(self.predicate_keys.shape[-1])
@@ -64,5 +75,4 @@ class AIEPredicateNaming(nn.Module):
             "name_compatibility": compatibility,
             "named_coverage": valid.float().mean(),
         }
-
 

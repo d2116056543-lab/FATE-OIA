@@ -35,3 +35,13 @@ def test_probe_chunking_is_numerically_equivalent():
     torch.testing.assert_close(full["evidence_map"], chunked["evidence_map"], atol=1e-6, rtol=1e-5)
     torch.testing.assert_close(full["evidence_token"], chunked["evidence_token"], atol=1e-6, rtol=1e-5)
 
+
+def test_role_initialization_remains_distinct_under_strong_action_node():
+    torch.manual_seed(7)
+    module = AIEEvidenceInterface(dim=32, num_predicates=32, grid_hw=(4, 5))
+    action_node = torch.randn(1, 1, 32)
+    queries = module.probe_query_norm(action_node[:, :, None] + module.role_embeddings[None, None])
+    queries = torch.nn.functional.normalize(queries[0, 0], dim=-1)
+    off_diagonal = queries @ queries.T
+    off_diagonal = off_diagonal[~torch.eye(4, dtype=torch.bool)]
+    assert float(off_diagonal.max()) < 0.95
