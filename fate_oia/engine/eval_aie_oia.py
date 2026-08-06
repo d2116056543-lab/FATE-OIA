@@ -5,7 +5,14 @@ from pathlib import Path
 
 import torch
 
-from .train_aie_oia import build_model, evaluate_epoch, load_config, make_dataset, make_loader
+from .train_aie_oia import (
+    build_model,
+    canonical_model_state_dict,
+    evaluate_epoch,
+    load_config,
+    make_dataset,
+    make_loader,
+)
 from fate_oia.datasets.aie_splits import stable_split_ids
 from fate_oia.utils.aie_artifacts import write_json
 from fate_oia.utils.aie_hashes import aie_source_tree_sha256, file_sha256
@@ -17,7 +24,9 @@ def main() -> None:
     model = build_model(cfg, device); checkpoint = torch.load(args.checkpoint, map_location=device)
     if checkpoint.get("config_hash") != file_sha256(args.config) or checkpoint.get("source_tree_hash") != aie_source_tree_sha256():
         raise RuntimeError("Evaluation checkpoint does not match current AIE config/source tree")
-    model.load_state_dict(checkpoint["model"])
+    # Training checkpoints canonicalize a verified DINO attention alias on
+    # save/resume. Standalone evaluation must use the identical contract.
+    model.load_state_dict(canonical_model_state_dict(checkpoint["model"]), strict=True)
     train = make_dataset(cfg, "train"); test = make_dataset(cfg, "test")
     train_ids = [sample.file_name for sample in train.samples]
     split = stable_split_ids(train_ids, int(cfg["data"]["split_seed"]), float(cfg["data"]["train_calib_fraction"]), int(cfg["data"]["train_audit_count"]))
