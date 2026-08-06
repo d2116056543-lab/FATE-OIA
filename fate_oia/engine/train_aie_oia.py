@@ -208,9 +208,28 @@ def _per_label_metrics(metrics: dict[str, Any], prefix: str) -> list[dict[str, f
     ]
 
 
+def enqueue_reason_rank_memory(
+    memory: dict[str, torch.Tensor],
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    negative_weight: torch.Tensor,
+    capacity: int,
+) -> None:
+    """Keep a tiny detached FIFO so rare labels see cross-sample rank pairs."""
+    for key, value in (
+        ("logits", logits),
+        ("target", target),
+        ("negative_weight", negative_weight),
+    ):
+        detached = value.detach()
+        previous = memory.get(key)
+        memory[key] = detached if previous is None else torch.cat((previous, detached), dim=0)[-capacity:]
+
+
 def compute_losses(
     output: dict[str, Any], batch: dict[str, Any], structured: dict[str, Any], cfg: dict[str, Any],
     grammar: ACPRReasonGrammar, cf: dict[str, Any] | None, grounding_scale: float, cf_scale: float,
+    reason_rank_memory: dict[str, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, list[dict[str, float | str]], dict[str, float], torch.Tensor]:
     registry = AIELossRegistry(cfg["loss_weights"])
     action, reason = batch["action"], batch["reason"]
@@ -246,7 +265,14 @@ def compute_losses(
     registry.add(
         "final_reason_rank",
         "reason_private",
-        reason_ranking_loss(output["reason_logits_final_train"], reason, negative_weight=reason_weights),
+        reason_ranking_loss(
+            output["reason_logits_final_train"],
+            reason,
+            negative_weight=reason_weights,
+            reference_logits=None if not reason_rank_memory else reason_rank_memory.get("logits"),
+            reference_target=None if not reason_rank_memory else reason_rank_memory.get("target"),
+            reference_negative_weight=None if not reason_rank_memory else reason_rank_memory.get("negative_weight"),
+        ),
     )
     registry.add("final_reason_soft_f1", "reason_private", soft_f1_loss(output["reason_logits_final_train"], reason, reason_weights))
     if cf and cf["cf_valid_count"] > 0:
@@ -480,6 +506,7 @@ def main() -> None:
     }
     write_json(output_dir / "source_contract.json", source_contract)
     start_epoch = 0; optimizer_update = 0; best: dict[str, float] = {}
+    reason_rank_memory: dict[str, torch.Tensor] = {}
     if args.resume:
         checkpoint = torch.load(args.resume, map_location=device)
         expected_hashes = {
@@ -495,6 +522,10 @@ def main() -> None:
         model.load_state_dict(canonical_model_state_dict(checkpoint["model"]), strict=True)
         optimizer.load_state_dict(checkpoint["optimizer"])
         start_epoch = int(checkpoint["epoch"]) + 1; optimizer_update = int(checkpoint["optimizer_update"]); best = checkpoint.get("best", {})
+        reason_rank_memory = {
+            key: value.to(device)
+            for key, value in checkpoint.get("reason_rank_memory", {}).items()
+        }
         restore_rng_state(checkpoint["rng_state"])
     structured_builder = AIEStructuredEvidenceBuilder(cfg["primary"]["scene_predicates"], data_cfg["bdd100k_root"])
     grammar = ACPRReasonGrammar(cfg["primary"]["reason_grammar"])
@@ -556,9 +587,21 @@ def main() -> None:
                 cf = cf_engine.run(model, output, batch["action"], batch["file_name"], global_update=optimizer_update, action_scale=schedule["action"]) if use_cf else None
                 if profile_step and device.type == "cuda": torch.cuda.synchronize(device)
                 counterfactual_time = time.perf_counter() - cf_start if use_cf else 0.0
-                total, rows, diagnostics, _ = compute_losses(
-                    output, batch, structured, cfg, grammar, cf, schedule["grounding"], schedule["cf"]
+                total, rows, diagnostics, counter_confidence = compute_losses(
+                    output, batch, structured, cfg, grammar, cf, schedule["grounding"], schedule["cf"],
+                    reason_rank_memory,
                 )
+            enqueue_reason_rank_memory(
+                reason_rank_memory,
+                output["reason_logits_final_train"],
+                batch["reason"],
+                reason_negative_weight(
+                    batch["reason"],
+                    counter_confidence,
+                    float(cfg["counter_evidence"]["zero_negative_floor"]),
+                ),
+                int(training.get("reason_rank_memory_size", 512)),
+            )
             reliable_name_batch = (structured["predicate_map_mask"] > 0) & (structured["predicate_target"] > 0)
             quality_batch = output["name_quality"].float()
             reliable_quality_batch = quality_batch.masked_fill(~reliable_name_batch[:, None, None, :], float("-inf")).max(-1).values
@@ -674,6 +717,7 @@ def main() -> None:
             "model": canonical_model_state_dict(model.state_dict()), "optimizer": optimizer.state_dict(), "scheduler_update": optimizer_update,
             "epoch": epoch, "micro_step": len(train_loader), "optimizer_update": optimizer_update, "best": dict(best),
             "rng_state": capture_rng_state(), "metrics": metrics, "calibration": metrics["calibration_thresholds"],
+            "reason_rank_memory": {key: value.detach().cpu() for key, value in reason_rank_memory.items()},
             "manifest": manifest, "manifest_hash": object_sha256(manifest), "split_manifest_hash": manifest["split_manifest_hash"],
             "config_hash": manifest["config_hash"], "source_head": manifest["source_head"],
             "predicate_schema_hash": manifest["predicate_schema_hash"], "counter_evidence_schema_hash": manifest["counter_evidence_schema_hash"],

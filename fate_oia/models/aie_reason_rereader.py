@@ -47,6 +47,8 @@ class AIEReasonRereader(nn.Module):
         self.predicate_prior_strength = nn.Parameter(torch.zeros(reason_dim))
         self.private_attention = nn.MultiheadAttention(dim, num_heads=4, batch_first=True)
         self.delta_head = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, 1))
+        nn.init.zeros_(self.delta_head[-1].weight)
+        nn.init.zeros_(self.delta_head[-1].bias)
         grammar = ACPRReasonGrammar(grammar_path)
         names = predicate_names or [str(i) for i in range(num_predicates)]
         positive, contradictory = grammar.reason_predicate_matrix(names)

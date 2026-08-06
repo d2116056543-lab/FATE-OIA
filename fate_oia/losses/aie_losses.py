@@ -38,6 +38,9 @@ def reason_ranking_loss(
     target: Tensor,
     negative_weight: Tensor | None = None,
     margin: float = 0.2,
+    reference_logits: Tensor | None = None,
+    reference_target: Tensor | None = None,
+    reference_negative_weight: Tensor | None = None,
 ) -> Tensor:
     positive = target > 0.5
     negative = ~positive
@@ -45,18 +48,46 @@ def reason_ranking_loss(
     # Exp mAP ranks examples independently for each reason label. Preserve the
     # single-example fallback used by unit probes, but optimize that actual
     # label-wise ordering whenever the batch contains both classes.
+    reference_logits = None if reference_logits is None else reference_logits.detach()
+    reference_target = None if reference_target is None else reference_target.detach()
+    reference_weights = (
+        None if reference_negative_weight is None else reference_negative_weight.detach()
+    )
     label_losses = []
     for label in range(logits.shape[1]):
-        if positive[:, label].any() and negative[:, label].any():
-            raw = F.relu(
-                float(margin)
-                - logits[positive[:, label], label][:, None]
-                + logits[negative[:, label], label][None]
+        current_positive = logits[positive[:, label], label]
+        current_negative = logits[negative[:, label], label]
+        negative_logits = current_negative
+        negative_weights = weights[negative[:, label], label]
+        reference_positive = logits.new_empty(0)
+        if reference_logits is not None and reference_target is not None:
+            ref_positive_mask = reference_target[:, label] > 0.5
+            ref_negative_mask = ~ref_positive_mask
+            reference_positive = reference_logits[ref_positive_mask, label]
+            negative_logits = torch.cat((negative_logits, reference_logits[ref_negative_mask, label]))
+            ref_weights = (
+                torch.ones_like(reference_logits[:, label])
+                if reference_weights is None
+                else reference_weights[:, label]
             )
+            negative_weights = torch.cat((negative_weights, ref_weights[ref_negative_mask]))
+
+        terms = []
+        if current_positive.numel() and negative_logits.numel():
+            raw = F.relu(float(margin) - current_positive[:, None] + negative_logits[None])
+            pair_weight = negative_weights[None].expand_as(raw)
+            terms.append((raw * pair_weight).sum() / pair_weight.sum().clamp_min(1e-8))
+        if reference_positive.numel() and current_negative.numel():
+            raw = F.relu(float(margin) - reference_positive[:, None] + current_negative[None])
             pair_weight = weights[negative[:, label], label][None].expand_as(raw)
-            label_losses.append((raw * pair_weight).sum() / pair_weight.sum().clamp_min(1e-8))
+            terms.append((raw * pair_weight).sum() / pair_weight.sum().clamp_min(1e-8))
+        if terms:
+            label_losses.append(torch.stack(terms).mean())
     if label_losses:
         return torch.stack(label_losses).mean()
+
+    if logits.shape[0] > 1:
+        return logits.sum() * 0
 
     losses = []
     for row in range(logits.shape[0]):
