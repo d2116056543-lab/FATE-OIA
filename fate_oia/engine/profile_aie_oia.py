@@ -20,9 +20,15 @@ CANDIDATES = ((6, 5, 16), (6, 5, 8), (5, 6, 16), (4, 8, 16))
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(); parser.add_argument("--config", required=True); parser.add_argument("--output-dir", required=True); parser.add_argument("--device", default="cuda"); parser.add_argument("--warmup", type=int, default=10); parser.add_argument("--measure", type=int, default=30)
+    parser = argparse.ArgumentParser(); parser.add_argument("--config", required=True); parser.add_argument("--output-dir", required=True); parser.add_argument("--device", default="cuda"); parser.add_argument("--warmup", type=int, default=10); parser.add_argument("--measure", type=int, default=30); parser.add_argument("--candidate", help="Profile one batch,accum,chunk tuple")
     args = parser.parse_args(); cfg = load_config(args.config); device = torch.device(args.device); rows = []
-    for batch, accum, chunk in CANDIDATES:
+    candidates = CANDIDATES
+    if args.candidate:
+        selected_candidate = tuple(int(value) for value in args.candidate.split(","))
+        if len(selected_candidate) != 3 or selected_candidate not in CANDIDATES:
+            raise ValueError(f"Unsupported AIE profile candidate: {args.candidate}")
+        candidates = (selected_candidate,)
+    for batch, accum, chunk in candidates:
         torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
         model = build_model(cfg, device).train(); optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-4)
         model.action_evidence.probe_chunk_size = chunk
