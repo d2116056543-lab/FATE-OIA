@@ -417,7 +417,11 @@ def collect_logits(
 
 
 def evaluate_epoch(model, calib_loader, test_loader, device, epoch_dir: Path, action_scale: float, reason_scale: float, cfg):
-    state_before = state_dict_sha256(model.state_dict())
+    state_before_dict = model.state_dict()
+    state_before = state_dict_sha256(state_before_dict)
+    state_key_hashes_before = {
+        key: state_dict_sha256({key: value}) for key, value in state_before_dict.items()
+    }
     calib, _, _ = collect_logits(model, calib_loader, device, action_scale, reason_scale)
     groups = [list(range(4)), list(range(4, 25))]
     thresholds = fit_posthoc_thresholds(
@@ -427,8 +431,14 @@ def evaluate_epoch(model, calib_loader, test_loader, device, epoch_dir: Path, ac
     )
     cf_cfg = AIECounterfactualConfig(**{k: cfg["counterfactual"][k] for k in AIECounterfactualConfig.__dataclass_fields__})
     test, names, audit = collect_logits(model, test_loader, device, action_scale, reason_scale, int(cfg["runtime"]["fixed_test_audit_samples"]), AIECounterfactualEngine(cf_cfg))
-    if state_dict_sha256(model.state_dict()) != state_before:
-        raise RuntimeError("Post-hoc calibration mutated model state")
+    state_after_dict = model.state_dict()
+    if state_dict_sha256(state_after_dict) != state_before:
+        changed_keys = [
+            key
+            for key, value in state_after_dict.items()
+            if state_key_hashes_before.get(key) != state_dict_sha256({key: value})
+        ]
+        raise RuntimeError(f"Post-hoc calibration mutated model state: {changed_keys}")
     primary = aie_branch_metrics(test["action_primary"], test["reason_primary"], test["action_target"], test["reason_target"])
     final = aie_branch_metrics(test["action_final"], test["reason_final"], test["action_target"], test["reason_target"])
     deploy_all = apply_posthoc_threshold(torch.cat((test["action_final"], test["reason_final"]), 1), thresholds["threshold_prob"])
