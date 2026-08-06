@@ -1,5 +1,6 @@
 import random
 import numpy as np
+import pytest
 import torch
 
 from fate_oia.utils.aie_artifacts import capture_rng_state, restore_rng_state
@@ -12,3 +13,10 @@ def test_rng_state_roundtrip_is_exact():
     actual = (random.random(), float(np.random.rand()), torch.rand(3))
     assert expected[:2] == actual[:2]; torch.testing.assert_close(expected[2], actual[2])
 
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA map_location regression")
+def test_rng_restore_accepts_checkpoint_loaded_on_cuda():
+    state = capture_rng_state()
+    state["torch"] = state["torch"].cuda()
+    state["cuda"] = [item.cuda() for item in state["cuda"]]
+    restore_rng_state(state)
