@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import subprocess
 from pathlib import Path
 
@@ -11,6 +12,22 @@ from fate_oia.utils.aie_hashes import file_sha256
 
 def read_jsonl(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def probe_health_gate(evidence: list[dict], epochs: list[dict]) -> bool:
+    """Judge late probe health; initialization is not final collapse evidence."""
+    if not evidence or not epochs:
+        return False
+    final_epoch_ids = {int(row["epoch"]) for row in epochs[-2:]}
+    late_rows = [row for row in evidence if int(row.get("epoch", -1)) in final_epoch_ids]
+    maximum_entropy = math.log(3600.0) - 0.01
+    return any(
+        row.get("dominant_probe_over_0p9_rate", 1.0) < 0.8
+        and row.get("probe_pairwise_overlap", 1.0) < 0.9
+        and row.get("probe_effective_count", 0.0) > 1.2
+        and 0.1 < row.get("probe_map_entropy", maximum_entropy + 1.0) < maximum_entropy
+        for row in late_rows
+    )
 
 
 def main() -> None:
@@ -28,7 +45,7 @@ def main() -> None:
         "B_evidence_active": any(row.get("raw_contribution_std", 0) > 1e-3 and row.get("action_evidence_grad", 0) > 0 and row.get("action_contribution_grad", 0) > 0 for row in loss_rows[:50]),
         "C_action_direction": any(row["final"]["Act_mAP"] >= row["primary"]["Act_mAP"] + 0.003 and row["final"]["Act_mF1"] >= row["primary"]["Act_mF1"] - 0.002 for row in final_two),
         "D_reason_direction": any(row["final"]["Exp_mAP"] >= row["primary"]["Exp_mAP"] + 0.003 and row["final"]["Exp_mF1"] >= row["primary"]["Exp_mF1"] - 0.003 for row in final_two),
-        "F_probe_health": bool(evidence) and max(row.get("dominant_probe_over_0p9_rate", 1) for row in evidence) < 0.8 and max(row.get("probe_pairwise_overlap", 1) for row in evidence) < 0.9,
+        "F_probe_health": probe_health_gate(evidence, epochs),
         "I_artifacts": bool(runtime.get("pass")) and not validate_run_artifacts(root),
     }
     cf_rows = [row for epoch in sorted(root.glob("epoch_*")) for row in (read_jsonl(epoch / "counterfactual_metrics.jsonl") if (epoch / "counterfactual_metrics.jsonl").exists() else [])]
