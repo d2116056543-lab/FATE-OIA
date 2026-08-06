@@ -29,26 +29,22 @@ class AIEPredicateNaming(nn.Module):
         presence_threshold: float = 0.30,
     ) -> None:
         super().__init__()
-        self.predicate_keys = nn.Parameter(torch.randn(num_predicates, 64) * 0.02)
-        self.evidence_projection = nn.Linear(dim, 64)
         self.confidence_threshold = confidence_threshold
         self.margin_threshold = margin_threshold
         self.presence_threshold = presence_threshold
 
     def forward(
         self,
-        evidence_token: Tensor,
         evidence_map: Tensor,
         predicate_attention: Tensor,
         predicate_probs: Tensor,
+        predicate_compatibility: Tensor,
         cf_effect: Tensor | None = None,
     ) -> dict[str, Tensor]:
         predicate_map = predicate_attention.detach().clamp_min(0)
         predicate_presence = predicate_probs.detach().clamp(0, 1)
         soft_iou = spatial_soft_iou(evidence_map[..., None, :], predicate_map[:, None, None, :, :])
-        compatibility = torch.sigmoid(
-            torch.einsum("bakd,pd->bakp", self.evidence_projection(evidence_token), self.predicate_keys)
-        )
+        compatibility = predicate_compatibility.clamp(0, 1)
         quality = soft_iou * compatibility * predicate_presence[:, None, None, :]
         if cf_effect is not None:
             quality = quality * torch.sigmoid(cf_effect.detach())[..., None]
