@@ -9,6 +9,12 @@ from torch import Tensor, nn
 from .acpr_reason_grammar import ACPRReasonGrammar
 
 
+def _bounded_log_prior(prior: Tensor, bound: float = 1.5) -> Tensor:
+    """Log-density ratio against a uniform field, bounded as required."""
+    uniform_log = -math.log(prior.shape[-1])
+    return (prior.clamp_min(1e-8).log() - uniform_log).clamp(min=-float(bound), max=float(bound))
+
+
 class AIEReasonRereader(nn.Module):
     def __init__(
         self,
@@ -99,12 +105,12 @@ class AIEReasonRereader(nn.Module):
         action_bias = score.new_zeros(action_prior.shape[0], self.reason_dim, 1, action_prior.shape[-1])
         if action_prior_enabled:
             strength = self.action_prior_max * torch.sigmoid(self.action_prior_strength)[None, :, None, None]
-            action_bias = strength * action_prior.clamp_min(1e-8).log()[:, :, None, :].clamp(min=-1.5)
+            action_bias = strength * _bounded_log_prior(action_prior)[:, :, None, :]
             score = score + action_bias
         predicate_bias = score.new_zeros(predicate_prior.shape[0], self.reason_dim, 1, predicate_prior.shape[-1])
         if predicate_prior_enabled:
             strength = self.predicate_prior_max * torch.sigmoid(self.predicate_prior_strength)[None, :, None, None]
-            predicate_bias = strength * predicate_prior.clamp_min(1e-8).log()[:, :, None, :].clamp(min=-1.5)
+            predicate_bias = strength * _bounded_log_prior(predicate_prior)[:, :, None, :]
             score = score + predicate_bias
         score = score + layer_mix[None, :, :, None].clamp_min(1e-8).log()
         attention = torch.softmax(score.flatten(2), dim=-1).view_as(score)

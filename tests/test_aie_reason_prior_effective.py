@@ -19,11 +19,14 @@ def test_action_prior_measurably_changes_private_attention_under_large_field_sca
         module.reason_query.weight.copy_(torch.eye(8)); module.reason_query.bias.zero_()
         module.field_keys[0].weight.copy_(torch.eye(8)); module.field_keys[0].bias.zero_()
     reason_nodes = torch.randn(1, 1, 8)
-    field = torch.randn(1, 1, 6, 8) * 1000
+    field = torch.randn(1, 1, 20, 8) * 1000
     evidence = torch.randn(1, 1, 1, 8)
-    maps = torch.tensor([[[[1.0, 0.0, 0.0, 0.0, 0.0, 0.0]]]])
+    # A realistic diffuse prior: every absolute probability is below exp(-1.5).
+    # Directly clamping log(p) therefore erases all spatial variation.
+    maps = torch.full((1, 1, 1, 20), 0.9 / 19)
+    maps[..., 0] = 0.1
     contribution = torch.ones(1, 1, 1)
-    predicate_attention = torch.full((1, 1, 6), 1 / 6)
+    predicate_attention = torch.full((1, 1, 20), 1 / 20)
     predicate_probs = torch.ones(1, 1)
     primary = torch.zeros(1, 1)
     enabled = module(
