@@ -12,8 +12,12 @@ def schedule_values(optimizer_update: int, schedule_total_updates: int, cfg: dic
     warmup = _ramp(p, 0.0, 0.05)
     cosine_p = _ramp(p, 0.05, 1.0)
     lr = warmup if p < 0.05 else 0.05 + 0.95 * 0.5 * (1.0 + math.cos(math.pi * cosine_p))
+    evidence = cfg.get("evidence", {})
+    action_start = float(evidence.get("action_scale_start", 0.10))
+    action_max = float(evidence.get("action_scale_max", 1.00))
     return {"lr_multiplier": max(lr, 1e-3), "grounding_scale": 0.25 + 0.75 * warmup,
-        "predicate_prior_scale": warmup, "action_scale": 0.10 + 0.90 * _ramp(p, 0.0, 0.10),
+        "predicate_prior_scale": warmup,
+        "action_scale": action_start + (action_max - action_start) * _ramp(p, 0.0, 0.10),
         "reason_budget_max": 0.10 + 0.50 * _ramp(p, 0.0, 0.10),
         "transport_gamma_cap": 0.05 + 0.20 * _ramp(p, 0.0, 0.10),
         "cf_scale": _ramp(p, 0.05, 0.15), "ecpo_scale": _ramp(p, 0.05, 0.15),

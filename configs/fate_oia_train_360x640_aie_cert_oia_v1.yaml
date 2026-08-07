@@ -51,7 +51,7 @@ evidence:
   overlap_ceiling: 0.65
   action_kappa: 3.0
   action_scale_start: 0.10
-  action_scale_max: 1.00
+  action_scale_max: 0.25
   action_logit_norm_cap: 20.0
 counterfactual:
   enabled: true
