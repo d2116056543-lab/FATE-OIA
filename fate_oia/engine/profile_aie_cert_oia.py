@@ -123,6 +123,7 @@ def main():
     dataset = torch.utils.data.Subset(make_dataset(cfg, "train"), range(320))
     builder = AIECertStructuredEvidenceBuilder(cfg["primary"]["scene_predicates"],
         cfg["primary"]["reason_counter_evidence"], cfg["data"]["bdd100k_root"])
+    builder.preload([dataset.dataset.samples[index].file_name for index in dataset.indices])
     results = []
     for candidate in candidates:
         try:

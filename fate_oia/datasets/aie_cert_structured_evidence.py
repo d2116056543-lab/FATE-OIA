@@ -40,7 +40,9 @@ def _box_mask(box: tuple[float, float, float, float], grid=(45, 80)) -> Tensor:
     return result.flatten()
 
 
-def _drivable(path: str | None, grid=(45, 80)) -> Tensor | None:
+def _drivable(path: str | Tensor | None, grid=(45, 80)) -> Tensor | None:
+    if torch.is_tensor(path):
+        return path
     if not path:
         return None
     try:
@@ -71,6 +73,7 @@ class AIECertStructuredEvidenceBuilder:
         self.reason_rules = counter.get("reasons", {})
         self.index = BDD100KGroundingIndex(bdd100k_root) if bdd100k_root else None
         self.grid_hw = grid_hw
+        self._record_cache: dict[str, dict[str, Any]] = {}
 
     def _set(self, state, row, name, mask=None, reliability=1.0):
         if name not in self.name_to_id:
@@ -145,7 +148,7 @@ class AIECertStructuredEvidenceBuilder:
                         self._set(state, row, f"merging_{side}_context", mask, 0.9)
             if object_complete and not front_hazard: self._set(state, row, "road_clear", None, 0.7)
             if object_complete and vehicle_count >= 6: self._set(state, row, "road_crowded", None, 0.75)
-            drive = _drivable(record.get("drivable_map_path"), self.grid_hw)
+            drive = _drivable(record.get("drivable_tensor", record.get("drivable_map_path")), self.grid_hw)
             if drive is not None:
                 h, w = self.grid_hw; x = torch.linspace(0, 1, w)[None].expand(h, -1)
                 for name, region in {"drivable_center": (x >= .35) & (x <= .65), "drivable_left": x < .45,
@@ -181,6 +184,9 @@ class AIECertStructuredEvidenceBuilder:
     def build(self, file_names: list[str], device=None) -> dict[str, Any]:
         records = []
         for name in file_names:
+            if name in self._record_cache:
+                records.append(self._record_cache[name])
+                continue
             record: dict[str, Any] = {}
             if self.index is not None:
                 paths = self.index.lookup(name)
@@ -195,5 +201,12 @@ class AIECertStructuredEvidenceBuilder:
                                 record.setdefault("labels", []).extend(data.get("labels", []))
                         except (OSError, json.JSONDecodeError):
                             pass
+                record["drivable_tensor"] = _drivable(record.get("drivable_map_path"), self.grid_hw)
+            self._record_cache[name] = record
             records.append(record)
         return self.build_from_records(records, device=device)
+
+    def preload(self, file_names: list[str]) -> None:
+        """Warm only external annotation parsing; image tensors and DINO fields are never cached."""
+        for start in range(0, len(file_names), 64):
+            self.build(file_names[start:start + 64], device=None)

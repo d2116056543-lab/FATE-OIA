@@ -61,7 +61,8 @@ def evidence_constraints(output: dict[str, Tensor], certificate: dict[str, Tenso
         valid = certificate["valid_mask"]
         cert = certificate["certificate"][valid]
         reliability = certificate["reliability"][valid]
-        contribution = output["bounded_contribution"].abs().amax(-1)[valid]
+        rows = torch.arange(output["bounded_contribution"].shape[0], device=valid.device)
+        contribution = output["bounded_contribution"][rows, certificate["action_id"], certificate["atom_id"]].abs()[valid]
         constraints = {
             "effect": (reliability * F.huber_loss(contribution, cert, reduction="none")).mean() - 0.05,
             "necessity": 0.05 - (reliability * cert).mean(),
