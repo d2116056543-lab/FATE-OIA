@@ -47,4 +47,11 @@ class AIECertPreferenceQueue:
         self.capacity = int(state["capacity"])
         self.max_age = int(state["max_age"])
         self.age_tau = float(state["age_tau"])
-        self.records = list(state["records"])[-self.capacity :]
+        records = []
+        for source in list(state["records"])[-self.capacity :]:
+            # Queue storage is deliberately CPU-resident. torch.load with a
+            # CUDA map_location otherwise mixes restored CUDA rows with newly
+            # enqueued CPU rows and makes reason-specific stacking fail.
+            records.append({key: value.detach().cpu() if torch.is_tensor(value) else value
+                            for key, value in source.items()})
+        self.records = records

@@ -5,6 +5,7 @@ from fate_oia.engine.train_aie_cert_oia import (
     assert_finite_gradients,
     assert_finite_loss,
     assert_finite_parameters,
+    canonical_model_state_dict,
 )
 from fate_oia.losses.aie_cert_loss_registry import AIECertLossRegistry
 from fate_oia.losses.aie_losses import predicate_map_compactness_loss, predicate_map_loss
@@ -41,3 +42,19 @@ def test_training_finiteness_guards_reject_nonfinite_values():
         model.bias.fill_(float("nan"))
     with pytest.raises(FloatingPointError, match="non-finite parameters"):
         assert_finite_parameters(model, 4)
+
+
+def test_checkpoint_canonicalization_removes_only_verified_dino_alias():
+    weight = torch.randn(2, 2)
+    state = {
+        "dino.blocks.0.attn.proj.weight": weight,
+        "dino.blocks.0.attn.vproj.weight": weight.clone(),
+        "head.weight": torch.randn(1, 2),
+    }
+    clean = canonical_model_state_dict(state)
+    assert "dino.blocks.0.attn.vproj.weight" not in clean
+    assert "dino.blocks.0.attn.proj.weight" in clean
+
+    state["dino.blocks.0.attn.vproj.weight"] = weight + 1
+    with pytest.raises(RuntimeError, match="unmatched DINO vproj alias"):
+        canonical_model_state_dict(state)

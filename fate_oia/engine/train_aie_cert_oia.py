@@ -90,6 +90,20 @@ def assert_finite_parameters(model, optimizer_update: int) -> None:
         )
 
 
+def canonical_model_state_dict(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Drop DINO's lazy vproj alias after verifying it matches proj exactly."""
+    clean = {}
+    for key, value in state.items():
+        if ".attn.vproj." not in key:
+            clean[key] = value
+            continue
+        canonical = key.replace(".attn.vproj.", ".attn.proj.")
+        counterpart = state.get(canonical)
+        if counterpart is None or counterpart.shape != value.shape or not torch.equal(counterpart, value):
+            raise RuntimeError(f"unmatched DINO vproj alias: {key}")
+    return clean
+
+
 def build_model(cfg, device, mock=False):
     b, p = cfg["backbone"], cfg["primary"]
     return AIECertOIAModel(dim=p["dim"], selected_layers=tuple(b["selected_layers"]),
@@ -344,7 +358,7 @@ def evaluate(model, calib_loader, test_loader, device, schedule, calibration, cf
 
 
 def save_checkpoint(path, model, optimizer, dual, queue, calibration, epoch, update, total_updates, best, cfg):
-    torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "dual": dual.state_dict(),
+    torch.save({"model": canonical_model_state_dict(model.state_dict()), "optimizer": optimizer.state_dict(), "dual": dual.state_dict(),
         "preference_queue": queue.state_dict(), "calibration_guard": calibration.state_dict(), "epoch": epoch,
         "optimizer_update": update, "schedule_total_updates": total_updates, "best": best, "config": cfg,
         "rng": {"torch": torch.get_rng_state(), "numpy": np.random.get_state(), "python": random.getstate()}}, path)
@@ -386,7 +400,9 @@ def main():
     best = {"deploy_joint": -1.0, "action_mf1": -1.0, "action_map": -1.0,
             "reason_mf1": -1.0, "reason_map": -1.0}
     if args.resume:
-        ckpt = torch.load(args.resume, map_location=device); model.load_state_dict(ckpt["model"]); optimizer.load_state_dict(ckpt["optimizer"])
+        ckpt = torch.load(args.resume, map_location=device)
+        model.load_state_dict(canonical_model_state_dict(ckpt["model"]))
+        optimizer.load_state_dict(ckpt["optimizer"])
         dual.load_state_dict(ckpt["dual"]); queue.load_state_dict(ckpt["preference_queue"]); calibration.load_state_dict(ckpt["calibration_guard"])
         epoch_start, update, total_updates, best = ckpt["epoch"] + 1, ckpt["optimizer_update"], ckpt["schedule_total_updates"], ckpt["best"]
     write_json(outdir / "run_manifest.json", {"git_head": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),

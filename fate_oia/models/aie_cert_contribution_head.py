@@ -9,6 +9,14 @@ def direction_preserving_l2_cap(delta: Tensor, cap: float = 20.0) -> Tensor:
     return delta * (cap / norm.clamp_min(cap))
 
 
+def stable_signed_decomposition(raw: Tensor, delta: Tensor) -> Tensor:
+    """Conserve delta exactly without dividing by a cancelling signed sum."""
+    centered = raw - raw.mean(dim=-1, keepdim=True)
+    contrast = centered / centered.abs().sum(dim=-1, keepdim=True).clamp_min(1e-6)
+    base = delta[..., None] / raw.shape[-1]
+    return base + 0.5 * delta.abs()[..., None] * contrast
+
+
 class AIECertContributionHead(nn.Module):
     def __init__(self, dim: int = 384, action_dim: int = 4, kappa: float = 3.0, norm_cap: float = 20.0) -> None:
         super().__init__()
@@ -22,9 +30,7 @@ class AIECertContributionHead(nn.Module):
         raw = torch.einsum("bakd,ad->bak", self.norm(centered_atom_token), self.weight)
         raw_delta = action_scale * self.kappa * torch.tanh(raw.sum(-1) / self.kappa)
         delta = direction_preserving_l2_cap(raw_delta, self.norm_cap)
-        denom = raw.sum(-1, keepdim=True)
-        share = torch.where(denom.abs() > 1e-8, raw / denom, torch.full_like(raw, 1.0 / raw.shape[-1]))
-        bounded = share * delta[..., None]
+        bounded = stable_signed_decomposition(raw, delta)
         final = primary_logits + bounded.sum(-1)
         error = (final - primary_logits - bounded.sum(-1)).abs().amax()
         return {
