@@ -288,7 +288,7 @@ def compute_loss(output, batch, structured, cfg, schedule, cf, dual, ecpo_pack):
     positive_names = structured["predicate_positive_mask"][:, None, None].bool().expand_as(output["name_quality"])
     name_loss = naming_preference_loss(output["name_quality"], positive_names)
     reg.add("naming_preference", "naming_readout", schedule["naming_scale"] * name_loss, w["naming_preference"], bool(positive_names.any()), "no_grounded_name")
-    constraints, availability = evidence_constraints(output, cf, ecpo_gain)
+    constraints, availability = evidence_constraints(output, cf, ecpo_gain, action)
     reg.add("primal_dual", "action_evidence", schedule["dual_scale"] * dual.primal_loss(constraints), 1.0)
     return reg.total(), reg, constraints, availability, pair_count
 
@@ -463,7 +463,11 @@ def main():
                     cf_positive += int((certificates > 0).sum())
                     cf_control_types += cf["per_control_validity"].detach().cpu().any(0).long()
                     rows = torch.arange(output["bounded_contribution"].shape[0], device=device)
-                    chosen = output["bounded_contribution"][rows,cf["action_id"],cf["atom_id"]].detach().cpu()[valid]
+                    target_sign = 2.0 * action[rows, cf["action_id"]] - 1.0
+                    chosen = (
+                        target_sign
+                        * output["bounded_contribution"][rows, cf["action_id"], cf["atom_id"]]
+                    ).detach().cpu()[valid]
                     cf_contributions.append(chosen); cf_certificates.append(certificates)
                 if update % cfg["runtime"]["print_every_optimizer_updates"] == 0:
                     event={"aie_cert_batch":True,"epoch":epoch,"micro_step":micro,"optimizer_update":update,

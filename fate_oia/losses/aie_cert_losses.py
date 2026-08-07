@@ -51,7 +51,7 @@ def naming_preference_loss(quality: Tensor, positive_mask: Tensor, margin: float
 
 
 def evidence_constraints(output: dict[str, Tensor], certificate: dict[str, Tensor] | None,
-                         ecpo_gain: Tensor | None) -> tuple[dict[str, Tensor], dict[str, bool]]:
+                         ecpo_gain: Tensor | None, action_target: Tensor) -> tuple[dict[str, Tensor], dict[str, bool]]:
     zero = output["action_delta"].sum() * 0.0
     if certificate is None or not certificate["valid_mask"].any():
         constraints = {"effect": zero, "necessity": zero,
@@ -62,7 +62,12 @@ def evidence_constraints(output: dict[str, Tensor], certificate: dict[str, Tenso
         cert = certificate["certificate"][valid]
         reliability = certificate["reliability"][valid]
         rows = torch.arange(output["bounded_contribution"].shape[0], device=valid.device)
-        contribution = output["bounded_contribution"][rows, certificate["action_id"], certificate["atom_id"]].abs()[valid]
+        action_ids = certificate["action_id"]
+        target_sign = 2.0 * action_target[rows, action_ids] - 1.0
+        contribution = (
+            target_sign
+            * output["bounded_contribution"][rows, action_ids, certificate["atom_id"]]
+        )[valid]
         constraints = {
             "effect": (reliability * F.huber_loss(contribution, cert, reduction="none")).mean() - 0.05,
             "necessity": 0.05 - (reliability * cert).mean(),

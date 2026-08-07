@@ -21,7 +21,14 @@ def test_effect_constraint_uses_only_selected_action_atom_for_each_sample():
                    "certificate": torch.tensor([0.3, 0.4, 0.5]),
                    "reliability": torch.ones(3), "action_id": torch.tensor([1, 3, 0]),
                    "atom_id": torch.tensor([2, 0, 1])}
-    constraints, availability = evidence_constraints(output, certificate, None)
+    targets = torch.zeros(3, 4)
+    targets[0, 1] = 1.0
+    targets[2, 0] = 1.0
+    # The negative target's raw contribution is negative so its
+    # target-signed contribution still agrees with the positive certificate.
+    contribution[1, 3, 0] = -0.4
+    constraints, availability = evidence_constraints(output, certificate, None, targets)
     assert availability["effect"]
     assert constraints["effect"].ndim == 0
     assert torch.isfinite(constraints["effect"])
+    assert torch.allclose(constraints["effect"], torch.tensor(-0.05))
