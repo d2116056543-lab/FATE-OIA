@@ -1,0 +1,115 @@
+experiment:
+  name: aie_cert_oia_v1
+  source_branch: acpr_aie_oia_v1_direct_image
+  source_head: 8a324b94b1cd6b4a4377655a1bd426f7d854fec0
+  direct_image: true
+  feature_cache_enabled: false
+  token_compression: none
+  eval_splits: [test]
+  best_selection_split: test
+  best_selection_metric: deploy_joint
+  internal_test_selected: true
+  publication_eligible: false
+data:
+  data_root: 'E:\sbw\BDD-OIA\data'
+  raw_root: 'E:\sbw\BDD-OIA'
+  bdd100k_root: 'E:\sbw\BDD100K'
+  image_height: 360
+  image_width: 640
+  patch_size: 8
+  action_dim: 4
+  reason_dim: 21
+  num_workers: 8
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+  split_seed: 20260806
+  train_calib_fraction: 0.10
+  train_audit_count: 1024
+  train_on_all_train: true
+backbone:
+  arch: vit_small
+  patch_size: 8
+  selected_layers: [3, 7, 11]
+  pretrained_weights: ckp/reference/dino_deitsmall8_pretrain.pth
+  freeze_backbone: true
+  no_grad_backbone: true
+primary:
+  dim: 384
+  scene_predicates: configs/aie_scene_predicates.yaml
+  reason_grammar: configs/acpr_reason_predicate_grammar.yaml
+  reason_counter_evidence: configs/aie_cert_reason_counter_evidence.yaml
+predicate_interface: {num_predicates: 32, key_dim: 64, presence_threshold: 0.30, prior_strength_max: 0.25, log_density_bound: 1.5}
+evidence:
+  probes_per_action: 4
+  local_points_per_layer: 8
+  max_offset: 0.25
+  probe_chunk_size: 16
+  transport_heads: 4
+  transport_gamma_init: 0.05
+  transport_gamma_max: 0.25
+  overlap_ceiling: 0.65
+  action_kappa: 3.0
+  action_scale_start: 0.10
+  action_scale_max: 1.00
+  action_logit_norm_cap: 20.0
+counterfactual:
+  enabled: true
+  interval_optimizer_updates: 4
+  batch_fraction: 0.50
+  max_actions_per_sample: 2
+  max_atoms_per_event: 8
+  topk_patches: 64
+  matched_control_count: 2
+  min_valid_controls: 3
+  max_control_overlap: 0.20
+  control_std_multiplier: 1.0
+  reliability_tau: 0.25
+  rerun_dino: false
+dual: {lr: 0.01, ema_decay: 0.95, lambda_max: 10.0, effect_tolerance: 0.05, necessity_margin: 0.05, action_budget_alpha: 1.25, action_budget_epsilon: 0.02, reason_budget_alpha: 1.00, reason_budget_epsilon: 0.02}
+reason_private: {action_prior_max: 0.75, predicate_prior_max: 0.75, reason_kappa: 4.0, budget_min: 0.10, budget_max: 0.60}
+ecpo: {beta: 2.0, queue_capacity: 512, max_age_updates: 64, age_tau: 32.0, pairs_per_label: 8, verified_counter_threshold: 0.50}
+training:
+  epochs: 16
+  batch_size: 6
+  gradient_accumulation_steps: 5
+  precision: bf16
+  optimizer: AdamW
+  fused_adamw_if_available: true
+  torch_compile: false
+  weight_decay: 0.05
+  lr_primary_core: 0.00020
+  lr_predicate_visual: 0.00010
+  lr_action_evidence: 0.00010
+  lr_action_contribution: 0.00008
+  lr_reason_private: 0.00010
+  lr_naming: 0.00005
+  warmup_ratio: 0.05
+  min_lr_ratio: 0.05
+  primary_grad_cap: 0.25
+  predicate_grad_cap: 0.25
+  action_evidence_grad_cap: 0.50
+  action_contribution_grad_cap: 0.50
+  reason_private_grad_cap: 0.50
+  naming_grad_cap: 0.25
+  global_grad_clip: 1.0
+  no_metric_early_stop: true
+loss_weights:
+  primary_action: 1.00
+  primary_action_visual: 0.05
+  primary_action_reason: 0.05
+  primary_reason_partial: 1.00
+  primary_reason_soft_f1: 0.08
+  predicate_cls: 0.12
+  predicate_map: 0.06
+  predicate_compactness: 0.0005
+  final_action: 1.00
+  final_action_soft_f1: 0.03
+  final_action_cardinality: 0.02
+  atom_overlap_ceiling: 0.005
+  final_reason: 1.00
+  final_reason_soft_f1: 0.04
+  ecpo: 0.08
+  naming_preference: 0.02
+calibration: {enabled: true, source: train_calib, grid_step: 0.01, group_shrinkage_support: 50, ema_decay: 0.80, max_threshold_step: 0.05, accept_min_joint_delta: -0.001, accept_max_action_mf1_drop: 0.002, test_oracle_writeback: false}
+runtime: {test_every_epoch: true, save_every_epoch: true, fixed_test_audit_samples: 128, print_every_optimizer_updates: 100, max_reserved_memory_gb: 44.5, memory_growth_tolerance_gb: 0.25}

@@ -1,0 +1,22 @@
+reasons:
+  0: {positive_predicates: [traffic_light_green], contradictory_predicates: [traffic_light_red, stop_sign_present]}
+  1: {positive_predicates: [front_vehicle_far, road_crowded], contradictory_predicates: [road_clear]}
+  2: {positive_predicates: [road_clear, drivable_center], contradictory_predicates: [front_vehicle_close, pedestrian_front, obstacle_front, road_crowded]}
+  3: {positive_predicates: [traffic_light_visible], contradictory_predicates: []}
+  4: {positive_predicates: [traffic_sign_visible], contradictory_predicates: []}
+  5: {positive_predicates: [front_vehicle_close, front_vehicle_far], contradictory_predicates: [road_clear]}
+  6: {positive_predicates: [pedestrian_front], contradictory_predicates: [road_clear]}
+  7: {positive_predicates: [cyclist_front], contradictory_predicates: [road_clear]}
+  8: {positive_predicates: [obstacle_front], contradictory_predicates: [road_clear]}
+  9: {positive_predicates: [], contradictory_predicates: [lane_left_available, drivable_left, open_left_gap]}
+  10: {positive_predicates: [parked_vehicle_left, vehicle_left], contradictory_predicates: [open_left_gap, drivable_left]}
+  11: {positive_predicates: [], contradictory_predicates: [open_left_gap]}
+  12: {positive_predicates: [left_turn_region, lane_left_available], contradictory_predicates: [vehicle_left]}
+  13: {positive_predicates: [traffic_light_green, left_turn_region], contradictory_predicates: [traffic_light_red]}
+  14: {positive_predicates: [front_vehicle_close, left_turn_region], contradictory_predicates: [road_clear]}
+  15: {positive_predicates: [], contradictory_predicates: [lane_right_available, drivable_right, open_right_gap]}
+  16: {positive_predicates: [parked_vehicle_right, vehicle_right], contradictory_predicates: [open_right_gap, drivable_right]}
+  17: {positive_predicates: [], contradictory_predicates: [open_right_gap]}
+  18: {positive_predicates: [right_turn_region, lane_right_available], contradictory_predicates: [vehicle_right]}
+  19: {positive_predicates: [traffic_light_green, right_turn_region], contradictory_predicates: [traffic_light_red]}
+  20: {positive_predicates: [front_vehicle_close, right_turn_region], contradictory_predicates: [road_clear]}
