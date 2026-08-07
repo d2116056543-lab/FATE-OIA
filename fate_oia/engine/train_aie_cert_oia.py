@@ -19,6 +19,7 @@ from fate_oia.losses.aie_cert_constraints import AIECertDualState
 from fate_oia.losses.aie_cert_loss_registry import AIECertLossRegistry, exact_owner_parameter_groups
 from fate_oia.losses.aie_cert_losses import (atom_overlap_ceiling_loss, ecpo_loss, evidence_constraints,
     naming_preference_loss, partial_asl, soft_f1)
+from fate_oia.losses.aie_losses import predicate_map_compactness_loss, predicate_map_loss
 from fate_oia.losses.asymmetric_loss import asymmetric_loss_with_logits
 from fate_oia.models.aie_cert_oia_model import AIECertOIAModel
 from fate_oia.transforms import AspectRatioLetterboxTransform
@@ -59,6 +60,34 @@ def accumulation_divisor(micro_step: int, total_micro_steps: int, accumulation: 
     if remainder and micro_step >= total_micro_steps - remainder:
         return remainder
     return accumulation
+
+
+def assert_finite_loss(loss, registry, optimizer_update: int) -> None:
+    bad = [name for name, term in registry.terms.items() if not bool(torch.isfinite(term.value).all())]
+    if not bool(torch.isfinite(loss).all()) or bad:
+        raise FloatingPointError(
+            f"non-finite loss before backward at optimizer_update={optimizer_update}; terms={bad}"
+        )
+
+
+def assert_finite_gradients(model, optimizer_update: int) -> None:
+    bad = [name for name, parameter in model.named_parameters()
+           if parameter.grad is not None and not bool(torch.isfinite(parameter.grad).all())]
+    if bad:
+        raise FloatingPointError(
+            f"non-finite gradients before optimizer step at optimizer_update={optimizer_update}; "
+            f"parameters={bad[:16]}"
+        )
+
+
+def assert_finite_parameters(model, optimizer_update: int) -> None:
+    bad = [name for name, parameter in model.named_parameters()
+           if parameter.requires_grad and not bool(torch.isfinite(parameter).all())]
+    if bad:
+        raise FloatingPointError(
+            f"non-finite parameters after optimizer step at optimizer_update={optimizer_update}; "
+            f"parameters={bad[:16]}"
+        )
 
 
 def build_model(cfg, device, mock=False):
@@ -226,10 +255,13 @@ def compute_loss(output, batch, structured, cfg, schedule, cf, dual, ecpo_pack):
     pred_loss = F.binary_cross_entropy_with_logits(output["predicate_logits_clean"], pred_target, reduction="none")
     pred_loss = (pred_loss * pred_mask * structured["predicate_reliability"].clamp_min(0.25)).sum() / pred_mask.sum().clamp_min(1.0)
     reg.add("predicate_cls", "predicate_visual", schedule["grounding_scale"] * pred_loss, w["predicate_cls"])
-    map_error = (output["predicate_attention_clean"] - structured["predicate_map_target"]).abs().sum(-1)
-    map_loss = (map_error * structured["predicate_map_mask"]).sum() / structured["predicate_map_mask"].sum().clamp_min(1.0)
+    map_loss = predicate_map_loss(
+        output["predicate_attention_clean"],
+        structured["predicate_map_target"],
+        structured["predicate_map_mask"],
+    )
     reg.add("predicate_map", "predicate_visual", schedule["grounding_scale"] * map_loss, w["predicate_map"])
-    compact = output["predicate_attention_clean"].sqrt().sum(-1).mean()
+    compact = predicate_map_compactness_loss(output["predicate_attention_clean"])
     reg.add("predicate_compactness", "predicate_visual", compact, w["predicate_compactness"])
     reg.add("final_action", "action_contribution", partial_asl(output["action_logits_final_train"], action), w["final_action"])
     reg.add("final_action_soft_f1", "action_contribution", soft_f1(output["action_logits_final_train"], action), w["final_action_soft_f1"])
@@ -388,6 +420,7 @@ def main():
                     update % cfg["counterfactual"]["interval_optimizer_updates"] == 0) else None
                 ecpo_pack = build_ecpo(output, {"reason": reason}, structured, update, queue, cfg["ecpo"]["verified_counter_threshold"], cfg["ecpo"]["pairs_per_label"])
                 loss, registry, constraints, availability, pairs = compute_loss(output, {"action": action, "reason": reason}, structured, cfg, schedule, cf, dual, ecpo_pack)
+            assert_finite_loss(loss, registry, update)
             divisor = accumulation_divisor(micro, len(train_loader), accumulation)
             (loss / divisor).backward(); ecpo_count += pairs; ecpo_label_counts += ecpo_pack[3]
             queue.enqueue(PreferenceBatch(output["reason_logits_primary"], output["reason_logits_final"], reason,
@@ -396,10 +429,14 @@ def main():
             if flush:
                 print_due = (update + 1) % cfg["runtime"]["print_every_optimizer_updates"] == 0
                 owner_before_clip = owner_gradient_stats(model)
+                assert_finite_gradients(model, update)
                 parameter_snapshot = snapshot_owner_parameters(model) if print_due else None
                 torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["training"]["global_grad_clip"])
+                assert_finite_gradients(model, update)
                 owner_after_clip = owner_gradient_stats(model)
-                optimizer.step(); optimizer.zero_grad(set_to_none=True); dual.update({k: v for k, v in constraints.items() if availability.get(k)}, schedule["dual_scale"]); update += 1
+                optimizer.step()
+                assert_finite_parameters(model, update)
+                optimizer.zero_grad(set_to_none=True); dual.update({k: v for k, v in constraints.items() if availability.get(k)}, schedule["dual_scale"]); update += 1
                 last_diag = evidence_diagnostics(output)
                 last_owner = {"before_clip": owner_before_clip, "after_clip": owner_after_clip,
                               "update_rms": owner_update_rms(model, parameter_snapshot) if parameter_snapshot else {}}
