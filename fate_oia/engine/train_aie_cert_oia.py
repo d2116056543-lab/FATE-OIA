@@ -54,6 +54,13 @@ def make_loader(dataset, batch, shuffle, workers, cfg):
     return DataLoader(dataset, **kwargs)
 
 
+def accumulation_divisor(micro_step: int, total_micro_steps: int, accumulation: int) -> int:
+    remainder = total_micro_steps % accumulation
+    if remainder and micro_step >= total_micro_steps - remainder:
+        return remainder
+    return accumulation
+
+
 def build_model(cfg, device, mock=False):
     b, p = cfg["backbone"], cfg["primary"]
     return AIECertOIAModel(dim=p["dim"], selected_layers=tuple(b["selected_layers"]),
@@ -381,7 +388,8 @@ def main():
                     update % cfg["counterfactual"]["interval_optimizer_updates"] == 0) else None
                 ecpo_pack = build_ecpo(output, {"reason": reason}, structured, update, queue, cfg["ecpo"]["verified_counter_threshold"], cfg["ecpo"]["pairs_per_label"])
                 loss, registry, constraints, availability, pairs = compute_loss(output, {"action": action, "reason": reason}, structured, cfg, schedule, cf, dual, ecpo_pack)
-            loss.backward(); ecpo_count += pairs; ecpo_label_counts += ecpo_pack[3]
+            divisor = accumulation_divisor(micro, len(train_loader), accumulation)
+            (loss / divisor).backward(); ecpo_count += pairs; ecpo_label_counts += ecpo_pack[3]
             queue.enqueue(PreferenceBatch(output["reason_logits_primary"], output["reason_logits_final"], reason,
                 structured["reason_verified_counter"], structured["reason_counter_reliability"],
                 torch.full((images.shape[0],), update, device=device), batch["file_name"]))

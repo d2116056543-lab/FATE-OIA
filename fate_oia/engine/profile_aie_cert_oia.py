@@ -83,7 +83,7 @@ def _profile_candidate(cfg, device, dataset, candidate, builder):
                                    cfg["ecpo"]["verified_counter_threshold"], cfg["ecpo"]["pairs_per_label"])
             loss, _, constraints, availability, _ = compute_loss(
                 output, {"action": action, "reason": reason}, structured, cfg, schedule, cf, dual, ecpo_pack)
-        loss.backward()
+        (loss / accum).backward()
         if (step + 1) % accum == 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["training"]["global_grad_clip"])
             optimizer.step(); optimizer.zero_grad(set_to_none=True)
