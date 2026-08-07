@@ -58,6 +58,7 @@ def evaluate(root: Path) -> dict:
                        if row.get("contribution_certificate_pearson") is not None]
     gates = {
         "three_epochs": len(metrics_rows) == 3,
+        "train_audit_512_executed": len(epoch_dirs) == 3 and all((epoch / "train_audit_metrics.json").exists() for epoch in epoch_dirs),
         "all_values_finite": finite,
         "all_owner_gradients_and_updates_nonzero": all(owner_nonzero.values()),
         "dino_gradient_zero": dino_zero,

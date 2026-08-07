@@ -328,15 +328,18 @@ def main():
     epochs = args.epochs or cfg["training"]["epochs"]; batch_size = args.batch_size or cfg["training"]["batch_size"]
     accumulation = args.gradient_accumulation_steps or cfg["training"]["gradient_accumulation_steps"]
     workers = cfg["data"]["num_workers"] if args.num_workers is None else args.num_workers
-    train, test = make_dataset(cfg, "train"), make_dataset(cfg, "test")
-    calib_count = max(1, int(len(train) * cfg["data"]["train_calib_fraction"]))
-    calib_indices = list(range(len(train) - calib_count, len(train)))
+    train_all, test = make_dataset(cfg, "train"), make_dataset(cfg, "test")
+    calib_count = max(1, int(len(train_all) * cfg["data"]["train_calib_fraction"]))
+    calib_indices = list(range(len(train_all) - calib_count, len(train_all)))
     if args.max_calib_samples: calib_indices = calib_indices[:args.max_calib_samples]
-    calib = Subset(train, calib_indices)
+    calib = Subset(train_all, calib_indices)
+    audit = Subset(train_all, range(min(args.max_audit_samples, len(train_all)))) if args.max_audit_samples else None
+    train = train_all
     if args.max_train_samples: train = Subset(train, range(min(args.max_train_samples, len(train))))
     if args.max_test_samples: test = Subset(test, range(min(args.max_test_samples, len(test))))
     train_loader = make_loader(train, batch_size, True, workers, cfg)
     calib_loader = make_loader(calib, batch_size, False, workers, cfg)
+    audit_loader = make_loader(audit, batch_size, False, workers, cfg) if audit is not None else None
     test_loader = make_loader(test, batch_size, False, workers, cfg)
     builder = AIECertStructuredEvidenceBuilder(cfg["primary"]["scene_predicates"], cfg["primary"]["reason_counter_evidence"], cfg["data"]["bdd100k_root"])
     total_updates = math.ceil(len(train_loader) / accumulation) * epochs
@@ -353,7 +356,9 @@ def main():
     (outdir / "config_resolved.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True), encoding="utf-8")
     write_json(outdir / "implementation_fingerprint.json", {"git_head": subprocess.check_output(["git","rev-parse","HEAD"],text=True).strip(),
         "formal_model": "AIECertOIAModel", "source_head": cfg["experiment"]["source_head"]})
-    write_json(outdir / "split_manifest.json", {"seed": seed, "train_count": len(train), "train_calib_count": len(calib), "test_count": len(test)})
+    write_json(outdir / "split_manifest.json", {"seed": seed, "train_count": len(train),
+        "train_calib_count": len(calib), "train_audit_count": len(audit) if audit is not None else 0,
+        "test_count": len(test)})
     write_json(outdir / "best_checkpoints.json", best)
     for epoch in range(epoch_start, epochs):
         model.train(); dual.train(); optimizer.zero_grad(set_to_none=True); last_diag = {}; last_owner = {}
@@ -416,6 +421,12 @@ def main():
         epoch_dir = outdir / f"epoch_{epoch:03d}"; epoch_dir.mkdir(exist_ok=True)
         save_checkpoint(epoch_dir/"checkpoint_pre_eval.pth",model,optimizer,dual,queue,calibration,epoch,update,total_updates,best,cfg)
         metrics, tensors = evaluate(model, calib_loader, test_loader, device, schedule, calibration, cfg)
+        train_audit_metrics = None
+        if audit_loader is not None:
+            audit_tensors = collect_predictions(model, audit_loader, device, schedule)
+            train_audit_metrics = {"primary":branch_metrics(audit_tensors["ap"],audit_tensors["rp"],audit_tensors["at"],audit_tensors["rt"]),
+                                   "final":branch_metrics(audit_tensors["af"],audit_tensors["rf"],audit_tensors["at"],audit_tensors["rt"])}
+            write_json(epoch_dir/"train_audit_metrics.json",train_audit_metrics)
         write_json(epoch_dir / "metrics.json", metrics); write_json(epoch_dir / "branch_metrics.json", metrics)
         if sum(value.numel() for value in cf_certificates) >= 2:
             cert_values, contribution_values = torch.cat(cf_certificates), torch.cat(cf_contributions)
