@@ -67,7 +67,8 @@ def requirement_matrix(root: Path, dynamic: dict, pytest_ok: bool, regression_ok
     profile = json.loads(profile_path.read_text(encoding="utf-8")) if profile_path.exists() else {"pass": False}
     branch = subprocess.check_output(["git", "branch", "--show-current"], cwd=root, text=True).strip()
     head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
-    remote = subprocess.run(["git", "ls-remote", "github", f"refs/heads/{branch}"], cwd=root, capture_output=True, text=True, timeout=60)
+    remote = subprocess.run(["git", "-c", "http.proxy=", "-c", "https.proxy=", "ls-remote", "github",
+                             f"refs/heads/{branch}"], cwd=root, capture_output=True, text=True, timeout=60)
     remote_head = remote.stdout.split()[0] if remote.returncode == 0 and remote.stdout.strip() else ""
     checks = {
         "C01": branch == "acpr_aie_cert_oia_v1_direct_image" and "aie_cert" in str(root).lower(),
@@ -83,7 +84,10 @@ def requirement_matrix(root: Path, dynamic: dict, pytest_ok: bool, regression_ok
         "C23": pytest_ok and dynamic["queue_checkpoint_roundtrip"], "C24": dynamic["naming_to_shared_key_grad_zero"],
         "C25": pytest_ok, "C26": pytest_ok, "C27": dynamic["dino_grad_zero"], "C28": pytest_ok,
         "C29": dynamic["dual_checkpoint_roundtrip"] and dynamic["queue_checkpoint_roundtrip"],
-        "C30": bool(profile.get("pass")), "C31": (root / "fate_oia/engine/evaluate_aie_cert_oia_pilot.py").exists() and pytest_ok,
+        "C30": bool(profile.get("pass")) and profile.get("git_head") == head and
+               profile.get("config_hash") == sha256(root / "configs/fate_oia_train_360x640_aie_cert_oia_v1.yaml") and
+               profile.get("source_head") == config["experiment"]["source_head"],
+        "C31": (root / "fate_oia/engine/evaluate_aie_cert_oia_pilot.py").exists() and pytest_ok,
         "C32": bool(remote_head) and remote_head == head,
     }
     symbols = {
