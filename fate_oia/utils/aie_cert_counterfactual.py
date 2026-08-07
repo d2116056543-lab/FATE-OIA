@@ -31,7 +31,10 @@ class AIECertCounterfactualEngine:
         masked = torch.where(control_valid, control_drop, torch.zeros_like(control_drop))
         mean = masked.sum(-1) / valid_count.clamp_min(1)
         variance = torch.where(control_valid, (control_drop - mean[..., None]).square(), torch.zeros_like(control_drop))
-        std = torch.sqrt(variance.sum(-1) / valid_count.clamp_min(1))
+        # A zero-variance control set is valid, but sqrt'(0) is infinite and
+        # poisons the evidence owner during the certificate backward pass.
+        control_variance = variance.sum(-1) / valid_count.clamp_min(1)
+        std = torch.sqrt(control_variance.clamp_min(1e-6))
         valid = valid_count >= self.config.min_valid_controls
         certificate = selected_drop - (mean + std)
         reliability = torch.exp(-std / self.config.reliability_tau)
