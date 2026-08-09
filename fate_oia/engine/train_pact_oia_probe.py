@@ -172,24 +172,27 @@ def pareto_controller_step(model: PACTOIAModel, controller: PACTParetoController
                            train_batch: dict, audit_batch: dict, cfg: dict, device: torch.device) -> dict:
     shared_parameters = dict(model.shared_readout.named_parameters())
     parameters = tuple(shared_parameters.values())
-    action_objective = asymmetric_loss_with_logits(train_output["action_logits_primary"], train_batch["action"])
-    # Build the semantic objective directly from shared nodes so g_S is measured at license=1.
-    semantic = model.explanation_decoder(
-        train_output["shared_label_nodes"], train_output["predicate_tokens"].detach()
-    )
-    semantic_reason = model.predicate_reason(
-        semantic["reason_nodes_formal"], train_output["semantic_predicate_probs"].detach(),
-        train_output["predicate_tokens"].detach(),
-    )
-    semantic_logits = semantic["reason_logits_visual_formal"] + semantic_reason["predicate_reason_delta"]
-    semantic_objective = acpr_losses.partial_label_reason_loss(
-        semantic_logits, train_batch["reason"], semantic_reason["contradiction_score"]
-    )
+    # The ordinary forward produces BF16 nodes. Re-enter the same autocast
+    # policy here because this controller runs outside the training context.
+    with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+        action_objective = asymmetric_loss_with_logits(train_output["action_logits_primary"], train_batch["action"])
+        # Build the semantic objective directly from shared nodes so g_S is measured at license=1.
+        semantic = model.explanation_decoder(
+            train_output["shared_label_nodes"], train_output["predicate_tokens"].detach()
+        )
+        semantic_reason = model.predicate_reason(
+            semantic["reason_nodes_formal"], train_output["semantic_predicate_probs"].detach(),
+            train_output["predicate_tokens"].detach(),
+        )
+        semantic_logits = semantic["reason_logits_visual_formal"] + semantic_reason["predicate_reason_delta"]
+        semantic_objective = acpr_losses.partial_label_reason_loss(
+            semantic_logits, train_batch["reason"], semantic_reason["contradiction_score"]
+        )
     action_grad = torch.autograd.grad(action_objective, parameters, retain_graph=True, allow_unused=True)
     semantic_grad = torch.autograd.grad(semantic_objective, parameters, retain_graph=True, allow_unused=True)
     action_grad = tuple(torch.zeros_like(p) if g is None else g.detach() for p, g in zip(parameters, action_grad))
     semantic_grad = tuple(torch.zeros_like(p) if g is None else g.detach() for p, g in zip(parameters, semantic_grad))
-    with torch.no_grad():
+    with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
         audit_images = audit_batch["image"].to(device, non_blocking=True)
         audit_target = audit_batch["action"].to(device, non_blocking=True)
         field = model.encode_images(audit_images)
@@ -204,7 +207,7 @@ def pareto_controller_step(model: PACTOIAModel, controller: PACTParetoController
             name: parameter - meta_step * (ga + float(candidate) * gs)
             for (name, parameter), ga, gs in zip(shared_parameters.items(), action_grad, semantic_grad)
         }
-        with torch.no_grad():
+        with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
             shared = functional_call(model.shared_readout, candidate_parameters, (audit_patch,))
             action = model.context_decoder(shared["shared_label_nodes"], audit_predicate)["action_logits_primary"]
             return float(asymmetric_loss_with_logits(action, audit_target))
