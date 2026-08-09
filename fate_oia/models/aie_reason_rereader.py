@@ -131,6 +131,7 @@ class AIEReasonRereader(nn.Module):
             "reason_visual_score_rms": torch.stack(layer_scores, dim=2).float().square().mean().sqrt(),
             "reason_action_prior_bias_rms": action_bias.float().square().mean().sqrt(),
             "reason_predicate_prior_bias_rms": predicate_bias.float().square().mean().sqrt(),
+            "reason_raw_delta": raw_delta,
             "reason_delta": delta,
             "reason_logits_final": final,
             "reason_logits_final_train": final_train,

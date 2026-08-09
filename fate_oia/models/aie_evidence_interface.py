@@ -88,6 +88,8 @@ class AIEEvidenceInterface(nn.Module):
         predicate_bias_enabled: bool = True,
         local_reread_enabled: bool = True,
         group_attention_enabled: bool = True,
+        predicate_agreement: nn.Module | None = None,
+        predicate_agreement_bypass: bool = False,
         profile: bool = False,
     ) -> dict[str, Tensor]:
         def stamp() -> float:
@@ -137,6 +139,19 @@ class AIEEvidenceInterface(nn.Module):
         predicate_log_prior = torch.einsum("bakp,bpn->bakn", normalized_compat, pred_attn.log())
         strength = self.predicate_bias_max * torch.sigmoid(self.predicate_strength(global_token)).squeeze(-1)
         visual_score = (layer_mix[..., None] * score_stack).sum(3)
+        agreement_result: dict[str, Tensor] = {}
+        if predicate_agreement is not None:
+            visual_map = torch.softmax(visual_score, dim=-1)
+            predicate_map = torch.einsum("bakp,bpn->bakn", normalized_compat, pred_attn)
+            predicate_confidence = torch.einsum("bakp,bp->bak", normalized_compat, pred_prob)
+            agreement_result = predicate_agreement(
+                visual_map,
+                predicate_map,
+                predicate_confidence,
+                bypass=predicate_agreement_bypass,
+            )
+            if not predicate_agreement_bypass:
+                strength = agreement_result["predicate_agreement_strength"]
         combined_score = visual_score + (strength[..., None] * predicate_log_prior if predicate_bias_enabled else 0.0)
         evidence_map = torch.softmax(combined_score, dim=-1)
         global_end = stamp()
@@ -162,6 +177,7 @@ class AIEEvidenceInterface(nn.Module):
             "sampling_weights": local_out["sampling_weights"],
             "predicate_compatibility": normalized_compat,
             "predicate_bias_strength": strength if predicate_bias_enabled else torch.zeros_like(strength),
+            **agreement_result,
         }
         if profile:
             result["_profile_evidence_global_time"] = global_end - global_start

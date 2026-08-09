@@ -475,7 +475,8 @@ def main() -> None:
     parser.add_argument("--epochs", type=int); parser.add_argument("--batch-size", type=int); parser.add_argument("--gradient-accumulation-steps", type=int)
     parser.add_argument("--num-workers", type=int); parser.add_argument("--max-train-samples", type=int); parser.add_argument("--max-audit-samples", type=int)
     parser.add_argument("--max-calib-samples", type=int); parser.add_argument("--max-test-samples", type=int); parser.add_argument("--device", default="cuda")
-    parser.add_argument("--resume"); parser.add_argument("--use-mock-dino", action="store_true")
+    parser.add_argument("--resume"); parser.add_argument("--init-model-checkpoint")
+    parser.add_argument("--use-mock-dino", action="store_true")
     args = parser.parse_args()
     cfg = load_config(args.config); cfg["counter_evidence"] = load_config("configs/aie_reason_counter_evidence.yaml"); output_dir = Path(args.output_dir); output_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device); torch.set_float32_matmul_precision("high")
@@ -503,7 +504,13 @@ def main() -> None:
     test_loader = make_loader(test_subset, batch_size, False, workers, cfg)
     write_split_manifest(output_dir / "split_manifest.json", train_ids, int(data_cfg["split_seed"]), float(data_cfg["train_calib_fraction"]), int(data_cfg["train_audit_count"]))
     write_json(output_dir / "train_calib_ids.json", splits["train_calib"]); write_json(output_dir / "train_audit_ids.json", splits["train_audit"])
-    model = build_model(cfg, device, args.use_mock_dino); optimizer = build_optimizer(model, cfg)
+    model = build_model(cfg, device, args.use_mock_dino)
+    if args.init_model_checkpoint:
+        if args.resume:
+            raise RuntimeError("--init-model-checkpoint and --resume are mutually exclusive")
+        initial = torch.load(args.init_model_checkpoint, map_location="cpu")
+        model.load_state_dict(canonical_model_state_dict(initial.get("model", initial)), strict=True)
+    optimizer = build_optimizer(model, cfg)
     parameter_names = {id(parameter): name for name, parameter in model.named_parameters()}
     owner_groups = exact_owner_parameter_groups(model)
     owner_map = {
