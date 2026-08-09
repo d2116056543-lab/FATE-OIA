@@ -14,3 +14,6 @@ def test_reason_delta_uses_true_literal_budget():
     )
     assert float(out["reason_delta"].abs().max()) <= 0.0700001
     assert float(out["reason_delta_to_budget_max"]) <= 1.000001
+    expected_ratio = out["reason_delta"].abs() / 0.07
+    assert torch.allclose(out["reason_delta_to_budget_mean"], expected_ratio.mean())
+    assert torch.allclose(out["reason_delta_saturation_rate"], (expected_ratio >= 0.95).float().mean())

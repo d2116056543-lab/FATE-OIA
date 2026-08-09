@@ -22,12 +22,15 @@ class PACTReasonRereader(AIEReasonRereader):
         raw_delta = result["reason_raw_delta"]
         budget = raw_delta.new_tensor(float(reason_budget)).clamp_min(0.0)
         delta = budget * raw_delta.tanh()
+        ratio = delta.abs() / budget.clamp_min(1e-8)
         primary = args[7]
         result.update(
             reason_delta=delta,
             reason_logits_final=primary + delta,
             reason_logits_final_train=primary.detach() + delta,
             reason_delta_budget=budget,
-            reason_delta_to_budget_max=(delta.abs() / budget.clamp_min(1e-8)).max(),
+            reason_delta_to_budget_max=ratio.max(),
+            reason_delta_to_budget_mean=ratio.mean(),
+            reason_delta_saturation_rate=(ratio >= 0.95).to(ratio.dtype).mean(),
         )
         return result

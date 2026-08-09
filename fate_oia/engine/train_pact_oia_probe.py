@@ -397,7 +397,8 @@ def main() -> None:
         model.train(); optimizer.zero_grad(set_to_none=True); micro = 0; start = time.perf_counter(); latest_stats = {}
         epoch_reason_coverage = None
         epoch_cf_cases = []; epoch_agreement = []; epoch_gate = []; epoch_named = []
-        epoch_reason_bound = []; epoch_action_delta = []; epoch_contribution = []
+        epoch_reason_bound = []; epoch_reason_bound_mean = []; epoch_reason_saturation = []
+        epoch_action_delta = []; epoch_contribution = []
         first_audit_batch = None; last_controller_result = None
         for batch in train_loader:
             batch = {key: value.to(device, non_blocking=True) if torch.is_tensor(value) else value for key, value in batch.items()}
@@ -428,6 +429,8 @@ def main() -> None:
             epoch_gate.append(float(output["predicate_agreement_strength"].mean().detach()))
             epoch_named.append(float((output["formal_predicate_name_id"] >= 0).float().mean().detach()))
             epoch_reason_bound.append(float(output["reason_delta_to_budget_max"].detach()))
+            epoch_reason_bound_mean.append(float(output["reason_delta_to_budget_mean"].detach()))
+            epoch_reason_saturation.append(float(output["reason_delta_saturation_rate"].detach()))
             epoch_action_delta.extend(output["action_delta"].detach().float().cpu().flatten().tolist())
             epoch_contribution.extend(output["bounded_contribution"].detach().float().cpu().flatten().tolist())
             controller_result = None
@@ -456,7 +459,9 @@ def main() -> None:
                                       "license": license_value,
                                       "reason_labels_with_pairs": latest_stats["labels_with_pairs"],
                                       "agreement": float(output.get("predicate_visual_agreement", torch.zeros(())).mean().detach()),
-                                      "reason_bound_ratio": float(output["reason_delta_to_budget_max"].detach()) if args.mode == "pact" else 0.0}, sort_keys=True), flush=True)
+                                      "reason_bound_ratio": float(output["reason_delta_to_budget_max"].detach()) if args.mode == "pact" else 0.0,
+                                      "reason_bound_mean": float(output["reason_delta_to_budget_mean"].detach()) if args.mode == "pact" else 0.0,
+                                      "reason_saturation_rate": float(output["reason_delta_saturation_rate"].detach()) if args.mode == "pact" else 0.0}, sort_keys=True), flush=True)
         if micro:
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["training"]["global_grad_clip"]); optimizer.step(); optimizer.zero_grad(set_to_none=True); update += 1
         epoch_dir = out_dir / f"epoch_{epoch:03d}"
@@ -474,7 +479,8 @@ def main() -> None:
             "named_coverage": float(np.mean(epoch_named)), "unnamed_visual_rate": 1.0 - float(np.mean(epoch_named))})
         reason_coverage = dict(epoch_reason_coverage or {})
         reason_coverage.update({"reason_delta_to_budget_max": max(epoch_reason_bound),
-                                "reason_delta_to_budget_mean": float(np.mean(epoch_reason_bound))})
+                                "reason_delta_to_budget_mean": float(np.mean(epoch_reason_bound_mean)),
+                                "reason_delta_saturation_rate": float(np.mean(epoch_reason_saturation))})
         write_json(epoch_dir / "reason_rank_coverage.json", reason_coverage)
         action_rank = {key: value for key, value in latest_stats.items()
                        if key in ("primary_correct_pair_count", "final_preserved_pair_rate", "primary_wrong_pair_repair_rate", "new_pair_inversion_rate")}
