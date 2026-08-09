@@ -59,11 +59,36 @@ def _json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def validate_external_bindings(audit_path: str | Path, selected_path: str | Path, git_head: str,
+                               config_hash: str, checkpoint_hash: str) -> tuple[dict, dict]:
+    audit = _json(Path(audit_path))
+    selected = _json(Path(selected_path))
+    errors = []
+    if not audit.get("pass", False):
+        errors.append("implementation audit did not pass")
+    if audit.get("git_head") != git_head:
+        errors.append("implementation audit git_head mismatch")
+    if audit.get("config_hash") != config_hash:
+        errors.append("implementation audit config_hash mismatch")
+    if audit.get("checkpoint_hash") != checkpoint_hash:
+        errors.append("implementation audit checkpoint_hash mismatch")
+    if not selected:
+        errors.append("selected hyperparameters are empty")
+    if errors:
+        raise RuntimeError("; ".join(errors))
+    return audit, selected
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(); parser.add_argument("--control-dir", required=True); parser.add_argument("--method-dir", required=True)
     parser.add_argument("--output-dir", required=True); parser.add_argument("--resamples", type=int, default=2000); parser.add_argument("--seed", type=int, default=20260809)
     parser.add_argument("--config", required=True); parser.add_argument("--source-checkpoint", required=True)
+    parser.add_argument("--implementation-audit", required=True); parser.add_argument("--selected-hparams", required=True)
     args = parser.parse_args(); out = Path(args.output_dir); out.mkdir(parents=True, exist_ok=True)
+    git_head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    config_hash, checkpoint_hash = sha256(args.config), sha256(args.source_checkpoint)
+    audit, selected_hparams = validate_external_bindings(
+        args.implementation_audit, args.selected_hparams, git_head, config_hash, checkpoint_hash)
     decisions = []
     for epoch in range(3):
         control = _load_epoch(args.control_dir, epoch)
@@ -126,7 +151,6 @@ def main() -> None:
         "counterfactual_lcb_positive": all(row["cf"].get("selected_minus_control_bootstrap_lcb", float("-inf")) > 0 for row in mechanism_rows),
         "naming_coverage": all(row["predicate"]["named_coverage"] > 0 for row in mechanism_rows),
     }
-    audit = _json(out / "implementation_audit.json")
     layers = {"code_and_numerics": bool(audit["pass"]) and not missing_artifacts,
               "paired_pareto_two_consecutive": two_consecutive, "old_pareto_line": old_line,
               "mechanism": all(mechanism.values())}
@@ -134,9 +158,9 @@ def main() -> None:
     method_manifest = _json(Path(args.method_dir) / "run_manifest.json")
     gate = {"pass": passed, "layers": layers, "pareto_epoch_pass": pareto_epoch_pass, "mechanism": mechanism,
             "missing_artifacts": missing_artifacts, "source_head": method_manifest["source_head"],
-            "probe_head": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
-            "config_hash": sha256(args.config), "checkpoint_hash": sha256(args.source_checkpoint),
-            "split_hash": method_manifest["split_hash"], "selected_hyperparameters": _json(out / "selected_probe_hparams.json"),
+            "probe_head": git_head,
+            "config_hash": config_hash, "checkpoint_hash": checkpoint_hash,
+            "split_hash": method_manifest["split_hash"], "selected_hyperparameters": selected_hparams,
             "control_output_hash": _output_hash(args.control_dir), "pact_output_hash": _output_hash(args.method_dir),
             "paired_results": decisions}
     write_json(out / "probe_gate.json", gate)
