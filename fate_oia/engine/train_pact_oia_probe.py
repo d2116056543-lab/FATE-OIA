@@ -119,6 +119,21 @@ def _reason_rank_loss(logits: Tensor, targets: Tensor, queue: PACTBalancedPairQu
     return (torch.stack(losses).mean() if losses else logits.sum() * 0), stats
 
 
+def accumulate_reason_coverage(aggregate: dict | None, current: dict) -> dict:
+    """Accumulate real per-label training coverage without extending stale queue entries."""
+    if aggregate is None:
+        aggregate = {
+            "positive_count": [0] * len(current["positive_count"]),
+            "negative_count": [0] * len(current["negative_count"]),
+            "pair_count": [0] * len(current["pair_count"]),
+        }
+    for key in ("positive_count", "negative_count", "pair_count"):
+        aggregate[key] = [max(int(old), int(new)) for old, new in zip(aggregate[key], current[key])]
+    aggregate["labels_with_pairs"] = sum(value > 0 for value in aggregate["pair_count"])
+    aggregate["latest_labels_with_pairs"] = int(current["labels_with_pairs"])
+    return aggregate
+
+
 def compute_losses(output: dict, batch: dict, structured: dict, cfg: dict,
                    queue: PACTBalancedPairQueue, update: int, cf: dict | None = None,
                    cf_accumulation_compensation: float = 1.0) -> tuple[Tensor, list[dict], dict]:
@@ -195,14 +210,16 @@ def pareto_controller_step(model: PACTOIAModel, controller: PACTParetoController
     with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
         audit_images = audit_batch["image"].to(device, non_blocking=True)
         audit_target = audit_batch["action"].to(device, non_blocking=True)
+        audit_reason_target = audit_batch["reason"].to(device, non_blocking=True)
         field = model.encode_images(audit_images)
         raw = field["patch_tokens_by_layer"]
         patch0, _, masks, _ = model.ego(raw[:, 0])
         audit_patch = raw.clone(); audit_patch[:, 0] = patch0
-        audit_predicate = model.predicate_head(audit_patch, region_masks=masks)["predicate_tokens"]
+        audit_predicate_output = model.predicate_head(audit_patch, region_masks=masks)
+        audit_predicate = audit_predicate_output["predicate_tokens"]
     meta_step = float(cfg["pareto"]["meta_step"])
 
-    def evaluator(candidate: float) -> float:
+    def evaluator(candidate: float) -> dict[str, float]:
         candidate_parameters = {
             name: parameter - meta_step * (ga + float(candidate) * gs)
             for (name, parameter), ga, gs in zip(shared_parameters.items(), action_grad, semantic_grad)
@@ -210,7 +227,15 @@ def pareto_controller_step(model: PACTOIAModel, controller: PACTParetoController
         with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
             shared = functional_call(model.shared_readout, candidate_parameters, (audit_patch,))
             action = model.context_decoder(shared["shared_label_nodes"], audit_predicate)["action_logits_primary"]
-            return float(asymmetric_loss_with_logits(action, audit_target))
+            explanation = model.explanation_decoder(shared["shared_label_nodes"], audit_predicate)
+            reason_route = model.predicate_reason(
+                explanation["reason_nodes_formal"], audit_predicate_output["predicate_probs"], audit_predicate)
+            reason_logits = explanation["reason_logits_visual_formal"] + reason_route["predicate_reason_delta"]
+            return {
+                "action_loss": float(asymmetric_loss_with_logits(action, audit_target)),
+                "semantic_loss": float(acpr_losses.partial_label_reason_loss(
+                    reason_logits, audit_reason_target, reason_route["contradiction_score"])),
+            }
 
     result = controller.evaluate_candidates(evaluator, model)
     flat_a = torch.cat([value.flatten() for value in action_grad])
@@ -316,7 +341,11 @@ def main() -> None:
     seed = int(cfg["data"]["split_seed"]); random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
     device = torch.device(args.device); torch.set_float32_matmul_precision("high")
     model = build_model(cfg, device); source = load_source(model, args.source_checkpoint)
-    controller = PACTParetoController(cfg["pareto"]["candidates"], cfg["pareto"]["epsilon_action_audit"], cfg["pareto"]["license_ema"]).to(device)
+    controller = PACTParetoController(
+        cfg["pareto"]["candidates"], cfg["pareto"]["epsilon_action_audit"], cfg["pareto"]["license_ema"],
+        action_best_tolerance=cfg["pareto"]["action_best_tolerance"],
+        semantic_improvement_min=cfg["pareto"]["semantic_improvement_min"],
+    ).to(device)
     optimizer = build_optimizer(model, cfg); queue = PACTBalancedPairQueue(21, cfg["reason"]["queue_capacity"], cfg["reason"]["queue_capacity"], cfg["reason"]["queue_max_age_updates"])
     full_train, full_test = make_dataset(cfg, "train"), make_dataset(cfg, "test")
     all_names = [sample.file_name for sample in full_train.samples]
@@ -366,6 +395,7 @@ def main() -> None:
     audit_iterator = iter(audit_loader)
     for epoch in range(start_epoch, epochs):
         model.train(); optimizer.zero_grad(set_to_none=True); micro = 0; start = time.perf_counter(); latest_stats = {}
+        epoch_reason_coverage = None
         epoch_cf_cases = []; epoch_agreement = []; epoch_gate = []; epoch_named = []
         epoch_reason_bound = []; epoch_action_delta = []; epoch_contribution = []
         first_audit_batch = None; last_controller_result = None
@@ -391,6 +421,7 @@ def main() -> None:
                 loss, rows, latest_stats = compute_losses(
                     output, batch, structured, cfg, queue, update, cf,
                     cf_accumulation_compensation=accumulation if use_cf else 1.0)
+            epoch_reason_coverage = accumulate_reason_coverage(epoch_reason_coverage, latest_stats)
             if cf:
                 epoch_cf_cases.extend(cf["cases"])
             epoch_agreement.append(float(output["predicate_visual_agreement"].mean().detach()))
@@ -441,7 +472,7 @@ def main() -> None:
             "agreement_p10": float(np.percentile(epoch_agreement, 10)), "agreement_p90": float(np.percentile(epoch_agreement, 90)),
             "gate_p10": float(np.percentile(epoch_gate, 10)), "gate_p90": float(np.percentile(epoch_gate, 90)),
             "named_coverage": float(np.mean(epoch_named)), "unnamed_visual_rate": 1.0 - float(np.mean(epoch_named))})
-        reason_coverage = {key: value for key, value in latest_stats.items() if isinstance(value, (int, list))}
+        reason_coverage = dict(epoch_reason_coverage or {})
         reason_coverage.update({"reason_delta_to_budget_max": max(epoch_reason_bound),
                                 "reason_delta_to_budget_mean": float(np.mean(epoch_reason_bound))})
         write_json(epoch_dir / "reason_rank_coverage.json", reason_coverage)

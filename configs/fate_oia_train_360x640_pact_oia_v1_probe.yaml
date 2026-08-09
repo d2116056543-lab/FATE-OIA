@@ -63,6 +63,8 @@ pareto:
   candidates: [0.0, 0.25, 0.50, 0.75]
   meta_step: 0.0001
   epsilon_action_audit: 0.001
+  action_best_tolerance: 0.00005
+  semantic_improvement_min: 0.0
   license_ema: 0.80
 training:
   epochs: 3
