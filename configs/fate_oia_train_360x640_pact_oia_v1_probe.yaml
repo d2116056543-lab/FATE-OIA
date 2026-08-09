@@ -83,7 +83,7 @@ training:
   min_lr_ratio: 0.20
   global_grad_clip: 1.0
   primary_grad_cap: 0.25
-  print_every_optimizer_updates: 100
+  print_every_optimizer_updates: 20
 loss_weights:
   primary_action: 1.00
   primary_action_visual: 0.05
@@ -108,6 +108,7 @@ loss_weights:
   probe_duplicate: 0.005
   action_delta: 0.003
 runtime:
+  cpu_threads: 4
   test_only: true
   no_feature_cache: true
   require_no_token_compression: true

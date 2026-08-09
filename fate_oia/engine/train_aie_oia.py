@@ -479,6 +479,8 @@ def main() -> None:
     parser.add_argument("--use-mock-dino", action="store_true")
     args = parser.parse_args()
     cfg = load_config(args.config); cfg["counter_evidence"] = load_config("configs/aie_reason_counter_evidence.yaml"); output_dir = Path(args.output_dir); output_dir.mkdir(parents=True, exist_ok=True)
+    torch.set_num_threads(int(cfg.get("runtime", {}).get("cpu_threads", 4)))
+    torch.set_num_interop_threads(1)
     device = torch.device(args.device); torch.set_float32_matmul_precision("high")
     training, data_cfg = cfg["training"], cfg["data"]
     seed = int(data_cfg["split_seed"])
@@ -583,7 +585,9 @@ def main() -> None:
         for micro_step, batch in enumerate(train_loader, 1):
             batch_ready = time.perf_counter(); data_time = batch_ready - iteration_end
             batch = {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v) for k, v in batch.items()}
+            structured_start = time.perf_counter()
             structured = structured_builder.build(batch["file_name"], device=device)
+            structured_time = time.perf_counter() - structured_start
             for key, value in structured["coverage"].items():
                 if isinstance(value, (int, float)): epoch_coverage[key] += float(value)
             schedule = schedule_values(optimizer_update, total_updates, cfg)
@@ -690,15 +694,16 @@ def main() -> None:
                         "data_time": data_time, "dino_time": dino_time,
                         "primary_time": output.get("_profile_primary_time"), "evidence_global_time": output.get("_profile_evidence_global_time"),
                         "evidence_local_time": output.get("_profile_evidence_local_time"), "reason_reread_time": output.get("_profile_reason_reread_time"),
+                        "structured_time": structured_time,
                         "counterfactual_time": counterfactual_time, "backward_time": backward_time,
-                        "step_time": dino_time + output.get("_profile_primary_time", 0.0) + output.get("_profile_evidence_global_time", 0.0) + output.get("_profile_evidence_local_time", 0.0) + output.get("_profile_reason_reread_time", 0.0) + counterfactual_time + backward_time,
+                        "step_time": structured_time + dino_time + output.get("_profile_primary_time", 0.0) + output.get("_profile_evidence_global_time", 0.0) + output.get("_profile_evidence_local_time", 0.0) + output.get("_profile_reason_reread_time", 0.0) + counterfactual_time + backward_time,
                         "allocated_gb": torch.cuda.memory_allocated()/2**30 if torch.cuda.is_available() else 0, "reserved_gb": torch.cuda.memory_reserved()/2**30 if torch.cuda.is_available() else 0,
                         "max_reserved_gb": torch.cuda.max_memory_reserved()/2**30 if torch.cuda.is_available() else 0,
                         "dino_calls_ordinary_batch": 1, "dino_calls_cf_event": 0}
                     payload["loss_name"] = payload.pop("loss_naming")
                     print(json.dumps(json_safe(payload)), flush=True)
                     append_jsonl(output_dir / "loss_components.jsonl", payload); append_jsonl(output_dir / "owner_gradients.jsonl", {"epoch": epoch, "optimizer_update": optimizer_update, **grad_before})
-                    append_jsonl(output_dir / "runtime_components.jsonl", {k: payload[k] for k in ("epoch", "optimizer_update", "data_time", "dino_time", "primary_time", "evidence_global_time", "evidence_local_time", "reason_reread_time", "counterfactual_time", "backward_time", "step_time", "allocated_gb", "reserved_gb", "max_reserved_gb", "dino_calls_ordinary_batch", "dino_calls_cf_event")})
+                    append_jsonl(output_dir / "runtime_components.jsonl", {k: payload[k] for k in ("epoch", "optimizer_update", "data_time", "structured_time", "dino_time", "primary_time", "evidence_global_time", "evidence_local_time", "reason_reread_time", "counterfactual_time", "backward_time", "step_time", "allocated_gb", "reserved_gb", "max_reserved_gb", "dino_calls_ordinary_batch", "dino_calls_cf_event")})
                     append_jsonl(output_dir / "evidence_components.jsonl", {"epoch": epoch, "optimizer_update": optimizer_update, **health, "named_coverage": payload["named_coverage"], "cf_valid_count": payload["cf_valid_count"]})
             iteration_end = time.perf_counter()
         epoch_dir = output_dir / f"epoch_{epoch:03d}"; epoch_dir.mkdir(parents=True, exist_ok=True)

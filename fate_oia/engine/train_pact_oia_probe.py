@@ -306,6 +306,8 @@ def main() -> None:
     parser.add_argument("--max-train-samples", type=int); parser.add_argument("--max-calib-samples", type=int); parser.add_argument("--max-test-samples", type=int)
     parser.add_argument("--device", default="cuda"); parser.add_argument("--resume")
     args = parser.parse_args(); cfg = load_config(args.config); out_dir = Path(args.output_dir); out_dir.mkdir(parents=True, exist_ok=True)
+    torch.set_num_threads(int(cfg.get("runtime", {}).get("cpu_threads", 4)))
+    torch.set_num_interop_threads(1)
     if cfg["experiment"]["feature_cache_enabled"] or cfg["experiment"]["token_compression"] != "none":
         raise RuntimeError("PACT probe forbids feature cache and token compression")
     seed = int(cfg["data"]["split_seed"]); random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
@@ -366,7 +368,9 @@ def main() -> None:
         first_audit_batch = None; last_controller_result = None
         for batch in train_loader:
             batch = {key: value.to(device, non_blocking=True) if torch.is_tensor(value) else value for key, value in batch.items()}
+            structured_start = time.perf_counter()
             structured = structured_builder.build(batch["file_name"], device=device)
+            structured_time = time.perf_counter() - structured_start
             if first_audit_batch is None:
                 first_audit_batch = {key: (value.detach().cpu() if torch.is_tensor(value) else value) for key, value in batch.items()}
             license_value = 0.0 if args.mode == "control" else float(controller.semantic_share_license)
@@ -411,10 +415,11 @@ def main() -> None:
                     last_controller_result = controller_result
                     append_jsonl(out_dir / "pareto_license_stats.jsonl", controller_result)
                 append_jsonl(out_dir / "loss_components.jsonl", {"epoch": epoch, "optimizer_update": update,
-                             "total_loss": float(loss.detach()), "terms": rows})
+                             "total_loss": float(loss.detach()), "structured_time": structured_time, "terms": rows})
                 if update == 1 or update % int(cfg["training"]["print_every_optimizer_updates"]) == 0:
                     print(json.dumps({"pact_batch": True, "mode": args.mode, "epoch": epoch, "update": update,
-                                      "loss": float(loss.detach()), "license": license_value,
+                                      "loss": float(loss.detach()), "structured_time": structured_time,
+                                      "license": license_value,
                                       "reason_labels_with_pairs": latest_stats["labels_with_pairs"],
                                       "agreement": float(output.get("predicate_visual_agreement", torch.zeros(())).mean().detach()),
                                       "reason_bound_ratio": float(output["reason_delta_to_budget_max"].detach()) if args.mode == "pact" else 0.0}, sort_keys=True), flush=True)

@@ -119,10 +119,11 @@ calibration:
   group_shrinkage_support: 50
   test_oracle_writeback: false
 runtime:
+  cpu_threads: 4
   no_feature_cache: true
   require_no_token_compression: true
   test_every_epoch: true
   save_every_epoch: true
   fixed_test_audit_samples: 128
-  print_every_optimizer_updates: 100
+  print_every_optimizer_updates: 20
   max_reserved_memory_gb: 45.0
