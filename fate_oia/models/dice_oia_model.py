@@ -54,7 +54,7 @@ class DICEOIAModel(nn.Module):
             base["evidence_token"], conditioned_patch_layers, base["predicate_attention"],
             base["predicate_probs"], base["ego_region_masks"])
         direction = self.directional_head(
-            atoms["centered_token"], base["action_logits_final"].detach(),
+            atoms["centered_token"], base["action_logits_base"].detach(),
             base["bounded_contribution"].detach(), evidence_map=atoms["coherent_map"],
             agreement=atoms["predicate_agreement"], confidence=atoms["predicate_confidence"])
         return {**atoms, **direction, "dino_calls_cf_event": 0}

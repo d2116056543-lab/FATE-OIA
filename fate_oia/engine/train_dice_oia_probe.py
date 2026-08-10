@@ -166,7 +166,7 @@ def main():
         float(cfg["counterfactual"]["batch_fraction"]),int(cfg["counterfactual"].get("topk_patches",64)))
     full_train,full_test=make_dataset(cfg,"train"),make_dataset(cfg,"test"); names=[s.file_name for s in full_train.samples]
     split=stable_split_ids(names,seed,float(cfg["data"]["train_calib_fraction"]),int(cfg["data"]["train_audit_count"])); index={s.file_name:i for i,s in enumerate(full_train.samples)}
-    train_ids=list(range(len(full_train))); random.Random(seed).shuffle(train_ids); train_ids=train_ids[:args.max_train_samples or None]
+    train_ids=[index[n] for n in split["train_main"][:args.max_train_samples or None]]
     calib_ids=[index[n] for n in split["train_calib"][:args.max_calib_samples or None]]; test_ids=list(range(len(full_test)))[:args.max_test_samples or None]
     batch=args.batch_size or int(cfg["data"]["batch_size"]); workers=args.num_workers if args.num_workers is not None else int(cfg["data"]["num_workers"])
     gen=torch.Generator().manual_seed(seed); train_loader=make_loader(Subset(full_train,train_ids),batch,True,workers,cfg,gen)
@@ -176,8 +176,8 @@ def main():
     manifest={"git_head":subprocess.check_output(["git","rev-parse","HEAD"],text=True).strip(),"source_head":cfg["experiment"]["source_head"],
               "base_checkpoint":str(Path(args.base_checkpoint).resolve()),"base_checkpoint_hash":sha256(args.base_checkpoint),"base_hash":base_hash,
               "config_hash":sha256(args.config),"split_hash":sha256(split_path),"train_samples":len(train_ids),"calib_samples":len(calib_ids),
-              "audit_samples":len(split["train_audit"]),"train_calib_overlap":len(calib_ids),
-              "train_audit_overlap":len(split["train_audit"]),"test_samples":len(test_ids),
+              "audit_samples":len(split["train_audit"]),"train_calib_overlap":0,
+              "train_audit_overlap":0,"test_samples":len(test_ids),
               "batch_size":batch,"gradient_accumulation_steps":accumulation,"num_workers":workers,"feature_cache_enabled":False,"token_compression":"none","best_selection_split":"test"}
     write_json(out_dir/"run_manifest.json",manifest)
     updates_per_epoch=math.ceil(len(train_loader)/accumulation); scheduler=make_scheduler(

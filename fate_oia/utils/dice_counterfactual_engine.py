@@ -7,6 +7,11 @@ from fate_oia.utils.aie_counterfactual import matched_control_mask
 from .dice_counterfactual import choose_round_robin_atoms, directional_certificate, hard_region_topk
 
 
+def counterfactual_logit_drop(original_delta: Tensor, modified_delta: Tensor, target_sign: Tensor) -> Tensor:
+    """Measure only the intervention-induced delta change; the frozen base cancels exactly."""
+    return target_sign * (original_delta - modified_delta)
+
+
 class DICECounterfactualEngine:
     def __init__(self, temperature: float = .05, max_actions_per_sample: int = 2,
                  batch_fraction: float = .50, topk_patches: int = 64) -> None:
@@ -23,7 +28,7 @@ class DICECounterfactualEngine:
         selected_drop, controls, atom_index = [], [], []
         for sample, action, probe in events:
             signed = 2 * action_target[sample, action] - 1
-            original = signed * output["action_logits_final"][sample, action]
+            original_delta = output["dice_action_delta"][sample, action]
             field = output["conditioned_patch_layers"][sample:sample+1].detach()
             probability = output["coherent_map"][sample, action, probe].detach()
             region_id = int(output["background_region_id"][sample, action, probe])
@@ -54,7 +59,8 @@ class DICECounterfactualEngine:
                 bg_weight = bg_weight / bg_weight.sum().clamp_min(1e-8)
                 background = torch.einsum("n,lnd->d", bg_weight, field[0]).detach() / field.shape[1]
                 rerun = model.rerun_dice_from_conditioned(output, self._replace(field, mask, background))
-                drops.append(original - signed * rerun["dice_action_logits"][0, action])
+                modified_delta = rerun["dice_action_delta"][0, action]
+                drops.append(counterfactual_logit_drop(original_delta, modified_delta, signed))
             selected_drop.append(drops[0]); controls.append(torch.stack(drops[1:])); atom_index.append((sample, action, probe))
         if not selected_drop:
             zero = output["action_logits_final"].sum() * 0

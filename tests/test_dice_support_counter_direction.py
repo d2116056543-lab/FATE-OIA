@@ -19,10 +19,10 @@ def test_directional_effect_is_eventwise_not_cross_event():
     assert torch.equal(atom.grad,torch.zeros_like(atom))
 
 
-def test_negative_effect_is_audited_but_not_duplicated_as_harmful_correction():
+def test_negative_effect_is_retained_as_signed_counter_supervision():
     zero=directional_effect_loss(torch.tensor([0.]),torch.tensor([1.]),torch.tensor([-.4]))
-    harmful=directional_effect_loss(torch.tensor([-.4]),torch.tensor([1.]),torch.tensor([-.4]))
-    assert zero<harmful
+    matching_counter=directional_effect_loss(torch.tensor([-.4]),torch.tensor([1.]),torch.tensor([-.4]))
+    assert matching_counter<zero
 
 
 def test_target_relative_certificate_is_routed_to_raw_action_direction():

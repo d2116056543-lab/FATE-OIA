@@ -30,9 +30,7 @@ def directional_effect_loss(atom_correction: Tensor, action_target: Tensor, effe
     if atom_correction.shape != action_target.shape or effect.shape != atom_correction.shape:
         raise ValueError("directional effect tensors must be eventwise and shape-identical")
     signed = (2 * action_target - 1) * atom_correction
-    # A negative target-margin effect is retained as a counter-evidence audit,
-    # but must not be duplicated as a new correction that further harms ranking.
-    return F.smooth_l1_loss(signed, effect.detach().clamp_min(0))
+    return F.smooth_l1_loss(signed, effect.detach())
 
 
 def delta_regularizer(delta: Tensor) -> Tensor:

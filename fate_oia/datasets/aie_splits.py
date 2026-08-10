@@ -12,7 +12,11 @@ def stable_split_ids(ids: list[str], seed: int = 20260806, calib_fraction: float
     calib_count = max(1, int(round(len(ordered) * calib_fraction))) if ordered else 0
     audit_start = calib_count
     audit_end = min(audit_start + audit_count, len(ordered))
-    return {"train_calib": ordered[:calib_count], "train_audit": ordered[audit_start:audit_end]}
+    return {
+        "train_calib": ordered[:calib_count],
+        "train_audit": ordered[audit_start:audit_end],
+        "train_main": ordered[audit_end:],
+    }
 
 
 def ids_sha256(ids: list[str]) -> str:
@@ -29,6 +33,10 @@ def write_split_manifest(path: str | Path, train_ids: list[str], seed: int, cali
         "train_calib_sha256": ids_sha256(splits["train_calib"]),
         "train_audit_count": len(splits["train_audit"]),
         "train_audit_sha256": ids_sha256(splits["train_audit"]),
+        "train_main_count": len(splits["train_main"]),
+        "train_main_sha256": ids_sha256(splits["train_main"]),
+        "main_calib_overlap": len(set(splits["train_main"]) & set(splits["train_calib"])),
+        "main_audit_overlap": len(set(splits["train_main"]) & set(splits["train_audit"])),
         "calib_audit_overlap": len(set(splits["train_calib"]) & set(splits["train_audit"])),
         "internal_engineering_protocol": True,
     }
