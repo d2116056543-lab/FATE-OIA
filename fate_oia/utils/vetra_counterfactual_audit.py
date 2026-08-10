@@ -8,6 +8,13 @@ class VETRACounterfactualAudit:
     """Conditional factor replacement in projected VETRA value space; never reruns DINO."""
 
     @staticmethod
+    def _donor_distances(values: Tensor, selected: int, null_index: int) -> Tensor:
+        distance = torch.linalg.vector_norm(values - values[selected], dim=-1)
+        distance[selected] = torch.inf
+        distance[null_index] = torch.inf
+        return distance
+
+    @staticmethod
     def _rerun_role(model, context: Tensor, route: Tensor, values: Tensor, selected: int,
                     donor: int, role: str, action: int) -> Tensor:
         modified = context + route[selected] * (values[donor] - values[selected])
@@ -27,8 +34,7 @@ class VETRACounterfactualAudit:
                     route = output[f"{role}_route"][sample, action]
                     values = output[f"{role}_factor_values"][sample]
                     selected = int(route[:-1].argmax())
-                    norm = values.norm(dim=-1)
-                    distance = (norm - norm[selected]).abs(); distance[selected] = torch.inf; distance[-1] = torch.inf
+                    distance = self._donor_distances(values, selected, values.shape[0] - 1)
                     donors = distance.topk(k=min(2, max(distance.numel()-2, 1)), largest=False).indices
                     modified_scores = [self._rerun_role(model, output[f"{role}_context"][sample, action], route,
                                                         values, selected, int(donor), role, action) for donor in donors]

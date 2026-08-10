@@ -54,7 +54,7 @@ def _optimizer(model, cfg):
 
 @torch.no_grad()
 def collect(model, loader, device, alpha: float, audit_limit: int = 0):
-    model.eval(); keys=("base_action","final_action","reason","action_target","reason_target")
+    model.eval(); keys=("base_action","final_action","base_reason","final_reason","action_target","reason_target")
     store={key:[] for key in keys}; names=[]; routes=[]; ablations={}; seen=0
     variants = {"null_only":{"force_null_only":True}, "semantic_shuffle":{"semantic_shuffle":True},
                 "visual_shuffle":{"visual_shuffle":True}, "named_off":{"named_factors_off":True},
@@ -68,7 +68,8 @@ def collect(model, loader, device, alpha: float, audit_limit: int = 0):
             output=model.decode_base_output(base,alpha=alpha)
         assert_vetra_contract(output)
         mapping={"base_action":output["action_logits_base"],"final_action":output["action_logits_final"],
-                 "reason":output["reason_logits_final"],"action_target":batch["action"],"reason_target":batch["reason"]}
+                 "base_reason":output["reason_logits_base"],"final_reason":output["reason_logits_final"],
+                 "action_target":batch["action"],"reason_target":batch["reason"]}
         for key,value in mapping.items(): store[key].append(value.detach().cpu())
         names.extend(batch["file_name"]); routes.append(route_statistics(output))
         if seen < audit_limit:
@@ -92,23 +93,23 @@ def evaluate(model, calib_loader, test_loader, device, epoch_dir: Path, alpha: f
     calib,_,_=collect(model,calib_loader,device,alpha)
     test,routes,ablations=collect(model,test_loader,device,alpha,audit_limit=128)
     groups=[list(range(4)),list(range(4,25))]
-    base_threshold=fit_posthoc_thresholds(torch.cat((calib["base_action"],calib["reason"]),1),
+    base_threshold=fit_posthoc_thresholds(torch.cat((calib["base_action"],calib["base_reason"]),1),
         torch.cat((calib["action_target"],calib["reason_target"]),1),groups)["threshold_prob"]
-    final_threshold=fit_posthoc_thresholds(torch.cat((calib["final_action"],calib["reason"]),1),
+    final_threshold=fit_posthoc_thresholds(torch.cat((calib["final_action"],calib["final_reason"]),1),
         torch.cat((calib["action_target"],calib["reason_target"]),1),groups)["threshold_prob"]
-    base_raw=aie_branch_metrics(test["base_action"],test["reason"],test["action_target"],test["reason_target"])
-    final_raw=aie_branch_metrics(test["final_action"],test["reason"],test["action_target"],test["reason_target"])
+    base_raw=aie_branch_metrics(test["base_action"],test["base_reason"],test["action_target"],test["reason_target"])
+    final_raw=aie_branch_metrics(test["final_action"],test["final_reason"],test["action_target"],test["reason_target"])
     base_deploy=aie_branch_metrics(apply_posthoc_threshold(test["base_action"],base_threshold[:4]),
-        apply_posthoc_threshold(test["reason"],base_threshold[4:]),test["action_target"],test["reason_target"])
+        apply_posthoc_threshold(test["base_reason"],base_threshold[4:]),test["action_target"],test["reason_target"])
     final_deploy=aie_branch_metrics(apply_posthoc_threshold(test["final_action"],final_threshold[:4]),
-        apply_posthoc_threshold(test["reason"],final_threshold[4:]),test["action_target"],test["reason_target"])
+        apply_posthoc_threshold(test["final_reason"],final_threshold[4:]),test["action_target"],test["reason_target"])
     base_source_fixed=aie_branch_metrics(apply_posthoc_threshold(test["base_action"],source_threshold[:4]),
-        apply_posthoc_threshold(test["reason"],source_threshold[4:]),test["action_target"],test["reason_target"])
+        apply_posthoc_threshold(test["base_reason"],source_threshold[4:]),test["action_target"],test["reason_target"])
     final_source_fixed=aie_branch_metrics(apply_posthoc_threshold(test["final_action"],source_threshold[:4]),
-        apply_posthoc_threshold(test["reason"],source_threshold[4:]),test["action_target"],test["reason_target"])
+        apply_posthoc_threshold(test["final_reason"],source_threshold[4:]),test["action_target"],test["reason_target"])
     epoch_dir.mkdir(parents=True,exist_ok=True)
     for name,key in (("action_logits_base_test.pt","base_action"),("action_logits_vetra_test.pt","final_action"),
-                     ("reason_logits_base_test.pt","reason"),("reason_logits_vetra_test.pt","reason"),
+                     ("reason_logits_base_test.pt","base_reason"),("reason_logits_vetra_test.pt","final_reason"),
                      ("labels_action_test.pt","action_target"),("labels_reason_test.pt","reason_target")):
         torch.save(test[key],epoch_dir/name)
     write_json(epoch_dir/"file_names_test.json",test["file_name"])
@@ -119,7 +120,7 @@ def evaluate(model, calib_loader, test_loader, device, epoch_dir: Path, alpha: f
              "base_source_fixed":base_source_fixed,"vetra_source_fixed":final_source_fixed,
              "base_thresholds_train_calib":base_threshold.tolist(),"vetra_thresholds_train_calib":final_threshold.tolist(),
              "source_fixed_thresholds":source_threshold.tolist(),
-             "reason_identity_max_abs":float((test["reason"]-test["reason"]).abs().max()),"alpha":alpha}
+             "reason_identity_max_abs":float((test["base_reason"]-test["final_reason"]).abs().max()),"alpha":alpha}
     write_json(epoch_dir/"branch_metrics.json",payload); write_json(epoch_dir/"ablation_metrics.json",ablation_metrics)
     return payload,routes,ablation_metrics
 
