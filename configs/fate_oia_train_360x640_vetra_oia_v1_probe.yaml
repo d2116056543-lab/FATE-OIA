@@ -1,0 +1,107 @@
+experiment:
+  name: vetra_oia_v1_probe
+  source_branch: acpr_dice_oia_v1_probe_direct_image
+  source_head: 1b7138f75a37925e35f50444eec8eee62e20d375
+  direct_image: true
+  frozen_base: true
+  feature_cache_enabled: false
+  token_compression: none
+  eval_splits: [test]
+  best_selection_split: test
+  test_only_evaluation: true
+  internal_test_selected: true
+  publication_eligible: false
+  source_control_dir: 'E:\sbw\FATE_Drive\fate_oia_acpr_pact_oia_v1_probe_worktree\.background_runs\pact_oia_v1_probe_control\epoch_001'
+data:
+  data_root: 'E:\sbw\BDD-OIA\data'
+  raw_root: 'E:\sbw\BDD-OIA'
+  bdd100k_root: 'E:\sbw\BDD100K'
+  image_height: 360
+  image_width: 640
+  patch_size: 8
+  action_dim: 4
+  reason_dim: 21
+  split_seed: 20260810
+  train_main_count: 13450
+  train_calib_count: 1608
+  train_audit_count: 1024
+  require_disjoint_splits: true
+  batch_size: 6
+  gradient_accumulation_steps: 5
+  num_workers: 8
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+backbone:
+  arch: vit_small
+  patch_size: 8
+  selected_layers: [3, 7, 11]
+  pretrained_weights: ckp/reference/dino_deitsmall8_pretrain.pth
+  checkpoint_key: teacher
+  freeze_backbone: true
+  no_grad_backbone: true
+primary:
+  dim: 384
+  action_dim: 4
+  reason_dim: 21
+  scene_predicates: configs/aie_scene_predicates.yaml
+  reason_grammar: configs/acpr_reason_predicate_grammar.yaml
+evidence:
+  probes_per_action: 4
+  local_points_per_layer: 8
+  max_offset: 0.25
+  predicate_bias_max: 0.25
+  probe_chunk_size: 16
+  action_kappa: 3.0
+reason:
+  kappa: 4.0
+reason_private:
+  reason_kappa: 4.0
+vetra:
+  roles: [support, counter]
+  sparse_attention: entmax15
+  correction_cap: 0.20
+  initial_scale: 0.02
+  full_scale_ratio: 0.20
+  use_named_factors: true
+  use_unnamed_visual_factors: true
+  use_null_factor: true
+  predicate_confidence_floor: 0.35
+  map_concentration_floor: 0.10
+  null_max_reliable: 0.70
+  rank_preserve_ratio: 0.95
+  base_margin_floor: 0.10
+training:
+  epochs: 3
+  precision: bf16
+  optimizer: AdamW
+  lr_transport: 0.00010
+  lr_action_query: 0.00010
+  lr_semantic_key: 0.00008
+  lr_reliability: 0.00005
+  lr_correction_head: 0.00015
+  weight_decay: 0.03
+  warmup_ratio: 0.05
+  min_lr_ratio: 0.20
+  global_grad_clip: 1.0
+  action_logit_norm_cap: 20.0
+  print_every_optimizer_updates: 100
+loss_weights:
+  action_asl: 0.60
+  action_map: 0.20
+  base_rank_protect: 0.12
+  correction_bias_energy: 0.04
+  route_health: 0.04
+counterfactual:
+  training_weight: 0.0
+  audit_interval_epochs: 1
+  max_audit_samples: 512
+  conditional_donor_matching: true
+  rerun_dino: false
+runtime:
+  cpu_threads: 4
+  max_reserved_memory_gb: 44.5
+  dino_calls_per_batch: 1
+bootstrap:
+  resamples: 2000
+  seed: 20260810
