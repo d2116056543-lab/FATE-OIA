@@ -1,0 +1,98 @@
+experiment:
+  name: dice_oia_v1_probe
+  source_branch: acpr_pact_oia_v1_probe_direct_image
+  source_head: 8372dbb0bf0544ad0a3e3b741dc5d3abaab5a5cf
+  direct_image: true
+  feature_cache_enabled: false
+  token_compression: none
+  eval_splits: [test]
+  best_selection_split: test
+  frozen_base_checkpoint: true
+  internal_test_selected: true
+  publication_eligible: false
+data:
+  data_root: 'E:\sbw\BDD-OIA\data'
+  raw_root: 'E:\sbw\BDD-OIA'
+  bdd100k_root: 'E:\sbw\BDD100K'
+  image_height: 360
+  image_width: 640
+  patch_size: 8
+  action_dim: 4
+  reason_dim: 21
+  batch_size: 7
+  gradient_accumulation_steps: 4
+  num_workers: 8
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+  train_calib_fraction: 0.10
+  train_audit_count: 1024
+  seed: 20260810
+backbone:
+  selected_layers: [3, 7, 11]
+  pretrained_weights: ckp/reference/dino_deitsmall8_pretrain.pth
+  freeze_backbone: true
+  no_grad_backbone: true
+primary:
+  dim: 384
+  scene_predicates: configs/aie_scene_predicates.yaml
+  reason_grammar: configs/acpr_reason_predicate_grammar.yaml
+evidence:
+  probes_per_action: 4
+  local_points_per_layer: 8
+  max_offset: 0.25
+  predicate_bias_max: 0.25
+  probe_chunk_size: 16
+  action_kappa: 3.0
+  action_scale_start: 1.0
+  action_scale_ramp_ratio: 0.001
+  dominant_probe_max_ratio: 0.90
+reason:
+  kappa: 4.0
+reason_private:
+  action_prior_max: 0.75
+  predicate_prior_max: 0.75
+  reason_kappa: 4.0
+  reason_scale_start: 0.60
+  reason_scale_max: 0.60
+  reason_scale_ramp_ratio: 0.001
+  zero_negative_floor: 0.25
+dice:
+  topk_predicates: 2
+  predicate_strength_max: 0.20
+  predicate_presence_floor: 0.30
+  c_max_per_atom: 0.08
+  total_action_cap: 0.25
+  license_temperature: 0.05
+  rank_quantiles: 16
+  rank_margin: 0.05
+  rank_preserve_ratio: 0.95
+counterfactual:
+  interval_optimizer_updates: 4
+  batch_fraction: 0.50
+  topk_patches: 64
+  max_actions_per_sample: 2
+  controls: [same_region_1, same_region_2, wrong_probe_own_region, wrong_action_own_region]
+  rerun_dino: false
+training:
+  epochs: 2
+  precision: bf16
+  optimizer: AdamW
+  lr_atom_reconstructor: 0.0001
+  lr_directional_head: 0.00015
+  lr_license_predictor: 0.0001
+  weight_decay: 0.03
+  warmup_ratio: 0.05
+  min_lr_ratio: 0.20
+  global_grad_clip: 1.0
+  action_logit_norm_cap: 20.0
+  print_every_optimizer_updates: 100
+runtime:
+  cpu_threads: 4
+  test_only: true
+  no_feature_cache: true
+  require_no_token_compression: true
+  max_reserved_memory_gb: 44.5
+bootstrap:
+  resamples: 2000
+  seed: 20260810
