@@ -34,7 +34,8 @@ def main():
     if run(profile): raise SystemExit("DICE training memory profile failed")
     train=[sys.executable,"-u","-m","fate_oia.engine.train_dice_oia_probe","--config",a.config,"--base-checkpoint",a.base_checkpoint,"--output-dir",str(output),"--epochs",str(a.epochs),"--device",a.device]
     if run(train): raise SystemExit("DICE Phase B failed")
-    evaluate=[sys.executable,"-m","fate_oia.engine.evaluate_dice_oia_probe","--probe-dir",str(output),"--output-dir",str(output)]
+    evaluate=[sys.executable,"-m","fate_oia.engine.evaluate_dice_oia_probe","--probe-dir",str(output),"--output-dir",str(output),
+              "--control-epoch-dir",str(control_epoch)]
     code=run(evaluate); missing=validate_gate_artifacts(output)
     if missing: raise SystemExit(f"DICE strict artifacts missing: {missing}")
     raise SystemExit(code)
