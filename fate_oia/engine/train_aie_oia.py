@@ -417,6 +417,26 @@ def collect_logits(
     return {key: torch.cat(value) for key, value in store.items()}, names, audit
 
 
+def save_calibration_artifacts(epoch_dir: Path, calibration: dict[str, torch.Tensor], names: list[str]) -> None:
+    required = ("action_final", "reason_final", "action_target", "reason_target")
+    missing = [key for key in required if key not in calibration]
+    if missing:
+        raise KeyError(f"Missing calibration tensors: {missing}")
+    sample_count = calibration["action_final"].shape[0]
+    if len(names) != sample_count or any(calibration[key].shape[0] != sample_count for key in required):
+        raise ValueError("Calibration tensors and file names must be aligned")
+    torch.save(
+        {
+            "action_logits": calibration["action_final"].detach().cpu(),
+            "reason_logits": calibration["reason_final"].detach().cpu(),
+            "action_labels": calibration["action_target"].detach().cpu(),
+            "reason_labels": calibration["reason_target"].detach().cpu(),
+        },
+        epoch_dir / "train_calib_logits.pt",
+    )
+    write_json(epoch_dir / "file_names_train_calib.json", names)
+
+
 def evaluate_epoch(model, calib_loader, test_loader, device, epoch_dir: Path, action_scale: float, reason_scale: float, cfg):
     # DINO lazily exposes ``vproj = proj`` during its first attention
     # forward. Canonicalization removes that verified alias while retaining
@@ -426,7 +446,8 @@ def evaluate_epoch(model, calib_loader, test_loader, device, epoch_dir: Path, ac
     state_key_hashes_before = {
         key: state_dict_sha256({key: value}) for key, value in state_before_dict.items()
     }
-    calib, _, _ = collect_logits(model, calib_loader, device, action_scale, reason_scale)
+    calib, calib_names, _ = collect_logits(model, calib_loader, device, action_scale, reason_scale)
+    save_calibration_artifacts(epoch_dir, calib, calib_names)
     groups = [list(range(4)), list(range(4, 25))]
     thresholds = fit_posthoc_thresholds(
         torch.cat((calib["action_final"], calib["reason_final"]), 1),
