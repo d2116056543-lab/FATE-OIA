@@ -11,6 +11,7 @@ from .vetra_visual_factor_transport import VETRAVisualFactorTransport
 class VETRAOIAModel(nn.Module):
     def __init__(self, base_model: nn.Module, predicate_names: list[str], grammar_path: str,
                  dim: int = 384, num_layers: int = 3, correction_cap: float = .20,
+                 null_route_prior: float = .50,
                  base_forward_kwargs: dict[str, Any] | None = None) -> None:
         super().__init__()
         self.base_model = base_model
@@ -19,7 +20,8 @@ class VETRAOIAModel(nn.Module):
         self.base_model.eval()
         self.base_forward_kwargs = base_forward_kwargs or {"action_scale": 1.0, "reason_scale": .60}
         self.transport = VETRAVisualFactorTransport(
-            predicate_names, grammar_path, dim=dim, num_layers=num_layers, correction_cap=correction_cap)
+            predicate_names, grammar_path, dim=dim, num_layers=num_layers,
+            correction_cap=correction_cap, null_route_prior=null_route_prior)
 
     def train(self, mode: bool = True):
         super().train(mode)

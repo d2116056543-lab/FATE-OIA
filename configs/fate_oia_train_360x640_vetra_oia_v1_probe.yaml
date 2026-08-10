@@ -69,6 +69,7 @@ vetra:
   predicate_confidence_floor: 0.35
   map_concentration_floor: 0.10
   null_max_reliable: 0.70
+  null_route_prior: 0.50
   rank_preserve_ratio: 0.95
   base_margin_floor: 0.10
 training:

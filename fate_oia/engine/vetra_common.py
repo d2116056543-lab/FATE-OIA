@@ -35,6 +35,7 @@ def build_vetra_model(cfg: dict, checkpoint_path: str | Path, device: torch.devi
         base, base.foundation.predicate_head.names, str(cfg["primary"]["reason_grammar"]),
         dim=int(cfg["primary"]["dim"]), num_layers=len(cfg["backbone"]["selected_layers"]),
         correction_cap=float(cfg["vetra"]["correction_cap"]),
+        null_route_prior=float(cfg["vetra"]["null_route_prior"]),
         base_forward_kwargs={"action_scale": 1.0, "reason_scale": .60},
     )
     return model.to(device)

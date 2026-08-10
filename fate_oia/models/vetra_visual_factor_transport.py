@@ -14,10 +14,12 @@ class VETRAVisualFactorTransport(nn.Module):
     """Route semantic hypotheses while transporting visual values only."""
 
     def __init__(self, predicate_names: list[str], grammar_path: str, dim: int = 384,
-                 num_layers: int = 3, action_dim: int = 4, correction_cap: float = .20) -> None:
+                 num_layers: int = 3, action_dim: int = 4, correction_cap: float = .20,
+                 null_route_prior: float = .50) -> None:
         super().__init__()
         self.dim, self.num_layers, self.action_dim = dim, num_layers, action_dim
         self.correction_cap = float(correction_cap)
+        self.null_route_prior = float(null_route_prior)
         grammar = ACPRReasonGrammar(grammar_path)
         positive, contradictory = grammar.reason_predicate_matrix(predicate_names)
         compatibility = grammar.compatible_action_matrix()
@@ -126,7 +128,12 @@ class VETRAVisualFactorTransport(nn.Module):
         reliability = torch.cat((reliability[..., :-1], torch.ones_like(reliability[..., -1:])), dim=-1)
         if reliability_off:
             reliability = torch.ones_like(reliability)
-        score = score + reliability.clamp_min(1e-8).log()
+        # Reliability ranks visual factors; null receives an explicit prior instead of a free advantage.
+        non_null = reliability[..., :-1]
+        relative = non_null / non_null.amax(-1, keepdim=True).clamp_min(1e-8)
+        routing_reliability = torch.cat(
+            (relative, relative.new_full(relative.shape[:-1] + (1,), self.null_route_prior)), dim=-1)
+        score = score + routing_reliability.clamp_min(1e-8).log()
         score = score.masked_fill(~allowed[None], -1e4)
         if named_factors_off:
             score[..., :meta["named_count"]] = -1e4

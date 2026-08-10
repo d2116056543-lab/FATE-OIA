@@ -59,7 +59,12 @@ def finalize_probe(root: Path, cfg: dict) -> dict:
     threshold=torch.tensor(_load_json(epoch/"branch_metrics.json")["source_fixed_thresholds"])
     bootstrap=paired_bootstrap(base,final,reason,ay,ry,threshold,int(cfg["bootstrap"]["resamples"]),int(cfg["bootstrap"]["seed"]))
     ablation=_load_json(epoch/"ablation_metrics.json"); cf=_load_json(epoch/"counterfactual_audit.json")
-    route_rows=_load_json(epoch/"route_stats.json"); route={k:float(np.mean([r[k] for r in route_rows])) for k in route_rows[0]} if route_rows else {}
+    route_rows=_load_json(epoch/"route_stats.json")
+    route={}
+    if route_rows:
+        for key in route_rows[0]:
+            values=[row[key] for row in route_rows]
+            route[key]=np.mean(values,axis=0).tolist() if isinstance(values[0],list) else float(np.mean(values))
     current=best["metrics"]; raw=best["raw"]
     per_ap=np.asarray(raw["Act_per_label_ap"])-np.asarray(source["Act_per_label_ap"])
     reason_exact=abs(current["Exp_mF1"]-source["Exp_mF1"])<1e-9 and abs(current["Exp_mAP"]-source["Exp_mAP"])<1e-9
@@ -68,10 +73,20 @@ def finalize_probe(root: Path, cfg: dict) -> dict:
                "ablation":ablation,"counterfactual":cf}
     write_json(root/"VETRA_ABLATION_METRICS.json",ablation); write_json(root/"VETRA_COUNTERFACTUAL_AUDIT.json",cf)
     write_json(root/"VETRA_PAIRED_BOOTSTRAP.json",bootstrap); write_json(root/"VETRA_MECHANISM_SCREEN.json",mechanism)
-    go=(current["Act_mF1"]>=.729 and raw["Act_mAP"]>=source["Act_mAP"]-.0003
-        and current["Act_oF1"]>=source["Act_oF1"]-.0005 and reason_exact
-        and int((per_ap>=-.0015).sum())==4 and bootstrap["act_map_delta_ci95"][0]>=-.0005)
-    decision={"pass":bool(go),"best_epoch":best["epoch"],"best_source_fixed":current,"source_same_subset":source,
+    if len(ay) < 4572:
+        formal=ablation.get("formal",{}); semantic=ablation.get("semantic_shuffle",{}); visual=ablation.get("visual_shuffle",{})
+        go=(raw["Act_mAP"]>=source["Act_mAP"]-.0005 and route.get("support_non_null_action_count",0)>=3.99
+            and route.get("counter_non_null_action_count",0)>=3.99 and route.get("support_null_rate",1)<.70
+            and route.get("counter_null_rate",1)<.70 and abs(route.get("delta_mean",1))<route.get("delta_std",0)
+            and formal.get("Act_mAP",0)>=semantic.get("Act_mAP",1)
+            and (formal.get("Act_mAP",0)>=visual.get("Act_mAP",1) or formal.get("Act_mF1",0)>=visual.get("Act_mF1",1)))
+        decision_stage="512_mechanism_screen"
+    else:
+        go=(current["Act_mF1"]>=.729 and raw["Act_mAP"]>=source["Act_mAP"]-.0003
+            and current["Act_oF1"]>=source["Act_oF1"]-.0005 and reason_exact
+            and int((per_ap>=-.0015).sum())==4 and bootstrap["act_map_delta_ci95"][0]>=-.0005)
+        decision_stage="formal_full_test_probe"
+    decision={"pass":bool(go),"stage":decision_stage,"best_epoch":best["epoch"],"best_source_fixed":current,"source_same_subset":source,
               "source_full_reference":source_full,
               "bootstrap":bootstrap,"reason":"metrics_and_mechanism_pass" if go else "fast_probe_did_not_meet_safe_improvement"}
     pass_path=root/"VETRA_FAST_VALIDATION_PASS.json"; fail_path=root/"VETRA_FAST_VALIDATION_FAIL.json"
