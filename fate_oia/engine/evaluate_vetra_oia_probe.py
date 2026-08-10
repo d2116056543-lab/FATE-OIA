@@ -47,12 +47,13 @@ def paired_bootstrap(base_action, final_action, reason, action_target, reason_ta
 def finalize_probe(root: Path, cfg: dict) -> dict:
     epochs=sorted(root.glob("epoch_*"));
     if not epochs: raise RuntimeError("no VETRA epoch artifacts")
-    source=_load_json(Path(cfg["experiment"]["source_control_dir"])/"branch_metrics.json")["deploy"]
+    source_full=_load_json(Path(cfg["experiment"]["source_control_dir"])/"branch_metrics.json")["deploy"]
     rows=[]
     for epoch in epochs:
         metrics=_load_json(epoch/"branch_metrics.json"); current=metrics["vetra_source_fixed"]
         rows.append({"epoch":int(epoch.name.split("_")[-1]),"metrics":current,"raw":metrics["vetra_raw"],"own":metrics["vetra_deploy"]})
     best=max(rows,key=lambda row: row["metrics"]["Act_mF1"]); epoch=root/f"epoch_{best['epoch']:03d}"
+    best_payload=_load_json(epoch/"branch_metrics.json"); source=best_payload["base_source_fixed"]
     base=torch.load(epoch/"action_logits_base_test.pt",weights_only=True); final=torch.load(epoch/"action_logits_vetra_test.pt",weights_only=True)
     reason=torch.load(epoch/"reason_logits_vetra_test.pt",weights_only=True); ay=torch.load(epoch/"labels_action_test.pt",weights_only=True); ry=torch.load(epoch/"labels_reason_test.pt",weights_only=True)
     threshold=torch.tensor(_load_json(epoch/"branch_metrics.json")["source_fixed_thresholds"])
@@ -62,7 +63,7 @@ def finalize_probe(root: Path, cfg: dict) -> dict:
     current=best["metrics"]; raw=best["raw"]
     per_ap=np.asarray(raw["Act_per_label_ap"])-np.asarray(source["Act_per_label_ap"])
     reason_exact=abs(current["Exp_mF1"]-source["Exp_mF1"])<1e-9 and abs(current["Exp_mAP"]-source["Exp_mAP"])<1e-9
-    mechanism={"best_epoch":best["epoch"],"source":source,"best":current,"raw":raw,
+    mechanism={"best_epoch":best["epoch"],"source_same_subset":source,"source_full_reference":source_full,"best":current,"raw":raw,
                "per_action_ap_delta":per_ap.tolist(),"reason_exact":reason_exact,"route_mean":route,
                "ablation":ablation,"counterfactual":cf}
     write_json(root/"VETRA_ABLATION_METRICS.json",ablation); write_json(root/"VETRA_COUNTERFACTUAL_AUDIT.json",cf)
@@ -70,7 +71,8 @@ def finalize_probe(root: Path, cfg: dict) -> dict:
     go=(current["Act_mF1"]>=.729 and raw["Act_mAP"]>=source["Act_mAP"]-.0003
         and current["Act_oF1"]>=source["Act_oF1"]-.0005 and reason_exact
         and int((per_ap>=-.0015).sum())==4 and bootstrap["act_map_delta_ci95"][0]>=-.0005)
-    decision={"pass":bool(go),"best_epoch":best["epoch"],"best_source_fixed":current,"source":source,
+    decision={"pass":bool(go),"best_epoch":best["epoch"],"best_source_fixed":current,"source_same_subset":source,
+              "source_full_reference":source_full,
               "bootstrap":bootstrap,"reason":"metrics_and_mechanism_pass" if go else "fast_probe_did_not_meet_safe_improvement"}
     pass_path=root/"VETRA_FAST_VALIDATION_PASS.json"; fail_path=root/"VETRA_FAST_VALIDATION_FAIL.json"
     if go:

@@ -185,22 +185,24 @@ def main():
         state=torch.load(a.resume,map_location=device); model.load_state_dict(state["model"],strict=True); optimizer.load_state_dict(state["optimizer"])
         map_loss.load_state_dict(state["map_loss"]); scheduler.load_state_dict(state["scheduler"]); start_epoch=int(state["epoch"])+1; update=int(state["update"])
     for epoch in range(start_epoch,epochs):
-        model.train(); optimizer.zero_grad(set_to_none=True); micro_count=0; route_rows=[]; started=time.perf_counter()
+        model.train(); optimizer.zero_grad(set_to_none=True); window_outputs=[]; window_targets=[]; route_rows=[]; started=time.perf_counter()
         for micro,batch_data in enumerate(train_loader):
             alpha=alpha_schedule(update,total_updates,float(cfg["vetra"]["initial_scale"]),float(cfg["vetra"]["full_scale_ratio"]))
             images=batch_data["image"].to(device,non_blocking=True); action=batch_data["action"].to(device,non_blocking=True)
             with torch.autocast("cuda",dtype=torch.bfloat16,enabled=device.type=="cuda"):
                 with torch.no_grad(): base=model.base_model(images,**model.base_forward_kwargs)
                 output=model.decode_base_output(base,alpha=alpha); assert_vetra_contract(output)
-                total,components=total_vetra_loss(output,action,map_loss,cfg["loss_weights"],float(cfg["vetra"]["rank_preserve_ratio"]),
-                    float(cfg["vetra"]["base_margin_floor"]),float(cfg["vetra"]["null_max_reliable"]),float(cfg["vetra"]["predicate_confidence_floor"]))
-            total.backward(); micro_count+=1; route_rows.append(route_statistics(output))
+            window_outputs.append(output); window_targets.append(action); route_rows.append(route_statistics(output))
             will_step=(micro+1)%accum==0 or micro+1==len(train_loader)
             if will_step:
-                for parameter in model.transport.parameters():
-                    if parameter.grad is not None: parameter.grad.div_(micro_count)
+                keys=("action_logits_final","action_logits_base","vetra_action_delta","support_route","counter_route","support_reliability")
+                merged={key:torch.cat([row[key] for row in window_outputs],0) for key in keys}
+                total,components=total_vetra_loss(merged,torch.cat(window_targets,0),map_loss,cfg["loss_weights"],
+                    float(cfg["vetra"]["rank_preserve_ratio"]),float(cfg["vetra"]["base_margin_floor"]),
+                    float(cfg["vetra"]["null_max_reliable"]),float(cfg["vetra"]["predicate_confidence_floor"]))
+                total.backward()
                 grad=float(torch.nn.utils.clip_grad_norm_(model.transport.parameters(),float(cfg["training"]["global_grad_clip"])))
-                optimizer.step(); scheduler.step(); optimizer.zero_grad(set_to_none=True); update+=1; micro_count=0
+                optimizer.step(); scheduler.step(); optimizer.zero_grad(set_to_none=True); update+=1; window_outputs=[]; window_targets=[]
                 assert_base_frozen(model,base_hash,tensor_state_hash)
                 if update==1 or update%int(cfg["training"]["print_every_optimizer_updates"])==0:
                     row={"event":"vetra_batch","epoch":epoch,"update":update,"alpha":alpha,"loss_total":float(total.detach()),
