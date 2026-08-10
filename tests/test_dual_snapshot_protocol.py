@@ -33,3 +33,5 @@ def test_supervisor_locks_dual_snapshot_deploy_contract():
     assert '"--reason-shrinkage", "0"' in source
     assert "--init-model-checkpoint" in source
     assert "checkpoint_best_test_deploy_joint.pth" in source
+    assert '$ErrorActionPreference = "Continue"' in source
+    assert "$nativeExitCode = $LASTEXITCODE" in source

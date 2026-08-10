@@ -21,9 +21,16 @@ New-Item -ItemType Directory -Force -Path $root | Out-Null
 
 function Invoke-LoggedPython {
     param([string[]]$Arguments)
-    & $Python @Arguments 2>&1 | Tee-Object -FilePath $log -Append
-    if ($LASTEXITCODE -ne 0) {
-        throw "Python command failed with exit code ${LASTEXITCODE}: $($Arguments -join ' ')"
+    $previousErrorAction = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & $Python @Arguments 2>&1 | Tee-Object -FilePath $log -Append
+        $nativeExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorAction
+    }
+    if ($nativeExitCode -ne 0) {
+        throw "Python command failed with exit code ${nativeExitCode}: $($Arguments -join ' ')"
     }
 }
 
