@@ -2,6 +2,7 @@ param(
     [string]$Worktree = "E:\sbw\FATE_Drive\fate_oia_dual_snapshot_oia_v1_worktree",
     [string]$OutputRoot = ".background_runs\dual_snapshot_oia_v1_full",
     [string]$Python = "E:\Anaconda\envs\sbw39\python.exe",
+    [string]$TorchHome = "C:\Users\Lenovo\.cache\torch",
     [string]$Device = "cuda"
 )
 
@@ -9,6 +10,7 @@ $ErrorActionPreference = "Stop"
 Set-Location -LiteralPath $Worktree
 $env:PYTHONPATH = $Worktree
 $env:PYTHONUNBUFFERED = "1"
+$env:TORCH_HOME = $TorchHome
 $env:OMP_NUM_THREADS = "4"
 $env:MKL_NUM_THREADS = "4"
 

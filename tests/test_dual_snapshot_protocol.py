@@ -35,3 +35,4 @@ def test_supervisor_locks_dual_snapshot_deploy_contract():
     assert "checkpoint_best_test_deploy_joint.pth" in source
     assert '$ErrorActionPreference = "Continue"' in source
     assert "$nativeExitCode = $LASTEXITCODE" in source
+    assert '$env:TORCH_HOME = $TorchHome' in source
