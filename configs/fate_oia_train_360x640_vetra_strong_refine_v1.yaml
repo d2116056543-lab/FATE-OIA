@@ -43,24 +43,24 @@ reason_private:
   reason_scale: 0.60
 refiner:
   rank: 64
-  max_delta: 0.12
+  max_delta: 0.05
   gain_candidates: [0.0, 0.25, 0.5, 0.75, 1.0]
 training:
   epochs: 3
   batch_size: 6
   gradient_accumulation_steps: 5
-  lr: 0.00002
+  lr: 0.00001
   weight_decay: 0.01
   grad_clip: 1.0
   precision: bf16
   action_logit_norm_cap: 20.0
   print_every_updates: 100
 loss_weights:
-  action_asl: 1.0
-  action_pairwise_ap: 0.15
-  action_smooth_ap: 0.50
-  base_margin_trust: 0.30
-  residual_energy: 0.01
+  action_asl: 0.20
+  action_pairwise_ap: 0.30
+  action_smooth_ap: 1.00
+  base_margin_trust: 1.00
+  residual_energy: 0.50
 loss:
   gamma_pos: 0.0
   gamma_neg: 4.0
