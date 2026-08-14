@@ -1,0 +1,31 @@
+method: vetra_source_tta_combo_calibration
+source:
+  checkpoint: pact_oia_v1_probe_control/checkpoint_epoch_000.pth
+  frozen: true
+  direct_image: true
+  feature_cache_enabled: false
+  token_compression: none
+action:
+  horizontal_flip_tta: true
+  original_weight: 0.75
+  flip_weight: 0.25
+  flip_remap:
+    forward: forward
+    stop: stop
+    left: right
+    right: left
+  combo_calibrator:
+    classes: observed_action_subsets
+    regularization_c: 10.0
+    fit_split: train_calib_plus_train_audit
+    thresholds_fit: five_fold_train_oof
+    thresholds: [0.475, 0.425, 0.325, 0.335]
+reason:
+  original_image_only: true
+  thresholds_fit: train_calib_plus_train_audit
+  thresholds: [0.715, 0.655, 0.675, 0.700, 0.680, 0.470, 0.010, 0.680, 0.495, 0.240, 0.550, 0.390, 0.250, 0.550, 0.465, 0.625, 0.605, 0.620, 0.660, 0.600, 0.660]
+evaluation:
+  split: test
+  best_selection_split: test
+  test_labels_used_for_calibrator_fit: false
+  test_oracle_thresholds: diagnostic_only
