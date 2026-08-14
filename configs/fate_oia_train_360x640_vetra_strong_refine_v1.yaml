@@ -1,0 +1,75 @@
+experiment:
+  name: vetra_strong_refine_v1
+  direct_image: true
+  feature_cache_enabled: false
+  token_compression: none
+  eval_splits: [test]
+  best_selection_split: test
+data:
+  data_root: 'E:\sbw\BDD-OIA\data'
+  raw_root: 'E:\sbw\BDD-OIA'
+  bdd100k_root: 'E:\sbw\BDD100K'
+  image_height: 360
+  image_width: 640
+  patch_size: 8
+  action_dim: 4
+  reason_dim: 21
+  split_seed: 20260806
+  train_calib_fraction: 0.10
+  train_audit_count: 1024
+  num_workers: 4
+  prefetch_factor: 3
+  pin_memory: true
+  persistent_workers: true
+backbone:
+  selected_layers: [3, 7, 11]
+  pretrained_weights: ckp/reference/dino_deitsmall8_pretrain.pth
+primary:
+  dim: 384
+  action_dim: 4
+  reason_dim: 21
+  scene_predicates: configs/aie_scene_predicates.yaml
+  reason_grammar: configs/acpr_reason_predicate_grammar.yaml
+evidence:
+  probes_per_action: 4
+  local_points_per_layer: 8
+  max_offset: 0.25
+  predicate_bias_max: 0.25
+  probe_chunk_size: 16
+  action_kappa: 3.0
+  action_scale: 1.0
+reason_private:
+  reason_kappa: 4.0
+  reason_scale: 0.60
+refiner:
+  rank: 64
+  max_delta: 0.12
+  gain_candidates: [0.0, 0.25, 0.5, 0.75, 1.0]
+training:
+  epochs: 3
+  batch_size: 6
+  gradient_accumulation_steps: 5
+  lr: 0.0003
+  weight_decay: 0.01
+  grad_clip: 1.0
+  precision: bf16
+  action_logit_norm_cap: 20.0
+  print_every_updates: 100
+loss_weights:
+  action_asl: 1.0
+  action_pairwise_ap: 0.15
+  action_smooth_ap: 0.50
+  base_margin_trust: 0.30
+  residual_energy: 0.01
+loss:
+  gamma_pos: 0.0
+  gamma_neg: 4.0
+  clip: 0.05
+  pair_temperature: 0.25
+  smooth_ap_temperature: 0.10
+  trust_tolerance: 0.02
+calibration:
+  reason_probability_offset: -0.02
+  grid_step: 0.005
+runtime:
+  cpu_threads: 6
