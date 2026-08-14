@@ -27,7 +27,7 @@ from fate_oia.losses.vetra_strong_rank_losses import (
     base_margin_trust_loss,
     residual_energy_loss,
 )
-from fate_oia.models.vetra_strong_refiner import SelectiveVisualActionRankRefiner
+from fate_oia.models.vetra_strong_refiner import SelectiveActionPathRefiner
 from fate_oia.utils.acpr_threshold_search import search_best_thresholds_for_f1
 from fate_oia.utils.aie_calibration import apply_posthoc_threshold
 from fate_oia.utils.aie_metrics import aie_branch_metrics
@@ -80,11 +80,7 @@ def collect(base, refiner, loader, device, cfg, gain=None):
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
             output = base_forward(base, images, cfg)
             refined = refiner(
-                output["action_logits_final"],
-                output["reason_logits_final"],
-                output["action_nodes_primary"],
-                output["evidence_token"],
-                gain=gain,
+                output, action_scale=float(cfg["evidence"]["action_scale"]), gain=gain
             )
         mapping = {
             "base_action": output["action_logits_final"],
@@ -193,9 +189,9 @@ def main():
     torch.set_float32_matmul_precision("high")
     device = torch.device(args.device)
     base = load_base(cfg, args.source_checkpoint, device)
-    refiner = SelectiveVisualActionRankRefiner(
-        dim=int(cfg["primary"]["dim"]),
-        rank=int(cfg["refiner"]["rank"]),
+    refiner = SelectiveActionPathRefiner(
+        base.action_evidence,
+        base.action_contribution,
         action_dim=4,
         max_delta=float(cfg["refiner"]["max_delta"]),
     ).to(device)
@@ -242,8 +238,8 @@ def main():
                 base_output = base_forward(base, images, cfg)
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
                 refined = refiner(
-                    base_output["action_logits_final"], base_output["reason_logits_final"],
-                    base_output["action_nodes_primary"], base_output["evidence_token"],
+                    base_output,
+                    action_scale=float(cfg["evidence"]["action_scale"]),
                     gain=torch.ones(4, device=device),
                 )
             window.append((refined, target))

@@ -49,7 +49,7 @@ training:
   epochs: 3
   batch_size: 6
   gradient_accumulation_steps: 5
-  lr: 0.0003
+  lr: 0.00002
   weight_decay: 0.01
   grad_clip: 1.0
   precision: bf16
