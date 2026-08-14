@@ -208,12 +208,16 @@ def main():
     split = stable_split_ids(
         names, seed, float(cfg["data"]["train_calib_fraction"]), int(cfg["data"]["train_audit_count"])
     )
+    held_out = set(split["train_calib"]) | set(split["train_audit"])
+    train_main = [name for name in names if name not in held_out]
+    if held_out & set(train_main):
+        raise RuntimeError("train_main overlaps train calibration/audit splits")
     index = {sample.file_name: i for i, sample in enumerate(train.samples)}
     batch_size = args.batch_size or int(cfg["training"]["batch_size"])
     workers = args.num_workers if args.num_workers is not None else int(cfg["data"]["num_workers"])
     accumulation = args.gradient_accumulation_steps or int(cfg["training"]["gradient_accumulation_steps"])
     loaders = {
-        "train": make_loader(Subset(train, [index[n] for n in split["train_main"]]), batch_size, True, workers, cfg),
+        "train": make_loader(Subset(train, [index[n] for n in train_main]), batch_size, True, workers, cfg),
         "calib": make_loader(Subset(train, [index[n] for n in split["train_calib"]]), batch_size, False, workers, cfg),
         "audit": make_loader(Subset(train, [index[n] for n in split["train_audit"]]), batch_size, False, workers, cfg),
         "test": make_loader(test, batch_size, False, workers, cfg),
