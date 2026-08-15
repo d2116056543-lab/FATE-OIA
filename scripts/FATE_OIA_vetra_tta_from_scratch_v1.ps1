@@ -41,8 +41,12 @@ $manifest = [ordered]@{
 $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $root 'run_manifest.json') -Encoding UTF8
 
 function Invoke-LoggedPython([string[]]$Arguments) {
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
     & $python @Arguments 2>&1 | Tee-Object -FilePath $log -Append
-    if ($LASTEXITCODE -ne 0) { throw "Python command failed with exit code $LASTEXITCODE" }
+    $exitCode = $LASTEXITCODE
+    $ErrorActionPreference = $previousPreference
+    if ($exitCode -ne 0) { throw "Python command failed with exit code $exitCode" }
 }
 
 $stage1Goal = Join-Path $stage1 'GOAL_COMPLETED_AIE_OIA_V1.json'
