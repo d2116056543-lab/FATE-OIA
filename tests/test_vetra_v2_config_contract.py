@@ -16,4 +16,10 @@ def test_joint_and_refine_configs_enforce_training_contract():
         assert config["loss_weights"]["final_reason_dr"] > 0
         assert config["reason_dr"]["gamma_pair"] > config["reason_dr"]["gamma_negative"] > 0
         assert config["ema"]["enabled"] is True
+        assert config["runtime"]["fixed_test_audit_samples"] == 32
     assert refine["training"]["trainable_owners"] == ["reason_private"]
+
+
+def test_ema_evaluation_does_not_repeat_expensive_counterfactual_audit():
+    source = (Path(__file__).parents[1] / "fate_oia" / "engine" / "train_aie_oia.py").read_text()
+    assert 'schedule["action"], schedule["reason"], cfg, audit_limit=0' in source

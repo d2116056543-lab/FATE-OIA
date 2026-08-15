@@ -436,7 +436,17 @@ def collect_logits(
     return {key: torch.cat(value) for key, value in store.items()}, names, audit
 
 
-def evaluate_epoch(model, calib_loader, test_loader, device, epoch_dir: Path, action_scale: float, reason_scale: float, cfg):
+def evaluate_epoch(
+    model,
+    calib_loader,
+    test_loader,
+    device,
+    epoch_dir: Path,
+    action_scale: float,
+    reason_scale: float,
+    cfg,
+    audit_limit: int | None = None,
+):
     # DINO lazily exposes ``vproj = proj`` during its first attention
     # forward. Canonicalization removes that verified alias while retaining
     # every independently owned parameter for the mutation check.
@@ -452,8 +462,15 @@ def evaluate_epoch(model, calib_loader, test_loader, device, epoch_dir: Path, ac
         torch.cat((calib["action_target"], calib["reason_target"]), 1), groups,
         shrinkage_support=float(cfg["calibration"]["group_shrinkage_support"]), grid_step=float(cfg["calibration"]["grid_step"]),
     )
-    cf_cfg = AIECounterfactualConfig(**{k: cfg["counterfactual"][k] for k in AIECounterfactualConfig.__dataclass_fields__})
-    test, names, audit = collect_logits(model, test_loader, device, action_scale, reason_scale, int(cfg["runtime"]["fixed_test_audit_samples"]), AIECounterfactualEngine(cf_cfg))
+    if audit_limit is None:
+        audit_limit = int(cfg["runtime"]["fixed_test_audit_samples"])
+    cf_engine = None
+    if audit_limit > 0:
+        cf_cfg = AIECounterfactualConfig(**{k: cfg["counterfactual"][k] for k in AIECounterfactualConfig.__dataclass_fields__})
+        cf_engine = AIECounterfactualEngine(cf_cfg)
+    test, names, audit = collect_logits(
+        model, test_loader, device, action_scale, reason_scale, audit_limit, cf_engine,
+    )
     state_after_dict = canonical_model_state_dict(model.state_dict())
     if state_dict_sha256(state_after_dict) != state_before:
         changed_keys = [
@@ -746,7 +763,7 @@ def main() -> None:
             ema_dir = epoch_dir / "ema"; ema_dir.mkdir(parents=True, exist_ok=True)
             metrics["ema"] = evaluate_epoch(
                 ema_model, calib_loader, test_loader, device, ema_dir,
-                schedule["action"], schedule["reason"], cfg,
+                schedule["action"], schedule["reason"], cfg, audit_limit=0,
             )
         train_audit_logits, _, _ = collect_logits(model, audit_loader, device, schedule["action"], schedule["reason"])
         train_audit_metrics = aie_branch_metrics(

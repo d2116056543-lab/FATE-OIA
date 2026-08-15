@@ -132,6 +132,6 @@ runtime:
   require_no_token_compression: true
   test_every_epoch: true
   save_every_epoch: true
-  fixed_test_audit_samples: 128
+  fixed_test_audit_samples: 32
   print_every_optimizer_updates: 100
   max_reserved_memory_gb: 45.0
