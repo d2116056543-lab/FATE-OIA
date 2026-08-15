@@ -12,7 +12,11 @@ def stable_split_ids(ids: list[str], seed: int = 20260806, calib_fraction: float
     calib_count = max(1, int(round(len(ordered) * calib_fraction))) if ordered else 0
     audit_start = calib_count
     audit_end = min(audit_start + audit_count, len(ordered))
-    return {"train_calib": ordered[:calib_count], "train_audit": ordered[audit_start:audit_end]}
+    return {
+        "train_calib": ordered[:calib_count],
+        "train_audit": ordered[audit_start:audit_end],
+        "train_fit": ordered[audit_end:],
+    }
 
 
 def ids_sha256(ids: list[str]) -> str:
@@ -29,7 +33,11 @@ def write_split_manifest(path: str | Path, train_ids: list[str], seed: int, cali
         "train_calib_sha256": ids_sha256(splits["train_calib"]),
         "train_audit_count": len(splits["train_audit"]),
         "train_audit_sha256": ids_sha256(splits["train_audit"]),
+        "train_fit_count": len(splits["train_fit"]),
+        "train_fit_sha256": ids_sha256(splits["train_fit"]),
         "calib_audit_overlap": len(set(splits["train_calib"]) & set(splits["train_audit"])),
+        "fit_calib_overlap": len(set(splits["train_fit"]) & set(splits["train_calib"])),
+        "fit_audit_overlap": len(set(splits["train_fit"]) & set(splits["train_audit"])),
         "internal_engineering_protocol": True,
     }
     Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")

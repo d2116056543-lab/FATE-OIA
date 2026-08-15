@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 from collections import defaultdict
 import json
 import math
@@ -20,9 +21,10 @@ from fate_oia.datasets.aie_splits import stable_split_ids, write_split_manifest
 from fate_oia.datasets.aie_structured_evidence import AIEStructuredEvidenceBuilder
 from fate_oia.datasets.bdd_oia_multitask import BDDOIAMultiTaskDataset
 from fate_oia.losses import acpr_losses as base_losses
-from fate_oia.losses.aie_loss_registry import AIELossRegistry, exact_owner_parameter_groups
+from fate_oia.losses.aie_loss_registry import AIELossRegistry, exact_owner_parameter_groups, owner_trainability
 from fate_oia.losses.aie_losses import (
     action_cardinality_loss,
+    classwise_pu_dr_loss,
     contribution_effect_loss,
     counterfactual_necessity_loss,
     evidence_censored_reason_asl_loss,
@@ -46,6 +48,7 @@ from fate_oia.utils.aie_contracts import gradient_norm
 from fate_oia.utils.aie_counterfactual import AIECounterfactualConfig, AIECounterfactualEngine
 from fate_oia.utils.aie_hashes import aie_source_tree_sha256, file_sha256, object_sha256, state_dict_sha256
 from fate_oia.utils.aie_metrics import aie_branch_metrics, counterfactual_case_metrics, counterfactual_metrics, probe_health_metrics
+from fate_oia.utils.aie_ema import ModelEMA
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
@@ -130,14 +133,15 @@ def build_model(cfg: dict[str, Any], device: torch.device, use_mock_dino: bool =
 
 def build_optimizer(model: AIEOIAModel, cfg: dict[str, Any]) -> torch.optim.Optimizer:
     training = cfg["training"]
-    owned = exact_owner_parameter_groups(model)
+    requested = tuple(training.get("trainable_owners", ("primary", "action_evidence", "action_contribution", "reason_private")))
+    owned = owner_trainability(model, requested)
     lr_key = {
         "primary": "lr_primary", "action_evidence": "lr_action_evidence",
         "action_contribution": "lr_action_contribution", "reason_private": "lr_reason_private",
     }
     groups = [
         {"params": list(parameters), "lr": float(training[lr_key[owner]]), "base_lr": float(training[lr_key[owner]]), "name": owner}
-        for owner, parameters in owned.items()
+        for owner, parameters in owned.items() if parameters
     ]
     return torch.optim.AdamW(groups, weight_decay=float(training["weight_decay"]))
 
@@ -275,6 +279,21 @@ def compute_losses(
             reference_negative_weight=None if not reason_rank_memory else reason_rank_memory.get("negative_weight"),
         ),
     )
+    if "final_reason_dr" in cfg["loss_weights"]:
+        registry.add(
+            "final_reason_dr",
+            "reason_private",
+            classwise_pu_dr_loss(
+                output["reason_logits_final_train"],
+                reason,
+                reason_weights,
+                gamma_pair=float(cfg.get("reason_dr", {}).get("gamma_pair", 2.0)),
+                gamma_negative=float(cfg.get("reason_dr", {}).get("gamma_negative", 1.0)),
+                reference_logits=None if not reason_rank_memory else reason_rank_memory.get("logits"),
+                reference_target=None if not reason_rank_memory else reason_rank_memory.get("target"),
+                reference_negative_weight=None if not reason_rank_memory else reason_rank_memory.get("negative_weight"),
+            ),
+        )
     registry.add("final_reason_soft_f1", "reason_private", soft_f1_loss(output["reason_logits_final_train"], reason, reason_weights))
     if cf and cf["cf_valid_count"] > 0:
         valid = cf["valid_mask"]
@@ -493,8 +512,12 @@ def main() -> None:
     train_ids = [sample.file_name for sample in train_ds.samples]
     splits = stable_split_ids(train_ids, int(data_cfg["split_seed"]), float(data_cfg["train_calib_fraction"]), int(data_cfg["train_audit_count"]))
     id_to_index = {sample.file_name: i for i, sample in enumerate(train_ds.samples)}
-    train_count = min(args.max_train_samples or len(train_ds), len(train_ds))
-    train_indices = list(range(len(train_ds)))
+    exclude_calibration = bool(cfg.get("calibration", {}).get("exclude_from_training", False))
+    if exclude_calibration:
+        train_indices = [id_to_index[x] for x in splits["train_fit"]]
+    else:
+        train_indices = list(range(len(train_ds)))
+    train_count = min(args.max_train_samples or len(train_indices), len(train_indices))
     random.Random(seed).shuffle(train_indices)
     train_subset = Subset(train_ds, train_indices[:train_count])
     calib_indices = [id_to_index[x] for x in splits["train_calib"][: args.max_calib_samples or None]]
@@ -528,7 +551,7 @@ def main() -> None:
         "excluded_formal_modules": ["pair_memory", "action_combo", "calibration_head", "threshold_head"],
     }
     write_json(output_dir / "source_contract.json", source_contract)
-    start_epoch = 0; optimizer_update = 0; best: dict[str, float] = {}
+    start_epoch = 0; optimizer_update = 0; best: dict[str, float] = {}; checkpoint = None
     reason_rank_memory: dict[str, torch.Tensor] = {}
     if args.resume:
         checkpoint = torch.load(args.resume, map_location=device)
@@ -550,6 +573,11 @@ def main() -> None:
             for key, value in checkpoint.get("reason_rank_memory", {}).items()
         }
         restore_rng_state(checkpoint["rng_state"])
+    ema_cfg = cfg.get("ema", {})
+    ema = ModelEMA(model, decay=float(ema_cfg.get("decay", 0.999))) if bool(ema_cfg.get("enabled", False)) else None
+    if ema is not None and checkpoint is not None and checkpoint.get("ema") is not None:
+        ema.load_state_dict(checkpoint["ema"])
+    ema_model = copy.deepcopy(model).eval() if ema is not None else None
     structured_builder = AIEStructuredEvidenceBuilder(cfg["primary"]["scene_predicates"], data_cfg["bdd100k_root"])
     grammar = ACPRReasonGrammar(cfg["primary"]["reason_grammar"])
     cf_cfg = AIECounterfactualConfig(**{k: cfg["counterfactual"][k] for k in AIECounterfactualConfig.__dataclass_fields__})
@@ -573,6 +601,7 @@ def main() -> None:
         "train_sample_count": len(train_subset),
         "train_audit_count": len(audit_indices),
         "train_calib_count": len(calib_indices),
+        "calibration_excluded_from_training": exclude_calibration,
         "test_sample_count": len(test_subset),
     }
     write_json(output_dir / "run_manifest.json", manifest); Path(output_dir / "config_resolved.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
@@ -651,10 +680,14 @@ def main() -> None:
                 grad_before = {name: gradient_norm(params) for name, params in owners.items()}
                 predicate_grad_before = gradient_norm(model.foundation.predicate_head.parameters())
                 dino_grad_before = gradient_norm(model.foundation.dino.parameters())
-                torch.nn.utils.clip_grad_norm_(owners["primary"], float(training["primary_grad_cap"]))
+                if owners.get("primary"):
+                    torch.nn.utils.clip_grad_norm_(owners["primary"], float(training["primary_grad_cap"]))
                 torch.nn.utils.clip_grad_norm_(model.parameters(), float(training["global_grad_clip"]))
                 grad_after = {name: gradient_norm(params) for name, params in owners.items()}
-                optimizer.step(); optimizer.zero_grad(set_to_none=True); optimizer_update += 1; window = 0
+                optimizer.step()
+                if ema is not None:
+                    ema.update(model)
+                optimizer.zero_grad(set_to_none=True); optimizer_update += 1; window = 0
                 if optimizer_update % int(cfg["runtime"]["print_every_optimizer_updates"]) == 0 or optimizer_update == 1:
                     health = probe_health_metrics(output["evidence_map"], output["bounded_contribution"])
                     cf_metrics = counterfactual_metrics(cf)
@@ -687,9 +720,9 @@ def main() -> None:
                         "counter_negative_weight_p10": p10, "counter_negative_weight_p50": p50, "counter_negative_weight_p90": p90,
                         "reliable_negative_rate": float((logged_counter_confidence >= 0.75).float().mean().detach().cpu()),
                         "weak_negative_rate": float((logged_counter_confidence < 0.75).float().mean().detach().cpu()),
-                        "primary_grad_raw": grad_before["primary"], "primary_grad_capped": grad_after["primary"],
-                        "action_evidence_grad": grad_before["action_evidence"], "action_contribution_grad": grad_before["action_contribution"],
-                        "reason_private_grad": grad_before["reason_private"], "predicate_grad": predicate_grad_before,
+                        "primary_grad_raw": grad_before.get("primary", 0.0), "primary_grad_capped": grad_after.get("primary", 0.0),
+                        "action_evidence_grad": grad_before.get("action_evidence", 0.0), "action_contribution_grad": grad_before.get("action_contribution", 0.0),
+                        "reason_private_grad": grad_before.get("reason_private", 0.0), "predicate_grad": predicate_grad_before,
                         "owner_gradients": grad_before, "dino_grad": dino_grad_before,
                         "data_time": data_time, "dino_time": dino_time,
                         "primary_time": output.get("_profile_primary_time"), "evidence_global_time": output.get("_profile_evidence_global_time"),
@@ -708,6 +741,13 @@ def main() -> None:
             iteration_end = time.perf_counter()
         epoch_dir = output_dir / f"epoch_{epoch:03d}"; epoch_dir.mkdir(parents=True, exist_ok=True)
         metrics = evaluate_epoch(model, calib_loader, test_loader, device, epoch_dir, schedule["action"], schedule["reason"], cfg)
+        if ema is not None and ema_model is not None:
+            ema.copy_to(ema_model)
+            ema_dir = epoch_dir / "ema"; ema_dir.mkdir(parents=True, exist_ok=True)
+            metrics["ema"] = evaluate_epoch(
+                ema_model, calib_loader, test_loader, device, ema_dir,
+                schedule["action"], schedule["reason"], cfg,
+            )
         train_audit_logits, _, _ = collect_logits(model, audit_loader, device, schedule["action"], schedule["reason"])
         train_audit_metrics = aie_branch_metrics(
             train_audit_logits["action_final"], train_audit_logits["reason_final"],
@@ -734,7 +774,8 @@ def main() -> None:
         write_json(epoch_dir / "counterfactual_metrics.json", counterfactual_case_metrics(epoch_cf_cases, epoch_cf_invalid))
         write_json(epoch_dir / "owner_metrics.json", grad_before)
         write_json(epoch_dir / "runtime_metrics.json", {"epoch_seconds": time.perf_counter()-epoch_start, "max_reserved_gb": torch.cuda.max_memory_reserved()/2**30 if torch.cuda.is_available() else 0})
-        criteria = {"deploy_joint": metrics["deploy"]["joint"], "action_mF1": metrics["deploy"]["Act_mF1"], "reason_mF1": metrics["deploy"]["Exp_mF1"], "action_mAP": metrics["final"]["Act_mAP"], "reason_mAP": metrics["final"]["Exp_mAP"]}
+        selected = metrics.get(str(ema_cfg.get("selection_view", "online")), metrics)
+        criteria = {"deploy_joint": selected["deploy"]["joint"], "action_mF1": selected["deploy"]["Act_mF1"], "reason_mF1": selected["deploy"]["Exp_mF1"], "action_mAP": selected["final"]["Act_mAP"], "reason_mAP": selected["final"]["Exp_mAP"]}
         improved = []
         for key, value in criteria.items():
             if value >= best.get(key, float("-inf")):
@@ -742,8 +783,9 @@ def main() -> None:
         checkpoint = {
             "model": canonical_model_state_dict(model.state_dict()), "optimizer": optimizer.state_dict(), "scheduler_update": optimizer_update,
             "epoch": epoch, "micro_step": len(train_loader), "optimizer_update": optimizer_update, "best": dict(best),
-            "rng_state": capture_rng_state(), "metrics": metrics, "calibration": metrics["calibration_thresholds"],
+            "rng_state": capture_rng_state(), "metrics": metrics, "calibration": selected["calibration_thresholds"],
             "reason_rank_memory": {key: value.detach().cpu() for key, value in reason_rank_memory.items()},
+            "ema": None if ema is None else ema.state_dict(),
             "manifest": manifest, "manifest_hash": object_sha256(manifest), "split_manifest_hash": manifest["split_manifest_hash"],
             "config_hash": manifest["config_hash"], "source_head": manifest["source_head"],
             "predicate_schema_hash": manifest["predicate_schema_hash"], "counter_evidence_schema_hash": manifest["counter_evidence_schema_hash"],
@@ -751,8 +793,13 @@ def main() -> None:
             "train_audit_ids": splits["train_audit"],
         }
         torch.save(checkpoint, output_dir / "checkpoint_latest.pth"); torch.save(checkpoint, output_dir / f"checkpoint_epoch_{epoch:03d}.pth")
+        best_checkpoint = checkpoint
+        if selected is not metrics and ema_model is not None:
+            best_checkpoint = dict(checkpoint)
+            best_checkpoint["model"] = canonical_model_state_dict(ema_model.state_dict())
+            best_checkpoint["selected_view"] = "ema"
         for key in improved:
-            torch.save(checkpoint, output_dir / f"checkpoint_best_test_{key}.pth")
+            torch.save(best_checkpoint, output_dir / f"checkpoint_best_test_{key}.pth")
         print(json.dumps(json_safe({"event": "aie_epoch", "epoch": epoch, **metrics})), flush=True)
     if args.run_kind == "full":
         write_json(output_dir / "GOAL_COMPLETED_AIE_OIA_V1.json", {"complete": True, "epochs": epochs, "best": best})

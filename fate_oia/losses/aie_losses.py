@@ -98,6 +98,54 @@ def reason_ranking_loss(
     return torch.stack(losses).mean() if losses else logits.sum() * 0
 
 
+def classwise_pu_dr_loss(
+    logits: Tensor,
+    target: Tensor,
+    negative_weight: Tensor,
+    gamma_pair: float = 2.0,
+    gamma_negative: float = 1.0,
+    reference_logits: Tensor | None = None,
+    reference_target: Tensor | None = None,
+    reference_negative_weight: Tensor | None = None,
+) -> Tensor:
+    """PU-aware class-wise DR loss (ECCV 2024, Eq. 8).
+
+    Ranking is performed down each label column rather than across labels in
+    one image. Uncertain BDD-OIA zeros retain a bounded contribution instead
+    of being promoted to certain negatives.
+    """
+    if reference_logits is not None:
+        logits_all = torch.cat((logits, reference_logits.detach()), dim=0)
+        target_all = torch.cat((target, reference_target.detach()), dim=0)
+        ref_weight = (
+            torch.ones_like(reference_target)
+            if reference_negative_weight is None
+            else reference_negative_weight.detach()
+        )
+        weight_all = torch.cat((negative_weight, ref_weight), dim=0)
+    else:
+        logits_all, target_all, weight_all = logits, target, negative_weight
+
+    losses = []
+    for label in range(logits.shape[1]):
+        positive_mask = target_all[:, label] > 0.5
+        negative_mask = ~positive_mask
+        positive = logits_all[positive_mask, label]
+        negative = logits_all[negative_mask, label]
+        if negative.numel() == 0:
+            continue
+        weights = weight_all[negative_mask, label].detach().clamp_min(1e-8)
+        terms = [negative.new_zeros(1)]
+        if positive.numel() > 0:
+            pair = float(gamma_pair) * (negative[:, None] - positive[None, :])
+            pair = pair + weights.log()[:, None]
+            terms.append(pair.reshape(-1))
+        ngc = float(gamma_negative) * negative + weights.log()
+        terms.append(ngc)
+        losses.append(torch.logsumexp(torch.cat(terms), dim=0))
+    return torch.stack(losses).mean() if losses else logits.sum() * 0
+
+
 def predicate_masked_bce(logits: Tensor, target: Tensor, mask: Tensor) -> Tensor:
     raw = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
     return (raw * mask).sum() / mask.sum().clamp_min(1.0)
