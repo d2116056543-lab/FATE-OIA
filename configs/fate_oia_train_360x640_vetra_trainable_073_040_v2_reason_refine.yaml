@@ -82,7 +82,7 @@ training:
   lr_primary: 0.00002
   lr_action_evidence: 0.00002
   lr_action_contribution: 0.00002
-  lr_reason_private: 0.00004
+  lr_reason_private: 0.00002
   warmup_ratio: 0.02
   min_lr_ratio: 0.10
   primary_grad_cap: 0.35
@@ -104,9 +104,9 @@ loss_weights:
   final_action: 1.00
   final_action_soft_f1: 0.03
   final_action_cardinality: 0.02
-  final_reason: 0.80
+  final_reason: 1.00
   final_reason_rank: 0.03
-  final_reason_dr: 0.12
+  final_reason_dr: 0.01
   final_reason_soft_f1: 0.04
   cf_necessity: 0.08
   cf_effect: 0.04
@@ -125,7 +125,7 @@ reason_dr:
   gamma_pair: 2.0
   gamma_negative: 1.0
 ema:
-  enabled: true
+  enabled: false
   decay: 0.995
   selection_view: online
 runtime:

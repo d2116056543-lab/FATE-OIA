@@ -15,8 +15,11 @@ def test_joint_and_refine_configs_enforce_training_contract():
         assert config["experiment"]["token_compression"] == "none"
         assert config["loss_weights"]["final_reason_dr"] > 0
         assert config["reason_dr"]["gamma_pair"] > config["reason_dr"]["gamma_negative"] > 0
-        assert config["ema"]["enabled"] is True
         assert config["runtime"]["fixed_test_audit_samples"] == 32
+    assert joint["ema"]["enabled"] is True
+    assert refine["ema"]["enabled"] is False
+    assert joint["loss_weights"]["final_reason_dr"] <= 0.005
+    assert refine["loss_weights"]["final_reason_dr"] <= 0.01
     assert refine["training"]["trainable_owners"] == ["reason_private"]
 
 

@@ -105,7 +105,7 @@ loss_weights:
   final_action_cardinality: 0.02
   final_reason: 1.00
   final_reason_rank: 0.04
-  final_reason_dr: 0.06
+  final_reason_dr: 0.005
   final_reason_soft_f1: 0.04
   cf_necessity: 0.08
   cf_effect: 0.04

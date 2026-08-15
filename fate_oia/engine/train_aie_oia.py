@@ -759,6 +759,8 @@ def main() -> None:
         epoch_dir = output_dir / f"epoch_{epoch:03d}"; epoch_dir.mkdir(parents=True, exist_ok=True)
         metrics = evaluate_epoch(model, calib_loader, test_loader, device, epoch_dir, schedule["action"], schedule["reason"], cfg)
         if ema is not None and ema_model is not None:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             ema.copy_to(ema_model)
             ema_dir = epoch_dir / "ema"; ema_dir.mkdir(parents=True, exist_ok=True)
             metrics["ema"] = evaluate_epoch(
