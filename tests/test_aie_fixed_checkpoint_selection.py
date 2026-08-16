@@ -4,6 +4,8 @@ import torch
 from fate_oia.engine.train_aie_oia import (
     checkpoint_selection_criteria,
     compatible_checkpoint_state_dict,
+    load_config,
+    schedule_values,
 )
 
 
@@ -33,3 +35,12 @@ def test_checkpoint_loader_drops_only_known_nonpersistent_grammar_buffers():
     state["unexpected.learned.weight"] = torch.ones(1)
     with pytest.raises(RuntimeError, match="unexpected learned state"):
         compatible_checkpoint_state_dict(model, state)
+
+
+def test_proper_recovery_preserves_strong_checkpoint_branch_scales_from_first_step():
+    cfg = load_config("configs/fate_oia_train_360x640_vetra_trainable_073_040_v2_proper_recovery.yaml")
+
+    schedule = schedule_values(0, 100, cfg)
+
+    assert schedule["action"] == 1.0
+    assert schedule["reason"] == 0.6
