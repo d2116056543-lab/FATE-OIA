@@ -94,21 +94,30 @@ def make_dataset(cfg: dict[str, Any], split: str) -> BDDOIAMultiTaskDataset:
     )
 
 
+def aie_worker_init_fn(_worker_id: int) -> None:
+    """Prevent each DataLoader worker from expanding its own CPU thread pool."""
+    torch.set_num_threads(1)
+
+
 def make_loader(
     dataset,
     batch_size: int,
     shuffle: bool,
     workers: int,
     cfg: dict[str, Any],
+    *,
+    persistent_workers: bool | None = None,
 ) -> DataLoader:
     data = cfg["data"]
+    persistent = bool(data.get("persistent_workers", True)) if persistent_workers is None else persistent_workers
     kwargs = {
         "batch_size": batch_size,
         "shuffle": shuffle,
         "num_workers": workers,
         "collate_fn": collate,
         "pin_memory": bool(data.get("pin_memory", True)),
-        "persistent_workers": bool(data.get("persistent_workers", True)) and workers > 0,
+        "persistent_workers": bool(persistent) and workers > 0,
+        "worker_init_fn": aie_worker_init_fn,
     }
     if workers > 0:
         kwargs["prefetch_factor"] = int(data.get("prefetch_factor", 2))
@@ -551,10 +560,23 @@ def main() -> None:
     calib_indices = [id_to_index[x] for x in splits["train_calib"][: args.max_calib_samples or None]]
     audit_indices = [id_to_index[x] for x in splits["train_audit"][: args.max_audit_samples or None]]
     test_subset = Subset(test_ds, list(range(min(args.max_test_samples or len(test_ds), len(test_ds)))))
-    train_loader = make_loader(train_subset, batch_size, True, workers, cfg)
-    calib_loader = make_loader(Subset(train_ds, calib_indices), batch_size, False, workers, cfg)
-    audit_loader = make_loader(Subset(train_ds, audit_indices), batch_size, False, workers, cfg)
-    test_loader = make_loader(test_subset, batch_size, False, workers, cfg)
+    train_loader = make_loader(
+        train_subset, batch_size, True, workers, cfg, persistent_workers=True
+    )
+    # Evaluation loaders are traversed only at epoch boundaries. Keeping all
+    # three pools alive oversubscribes CPU threads and intermittently starves
+    # the GPU during subsequent training epochs.
+    calib_loader = make_loader(
+        Subset(train_ds, calib_indices), batch_size, False, workers, cfg,
+        persistent_workers=False,
+    )
+    audit_loader = make_loader(
+        Subset(train_ds, audit_indices), batch_size, False, workers, cfg,
+        persistent_workers=False,
+    )
+    test_loader = make_loader(
+        test_subset, batch_size, False, workers, cfg, persistent_workers=False
+    )
     write_split_manifest(output_dir / "split_manifest.json", train_ids, int(data_cfg["split_seed"]), float(data_cfg["train_calib_fraction"]), int(data_cfg["train_audit_count"]))
     write_json(output_dir / "train_calib_ids.json", splits["train_calib"]); write_json(output_dir / "train_audit_ids.json", splits["train_audit"])
     model = build_model(cfg, device, args.use_mock_dino)
