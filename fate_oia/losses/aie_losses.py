@@ -14,6 +14,17 @@ def reason_negative_weight(target: Tensor, counter_confidence: Tensor, floor: fl
     return torch.where(target > 0.5, torch.ones_like(negative), negative)
 
 
+def proper_binary_calibration_loss(
+    logits: Tensor,
+    target: Tensor,
+    weights: Tensor | None = None,
+) -> Tensor:
+    """Strictly proper BCE, optionally censored for partially observed labels."""
+    raw = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+    sample_weight = torch.ones_like(target) if weights is None else weights.detach()
+    return (raw * sample_weight).sum() / sample_weight.sum().clamp_min(1.0)
+
+
 def evidence_censored_reason_asl_loss(logits: Tensor, target: Tensor, counter_confidence: Tensor) -> Tensor:
     weights = reason_negative_weight(target, counter_confidence)
     raw = asymmetric_loss_with_logits(logits, target, reduction="none")

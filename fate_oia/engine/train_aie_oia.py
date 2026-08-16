@@ -34,6 +34,7 @@ from fate_oia.losses.aie_losses import (
     predicate_reason_alignment_pu_loss,
     predicate_map_loss,
     probe_duplicate_loss,
+    proper_binary_calibration_loss,
     reason_negative_weight,
     reason_ranking_loss,
     soft_f1_loss,
@@ -273,9 +274,21 @@ def compute_losses(
     ))
     registry.add("predicate_compactness", "primary", float(grounding_scale) * predicate_map_compactness_loss(output["predicate_attention"]))
     registry.add("final_action", "action_contribution", asymmetric_loss_with_logits(output["action_logits_final_train"], action))
+    if "final_action_calibration" in cfg["loss_weights"]:
+        registry.add(
+            "final_action_calibration",
+            "action_contribution",
+            proper_binary_calibration_loss(output["action_logits_final_train"], action),
+        )
     registry.add("final_action_soft_f1", "action_contribution", soft_f1_loss(output["action_logits_final_train"], action))
     registry.add("final_action_cardinality", "action_contribution", action_cardinality_loss(output["action_logits_final_train"], action))
     registry.add("final_reason", "reason_private", evidence_censored_reason_asl_loss(output["reason_logits_final_train"], reason, counter_confidence))
+    if "final_reason_calibration" in cfg["loss_weights"]:
+        registry.add(
+            "final_reason_calibration",
+            "reason_private",
+            proper_binary_calibration_loss(output["reason_logits_final_train"], reason, reason_weights),
+        )
     registry.add(
         "final_reason_rank",
         "reason_private",
@@ -344,6 +357,22 @@ def compute_losses(
 def attach_grammar_masks(output: dict[str, Any], model: AIEOIAModel) -> None:
     output["_positive_mask"] = model.foundation.predicate_reason.positive_mask.detach().cpu().tolist()
     output["_negative_mask"] = model.foundation.predicate_reason.contradictory_mask.detach().cpu().tolist()
+
+
+def checkpoint_selection_criteria(selected: dict[str, Any]) -> dict[str, float]:
+    """Keep trained fixed-threshold quality distinct from train-calib deployment views."""
+    final = selected["final"]
+    deploy = selected["deploy"]
+    return {
+        "fixed_joint": float(final["joint"]),
+        "fixed_action_mF1": float(final["Act_mF1"]),
+        "fixed_reason_mF1": float(final["Exp_mF1"]),
+        "deploy_joint": float(deploy["joint"]),
+        "action_mF1": float(deploy["Act_mF1"]),
+        "reason_mF1": float(deploy["Exp_mF1"]),
+        "action_mAP": float(final["Act_mAP"]),
+        "reason_mAP": float(final["Exp_mAP"]),
+    }
 
 
 def _append_cpu(store: dict[str, list[torch.Tensor]], key: str, value: torch.Tensor, limit: int) -> None:
@@ -839,7 +868,7 @@ def main() -> None:
         write_json(epoch_dir / "owner_metrics.json", grad_before)
         write_json(epoch_dir / "runtime_metrics.json", {"epoch_seconds": time.perf_counter()-epoch_start, "max_reserved_gb": torch.cuda.max_memory_reserved()/2**30 if torch.cuda.is_available() else 0})
         selected = metrics.get(str(ema_cfg.get("selection_view", "online")), metrics)
-        criteria = {"deploy_joint": selected["deploy"]["joint"], "action_mF1": selected["deploy"]["Act_mF1"], "reason_mF1": selected["deploy"]["Exp_mF1"], "action_mAP": selected["final"]["Act_mAP"], "reason_mAP": selected["final"]["Exp_mAP"]}
+        criteria = checkpoint_selection_criteria(selected)
         improved = []
         for key, value in criteria.items():
             if value >= best.get(key, float("-inf")):
