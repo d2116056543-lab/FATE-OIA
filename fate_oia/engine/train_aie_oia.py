@@ -74,6 +74,28 @@ def canonical_model_state_dict(state: dict[str, torch.Tensor]) -> dict[str, torc
     return clean
 
 
+_KNOWN_NONPERSISTENT_GRAMMAR_BUFFERS = {
+    "foundation.predicate_reason.positive_mask",
+    "foundation.predicate_reason.contradictory_mask",
+    "reason_private.positive_predicate_mask",
+    "reason_private.contradictory_predicate_mask",
+}
+
+
+def compatible_checkpoint_state_dict(
+    model: torch.nn.Module,
+    state: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Strictly load learned state while discarding deterministic nonpersistent masks."""
+    clean = canonical_model_state_dict(state)
+    expected = set(model.state_dict())
+    unexpected = set(clean) - expected
+    illegal = unexpected - _KNOWN_NONPERSISTENT_GRAMMAR_BUFFERS
+    if illegal:
+        raise RuntimeError(f"checkpoint contains unexpected learned state: {sorted(illegal)}")
+    return {key: value for key, value in clean.items() if key in expected}
+
+
 def collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "image": torch.stack([row["image"] for row in batch]),
@@ -613,7 +635,7 @@ def main() -> None:
         if args.resume:
             raise RuntimeError("--init-model-checkpoint and --resume are mutually exclusive")
         initial = torch.load(args.init_model_checkpoint, map_location="cpu")
-        model.load_state_dict(canonical_model_state_dict(initial.get("model", initial)), strict=True)
+        model.load_state_dict(compatible_checkpoint_state_dict(model, initial.get("model", initial)), strict=True)
     optimizer = build_optimizer(model, cfg)
     parameter_names = {id(parameter): name for name, parameter in model.named_parameters()}
     owner_groups = exact_owner_parameter_groups(model)
