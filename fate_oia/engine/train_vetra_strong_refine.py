@@ -27,7 +27,10 @@ from fate_oia.losses.vetra_strong_rank_losses import (
     base_margin_trust_loss,
     residual_energy_loss,
 )
-from fate_oia.models.vetra_strong_refiner import SelectiveActionPathRefiner
+from fate_oia.models.vetra_strong_refiner import (
+    SelectiveActionPathRefiner,
+    SelectiveVisualActionRankRefiner,
+)
 from fate_oia.utils.acpr_threshold_search import search_best_thresholds_for_f1
 from fate_oia.utils.aie_calibration import apply_posthoc_threshold
 from fate_oia.utils.aie_metrics import aie_branch_metrics
@@ -58,6 +61,38 @@ def load_base(cfg: dict, checkpoint_path: str, device: torch.device):
     return model
 
 
+def build_refiner(base, cfg: dict):
+    refiner_cfg = cfg["refiner"]
+    refiner_type = str(refiner_cfg.get("type", "path"))
+    if refiner_type == "rank":
+        return SelectiveVisualActionRankRefiner(
+            dim=int(cfg["primary"]["dim"]),
+            rank=int(refiner_cfg["rank"]),
+            action_dim=4,
+            max_delta=float(refiner_cfg["max_delta"]),
+        )
+    if refiner_type == "path":
+        return SelectiveActionPathRefiner(
+            base.action_evidence,
+            base.action_contribution,
+            action_dim=4,
+            max_delta=float(refiner_cfg["max_delta"]),
+        )
+    raise ValueError(f"unsupported refiner.type: {refiner_type}")
+
+
+def run_refiner(refiner, source, action_scale: float, gain=None):
+    if isinstance(refiner, SelectiveVisualActionRankRefiner):
+        return refiner(
+            source["action_logits_final"].detach(),
+            source["reason_logits_final"],
+            source["action_nodes_primary"],
+            source["evidence_token"],
+            gain=gain,
+        )
+    return refiner(source, action_scale=action_scale, gain=gain)
+
+
 @torch.no_grad()
 def base_forward(base, images, cfg):
     field = base.encode_images(images)
@@ -79,8 +114,8 @@ def collect(base, refiner, loader, device, cfg, gain=None):
         images = batch["image"].to(device, non_blocking=True)
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
             output = base_forward(base, images, cfg)
-            refined = refiner(
-                output, action_scale=float(cfg["evidence"]["action_scale"]), gain=gain
+            refined = run_refiner(
+                refiner, output, action_scale=float(cfg["evidence"]["action_scale"]), gain=gain
             )
         mapping = {
             "base_action": output["action_logits_final"],
@@ -189,12 +224,7 @@ def main():
     torch.set_float32_matmul_precision("high")
     device = torch.device(args.device)
     base = load_base(cfg, args.source_checkpoint, device)
-    refiner = SelectiveActionPathRefiner(
-        base.action_evidence,
-        base.action_contribution,
-        action_dim=4,
-        max_delta=float(cfg["refiner"]["max_delta"]),
-    ).to(device)
+    refiner = build_refiner(base, cfg).to(device)
     optimizer = torch.optim.AdamW(
         refiner.parameters(), lr=float(cfg["training"]["lr"]),
         weight_decay=float(cfg["training"]["weight_decay"]),
@@ -237,7 +267,8 @@ def main():
             with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
                 base_output = base_forward(base, images, cfg)
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
-                refined = refiner(
+                refined = run_refiner(
+                    refiner,
                     base_output,
                     action_scale=float(cfg["evidence"]["action_scale"]),
                     gain=torch.ones(4, device=device),

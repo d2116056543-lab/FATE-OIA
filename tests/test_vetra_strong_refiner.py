@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 
+from fate_oia.engine.train_vetra_strong_refine import build_refiner, run_refiner
 from fate_oia.models.vetra_strong_refiner import SelectiveActionPathRefiner, SelectiveVisualActionRankRefiner
 
 
@@ -78,3 +79,31 @@ def test_action_path_refiner_starts_equivalent_and_keeps_reason_identity():
     output = module(source, action_scale=1.0)
     torch.testing.assert_close(output["action_logits_final"], source_action, rtol=0, atol=0)
     assert output["reason_logits_final"].data_ptr() == reason.data_ptr()
+
+
+def test_trainer_builds_requested_low_rank_refiner():
+    base = nn.Module()
+    base.action_evidence = DummyEvidence()
+    base.action_contribution = DummyContribution()
+    config = {
+        "primary": {"dim": 16},
+        "refiner": {"type": "rank", "rank": 8, "max_delta": 0.05},
+    }
+    module = build_refiner(base, config)
+    assert isinstance(module, SelectiveVisualActionRankRefiner)
+
+
+def test_rank_refiner_runner_preserves_reason_and_detaches_source_features():
+    module = SelectiveVisualActionRankRefiner(dim=16, rank=8, action_dim=4, max_delta=0.05)
+    source = {
+        "action_logits_final": torch.randn(3, 4, requires_grad=True),
+        "reason_logits_final": torch.randn(3, 21, requires_grad=True),
+        "action_nodes_primary": torch.randn(3, 4, 16, requires_grad=True),
+        "evidence_token": torch.randn(3, 4, 2, 16, requires_grad=True),
+    }
+    output = run_refiner(module, source, action_scale=1.0)
+    output["action_logits_final"].sum().backward()
+    assert output["reason_logits_final"].data_ptr() == source["reason_logits_final"].data_ptr()
+    assert source["action_logits_final"].grad is None
+    assert source["action_nodes_primary"].grad is None
+    assert source["evidence_token"].grad is None
