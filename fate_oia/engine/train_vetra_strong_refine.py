@@ -114,9 +114,9 @@ def collect(base, refiner, loader, device, cfg, gain=None):
         images = batch["image"].to(device, non_blocking=True)
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
             output = base_forward(base, images, cfg)
-            refined = run_refiner(
-                refiner, output, action_scale=float(cfg["evidence"]["action_scale"]), gain=gain
-            )
+        refined = run_refiner(
+            refiner, output, action_scale=float(cfg["evidence"]["action_scale"]), gain=gain
+        )
         mapping = {
             "base_action": output["action_logits_final"],
             "final_action": refined["action_logits_final"],
@@ -266,13 +266,12 @@ def main():
             target = batch["action"].to(device, non_blocking=True)
             with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
                 base_output = base_forward(base, images, cfg)
-            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
-                refined = run_refiner(
-                    refiner,
-                    base_output,
-                    action_scale=float(cfg["evidence"]["action_scale"]),
-                    gain=torch.ones(4, device=device),
-                )
+            refined = run_refiner(
+                refiner,
+                base_output,
+                action_scale=float(cfg["evidence"]["action_scale"]),
+                gain=torch.ones(4, device=device),
+            )
             window.append((refined, target))
             if (micro + 1) % accumulation and micro + 1 != len(loaders["train"]):
                 continue

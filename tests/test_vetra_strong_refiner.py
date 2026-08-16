@@ -107,3 +107,25 @@ def test_rank_refiner_runner_preserves_reason_and_detaches_source_features():
     assert source["action_logits_final"].grad is None
     assert source["action_nodes_primary"].grad is None
     assert source["evidence_token"].grad is None
+
+
+def test_rank_refiner_has_no_learnable_class_bias_shortcut():
+    module = SelectiveVisualActionRankRefiner(dim=16, rank=8, action_dim=4, max_delta=0.05)
+    parameter_names = dict(module.named_parameters())
+    assert "output_bias" not in parameter_names
+
+
+def test_rank_refiner_keeps_small_residual_in_float32_with_bfloat16_source():
+    module = SelectiveVisualActionRankRefiner(dim=16, rank=8, action_dim=4, max_delta=0.05)
+    with torch.no_grad():
+        module.output_weight.fill_(0.01)
+    source = {
+        "action_logits_final": torch.full((3, 4), 2.0, dtype=torch.bfloat16),
+        "reason_logits_final": torch.randn(3, 21, dtype=torch.bfloat16),
+        "action_nodes_primary": torch.randn(3, 4, 16, dtype=torch.bfloat16),
+        "evidence_token": torch.randn(3, 4, 2, 16, dtype=torch.bfloat16),
+    }
+    output = run_refiner(module, source, action_scale=1.0)
+    assert output["action_logits_final"].dtype == torch.float32
+    assert output["action_delta_unscaled"].dtype == torch.float32
+    assert torch.count_nonzero(output["action_delta_unscaled"]) > 0

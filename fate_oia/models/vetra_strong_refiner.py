@@ -22,7 +22,6 @@ class SelectiveVisualActionRankRefiner(nn.Module):
         self.norm = nn.LayerNorm(2 * dim)
         self.input_projection = nn.Linear(2 * dim, rank)
         self.output_weight = nn.Parameter(torch.zeros(action_dim, rank))
-        self.output_bias = nn.Parameter(torch.zeros(action_dim))
         self.register_buffer("deployment_gain", torch.ones(action_dim))
 
     def set_deployment_gain(self, gain: Tensor) -> None:
@@ -45,15 +44,20 @@ class SelectiveVisualActionRankRefiner(nn.Module):
             raise ValueError(
                 f"action/evidence shape mismatch: {tuple(action_nodes.shape)} vs {tuple(evidence_tokens.shape)}"
             )
-        features = torch.cat((action_nodes.detach(), evidence_tokens.detach()), dim=-1)
-        hidden = torch.nn.functional.gelu(self.input_projection(self.norm(features)))
-        raw_delta = torch.einsum("bar,ar->ba", hidden, self.output_weight) + self.output_bias
-        bounded = self.max_delta * torch.tanh(raw_delta)
-        effective_gain = self.deployment_gain if gain is None else gain
-        delta = bounded * effective_gain.to(bounded).view(1, self.action_dim)
+        # Keep the small ranking residual in FP32. Under BF16, deltas below the
+        # base-logit ULP can disappear in the forward pass while retaining a
+        # misleading straight-through gradient.
+        features = torch.cat((action_nodes.detach(), evidence_tokens.detach()), dim=-1).float()
+        with torch.autocast(device_type=features.device.type, enabled=False):
+            hidden = torch.nn.functional.gelu(self.input_projection(self.norm(features)))
+            raw_delta = torch.einsum("bar,ar->ba", hidden, self.output_weight)
+            bounded = self.max_delta * torch.tanh(raw_delta)
+            effective_gain = self.deployment_gain if gain is None else gain
+            delta = bounded * effective_gain.to(bounded).view(1, self.action_dim)
+            final = action_logits_base.detach().float() + delta
         return {
             "action_logits_base": action_logits_base,
-            "action_logits_final": action_logits_base + delta,
+            "action_logits_final": final,
             "reason_logits_final": reason_logits_base,
             "action_delta": delta,
             "action_delta_unscaled": bounded,
