@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import gc
 from collections import defaultdict
 import json
 import math
@@ -605,7 +606,6 @@ def main() -> None:
     ema = ModelEMA(model, decay=float(ema_cfg.get("decay", 0.999))) if bool(ema_cfg.get("enabled", False)) else None
     if ema is not None and checkpoint is not None and checkpoint.get("ema") is not None:
         ema.load_state_dict(checkpoint["ema"])
-    ema_model = copy.deepcopy(model).eval() if ema is not None else None
     structured_builder = AIEStructuredEvidenceBuilder(cfg["primary"]["scene_predicates"], data_cfg["bdd100k_root"])
     grammar = ACPRReasonGrammar(cfg["primary"]["reason_grammar"])
     cf_cfg = AIECounterfactualConfig(**{k: cfg["counterfactual"][k] for k in AIECounterfactualConfig.__dataclass_fields__})
@@ -773,9 +773,13 @@ def main() -> None:
             schedule["action"], schedule["reason"], cfg,
             target_prevalence=train_prevalence,
         )
-        if ema is not None and ema_model is not None:
+        ema_checkpoint_state = None
+        if ema is not None:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+            # Materialize the lazy EMA copy only for evaluation. Keeping it on
+            # CUDA made later epochs train beside its full inference workspace.
+            ema_model = copy.deepcopy(model).eval()
             ema.copy_to(ema_model)
             ema_dir = epoch_dir / "ema"; ema_dir.mkdir(parents=True, exist_ok=True)
             metrics["ema"] = evaluate_epoch(
@@ -783,6 +787,14 @@ def main() -> None:
                 schedule["action"], schedule["reason"], cfg,
                 target_prevalence=train_prevalence, audit_limit=0,
             )
+            ema_checkpoint_state = {
+                key: value.detach().cpu()
+                for key, value in canonical_model_state_dict(ema_model.state_dict()).items()
+            }
+            del ema_model
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         train_audit_logits, _, _ = collect_logits(model, audit_loader, device, schedule["action"], schedule["reason"])
         train_audit_metrics = aie_branch_metrics(
             train_audit_logits["action_final"], train_audit_logits["reason_final"],
@@ -829,9 +841,9 @@ def main() -> None:
         }
         torch.save(checkpoint, output_dir / "checkpoint_latest.pth"); torch.save(checkpoint, output_dir / f"checkpoint_epoch_{epoch:03d}.pth")
         best_checkpoint = checkpoint
-        if selected is not metrics and ema_model is not None:
+        if selected is not metrics and ema_checkpoint_state is not None:
             best_checkpoint = dict(checkpoint)
-            best_checkpoint["model"] = canonical_model_state_dict(ema_model.state_dict())
+            best_checkpoint["model"] = ema_checkpoint_state
             best_checkpoint["selected_view"] = "ema"
         for key in improved:
             torch.save(best_checkpoint, output_dir / f"checkpoint_best_test_{key}.pth")
