@@ -44,3 +44,13 @@ def test_proper_recovery_preserves_strong_checkpoint_branch_scales_from_first_st
 
     assert schedule["action"] == 1.0
     assert schedule["reason"] == 0.6
+
+
+def test_reason_recovery_freezes_every_action_owner_and_keeps_reason_proper_loss():
+    cfg = load_config("configs/fate_oia_train_360x640_vetra_trainable_073_040_v2_reason_recovery.yaml")
+
+    assert cfg["training"]["trainable_owners"] == ["reason_private"]
+    assert "final_action_calibration" not in cfg["loss_weights"]
+    assert cfg["loss_weights"]["final_reason_calibration"] > 0
+    assert schedule_values(0, 100, cfg)["action"] == 1.0
+    assert schedule_values(0, 100, cfg)["reason"] == 0.6
