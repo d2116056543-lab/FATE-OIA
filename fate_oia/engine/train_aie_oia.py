@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import copy
 import gc
 from collections import defaultdict
 import json
@@ -775,23 +774,19 @@ def main() -> None:
         )
         ema_checkpoint_state = None
         if ema is not None:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            # Materialize the lazy EMA copy only for evaluation. Keeping it on
-            # CUDA made later epochs train beside its full inference workspace.
-            ema_model = copy.deepcopy(model).eval()
-            ema.copy_to(ema_model)
             ema_dir = epoch_dir / "ema"; ema_dir.mkdir(parents=True, exist_ok=True)
-            metrics["ema"] = evaluate_epoch(
-                ema_model, calib_loader, test_loader, device, ema_dir,
-                schedule["action"], schedule["reason"], cfg,
-                target_prevalence=train_prevalence, audit_limit=0,
-            )
-            ema_checkpoint_state = {
-                key: value.detach().cpu()
-                for key, value in canonical_model_state_dict(ema_model.state_dict()).items()
-            }
-            del ema_model
+            # Reuse the online model for EMA evaluation. A deep CUDA model copy
+            # nearly exhausted 48 GB and left too little inference workspace.
+            with ema.average_parameters(model):
+                metrics["ema"] = evaluate_epoch(
+                    model, calib_loader, test_loader, device, ema_dir,
+                    schedule["action"], schedule["reason"], cfg,
+                    target_prevalence=train_prevalence, audit_limit=0,
+                )
+                ema_checkpoint_state = {
+                    key: value.detach().cpu()
+                    for key, value in canonical_model_state_dict(model.state_dict()).items()
+                }
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from contextlib import contextmanager
 
 import torch
 from torch import nn
@@ -46,3 +47,30 @@ class ModelEMA:
             raise RuntimeError("EMA/model state keys differ")
         for name, value in self._state.items():
             target[name].copy_(value)
+
+    @contextmanager
+    @torch.no_grad()
+    def average_parameters(self, model: nn.Module):
+        """Temporarily swap EMA values into ``model`` without a model copy.
+
+        During the context, the EMA storage holds the online values. Swapping
+        one tensor at a time bounds temporary CUDA memory to the largest state
+        tensor and the ``finally`` block restores both sides after exceptions.
+        """
+        target = dict(model.named_parameters())
+        target.update(dict(model.named_buffers()))
+        if target.keys() != self._state.keys():
+            raise RuntimeError("EMA/model state keys differ")
+
+        def swap() -> None:
+            for name, average in self._state.items():
+                online = target[name]
+                temporary = online.detach().clone()
+                online.copy_(average)
+                average.copy_(temporary)
+
+        swap()
+        try:
+            yield model
+        finally:
+            swap()
