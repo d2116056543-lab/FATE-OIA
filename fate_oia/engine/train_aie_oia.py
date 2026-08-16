@@ -445,6 +445,7 @@ def evaluate_epoch(
     action_scale: float,
     reason_scale: float,
     cfg,
+    target_prevalence: torch.Tensor | None = None,
     audit_limit: int | None = None,
 ):
     # DINO lazily exposes ``vproj = proj`` during its first attention
@@ -457,10 +458,18 @@ def evaluate_epoch(
     }
     calib, _, _ = collect_logits(model, calib_loader, device, action_scale, reason_scale)
     groups = [list(range(4)), list(range(4, 25))]
+    prevalence_cfg = cfg.get("calibration", {}).get("prevalence_shrinkage", {})
+    prevalence_multiplier = torch.tensor(
+        [float(prevalence_cfg.get("action_multiplier", 1.0))] * 4
+        + [float(prevalence_cfg.get("reason_multiplier", 1.0))] * 21
+    )
     thresholds = fit_posthoc_thresholds(
         torch.cat((calib["action_final"], calib["reason_final"]), 1),
         torch.cat((calib["action_target"], calib["reason_target"]), 1), groups,
         shrinkage_support=float(cfg["calibration"]["group_shrinkage_support"]), grid_step=float(cfg["calibration"]["grid_step"]),
+        target_prevalence=(target_prevalence if bool(prevalence_cfg.get("enabled", False)) else None),
+        prevalence_multiplier=prevalence_multiplier,
+        prevalence_support_prior=float(prevalence_cfg.get("support_prior", 0.0)),
     )
     if audit_limit is None:
         audit_limit = int(cfg["runtime"]["fixed_test_audit_samples"])
@@ -468,9 +477,7 @@ def evaluate_epoch(
     if audit_limit > 0:
         cf_cfg = AIECounterfactualConfig(**{k: cfg["counterfactual"][k] for k in AIECounterfactualConfig.__dataclass_fields__})
         cf_engine = AIECounterfactualEngine(cf_cfg)
-    test, names, audit = collect_logits(
-        model, test_loader, device, action_scale, reason_scale, audit_limit, cf_engine,
-    )
+    test, names, audit = collect_logits(model, test_loader, device, action_scale, reason_scale, audit_limit, cf_engine)
     state_after_dict = canonical_model_state_dict(model.state_dict())
     if state_dict_sha256(state_after_dict) != state_before:
         changed_keys = [
@@ -526,6 +533,10 @@ def main() -> None:
     accumulation = args.gradient_accumulation_steps or int(training["gradient_accumulation_steps"])
     workers = args.num_workers if args.num_workers is not None else int(data_cfg["num_workers"])
     train_ds, test_ds = make_dataset(cfg, "train"), make_dataset(cfg, "test")
+    train_prevalence = torch.tensor(
+        [list(sample.action) + list(sample.reason) for sample in train_ds.samples],
+        dtype=torch.float32,
+    ).mean(0)
     train_ids = [sample.file_name for sample in train_ds.samples]
     splits = stable_split_ids(train_ids, int(data_cfg["split_seed"]), float(data_cfg["train_calib_fraction"]), int(data_cfg["train_audit_count"]))
     id_to_index = {sample.file_name: i for i, sample in enumerate(train_ds.samples)}
@@ -757,7 +768,11 @@ def main() -> None:
                     append_jsonl(output_dir / "evidence_components.jsonl", {"epoch": epoch, "optimizer_update": optimizer_update, **health, "named_coverage": payload["named_coverage"], "cf_valid_count": payload["cf_valid_count"]})
             iteration_end = time.perf_counter()
         epoch_dir = output_dir / f"epoch_{epoch:03d}"; epoch_dir.mkdir(parents=True, exist_ok=True)
-        metrics = evaluate_epoch(model, calib_loader, test_loader, device, epoch_dir, schedule["action"], schedule["reason"], cfg)
+        metrics = evaluate_epoch(
+            model, calib_loader, test_loader, device, epoch_dir,
+            schedule["action"], schedule["reason"], cfg,
+            target_prevalence=train_prevalence,
+        )
         if ema is not None and ema_model is not None:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -765,7 +780,8 @@ def main() -> None:
             ema_dir = epoch_dir / "ema"; ema_dir.mkdir(parents=True, exist_ok=True)
             metrics["ema"] = evaluate_epoch(
                 ema_model, calib_loader, test_loader, device, ema_dir,
-                schedule["action"], schedule["reason"], cfg, audit_limit=0,
+                schedule["action"], schedule["reason"], cfg,
+                target_prevalence=train_prevalence, audit_limit=0,
             )
         train_audit_logits, _, _ = collect_logits(model, audit_loader, device, schedule["action"], schedule["reason"])
         train_audit_metrics = aie_branch_metrics(

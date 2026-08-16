@@ -120,6 +120,11 @@ calibration:
   group_shrinkage_support: 100
   exclude_from_training: true
   test_oracle_writeback: false
+  prevalence_shrinkage:
+    enabled: true
+    action_multiplier: 3.0
+    reason_multiplier: 4.0
+    support_prior: 10.0
 reason_dr:
   gamma_pair: 2.0
   gamma_negative: 1.0

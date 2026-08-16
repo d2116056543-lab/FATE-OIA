@@ -16,6 +16,12 @@ def test_joint_and_refine_configs_enforce_training_contract():
         assert config["loss_weights"]["final_reason_dr"] > 0
         assert config["reason_dr"]["gamma_pair"] > config["reason_dr"]["gamma_negative"] > 0
         assert config["runtime"]["fixed_test_audit_samples"] == 32
+        assert config["calibration"]["prevalence_shrinkage"] == {
+            "enabled": True,
+            "action_multiplier": 3.0,
+            "reason_multiplier": 4.0,
+            "support_prior": 10.0,
+        }
     assert joint["ema"]["enabled"] is True
     assert refine["ema"]["enabled"] is False
     assert joint["loss_weights"]["final_reason_dr"] <= 0.005
@@ -25,4 +31,4 @@ def test_joint_and_refine_configs_enforce_training_contract():
 
 def test_ema_evaluation_does_not_repeat_expensive_counterfactual_audit():
     source = (Path(__file__).parents[1] / "fate_oia" / "engine" / "train_aie_oia.py").read_text()
-    assert 'schedule["action"], schedule["reason"], cfg, audit_limit=0' in source
+    assert "target_prevalence=train_prevalence, audit_limit=0" in source
