@@ -4,6 +4,7 @@ import torch
 from torch import nn
 
 from fate_oia.models.aie_trainable_decision_model import AIETrainableDecisionModel
+from fate_oia.engine.compose_aie_train_locked_deployment import compose_deployment_parameters
 from fate_oia.engine.train_aie_trainable_decision import (
     contradiction_weighted_reason_calibration_loss,
     decision_loss,
@@ -188,3 +189,17 @@ def test_reason_label_pair_ranking_uses_only_positive_vs_reliable_negative():
     assert float(logits.grad[0, 0]) < 0.0
     assert float(logits.grad[0, 1]) > 0.0
     assert float(logits.grad[0, 2]) == 0.0
+
+
+def test_composed_deployment_preserves_trained_action_and_locked_reason_boundaries():
+    action_scale_raw = torch.logit(torch.tensor([0.2, 0.3, 0.4, 0.5]))
+    threshold_raw = torch.zeros(25)
+    locked_threshold = torch.linspace(0.10, 0.82, 25)
+    action_scales, thresholds = compose_deployment_parameters(
+        action_scale_raw=action_scale_raw,
+        decision_threshold_raw=threshold_raw,
+        locked_threshold_prob=locked_threshold,
+    )
+    torch.testing.assert_close(action_scales, torch.tensor([0.2, 0.3, 0.4, 0.5]))
+    torch.testing.assert_close(thresholds[:4], torch.full((4,), 0.5))
+    torch.testing.assert_close(thresholds[4:], locked_threshold[4:])
