@@ -67,6 +67,7 @@ def main() -> None:
     parser.add_argument("--output", required=True)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=6)
+    parser.add_argument("--max-samples-per-split", type=int)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
 
@@ -84,6 +85,11 @@ def main() -> None:
         names = json.loads(Path(args.run_root, f"{split}_ids.json").read_text(encoding="utf-8"))
         datasets[split] = Subset(train, [by_name[name] for name in names])
     datasets["test"] = make_dataset(cfg, "test")
+    if args.max_samples_per_split is not None:
+        datasets = {
+            split: Subset(dataset, range(min(len(dataset), args.max_samples_per_split)))
+            for split, dataset in datasets.items()
+        }
 
     payload = {"original": {}, "flip": {}}
     for split, dataset in datasets.items():
