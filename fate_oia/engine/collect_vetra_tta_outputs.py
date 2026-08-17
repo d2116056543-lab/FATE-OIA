@@ -38,15 +38,23 @@ def remap_action_outputs(outputs: dict[str, torch.Tensor]) -> dict[str, torch.Te
     return outputs
 
 
-def collect(model, dataset, cfg, args, device, *, flipped: bool):
+def checkpoint_inference_scales(checkpoint, cfg) -> tuple[float, float]:
+    scales = checkpoint.get("inference_scales") or {}
+    return (
+        float(scales.get("action", 1.0)),
+        float(scales.get("reason", cfg["reason_private"]["reason_scale_max"])),
+    )
+
+
+def collect(model, dataset, cfg, args, device, *, flipped: bool, action_scale: float, reason_scale: float):
     source = HorizontalFlipDataset(dataset) if flipped else dataset
     loader = make_loader(source, args.batch_size, False, args.num_workers, cfg)
     outputs, _, _ = collect_logits(
         model,
         loader,
         device,
-        float(cfg["evidence"]["action_scale_start"]),
-        float(cfg["reason_private"]["reason_scale_start"]),
+        action_scale,
+        reason_scale,
     )
     return remap_action_outputs(outputs) if flipped else outputs
 
@@ -67,6 +75,7 @@ def main() -> None:
     model = build_model(cfg, device)
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     model.load_state_dict(canonical_model_state_dict(checkpoint["model"]), strict=True)
+    action_scale, reason_scale = checkpoint_inference_scales(checkpoint, cfg)
 
     train = make_dataset(cfg, "train")
     by_name = {sample.file_name: index for index, sample in enumerate(train.samples)}
@@ -78,13 +87,22 @@ def main() -> None:
 
     payload = {"original": {}, "flip": {}}
     for split, dataset in datasets.items():
-        payload["original"][split] = collect(model, dataset, cfg, args, device, flipped=False)
-        payload["flip"][split] = collect(model, dataset, cfg, args, device, flipped=True)
+        payload["original"][split] = collect(
+            model, dataset, cfg, args, device, flipped=False,
+            action_scale=action_scale, reason_scale=reason_scale,
+        )
+        payload["flip"][split] = collect(
+            model, dataset, cfg, args, device, flipped=True,
+            action_scale=action_scale, reason_scale=reason_scale,
+        )
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, output)
-    print(json.dumps({view: {split: len(rows["action_target"]) for split, rows in splits.items()} for view, splits in payload.items()}))
+    print(json.dumps({
+        "inference_scales": {"action": action_scale, "reason": reason_scale},
+        "counts": {view: {split: len(rows["action_target"]) for split, rows in splits.items()} for view, splits in payload.items()},
+    }))
 
 
 if __name__ == "__main__":

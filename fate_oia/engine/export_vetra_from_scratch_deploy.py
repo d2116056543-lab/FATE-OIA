@@ -22,8 +22,8 @@ def multilabel_metrics(prefix: str, probability: np.ndarray, target: np.ndarray,
     }
 
 
-def concatenate(payload, view: str, key: str) -> np.ndarray:
-    return torch.cat([payload[view][split][key] for split in ("train_calib", "train_audit")]).numpy()
+def concatenate(payload, view: str, key: str, splits: tuple[str, ...]) -> np.ndarray:
+    return torch.cat([payload[view][split][key] for split in splits]).numpy()
 
 
 def main() -> None:
@@ -35,12 +35,16 @@ def main() -> None:
     parser.add_argument("--regularization-c", type=float, default=10.0)
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--seed", type=int, default=20260815)
+    parser.add_argument("--fit-splits", nargs="+", default=["train_calib"])
     args = parser.parse_args()
 
     payload = torch.load(args.outputs, map_location="cpu", weights_only=False)
-    original_action = concatenate(payload, "original", "action_final")
-    flipped_action = concatenate(payload, "flip", "action_final")
-    action_target = concatenate(payload, "original", "action_target")
+    fit_splits = tuple(args.fit_splits)
+    if any(split == "test" for split in fit_splits):
+        raise RuntimeError("test outputs cannot be used to fit deployment parameters")
+    original_action = concatenate(payload, "original", "action_final", fit_splits)
+    flipped_action = concatenate(payload, "flip", "action_final", fit_splits)
+    action_target = concatenate(payload, "original", "action_target", fit_splits)
     mixed_action = args.original_weight * original_action + (1.0 - args.original_weight) * flipped_action
     fitted = fit_action_combo_oof(
         mixed_action,
@@ -59,8 +63,8 @@ def main() -> None:
     action_probability = model.predict_proba(scaler.transform(mixed_test)) @ class_bits
     test_action_target = payload["original"]["test"]["action_target"].numpy()
 
-    reason_train_logits = concatenate(payload, "original", "reason_final")
-    reason_train_target = concatenate(payload, "original", "reason_target")
+    reason_train_logits = concatenate(payload, "original", "reason_final", fit_splits)
+    reason_train_target = concatenate(payload, "original", "reason_target", fit_splits)
     reason_train_probability = 1.0 / (1.0 + np.exp(-reason_train_logits))
     reason_thresholds = fit_label_thresholds(reason_train_probability, reason_train_target)
     reason_test_logits = payload["original"]["test"]["reason_final"].numpy()
@@ -92,9 +96,9 @@ def main() -> None:
         "method": "clean AIE training + internal low-LR stage + action flip/combo deployment",
         "source_checkpoint": str(Path(args.source_checkpoint).resolve()),
         "source_checkpoint_sha256": checkpoint_hash,
-        "action_calibrator_fit_split": "train_calib+train_audit",
+        "action_calibrator_fit_split": "+".join(fit_splits),
         "action_threshold_fit_split": f"{args.folds}-fold train OOF",
-        "reason_threshold_fit_split": "train_calib+train_audit",
+        "reason_threshold_fit_split": "+".join(fit_splits),
         "test_labels_used_for_parameters": False,
         "original_weight": args.original_weight,
         "regularization_c": args.regularization_c,

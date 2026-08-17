@@ -1,9 +1,11 @@
 import pytest
 import torch
 
+from fate_oia.engine.collect_vetra_tta_outputs import checkpoint_inference_scales
 from fate_oia.engine.train_aie_oia import (
     checkpoint_selection_criteria,
     compatible_checkpoint_state_dict,
+    deployment_metrics_from_logits,
     load_config,
     schedule_values,
 )
@@ -21,6 +23,37 @@ def test_checkpoint_selection_tracks_genuine_fixed_metrics_separately_from_deplo
     assert criteria["fixed_action_mF1"] == 0.72
     assert criteria["fixed_reason_mF1"] == 0.36
     assert criteria["deploy_joint"] == 0.57
+
+
+def test_train_audit_deployment_metrics_apply_train_calib_thresholds():
+    action_logits = torch.tensor([[2.0, -2.0, -2.0, -2.0], [-2.0, 2.0, -2.0, -2.0]])
+    reason_logits = torch.full((2, 21), -2.0)
+    action_target = torch.tensor([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]])
+    reason_target = torch.zeros(2, 21)
+    thresholds = {"threshold_prob": torch.full((25,), 0.5)}
+
+    metrics = deployment_metrics_from_logits(
+        action_logits, reason_logits, action_target, reason_target, thresholds
+    )
+
+    assert metrics["final"]["Act_mF1"] == pytest.approx(0.5)
+    assert metrics["deploy"]["Act_mF1"] == pytest.approx(0.5)
+
+
+def test_clean_single_run_config_never_selects_or_trains_on_held_out_splits():
+    cfg = load_config("configs/fate_oia_train_360x640_vetra_clean_single_run.yaml")
+
+    assert cfg["experiment"]["best_selection_split"] == "train_audit"
+    assert cfg["experiment"]["internal_test_selected"] is False
+    assert cfg["calibration"]["exclude_from_training"] is True
+    assert cfg["data"]["train_on_all_train"] is False
+
+
+def test_tta_collection_uses_checkpoint_scales_not_schedule_start_values():
+    cfg = load_config("configs/fate_oia_train_360x640_vetra_clean_single_run.yaml")
+    checkpoint = {"inference_scales": {"action": 0.85, "reason": 0.55}}
+
+    assert checkpoint_inference_scales(checkpoint, cfg) == (0.85, 0.55)
 
 
 def test_checkpoint_loader_drops_only_known_nonpersistent_grammar_buffers():

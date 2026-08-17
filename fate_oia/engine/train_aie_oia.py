@@ -397,6 +397,40 @@ def checkpoint_selection_criteria(selected: dict[str, Any]) -> dict[str, float]:
     }
 
 
+def deployment_metrics_from_logits(
+    action_logits: torch.Tensor,
+    reason_logits: torch.Tensor,
+    action_target: torch.Tensor,
+    reason_target: torch.Tensor,
+    thresholds: dict[str, Any],
+) -> dict[str, Any]:
+    """Evaluate a held-out train split with thresholds fitted on train-calib."""
+    final = aie_branch_metrics(action_logits, reason_logits, action_target, reason_target)
+    deploy_logits = apply_posthoc_threshold(
+        torch.cat((action_logits, reason_logits), 1), thresholds["threshold_prob"]
+    )
+    deploy = aie_branch_metrics(
+        deploy_logits[:, :4], deploy_logits[:, 4:], action_target, reason_target
+    )
+    return {"final": final, "deploy": deploy, "deploy_joint": deploy["joint"]}
+
+
+@torch.no_grad()
+def evaluate_selection_epoch(
+    model: AIEOIAModel,
+    audit_loader: DataLoader,
+    device: torch.device,
+    action_scale: float,
+    reason_scale: float,
+    thresholds: dict[str, Any],
+) -> dict[str, Any]:
+    audit, _, _ = collect_logits(model, audit_loader, device, action_scale, reason_scale)
+    return deployment_metrics_from_logits(
+        audit["action_final"], audit["reason_final"],
+        audit["action_target"], audit["reason_target"], thresholds,
+    )
+
+
 def _append_cpu(store: dict[str, list[torch.Tensor]], key: str, value: torch.Tensor, limit: int) -> None:
     store.setdefault(key, []).append(value[:limit].detach().to("cpu"))
 
@@ -593,10 +627,6 @@ def main() -> None:
     accumulation = args.gradient_accumulation_steps or int(training["gradient_accumulation_steps"])
     workers = args.num_workers if args.num_workers is not None else int(data_cfg["num_workers"])
     train_ds, test_ds = make_dataset(cfg, "train"), make_dataset(cfg, "test")
-    train_prevalence = torch.tensor(
-        [list(sample.action) + list(sample.reason) for sample in train_ds.samples],
-        dtype=torch.float32,
-    ).mean(0)
     train_ids = [sample.file_name for sample in train_ds.samples]
     splits = stable_split_ids(train_ids, int(data_cfg["split_seed"]), float(data_cfg["train_calib_fraction"]), int(data_cfg["train_audit_count"]))
     id_to_index = {sample.file_name: i for i, sample in enumerate(train_ds.samples)}
@@ -605,6 +635,10 @@ def main() -> None:
         train_indices = [id_to_index[x] for x in splits["train_fit"]]
     else:
         train_indices = list(range(len(train_ds)))
+    train_prevalence = torch.tensor(
+        [list(train_ds.samples[index].action) + list(train_ds.samples[index].reason) for index in train_indices],
+        dtype=torch.float32,
+    ).mean(0)
     train_count = min(args.max_train_samples or len(train_indices), len(train_indices))
     random.Random(seed).shuffle(train_indices)
     train_subset = Subset(train_ds, train_indices[:train_count])
@@ -703,7 +737,18 @@ def main() -> None:
         "train_calib_count": len(calib_indices),
         "calibration_excluded_from_training": exclude_calibration,
         "test_sample_count": len(test_subset),
+        "checkpoint_selection_split": cfg["experiment"].get("best_selection_split", "test"),
+        "test_metrics_used_for_checkpoint_selection": cfg["experiment"].get("best_selection_split") == "test",
+        "external_task_checkpoint": args.init_model_checkpoint,
     }
+    clean_selection = cfg["experiment"].get("best_selection_split") == "train_audit"
+    if args.run_kind == "full" and bool(cfg["experiment"].get("publication_eligible", False)):
+        if not clean_selection:
+            raise RuntimeError("Publication-eligible full runs must select checkpoints on train_audit")
+        if args.init_model_checkpoint:
+            raise RuntimeError("Publication-eligible clean runs cannot load an external task checkpoint")
+        if not exclude_calibration:
+            raise RuntimeError("train_calib and train_audit must be excluded from gradient training")
     write_json(output_dir / "run_manifest.json", manifest); Path(output_dir / "config_resolved.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
     for epoch in range(start_epoch, epochs):
         model.train(); optimizer.zero_grad(set_to_none=True); window = 0
@@ -845,6 +890,11 @@ def main() -> None:
             schedule["action"], schedule["reason"], cfg,
             target_prevalence=train_prevalence,
         )
+        selection_metrics = evaluate_selection_epoch(
+            model, audit_loader, device, schedule["action"], schedule["reason"],
+            metrics["calibration_thresholds"],
+        )
+        metrics["train_audit_selection"] = selection_metrics
         ema_checkpoint_state = None
         if ema is not None:
             ema_dir = epoch_dir / "ema"; ema_dir.mkdir(parents=True, exist_ok=True)
@@ -856,6 +906,10 @@ def main() -> None:
                     schedule["action"], schedule["reason"], cfg,
                     target_prevalence=train_prevalence, audit_limit=0,
                 )
+                metrics["ema_train_audit_selection"] = evaluate_selection_epoch(
+                    model, audit_loader, device, schedule["action"], schedule["reason"],
+                    metrics["ema"]["calibration_thresholds"],
+                )
                 ema_checkpoint_state = {
                     key: value.detach().cpu()
                     for key, value in canonical_model_state_dict(model.state_dict()).items()
@@ -863,12 +917,7 @@ def main() -> None:
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-        train_audit_logits, _, _ = collect_logits(model, audit_loader, device, schedule["action"], schedule["reason"])
-        train_audit_metrics = aie_branch_metrics(
-            train_audit_logits["action_final"], train_audit_logits["reason_final"],
-            train_audit_logits["action_target"], train_audit_logits["reason_target"],
-        )
-        write_json(epoch_dir / "train_audit_metrics.json", train_audit_metrics)
+        write_json(epoch_dir / "train_audit_metrics.json", selection_metrics)
         naming_summary = {
             "named_coverage": epoch_named_sum / max(epoch_named_count, 1),
             "quality_gt_random_rate": epoch_name_quality_hits / max(epoch_name_quality_count, 1),
@@ -889,8 +938,16 @@ def main() -> None:
         write_json(epoch_dir / "counterfactual_metrics.json", counterfactual_case_metrics(epoch_cf_cases, epoch_cf_invalid))
         write_json(epoch_dir / "owner_metrics.json", grad_before)
         write_json(epoch_dir / "runtime_metrics.json", {"epoch_seconds": time.perf_counter()-epoch_start, "max_reserved_gb": torch.cuda.max_memory_reserved()/2**30 if torch.cuda.is_available() else 0})
-        selected = metrics.get(str(ema_cfg.get("selection_view", "online")), metrics)
-        criteria = checkpoint_selection_criteria(selected)
+        selection_view = str(ema_cfg.get("selection_view", "online"))
+        selected = metrics.get(selection_view, metrics)
+        if clean_selection:
+            selection_metrics = metrics.get(
+                "ema_train_audit_selection" if selection_view == "ema" else "train_audit_selection",
+                metrics["train_audit_selection"],
+            )
+        else:
+            selection_metrics = selected
+        criteria = checkpoint_selection_criteria(selection_metrics)
         improved = []
         for key, value in criteria.items():
             if value >= best.get(key, float("-inf")):
@@ -898,7 +955,10 @@ def main() -> None:
         checkpoint = {
             "model": canonical_model_state_dict(model.state_dict()), "optimizer": optimizer.state_dict(), "scheduler_update": optimizer_update,
             "epoch": epoch, "micro_step": len(train_loader), "optimizer_update": optimizer_update, "best": dict(best),
-            "rng_state": capture_rng_state(), "metrics": metrics, "calibration": selected["calibration_thresholds"],
+            "rng_state": capture_rng_state(), "metrics": metrics, "selection_metrics": selection_metrics,
+            "selection_split": "train_audit" if clean_selection else "test",
+            "calibration": selected["calibration_thresholds"],
+            "inference_scales": {"action": schedule["action"], "reason": schedule["reason"]},
             "reason_rank_memory": {key: value.detach().cpu() for key, value in reason_rank_memory.items()},
             "ema": None if ema is None else ema.state_dict(),
             "manifest": manifest, "manifest_hash": object_sha256(manifest), "split_manifest_hash": manifest["split_manifest_hash"],
@@ -914,10 +974,33 @@ def main() -> None:
             best_checkpoint["model"] = ema_checkpoint_state
             best_checkpoint["selected_view"] = "ema"
         for key in improved:
-            torch.save(best_checkpoint, output_dir / f"checkpoint_best_test_{key}.pth")
+            prefix = "checkpoint_best_train_audit" if clean_selection else "checkpoint_best_test"
+            torch.save(best_checkpoint, output_dir / f"{prefix}_{key}.pth")
         print(json.dumps(json_safe({"event": "aie_epoch", "epoch": epoch, **metrics})), flush=True)
     if args.run_kind == "full":
-        write_json(output_dir / "GOAL_COMPLETED_AIE_OIA_V1.json", {"complete": True, "epochs": epochs, "best": best})
+        final_checkpoint = None
+        final_metrics = None
+        if clean_selection:
+            selected_path = output_dir / "checkpoint_best_train_audit_deploy_joint.pth"
+            if not selected_path.exists():
+                raise RuntimeError("train-audit-selected deployment checkpoint was not produced")
+            selected_checkpoint = torch.load(selected_path, map_location="cpu")
+            final_checkpoint = output_dir / "checkpoint_final_train_audit_selected.pth"
+            torch.save(selected_checkpoint, final_checkpoint)
+            selected_view = str(selected_checkpoint.get("selected_view", "online"))
+            final_metrics = selected_checkpoint["metrics"].get(
+                selected_view, selected_checkpoint["metrics"]
+            )
+            write_json(output_dir / "final_selected_test_metrics.json", final_metrics)
+        write_json(output_dir / "GOAL_COMPLETED_AIE_OIA_V1.json", {
+            "complete": True,
+            "epochs": epochs,
+            "best": best,
+            "checkpoint_selection_split": "train_audit" if clean_selection else "test",
+            "test_metrics_used_for_checkpoint_selection": not clean_selection,
+            "final_checkpoint": None if final_checkpoint is None else str(final_checkpoint),
+            "final_test_metrics": final_metrics,
+        })
 
 
 if __name__ == "__main__":
