@@ -66,7 +66,7 @@ class AIEReasonRereader(nn.Module):
         predicate_probs: Tensor,
         reason_logits_primary: Tensor,
         *,
-        reason_scale: float = 1.0,
+        reason_scale: float | Tensor = 1.0,
         action_prior_enabled: bool = True,
         predicate_prior_enabled: bool = True,
     ) -> dict[str, Tensor]:
@@ -119,7 +119,18 @@ class AIEReasonRereader(nn.Module):
         private = sum(torch.einsum("brn,bnd->brd", attention[:, :, layer], layer_values[layer]) for layer in range(self.num_layers))
         private = private + self.private_attention(private, private, private, need_weights=False)[0]
         raw_delta = self.delta_head(private).squeeze(-1)
-        delta = float(reason_scale) * self.kappa * torch.tanh(raw_delta / self.kappa)
+        scale = torch.as_tensor(reason_scale, device=raw_delta.device, dtype=raw_delta.dtype)
+        if scale.ndim == 1:
+            if scale.shape[0] != self.reason_dim:
+                raise ValueError(
+                    f"reason_scale must be scalar or [{self.reason_dim}], got {tuple(scale.shape)}"
+                )
+            scale = scale.view(1, self.reason_dim)
+        elif scale.ndim != 0:
+            raise ValueError(
+                f"reason_scale must be scalar or [{self.reason_dim}], got {tuple(scale.shape)}"
+            )
+        delta = scale * self.kappa * torch.tanh(raw_delta / self.kappa)
         final = reason_logits_primary + delta
         final_train = reason_logits_primary.detach() + delta
         return {

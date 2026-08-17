@@ -36,6 +36,7 @@ def test_name_accepts_one_clear_localized_predicate_match():
     )
     assert out["name_id"].item() == 0
     assert out["name_confidence"].item() >= 0.45
+    assert out["name_confidence"].item() > out["name_quality"].amax().item()
 
 
 def test_compatibility_uses_the_planned_unscaled_inner_product():

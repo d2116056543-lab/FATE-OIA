@@ -51,8 +51,14 @@ class AIEPredicateNaming(nn.Module):
         )
         quality = soft_iou * compatibility * predicate_presence[:, None, None, :]
         if cf_effect is not None:
-            quality = quality * torch.sigmoid(cf_effect.detach())[..., None]
-        top = quality.topk(k=2, dim=-1)
+            # Zero counterfactual effect is neutral rather than a silent 0.5
+            # penalty; negative evidence can still suppress an unsafe name.
+            cf_relevance = (2.0 * torch.sigmoid(cf_effect.detach())).clamp(0.0, 1.0)
+            quality = quality * cf_relevance[..., None]
+        # The raw product remains the naming alignment signal. Confidence is
+        # its geometric mean so the fixed threshold has a per-factor meaning.
+        calibrated_quality = quality.clamp_min(0.0).pow(0.25)
+        top = calibrated_quality.topk(k=2, dim=-1)
         confidence = top.values[..., 0]
         margin = top.values[..., 0] - top.values[..., 1]
         top_id = top.indices[..., 0]
@@ -68,6 +74,7 @@ class AIEPredicateNaming(nn.Module):
             "name_confidence": confidence,
             "name_margin": margin,
             "name_quality": quality,
+            "name_calibrated_quality": calibrated_quality,
             "name_spatial_soft_iou": soft_iou,
             "name_compatibility": compatibility,
             "named_coverage": valid.float().mean(),

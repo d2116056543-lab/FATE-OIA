@@ -92,7 +92,7 @@ class AIEOIAModel(nn.Module):
         field: dict[str, Any],
         *,
         action_scale: ActionScale,
-        reason_scale: float,
+        reason_scale: ActionScale,
         predicate_bias_enabled: bool = True,
         local_reread_enabled: bool = True,
         group_attention_enabled: bool = True,
