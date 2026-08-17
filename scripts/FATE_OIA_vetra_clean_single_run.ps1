@@ -20,7 +20,14 @@ $log = Join-Path $root 'full_train.log'
 New-Item -ItemType Directory -Force -Path $root | Out-Null
 
 $dino = Join-Path $worktree 'ckp\reference\dino_deitsmall8_pretrain.pth'
-if (-not (Test-Path -LiteralPath $dino)) { throw "Official DINO checkpoint missing: $dino" }
+if (-not (Test-Path -LiteralPath $dino)) {
+    $sharedDino = 'E:\sbw\FATE_Drive\fate_oia_worktree\ckp\reference\dino_deitsmall8_pretrain.pth'
+    if (-not (Test-Path -LiteralPath $sharedDino)) {
+        throw "Official DINO checkpoint missing from worktree and shared reference: $dino"
+    }
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dino) | Out-Null
+    New-Item -ItemType HardLink -Path $dino -Target $sharedDino | Out-Null
+}
 
 function Invoke-LoggedPython([string[]]$Arguments) {
     $oldPreference = $ErrorActionPreference
