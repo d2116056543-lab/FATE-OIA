@@ -16,6 +16,6 @@ def test_clean_checkpoint_selection_is_computed_from_train_audit_not_test_metric
 
     assert "selection_metrics = evaluate_selection_epoch" in epoch_loop
     assert "criteria = checkpoint_selection_criteria(selection_metrics)" in epoch_loop
-    assert "checkpoint_best_train_audit_" in epoch_loop
-    assert "checkpoint_best_test_" not in epoch_loop
+    assert 'prefix = "checkpoint_best_train_audit" if clean_selection else "checkpoint_best_test"' in epoch_loop
+    assert "criteria = checkpoint_selection_criteria(selected)" not in epoch_loop
 
