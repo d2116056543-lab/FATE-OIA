@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+from typing import Sequence, Union
+
 import torch
 from torch import Tensor, nn
+
+
+ActionScale = Union[float, Tensor, Sequence[float]]
 
 
 def direction_preserving_l2_cap(logits: Tensor, cap: float = 20.0) -> Tensor:
@@ -22,17 +27,37 @@ class AIEContributionHead(nn.Module):
         self.bias = nn.Parameter(torch.zeros(action_dim, probes_per_action))
         nn.init.normal_(self.weight, std=1e-3)
 
-    def forward(self, evidence_token: Tensor, action_logits_primary: Tensor, *, action_scale: float = 1.0) -> dict[str, Tensor]:
+    def _scale_row(self, action_scale: ActionScale, reference: Tensor) -> Tensor:
+        scale = torch.as_tensor(action_scale, device=reference.device, dtype=reference.dtype)
+        if scale.ndim == 0:
+            scale = scale.expand(self.action_dim)
+        if scale.shape != (self.action_dim,):
+            raise ValueError(
+                "action_scale must be a scalar or contain exactly four action values "
+                f"(expected {self.action_dim}, got shape {tuple(scale.shape)})"
+            )
+        if not bool(torch.isfinite(scale).all()):
+            raise ValueError("action_scale values must be finite")
+        return scale.view(1, self.action_dim)
+
+    def forward(
+        self,
+        evidence_token: Tensor,
+        action_logits_primary: Tensor,
+        *,
+        action_scale: ActionScale = 1.0,
+    ) -> dict[str, Tensor]:
         raw = torch.einsum("bakd,ad->bak", self.norm(evidence_token), self.weight) + self.bias[None]
         summed = raw.sum(-1)
-        bounded_delta = float(action_scale) * self.kappa * torch.tanh(summed / self.kappa)
+        scale_row = self._scale_row(action_scale, summed)
+        bounded_delta = scale_row * self.kappa * torch.tanh(summed / self.kappa)
         uncapped_final = action_logits_primary + bounded_delta
         final = direction_preserving_l2_cap(uncapped_final, self.logit_norm_cap)
         exact_delta = final - action_logits_primary
         ratio = torch.where(
             summed.abs() > 1e-7,
             exact_delta / summed,
-            torch.full_like(summed, float(action_scale)),
+            scale_row.expand_as(summed),
         )
         bounded_contribution = torch.where(
             (summed.abs() > 1e-7)[..., None],
