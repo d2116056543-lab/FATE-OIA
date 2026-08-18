@@ -46,7 +46,7 @@ $manifest = [ordered]@{
     random_task_head_initialization = $true
     external_task_checkpoint = $null
     checkpoint_selection_split = 'train_audit'
-    deployment_fit_split = 'train_calib'
+    deployment_fit_split = 'train_calib+train_audit'
     test_labels_used_for_parameters = $false
     feature_cache_enabled = $false
     token_compression = 'none'
@@ -97,9 +97,9 @@ Invoke-LoggedPython @(
     '--outputs', $outputs,
     '--source-checkpoint', $selected,
     '--output-dir', $deployment,
-    '--fit-splits', 'train_calib',
-    '--original-weight', '0.75',
-    '--regularization-c', '10.0',
+    '--fit-splits', 'train_calib', 'train_audit',
+    '--select-hyperparameters',
+    '--stable-action-thresholds',
     '--folds', '5'
 )
 
