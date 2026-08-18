@@ -96,3 +96,145 @@ def fit_label_thresholds(
         ]
         thresholds.append(grid[int(np.argmax(scores))])
     return np.asarray(thresholds, dtype=np.float32)
+
+
+def fit_stable_label_thresholds(
+    probability: np.ndarray,
+    target: np.ndarray,
+    *,
+    folds: int = 10,
+    seed: int = 20260815,
+) -> dict[str, np.ndarray]:
+    """Reduce threshold variance with train-only jackknife medians."""
+    probability = np.asarray(probability, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    if probability.ndim != 2 or target.shape != probability.shape:
+        raise ValueError("probabilities and targets must be matching [N,L] arrays")
+    if folds < 2 or len(probability) < folds:
+        raise ValueError("invalid threshold fold configuration")
+    splitter = KFold(n_splits=folds, shuffle=True, random_state=seed)
+    fold_thresholds = np.stack(
+        [
+            fit_label_thresholds(probability[fit_indices], target[fit_indices])
+            for fit_indices, _ in splitter.split(probability)
+        ]
+    )
+    return {
+        "thresholds": np.median(fold_thresholds, axis=0).astype(np.float32),
+        "fold_thresholds": fold_thresholds.astype(np.float32),
+        "full_sample_thresholds": fit_label_thresholds(probability, target),
+        "threshold_iqr": (
+            np.percentile(fold_thresholds, 75, axis=0)
+            - np.percentile(fold_thresholds, 25, axis=0)
+        ).astype(np.float32),
+    }
+
+
+def select_action_combo_hyperparameters(
+    original_logits: np.ndarray,
+    flipped_logits: np.ndarray,
+    target: np.ndarray,
+    *,
+    original_weights: Sequence[float],
+    regularization_cs: Sequence[float],
+    outer_folds: int = 5,
+    inner_folds: int = 4,
+    seed: int = 20260815,
+) -> dict[str, object]:
+    """Select deployment hyperparameters using nested train-only OOF scores."""
+    original_logits = np.asarray(original_logits, dtype=np.float64)
+    flipped_logits = np.asarray(flipped_logits, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    if original_logits.ndim != 2 or original_logits.shape != target.shape:
+        raise ValueError("original logits and targets must be matching [N,A] arrays")
+    if flipped_logits.shape != original_logits.shape:
+        raise ValueError("original and flipped logits must have matching shapes")
+    weights = tuple(float(value) for value in original_weights)
+    regularizations = tuple(float(value) for value in regularization_cs)
+    if not weights or not regularizations:
+        raise ValueError("candidate grid must not be empty")
+    if len(original_logits) < outer_folds or outer_folds < 2 or inner_folds < 2:
+        raise ValueError("invalid nested fold configuration")
+
+    outer = KFold(n_splits=outer_folds, shuffle=True, random_state=seed)
+    candidates: list[dict[str, object]] = []
+    for original_weight in weights:
+        mixed = original_weight * original_logits + (1.0 - original_weight) * flipped_logits
+        for regularization_c in regularizations:
+            fold_scores = []
+            for fold, (fit_indices, held_indices) in enumerate(outer.split(mixed)):
+                fold_inner_folds = min(inner_folds, len(fit_indices))
+                fitted = fit_action_combo_oof(
+                    mixed[fit_indices],
+                    target[fit_indices],
+                    regularization_c=regularization_c,
+                    folds=fold_inner_folds,
+                    seed=seed + fold + 1,
+                )
+                thresholds = fit_label_thresholds(
+                    fitted["oof_action_probability"], target[fit_indices]
+                )
+                scaler, model = fitted["scaler"], fitted["model"]
+                held_combo = model.predict_proba(scaler.transform(mixed[held_indices]))
+                held_probability = held_combo @ _combo_membership(
+                    model.classes_, target.shape[1]
+                )
+                held_prediction = held_probability >= thresholds[None, :]
+                macro_f1 = float(
+                    np.mean(
+                        [
+                            f1_score(
+                                target[held_indices, label],
+                                held_prediction[:, label],
+                                zero_division=0,
+                            )
+                            for label in range(target.shape[1])
+                        ]
+                    )
+                )
+                overall_f1 = float(
+                    f1_score(
+                        target[held_indices].ravel(),
+                        held_prediction.ravel(),
+                        zero_division=0,
+                    )
+                )
+                fold_scores.append(
+                    {
+                        "fold": fold,
+                        "macro_f1": macro_f1,
+                        "overall_f1": overall_f1,
+                        "selection_score": 0.8 * macro_f1 + 0.2 * overall_f1,
+                    }
+                )
+            candidates.append(
+                {
+                    "original_weight": original_weight,
+                    "regularization_c": regularization_c,
+                    "mean_macro_f1": float(np.mean([row["macro_f1"] for row in fold_scores])),
+                    "mean_overall_f1": float(np.mean([row["overall_f1"] for row in fold_scores])),
+                    "mean_selection_score": float(
+                        np.mean([row["selection_score"] for row in fold_scores])
+                    ),
+                    "fold_scores": fold_scores,
+                }
+            )
+
+    ranked = sorted(
+        candidates,
+        key=lambda row: (
+            -row["mean_selection_score"],
+            -row["mean_macro_f1"],
+            -row["mean_overall_f1"],
+            abs(row["original_weight"] - 0.75),
+            row["regularization_c"],
+        ),
+    )
+    best = ranked[0]
+    return {
+        "selection_split": "provided_train_rows_nested_oof",
+        "selection_objective": "0.8*macro_f1+0.2*overall_f1",
+        "selected_original_weight": best["original_weight"],
+        "selected_regularization_c": best["regularization_c"],
+        "candidate_scores": ranked,
+    }

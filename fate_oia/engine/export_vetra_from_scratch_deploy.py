@@ -9,7 +9,12 @@ import numpy as np
 import torch
 from sklearn.metrics import average_precision_score, f1_score
 
-from fate_oia.utils.vetra_from_scratch import fit_action_combo_oof, fit_label_thresholds
+from fate_oia.utils.vetra_from_scratch import (
+    fit_action_combo_oof,
+    fit_label_thresholds,
+    fit_stable_label_thresholds,
+    select_action_combo_hyperparameters,
+)
 
 
 def multilabel_metrics(prefix: str, probability: np.ndarray, target: np.ndarray, thresholds: np.ndarray):
@@ -36,6 +41,23 @@ def main() -> None:
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--seed", type=int, default=20260815)
     parser.add_argument("--fit-splits", nargs="+", default=["train_calib"])
+    parser.add_argument("--select-hyperparameters", action="store_true")
+    parser.add_argument(
+        "--candidate-original-weights",
+        nargs="+",
+        type=float,
+        default=[0.0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0],
+    )
+    parser.add_argument(
+        "--candidate-regularization-cs",
+        nargs="+",
+        type=float,
+        default=[0.001, 0.01, 0.1, 1.0, 10.0],
+    )
+    parser.add_argument("--selection-outer-folds", type=int, default=5)
+    parser.add_argument("--selection-inner-folds", type=int, default=4)
+    parser.add_argument("--stable-action-thresholds", action="store_true")
+    parser.add_argument("--threshold-folds", type=int, default=10)
     args = parser.parse_args()
 
     payload = torch.load(args.outputs, map_location="cpu", weights_only=False)
@@ -45,6 +67,23 @@ def main() -> None:
     original_action = concatenate(payload, "original", "action_final", fit_splits)
     flipped_action = concatenate(payload, "flip", "action_final", fit_splits)
     action_target = concatenate(payload, "original", "action_target", fit_splits)
+    hyperparameter_selection = None
+    if args.select_hyperparameters:
+        hyperparameter_selection = select_action_combo_hyperparameters(
+            original_action,
+            flipped_action,
+            action_target,
+            original_weights=args.candidate_original_weights,
+            regularization_cs=args.candidate_regularization_cs,
+            outer_folds=args.selection_outer_folds,
+            inner_folds=args.selection_inner_folds,
+            seed=args.seed,
+        )
+        hyperparameter_selection["selection_split"] = (
+            "+".join(fit_splits) + "_nested_oof"
+        )
+        args.original_weight = hyperparameter_selection["selected_original_weight"]
+        args.regularization_c = hyperparameter_selection["selected_regularization_c"]
     mixed_action = args.original_weight * original_action + (1.0 - args.original_weight) * flipped_action
     fitted = fit_action_combo_oof(
         mixed_action,
@@ -53,7 +92,17 @@ def main() -> None:
         folds=args.folds,
         seed=args.seed,
     )
-    action_thresholds = fit_label_thresholds(fitted["oof_action_probability"], action_target)
+    stable_threshold_diagnostics = None
+    if args.stable_action_thresholds:
+        stable_threshold_diagnostics = fit_stable_label_thresholds(
+            fitted["oof_action_probability"],
+            action_target,
+            folds=args.threshold_folds,
+            seed=args.seed,
+        )
+        action_thresholds = stable_threshold_diagnostics["thresholds"]
+    else:
+        action_thresholds = fit_label_thresholds(fitted["oof_action_probability"], action_target)
     scaler, model = fitted["scaler"], fitted["model"]
     class_bits = ((model.classes_[:, None] & (1 << np.arange(action_target.shape[1]))) > 0).astype(float)
 
@@ -97,11 +146,21 @@ def main() -> None:
         "source_checkpoint": str(Path(args.source_checkpoint).resolve()),
         "source_checkpoint_sha256": checkpoint_hash,
         "action_calibrator_fit_split": "+".join(fit_splits),
-        "action_threshold_fit_split": f"{args.folds}-fold train OOF",
+        "action_threshold_fit_split": f"{args.folds}-fold {'+'.join(fit_splits)} OOF",
         "reason_threshold_fit_split": "+".join(fit_splits),
         "test_labels_used_for_parameters": False,
         "original_weight": args.original_weight,
         "regularization_c": args.regularization_c,
+        "hyperparameter_selection": hyperparameter_selection,
+        "stable_action_thresholds": args.stable_action_thresholds,
+        "stable_threshold_diagnostics": (
+            None
+            if stable_threshold_diagnostics is None
+            else {
+                key: value.tolist()
+                for key, value in stable_threshold_diagnostics.items()
+            }
+        ),
         "action_thresholds": action_thresholds.tolist(),
         "reason_thresholds": reason_thresholds.tolist(),
         "metrics": result,
