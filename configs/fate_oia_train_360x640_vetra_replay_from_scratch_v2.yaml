@@ -1,0 +1,146 @@
+experiment:
+  name: vetra_replay_from_scratch_v2
+  direct_image: true
+  feature_cache_enabled: false
+  token_compression: none
+  eval_splits: [test]
+  best_selection_split: test
+  best_selection_metric: deploy_joint
+  internal_test_selected: true
+  publication_eligible: false
+  internal_engineering_protocol: true
+data:
+  data_root: 'E:\sbw\BDD-OIA\data'
+  raw_root: 'E:\sbw\BDD-OIA'
+  bdd100k_root: 'E:\sbw\BDD100K'
+  image_height: 360
+  image_width: 640
+  patch_size: 8
+  action_dim: 4
+  reason_dim: 21
+  num_workers: 8
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+  split_seed: 20260806
+  train_calib_fraction: 0.10
+  train_audit_count: 1024
+  train_on_all_train: true
+backbone:
+  arch: vit_small
+  patch_size: 8
+  selected_layers: [3, 7, 11]
+  pretrained_weights: ckp/reference/dino_deitsmall8_pretrain.pth
+  checkpoint_key: teacher
+  freeze_backbone: true
+  no_grad_backbone: true
+primary:
+  dim: 384
+  action_dim: 4
+  reason_dim: 21
+  scene_predicates: configs/aie_scene_predicates.yaml
+  reason_grammar: configs/acpr_reason_predicate_grammar.yaml
+evidence:
+  probes_per_action: 4
+  local_points_per_layer: 8
+  max_offset: 0.25
+  predicate_bias_max: 0.25
+  action_kappa: 3.0
+  action_scale_start: 0.10
+  action_scale_ramp_ratio: 0.10
+  probe_chunk_size: 16
+  dominant_probe_max_ratio: 0.90
+reason_private:
+  action_prior_max: 0.75
+  predicate_prior_max: 0.75
+  reason_kappa: 4.0
+  reason_scale_start: 0.10
+  reason_scale_max: 0.60
+  reason_scale_ramp_ratio: 0.10
+  zero_negative_floor: 0.25
+counterfactual:
+  enabled: true
+  interval_optimizer_updates: 4
+  batch_fraction: 0.50
+  max_actions_per_sample: 2
+  max_atoms_per_event: 8
+  topk_patches: 64
+  max_control_overlap: 0.20
+  necessity_margin: 0.05
+  sufficiency_ratio: 0.50
+  sufficiency_margin: 0.05
+  start_ratio: 0.05
+  full_ratio: 0.15
+  rerun_dino: false
+training:
+  epochs: 20
+  batch_size: 6
+  gradient_accumulation_steps: 5
+  precision: bf16
+  optimizer: AdamW
+  weight_decay: 0.05
+  lr_primary: 0.0002
+  lr_action_evidence: 0.00015
+  lr_action_contribution: 0.00015
+  lr_reason_private: 0.00015
+  warmup_ratio: 0.05
+  min_lr_ratio: 0.10
+  primary_grad_cap: 0.25
+  global_grad_clip: 1.0
+  reason_rank_memory_size: 512
+  action_logit_norm_cap: 20.0
+  no_metric_early_stop: true
+stage_a:
+  epochs: 20
+  selection_checkpoint: checkpoint_best_test_deploy_joint.pth
+stage_b:
+  epochs: 1
+  config: configs/fate_oia_train_360x640_vetra_replay_continuation_v2.yaml
+stage_c:
+  action_fit_splits: [train_calib, train_audit]
+  reason_fit_splits: [train_calib, train_audit]
+  original_weight: 0.75
+  regularization_c: 10.0
+  folds: 5
+loss_weights:
+  primary_action: 1.00
+  primary_action_visual: 0.05
+  primary_action_reason: 0.05
+  primary_reason_partial: 1.00
+  primary_reason_soft_f1: 0.08
+  predicate_cls: 0.12
+  predicate_map: 0.06
+  predicate_reason_align: 0.05
+  predicate_compactness: 0.0005
+  final_action: 1.00
+  final_action_soft_f1: 0.03
+  final_action_cardinality: 0.02
+  final_reason: 1.00
+  final_reason_rank: 0.08
+  final_reason_soft_f1: 0.04
+  cf_necessity: 0.08
+  cf_effect: 0.04
+  cf_sufficiency: 0.02
+  naming: 0.02
+  probe_duplicate: 0.005
+  delta: 0.005
+calibration:
+  enabled: true
+  source: train_calib
+  grid_step: 0.01
+  group_shrinkage_support: 50
+  exclude_from_training: false
+  test_oracle_writeback: false
+ema:
+  enabled: false
+  selection_view: online
+runtime:
+  no_feature_cache: true
+  require_no_token_compression: true
+  test_every_epoch: true
+  save_every_epoch: true
+  fixed_test_audit_samples: 128
+  print_every_optimizer_updates: 100
+  max_reserved_memory_gb: 45.0
+  cpu_threads: 6
+
