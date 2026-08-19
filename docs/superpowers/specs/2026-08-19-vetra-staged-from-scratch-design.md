@@ -8,7 +8,7 @@ Produce one auditable BDD-OIA run that starts from the official frozen DINO ViT-
 
 The prior clean run already reached `Act_mAP=0.797036` and `Exp_mAP=0.383989`, while the historical strong-refine result had `Act_mAP=0.798167` and `Exp_mAP=0.384217`. The remaining gap is therefore primarily deployment calibration and action refinement, not missing visual ranking capacity.
 
-The historical strong-refine source checkpoint already produced `Act_mF1=0.720359`, `Exp_mF1=0.407559`, and `Exp_oF1=0.574672`. Its refiner changed the final metrics by approximately `+0.012624/+0.000130/+0.000206`, so the valid lesson is to freeze a mature base before action-only refinement. It is not valid to load that source checkpoint in the new run.
+The historical strong-refine source checkpoint already produced `Act_mF1=0.720359`, `Exp_mF1=0.407559`, and `Exp_oF1=0.574672`. The strongest exported artifact reached approximately `+0.012624/+0.000130/+0.000206` above that source, but forensic inspection showed that the final exporter consumed the source checkpoint plus action TTA/combo calibration rather than the separately trained refiner checkpoint. The valid lesson is therefore narrower: preserve a mature base, keep any action-only refinement fail-closed, and reproduce the proven TTA/combo deployment. It is not valid to load that source checkpoint in the new run or to assume Stage B is beneficial.
 
 The clean deployment experiment also proved that fitting reason thresholds on `train_calib+train_audit` was harmful: it reduced `Exp_mF1/Exp_oF1` from `0.405597/0.554805` to `0.402463/0.536148`. Action and reason deployment fitting must therefore use independent train-only split policies.
 
@@ -40,7 +40,7 @@ Load only `checkpoint_stage_a_selected.pth` from the same run root. Freeze the f
 
 Train the refiner for at most three epochs on the same 13,450-image gradient-training split. The objective contains action ASL, pairwise AP, smooth AP, and bounded delta regularization. Reason logits are copied directly from Stage A and receive no gradient. Candidate gains include zero and bounded positive values; per-action gain selection uses `train_calib` thresholds and `train_audit` F1/AP. The selected refiner checkpoint is based only on train-audit action score with an explicit no-regression guard on the frozen reason identity hash.
 
-Stage B writes `checkpoint_stage_b_selected.pth`, `stage_b_gain_audit.json`, gradient ownership evidence, action delta RMS, per-action AP/F1 deltas, and the Stage A parent checkpoint SHA256.
+Stage B writes `checkpoint_stage_b_selected.pth`, `stage_b_gain_audit.json`, gradient ownership evidence, action delta RMS, per-action AP/F1 deltas, and the Stage A parent checkpoint SHA256. The candidate set includes an explicit no-refiner state, not merely zero numerical gain inside a mutated refiner. If no candidate improves the declared train-audit action score without changing reason identity, Stage B selects the untouched Stage A model and records `refiner_selected=false`.
 
 ### Stage C: Independent Train-Only Deployment
 
