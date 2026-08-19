@@ -31,6 +31,17 @@ def concatenate(payload, view: str, key: str, splits: tuple[str, ...]) -> np.nda
     return torch.cat([payload[view][split][key] for split in splits]).numpy()
 
 
+def resolve_fit_splits(action_splits, reason_splits):
+    action = tuple(action_splits)
+    reason = action if reason_splits is None else tuple(reason_splits)
+    for name, splits in (("action", action), ("reason", reason)):
+        if not splits:
+            raise ValueError(f"{name} fit splits must be non-empty")
+        if "test" in splits:
+            raise ValueError(f"test outputs cannot be used to fit {name} deployment parameters")
+    return action, reason
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--outputs", required=True)
@@ -41,6 +52,7 @@ def main() -> None:
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--seed", type=int, default=20260815)
     parser.add_argument("--fit-splits", nargs="+", default=["train_calib"])
+    parser.add_argument("--reason-fit-splits", nargs="+", default=None)
     parser.add_argument("--select-hyperparameters", action="store_true")
     parser.add_argument(
         "--candidate-original-weights",
@@ -61,9 +73,9 @@ def main() -> None:
     args = parser.parse_args()
 
     payload = torch.load(args.outputs, map_location="cpu", weights_only=False)
-    fit_splits = tuple(args.fit_splits)
-    if any(split == "test" for split in fit_splits):
-        raise RuntimeError("test outputs cannot be used to fit deployment parameters")
+    fit_splits, reason_fit_splits = resolve_fit_splits(
+        args.fit_splits, args.reason_fit_splits
+    )
     original_action = concatenate(payload, "original", "action_final", fit_splits)
     flipped_action = concatenate(payload, "flip", "action_final", fit_splits)
     action_target = concatenate(payload, "original", "action_target", fit_splits)
@@ -112,8 +124,12 @@ def main() -> None:
     action_probability = model.predict_proba(scaler.transform(mixed_test)) @ class_bits
     test_action_target = payload["original"]["test"]["action_target"].numpy()
 
-    reason_train_logits = concatenate(payload, "original", "reason_final", fit_splits)
-    reason_train_target = concatenate(payload, "original", "reason_target", fit_splits)
+    reason_train_logits = concatenate(
+        payload, "original", "reason_final", reason_fit_splits
+    )
+    reason_train_target = concatenate(
+        payload, "original", "reason_target", reason_fit_splits
+    )
     reason_train_probability = 1.0 / (1.0 + np.exp(-reason_train_logits))
     reason_thresholds = fit_label_thresholds(reason_train_probability, reason_train_target)
     reason_test_logits = payload["original"]["test"]["reason_final"].numpy()
@@ -147,7 +163,7 @@ def main() -> None:
         "source_checkpoint_sha256": checkpoint_hash,
         "action_calibrator_fit_split": "+".join(fit_splits),
         "action_threshold_fit_split": f"{args.folds}-fold {'+'.join(fit_splits)} OOF",
-        "reason_threshold_fit_split": "+".join(fit_splits),
+        "reason_threshold_fit_split": "+".join(reason_fit_splits),
         "test_labels_used_for_parameters": False,
         "original_weight": args.original_weight,
         "regularization_c": args.regularization_c,

@@ -106,7 +106,7 @@ def base_forward(base, images, cfg):
 @torch.no_grad()
 def collect(base, refiner, loader, device, cfg, gain=None):
     store = {key: [] for key in (
-        "base_action", "final_action", "reason", "delta", "action_target", "reason_target"
+        "base_action", "final_action", "base_reason", "reason", "delta", "action_target", "reason_target"
     )}
     names = []
     base.eval(); refiner.eval()
@@ -120,6 +120,7 @@ def collect(base, refiner, loader, device, cfg, gain=None):
         mapping = {
             "base_action": output["action_logits_final"],
             "final_action": refined["action_logits_final"],
+            "base_reason": output["reason_logits_final"],
             "reason": refined["reason_logits_final"],
             "delta": refined["action_delta_unscaled"],
             "action_target": batch["action"],
