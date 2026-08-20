@@ -19,6 +19,13 @@ from fate_oia.utils.vetra_stage_contracts import (
 )
 
 
+VETRA_REASON_THRESHOLD_PRIOR = [
+    0.715, 0.655, 0.675, 0.700, 0.680, 0.470, 0.010,
+    0.680, 0.495, 0.240, 0.550, 0.390, 0.250, 0.550,
+    0.465, 0.625, 0.605, 0.620, 0.660, 0.600, 0.660,
+]
+
+
 def validate_replay_config(cfg: dict[str, Any]) -> None:
     experiment = cfg["experiment"]
     if not experiment.get("direct_image"):
@@ -46,8 +53,25 @@ def validate_replay_config(cfg: dict[str, Any]) -> None:
     stage_c = cfg["stage_c"]
     if float(stage_c.get("original_weight", -1.0)) != 0.75:
         raise ValueError("Stage C original weight must be 0.75")
-    if float(stage_c.get("regularization_c", -1.0)) != 10.0:
-        raise ValueError("Stage C regularization must be 10")
+    if float(stage_c.get("regularization_c", -1.0)) != 1.0:
+        raise ValueError("Stage C regularization must be 1")
+    if not stage_c.get("select_action_hyperparameters"):
+        raise ValueError("Stage C must use nested train-only action selection")
+    if [float(value) for value in stage_c.get("candidate_original_weights", ())] != [0.75]:
+        raise ValueError("nested action selection must preserve the verified 0.75 TTA weight")
+    if [float(value) for value in stage_c.get("candidate_regularization_cs", ())] != [0.1, 1.0, 10.0]:
+        raise ValueError("nested action selection must compare C values 0.1, 1, and 10")
+    if stage_c.get("reason_threshold_mode") != "prior_anchored_train_oof":
+        raise ValueError("Stage C reason calibration must be prior anchored and train-only")
+    configured_prior = [float(value) for value in stage_c.get("reason_threshold_prior", ())]
+    if configured_prior != VETRA_REASON_THRESHOLD_PRIOR:
+        raise ValueError("Stage C must use the fixed historical train-only reason prior")
+    if float(stage_c.get("reason_prior_min_macro_gain", -1.0)) != 0.001:
+        raise ValueError("reason prior update must require 0.001 OOF macro-F1 gain")
+    if float(stage_c.get("reason_prior_alpha_step", -1.0)) != 0.05:
+        raise ValueError("reason prior alpha step must be 0.05")
+    if int(stage_c.get("reason_threshold_folds", -1)) != 5:
+        raise ValueError("reason prior selection must use 5 train-only folds")
     allowed = {"train_calib", "train_audit"}
     for key in ("action_fit_splits", "reason_fit_splits"):
         splits = set(stage_c.get(key, ()))
@@ -193,6 +217,21 @@ def build_replay_commands(
         *stage_c["reason_fit_splits"],
         "--folds",
         str(stage_c.get("folds", 5)),
+        "--select-hyperparameters",
+        "--candidate-original-weights",
+        *[str(value) for value in stage_c["candidate_original_weights"]],
+        "--candidate-regularization-cs",
+        *[str(value) for value in stage_c["candidate_regularization_cs"]],
+        "--reason-threshold-mode",
+        stage_c["reason_threshold_mode"],
+        "--reason-threshold-prior",
+        *[str(value) for value in stage_c["reason_threshold_prior"]],
+        "--reason-prior-min-macro-gain",
+        str(stage_c["reason_prior_min_macro_gain"]),
+        "--reason-prior-alpha-step",
+        str(stage_c["reason_prior_alpha_step"]),
+        "--reason-threshold-folds",
+        str(stage_c["reason_threshold_folds"]),
     ]
     if smoke_limits:
         for key in ("train", "calib", "audit", "test"):
