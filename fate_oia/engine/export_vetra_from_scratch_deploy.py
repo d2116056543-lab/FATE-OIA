@@ -12,6 +12,7 @@ from sklearn.metrics import average_precision_score, f1_score
 from fate_oia.utils.vetra_from_scratch import (
     fit_action_combo_oof,
     fit_label_thresholds,
+    fit_prior_anchored_label_thresholds,
     fit_stable_label_thresholds,
     select_action_combo_hyperparameters,
 )
@@ -70,6 +71,15 @@ def main() -> None:
     parser.add_argument("--selection-inner-folds", type=int, default=4)
     parser.add_argument("--stable-action-thresholds", action="store_true")
     parser.add_argument("--threshold-folds", type=int, default=10)
+    parser.add_argument(
+        "--reason-threshold-mode",
+        choices=("independent", "prior_anchored_train_oof"),
+        default="independent",
+    )
+    parser.add_argument("--reason-threshold-prior", nargs="+", type=float)
+    parser.add_argument("--reason-prior-min-macro-gain", type=float, default=0.001)
+    parser.add_argument("--reason-prior-alpha-step", type=float, default=0.05)
+    parser.add_argument("--reason-threshold-folds", type=int, default=5)
     args = parser.parse_args()
 
     payload = torch.load(args.outputs, map_location="cpu", weights_only=False)
@@ -131,7 +141,35 @@ def main() -> None:
         payload, "original", "reason_target", reason_fit_splits
     )
     reason_train_probability = 1.0 / (1.0 + np.exp(-reason_train_logits))
-    reason_thresholds = fit_label_thresholds(reason_train_probability, reason_train_target)
+    reason_threshold_diagnostics = None
+    if args.reason_threshold_mode == "prior_anchored_train_oof":
+        if args.reason_threshold_prior is None:
+            raise ValueError("prior-anchored reason calibration requires a threshold prior")
+        if args.reason_prior_alpha_step <= 0.0 or args.reason_prior_alpha_step > 1.0:
+            raise ValueError("reason prior alpha step must be in (0,1]")
+        alpha_grid = np.arange(
+            0.0,
+            1.0 + args.reason_prior_alpha_step * 0.5,
+            args.reason_prior_alpha_step,
+            dtype=np.float64,
+        ).clip(0.0, 1.0)
+        alpha_grid = np.unique(alpha_grid)
+        reason_threshold_diagnostics = fit_prior_anchored_label_thresholds(
+            reason_train_probability,
+            reason_train_target,
+            prior_thresholds=np.asarray(args.reason_threshold_prior, dtype=np.float64),
+            alpha_grid=alpha_grid,
+            folds=args.reason_threshold_folds,
+            seed=args.seed,
+            minimum_macro_gain=args.reason_prior_min_macro_gain,
+        )
+        reason_thresholds = reason_threshold_diagnostics["thresholds"]
+    else:
+        if args.reason_threshold_prior is not None:
+            raise ValueError("reason threshold prior is only valid in prior-anchored mode")
+        reason_thresholds = fit_label_thresholds(
+            reason_train_probability, reason_train_target
+        )
     reason_test_logits = payload["original"]["test"]["reason_final"].numpy()
     reason_probability = 1.0 / (1.0 + np.exp(-reason_test_logits))
     test_reason_target = payload["original"]["test"]["reason_target"].numpy()
@@ -152,6 +190,12 @@ def main() -> None:
             "class_codes": torch.from_numpy(model.classes_).long(),
             "action_thresholds": torch.from_numpy(action_thresholds),
             "reason_thresholds": torch.from_numpy(reason_thresholds),
+            "reason_threshold_mode": args.reason_threshold_mode,
+            "reason_threshold_alpha": (
+                None
+                if reason_threshold_diagnostics is None
+                else reason_threshold_diagnostics["selected_alpha"]
+            ),
             "original_weight": args.original_weight,
             "source_checkpoint_sha256": checkpoint_hash,
         },
@@ -164,6 +208,15 @@ def main() -> None:
         "action_calibrator_fit_split": "+".join(fit_splits),
         "action_threshold_fit_split": f"{args.folds}-fold {'+'.join(fit_splits)} OOF",
         "reason_threshold_fit_split": "+".join(reason_fit_splits),
+        "reason_threshold_mode": args.reason_threshold_mode,
+        "reason_threshold_diagnostics": (
+            None
+            if reason_threshold_diagnostics is None
+            else {
+                key: value.tolist() if isinstance(value, np.ndarray) else value
+                for key, value in reason_threshold_diagnostics.items()
+            }
+        ),
         "test_labels_used_for_parameters": False,
         "original_weight": args.original_weight,
         "regularization_c": args.regularization_c,

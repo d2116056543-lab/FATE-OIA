@@ -130,6 +130,101 @@ def fit_stable_label_thresholds(
     }
 
 
+def fit_prior_anchored_label_thresholds(
+    probability: np.ndarray,
+    target: np.ndarray,
+    *,
+    prior_thresholds: np.ndarray,
+    alpha_grid: np.ndarray,
+    folds: int = 5,
+    seed: int = 20260815,
+    minimum_macro_gain: float = 0.001,
+) -> dict[str, object]:
+    """Conservatively update a fixed threshold prior using train-only OOF evidence.
+
+    The smallest blend that clears the requested OOF macro-F1 gain is used. This
+    preserves the prior deployment prevalence unless current training rows prove
+    that a larger update is useful, and never reads evaluation labels.
+    """
+    probability = np.asarray(probability, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    prior = np.asarray(prior_thresholds, dtype=np.float64)
+    alphas = np.asarray(alpha_grid, dtype=np.float64)
+    if probability.ndim != 2 or target.shape != probability.shape:
+        raise ValueError("probabilities and targets must be matching [N,L] arrays")
+    if prior.shape != (target.shape[1],):
+        raise ValueError("prior thresholds must contain one value per label")
+    if folds < 2 or len(probability) < folds:
+        raise ValueError("invalid threshold fold configuration")
+    if alphas.ndim != 1 or len(alphas) == 0 or np.any(np.diff(alphas) < 0):
+        raise ValueError("alpha grid must be a non-empty sorted vector")
+    if not np.isclose(alphas[0], 0.0) or np.any((alphas < 0.0) | (alphas > 1.0)):
+        raise ValueError("alpha grid must start at zero and remain in [0,1]")
+    if minimum_macro_gain < 0.0:
+        raise ValueError("minimum macro gain must be non-negative")
+
+    splitter = KFold(n_splits=folds, shuffle=True, random_state=seed)
+    fold_data = [
+        (
+            held_indices,
+            fit_label_thresholds(probability[fit_indices], target[fit_indices]),
+        )
+        for fit_indices, held_indices in splitter.split(probability)
+    ]
+    candidate_scores: list[dict[str, float]] = []
+    for alpha in alphas:
+        oof_prediction = np.zeros_like(target, dtype=bool)
+        for held_indices, fold_thresholds in fold_data:
+            thresholds = alpha * fold_thresholds + (1.0 - alpha) * prior
+            oof_prediction[held_indices] = probability[held_indices] >= thresholds
+        macro_f1 = float(
+            np.mean(
+                [
+                    f1_score(
+                        target[:, label],
+                        oof_prediction[:, label],
+                        zero_division=0,
+                    )
+                    for label in range(target.shape[1])
+                ]
+            )
+        )
+        overall_f1 = float(
+            f1_score(target.ravel(), oof_prediction.ravel(), zero_division=0)
+        )
+        candidate_scores.append(
+            {
+                "alpha": float(alpha),
+                "macro_f1": macro_f1,
+                "overall_f1": overall_f1,
+            }
+        )
+
+    baseline = candidate_scores[0]
+    eligible = [
+        row
+        for row in candidate_scores
+        if row["macro_f1"] >= baseline["macro_f1"] + minimum_macro_gain
+        and row["overall_f1"] >= baseline["overall_f1"]
+    ]
+    selected = min(eligible, key=lambda row: row["alpha"]) if eligible else baseline
+    full_sample_thresholds = fit_label_thresholds(probability, target)
+    selected_alpha = float(selected["alpha"])
+    thresholds = (
+        selected_alpha * full_sample_thresholds
+        + (1.0 - selected_alpha) * prior
+    ).astype(np.float32)
+    return {
+        "thresholds": thresholds,
+        "selected_alpha": selected_alpha,
+        "prior_thresholds": prior.astype(np.float32),
+        "full_sample_thresholds": full_sample_thresholds,
+        "minimum_macro_gain": float(minimum_macro_gain),
+        "selection_rule": "smallest_alpha_with_oof_macro_gain_and_no_overall_drop",
+        "candidate_scores": candidate_scores,
+    }
+
+
 def select_action_combo_hyperparameters(
     original_logits: np.ndarray,
     flipped_logits: np.ndarray,

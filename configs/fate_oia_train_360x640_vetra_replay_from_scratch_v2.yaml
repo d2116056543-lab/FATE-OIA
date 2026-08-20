@@ -100,8 +100,17 @@ stage_c:
   action_fit_splits: [train_calib, train_audit]
   reason_fit_splits: [train_calib, train_audit]
   original_weight: 0.75
-  regularization_c: 10.0
+  regularization_c: 1.0
   folds: 5
+  select_action_hyperparameters: true
+  candidate_original_weights: [0.75]
+  candidate_regularization_cs: [0.1, 1.0, 10.0]
+  reason_threshold_mode: prior_anchored_train_oof
+  # Fixed before this replay from the historical train-only VETRA deployment.
+  reason_threshold_prior: [0.715, 0.655, 0.675, 0.700, 0.680, 0.470, 0.010, 0.680, 0.495, 0.240, 0.550, 0.390, 0.250, 0.550, 0.465, 0.625, 0.605, 0.620, 0.660, 0.600, 0.660]
+  reason_prior_min_macro_gain: 0.001
+  reason_prior_alpha_step: 0.05
+  reason_threshold_folds: 5
 loss_weights:
   primary_action: 1.00
   primary_action_visual: 0.05
@@ -143,4 +152,3 @@ runtime:
   print_every_optimizer_updates: 100
   max_reserved_memory_gb: 45.0
   cpu_threads: 6
-
