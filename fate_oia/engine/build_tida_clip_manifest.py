@@ -12,7 +12,7 @@ from fate_oia.datasets.tida_clip_manifest import (
     _phash64,
     file_sha256,
     normalize_source_id,
-    partition_train_records,
+    partition_source_grouped_records,
     validate_records,
     write_manifest,
 )
@@ -81,7 +81,7 @@ def build_records(source_manifests: list[Path]) -> list[TIDAClipRecord]:
             records.append(
                 TIDAClipRecord(
                     official_split=official_split,
-                    partition="test" if official_split == "test" else "unassigned",
+                    partition="unassigned",
                     file_name=str(row["image_name"]),
                     target_image_path=target_path,
                     clip_path=clip_path,
@@ -100,9 +100,7 @@ def build_records(source_manifests: list[Path]) -> list[TIDAClipRecord]:
                     source_row_index=row_index,
                 )
             )
-    train = partition_train_records([record for record in records if record.official_split == "train"])
-    test = [record for record in records if record.official_split == "test"]
-    result = train + sorted(test, key=lambda record: record.file_name)
+    result = partition_source_grouped_records(records)
     validation = validate_records(result, require_files=True)
     if not validation["pass"]:
         raise RuntimeError(f"TIDA manifest validation failed: {validation['errors']}")

@@ -61,6 +61,13 @@ def audit_manifest(manifest_path: Path, output_dir: Path) -> dict:
         values = [float(row[key]) for row in scores]
         return {name: float(np.percentile(values, value)) for name, value in (("p10", 10), ("p50", 50), ("p90", 90))} if values else {}
     counts = {partition: sum(row.partition == partition for row in rows) for partition in ("train_core", "train_calib", "train_audit", "test")}
+    official_counts = {split: sum(row.official_split == split for row in rows) for split in ("train", "test")}
+    split_migration = {
+        "official_train_to_internal_test": sum(row.official_split == "train" and row.partition == "test" for row in rows),
+        "official_test_to_internal_train": sum(row.official_split == "test" and row.partition != "test" for row in rows),
+        "official_train_retained_internal_train": sum(row.official_split == "train" and row.partition != "test" for row in rows),
+        "official_test_retained_internal_test": sum(row.official_split == "test" and row.partition == "test" for row in rows),
+    }
     duration_rate = sum(row.duration_seconds >= 4.8 for row in rows) / max(len(rows), 1)
     mapping_unique_rate = len({(row.official_split, row.file_name) for row in rows}) / max(len(rows), 1)
     target_exists_rate = sum(row.target_image_path.is_file() for row in rows) / max(len(rows), 1)
@@ -85,6 +92,10 @@ def audit_manifest(manifest_path: Path, output_dir: Path) -> dict:
         "manifest_sha256": file_sha256(manifest_path),
         "count": len(rows),
         "partition_counts": counts,
+        "official_split_counts": official_counts,
+        "split_strategy": "source_grouped_internal_3115_885",
+        "split_migration": split_migration,
+        "publication_eligible": False,
         "median_ssim": median_ssim,
         "mapping_unique_rate": mapping_unique_rate,
         "target_image_exists_rate": target_exists_rate,

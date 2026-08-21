@@ -46,8 +46,6 @@ class TIDAClipRecord:
             raise ValueError(f"invalid official_split: {self.official_split}")
         if self.partition not in PARTITIONS and self.partition != "unassigned":
             raise ValueError(f"invalid partition: {self.partition}")
-        if (self.official_split == "test") != (self.partition == "test") and self.partition != "unassigned":
-            raise ValueError("official_split and partition disagree")
         if len(self.action) != 4 or len(self.reason) != 21:
             raise ValueError("TIDA requires action_4 and reason_21")
 
@@ -115,6 +113,42 @@ def partition_train_records(
     for record in records:
         source_id = normalize_source_id(record.source_video_id)
         partition = "train_calib" if source_id in calib_ids else "train_audit" if source_id in audit_ids else "train_core"
+        result.append(replace(record, partition=partition))
+    return sorted(result, key=lambda row: (row.partition, row.file_name))
+
+
+def partition_source_grouped_records(
+    records: Sequence[TIDAClipRecord], *, seed: int = 20260821, test_count: int = 885,
+    calib_count: int = 312, audit_count: int = 512,
+) -> list[TIDAClipRecord]:
+    """Create deterministic internal splits without leaking an original video.
+
+    The supplied 4000-clip inventory contains image-level official train/test
+    assignments that overlap at the original-video level. We preserve those
+    assignments in ``official_split`` for provenance, but formal TIDA training
+    uses this source-grouped ``partition`` field.
+    """
+    groups: dict[str, list[TIDAClipRecord]] = {}
+    for record in records:
+        groups.setdefault(normalize_source_id(record.source_video_id), []).append(record)
+    ordered = _group_order(groups, seed)
+    test_indices = set(_exact_group_subset(ordered, test_count))
+    train_groups = [entry for index, entry in enumerate(ordered) if index not in test_indices]
+    calib_indices = set(_exact_group_subset(train_groups, calib_count))
+    non_calib_groups = [entry for index, entry in enumerate(train_groups) if index not in calib_indices]
+    audit_indices = set(_exact_group_subset(non_calib_groups, audit_count))
+    test_ids = {ordered[index][0] for index in test_indices}
+    calib_ids = {train_groups[index][0] for index in calib_indices}
+    audit_ids = {non_calib_groups[index][0] for index in audit_indices}
+    result = []
+    for record in records:
+        source_id = normalize_source_id(record.source_video_id)
+        partition = (
+            "test" if source_id in test_ids else
+            "train_calib" if source_id in calib_ids else
+            "train_audit" if source_id in audit_ids else
+            "train_core"
+        )
         result.append(replace(record, partition=partition))
     return sorted(result, key=lambda row: (row.partition, row.file_name))
 
@@ -192,7 +226,7 @@ def assert_no_partition_leakage(rows: Sequence[dict[str, Any] | TIDAClipRecord])
                 continue
             if not left.get("endpoint_phash") or not right.get("endpoint_phash"):
                 continue
-            distance = (int(left["endpoint_phash"]) ^ int(right["endpoint_phash"])).bit_count()
+            distance = bin(int(left["endpoint_phash"]) ^ int(right["endpoint_phash"])).count("1")
             if distance <= 4 and abs(float(left.get("duration_seconds", 0)) - float(right.get("duration_seconds", 0))) <= 0.1 and abs(float(left.get("fps", 0)) - float(right.get("fps", 0))) <= 0.5:
                 raise ValueError("partition leakage through endpoint near-duplicate")
 
