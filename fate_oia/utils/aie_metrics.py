@@ -9,11 +9,12 @@ from fate_oia.metrics import multilabel_metrics_from_logits
 
 
 def aie_branch_metrics(action_logits: Tensor, reason_logits: Tensor, action_target: Tensor, reason_target: Tensor, threshold: float | Tensor = 0.5) -> dict[str, Any]:
-    action = multilabel_metrics_from_logits(action_logits.float(), action_target.float(), threshold=threshold, prefix="Act_")
-    reason_threshold = threshold[4:] if isinstance(threshold, Tensor) and threshold.numel() == 25 else threshold
-    action_threshold = threshold[:4] if isinstance(threshold, Tensor) and threshold.numel() == 25 else threshold
-    if isinstance(threshold, Tensor) and threshold.numel() == 25:
-        action = multilabel_metrics_from_logits(action_logits.float(), action_target.float(), threshold=action_threshold, prefix="Act_")
+    joint_threshold = isinstance(threshold, Tensor) and threshold.numel() == 25
+    action_threshold = threshold[:4] if joint_threshold else threshold
+    reason_threshold = threshold[4:] if joint_threshold else threshold
+    action = multilabel_metrics_from_logits(
+        action_logits.float(), action_target.float(), threshold=action_threshold, prefix="Act_"
+    )
     reason = multilabel_metrics_from_logits(reason_logits.float(), reason_target.float(), threshold=reason_threshold, prefix="Exp_")
     return {**action, **reason, "joint": 0.5 * action["Act_mF1"] + 0.5 * reason["Exp_mF1"]}
 
