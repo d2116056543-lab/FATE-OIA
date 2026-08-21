@@ -166,7 +166,9 @@ def compare_last_frames(reference: np.ndarray, decoded: np.ndarray) -> dict[str,
         covariance = float(((ref - mu_x) * (dec - mu_y)).mean())
         c1, c2 = 0.01**2, 0.03**2
         ssim = ((2 * mu_x * mu_y + c1) * (2 * covariance + c2)) / ((mu_x**2 + mu_y**2 + c1) * (var_x + var_y + c2))
-    phash_distance = (_phash64(reference) ^ _phash64(decoded)).bit_count()
+    # bin().count() keeps the manifest audit compatible with the project's
+    # Python 3.9 runtime while computing the same unsigned Hamming distance.
+    phash_distance = bin(_phash64(reference) ^ _phash64(decoded)).count("1")
     passed = ssim >= 0.90 and psnr >= 20.0 and mae <= 0.08 and phash_distance <= 16
     return {"ssim": ssim, "psnr": psnr, "normalized_mae": mae, "phash_distance": phash_distance, "pass": passed}
 
