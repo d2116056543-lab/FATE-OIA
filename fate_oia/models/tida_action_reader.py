@@ -49,9 +49,12 @@ class TIDAActionReader(nn.Module):
         query = self.action_query(action_nodes)
         keys = self.factor_key(key_factors)
         nonnull_score = torch.einsum("bad,bfd->baf", query, keys) / math.sqrt(keys.shape[-1])
-        nonnull_score = nonnull_score + reliability.clamp_min(self.eps).log()[:, None]
         null_score = torch.einsum("bad,d->ba", query, self.null_key)[:, :, None] / math.sqrt(keys.shape[-1])
-        route = entmax15_bisect(torch.cat([nonnull_score, null_score], dim=-1), dim=-1)
+        nonnull_reliability = reliability.detach().clamp(0, 1)
+        null_reliability = (1.0 - nonnull_reliability.max(-1, keepdim=True).values).clamp_min(self.eps)
+        factor_reliability = torch.cat([nonnull_reliability, null_reliability], dim=-1)
+        route_score = torch.cat([nonnull_score, null_score], dim=-1)
+        route = entmax15_bisect(route_score + factor_reliability.clamp_min(self.eps).log()[:, None], dim=-1)
         visual_value = self.visual_value_projection(factors)
         null_value = torch.zeros(batch, 1, visual_value.shape[-1], device=visual_value.device, dtype=visual_value.dtype)
         factor_value = torch.cat([visual_value, null_value], dim=1)[:, None].expand(-1, self.num_actions, -1, -1)
@@ -68,6 +71,7 @@ class TIDAActionReader(nn.Module):
             "action_route": route,
             "action_factor_keys": torch.cat([keys, self.null_key.view(1, 1, -1).expand(batch, -1, -1)], dim=1),
             "action_factor_value": factor_value,
+            "action_factor_reliability": factor_reliability,
             "action_raw_factor_contribution": raw_contribution,
             "action_factor_contribution": bounded,
             "action_temporal_delta": delta,

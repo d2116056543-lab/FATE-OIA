@@ -16,6 +16,7 @@ class TIDAReasonReader(nn.Module):
         self.reason_query = nn.Linear(dim, dim)
         self.factor_key = nn.Linear(dim, dim)
         self.factor_value = nn.Linear(dim, dim)
+        self.null_key = nn.Parameter(torch.zeros(dim))
         self.private_attention = nn.MultiheadAttention(dim, num_heads=4, batch_first=True)
         self.delta_head = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, 1))
 
@@ -33,18 +34,28 @@ class TIDAReasonReader(nn.Module):
         query = self.reason_query(reason_nodes)
         keys = self.factor_key(factors)
         values = self.factor_value(factors)
+        null_key = self.null_key.view(1, 1, -1).expand(factors.shape[0], -1, -1)
+        null_value = torch.zeros_like(null_key)
+        keys = torch.cat([keys, null_key], dim=1)
+        values = torch.cat([values, null_value], dim=1)
+        null_reliability = (1.0 - weights.max(-1, keepdim=True).values).clamp_min(1e-7)
+        factor_reliability = torch.cat([weights, null_reliability], dim=-1)
         score = torch.einsum("brd,bfd->brf", query, keys) / math.sqrt(keys.shape[-1])
-        score = score + weights.clamp_min(1e-7).log()[:, None]
-        attention = torch.softmax(score, dim=-1) * weights[:, None]
-        attention = attention / attention.sum(-1, keepdim=True).clamp_min(1e-7)
+        attention = torch.softmax(score + factor_reliability.clamp_min(1e-7).log()[:, None], dim=-1)
+        no_reliable_factor = ~weights.gt(0).any(dim=-1)
+        null_route = torch.zeros_like(attention)
+        null_route[..., -1] = 1.0
+        attention = torch.where(no_reliable_factor[:, None, None], null_route, attention)
         private = torch.einsum("brf,bfd->brd", attention, values)
         private = private + self.private_attention(private, private, private, need_weights=False)[0]
         raw_delta = self.delta_head(private + reason_nodes).squeeze(-1)
         scale = torch.as_tensor(temporal_scale, device=raw_delta.device, dtype=raw_delta.dtype)
         delta = scale * self.kappa * torch.tanh(raw_delta / self.kappa)
-        no_reliable_factor = ~weights.gt(0).any(dim=-1)
         delta = torch.where(no_reliable_factor[:, None], torch.zeros_like(delta), delta)
         return {
+            "reason_temporal_route": attention,
+            "reason_temporal_evidence": private,
+            "reason_factor_reliability": factor_reliability,
             "reason_temporal_attention": attention,
             "reason_private_token": private,
             "reason_raw_temporal_delta": raw_delta,
