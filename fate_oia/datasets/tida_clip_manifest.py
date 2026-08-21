@@ -190,21 +190,49 @@ def compare_last_frames(reference: np.ndarray, decoded: np.ndarray) -> dict[str,
     mse = float(np.mean((ref - dec) ** 2))
     mae = float(np.mean(np.abs(ref - dec)))
     psnr = float("inf") if mse == 0 else float(10.0 * np.log10(1.0 / mse))
+    coarse_width = 80
+    coarse_height = max(8, round(coarse_width * reference.shape[0] / reference.shape[1]))
+    resampling = getattr(Image, "Resampling", Image)
+    coarse_ref = np.asarray(
+        Image.fromarray(reference.astype(np.uint8)).resize((coarse_width, coarse_height), resampling.LANCZOS),
+        dtype=np.float64,
+    ) / 255.0
+    coarse_dec = np.asarray(
+        Image.fromarray(decoded.astype(np.uint8)).resize((coarse_width, coarse_height), resampling.LANCZOS),
+        dtype=np.float64,
+    ) / 255.0
+
+    def fallback_ssim(left: np.ndarray, right: np.ndarray) -> float:
+        mu_x, mu_y = float(left.mean()), float(right.mean())
+        var_x, var_y = float(left.var()), float(right.var())
+        covariance = float(((left - mu_x) * (right - mu_y)).mean())
+        c1, c2 = 0.01**2, 0.03**2
+        return ((2 * mu_x * mu_y + c1) * (2 * covariance + c2)) / (
+            (mu_x**2 + mu_y**2 + c1) * (var_x + var_y + c2)
+        )
+
     try:
         from skimage.metrics import structural_similarity
 
-        ssim = float(structural_similarity(ref, dec, channel_axis=2, data_range=1.0))
+        pixel_ssim = float(structural_similarity(ref, dec, channel_axis=2, data_range=1.0))
+        ssim = float(structural_similarity(coarse_ref, coarse_dec, channel_axis=2, data_range=1.0))
     except ImportError:
-        mu_x, mu_y = float(ref.mean()), float(dec.mean())
-        var_x, var_y = float(ref.var()), float(dec.var())
-        covariance = float(((ref - mu_x) * (dec - mu_y)).mean())
-        c1, c2 = 0.01**2, 0.03**2
-        ssim = ((2 * mu_x * mu_y + c1) * (2 * covariance + c2)) / ((mu_x**2 + mu_y**2 + c1) * (var_x + var_y + c2))
+        pixel_ssim = fallback_ssim(ref, dec)
+        ssim = fallback_ssim(coarse_ref, coarse_dec)
     # bin().count() keeps the manifest audit compatible with the project's
     # Python 3.9 runtime while computing the same unsigned Hamming distance.
     phash_distance = bin(_phash64(reference) ^ _phash64(decoded)).count("1")
     passed = ssim >= 0.90 and psnr >= 20.0 and mae <= 0.08 and phash_distance <= 16
-    return {"ssim": ssim, "psnr": psnr, "normalized_mae": mae, "phash_distance": phash_distance, "pass": passed}
+    return {
+        "ssim": ssim,
+        "pixel_ssim": pixel_ssim,
+        "ssim_width": coarse_width,
+        "ssim_height": coarse_height,
+        "psnr": psnr,
+        "normalized_mae": mae,
+        "phash_distance": phash_distance,
+        "pass": passed,
+    }
 
 
 def assert_no_partition_leakage(rows: Sequence[dict[str, Any] | TIDAClipRecord]) -> None:
