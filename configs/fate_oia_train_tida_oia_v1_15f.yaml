@@ -1,0 +1,113 @@
+experiment:
+  name: tida_oia_v1_video
+  direct_video: true
+  eval_splits: [test]
+  best_selection_split: test
+  best_selection_metric: deploy_joint
+  internal_test_selected: true
+  publication_eligible: false
+data:
+  manifest_path: artifacts/tida_clip_manifest.jsonl
+  partition_seed: 20260821
+  train_core_count: 2291
+  train_calib_count: 312
+  train_audit_count: 512
+  test_count: 885
+  target_height: 360
+  target_width: 640
+  context_height: 192
+  context_width: 344
+  history_frames: 14
+  clip_seconds: 5.0
+  num_workers: 6
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 4
+  batches:
+    - {name: batch1, root: 'E:\sbw\FATE_Drive\bdd_oia_1000_train_test', clips: 'E:\sbw\FATE_Drive\bdd_oia_1000_train_test\clips'}
+    - {name: batch2, root: 'E:\sbw\FATE_Drive\bdd_oia_linxxx3_batch2', clips: 'E:\sbw\FATE_Drive\bdd_oia_linxxx3_batch2\clips_prev5s'}
+    - {name: batch3, root: 'F:\sbw\FATE_Drive\bdd_oia_linxxx3_batch3', clips: 'F:\sbw\FATE_Drive\bdd_oia_linxxx3_batch3\clips_prev5s'}
+backbone:
+  arch: vit_small
+  patch_size: 8
+  selected_layers: [3, 7, 11]
+  pretrained_weights: ckp/reference/dino_deitsmall8_pretrain.pth
+  freeze_backbone: true
+  no_grad_backbone: true
+  feature_cache_enabled: false
+  token_compression: none
+image_base:
+  checkpoint: 'F:\FATE_Drive_runs\vetra_replay_from_scratch_v2_full_20260819_retry1\checkpoint_stage_b_continued.pth'
+  config: configs/fate_oia_train_360x640_vetra_staged_from_scratch_v1.yaml
+  action_scale: 1.0
+  reason_scale: 0.60
+model:
+  dim: 384
+  num_actions: 4
+  num_reasons: 21
+  num_predicates: 32
+  context_chunk_size: 2
+  temporal_layers: 2
+  temporal_heads: 4
+  temporal_dropout: 0.10
+  action_kappa: 0.15
+  reason_kappa: 0.12
+loss:
+  terminal_hist: 0.25
+  terminal_no_history: 0.0625
+  terminal_gain: 0.05
+  temporal_order: 0.025
+  repeated_last_contrast: 0.025
+  action_asl: 1.00
+  action_smooth_ap: 0.15
+  action_base_protect: 0.10
+  action_delta: 0.005
+  action_route_sparse: 0.005
+  reason_partial: 1.00
+  reason_rank: 0.08
+  reason_soft_f1: 0.04
+  reason_delta: 0.005
+training:
+  epochs: 10
+  precision: bf16
+  optimizer: AdamW
+  weight_decay: 0.05
+  global_grad_clip: 1.0
+  warmup_ratio: 0.05
+  temporal_ramp_end_ratio: 0.20
+  min_lr_ratio: 0.10
+  ema_decay: 0.998
+  no_metric_early_stop: true
+  lr:
+    history_reader: 0.0001
+    temporal_encoder: 0.0001
+    innovation_predictor: 0.0001
+    predicate_differential: 0.0001
+    temporal_action: 0.00015
+    temporal_reason: 0.0001
+memory_probe:
+  max_reserved_gib: 45.0
+  max_growth_gib: 0.25
+  warmup_updates: 10
+  measured_updates: 50
+  candidates:
+    - {name: A, batch_size: 4, gradient_accumulation_steps: 8, context_chunk_size: 2}
+    - {name: B, batch_size: 3, gradient_accumulation_steps: 10, context_chunk_size: 3}
+    - {name: C, batch_size: 2, gradient_accumulation_steps: 15, context_chunk_size: 5}
+    - {name: D, batch_size: 1, gradient_accumulation_steps: 30, context_chunk_size: 7}
+runtime:
+  foreground_only: true
+  no_feature_cache: true
+  require_no_token_compression: true
+  test_every_epoch: true
+  save_every_epoch: true
+  intervention_interval_updates: 4
+  fixed_test_audit_samples: 128
+  print_every_optimizer_updates: 100
+  exact_resume: true
+deployment:
+  calibration_source: train_calib
+  reason_beta_source: [train_calib, train_audit]
+  reason_beta_candidates: [0.0, 0.25, 0.5, 0.75, 1.0]
+  test_oracle_writeback: false
+  stage_c_nested_oof: true

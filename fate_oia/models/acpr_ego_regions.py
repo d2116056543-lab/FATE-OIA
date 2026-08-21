@@ -10,8 +10,21 @@ class ACPREgoRegionEncoder(nn.Module):
         self.grid_hw = grid_hw
         self.proj = nn.Linear(8, dim)
 
-    def features(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        h, w = self.grid_hw
+    def features(
+        self, grid_hw: tuple[int, int] | None = None, device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        # Backward compatibility: old callers passed (device, dtype) positionally.
+        if isinstance(grid_hw, torch.device):
+            legacy_device = grid_hw
+            legacy_dtype = device if isinstance(device, torch.dtype) else dtype
+            device = legacy_device
+            dtype = legacy_dtype
+            grid_hw = None
+        grid_hw = grid_hw or self.grid_hw
+        device = device or torch.device("cpu")
+        dtype = dtype or torch.float32
+        h, w = grid_hw
         yy, xx = torch.meshgrid(
             torch.linspace(0, 1, h, device=device, dtype=dtype),
             torch.linspace(0, 1, w, device=device, dtype=dtype),
@@ -29,9 +42,11 @@ class ACPREgoRegionEncoder(nn.Module):
         )
         return feats.view(h * w, 8)
 
-    def forward(self, patch_tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor], dict[str, float]]:
+    def forward(
+        self, patch_tokens: torch.Tensor, grid_hw: tuple[int, int] | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor], dict[str, float]]:
         b, n, d = patch_tokens.shape
-        feats = self.features(patch_tokens.device, patch_tokens.dtype)
+        feats = self.features(grid_hw, patch_tokens.device, patch_tokens.dtype)
         if feats.shape[0] != n:
             raise ValueError(f"Expected {feats.shape[0]} patches, got {n}")
         ego_embed = self.proj(feats).unsqueeze(0).expand(b, -1, -1)

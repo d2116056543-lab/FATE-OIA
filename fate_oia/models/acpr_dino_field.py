@@ -37,10 +37,12 @@ class ACPRDinoFieldExtractor(nn.Module):
                 p.requires_grad = False
         self.backbone.eval()
 
-    def _mock_forward(self, images: torch.Tensor) -> dict[str, torch.Tensor | tuple[int, int] | int]:
+    def _mock_forward(
+        self, images: torch.Tensor, grid_hw: tuple[int, int]
+    ) -> dict[str, torch.Tensor | tuple[int, int] | int]:
         with torch.no_grad():
             patch = self.backbone(images).flatten(2).transpose(1, 2)
-            patch = patch[:, : self.grid_hw[0] * self.grid_hw[1]]
+            patch = patch[:, : grid_hw[0] * grid_hw[1]]
             cls = patch.mean(1, keepdim=True)
             patches = torch.stack([patch for _ in self.selected_layers], dim=1)
             cls_layers = torch.stack([cls.squeeze(1) for _ in self.selected_layers], dim=1)
@@ -49,15 +51,20 @@ class ACPRDinoFieldExtractor(nn.Module):
             "cls_tokens_by_layer": cls_layers,
             "patch_tokens_last": patches[:, -1],
             "cls_token_last": cls_layers[:, -1],
-            "grid_hw": self.grid_hw,
-            "original_tokens": self.original_tokens,
+            "grid_hw": grid_hw,
+            "original_tokens": grid_hw[0] * grid_hw[1] + 1,
         }
 
-    def forward(self, images: torch.Tensor) -> dict[str, torch.Tensor | tuple[int, int] | int]:
-        if images.shape[-2:] != (360, 640):
-            raise ValueError(f"ACPR expects 360x640 images, got {tuple(images.shape[-2:])}")
+    def forward_at_resolution(
+        self, images: torch.Tensor, *, expected_hw: tuple[int, int]
+    ) -> dict[str, torch.Tensor | tuple[int, int] | int]:
+        if tuple(images.shape[-2:]) != tuple(expected_hw):
+            raise ValueError(f"Expected {expected_hw} images, got {tuple(images.shape[-2:])}")
+        if expected_hw[0] % self.patch_size or expected_hw[1] % self.patch_size:
+            raise ValueError(f"Image size {expected_hw} must be divisible by patch size {self.patch_size}")
+        grid_hw = (expected_hw[0] // self.patch_size, expected_hw[1] // self.patch_size)
         if self.use_mock_dino:
-            return self._mock_forward(images)
+            return self._mock_forward(images, grid_hw)
         with torch.no_grad():
             x = self.backbone.prepare_tokens(images)
             outputs: list[torch.Tensor] = []
@@ -72,8 +79,9 @@ class ACPRDinoFieldExtractor(nn.Module):
                 raise RuntimeError(f"Requested layers {self.selected_layers}, collected {len(outputs)}")
             cls = torch.stack([o[:, 0] for o in outputs], dim=1)
             patch = torch.stack([o[:, 1:] for o in outputs], dim=1)
-        if patch.shape[2] != 3600:
-            raise RuntimeError(f"Expected 3600 patch tokens, got {patch.shape[2]}")
+        expected_patches = grid_hw[0] * grid_hw[1]
+        if patch.shape[2] != expected_patches:
+            raise RuntimeError(f"Expected {expected_patches} patch tokens, got {patch.shape[2]}")
         patch = patch.detach()
         cls = cls.detach()
         return {
@@ -81,6 +89,14 @@ class ACPRDinoFieldExtractor(nn.Module):
             "cls_tokens_by_layer": cls,
             "patch_tokens_last": patch[:, -1],
             "cls_token_last": cls[:, -1],
-            "grid_hw": self.grid_hw,
-            "original_tokens": self.original_tokens,
+            "grid_hw": grid_hw,
+            "original_tokens": expected_patches + 1,
         }
+
+    def forward(self, images: torch.Tensor) -> dict[str, torch.Tensor | tuple[int, int] | int]:
+        return self.forward_at_resolution(images, expected_hw=(360, 640))
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.backbone.eval()
+        return self
