@@ -16,6 +16,30 @@ def _device_batch(batch: dict[str, Any], device: torch.device) -> dict[str, Any]
     return {key: value.to(device, non_blocking=True) if torch.is_tensor(value) else value for key, value in batch.items()}
 
 
+def select_predicate_intervention_indices(
+    route: torch.Tensor,
+    contribution: torch.Tensor,
+    *,
+    count: int = 4,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if route.shape != contribution.shape or route.ndim != 3:
+        raise ValueError("route and contribution must both be [B,A,F]")
+    if int(count) * 2 > route.shape[-1]:
+        raise ValueError("factor bank is too small for disjoint selected/control sets")
+    route_score = route.mean((0, 1))
+    contribution_score = contribution.abs().mean((0, 1))
+    selected = contribution_score.topk(int(count)).indices
+    available = torch.ones_like(route_score, dtype=torch.bool)
+    available[selected] = False
+    controls = []
+    for selected_index in selected:
+        distance = (route_score - route_score[selected_index]).abs().masked_fill(~available, float("inf"))
+        control = distance.argmin()
+        controls.append(control)
+        available[control] = False
+    return selected, torch.stack(controls)
+
+
 @torch.no_grad()
 def collect_tida_outputs(
     model, loader, device: torch.device, *, temporal_scale: float = 1.0,
@@ -72,17 +96,10 @@ def collect_tida_outputs(
             dynamic_concepts.extend(output["dynamic_concepts"])
         file_names.extend(batch["file_name"])
         if collect_mechanism and mechanism_count < mechanism_samples:
-            route_score = output["action_route"][..., :32].mean((0, 1))
-            selected = route_score.topk(4).indices
-            available = torch.ones_like(route_score, dtype=torch.bool)
-            available[selected] = False
-            controls = []
-            for selected_index in selected:
-                distance = (route_score - route_score[selected_index]).abs().masked_fill(~available, float("inf"))
-                control = distance.argmin()
-                controls.append(control)
-                available[control] = False
-            matched = torch.stack(controls)
+            selected, matched = select_predicate_intervention_indices(
+                output["action_route"][..., :32],
+                output["action_factor_contribution"][..., :32],
+            )
             mechanism_base["action"].append(output["video_action_logits"].detach().float().cpu())
             mechanism_base["reason"].append(output["video_reason_logits"].detach().float().cpu())
             mechanism_base["action_target"].append(batch["action"].detach().float().cpu())
