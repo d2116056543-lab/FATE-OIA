@@ -25,7 +25,7 @@ from fate_oia.engine.evaluate_tida_oia import (
 from fate_oia.engine.train_aie_oia import build_model as build_aie_model, canonical_model_state_dict
 from fate_oia.engine.train_vetra_strong_refine import build_refiner
 from fate_oia.losses.tida_loss_registry import assert_owner_exact_cover
-from fate_oia.losses.tida_losses import build_tida_loss_registry
+from fate_oia.losses.tida_losses import build_tida_loss_registry, reason_pu_weight
 from fate_oia.models.tida_oia_model import TIDAFrozenVETRAImageBase, TIDAOIAModel
 from fate_oia.utils.tida_artifacts import (
     TIDATrainableEMA,
@@ -48,6 +48,35 @@ class TIDARuntime:
     device: torch.device
     image_checkpoint: Path
     clip_manifest: Path
+
+
+def append_rank_window(
+    window: dict[str, list[torch.Tensor]],
+    action_logits: torch.Tensor,
+    action_target: torch.Tensor,
+    reason_logits: torch.Tensor,
+    reason_target: torch.Tensor,
+    reason_negative_weight: torch.Tensor,
+) -> None:
+    values = {
+        "action_logits": action_logits,
+        "action_target": action_target,
+        "reason_logits": reason_logits,
+        "reason_target": reason_target,
+        "reason_negative_weight": reason_negative_weight,
+    }
+    for key, value in values.items():
+        window.setdefault(key, []).append(value.detach())
+
+
+def rank_window_reference(window: dict[str, list[torch.Tensor]]) -> dict[str, torch.Tensor] | None:
+    if not window.get("action_logits"):
+        return None
+    return {key: torch.cat(values, dim=0).detach() for key, values in window.items()}
+
+
+def clear_rank_window(window: dict[str, list[torch.Tensor]]) -> None:
+    window.clear()
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
@@ -357,6 +386,7 @@ def train(args: Any) -> None:
     scaler_enabled = device.type == "cuda"
     model.train()
     optimizer.zero_grad(set_to_none=True)
+    rank_window: dict[str, list[torch.Tensor]] = {}
     completed_epochs = start_epoch
     for epoch in range(start_epoch, epochs):
         epoch_start = time.perf_counter()
@@ -383,11 +413,21 @@ def train(args: Any) -> None:
                     batch["action"],
                     batch["reason"],
                     counterfactual_errors=counterfactual,
+                    rank_reference=rank_window_reference(rank_window),
                     weights=config["loss"],
                 )
                 loss = registry.total() / grad_accum
             loss.backward()
             _apply_initial_owner_firewall(model, schedule["temporal_scale"])
+            contradiction = output.get("image_branch", {}).get("contradiction_score")
+            append_rank_window(
+                rank_window,
+                output["video_action_logits"],
+                batch["action"],
+                output["video_reason_logits"],
+                batch["reason"],
+                reason_pu_weight(batch["reason"], contradiction),
+            )
             micro_count += 1
             should_update = micro_count == grad_accum or micro_step + 1 == len(runtime.loaders["train_core"])
             if not should_update:
@@ -403,6 +443,7 @@ def train(args: Any) -> None:
             )
             optimizer.step(); optimizer.zero_grad(set_to_none=True); ema.update(model)
             optimizer_update += 1; micro_count = 0
+            rank_window_samples = sum(value.shape[0] for value in rank_window.get("action_logits", []))
             row = {
                 "epoch": epoch, "micro_step": micro_step, "optimizer_update": optimizer_update,
                 "total_updates": total_updates, "temporal_scale": schedule["temporal_scale"],
@@ -415,11 +456,13 @@ def train(args: Any) -> None:
                 "action_delta_rms": float(output["action_temporal_delta"].float().square().mean().sqrt().detach().cpu()),
                 "reason_delta_rms": float(output["reason_temporal_delta"].float().square().mean().sqrt().detach().cpu()),
                 "action_null_mass": float(output["action_null_mass"].mean().detach().cpu()),
+                "rank_window_samples": int(rank_window_samples),
                 "gpu_peak_reserved_gib": torch.cuda.max_memory_reserved(device) / 2**30 if device.type == "cuda" else 0.0,
             }
             append_jsonl(output_dir / "loss_components.jsonl", row)
             if optimizer_update % int(config["runtime"]["print_every_optimizer_updates"]) == 0:
                 print(json.dumps({"event": "tida_batch", **row}, ensure_ascii=False), flush=True)
+            clear_rank_window(rank_window)
             if max_optimizer_updates is not None and optimizer_update >= int(max_optimizer_updates):
                 break
 
