@@ -47,7 +47,7 @@ FORBIDDEN = {
     "second_backbone": r"VideoSwin|GroundingDINO|optical.flow|flow_network|depth_model|BEV",
     "vlm_text": r"\b(?:BERT|CLIPText|text_encoder|VLM|MLLM)\b",
     "graph_pair": r"HardPair|PairMemory|PMI|graph_delta|cooccurrence",
-    "cache_distill": r"cached_logits|feature_cache_enabled\s*[:=]\s*true|token_compression\s*[:=]\s*(?!none)|distill",
+    "cache_distill": r"cached_logits|feature_cache_enabled\s*[:=]\s*true|\btoken_compression\s*[:=]\s*(?P<token_compression_value>[A-Za-z_][A-Za-z0-9_]*)|distill",
     "background": r"Start-Process|Start-Job|Win32_Process\.Create|nohup|Scheduled.Task",
 }
 
@@ -60,6 +60,27 @@ def _write(review_dir: Path, name: str, payload: Any) -> None:
     atomic_write_json(review_dir / name, payload)
 
 
+def _forbidden_findings(source: str, path: str, key: str, pattern: str) -> list[dict[str, Any]]:
+    findings = []
+    for match in re.finditer(pattern, source, flags=re.IGNORECASE):
+        value = match.groupdict().get("token_compression_value")
+        if key == "cache_distill" and value is not None and value.lower() == "none":
+            continue
+        findings.append({"file": path, "line": source.count("\n", 0, match.start()) + 1, "text": match.group(0)})
+    return findings
+
+
+def _code_remote() -> str | None:
+    remotes = subprocess.run(["git", "remote"], text=True, capture_output=True, check=True).stdout.split()
+    for name in ("github", "origin", *remotes):
+        if name not in remotes:
+            continue
+        url = subprocess.run(["git", "remote", "get-url", name], text=True, capture_output=True).stdout.strip()
+        if "fate-oia" in url.lower():
+            return name
+    return None
+
+
 def static_audit(review_dir: Path) -> dict[str, Any]:
     required = {path: Path(path).is_file() for path in REQUIRED_FILES}
     _write(review_dir, "required_files.json", {"pass": all(required.values()), "files": required})
@@ -69,8 +90,7 @@ def static_audit(review_dir: Path) -> dict[str, Any]:
             continue
         source = Path(path).read_text(encoding="utf-8")
         for key, pattern in FORBIDDEN.items():
-            for match in re.finditer(pattern, source, flags=re.IGNORECASE):
-                scans[key].append({"file": path, "line": source.count("\n", 0, match.start()) + 1, "text": match.group(0)})
+            scans[key].extend(_forbidden_findings(source, path, key, pattern))
     forbidden_pass = not any(scans.values())
     _write(review_dir, "forbidden_path_scan.json", {"pass": forbidden_pass, "results": scans})
     placeholders = []
@@ -318,10 +338,13 @@ def evidence_audits(args: Any, review_dir: Path) -> tuple[dict[str, Any], dict[s
 def binding(args: Any, tests: dict[str, Any]) -> dict[str, Any]:
     head, tree = _git("rev-parse", "HEAD"), _git("rev-parse", "HEAD^{tree}")
     branch = _git("branch", "--show-current")
-    remote = subprocess.run(["git", "ls-remote", "origin", f"refs/heads/{branch}"], text=True, capture_output=True)
+    remote_name = _code_remote()
+    remote = subprocess.run(
+        ["git", "ls-remote", remote_name, f"refs/heads/{branch}"], text=True, capture_output=True
+    ) if remote_name else subprocess.CompletedProcess([], 1, "", "FATE-OIA remote not found")
     remote_head = remote.stdout.split()[0] if remote.returncode == 0 and remote.stdout.strip() else None
     return {
-        "git_head": head, "git_tree": tree, "remote_head": remote_head,
+        "git_head": head, "git_tree": tree, "remote_name": remote_name, "remote_head": remote_head,
         "clean": not bool(_git("status", "--porcelain", "--untracked-files=all")),
         "remote_matches": remote_head == head, "tests": tests,
     }
