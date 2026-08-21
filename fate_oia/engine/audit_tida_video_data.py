@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import json
+import os
 from pathlib import Path
 
 import cv2
@@ -12,6 +14,22 @@ from PIL import Image
 from fate_oia.datasets.tida_clip_manifest import compare_last_frames, load_manifest, validate_records
 from fate_oia.datasets.bdd_oia_video import decode_selected_frames, quadratic_multirate_timestamps, timestamps_to_indices
 from fate_oia.utils.tida_artifacts import append_jsonl, atomic_write_json, file_sha256
+
+
+@contextmanager
+def exclusive_audit_lock(output_dir: Path):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = output_dir / ".tida_data_audit.lock"
+    try:
+        descriptor = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError as error:
+        raise RuntimeError(f"another TIDA data audit owns {lock_path}") from error
+    try:
+        os.write(descriptor, str(os.getpid()).encode("ascii"))
+        yield
+    finally:
+        os.close(descriptor)
+        lock_path.unlink(missing_ok=True)
 
 
 def decode_last_frame(path: Path, frame_index: int) -> np.ndarray:
@@ -135,7 +153,8 @@ def main() -> None:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--workers", type=int, default=6)
     args = parser.parse_args()
-    summary = audit_manifest(Path(args.clip_manifest), Path(args.output_dir), workers=args.workers)
+    with exclusive_audit_lock(Path(args.output_dir)):
+        summary = audit_manifest(Path(args.clip_manifest), Path(args.output_dir), workers=args.workers)
     print(json.dumps(summary), flush=True)
     if not summary["pass"]:
         raise SystemExit(2)
