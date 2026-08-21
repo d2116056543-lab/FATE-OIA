@@ -52,6 +52,12 @@ def _video_metadata(path: Path) -> tuple[float, float, int, int]:
     return fps, frames / fps, frames, _phash64(endpoint_rgb)
 
 
+def _endpoint_timestamp_seconds(num_frames: int, fps: float) -> float:
+    if num_frames <= 0 or fps <= 0:
+        raise ValueError("endpoint timestamp requires positive frame count and fps")
+    return (num_frames - 1) / fps
+
+
 def build_records(source_manifests: list[Path]) -> list[TIDAClipRecord]:
     records: list[TIDAClipRecord] = []
     for source_manifest in source_manifests:
@@ -83,7 +89,7 @@ def build_records(source_manifests: list[Path]) -> list[TIDAClipRecord]:
                     duration_seconds=duration,
                     fps=fps,
                     num_frames=num_frames,
-                    target_timestamp_seconds=duration,
+                    target_timestamp_seconds=_endpoint_timestamp_seconds(num_frames, fps),
                     target_frame_index=num_frames - 1,
                     action=tuple(float(value) for value in action),
                     reason=tuple(float(value) for value in reason),
