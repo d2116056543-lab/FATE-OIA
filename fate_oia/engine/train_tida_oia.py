@@ -25,7 +25,7 @@ from fate_oia.engine.evaluate_tida_oia import (
 from fate_oia.engine.train_aie_oia import build_model as build_aie_model, canonical_model_state_dict
 from fate_oia.engine.train_vetra_strong_refine import build_refiner
 from fate_oia.losses.tida_loss_registry import assert_owner_exact_cover
-from fate_oia.losses.tida_losses import build_tida_loss_registry, reason_pu_weight
+from fate_oia.losses.tida_losses import build_tida_loss_registry
 from fate_oia.models.tida_oia_model import TIDAFrozenVETRAImageBase, TIDAOIAModel
 from fate_oia.utils.tida_artifacts import (
     TIDATrainableEMA,
@@ -54,16 +54,10 @@ def append_rank_window(
     window: dict[str, list[torch.Tensor]],
     action_logits: torch.Tensor,
     action_target: torch.Tensor,
-    reason_logits: torch.Tensor,
-    reason_target: torch.Tensor,
-    reason_negative_weight: torch.Tensor,
 ) -> None:
     values = {
         "action_logits": action_logits,
         "action_target": action_target,
-        "reason_logits": reason_logits,
-        "reason_target": reason_target,
-        "reason_negative_weight": reason_negative_weight,
     }
     for key, value in values.items():
         window.setdefault(key, []).append(value.detach())
@@ -419,14 +413,10 @@ def train(args: Any) -> None:
                 loss = registry.total() / grad_accum
             loss.backward()
             _apply_initial_owner_firewall(model, schedule["temporal_scale"])
-            contradiction = output.get("image_branch", {}).get("contradiction_score")
             append_rank_window(
                 rank_window,
                 output["video_action_logits"],
                 batch["action"],
-                output["video_reason_logits"],
-                batch["reason"],
-                reason_pu_weight(batch["reason"], contradiction),
             )
             micro_count += 1
             should_update = micro_count == grad_accum or micro_step + 1 == len(runtime.loaders["train_core"])

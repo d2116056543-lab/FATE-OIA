@@ -55,7 +55,7 @@ def action_base_protect_loss(
     video_logits: torch.Tensor,
     target: torch.Tensor,
     reliability: torch.Tensor,
-    epsilon: float = 0.0,
+    epsilon: float = 0.005,
 ) -> torch.Tensor:
     sign = 2.0 * target.float() - 1.0
     image_margin = sign * image_logits
@@ -107,44 +107,18 @@ def reason_rank_loss(
     target: torch.Tensor,
     negative_weight: torch.Tensor | None = None,
     margin: float = 0.2,
-    reference_logits: torch.Tensor | None = None,
-    reference_target: torch.Tensor | None = None,
-    reference_negative_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     weights = torch.ones_like(target) if negative_weight is None else negative_weight.detach()
-    reference_logits = None if reference_logits is None else reference_logits.detach()
-    reference_target = None if reference_target is None else reference_target.detach()
-    reference_weights = None if reference_negative_weight is None else reference_negative_weight.detach()
     losses = []
     for label in range(logits.shape[1]):
         positive = logits[target[:, label] > 0.5, label]
         negative_mask = target[:, label] <= 0.5
         negative = logits[negative_mask, label]
         negative_weights = weights[negative_mask, label]
-        reference_positive = logits.new_empty(0)
-        if reference_logits is not None and reference_target is not None:
-            reference_positive_mask = reference_target[:, label] > 0.5
-            reference_negative_mask = ~reference_positive_mask
-            reference_positive = reference_logits[reference_positive_mask, label]
-            negative = torch.cat([negative, reference_logits[reference_negative_mask, label]])
-            candidate_reference_weights = (
-                torch.ones_like(reference_target)
-                if reference_weights is None
-                else reference_weights
-            )
-            negative_weights = torch.cat([negative_weights, candidate_reference_weights[reference_negative_mask, label]])
-        terms = []
         if positive.numel() and negative.numel():
             raw = F.relu(float(margin) - positive[:, None] + negative[None])
             pair_weight = negative_weights[None].expand_as(raw)
-            terms.append((raw * pair_weight).sum() / pair_weight.sum().clamp_min(1e-8))
-        current_negative = logits[negative_mask, label]
-        if reference_positive.numel() and current_negative.numel():
-            raw = F.relu(float(margin) - reference_positive[:, None] + current_negative[None])
-            pair_weight = weights[negative_mask, label][None].expand_as(raw)
-            terms.append((raw * pair_weight).sum() / pair_weight.sum().clamp_min(1e-8))
-        if terms:
-            losses.append(torch.stack(terms).mean())
+            losses.append((raw * pair_weight).sum() / pair_weight.sum().clamp_min(1e-8))
     return torch.stack(losses).mean() if losses else logits.sum() * 0.0
 
 
@@ -222,14 +196,7 @@ def build_tida_loss_registry(
     registry.add("reason_partial", reason_partial_asl_loss(output["video_reason_logits"], reason_target, contradiction))
     registry.add(
         "reason_rank",
-        reason_rank_loss(
-            output["video_reason_logits"],
-            reason_target,
-            reason_weights,
-            reference_logits=rank_reference.get("reason_logits"),
-            reference_target=rank_reference.get("reason_target"),
-            reference_negative_weight=rank_reference.get("reason_negative_weight"),
-        ),
+        reason_rank_loss(output["video_reason_logits"], reason_target, reason_weights),
     )
     registry.add("reason_soft_f1", reason_soft_f1_loss(output["video_reason_logits"], reason_target, contradiction))
     registry.add("reason_delta", output["reason_temporal_delta"].square().mean())
