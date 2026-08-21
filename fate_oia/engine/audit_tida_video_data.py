@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 
@@ -23,7 +24,26 @@ def decode_last_frame(path: Path, frame_index: int) -> np.ndarray:
     return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
 
-def audit_manifest(manifest_path: Path, output_dir: Path) -> dict:
+def _audit_one(payload: tuple[int, object]) -> tuple[dict, int, int, bool]:
+    index, row = payload
+    reference = np.asarray(Image.open(row.target_image_path).convert("RGB"))
+    indices = timestamps_to_indices(quadratic_multirate_timestamps(), row.fps, row.target_frame_index)
+    selected_frames, selected_valid = decode_selected_frames(row.clip_path, indices)
+    decoded_arrays = [np.asarray(frame.resize((64, 36)), dtype=np.float32) for frame in selected_frames]
+    duplicate_pairs = sum(
+        float(np.mean((left - right) ** 2)) < 1e-6
+        for left, right in zip(decoded_arrays, decoded_arrays[1:])
+    )
+    score = compare_last_frames(reference, np.asarray(selected_frames[-1]))
+    record = {
+        "index": index, "file_name": row.file_name, "partition": row.partition,
+        "selected_valid_count": int(selected_valid.sum()), "selected_frame_count": len(selected_valid),
+        "adjacent_exact_duplicate_pairs": duplicate_pairs, **score,
+    }
+    return record, int(selected_valid.sum()), len(selected_valid), duplicate_pairs == len(decoded_arrays) - 1
+
+
+def audit_manifest(manifest_path: Path, output_dir: Path, *, workers: int = 6) -> dict:
     rows = load_manifest(manifest_path)
     validation = validate_records(rows, require_files=True)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -35,27 +55,19 @@ def audit_manifest(manifest_path: Path, output_dir: Path) -> dict:
     selected_valid_count = 0
     selected_total_count = 0
     fully_repeated_clips = []
-    for index, row in enumerate(rows):
-        reference = np.asarray(Image.open(row.target_image_path).convert("RGB"))
-        indices = timestamps_to_indices(quadratic_multirate_timestamps(), row.fps, row.target_frame_index)
-        selected_frames, selected_valid = decode_selected_frames(row.clip_path, indices)
-        selected_valid_count += int(selected_valid.sum())
-        selected_total_count += len(selected_valid)
-        decoded_arrays = [np.asarray(frame.resize((64, 36)), dtype=np.float32) for frame in selected_frames]
-        duplicate_pairs = sum(float(np.mean((left - right) ** 2)) < 1e-6 for left, right in zip(decoded_arrays, decoded_arrays[1:]))
-        if duplicate_pairs == len(decoded_arrays) - 1:
-            fully_repeated_clips.append(row.file_name)
-        decoded = np.asarray(selected_frames[-1])
-        score = compare_last_frames(reference, decoded)
-        record = {
-            "index": index, "file_name": row.file_name, "partition": row.partition,
-            "selected_valid_count": int(selected_valid.sum()), "selected_frame_count": len(selected_valid),
-            "adjacent_exact_duplicate_pairs": duplicate_pairs, **score,
-        }
-        append_jsonl(sample_path, record)
-        scores.append(record)
-        if not score["pass"]:
-            rejected.append(row.file_name)
+    if workers < 1:
+        raise ValueError("workers must be positive")
+    cv2.setNumThreads(1)
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="tida-data-audit") as executor:
+        for record, valid_count, total_count, fully_repeated in executor.map(_audit_one, enumerate(rows)):
+            selected_valid_count += valid_count
+            selected_total_count += total_count
+            if fully_repeated:
+                fully_repeated_clips.append(record["file_name"])
+            append_jsonl(sample_path, record)
+            scores.append(record)
+            if not record["pass"]:
+                rejected.append(record["file_name"])
     median_ssim = float(np.median([row["ssim"] for row in scores])) if scores else 0.0
     def percentiles(key: str) -> dict[str, float]:
         values = [float(row[key]) for row in scores]
@@ -96,6 +108,7 @@ def audit_manifest(manifest_path: Path, output_dir: Path) -> dict:
         "split_strategy": "source_grouped_internal_3115_885",
         "split_migration": split_migration,
         "publication_eligible": False,
+        "audit_workers": workers,
         "median_ssim": median_ssim,
         "mapping_unique_rate": mapping_unique_rate,
         "target_image_exists_rate": target_exists_rate,
@@ -118,8 +131,9 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--clip-manifest", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--workers", type=int, default=6)
     args = parser.parse_args()
-    summary = audit_manifest(Path(args.clip_manifest), Path(args.output_dir))
+    summary = audit_manifest(Path(args.clip_manifest), Path(args.output_dir), workers=args.workers)
     print(json.dumps(summary), flush=True)
     if not summary["pass"]:
         raise SystemExit(2)
