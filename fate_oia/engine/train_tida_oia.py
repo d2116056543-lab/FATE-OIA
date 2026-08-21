@@ -35,6 +35,7 @@ from fate_oia.utils.tida_artifacts import (
     file_sha256,
     restore_rng_state,
     save_checkpoint_atomic,
+    seed_tida_run,
 )
 from fate_oia.utils.tida_contracts import schedule_values, validate_training_protocol
 from fate_oia.utils.vetra_stage_contracts import sha256_file
@@ -71,6 +72,20 @@ def rank_window_reference(window: dict[str, list[torch.Tensor]]) -> dict[str, to
 
 def clear_rank_window(window: dict[str, list[torch.Tensor]]) -> None:
     window.clear()
+
+
+@torch.no_grad()
+def owner_gradient_norms(owners: dict[str, list[torch.nn.Parameter]]) -> dict[str, float]:
+    result: dict[str, float] = {}
+    for owner, parameters in owners.items():
+        squared = None
+        for parameter in parameters:
+            if parameter.grad is None:
+                continue
+            value = parameter.grad.detach().float().square().sum()
+            squared = value if squared is None else squared + value
+        result[owner] = 0.0 if squared is None else float(squared.sqrt().cpu())
+    return result
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
@@ -137,6 +152,8 @@ def _arg(args: Any, name: str, default: Any = None) -> Any:
 
 def build_runtime(args: Any, evaluation_only: bool = False) -> TIDARuntime:
     config = load_config(_arg(args, "config"))
+    seed = int(config["training"].get("seed", config["data"]["partition_seed"]))
+    seed_tida_run(seed)
     device = torch.device(_arg(args, "device", "cuda"))
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
@@ -358,6 +375,7 @@ def train(args: Any) -> None:
         "predicate_role_sha256": file_sha256(predicate_role_path), "config_sha256": file_sha256(config_path),
         "split_sha256": file_sha256(runtime.clip_manifest), "selected_layers": config["backbone"]["selected_layers"],
         "loss_weights": config["loss"], "learning_rates": config["training"]["lr"],
+        "seed": int(config["training"].get("seed", config["data"]["partition_seed"])),
         "max_optimizer_updates": max_optimizer_updates,
     }
     atomic_write_json(output_dir / "run_manifest.json", manifest)
@@ -427,6 +445,7 @@ def train(args: Any) -> None:
                 for parameter in model.parameters():
                     if parameter.grad is not None:
                         parameter.grad.mul_(correction)
+            owner_gradients = owner_gradient_norms(model.owner_parameters())
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 [parameter for parameter in model.parameters() if parameter.requires_grad],
                 float(config["training"]["global_grad_clip"]),
@@ -441,6 +460,7 @@ def train(args: Any) -> None:
                 "lr_scale": schedule["lr_scale"], "learning_rates": {group["name"]: group["lr"] for group in optimizer.param_groups},
                 "loss_total": float(registry.total().detach().cpu()), "losses": registry.artifact(),
                 "grad_norm": float(grad_norm.detach().cpu()),
+                "owner_gradient_norms": owner_gradients,
                 "rho_mean": float(output["innovation_reliability"].mean().detach().cpu()),
                 "rho_nonzero_rate": float((output["innovation_reliability"] > 0).float().mean().detach().cpu()),
                 "action_delta_rms": float(output["action_temporal_delta"].float().square().mean().sqrt().detach().cpu()),

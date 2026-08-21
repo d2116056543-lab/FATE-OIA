@@ -46,6 +46,16 @@ def append_jsonl(path: str | Path, payload: Any) -> None:
         handle.write(json.dumps(json_safe(payload), ensure_ascii=False) + "\n")
 
 
+def seed_tida_run(seed: int) -> None:
+    """Seed every RNG used before constructing a fresh TIDA model."""
+    value = int(seed)
+    random.seed(value)
+    np.random.seed(value)
+    torch.manual_seed(value)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(value)
+
+
 def capture_rng_state() -> dict[str, Any]:
     return {
         "python": random.getstate(),

@@ -68,6 +68,7 @@ loss:
   reason_soft_f1: 0.04
   reason_delta: 0.005
 training:
+  seed: 20260821
   epochs: 10
   precision: bf16
   optimizer: AdamW
