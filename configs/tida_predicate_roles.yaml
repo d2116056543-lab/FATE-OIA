@@ -1,0 +1,35 @@
+static_anchor:
+  - lane_left_available
+  - lane_right_available
+  - left_turn_region
+  - right_turn_region
+  - drivable_center
+  - drivable_left
+  - drivable_right
+  - crosswalk_region
+  - intersection_region
+  - ego_lane_centered
+dynamic_actor:
+  - traffic_light_red
+  - traffic_light_green
+  - front_vehicle_close
+  - front_vehicle_far
+  - pedestrian_front
+  - cyclist_front
+  - obstacle_front
+  - road_crowded
+  - parked_vehicle_left
+  - parked_vehicle_right
+  - vehicle_left
+  - vehicle_right
+  - traffic_light_visible
+  - traffic_sign_visible
+terminal_context:
+  - stop_sign_present
+  - road_clear
+  - merging_left_context
+  - merging_right_context
+  - low_front_visibility
+  - open_left_gap
+  - open_right_gap
+  - global_scene_context
