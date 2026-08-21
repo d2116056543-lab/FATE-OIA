@@ -17,9 +17,8 @@ class TIDAReasonReader(nn.Module):
         self.factor_key = nn.Linear(dim, dim)
         self.factor_value = nn.Linear(dim, dim)
         self.null_key = nn.Parameter(torch.zeros(dim))
-        self.private_attention = nn.MultiheadAttention(dim, num_heads=4, batch_first=True)
-        self.delta_head = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, 1))
-        nn.init.zeros_(self.delta_head[-1].bias)
+        self.delta_query = nn.Linear(dim, dim, bias=False)
+        self.delta_value = nn.Linear(dim, dim, bias=False)
 
     def forward(
         self,
@@ -51,8 +50,12 @@ class TIDAReasonReader(nn.Module):
         null_route[..., -1] = 1.0
         attention = torch.where(no_reliable_factor[:, None, None], null_route, attention)
         private = torch.einsum("brf,bfd->brd", attention, values)
-        private = private + self.private_attention(private, private, private, need_weights=False)[0]
-        raw_delta = self.delta_head(private).squeeze(-1)
+        # Keep each reason's correction private. A query-evidence interaction
+        # preserves label-specific signs while guaranteeing zero evidence gives
+        # an exact zero correction without a static-query or bias shortcut.
+        delta_query = self.delta_query(reason_nodes)
+        delta_value = self.delta_value(private)
+        raw_delta = torch.einsum("brd,brd->br", delta_query, delta_value) / math.sqrt(delta_query.shape[-1])
         scale = torch.as_tensor(temporal_scale, device=raw_delta.device, dtype=raw_delta.dtype)
         nonnull_mass = 1.0 - attention[..., -1]
         delta = scale * nonnull_mass * self.kappa * torch.tanh(raw_delta / self.kappa)

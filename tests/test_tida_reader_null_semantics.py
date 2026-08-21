@@ -66,9 +66,6 @@ def test_reason_delta_cannot_come_from_static_query_without_temporal_value() -> 
     with torch.no_grad():
         reader.factor_value.weight.zero_()
         reader.factor_value.bias.zero_()
-        for parameter in reader.private_attention.parameters():
-            parameter.zero_()
-        reader.delta_head[-1].bias.zero_()
     output = reader(
         torch.randn(2, 21, 8),
         torch.randn(2, 32, 8),
@@ -79,3 +76,24 @@ def test_reason_delta_cannot_come_from_static_query_without_temporal_value() -> 
 
     assert torch.equal(output["reason_temporal_evidence"], torch.zeros(2, 21, 8))
     assert torch.equal(output["reason_temporal_delta"], torch.zeros(2, 21))
+
+
+def test_reason_queries_do_not_mix_temporal_corrections_between_labels() -> None:
+    torch.manual_seed(7)
+    reader = TIDAReasonReader(dim=8)
+    reason_nodes = torch.randn(2, 21, 8)
+    predicate = torch.randn(2, 32, 8)
+    action = torch.randn(2, 4, 8)
+    reliability = torch.full((2, 36), 0.4)
+
+    baseline = reader(reason_nodes, predicate, action, reliability, temporal_scale=1.0)
+    changed_nodes = reason_nodes.clone()
+    changed_nodes[:, 0] += 3.0
+    changed = reader(changed_nodes, predicate, action, reliability, temporal_scale=1.0)
+
+    assert not torch.allclose(
+        baseline["reason_temporal_delta"][:, 0], changed["reason_temporal_delta"][:, 0]
+    )
+    torch.testing.assert_close(
+        baseline["reason_temporal_delta"][:, 1:], changed["reason_temporal_delta"][:, 1:]
+    )
