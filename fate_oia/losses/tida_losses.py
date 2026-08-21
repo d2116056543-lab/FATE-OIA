@@ -61,25 +61,55 @@ def action_route_sparse_loss(route: torch.Tensor, factor_keys: torch.Tensor, val
     return route_term + diversity
 
 
-def reason_partial_asl_loss(logits: torch.Tensor, target: torch.Tensor, negative_weight: float = 0.2) -> torch.Tensor:
+def reason_pu_weight(
+    target: torch.Tensor,
+    contradiction_scores: torch.Tensor | None = None,
+    *,
+    negative_floor: float = 0.2,
+) -> torch.Tensor:
+    contradiction = torch.zeros_like(target) if contradiction_scores is None else contradiction_scores.detach().clamp(0, 1)
+    negative = float(negative_floor) + (1.0 - float(negative_floor)) * contradiction
+    return torch.where(target > 0.5, torch.ones_like(target), negative).detach()
+
+
+def reason_partial_asl_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    contradiction_scores: torch.Tensor | None = None,
+    negative_floor: float = 0.2,
+) -> torch.Tensor:
     raw = asymmetric_loss_with_logits(logits, target.float(), gamma_neg=4, gamma_pos=0, clip=0.05, reduction="none")
-    weights = torch.where(target > 0.5, torch.ones_like(target), torch.full_like(target, float(negative_weight)))
+    weights = reason_pu_weight(target, contradiction_scores, negative_floor=negative_floor)
     return (raw * weights).sum() / weights.sum().clamp_min(1.0)
 
 
-def reason_rank_loss(logits: torch.Tensor, target: torch.Tensor, margin: float = 0.2) -> torch.Tensor:
+def reason_rank_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    negative_weight: torch.Tensor | None = None,
+    margin: float = 0.2,
+) -> torch.Tensor:
+    weights = torch.ones_like(target) if negative_weight is None else negative_weight.detach()
     losses = []
     for label in range(logits.shape[1]):
         positive = logits[target[:, label] > 0.5, label]
-        negative = logits[target[:, label] <= 0.5, label]
+        negative_mask = target[:, label] <= 0.5
+        negative = logits[negative_mask, label]
         if positive.numel() and negative.numel():
-            losses.append(F.relu(float(margin) - positive[:, None] + negative[None]).mean())
+            raw = F.relu(float(margin) - positive[:, None] + negative[None])
+            pair_weight = weights[negative_mask, label][None].expand_as(raw)
+            losses.append((raw * pair_weight).sum() / pair_weight.sum().clamp_min(1e-8))
     return torch.stack(losses).mean() if losses else logits.sum() * 0.0
 
 
-def reason_soft_f1_loss(logits: torch.Tensor, target: torch.Tensor, negative_weight: float = 0.2) -> torch.Tensor:
+def reason_soft_f1_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    contradiction_scores: torch.Tensor | None = None,
+    negative_floor: float = 0.2,
+) -> torch.Tensor:
     probabilities = torch.sigmoid(logits)
-    weights = torch.where(target > 0.5, torch.ones_like(target), torch.full_like(target, float(negative_weight)))
+    weights = reason_pu_weight(target, contradiction_scores, negative_floor=negative_floor)
     true_positive = (probabilities * target * weights).sum(0)
     false_positive = (probabilities * (1.0 - target) * weights).sum(0)
     false_negative = ((1.0 - probabilities) * target * weights).sum(0)
@@ -130,8 +160,11 @@ def build_tida_loss_registry(
             valid_rho=output["innovation_reliability"].max(-1).values > 0,
         ),
     )
-    registry.add("reason_partial", reason_partial_asl_loss(output["video_reason_logits"], reason_target))
-    registry.add("reason_rank", reason_rank_loss(output["video_reason_logits"], reason_target))
-    registry.add("reason_soft_f1", reason_soft_f1_loss(output["video_reason_logits"], reason_target))
+    image_branch = output.get("image_branch", {})
+    contradiction = image_branch.get("contradiction_score") if isinstance(image_branch, dict) else None
+    reason_weights = reason_pu_weight(reason_target, contradiction)
+    registry.add("reason_partial", reason_partial_asl_loss(output["video_reason_logits"], reason_target, contradiction))
+    registry.add("reason_rank", reason_rank_loss(output["video_reason_logits"], reason_target, reason_weights))
+    registry.add("reason_soft_f1", reason_soft_f1_loss(output["video_reason_logits"], reason_target, contradiction))
     registry.add("reason_delta", output["reason_temporal_delta"].square().mean())
     return registry
