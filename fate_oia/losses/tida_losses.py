@@ -36,7 +36,7 @@ def action_base_protect_loss(
     video_logits: torch.Tensor,
     target: torch.Tensor,
     reliability: torch.Tensor,
-    epsilon: float = 0.02,
+    epsilon: float = 0.0,
 ) -> torch.Tensor:
     sign = 2.0 * target.float() - 1.0
     image_margin = sign * image_logits
