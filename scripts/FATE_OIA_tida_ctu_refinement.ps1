@@ -5,6 +5,7 @@ param(
     [int]$BatchSize = 4,
     [int]$GradAccum = 8,
     [int]$NumWorkers = 6,
+    [string]$TrainOwners = "",
     [string]$Device = "cuda"
 )
 
@@ -17,6 +18,11 @@ $microBatches = [Math]::Ceiling(2291.0 / $BatchSize)
 $scheduleUpdates = [int]([Math]::Ceiling($microBatches / $GradAccum) * $Epochs)
 
 Set-Location $root
+$ownerArgs = @()
+if ($TrainOwners) {
+    $ownerArgs = @("--train-owners", $TrainOwners)
+}
+
 & $python -u -m fate_oia.engine.train_tida_oia `
     --config configs\fate_oia_train_tida_oia_v1_15f.yaml `
     --clip-manifest $manifest `
@@ -30,7 +36,8 @@ Set-Location $root
     --num-workers $NumWorkers `
     --schedule-total-updates $scheduleUpdates `
     --run-kind smoke `
-    --device $Device
+    --device $Device `
+    @ownerArgs
 
 if ($LASTEXITCODE -ne 0) {
     throw "TIDA CTU refinement failed with exit code $LASTEXITCODE"
