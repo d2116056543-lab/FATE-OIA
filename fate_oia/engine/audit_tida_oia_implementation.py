@@ -27,6 +27,7 @@ REQUIRED_FILES = (
     "fate_oia/models/tida_reason_reader.py", "fate_oia/models/tida_oia_model.py",
     "fate_oia/losses/tida_losses.py", "fate_oia/losses/tida_loss_registry.py",
     "fate_oia/utils/tida_temporal_interventions.py", "fate_oia/utils/tida_artifacts.py", "fate_oia/utils/tida_contracts.py",
+    "fate_oia/utils/tida_stateful_sampler.py",
     "fate_oia/explain/tida_dynamic_concepts.py", "fate_oia/engine/build_tida_clip_manifest.py",
     "fate_oia/engine/audit_tida_video_data.py", "fate_oia/engine/train_tida_oia.py",
     "fate_oia/engine/evaluate_tida_oia.py", "fate_oia/engine/profile_tida_oia.py",
@@ -118,7 +119,18 @@ def static_audit(review_dir: Path) -> dict[str, Any]:
         '"rng_state"', '"sampler_state"', '"clip_manifest_sha256"', '"config_sha256"',
         '"git_head"', '"git_tree"', '"image_checkpoint_sha256"', '"predicate_role_sha256"',
     )
-    checkpoint_audit = {"pass": all(field in checkpoint_source for field in checkpoint_fields), "required_fields": list(checkpoint_fields)}
+    resume_semantics = {
+        "stateful_sampler": "TIDAStatefulRandomSampler" in checkpoint_source,
+        "consumed_cursor": "mark_consumed" in checkpoint_source,
+        "sampler_restore": "train_sampler.load_state_dict" in checkpoint_source,
+        "optimizer_boundary": "checkpoint_at_optimizer_boundary" in checkpoint_source,
+        "no_epoch_skip_restore": 'return int(runtime.train_sampler.epoch)' in checkpoint_source,
+    }
+    checkpoint_audit = {
+        "pass": all(field in checkpoint_source for field in checkpoint_fields) and all(resume_semantics.values()),
+        "required_fields": list(checkpoint_fields),
+        "resume_semantics": resume_semantics,
+    }
     _write(review_dir, "checkpoint_resume_audit.json", checkpoint_audit)
     supervisor_source = Path("fate_oia/engine/supervise_tida_oia_foreground.py").read_text(encoding="utf-8")
     supervisor_audit = {
@@ -195,11 +207,25 @@ def dynamic_audit(args: Any, review_dir: Path) -> dict[str, Any]:
     _write(review_dir, "source_tree_image_oracle_audit.json", oracle_audit)
     invalid = torch.zeros_like(batch["frame_valid_mask"]); invalid[:, -1] = True
     zero = model(batch["target_image"], batch["context_images"], batch["timestamps"], invalid, temporal_action_scale=0.0, temporal_reason_scale=0.0)
+    direct_history_off = model(
+        batch["target_image"], batch["context_images"], batch["timestamps"], batch["frame_valid_mask"],
+        temporal_action_scale=1.0, temporal_reason_scale=1.0, intervention="history_off",
+    )
     target_equivalence = {
         "action_max_abs": float((zero["video_action_logits"] - zero["image_action_logits"]).abs().max()),
         "reason_max_abs": float((zero["video_reason_logits"] - zero["image_reason_logits"]).abs().max()),
+        "direct_history_off_action_max_abs": float(
+            (direct_history_off["video_action_logits"] - direct_history_off["image_action_logits"]).abs().max()
+        ),
+        "direct_history_off_reason_max_abs": float(
+            (direct_history_off["video_reason_logits"] - direct_history_off["image_reason_logits"]).abs().max()
+        ),
+        "direct_history_off_any_valid": bool(direct_history_off["history_valid"].any()),
     }
-    target_equivalence["pass"] = max(target_equivalence.values()) < 1e-6
+    target_equivalence["pass"] = (
+        max(value for key, value in target_equivalence.items() if key.endswith("max_abs")) < 1e-6
+        and not target_equivalence["direct_history_off_any_valid"]
+    )
     _write(review_dir, "target_equivalence.json", target_equivalence)
     dino = model.image_model.foundation.dino
     dino_audit = {
@@ -369,7 +395,8 @@ def pass_payload(args: Any, gates: dict[str, Any], tests: dict[str, Any]) -> dic
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True); parser.add_argument("--clip-manifest", required=True)
-    parser.add_argument("--image-checkpoint", required=True); parser.add_argument("--review-dir", default=".review/tida_oia_v1")
+    parser.add_argument("--image-checkpoint", required=True)
+    parser.add_argument("--review-dir", "--output-dir", dest="review_dir", default=".review/tida_oia_v1")
     parser.add_argument("--golden-oracle", required=True); parser.add_argument("--source-root", required=True)
     parser.add_argument("--device", default="cuda"); parser.add_argument("--data-audit")
     parser.add_argument("--mechanism-run-dir"); parser.add_argument("--memory-profile")

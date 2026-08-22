@@ -96,8 +96,11 @@ class BDDOIAVideoDataset(Dataset):
         transform: SynchronizedVideoTransform | None = None,
         decoder: Callable[[str | Path, torch.Tensor], tuple[list[Any], torch.Tensor]] = decode_selected_frames,
         seed: int = 20260821,
+        max_samples: int | None = None,
     ) -> None:
         self.records = [record for record in load_manifest(manifest_path) if record.partition == partition]
+        if max_samples is not None:
+            self.records = self.records[: max(0, int(max_samples))]
         self.partition = partition
         self.training = training
         self.transform = transform or SynchronizedVideoTransform()
@@ -107,13 +110,16 @@ class BDDOIAVideoDataset(Dataset):
     def __len__(self) -> int:
         return len(self.records)
 
-    def __getitem__(self, index: int) -> dict[str, Any]:
+    def __getitem__(self, index: int | tuple[int, int]) -> dict[str, Any]:
         from PIL import Image
 
+        augmentation_seed = self.seed
+        if isinstance(index, tuple):
+            index, augmentation_seed = int(index[0]), int(index[1])
         record = self.records[index]
         requested_timestamps = quadratic_multirate_timestamps()
         if self.training:
-            requested_timestamps = jitter_timestamps(requested_timestamps, random.Random(self.seed + index))
+            requested_timestamps = jitter_timestamps(requested_timestamps, random.Random(augmentation_seed))
         frame_indices = timestamps_to_indices(requested_timestamps, record.fps, record.target_frame_index)
         timestamps = (frame_indices.to(torch.float32) - float(record.target_frame_index)) / float(record.fps)
         timestamps[-1] = 0.0
@@ -122,7 +128,9 @@ class BDDOIAVideoDataset(Dataset):
         decoded, decoded_valid = self.decoder(record.clip_path, frame_indices)
         target = Image.open(record.target_image_path).convert("RGB")
         frames = decoded[:14] + [target]
-        transformed = self.transform(frames, training=self.training)
+        transformed = self.transform(
+            frames, training=self.training, random_value=random.Random(augmentation_seed + 1).random()
+        )
         action = record.action
         reason = record.reason
         if transformed["meta"]["flipped"]:

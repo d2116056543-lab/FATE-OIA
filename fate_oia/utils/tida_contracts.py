@@ -19,6 +19,19 @@ def schedule_values(update: int, total_updates: int, *, warmup_ratio: float = 0.
     return {"progress": progress, "temporal_scale": temporal_scale, "lr_scale": lr_scale}
 
 
+def resolve_schedule_total_updates(
+    *, updates_per_epoch: int, configured_epochs: int, schedule_total_updates: int | None = None
+) -> int:
+    formal_total = int(updates_per_epoch) * int(configured_epochs)
+    if formal_total <= 0:
+        raise ValueError("schedule requires positive updates_per_epoch and configured_epochs")
+    if schedule_total_updates is None:
+        return formal_total
+    if int(schedule_total_updates) <= 0:
+        raise ValueError("schedule_total_updates must be positive")
+    return int(schedule_total_updates)
+
+
 def validate_training_protocol(config: dict[str, Any]) -> None:
     experiment, runtime, training = config["experiment"], config["runtime"], config["training"]
     errors = []

@@ -307,6 +307,7 @@ class TIDAOIAModel(nn.Module):
             canonicalize_horizontal_flip=canonicalize_horizontal_flip,
         )
         history_tokens = context["history_query_tokens"]
+        effective_frame_valid_mask = frame_valid_mask
         if intervention is not None:
             from ..utils.tida_temporal_interventions import apply_query_intervention
 
@@ -316,8 +317,11 @@ class TIDAOIAModel(nn.Module):
                 static_predicate_mask=self.predicate_differential.static_mask,
                 action_count=self.num_actions,
             )
+            if intervention == "history_off":
+                effective_frame_valid_mask = frame_valid_mask.clone()
+                effective_frame_valid_mask[:, :-1] = False
         temporal_output = self.decode_encoded_history(
-            history_tokens, context["history_query_region_mass"], timestamps, frame_valid_mask,
+            history_tokens, context["history_query_region_mass"], timestamps, effective_frame_valid_mask,
             target_evidence, static_context, image,
             temporal_action_scale=temporal_action_scale,
             temporal_reason_scale=temporal_reason_scale,

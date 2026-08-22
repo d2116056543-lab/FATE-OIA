@@ -39,7 +39,12 @@ from fate_oia.utils.tida_artifacts import (
     save_checkpoint_atomic,
     seed_tida_run,
 )
-from fate_oia.utils.tida_contracts import schedule_values, validate_training_protocol
+from fate_oia.utils.tida_contracts import (
+    resolve_schedule_total_updates,
+    schedule_values,
+    validate_training_protocol,
+)
+from fate_oia.utils.tida_stateful_sampler import TIDAStatefulRandomSampler
 from fate_oia.utils.vetra_stage_contracts import sha256_file
 
 
@@ -51,6 +56,7 @@ class TIDARuntime:
     device: torch.device
     image_checkpoint: Path
     clip_manifest: Path
+    train_sampler: TIDAStatefulRandomSampler
 
 
 def append_rank_window(
@@ -351,12 +357,15 @@ def _worker_init(_worker_id: int) -> None:
     torch.set_num_threads(1)
 
 
-def make_loader(dataset, batch_size: int, shuffle: bool, workers: int, config: dict[str, Any], generator=None) -> DataLoader:
+def make_loader(
+    dataset, batch_size: int, shuffle: bool, workers: int, config: dict[str, Any],
+    generator=None, sampler=None,
+) -> DataLoader:
     data = config["data"]
     kwargs: dict[str, Any] = {
         "dataset": dataset,
         "batch_size": int(batch_size),
-        "shuffle": bool(shuffle),
+        "shuffle": bool(shuffle) if sampler is None else False,
         "num_workers": int(workers),
         "pin_memory": bool(data["pin_memory"]),
         "persistent_workers": bool(data["persistent_workers"]) and workers > 0,
@@ -364,6 +373,8 @@ def make_loader(dataset, batch_size: int, shuffle: bool, workers: int, config: d
         "worker_init_fn": _worker_init,
         "generator": generator,
     }
+    if sampler is not None:
+        kwargs["sampler"] = sampler
     if workers > 0:
         kwargs["prefetch_factor"] = int(data["prefetch_factor"])
     return DataLoader(**kwargs)
@@ -422,21 +433,18 @@ def build_runtime(args: Any, evaluation_only: bool = False) -> TIDARuntime:
     ).to(device)
     batch_size = int(_arg(args, "batch_size", 2))
     workers = int(_arg(args, "num_workers", config["data"]["num_workers"]))
-    train_generator = torch.Generator().manual_seed(20260821)
+    max_samples = _arg(args, "max_samples", None)
     datasets = {
         partition: BDDOIAVideoDataset(
             clip_manifest,
             partition,
             training=partition == "train_core" and not evaluation_only,
             seed=20260821,
+            max_samples=max_samples,
         )
         for partition in ("train_core", "train_calib", "train_audit", "test")
     }
-    max_samples = _arg(args, "max_samples", None)
-    if max_samples is not None:
-        from torch.utils.data import Subset
-
-        datasets = {key: Subset(value, range(min(len(value), int(max_samples)))) for key, value in datasets.items()}
+    train_sampler = TIDAStatefulRandomSampler(datasets["train_core"], seed=20260821)
     loaders = {
         partition: make_loader(
             dataset,
@@ -444,7 +452,7 @@ def build_runtime(args: Any, evaluation_only: bool = False) -> TIDARuntime:
             shuffle=partition == "train_core" and not evaluation_only,
             workers=workers,
             config=config,
-            generator=train_generator if partition == "train_core" else None,
+            sampler=train_sampler if partition == "train_core" and not evaluation_only else None,
         )
         for partition, dataset in datasets.items()
     }
@@ -454,7 +462,7 @@ def build_runtime(args: Any, evaluation_only: bool = False) -> TIDARuntime:
         trainable = dict(model.named_parameters())
         for name, value in payload["tida_trainable_state"].items():
             trainable[name].data.copy_(value.to(trainable[name]))
-    return TIDARuntime(config, model, loaders, device, image_checkpoint, clip_manifest)
+    return TIDARuntime(config, model, loaders, device, image_checkpoint, clip_manifest, train_sampler)
 
 
 def build_optimizer(model: TIDAOIAModel, config: dict[str, Any]) -> torch.optim.Optimizer:
@@ -500,7 +508,7 @@ def _checkpoint_payload(
     epoch: int,
     update: int,
     best: dict[str, Any],
-    train_generator: torch.Generator,
+    train_sampler: TIDAStatefulRandomSampler,
     *,
     total_updates: int,
     git_head: str,
@@ -519,8 +527,8 @@ def _checkpoint_payload(
         "scheduler": {"kind": "warmup_cosine_by_update", "update": update, "total_updates": total_updates},
         "ema": ema.state_dict(),
         "rng_state": capture_rng_state(),
-        "train_generator_state": train_generator.get_state(),
-        "sampler_state": {"epoch": epoch, "generator_state": train_generator.get_state()},
+        "sampler_state": train_sampler.state_dict(),
+        "checkpoint_at_optimizer_boundary": True,
         "best": best,
         "git_head": git_head,
         "git_tree": git_tree,
@@ -535,7 +543,7 @@ def _checkpoint_payload(
 
 
 def _restore_training_state(
-    runtime: TIDARuntime, optimizer, ema, path: Path, train_generator: torch.Generator,
+    runtime: TIDARuntime, optimizer, ema, path: Path,
     *, total_updates: int, config_path: Path, predicate_role_path: Path, git_head: str, git_tree: str,
 ):
     payload = torch.load(path, map_location="cpu", weights_only=False)
@@ -556,8 +564,10 @@ def _restore_training_state(
     optimizer.load_state_dict(payload["optimizer"])
     ema.load_state_dict(payload["ema"])
     restore_rng_state(payload["rng_state"])
-    train_generator.set_state(payload["train_generator_state"])
-    return int(payload["epoch"]) + 1, int(payload["optimizer_update"]), dict(payload["best"])
+    if not payload.get("checkpoint_at_optimizer_boundary", False):
+        raise RuntimeError("resume checkpoint is not at an optimizer boundary")
+    runtime.train_sampler.load_state_dict(payload["sampler_state"])
+    return int(runtime.train_sampler.epoch), int(payload["optimizer_update"]), dict(payload["best"])
 
 
 def _view_metrics(test_rows, calib_rows):
@@ -596,12 +606,18 @@ def train(args: Any) -> None:
         raise ValueError("formal full training requires exactly ten epochs")
     if run_kind == "full" and max_optimizer_updates is not None:
         raise ValueError("formal full training forbids max_optimizer_updates")
+    schedule_override = _arg(args, "schedule_total_updates", None)
+    if run_kind == "full" and schedule_override is not None:
+        raise ValueError("formal full training forbids schedule_total_updates override")
     grad_accum = int(_arg(args, "gradient_accumulation_steps", 15))
     optimizer = build_optimizer(model, config)
     ema = TIDATrainableEMA(model, decay=float(config["training"]["ema_decay"]))
     updates_per_epoch = math.ceil(len(runtime.loaders["train_core"]) / grad_accum)
-    total_updates = max(int(max_optimizer_updates or (updates_per_epoch * epochs)), 1)
-    train_generator = runtime.loaders["train_core"].generator
+    total_updates = resolve_schedule_total_updates(
+        updates_per_epoch=updates_per_epoch,
+        configured_epochs=int(config["training"]["epochs"]),
+        schedule_total_updates=schedule_override,
+    )
     start_epoch, optimizer_update, best = 0, 0, {}
     git_head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     git_tree = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], text=True).strip()
@@ -610,7 +626,7 @@ def train(args: Any) -> None:
     resume = _arg(args, "resume", None)
     if resume:
         start_epoch, optimizer_update, best = _restore_training_state(
-            runtime, optimizer, ema, Path(resume), train_generator,
+            runtime, optimizer, ema, Path(resume),
             total_updates=total_updates, config_path=config_path, predicate_role_path=predicate_role_path,
             git_head=git_head, git_tree=git_tree,
         )
@@ -630,6 +646,8 @@ def train(args: Any) -> None:
         "loss_weights": config["loss"], "learning_rates": config["training"]["lr"],
         "seed": int(config["training"].get("seed", config["data"]["partition_seed"])),
         "max_optimizer_updates": max_optimizer_updates,
+        "schedule_total_updates": total_updates,
+        "schedule_override": schedule_override is not None,
     }
     atomic_write_json(output_dir / "run_manifest.json", manifest)
     Path(output_dir / "config_resolved.yaml").write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
@@ -657,7 +675,10 @@ def train(args: Any) -> None:
     print_interval = int(config["runtime"]["print_every_optimizer_updates"])
     completed_epochs = start_epoch
     for epoch in range(start_epoch, epochs):
+        if runtime.train_sampler.epoch != epoch:
+            raise RuntimeError("train sampler epoch and trainer epoch differ")
         epoch_start = time.perf_counter()
+        epoch_batch_count = math.ceil(len(runtime.train_sampler) / int(_arg(args, "batch_size", 2)))
         micro_count = 0
         previous_iteration_end = time.perf_counter()
         telemetry_window = False
@@ -724,7 +745,8 @@ def train(args: Any) -> None:
                 batch["action"],
             )
             micro_count += 1
-            should_update = micro_count == grad_accum or micro_step + 1 == len(runtime.loaders["train_core"])
+            runtime.train_sampler.mark_consumed(int(batch["target_image"].shape[0]))
+            should_update = micro_count == grad_accum or micro_step + 1 == epoch_batch_count
             if not should_update:
                 previous_iteration_end = time.perf_counter()
                 continue
@@ -805,6 +827,9 @@ def train(args: Any) -> None:
             if max_optimizer_updates is not None and optimizer_update >= int(max_optimizer_updates):
                 break
 
+        epoch_exhausted = runtime.train_sampler.epoch_complete
+        if epoch_exhausted:
+            runtime.train_sampler.advance_epoch()
         model.eval()
         online_calib = collect_tida_outputs(model, runtime.loaders["train_calib"], device)
         online_test = collect_tida_outputs(
@@ -825,7 +850,7 @@ def train(args: Any) -> None:
             key=lambda pair: float(pair[1]["deploy"]["video"]["joint"]),
         )
         payload = _checkpoint_payload(
-            runtime, optimizer, ema, epoch, optimizer_update, best, train_generator,
+            runtime, optimizer, ema, epoch, optimizer_update, best, runtime.train_sampler,
             total_updates=total_updates, git_head=git_head, git_tree=git_tree,
             config_path=config_path, predicate_role_path=predicate_role_path,
         )
@@ -855,7 +880,7 @@ def train(args: Any) -> None:
         save_epoch_outputs(output_dir, epoch, online_test, metrics, online["thresholds"], mechanism)
         print(json.dumps({"event": "tida_epoch", "epoch": epoch, "selected_view": selected_name, **criteria}), flush=True)
         model.train()
-        completed_epochs = epoch + 1
+        completed_epochs = epoch + 1 if epoch_exhausted else epoch
         if max_optimizer_updates is not None and optimizer_update >= int(max_optimizer_updates):
             break
 
@@ -891,6 +916,7 @@ def main() -> None:
     parser.add_argument("--run-kind", choices=("smoke", "profile", "full"), default="full")
     parser.add_argument("--max-samples", type=int)
     parser.add_argument("--max-optimizer-updates", type=int)
+    parser.add_argument("--schedule-total-updates", type=int)
     args = parser.parse_args()
     train(args)
 
