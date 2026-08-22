@@ -44,3 +44,21 @@ def test_slice_marks_labels_without_both_classes_unavailable():
     )
     assert result["full"]["eligible_label_count"] == 0
     assert all(not row["class_metrics_available"] for row in result["per_label"])
+
+
+def test_reason_pu_weight_does_not_treat_every_observed_zero_as_hard_negative():
+    image = torch.zeros(2, 2)
+    video = torch.tensor([[0.2, 0.2], [0.2, 0.2]])
+    target = torch.tensor([[1.0, 0.0], [1.0, 0.0]])
+    hard = paired_temporal_contribution(
+        image, video, target, motion_score=torch.arange(2).float(),
+        bootstrap_samples=20, seed=2,
+    )
+    pu = paired_temporal_contribution(
+        image, video, target, motion_score=torch.arange(2).float(),
+        pu_negative_weight=torch.zeros_like(target), bootstrap_samples=20, seed=2,
+    )
+    assert hard["full"]["signed_margin_mean"] == 0.0
+    assert pu["full"]["signed_margin_mean"] > 0.19
+    assert pu["full"]["observed_positive_margin_mean"] > 0
+    assert pu["full"]["observed_zero_logit_delta_mean"] > 0
