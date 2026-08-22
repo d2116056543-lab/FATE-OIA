@@ -481,17 +481,30 @@ def _trainable_state(model: TIDAOIAModel) -> dict[str, torch.Tensor]:
     return {name: parameter.detach().cpu() for name, parameter in model.named_parameters() if parameter.requires_grad}
 
 
-def _counterfactual_errors(model: TIDAOIAModel, output: dict[str, Any], update: int, scale: float) -> dict[str, torch.Tensor]:
-    if update % 4:
-        return {}
-    order_name = "time_shuffle" if (update // 4) % 2 == 0 else "time_reverse"
+def _counterfactual_outputs(
+    model: TIDAOIAModel,
+    output: dict[str, Any],
+    update: int,
+    scale: float,
+    *,
+    enabled: bool,
+) -> tuple[dict[str, torch.Tensor], dict[str, dict[str, torch.Tensor]]]:
+    if not enabled:
+        return {}, {}
+    order_name = "time_shuffle" if update % 2 == 0 else "time_reverse"
     order = model.rerun_temporal_from_output(
         output, order_name, temporal_action_scale=scale, temporal_reason_scale=scale
     )
     repeat = model.rerun_temporal_from_output(
         output, "repeated_last", temporal_action_scale=scale, temporal_reason_scale=scale
     )
-    return {"order": order["terminal_error_history"], "repeat": repeat["terminal_error_history"]}
+    history_off = model.rerun_temporal_from_output(
+        output, "history_off", temporal_action_scale=scale, temporal_reason_scale=scale
+    )
+    return (
+        {"order": order["terminal_error_history"], "repeat": repeat["terminal_error_history"]},
+        {order_name: order, "repeated_last": repeat, "history_off": history_off},
+    )
 
 
 def _apply_initial_owner_firewall(model: TIDAOIAModel, temporal_scale: float) -> None:
@@ -717,12 +730,16 @@ def train(args: Any) -> None:
                     batch["target_image"], batch["context_images"], batch["timestamps"], batch["frame_valid_mask"],
                     temporal_action_scale=schedule["temporal_scale"], temporal_reason_scale=schedule["temporal_scale"],
                 )
-                counterfactual = _counterfactual_errors(model, output, optimizer_update, schedule["temporal_scale"])
+                counterfactual_enabled = micro_count + 1 == grad_accum or micro_step + 1 == epoch_batch_count
+                counterfactual_errors, counterfactual_outputs = _counterfactual_outputs(
+                    model, output, optimizer_update, schedule["temporal_scale"], enabled=counterfactual_enabled
+                )
                 registry = build_tida_loss_registry(
                     output,
                     batch["action"],
                     batch["reason"],
-                    counterfactual_errors=counterfactual,
+                    counterfactual_errors=counterfactual_errors,
+                    counterfactual_outputs=counterfactual_outputs,
                     rank_reference=rank_window_reference(rank_window),
                     weights=config["loss"],
                 )
@@ -776,6 +793,7 @@ def train(args: Any) -> None:
             row = {
                 "epoch": epoch, "micro_step": micro_step, "optimizer_update": optimizer_update,
                 "total_updates": total_updates, "temporal_scale": schedule["temporal_scale"],
+                "flow_phase": schedule["phase"],
                 "initial_owner_firewall_active": schedule["temporal_scale"] == 0.0,
                 "lr_scale": schedule["lr_scale"], "learning_rates": {group["name"]: group["lr"] for group in optimizer.param_groups},
                 "loss_total": float(registry.total().detach().cpu()), "losses": registry.artifact(),

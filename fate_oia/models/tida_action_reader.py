@@ -46,14 +46,25 @@ class TIDAActionReader(nn.Module):
         *,
         temporal_scale: float | torch.Tensor,
         predicate_key_state: torch.Tensor | None = None,
+        transition_state: torch.Tensor | None = None,
+        transition_reliability: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         batch = action_nodes.shape[0]
-        factors = torch.cat([predicate_state, action_innovation], dim=1)
-        key_factors = torch.cat([
+        base_factors = [predicate_state, action_innovation]
+        base_keys = [
             predicate_state if predicate_key_state is None else predicate_key_state,
             action_innovation,
-        ], dim=1)
-        if factors.shape[1] != self.num_predicates + self.num_actions:
+        ]
+        if transition_state is not None:
+            if transition_reliability is None:
+                raise ValueError("transition reliability is required with transition state")
+            base_factors.append(transition_state)
+            base_keys.append(transition_state)
+            reliability = torch.cat([reliability, transition_reliability], dim=1)
+        factors = torch.cat(base_factors, dim=1)
+        key_factors = torch.cat(base_keys, dim=1)
+        expected = self.num_predicates + self.num_actions + (0 if transition_state is None else transition_state.shape[1])
+        if factors.shape[1] != expected:
             raise ValueError("factor bank must contain predicate and action innovation factors")
         if reliability.shape != factors.shape[:2]:
             raise ValueError("reliability shape mismatch")
@@ -80,6 +91,8 @@ class TIDAActionReader(nn.Module):
         bounded = raw_contribution * ratio[..., None]
         bounded = torch.where((raw_sum.abs() > self.eps)[..., None], bounded, torch.zeros_like(bounded))
         bounded = self._reconcile(bounded, delta)
+        flow_start = self.num_predicates + self.num_actions
+        flow_route_mass = route[..., flow_start:-1].sum(-1) if transition_state is not None else route[..., :0].sum(-1)
         return {
             "action_route": route,
             "action_factor_keys": torch.cat([keys, self.null_key.view(1, 1, -1).expand(batch, -1, -1)], dim=1),
@@ -92,5 +105,6 @@ class TIDAActionReader(nn.Module):
             "action_effective_trust": effective_trust,
             "action_nonnull_mass": route[..., :-1].sum(-1),
             "action_route_entropy": -(route * route.clamp_min(self.eps).log()).sum(-1),
+            "action_flow_route_mass": flow_route_mass,
             "selected_action_temporal_evidence": torch.einsum("baf,bafd->bad", route, factor_value),
         }

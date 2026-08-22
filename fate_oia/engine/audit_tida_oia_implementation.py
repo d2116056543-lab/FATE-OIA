@@ -24,7 +24,8 @@ REQUIRED_FILES = (
     "fate_oia/models/tida_terminal_query_reader.py", "fate_oia/models/tida_context_encoder.py",
     "fate_oia/models/tida_temporal_encoder.py", "fate_oia/models/tida_terminal_innovation.py",
     "fate_oia/models/tida_predicate_differential.py", "fate_oia/models/tida_action_reader.py",
-    "fate_oia/models/tida_reason_reader.py", "fate_oia/models/tida_oia_model.py",
+    "fate_oia/models/tida_flow_transition_bank.py", "fate_oia/models/tida_reason_reader.py",
+    "fate_oia/models/tida_oia_model.py", "fate_oia/losses/tida_flow_credit_losses.py",
     "fate_oia/losses/tida_losses.py", "fate_oia/losses/tida_loss_registry.py",
     "fate_oia/utils/tida_temporal_interventions.py", "fate_oia/utils/tida_artifacts.py", "fate_oia/utils/tida_contracts.py",
     "fate_oia/utils/tida_stateful_sampler.py",
@@ -36,7 +37,10 @@ REQUIRED_FILES = (
     "fate_oia/engine/export_tida_deployment.py", "fate_oia/engine/supervise_tida_oia_foreground.py",
     "scripts/FATE_OIA_tida_oia_v1_foreground.ps1", "configs/fate_oia_train_tida_oia_v1_15f.yaml",
     "configs/tida_predicate_roles.yaml", "docs/superpowers/specs/2026-08-21-tida-oia-v1-design.md",
-    "docs/superpowers/plans/2026-08-21-tida-oia-v1-implementation.md", ".codex/skills/tida-oia-v1-implementation-audit/SKILL.md",
+    "docs/superpowers/plans/2026-08-21-tida-oia-v1-implementation.md",
+    "docs/superpowers/specs/2026-08-22-tida-flow-credit-design.md",
+    "docs/superpowers/plans/2026-08-22-tida-flow-credit.md",
+    ".codex/skills/tida-oia-v1-implementation-audit/SKILL.md",
 )
 
 FORMAL_FILES = tuple(
@@ -111,6 +115,8 @@ def static_audit(review_dir: Path) -> dict[str, Any]:
         "trainer_to_model": "model(" in Path("fate_oia/engine/train_tida_oia.py").read_text(encoding="utf-8"),
         "trainer_to_losses": "build_tida_loss_registry" in Path("fate_oia/engine/train_tida_oia.py").read_text(encoding="utf-8"),
         "trainer_to_evaluator": "collect_tida_outputs" in Path("fate_oia/engine/train_tida_oia.py").read_text(encoding="utf-8"),
+        "model_to_transition_bank": "self.flow_transition_bank(" in Path("fate_oia/models/tida_oia_model.py").read_text(encoding="utf-8"),
+        "trainer_to_margin_credit": "counterfactual_outputs=" in Path("fate_oia/engine/train_tida_oia.py").read_text(encoding="utf-8"),
     }
     _write(review_dir, "call_graph.json", {"pass": all(call_graph_requirements.values()), "edges": call_graph_requirements})
     checkpoint_source = Path("fate_oia/engine/train_tida_oia.py").read_text(encoding="utf-8")
@@ -275,7 +281,10 @@ def dynamic_audit(args: Any, review_dir: Path) -> dict[str, Any]:
     reason_output = model(batch["target_image"], batch["context_images"], batch["timestamps"], batch["frame_valid_mask"], temporal_action_scale=1.0, temporal_reason_scale=1.0)
     reason_output["video_reason_logits"].sum().backward()
     owner_parameters = model.owner_parameters()
-    blocked = ("history_reader", "temporal_encoder", "innovation_predictor", "predicate_differential", "temporal_action")
+    blocked = (
+        "history_reader", "temporal_encoder", "innovation_predictor", "predicate_differential",
+        "flow_transition", "temporal_action",
+    )
     reason_firewall = {
         "pass": not any(_has_grad(owner_parameters[name]) for name in blocked) and _has_grad(owner_parameters["temporal_reason"]),
         "blocked_owner_has_grad": {name: _has_grad(owner_parameters[name]) for name in blocked},
@@ -308,10 +317,33 @@ def dynamic_audit(args: Any, review_dir: Path) -> dict[str, Any]:
     _write(review_dir, "temporal_encoder_audit.json", temporal)
     predicate = {"pass": output["predicate_differential_state"].shape == (1, 32, 384), "role_exact_cover": True}
     _write(review_dir, "predicate_differential_audit.json", predicate)
+    reversed_output = model.rerun_temporal_from_output(
+        output, "time_reverse", temporal_action_scale=1.0, temporal_reason_scale=1.0
+    )
+    transition = {
+        "pass": bool(
+            output["transition_tokens"].shape == (1, 32, 384)
+            and torch.isfinite(output["transition_tokens"]).all()
+            and output["transition_reliability"].shape == (1, 32)
+            and output["action_flow_route_mass"].shape == (1, 4)
+            and output["reason_flow_route_mass"].shape == (1, 21)
+        ),
+        "transition_shape": list(output["transition_tokens"].shape),
+        "velocity_reverse_cosine": float(torch.nn.functional.cosine_similarity(
+            output["velocity"].flatten(1), reversed_output["velocity"].flatten(1), dim=-1
+        ).mean()),
+        "action_flow_route_mass_mean": float(output["action_flow_route_mass"].mean()),
+        "reason_flow_route_mass_mean": float(output["reason_flow_route_mass"].mean()),
+    }
+    _write(review_dir, "flow_transition_audit.json", transition)
     expected_confidence = (
         output["reason_temporal_route"][..., :-1]
         * torch.cat(
-            [output["innovation_reliability"][:, 4:], output["innovation_reliability"][:, :4]],
+            [
+                output["innovation_reliability"][:, 4:],
+                output["innovation_reliability"][:, :4],
+                output["transition_reliability"],
+            ],
             dim=1,
         )[:, None]
     ).sum(-1)
@@ -331,6 +363,7 @@ def dynamic_audit(args: Any, review_dir: Path) -> dict[str, Any]:
         "source_tree_image_oracle": oracle_audit["pass"],
         "target_equivalence": target_equivalence["pass"], "dino": dino_audit["pass"], "query": query_audit["pass"],
         "temporal": temporal["pass"], "innovation": innovation_audit["pass"], "predicate": predicate["pass"],
+        "flow_transition": transition["pass"],
         "action": action_audit["pass"], "reason_firewall": reason_firewall["pass"],
         "reason_evidence_trust": reason_trust["pass"],
         "loss_registry": loss_audit["pass"], "interventions": intervention_audit["pass"],
@@ -409,8 +442,8 @@ def binding(args: Any, tests: dict[str, Any]) -> dict[str, Any]:
 
 
 def pass_payload(args: Any, gates: dict[str, Any], tests: dict[str, Any]) -> dict[str, Any]:
-    spec = Path("docs/superpowers/specs/2026-08-21-tida-oia-v1-design.md")
-    plan = Path("docs/superpowers/plans/2026-08-21-tida-oia-v1-implementation.md")
+    spec = Path("docs/superpowers/specs/2026-08-22-tida-flow-credit-design.md")
+    plan = Path("docs/superpowers/plans/2026-08-22-tida-flow-credit.md")
     skill = Path(".codex/skills/tida-oia-v1-implementation-audit/SKILL.md")
     return {
         "pass": True, "git_head": _git("rev-parse", "HEAD"), "git_tree": _git("rev-parse", "HEAD^{tree}"),

@@ -37,8 +37,16 @@ class TIDAReasonReader(nn.Module):
         reliability: torch.Tensor,
         *,
         temporal_scale: float | torch.Tensor,
+        transition_state: torch.Tensor | None = None,
+        transition_reliability: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        factors = torch.cat([predicate_state.detach(), action_innovation.detach()], dim=1)
+        factor_parts = [predicate_state.detach(), action_innovation.detach()]
+        if transition_state is not None:
+            if transition_reliability is None:
+                raise ValueError("transition reliability is required with transition state")
+            factor_parts.append(transition_state.detach())
+            reliability = torch.cat([reliability, transition_reliability.detach()], dim=1)
+        factors = torch.cat(factor_parts, dim=1)
         weights = reliability.detach().clamp(0, 1)
         query = self.reason_query(reason_nodes)
         keys = self.factor_key(factors)
@@ -74,6 +82,8 @@ class TIDAReasonReader(nn.Module):
         effective_trust = self.evidence_trust_cap * evidence_confidence
         delta = scale * effective_trust * self.kappa * torch.tanh(raw_delta / self.kappa)
         delta = torch.where(no_reliable_factor[:, None], torch.zeros_like(delta), delta)
+        flow_start = predicate_state.shape[1] + action_innovation.shape[1]
+        flow_route_mass = attention[..., flow_start:-1].sum(-1) if transition_state is not None else attention[..., :0].sum(-1)
         return {
             "reason_temporal_route": attention,
             "reason_temporal_evidence": private,
@@ -85,4 +95,5 @@ class TIDAReasonReader(nn.Module):
             "reason_private_token": private,
             "reason_raw_temporal_delta": raw_delta,
             "reason_temporal_delta": delta,
+            "reason_flow_route_mass": flow_route_mass,
         }

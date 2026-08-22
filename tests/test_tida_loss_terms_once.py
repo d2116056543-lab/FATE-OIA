@@ -20,8 +20,11 @@ def test_each_required_loss_is_registered_exactly_once():
 def test_required_loss_names_and_yaml_weights_match_strict_contract():
     expected = (
         "terminal_hist", "terminal_no_history", "terminal_gain", "temporal_order", "repeated_last_contrast",
+        "flow_transition_align",
         "action_asl", "action_smooth_ap", "action_base_protect", "action_delta", "action_route_sparse",
+        "action_flow_credit", "action_flow_no_harm",
         "reason_partial", "reason_rank", "reason_soft_f1", "reason_delta",
+        "reason_flow_credit", "reason_flow_no_harm",
     )
     config = yaml.safe_load(open("configs/fate_oia_train_tida_oia_v1_15f.yaml", encoding="utf-8"))
     assert TIDALossRegistry.required_terms == expected

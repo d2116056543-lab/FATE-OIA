@@ -1,5 +1,5 @@
 experiment:
-  name: tida_oia_v1_video
+  name: tida_oia_flow_credit_v1
   direct_video: true
   eval_splits: [test]
   best_selection_split: test
@@ -56,19 +56,24 @@ model:
   reason_evidence_trust_cap: 0.25
 loss:
   terminal_hist: 0.25
-  terminal_no_history: 0.0625
+  terminal_no_history: 0.0
   terminal_gain: 0.05
   temporal_order: 0.025
   repeated_last_contrast: 0.025
+  flow_transition_align: 0.05
   action_asl: 1.00
   action_smooth_ap: 0.15
   action_base_protect: 0.10
   action_delta: 0.005
   action_route_sparse: 0.005
+  action_flow_credit: 0.08
+  action_flow_no_harm: 0.10
   reason_partial: 1.00
   reason_rank: 0.08
   reason_soft_f1: 0.04
   reason_delta: 0.005
+  reason_flow_credit: 0.06
+  reason_flow_no_harm: 0.08
 training:
   seed: 20260821
   epochs: 10
@@ -78,6 +83,10 @@ training:
   global_grad_clip: 1.0
   warmup_ratio: 0.05
   temporal_ramp_end_ratio: 0.20
+  flow_phases:
+    foundation_end_ratio: 0.05
+    credit_end_ratio: 0.20
+    final_phase: SAFE_JOINT
   min_lr_ratio: 0.10
   ema_decay: 0.998
   no_metric_early_stop: true
@@ -86,6 +95,7 @@ training:
     temporal_encoder: 0.0001
     innovation_predictor: 0.0001
     predicate_differential: 0.0001
+    flow_transition: 0.00015
     temporal_action: 0.00015
     temporal_reason: 0.0001
 memory_probe:

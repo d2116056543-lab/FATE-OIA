@@ -12,6 +12,15 @@ from fate_oia.utils.tida_contracts import _best_label_threshold
 from fate_oia.utils.tida_artifacts import atomic_write_json
 
 
+def gt_margin_advantage(
+    real_logits: torch.Tensor,
+    counterfactual_logits: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    sign = 2.0 * target.to(real_logits.dtype) - 1.0
+    return sign * (real_logits - counterfactual_logits)
+
+
 def _device_batch(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
     return {key: value.to(device, non_blocking=True) if torch.is_tensor(value) else value for key, value in batch.items()}
 
@@ -51,12 +60,16 @@ def collect_tida_outputs(
         "rho", "action_delta", "reason_delta", "null_mass", "route_entropy",
         "action_evidence_confidence", "action_effective_trust",
         "reason_evidence_confidence", "reason_effective_trust",
+        "action_flow_route_mass", "reason_flow_route_mass", "transition_reliability",
+        "velocity_norm", "acceleration_norm",
     )}
     audit_keys = (
         "terminal_prediction_history", "terminal_prediction_no_history", "terminal_target_evidence",
         "terminal_error_history", "terminal_error_no_history", "innovation_token",
         "predicate_differential_state", "predicate_velocity_norm", "predicate_acceleration_norm",
         "predicate_persistence", "predicate_region_mass", "predicate_region_mass_velocity", "common_motion_norm",
+        "transition_tokens", "velocity", "acceleration", "region_velocity", "transition_reliability",
+        "action_flow_route_mass", "reason_flow_route_mass",
         "action_temporal_route", "action_factor_contribution", "reason_temporal_route", "frame_valid_mask", "timestamps",
     )
     audit_store: dict[str, list[torch.Tensor]] = {key: [] for key in audit_keys}
@@ -70,9 +83,9 @@ def collect_tida_outputs(
         )
     }
     mechanism_outputs: dict[str, dict[str, list[torch.Tensor]]] = {
-        name: {key: [] for key in ("action", "reason")} for name in mechanism_rows
+        name: {key: [] for key in ("action", "reason", "velocity")} for name in mechanism_rows
     }
-    mechanism_base = {key: [] for key in ("action", "reason", "action_target", "reason_target")}
+    mechanism_base = {key: [] for key in ("action", "reason", "action_target", "reason_target", "velocity")}
     mechanism_count = 0
     model.eval()
     for batch in loader:
@@ -96,6 +109,11 @@ def collect_tida_outputs(
             "action_effective_trust": output["action_effective_trust"],
             "reason_evidence_confidence": output["reason_evidence_confidence"],
             "reason_effective_trust": output["reason_effective_trust"],
+            "action_flow_route_mass": output["action_flow_route_mass"],
+            "reason_flow_route_mass": output["reason_flow_route_mass"],
+            "transition_reliability": output["transition_reliability"],
+            "velocity_norm": output["velocity"].norm(dim=-1),
+            "acceleration_norm": output["acceleration"].norm(dim=-1),
         }.items():
             diagnostics[key].append(value.detach().float().cpu())
         if collect_audit_tensors:
@@ -113,6 +131,7 @@ def collect_tida_outputs(
             mechanism_base["reason"].append(output["video_reason_logits"].detach().float().cpu())
             mechanism_base["action_target"].append(batch["action"].detach().float().cpu())
             mechanism_base["reason_target"].append(batch["reason"].detach().float().cpu())
+            mechanism_base["velocity"].append(output["velocity"].detach().float().cpu())
             for name in mechanism_rows:
                 if "predicate_flatten" in name:
                     indices = selected if name.startswith("selected") else matched
@@ -125,6 +144,7 @@ def collect_tida_outputs(
                 ))
                 mechanism_outputs[name]["action"].append(changed["video_action_logits"].detach().float().cpu())
                 mechanism_outputs[name]["reason"].append(changed["video_reason_logits"].detach().float().cpu())
+                mechanism_outputs[name]["velocity"].append(changed["velocity"].detach().float().cpu())
             mechanism_count += batch["target_image"].shape[0]
     result = {key: torch.cat(value) for key, value in store.items()} | {
         key: torch.cat(value) for key, value in diagnostics.items()
@@ -145,11 +165,29 @@ def collect_tida_outputs(
             changed_rows["video_action"] = torch.cat(values["action"])
             changed_rows["video_reason"] = torch.cat(values["reason"])
             metric = branch_metrics(changed_rows)["video"]
+            changed_action = torch.cat(values["action"])
+            changed_reason = torch.cat(values["reason"])
+            action_advantage = gt_margin_advantage(
+                base_rows["video_action"], changed_action, base_rows["action_target"]
+            )
+            reason_advantage = gt_margin_advantage(
+                base_rows["video_reason"], changed_reason, base_rows["reason_target"]
+            )
+            changed_velocity = torch.cat(values["velocity"])
+            real_velocity = torch.cat(mechanism_base["velocity"])
+            velocity_cosine = torch.nn.functional.cosine_similarity(
+                real_velocity.flatten(1), changed_velocity.flatten(1), dim=-1
+            )
             intervention_metrics[name] = {
                 **metric,
                 "joint_drop_from_real": base_metric["joint"] - metric["joint"],
                 "action_mf1_drop_from_real": base_metric["Act_mF1"] - metric["Act_mF1"],
                 "reason_mf1_drop_from_real": base_metric["Exp_mF1"] - metric["Exp_mF1"],
+                "action_gt_margin_advantage_mean": float(action_advantage.mean()),
+                "reason_gt_margin_advantage_mean": float(reason_advantage.mean()),
+                "action_gt_margin_advantage_by_label": action_advantage.mean(0).tolist(),
+                "reason_gt_margin_advantage_by_label": reason_advantage.mean(0).tolist(),
+                "velocity_cosine_with_reference": float(velocity_cosine.mean()),
             }
         result["_mechanism"] = {
             "available": mechanism_count > 0,
@@ -249,10 +287,13 @@ def save_epoch_outputs(output_dir: Path, epoch: int, rows: dict[str, Any], metri
         "rho", "action_delta", "reason_delta", "null_mass", "route_entropy",
         "action_evidence_confidence", "action_effective_trust",
         "reason_evidence_confidence", "reason_effective_trust",
+        "action_flow_route_mass", "reason_flow_route_mass", "transition_reliability",
+        "velocity_norm", "acceleration_norm",
         "terminal_prediction_history", "terminal_prediction_no_history", "terminal_target_evidence",
         "terminal_error_history", "terminal_error_no_history", "innovation_token",
         "predicate_differential_state", "predicate_velocity_norm", "predicate_acceleration_norm",
         "predicate_persistence", "predicate_region_mass", "predicate_region_mass_velocity", "common_motion_norm",
+        "transition_tokens", "velocity", "acceleration", "region_velocity",
         "action_temporal_route", "action_factor_contribution", "reason_temporal_route", "frame_valid_mask", "timestamps",
     )
     for key in tensor_keys:

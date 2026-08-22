@@ -1,9 +1,25 @@
 ---
 name: tida-oia-v1-implementation-audit
-description: Fail-closed audit for the full TIDA-OIA V1 video implementation, data, mechanism, memory, Git, and foreground training contracts.
+description: Fail-closed audit for TIDA-OIA video and Flow Credit implementation, data, mechanism, memory, Git, and training contracts.
 ---
 
 # TIDA-OIA V1 Strict Implementation Audit Skill
+
+## 2026-08-22 Flow Credit Addendum
+
+This addendum is mandatory for branch `tida_oia_flow_credit_v1` and takes priority over conflicting V1 text.
+
+- Required code: `tida_flow_transition_bank.py` and `tida_flow_credit_losses.py` must exist and be reached from formal model/trainer call graphs.
+- The terminal predictor may use query identity and causal history but must not use current target-frame static/global features as predictor input.
+- `terminal_no_history` remains an artifact row with loss weight exactly zero.
+- The transition bank must expose signed velocity, acceleration, region velocity, persistence, reliability, and transition tokens without dense patch-time factor tensors.
+- Both action and reason readers must consume transition tokens. Reason flow inputs must be detached from shared/action owners.
+- Scale zero and direct `history_off` must reproduce image logits exactly.
+- Training must compute same-image action/reason GT-margin credit against history-off, repeated-last, and alternating shuffle/reverse interventions.
+- Positive reason labels have weight 1. Unknown negatives use PU weights. Test labels and test thresholds cannot update any parameter or schedule.
+- Mechanism artifacts must report per-intervention action/reason GT-margin advantage, per-label values, flow route mass, transition reliability, and velocity direction diagnostics.
+- A non-zero gate, route, or delta is not evidence of useful traffic flow. A flow-aware claim requires ordered-history target-margin and metric advantages.
+- REVIEW_PASS proves implementation correctness only. It cannot claim metric improvement without real-video intervention evidence.
 
 ## 2026-08-21 用户指令覆盖条款
 

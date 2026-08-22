@@ -15,8 +15,8 @@ class _SharedTerminalPredictor(nn.Module):
             nn.Linear(dim * 2, dim),
         )
 
-    def forward(self, static: torch.Tensor, history: torch.Tensor) -> torch.Tensor:
-        return self.network(torch.cat([static, history], dim=-1))
+    def forward(self, query_identity: torch.Tensor, history: torch.Tensor) -> torch.Tensor:
+        return self.network(torch.cat([query_identity, history], dim=-1))
 
 
 def _prediction_distance(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -40,14 +40,14 @@ class TIDATerminalInnovation(nn.Module):
 
     def forward(
         self,
-        static_token: torch.Tensor,
+        query_identity: torch.Tensor,
         history_summary: torch.Tensor,
         terminal_target: torch.Tensor,
         history_valid: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         target = terminal_target.detach()
-        prediction_history = self.history_predictor(static_token, history_summary)
-        prediction_no_history = self.no_history_predictor(static_token, torch.zeros_like(history_summary))
+        prediction_history = self.history_predictor(query_identity, history_summary)
+        prediction_no_history = self.no_history_predictor(query_identity, torch.zeros_like(history_summary))
         error_history = _prediction_distance(prediction_history, target)
         error_no_history = _prediction_distance(prediction_no_history, target)
         reliability = ((error_no_history - error_history) / (error_no_history + self.eps)).clamp(0.0, 1.0).detach()
@@ -62,4 +62,5 @@ class TIDATerminalInnovation(nn.Module):
             "terminal_error_no_history": error_no_history,
             "innovation_reliability": reliability,
             "innovation_token": innovation,
+            "terminal_no_history_optimized": torch.tensor(False, device=target.device),
         }

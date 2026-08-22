@@ -6,6 +6,11 @@ import torch
 import torch.nn.functional as F
 
 from .asymmetric_loss import asymmetric_loss_with_logits
+from .tida_flow_credit_losses import (
+    counterfactual_margin_credit_loss,
+    image_fallback_no_harm_loss,
+    transition_alignment_loss,
+)
 
 
 def terminal_gain_loss(error_history: torch.Tensor, error_no_history: torch.Tensor, margin: float = 0.03) -> torch.Tensor:
@@ -164,6 +169,7 @@ def build_tida_loss_registry(
     reason_target: torch.Tensor,
     *,
     counterfactual_errors: dict[str, torch.Tensor] | None = None,
+    counterfactual_outputs: dict[str, dict[str, torch.Tensor]] | None = None,
     rank_reference: dict[str, torch.Tensor] | None = None,
     weights: dict[str, float] | None = None,
 ):
@@ -186,6 +192,14 @@ def build_tida_loss_registry(
                 available=False,
                 unavailable_reason="counterfactual scheduled every four optimizer updates",
             )
+    registry.add(
+        "flow_transition_align",
+        transition_alignment_loss(
+            output["transition_tokens"],
+            output["predicate_innovation_token"],
+            output["transition_reliability"] * output["predicate_innovation_reliability"],
+        ),
+    )
     registry.add("action_asl", action_macro_asl_loss(output["video_action_logits"], action_target))
     rank_reference = rank_reference or {}
     registry.add(
@@ -212,6 +226,23 @@ def build_tida_loss_registry(
             valid_rho=output["innovation_reliability"].max(-1).values > 0,
         ),
     )
+    counterfactual_outputs = counterfactual_outputs or {}
+    action_credit = [
+        counterfactual_margin_credit_loss(
+            output["video_action_logits"], value["video_action_logits"], action_target, margin=0.02
+        )
+        for value in counterfactual_outputs.values()
+    ]
+    registry.add(
+        "action_flow_credit",
+        torch.stack(action_credit).mean() if action_credit else output["video_action_logits"].sum() * 0.0,
+        available=bool(action_credit),
+        unavailable_reason=None if action_credit else "counterfactual evaluated at optimizer boundary only",
+    )
+    registry.add(
+        "action_flow_no_harm",
+        image_fallback_no_harm_loss(output["image_action_logits"], output["video_action_logits"], action_target),
+    )
     image_branch = output.get("image_branch", {})
     contradiction = image_branch.get("contradiction_score") if isinstance(image_branch, dict) else None
     reason_weights = reason_pu_weight(reason_target, contradiction)
@@ -222,4 +253,24 @@ def build_tida_loss_registry(
     )
     registry.add("reason_soft_f1", reason_soft_f1_loss(output["video_reason_logits"], reason_target, contradiction))
     registry.add("reason_delta", output["reason_temporal_delta"].square().mean())
+    reason_credit = [
+        counterfactual_margin_credit_loss(
+            output["video_reason_logits"], value["video_reason_logits"], reason_target,
+            sample_weight=reason_weights, margin=0.015,
+        )
+        for value in counterfactual_outputs.values()
+    ]
+    registry.add(
+        "reason_flow_credit",
+        torch.stack(reason_credit).mean() if reason_credit else output["video_reason_logits"].sum() * 0.0,
+        available=bool(reason_credit),
+        unavailable_reason=None if reason_credit else "counterfactual evaluated at optimizer boundary only",
+    )
+    registry.add(
+        "reason_flow_no_harm",
+        image_fallback_no_harm_loss(
+            output["image_reason_logits"], output["video_reason_logits"], reason_target,
+            sample_weight=reason_weights,
+        ),
+    )
     return registry

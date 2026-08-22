@@ -7,6 +7,7 @@ from torch import nn
 
 from .tida_action_reader import TIDAActionReader
 from .tida_context_encoder import TIDAContextEncoder
+from .tida_flow_transition_bank import TIDAFlowTransitionBank
 from .tida_predicate_differential import TIDAPredicateDifferential
 from .tida_reason_reader import TIDAReasonReader
 from .tida_temporal_encoder import TIDATemporalEncoder
@@ -84,6 +85,7 @@ class TIDAOIAModel(nn.Module):
         "temporal_encoder": "temporal_encoder",
         "innovation_predictor": "terminal_innovation",
         "predicate_differential": "predicate_differential",
+        "flow_transition": "flow_transition_bank",
         "temporal_action": "action_reader",
         "temporal_reason": "reason_reader",
     }
@@ -123,6 +125,7 @@ class TIDAOIAModel(nn.Module):
             roles=predicate_roles,
             role_path=predicate_role_path,
         )
+        self.flow_transition_bank = TIDAFlowTransitionBank(dim=dim, region_count=5)
         self.action_reader = TIDAActionReader(
             dim,
             num_actions,
@@ -138,7 +141,6 @@ class TIDAOIAModel(nn.Module):
         )
         self.query_identity = nn.Parameter(torch.randn(num_actions + num_predicates, dim) * 0.02)
         self.predicate_identity = nn.Parameter(torch.randn(num_predicates, dim) * 0.02)
-        self.static_context_projection = nn.Sequential(nn.LayerNorm(dim * 2), nn.Linear(dim * 2, dim))
         self.num_actions = int(num_actions)
         self.num_predicates = int(num_predicates)
         self.predicate_names = predicate_names
@@ -191,9 +193,8 @@ class TIDAOIAModel(nn.Module):
         owners: dict[str, list[nn.Parameter]] = {}
         for owner, module_name in self.OWNER_MODULES.items():
             owners[owner] = [parameter for parameter in getattr(self, module_name).parameters() if parameter.requires_grad]
-        # Query identities and static context are part of target-conditioned history reading.
+        # Query identities are the shortcut-free prior for terminal prediction.
         owners["history_reader"] += [self.query_identity, self.predicate_identity]
-        owners["history_reader"] += list(self.static_context_projection.parameters())
         return owners
 
     @staticmethod
@@ -208,7 +209,7 @@ class TIDAOIAModel(nn.Module):
         timestamps: torch.Tensor,
         frame_valid_mask: torch.Tensor,
         terminal_target_evidence: torch.Tensor,
-        terminal_static_context: torch.Tensor,
+        terminal_query_identity: torch.Tensor,
         image: dict[str, Any],
         *,
         temporal_action_scale: float | torch.Tensor,
@@ -219,7 +220,7 @@ class TIDAOIAModel(nn.Module):
         predicate_tokens = image["predicate_tokens"].detach()
         temporal = self.temporal_encoder(history_tokens, timestamps, frame_valid_mask)
         innovation = self.terminal_innovation(
-            terminal_static_context, temporal["history_summary"], terminal_target_evidence, temporal["history_valid"]
+            terminal_query_identity, temporal["history_summary"], terminal_target_evidence, temporal["history_valid"]
         )
         rho = innovation["innovation_reliability"]
         xi = innovation["innovation_token"]
@@ -229,23 +230,38 @@ class TIDAOIAModel(nn.Module):
             timestamps, frame_valid_mask, history_region_mass[:, :, self.num_actions :],
             target_region_mass, rho[:, self.num_actions :],
         )
+        predicate_trajectory = torch.cat(
+            [history_tokens[:, :, self.num_actions :], predicate_tokens[:, None]], dim=1
+        )
+        predicate_region_trajectory = torch.cat(
+            [history_region_mass[:, :, self.num_actions :], target_region_mass[:, None]], dim=1
+        )
+        flow = self.flow_transition_bank(
+            predicate_trajectory, predicate_region_trajectory, timestamps, frame_valid_mask
+        )
         factor_reliability = torch.cat([rho[:, self.num_actions :], rho[:, : self.num_actions]], dim=1)
         action = self.action_reader(
             action_nodes, differential["predicate_differential_state"], xi[:, : self.num_actions],
             factor_reliability, temporal_scale=temporal_action_scale,
             predicate_key_state=differential["predicate_routing_key_state"],
+            transition_state=flow["transition_tokens"],
+            transition_reliability=flow["transition_reliability"],
         )
         reason = self.reason_reader(
             reason_nodes, differential["predicate_differential_state"],
             action["selected_action_temporal_evidence"], factor_reliability,
             temporal_scale=temporal_reason_scale,
+            transition_state=flow["transition_tokens"],
+            transition_reliability=flow["transition_reliability"],
         )
         image_action = image["action_logits_final"].detach()
         image_reason = image["reason_logits_final"].detach()
         return {
-            **temporal, **innovation, **differential, **action, **reason,
+            **temporal, **innovation, **differential, **flow, **action, **reason,
             "terminal_target_evidence": terminal_target_evidence,
-            "terminal_static_context": terminal_static_context,
+            "terminal_query_identity": terminal_query_identity,
+            "predicate_innovation_token": xi[:, self.num_actions :],
+            "predicate_innovation_reliability": rho[:, self.num_actions :],
             "image_action_logits": image_action,
             "video_action_logits": image_action + action["action_temporal_delta"],
             "image_reason_logits": image_reason,
@@ -289,7 +305,7 @@ class TIDAOIAModel(nn.Module):
             rerun_valid[:, :-1] = False
         return self.decode_encoded_history(
             history, output["history_query_region_mass"], output["timestamps"], rerun_valid,
-            output["terminal_target_evidence"], output["terminal_static_context"], output["image_branch"],
+            output["terminal_target_evidence"], output["terminal_query_identity"], output["image_branch"],
             temporal_action_scale=temporal_action_scale, temporal_reason_scale=temporal_reason_scale,
         )
 
@@ -314,10 +330,7 @@ class TIDAOIAModel(nn.Module):
         reason_nodes = image["reason_nodes_primary"].detach()
         predicate_tokens = image["predicate_tokens"].detach()
         target_evidence = torch.cat([action_nodes, predicate_tokens], dim=1)
-        global_token = image["cls_tokens_by_layer"].detach().mean(1)
-        static_token = predicate_tokens[:, self.predicate_differential.static_mask].mean(1)
-        static_context = self.static_context_projection(torch.cat([global_token, static_token], dim=-1))[:, None]
-        static_context = static_context + self.query_identity[None]
+        terminal_query_identity = self.query_identity[None].expand(target_image.shape[0], -1, -1)
 
         context = self.context_encoder(
             context_images, action_nodes, predicate_tokens, self.predicate_identity,
@@ -339,7 +352,7 @@ class TIDAOIAModel(nn.Module):
                 effective_frame_valid_mask[:, :-1] = False
         temporal_output = self.decode_encoded_history(
             history_tokens, context["history_query_region_mass"], timestamps, effective_frame_valid_mask,
-            target_evidence, static_context, image,
+            target_evidence, terminal_query_identity, image,
             temporal_action_scale=temporal_action_scale,
             temporal_reason_scale=temporal_reason_scale,
         )

@@ -11,12 +11,14 @@ def schedule_values(update: int, total_updates: int, *, warmup_ratio: float = 0.
     if progress <= warmup_ratio:
         temporal_scale = 0.0
         lr_scale = max(progress / max(warmup_ratio, 1e-8), 1e-3)
+        phase = "FLOW_FOUNDATION"
     else:
         ramp_progress = min((progress - warmup_ratio) / max(ramp_end_ratio - warmup_ratio, 1e-8), 1.0)
         temporal_scale = 0.5 - 0.5 * math.cos(math.pi * ramp_progress)
         cosine_progress = (progress - warmup_ratio) / max(1.0 - warmup_ratio, 1e-8)
         lr_scale = min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (1.0 + math.cos(math.pi * cosine_progress))
-    return {"progress": progress, "temporal_scale": temporal_scale, "lr_scale": lr_scale}
+        phase = "FLOW_CREDIT" if progress < ramp_end_ratio else "SAFE_JOINT"
+    return {"progress": progress, "temporal_scale": temporal_scale, "lr_scale": lr_scale, "phase": phase}
 
 
 def resolve_schedule_total_updates(
