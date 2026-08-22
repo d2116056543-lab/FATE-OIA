@@ -230,14 +230,16 @@ class TIDAOIAModel(nn.Module):
             timestamps, frame_valid_mask, history_region_mass[:, :, self.num_actions :],
             target_region_mass, rho[:, self.num_actions :],
         )
-        predicate_trajectory = torch.cat(
-            [history_tokens[:, :, self.num_actions :], predicate_tokens[:, None]], dim=1
-        )
-        predicate_region_trajectory = torch.cat(
-            [history_region_mass[:, :, self.num_actions :], target_region_mass[:, None]], dim=1
-        )
+        # Flow direction must come from ordered history only. Appending the
+        # current target after a reversed history creates one artificial final
+        # jump that can dominate the EMA and hide the reversal.
+        predicate_trajectory = history_tokens[:, :, self.num_actions :]
+        predicate_region_trajectory = history_region_mass[:, :, self.num_actions :]
         flow = self.flow_transition_bank(
-            predicate_trajectory, predicate_region_trajectory, timestamps, frame_valid_mask
+            predicate_trajectory,
+            predicate_region_trajectory,
+            timestamps[:, :-1],
+            frame_valid_mask[:, :-1],
         )
         factor_reliability = torch.cat([rho[:, self.num_actions :], rho[:, : self.num_actions]], dim=1)
         action = self.action_reader(

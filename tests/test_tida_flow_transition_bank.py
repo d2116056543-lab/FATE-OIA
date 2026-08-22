@@ -37,3 +37,12 @@ def test_repeated_trajectory_has_zero_motion_and_invalid_steps_are_ignored():
     assert torch.count_nonzero(result["region_velocity"]) == 0
     assert torch.isfinite(result["transition_reliability"]).all()
 
+
+def test_terminal_target_jump_is_not_part_of_history_flow_derivatives():
+    module = TIDAFlowTransitionBank(dim=4, region_count=3).eval()
+    history = torch.arange(4, dtype=torch.float32).view(1, 4, 1, 1).repeat(1, 1, 2, 4)
+    regions = torch.arange(4, dtype=torch.float32).view(1, 4, 1, 1).repeat(1, 1, 2, 3)
+    timestamps = torch.arange(4, dtype=torch.float32).view(1, 4)
+    real = module(history, regions, timestamps, torch.ones(1, 4, dtype=torch.bool))
+    reversed_history = module(history.flip(1), regions.flip(1), timestamps, torch.ones(1, 4, dtype=torch.bool))
+    torch.testing.assert_close(real["velocity"], -reversed_history["velocity"], atol=1e-6, rtol=0)

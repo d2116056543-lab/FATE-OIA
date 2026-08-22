@@ -250,8 +250,14 @@ def reason_firewall_gradient_audit(
     registry,
     model: TIDAOIAModel,
 ) -> dict[str, float]:
-    reason_names = ("reason_partial", "reason_rank", "reason_soft_f1", "reason_delta")
-    action_names = ("action_asl", "action_smooth_ap", "action_base_protect", "action_delta")
+    reason_names = (
+        "reason_partial", "reason_rank", "reason_soft_f1", "reason_delta",
+        "reason_flow_credit", "reason_flow_no_harm",
+    )
+    action_names = (
+        "action_asl", "action_smooth_ap", "action_base_protect", "action_delta",
+        "action_flow_credit", "action_flow_no_harm",
+    )
     reason_loss = sum(registry.rows[name].weight * registry.rows[name].value for name in reason_names)
     action_loss = sum(registry.rows[name].weight * registry.rows[name].value for name in action_names)
     action_parameters = list(model.action_reader.parameters())
@@ -278,6 +284,11 @@ def append_supervision_tensors(
         "rho": output["innovation_reliability"],
         "action_delta": output["action_temporal_delta"],
         "reason_delta": output["reason_temporal_delta"],
+        "action_flow_route_mass": output["action_flow_route_mass"],
+        "reason_flow_route_mass": output["reason_flow_route_mass"],
+        "transition_reliability": output["transition_reliability"],
+        "flow_velocity": output["velocity"],
+        "flow_acceleration": output["acceleration"],
         "action_null_mass": output["action_null_mass"],
         "route_entropy": output["action_route_entropy"],
         "action_nonnull_mass": output["action_nonnull_mass"],
@@ -334,6 +345,11 @@ def supervision_tensor_summary(
         "region_mass_velocity_rms": float(values["region_mass_velocity"].square().mean().sqrt()),
         "action_delta_rms_window": float(values["action_delta"].square().mean().sqrt()),
         "reason_delta_rms_window": float(values["reason_delta"].square().mean().sqrt()),
+        "action_flow_route_mass_mean": float(values["action_flow_route_mass"].mean()),
+        "reason_flow_route_mass_mean": float(values["reason_flow_route_mass"].mean()),
+        "transition_reliability_mean": float(values["transition_reliability"].mean()),
+        "flow_velocity_rms": float(values["flow_velocity"].square().mean().sqrt()),
+        "flow_acceleration_rms": float(values["flow_acceleration"].square().mean().sqrt()),
         "action_null_mass_window": float(values["action_null_mass"].mean()),
         "route_entropy_window": float(values["route_entropy"].mean()),
         "per_action_route_coverage": (nonnull >= 0.01).float().mean(0).tolist(),
