@@ -16,6 +16,23 @@ from .tida_terminal_query_reader import TIDATerminalQueryReader
 from ..explain.tida_dynamic_concepts import translate_dynamic_concepts
 
 
+def confidence_aware_reason_delta(
+    image_logits: torch.Tensor,
+    temporal_delta: torch.Tensor,
+    *,
+    temperature: float = 0.5,
+) -> torch.Tensor:
+    """Keep positive temporal evidence while protecting likely image positives."""
+    if image_logits.shape != temporal_delta.shape:
+        raise ValueError("image logits and temporal delta must have identical shapes")
+    if float(temperature) <= 0:
+        raise ValueError("temperature must be positive")
+    positive_delta = torch.relu(temporal_delta)
+    negative_delta = torch.relu(-temporal_delta)
+    negative_permission = 1.0 - torch.sigmoid(image_logits.detach() / float(temperature))
+    return positive_delta - negative_permission * negative_delta
+
+
 class TIDAFrozenVETRAImageBase(nn.Module):
     """Expose a Stage-A/Stage-B VETRA checkpoint as one frozen image model."""
 
@@ -106,6 +123,8 @@ class TIDAOIAModel(nn.Module):
         conditional_temporal_utility: bool = False,
         action_temporal_budget_cap: float = 0.60,
         reason_temporal_budget_cap: float = 0.50,
+        confidence_aware_reason_gate: bool = False,
+        reason_gate_temperature: float = 0.5,
     ) -> None:
         super().__init__()
         self.image_model = image_model
@@ -229,6 +248,8 @@ class TIDAOIAModel(nn.Module):
         innovation = self.terminal_innovation(
             terminal_query_identity, temporal["history_summary"], terminal_target_evidence, temporal["history_valid"]
         )
+        self.confidence_aware_reason_gate = bool(confidence_aware_reason_gate)
+        self.reason_gate_temperature = float(reason_gate_temperature)
         rho = innovation["innovation_reliability"]
         xi = innovation["innovation_token"]
         target_region_mass = self._target_region_mass(image["predicate_attention"].detach(), (45, 80))
@@ -275,6 +296,14 @@ class TIDAOIAModel(nn.Module):
             history_available=flow["history_available"],
             image_logits=image_reason,
         )
+        reason_delta_raw = reason["reason_temporal_delta"]
+        reason_delta = (
+            confidence_aware_reason_delta(
+                image_reason, reason_delta_raw, temperature=self.reason_gate_temperature,
+            )
+            if self.confidence_aware_reason_gate
+            else reason_delta_raw
+        )
         return {
             **temporal, **innovation, **differential, **flow, **action, **reason,
             "terminal_target_evidence": terminal_target_evidence,
@@ -284,7 +313,10 @@ class TIDAOIAModel(nn.Module):
             "image_action_logits": image_action,
             "video_action_logits": image_action + action["action_temporal_delta"],
             "image_reason_logits": image_reason,
-            "video_reason_logits": image_reason + reason["reason_temporal_delta"],
+            "reason_temporal_delta_raw": reason_delta_raw,
+            "reason_temporal_delta": reason_delta,
+            "reason_negative_suppression": (reason_delta_raw - reason_delta).clamp_max(0.0).abs(),
+            "video_reason_logits": image_reason + reason_delta,
             "action_temporal_route": action["action_route"],
             "action_null_mass": action["action_route"][..., -1],
             "action_evidence_confidence": action["action_evidence_confidence"],
