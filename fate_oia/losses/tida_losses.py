@@ -64,16 +64,38 @@ def action_base_protect_loss(
     return ((1.0 - rho) * F.relu(image_margin - video_margin - float(epsilon))).mean(0).mean()
 
 
-def action_route_sparse_loss(route: torch.Tensor, factor_keys: torch.Tensor, valid_rho: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+def action_route_sparse_loss(
+    route: torch.Tensor,
+    factor_keys: torch.Tensor,
+    valid_rho: torch.Tensor,
+    eps: float = 1e-8,
+    min_diversity_mass: float = 0.01,
+    cosine_eps: float = 1e-4,
+) -> torch.Tensor:
     entropy = -(route * route.clamp_min(eps).log()).sum(-1) / math.log(route.shape[-1])
     nonnull_mass = 1.0 - route[..., -1]
-    normalized_keys = F.normalize(factor_keys, dim=-1)
-    centroids = torch.einsum("baf,bfd->bad", route, normalized_keys)
-    centroid_norm = F.normalize(centroids, dim=-1)
-    similarity = torch.einsum("bad,bcd->bac", centroid_norm, centroid_norm)
+
+    # The null key has no semantic direction. Computing cosine diversity from a
+    # nearly all-null route makes the centroid norm approach zero and amplifies
+    # its gradient by 1 / ||centroid||. Only compare action centroids after they
+    # carry enough non-null mass, and use a scale-aware stabilized cosine.
+    nonnull_route = route[..., :-1]
+    normalized_keys = F.normalize(factor_keys[:, :-1], dim=-1)
+    conditional_route = nonnull_route / nonnull_mass.clamp_min(float(min_diversity_mass))[..., None]
+    centroids = torch.einsum("baf,bfd->bad", conditional_route, normalized_keys)
+    centroid_dot = torch.einsum("bad,bcd->bac", centroids, centroids)
+    centroid_sq = centroids.square().sum(-1)
+    denominator = (
+        (centroid_sq + float(cosine_eps))[:, :, None]
+        * (centroid_sq + float(cosine_eps))[:, None, :]
+    ).sqrt()
+    similarity = centroid_dot / denominator
     actions = route.shape[1]
     off_diagonal = ~torch.eye(actions, dtype=torch.bool, device=route.device)[None]
-    diversity = F.relu(similarity - 0.90).masked_select(off_diagonal.expand_as(similarity)).mean()
+    centroid_valid = nonnull_mass >= float(min_diversity_mass)
+    diversity_mask = off_diagonal & centroid_valid[:, :, None] & centroid_valid[:, None, :]
+    diversity_values = F.relu(similarity - 0.90)
+    diversity = (diversity_values * diversity_mask.to(diversity_values.dtype)).sum() / diversity_mask.sum().clamp_min(1)
     per_sample = entropy.mean(-1) + F.relu(0.05 - nonnull_mass).mean(-1)
     mask = valid_rho.to(route.dtype)
     route_term = (per_sample * mask).sum() / mask.sum().clamp_min(1.0)

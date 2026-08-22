@@ -61,7 +61,8 @@ def collect_tida_outputs(
     mechanism_rows: dict[str, list[float]] = {
         name: [] for name in (
             "history_off", "repeated_last", "time_shuffle", "time_reverse",
-            "selected_predicate_flatten", "matched_predicate_flatten", "static_only", "dynamic_only",
+            "selected_predicate_flatten", "matched_predicate_flatten", "wrong_action_route",
+            "static_only", "dynamic_only",
         )
     }
     mechanism_outputs: dict[str, dict[str, list[torch.Tensor]]] = {
@@ -193,7 +194,10 @@ def fit_train_calib_thresholds(rows: dict[str, Any]) -> dict[str, torch.Tensor]:
 
 @torch.no_grad()
 def collect_intervention_audit(model, loader, device: torch.device, max_samples: int = 128) -> dict[str, Any]:
-    interventions = ("history_off", "repeated_last", "time_shuffle", "time_reverse", "static_only", "dynamic_only")
+    interventions = (
+        "history_off", "repeated_last", "time_shuffle", "time_reverse",
+        "wrong_action_route", "static_only", "dynamic_only",
+    )
     rows: dict[str, list[float]] = {name: [] for name in interventions}
     count = 0
     target_encode_calls = 0
