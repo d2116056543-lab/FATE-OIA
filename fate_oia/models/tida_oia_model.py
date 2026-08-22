@@ -165,6 +165,8 @@ class TIDAOIAModel(nn.Module):
             conditional_utility_enabled=conditional_temporal_utility,
             conditional_flow_mix_cap=reason_temporal_budget_cap,
         )
+        self.confidence_aware_reason_gate = bool(confidence_aware_reason_gate)
+        self.reason_gate_temperature = float(reason_gate_temperature)
         self.query_identity = nn.Parameter(torch.randn(num_actions + num_predicates, dim) * 0.02)
         self.predicate_identity = nn.Parameter(torch.randn(num_predicates, dim) * 0.02)
         self.num_actions = int(num_actions)
@@ -248,8 +250,6 @@ class TIDAOIAModel(nn.Module):
         innovation = self.terminal_innovation(
             terminal_query_identity, temporal["history_summary"], terminal_target_evidence, temporal["history_valid"]
         )
-        self.confidence_aware_reason_gate = bool(confidence_aware_reason_gate)
-        self.reason_gate_temperature = float(reason_gate_temperature)
         rho = innovation["innovation_reliability"]
         xi = innovation["innovation_token"]
         target_region_mass = self._target_region_mass(image["predicate_attention"].detach(), (45, 80))
