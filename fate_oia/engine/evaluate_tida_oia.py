@@ -10,6 +10,7 @@ import torch
 from fate_oia.utils.aie_metrics import aie_branch_metrics
 from fate_oia.utils.tida_contracts import _best_label_threshold
 from fate_oia.utils.tida_artifacts import atomic_write_json
+from fate_oia.utils.tida_temporal_metrics import paired_temporal_contribution, robust_motion_score
 
 
 def gt_margin_advantage(
@@ -61,6 +62,9 @@ def collect_tida_outputs(
         "action_evidence_confidence", "action_effective_trust",
         "reason_evidence_confidence", "reason_effective_trust",
         "action_flow_route_mass", "reason_flow_route_mass", "transition_reliability",
+        "action_temporal_budget", "reason_temporal_budget",
+        "action_temporal_need", "reason_temporal_need",
+        "action_temporal_target_motion", "reason_temporal_target_motion",
         "velocity_norm", "acceleration_norm",
     )}
     audit_keys = (
@@ -68,7 +72,8 @@ def collect_tida_outputs(
         "terminal_error_history", "terminal_error_no_history", "innovation_token",
         "predicate_differential_state", "predicate_velocity_norm", "predicate_acceleration_norm",
         "predicate_persistence", "predicate_region_mass", "predicate_region_mass_velocity", "common_motion_norm",
-        "transition_tokens", "velocity", "acceleration", "region_velocity", "transition_reliability",
+        "transition_tokens", "transition_tokens_by_scale", "motion_salience", "transition_consistency",
+        "velocity", "acceleration", "region_velocity", "transition_reliability",
         "action_flow_route_mass", "reason_flow_route_mass",
         "action_temporal_route", "action_factor_contribution", "reason_temporal_route", "frame_valid_mask", "timestamps",
     )
@@ -112,6 +117,12 @@ def collect_tida_outputs(
             "action_flow_route_mass": output["action_flow_route_mass"],
             "reason_flow_route_mass": output["reason_flow_route_mass"],
             "transition_reliability": output["transition_reliability"],
+            "action_temporal_budget": output["action_temporal_budget"],
+            "reason_temporal_budget": output["reason_temporal_budget"],
+            "action_temporal_need": output["action_temporal_need"],
+            "reason_temporal_need": output["reason_temporal_need"],
+            "action_temporal_target_motion": output["action_temporal_target_motion"],
+            "reason_temporal_target_motion": output["reason_temporal_target_motion"],
             "velocity_norm": output["velocity"].norm(dim=-1),
             "acceleration_norm": output["acceleration"].norm(dim=-1),
         }.items():
@@ -228,6 +239,18 @@ def dynamic_slice_metrics(rows: dict[str, Any], thresholds: torch.Tensor | float
     return result
 
 
+def temporal_contribution_metrics(rows: dict[str, Any]) -> dict[str, Any]:
+    motion = robust_motion_score(rows["velocity_norm"], rows["acceleration_norm"])
+    return {
+        "action": paired_temporal_contribution(
+            rows["image_action"], rows["video_action"], rows["action_target"], motion_score=motion,
+        ),
+        "reason": paired_temporal_contribution(
+            rows["image_reason"], rows["video_reason"], rows["reason_target"], motion_score=motion,
+        ),
+    }
+
+
 def fit_train_calib_thresholds(rows: dict[str, Any]) -> dict[str, torch.Tensor]:
     video_logits = torch.cat([rows["video_action"], rows["video_reason"]], dim=-1)
     image_logits = torch.cat([rows["image_action"], rows["image_reason"]], dim=-1)
@@ -277,6 +300,9 @@ def save_epoch_outputs(output_dir: Path, epoch: int, rows: dict[str, Any], metri
     atomic_write_json(epoch_dir / "metrics_summary.json", metrics)
     atomic_write_json(epoch_dir / "calibration.json", {key: value.tolist() for key, value in thresholds.items()})
     atomic_write_json(epoch_dir / "temporal_mechanism_audit.json", mechanism)
+    contribution = metrics.get("online", {}).get("temporal_contribution")
+    if contribution is not None:
+        atomic_write_json(epoch_dir / "temporal_contribution_metrics.json", contribution)
     atomic_write_json(epoch_dir / "file_names_test.json", rows["file_names"])
     if "dynamic_concepts" in rows:
         with (epoch_dir / "dynamic_concepts_test.jsonl").open("w", encoding="utf-8", newline="\n") as handle:
@@ -288,12 +314,16 @@ def save_epoch_outputs(output_dir: Path, epoch: int, rows: dict[str, Any], metri
         "action_evidence_confidence", "action_effective_trust",
         "reason_evidence_confidence", "reason_effective_trust",
         "action_flow_route_mass", "reason_flow_route_mass", "transition_reliability",
+        "action_temporal_budget", "reason_temporal_budget",
+        "action_temporal_need", "reason_temporal_need",
+        "action_temporal_target_motion", "reason_temporal_target_motion",
         "velocity_norm", "acceleration_norm",
         "terminal_prediction_history", "terminal_prediction_no_history", "terminal_target_evidence",
         "terminal_error_history", "terminal_error_no_history", "innovation_token",
         "predicate_differential_state", "predicate_velocity_norm", "predicate_acceleration_norm",
         "predicate_persistence", "predicate_region_mass", "predicate_region_mass_velocity", "common_motion_norm",
-        "transition_tokens", "velocity", "acceleration", "region_velocity",
+        "transition_tokens", "transition_tokens_by_scale", "motion_salience", "transition_consistency",
+        "velocity", "acceleration", "region_velocity",
         "action_temporal_route", "action_factor_contribution", "reason_temporal_route", "frame_valid_mask", "timestamps",
     )
     for key in tensor_keys:

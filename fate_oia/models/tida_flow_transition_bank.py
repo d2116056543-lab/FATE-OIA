@@ -104,7 +104,7 @@ class TIDAFlowTransitionBank(nn.Module):
         persistence = (agreement * valid).sum((1, 3)) / valid.sum((1, 3)).clamp_min(1)
 
         features = torch.cat([velocity, acceleration, region_velocity, persistence[..., None]], dim=-1)
-        transition_tokens = self.projection(features)
+        legacy_transition_tokens = self.projection(features)
         valid_fraction = velocity_valid.to(query_trajectory.dtype).mean(1, keepdim=True)
         motion_strength = velocity.norm(dim=-1) + 0.5 * acceleration.norm(dim=-1) + region_velocity.norm(dim=-1)
         reliability = valid_fraction * torch.tanh(motion_strength)
@@ -114,10 +114,11 @@ class TIDAFlowTransitionBank(nn.Module):
             dim=2,
         )
         transition_tokens_by_scale = (
-            transition_tokens[:, :, None]
+            legacy_transition_tokens[:, :, None]
             + scale_residual
             + self.scale_type_embedding[None, None]
         )
+        transition_tokens = transition_tokens_by_scale.mean(2)
         history_available = valid_mask.sum(1) >= 2
         motion_salience = valid_fraction * torch.log1p(motion_strength)
         motion_salience = motion_salience * history_available[:, None].to(motion_salience.dtype)
@@ -125,6 +126,7 @@ class TIDAFlowTransitionBank(nn.Module):
         transition_consistency = transition_consistency * history_available[:, None].to(transition_consistency.dtype)
         return {
             "transition_tokens": transition_tokens,
+            "legacy_transition_tokens": legacy_transition_tokens,
             "transition_tokens_by_scale": transition_tokens_by_scale,
             "transition_scale_names": TRANSITION_SCALE_NAMES,
             "velocity": velocity,

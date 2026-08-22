@@ -35,7 +35,10 @@ def temporal_utility_calibration_loss(
     benefit = (
         signed_gt_margin(real_logits, target) - signed_gt_margin(counterfactual_logits, target)
     ).detach()
-    soft_target = float(max_budget) * torch.sigmoid(benefit / float(temperature))
+    # No measured advantage should not justify a standing temporal budget.
+    # Positive paired benefit raises the target smoothly; harmful or neutral
+    # history maps to zero and is handled by the image-fallback no-harm term.
+    soft_target = float(max_budget) * torch.tanh(F.relu(benefit) / float(temperature))
     return F.smooth_l1_loss(budget, soft_target)
 
 
