@@ -448,6 +448,15 @@ def _arg(args: Any, name: str, default: Any = None) -> Any:
     return getattr(args, name.replace("-", "_"), default)
 
 
+def checkpoint_trainable_state(payload: dict[str, Any], view: str) -> dict[str, torch.Tensor]:
+    if view not in {"online", "ema"}:
+        raise ValueError(f"unsupported checkpoint view: {view}")
+    state_key = "ema" if view == "ema" else "tida_trainable_state"
+    if state_key not in payload:
+        raise RuntimeError(f"checkpoint does not contain requested {view} state")
+    return payload[state_key]
+
+
 def build_runtime(args: Any, evaluation_only: bool = False) -> TIDARuntime:
     config = load_config(_arg(args, "config"))
     seed = int(config["training"].get("seed", config["data"]["partition_seed"]))
@@ -498,8 +507,9 @@ def build_runtime(args: Any, evaluation_only: bool = False) -> TIDARuntime:
     checkpoint = _arg(args, "checkpoint", None)
     if checkpoint:
         payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        checkpoint_view = _arg(args, "checkpoint_view", "online")
         trainable = dict(model.named_parameters())
-        for name, value in payload["tida_trainable_state"].items():
+        for name, value in checkpoint_trainable_state(payload, checkpoint_view).items():
             trainable[name].data.copy_(value.to(trainable[name]))
     return TIDARuntime(config, model, loaders, device, image_checkpoint, clip_manifest, train_sampler)
 
@@ -718,6 +728,7 @@ def train(args: Any) -> None:
         "schedule_total_updates": total_updates,
         "schedule_override": schedule_override is not None,
         "train_owners": sorted(train_owners) if train_owners is not None else "all",
+        "checkpoint_view": _arg(args, "checkpoint_view", "online"),
     }
     atomic_write_json(output_dir / "run_manifest.json", manifest)
     Path(output_dir / "config_resolved.yaml").write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
@@ -992,6 +1003,7 @@ def main() -> None:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--resume")
     parser.add_argument("--checkpoint")
+    parser.add_argument("--checkpoint-view", choices=("online", "ema"), default="online")
     parser.add_argument("--run-kind", choices=("smoke", "profile", "full"), default="full")
     parser.add_argument("--max-samples", type=int)
     parser.add_argument("--max-optimizer-updates", type=int)
