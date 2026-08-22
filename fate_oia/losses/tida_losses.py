@@ -11,6 +11,7 @@ from .tida_flow_credit_losses import (
     conditional_no_harm_weight,
     counterfactual_margin_credit_loss,
     image_fallback_no_harm_loss,
+    positive_label_no_harm_loss,
     temporal_utility_calibration_loss,
     transition_alignment_loss,
 )
@@ -298,6 +299,12 @@ def build_tida_loss_registry(
         image_fallback_no_harm_loss(
             output["image_reason_logits"], output["video_reason_logits"], reason_target,
             sample_weight=reason_no_harm_weight,
+        ),
+    )
+    registry.add(
+        "reason_positive_no_harm",
+        positive_label_no_harm_loss(
+            output["image_reason_logits"], output["video_reason_logits"], reason_target,
         ),
     )
     reason_utility = [

@@ -80,6 +80,20 @@ def image_fallback_no_harm_loss(
     return _weighted_mean(F.relu(image_margin - video_margin + float(epsilon)), sample_weight)
 
 
+def positive_label_no_harm_loss(
+    image_logits: torch.Tensor,
+    video_logits: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    epsilon: float = 0.0,
+) -> torch.Tensor:
+    """Protect observed positives without dilution by PU zero labels."""
+    positive = target.to(video_logits.dtype).clamp(0.0, 1.0)
+    image_margin = image_logits.detach()
+    violation = F.relu(image_margin - video_logits + float(epsilon))
+    return (violation * positive).sum() / positive.sum().clamp_min(1.0)
+
+
 def transition_alignment_loss(
     transition_tokens: torch.Tensor,
     predicate_innovation: torch.Tensor,

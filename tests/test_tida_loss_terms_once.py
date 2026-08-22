@@ -25,7 +25,7 @@ def test_required_loss_names_and_yaml_weights_match_strict_contract():
         "action_flow_credit", "action_flow_no_harm",
         "action_utility_calibration",
         "reason_partial", "reason_rank", "reason_soft_f1", "reason_delta",
-        "reason_flow_credit", "reason_flow_no_harm",
+        "reason_flow_credit", "reason_flow_no_harm", "reason_positive_no_harm",
         "reason_utility_calibration",
     )
     config = yaml.safe_load(open("configs/fate_oia_train_tida_oia_v1_15f.yaml", encoding="utf-8"))

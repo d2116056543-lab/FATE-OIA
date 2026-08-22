@@ -3,6 +3,7 @@ import torch
 from fate_oia.losses.tida_flow_credit_losses import (
     conditional_credit_weight,
     conditional_no_harm_weight,
+    positive_label_no_harm_loss,
     temporal_utility_calibration_loss,
 )
 
@@ -35,3 +36,14 @@ def test_conditional_credit_and_no_harm_weights_are_complementary():
     assert torch.all(credit[:, 1:] > credit[:, :-1])
     assert torch.all(no_harm[:, 1:] < no_harm[:, :-1])
     torch.testing.assert_close(credit + no_harm, torch.full_like(credit, 1.25))
+
+
+def test_positive_label_no_harm_is_not_diluted_by_unobserved_zeros():
+    image = torch.tensor([[1.0, -2.0, -2.0], [2.0, -2.0, -2.0]])
+    video = torch.tensor([[0.0, 4.0, 4.0], [1.0, 4.0, 4.0]], requires_grad=True)
+    target = torch.tensor([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+    loss = positive_label_no_harm_loss(image, video, target)
+    torch.testing.assert_close(loss, torch.tensor(1.0))
+    loss.backward()
+    assert video.grad[:, 0].abs().sum() > 0
+    assert video.grad[:, 1:].abs().sum() == 0

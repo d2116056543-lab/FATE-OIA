@@ -79,6 +79,7 @@ loss:
   reason_delta: 0.005
   reason_flow_credit: 0.30
   reason_flow_no_harm: 0.12
+  reason_positive_no_harm: 0.25
   reason_utility_calibration: 0.04
 training:
   seed: 20260821
