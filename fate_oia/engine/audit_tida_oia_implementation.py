@@ -296,11 +296,31 @@ def dynamic_audit(args: Any, review_dir: Path) -> dict[str, Any]:
     _write(review_dir, "temporal_encoder_audit.json", temporal)
     predicate = {"pass": output["predicate_differential_state"].shape == (1, 32, 384), "role_exact_cover": True}
     _write(review_dir, "predicate_differential_audit.json", predicate)
+    expected_confidence = (
+        output["reason_temporal_route"][..., :-1]
+        * torch.cat(
+            [output["innovation_reliability"][:, 4:], output["innovation_reliability"][:, :4]],
+            dim=1,
+        )[:, None]
+    ).sum(-1)
+    reason_trust = {
+        "pass": bool(
+            torch.allclose(output["reason_evidence_confidence"], expected_confidence, atol=1e-6)
+            and output["reason_effective_trust"].max() <= model.reason_reader.evidence_trust_cap + 1e-7
+            and output["reason_temporal_delta"].abs().max()
+            <= model.reason_reader.evidence_trust_cap * model.reason_reader.kappa + 1e-7
+        ),
+        "evidence_trust_cap": model.reason_reader.evidence_trust_cap,
+        "confidence_mean": float(output["reason_evidence_confidence"].mean().detach().cpu()),
+        "effective_trust_max": float(output["reason_effective_trust"].max().detach().cpu()),
+    }
+    _write(review_dir, "reason_evidence_trust_audit.json", reason_trust)
     return {
         "source_tree_image_oracle": oracle_audit["pass"],
         "target_equivalence": target_equivalence["pass"], "dino": dino_audit["pass"], "query": query_audit["pass"],
         "temporal": temporal["pass"], "innovation": innovation_audit["pass"], "predicate": predicate["pass"],
         "action": action_audit["pass"], "reason_firewall": reason_firewall["pass"],
+        "reason_evidence_trust": reason_trust["pass"],
         "loss_registry": loss_audit["pass"], "interventions": intervention_audit["pass"],
     }
 

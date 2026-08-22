@@ -430,6 +430,7 @@ def build_runtime(args: Any, evaluation_only: bool = False) -> TIDARuntime:
         image_base,
         dim=int(config["model"]["dim"]),
         context_chunk_size=int(_arg(args, "context_chunk_size", config["model"]["context_chunk_size"])),
+        reason_evidence_trust_cap=float(config["model"].get("reason_evidence_trust_cap", 0.25)),
     ).to(device)
     batch_size = int(_arg(args, "batch_size", 2))
     workers = int(_arg(args, "num_workers", config["data"]["num_workers"]))
@@ -783,6 +784,8 @@ def train(args: Any) -> None:
                 "rho_nonzero_rate": float((output["innovation_reliability"] > 0).float().mean().detach().cpu()),
                 "action_delta_rms": float(output["action_temporal_delta"].float().square().mean().sqrt().detach().cpu()),
                 "reason_delta_rms": float(output["reason_temporal_delta"].float().square().mean().sqrt().detach().cpu()),
+                "reason_evidence_confidence_mean": float(output["reason_evidence_confidence"].mean().detach().cpu()),
+                "reason_effective_trust_mean": float(output["reason_effective_trust"].mean().detach().cpu()),
                 "action_null_mass": float(output["action_null_mass"].mean().detach().cpu()),
                 "rank_window_samples": int(rank_window_samples),
                 "gpu_peak_reserved_gib": torch.cuda.max_memory_reserved(device) / 2**30 if device.type == "cuda" else 0.0,

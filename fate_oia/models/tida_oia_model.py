@@ -99,6 +99,7 @@ class TIDAOIAModel(nn.Module):
         predicate_roles: dict[str, list[str]] | None = None,
         predicate_role_path: str = "configs/tida_predicate_roles.yaml",
         context_chunk_size: int = 2,
+        reason_evidence_trust_cap: float = 0.25,
     ) -> None:
         super().__init__()
         self.image_model = image_model
@@ -122,7 +123,12 @@ class TIDAOIAModel(nn.Module):
             role_path=predicate_role_path,
         )
         self.action_reader = TIDAActionReader(dim, num_actions, num_predicates, kappa=0.15)
-        self.reason_reader = TIDAReasonReader(dim, num_reasons, kappa=0.12)
+        self.reason_reader = TIDAReasonReader(
+            dim,
+            num_reasons,
+            kappa=0.12,
+            evidence_trust_cap=reason_evidence_trust_cap,
+        )
         self.query_identity = nn.Parameter(torch.randn(num_actions + num_predicates, dim) * 0.02)
         self.predicate_identity = nn.Parameter(torch.randn(num_predicates, dim) * 0.02)
         self.static_context_projection = nn.Sequential(nn.LayerNorm(dim * 2), nn.Linear(dim * 2, dim))
@@ -240,6 +246,8 @@ class TIDAOIAModel(nn.Module):
             "action_temporal_route": action["action_route"],
             "action_null_mass": action["action_route"][..., -1],
             "reason_temporal_route": reason["reason_temporal_attention"],
+            "reason_evidence_confidence": reason["reason_evidence_confidence"],
+            "reason_effective_trust": reason["reason_effective_trust"],
             "frame_valid_mask": frame_valid_mask,
             "timestamps": timestamps,
             "dynamic_concepts": translate_dynamic_concepts(

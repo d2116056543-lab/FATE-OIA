@@ -52,6 +52,7 @@ model:
   temporal_dropout: 0.10
   action_kappa: 0.15
   reason_kappa: 0.12
+  reason_evidence_trust_cap: 0.25
 loss:
   terminal_hist: 0.25
   terminal_no_history: 0.0625

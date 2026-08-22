@@ -47,7 +47,10 @@ def collect_tida_outputs(
     collect_audit_tensors: bool = False,
 ) -> dict[str, Any]:
     store = {key: [] for key in ("image_action", "video_action", "image_reason", "video_reason", "action_target", "reason_target")}
-    diagnostics = {key: [] for key in ("rho", "action_delta", "reason_delta", "null_mass", "route_entropy")}
+    diagnostics = {key: [] for key in (
+        "rho", "action_delta", "reason_delta", "null_mass", "route_entropy",
+        "reason_evidence_confidence", "reason_effective_trust",
+    )}
     audit_keys = (
         "terminal_prediction_history", "terminal_prediction_no_history", "terminal_target_evidence",
         "terminal_error_history", "terminal_error_no_history", "innovation_token",
@@ -88,6 +91,8 @@ def collect_tida_outputs(
             "rho": output["innovation_reliability"], "action_delta": output["action_temporal_delta"],
             "reason_delta": output["reason_temporal_delta"], "null_mass": output["action_null_mass"],
             "route_entropy": output["action_route_entropy"],
+            "reason_evidence_confidence": output["reason_evidence_confidence"],
+            "reason_effective_trust": output["reason_effective_trust"],
         }.items():
             diagnostics[key].append(value.detach().float().cpu())
         if collect_audit_tensors:
@@ -239,6 +244,7 @@ def save_epoch_outputs(output_dir: Path, epoch: int, rows: dict[str, Any], metri
     tensor_keys = (
         "image_action", "video_action", "image_reason", "video_reason", "action_target", "reason_target",
         "rho", "action_delta", "reason_delta", "null_mass", "route_entropy",
+        "reason_evidence_confidence", "reason_effective_trust",
         "terminal_prediction_history", "terminal_prediction_no_history", "terminal_target_evidence",
         "terminal_error_history", "terminal_error_no_history", "innovation_token",
         "predicate_differential_state", "predicate_velocity_norm", "predicate_acceleration_norm",

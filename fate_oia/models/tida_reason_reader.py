@@ -9,10 +9,19 @@ from torch import nn
 class TIDAReasonReader(nn.Module):
     """Private reason correction with an explicit detach firewall."""
 
-    def __init__(self, dim: int = 384, num_reasons: int = 21, kappa: float = 0.12) -> None:
+    def __init__(
+        self,
+        dim: int = 384,
+        num_reasons: int = 21,
+        kappa: float = 0.12,
+        evidence_trust_cap: float = 0.25,
+    ) -> None:
         super().__init__()
         self.num_reasons = int(num_reasons)
         self.kappa = float(kappa)
+        self.evidence_trust_cap = float(evidence_trust_cap)
+        if not 0.0 < self.evidence_trust_cap <= 1.0:
+            raise ValueError("evidence_trust_cap must be in (0, 1]")
         self.reason_query = nn.Linear(dim, dim)
         self.factor_key = nn.Linear(dim, dim)
         self.factor_value = nn.Linear(dim, dim)
@@ -58,13 +67,20 @@ class TIDAReasonReader(nn.Module):
         raw_delta = torch.einsum("brd,brd->br", delta_query, delta_value) / math.sqrt(delta_query.shape[-1])
         scale = torch.as_tensor(temporal_scale, device=raw_delta.device, dtype=raw_delta.dtype)
         nonnull_mass = 1.0 - attention[..., -1]
-        delta = scale * nonnull_mass * self.kappa * torch.tanh(raw_delta / self.kappa)
+        # Non-null attention alone only proves that a factor was selected. It
+        # does not prove that the selected factor is reliable. Bound the side
+        # residual by the reliability actually transported through the route.
+        evidence_confidence = (attention[..., :-1] * weights[:, None, :]).sum(-1)
+        effective_trust = self.evidence_trust_cap * evidence_confidence
+        delta = scale * effective_trust * self.kappa * torch.tanh(raw_delta / self.kappa)
         delta = torch.where(no_reliable_factor[:, None], torch.zeros_like(delta), delta)
         return {
             "reason_temporal_route": attention,
             "reason_temporal_evidence": private,
             "reason_factor_reliability": factor_reliability,
             "reason_nonnull_mass": nonnull_mass,
+            "reason_evidence_confidence": evidence_confidence,
+            "reason_effective_trust": effective_trust,
             "reason_temporal_attention": attention,
             "reason_private_token": private,
             "reason_raw_temporal_delta": raw_delta,
