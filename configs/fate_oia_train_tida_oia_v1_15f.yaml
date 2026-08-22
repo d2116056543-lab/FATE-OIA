@@ -51,6 +51,7 @@ model:
   temporal_heads: 4
   temporal_dropout: 0.10
   action_kappa: 0.15
+  action_evidence_trust_cap: 0.25
   reason_kappa: 0.12
   reason_evidence_trust_cap: 0.25
 loss:

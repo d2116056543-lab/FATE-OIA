@@ -253,9 +253,21 @@ def dynamic_audit(args: Any, review_dir: Path) -> dict[str, Any]:
     }
     _write(review_dir, "innovation_audit.json", innovation_audit)
     contribution_error = float((output["action_factor_contribution"].sum(-1) - output["action_temporal_delta"]).abs().max())
+    expected_action_confidence = (
+        output["action_route"][..., :-1]
+        * output["action_factor_reliability"][:, None, :-1]
+    ).sum(-1)
     action_audit = {
-        "pass": contribution_error < 1e-6 and float(output["action_temporal_delta"].abs().max()) <= model.action_reader.kappa + 1e-6,
+        "pass": bool(
+            contribution_error < 1e-6
+            and torch.allclose(output["action_evidence_confidence"], expected_action_confidence, atol=1e-6)
+            and output["action_effective_trust"].max() <= model.action_reader.evidence_trust_cap + 1e-7
+            and output["action_temporal_delta"].abs().max()
+            <= model.action_reader.evidence_trust_cap * model.action_reader.kappa + 1e-6
+        ),
         "contribution_sum_error": contribution_error, "delta_abs_max": float(output["action_temporal_delta"].abs().max()),
+        "evidence_trust_cap": model.action_reader.evidence_trust_cap,
+        "confidence_mean": float(output["action_evidence_confidence"].mean().detach().cpu()),
         "route_shape": list(output["action_route"].shape),
     }
     _write(review_dir, "action_reader_audit.json", action_audit)

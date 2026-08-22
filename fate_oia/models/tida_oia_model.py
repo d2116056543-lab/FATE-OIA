@@ -99,6 +99,7 @@ class TIDAOIAModel(nn.Module):
         predicate_roles: dict[str, list[str]] | None = None,
         predicate_role_path: str = "configs/tida_predicate_roles.yaml",
         context_chunk_size: int = 2,
+        action_evidence_trust_cap: float = 0.25,
         reason_evidence_trust_cap: float = 0.25,
     ) -> None:
         super().__init__()
@@ -122,7 +123,13 @@ class TIDAOIAModel(nn.Module):
             roles=predicate_roles,
             role_path=predicate_role_path,
         )
-        self.action_reader = TIDAActionReader(dim, num_actions, num_predicates, kappa=0.15)
+        self.action_reader = TIDAActionReader(
+            dim,
+            num_actions,
+            num_predicates,
+            kappa=0.15,
+            evidence_trust_cap=action_evidence_trust_cap,
+        )
         self.reason_reader = TIDAReasonReader(
             dim,
             num_reasons,
@@ -245,6 +252,8 @@ class TIDAOIAModel(nn.Module):
             "video_reason_logits": image_reason + reason["reason_temporal_delta"],
             "action_temporal_route": action["action_route"],
             "action_null_mass": action["action_route"][..., -1],
+            "action_evidence_confidence": action["action_evidence_confidence"],
+            "action_effective_trust": action["action_effective_trust"],
             "reason_temporal_route": reason["reason_temporal_attention"],
             "reason_evidence_confidence": reason["reason_evidence_confidence"],
             "reason_effective_trust": reason["reason_effective_trust"],

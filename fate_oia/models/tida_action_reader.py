@@ -9,12 +9,23 @@ from .acpr_sparse_ops import entmax15_bisect
 
 
 class TIDAActionReader(nn.Module):
-    def __init__(self, dim: int = 384, num_actions: int = 4, num_predicates: int = 32, kappa: float = 0.15, eps: float = 1e-7) -> None:
+    def __init__(
+        self,
+        dim: int = 384,
+        num_actions: int = 4,
+        num_predicates: int = 32,
+        kappa: float = 0.15,
+        eps: float = 1e-7,
+        evidence_trust_cap: float = 0.25,
+    ) -> None:
         super().__init__()
         self.num_actions = int(num_actions)
         self.num_predicates = int(num_predicates)
         self.kappa = float(kappa)
         self.eps = float(eps)
+        self.evidence_trust_cap = float(evidence_trust_cap)
+        if not 0.0 < self.evidence_trust_cap <= 1.0:
+            raise ValueError("evidence_trust_cap must be in (0, 1]")
         self.action_query = nn.Linear(dim, dim)
         self.factor_key = nn.Linear(dim, dim)
         self.visual_value_projection = nn.Linear(dim, dim)
@@ -62,7 +73,9 @@ class TIDAActionReader(nn.Module):
         raw_contribution = route * factor_score
         raw_sum = raw_contribution.sum(-1)
         scale = torch.as_tensor(temporal_scale, device=raw_sum.device, dtype=raw_sum.dtype)
-        delta = scale * self.kappa * torch.tanh(raw_sum / self.kappa)
+        evidence_confidence = (route[..., :-1] * nonnull_reliability[:, None]).sum(-1)
+        effective_trust = self.evidence_trust_cap * evidence_confidence
+        delta = scale * effective_trust * self.kappa * torch.tanh(raw_sum / self.kappa)
         ratio = torch.where(raw_sum.abs() > self.eps, delta / raw_sum, torch.ones_like(raw_sum))
         bounded = raw_contribution * ratio[..., None]
         bounded = torch.where((raw_sum.abs() > self.eps)[..., None], bounded, torch.zeros_like(bounded))
@@ -75,6 +88,8 @@ class TIDAActionReader(nn.Module):
             "action_raw_factor_contribution": raw_contribution,
             "action_factor_contribution": bounded,
             "action_temporal_delta": delta,
+            "action_evidence_confidence": evidence_confidence,
+            "action_effective_trust": effective_trust,
             "action_nonnull_mass": route[..., :-1].sum(-1),
             "action_route_entropy": -(route * route.clamp_min(self.eps).log()).sum(-1),
             "selected_action_temporal_evidence": torch.einsum("baf,bafd->bad", route, factor_value),

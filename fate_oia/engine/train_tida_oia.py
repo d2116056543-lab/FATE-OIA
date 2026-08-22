@@ -430,6 +430,7 @@ def build_runtime(args: Any, evaluation_only: bool = False) -> TIDARuntime:
         image_base,
         dim=int(config["model"]["dim"]),
         context_chunk_size=int(_arg(args, "context_chunk_size", config["model"]["context_chunk_size"])),
+        action_evidence_trust_cap=float(config["model"].get("action_evidence_trust_cap", 0.25)),
         reason_evidence_trust_cap=float(config["model"].get("reason_evidence_trust_cap", 0.25)),
     ).to(device)
     batch_size = int(_arg(args, "batch_size", 2))
@@ -783,6 +784,8 @@ def train(args: Any) -> None:
                 "rho_mean": float(output["innovation_reliability"].mean().detach().cpu()),
                 "rho_nonzero_rate": float((output["innovation_reliability"] > 0).float().mean().detach().cpu()),
                 "action_delta_rms": float(output["action_temporal_delta"].float().square().mean().sqrt().detach().cpu()),
+                "action_evidence_confidence_mean": float(output["action_evidence_confidence"].mean().detach().cpu()),
+                "action_effective_trust_mean": float(output["action_effective_trust"].mean().detach().cpu()),
                 "reason_delta_rms": float(output["reason_temporal_delta"].float().square().mean().sqrt().detach().cpu()),
                 "reason_evidence_confidence_mean": float(output["reason_evidence_confidence"].mean().detach().cpu()),
                 "reason_effective_trust_mean": float(output["reason_effective_trust"].mean().detach().cpu()),

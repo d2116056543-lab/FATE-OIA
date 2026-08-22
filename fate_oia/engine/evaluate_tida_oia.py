@@ -49,6 +49,7 @@ def collect_tida_outputs(
     store = {key: [] for key in ("image_action", "video_action", "image_reason", "video_reason", "action_target", "reason_target")}
     diagnostics = {key: [] for key in (
         "rho", "action_delta", "reason_delta", "null_mass", "route_entropy",
+        "action_evidence_confidence", "action_effective_trust",
         "reason_evidence_confidence", "reason_effective_trust",
     )}
     audit_keys = (
@@ -91,6 +92,8 @@ def collect_tida_outputs(
             "rho": output["innovation_reliability"], "action_delta": output["action_temporal_delta"],
             "reason_delta": output["reason_temporal_delta"], "null_mass": output["action_null_mass"],
             "route_entropy": output["action_route_entropy"],
+            "action_evidence_confidence": output["action_evidence_confidence"],
+            "action_effective_trust": output["action_effective_trust"],
             "reason_evidence_confidence": output["reason_evidence_confidence"],
             "reason_effective_trust": output["reason_effective_trust"],
         }.items():
@@ -244,6 +247,7 @@ def save_epoch_outputs(output_dir: Path, epoch: int, rows: dict[str, Any], metri
     tensor_keys = (
         "image_action", "video_action", "image_reason", "video_reason", "action_target", "reason_target",
         "rho", "action_delta", "reason_delta", "null_mass", "route_entropy",
+        "action_evidence_confidence", "action_effective_trust",
         "reason_evidence_confidence", "reason_effective_trust",
         "terminal_prediction_history", "terminal_prediction_no_history", "terminal_target_evidence",
         "terminal_error_history", "terminal_error_no_history", "innovation_token",
