@@ -22,6 +22,7 @@ from fate_oia.engine.evaluate_tida_oia import (
     dynamic_slice_metrics,
     fit_train_calib_thresholds,
     save_epoch_outputs,
+    temporal_contribution_metrics,
 )
 from fate_oia.engine.train_aie_oia import build_model as build_aie_model, canonical_model_state_dict
 from fate_oia.engine.train_vetra_strong_refine import build_refiner
@@ -252,11 +253,11 @@ def reason_firewall_gradient_audit(
 ) -> dict[str, float]:
     reason_names = (
         "reason_partial", "reason_rank", "reason_soft_f1", "reason_delta",
-        "reason_flow_credit", "reason_flow_no_harm",
+        "reason_flow_credit", "reason_flow_no_harm", "reason_utility_calibration",
     )
     action_names = (
         "action_asl", "action_smooth_ap", "action_base_protect", "action_delta",
-        "action_flow_credit", "action_flow_no_harm",
+        "action_flow_credit", "action_flow_no_harm", "action_utility_calibration",
     )
     reason_loss = sum(registry.rows[name].weight * registry.rows[name].value for name in reason_names)
     action_loss = sum(registry.rows[name].weight * registry.rows[name].value for name in action_names)
@@ -286,6 +287,10 @@ def append_supervision_tensors(
         "reason_delta": output["reason_temporal_delta"],
         "action_flow_route_mass": output["action_flow_route_mass"],
         "reason_flow_route_mass": output["reason_flow_route_mass"],
+        "action_temporal_budget": output["action_temporal_budget"],
+        "reason_temporal_budget": output["reason_temporal_budget"],
+        "action_temporal_need": output["action_temporal_need"],
+        "reason_temporal_need": output["reason_temporal_need"],
         "transition_reliability": output["transition_reliability"],
         "flow_velocity": output["velocity"],
         "flow_acceleration": output["acceleration"],
@@ -347,6 +352,18 @@ def supervision_tensor_summary(
         "reason_delta_rms_window": float(values["reason_delta"].square().mean().sqrt()),
         "action_flow_route_mass_mean": float(values["action_flow_route_mass"].mean()),
         "reason_flow_route_mass_mean": float(values["reason_flow_route_mass"].mean()),
+        "action_temporal_budget_quantiles": {
+            "p10": float(torch.quantile(values["action_temporal_budget"], 0.10)),
+            "p50": float(torch.quantile(values["action_temporal_budget"], 0.50)),
+            "p90": float(torch.quantile(values["action_temporal_budget"], 0.90)),
+        },
+        "reason_temporal_budget_quantiles": {
+            "p10": float(torch.quantile(values["reason_temporal_budget"], 0.10)),
+            "p50": float(torch.quantile(values["reason_temporal_budget"], 0.50)),
+            "p90": float(torch.quantile(values["reason_temporal_budget"], 0.90)),
+        },
+        "action_temporal_need_mean": float(values["action_temporal_need"].mean()),
+        "reason_temporal_need_mean": float(values["reason_temporal_need"].mean()),
         "transition_reliability_mean": float(values["transition_reliability"].mean()),
         "flow_velocity_rms": float(values["flow_velocity"].square().mean().sqrt()),
         "flow_acceleration_rms": float(values["flow_acceleration"].square().mean().sqrt()),
@@ -614,6 +631,7 @@ def _view_metrics(test_rows, calib_rows):
     return {
         "raw_fixed": raw, "deploy": deploy, "thresholds": thresholds,
         "dynamic_slices": dynamic_slice_metrics(test_rows, thresholds["video"]),
+        "temporal_contribution": temporal_contribution_metrics(test_rows),
     }
 
 

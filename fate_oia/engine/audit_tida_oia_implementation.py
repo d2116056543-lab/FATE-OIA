@@ -25,10 +25,11 @@ REQUIRED_FILES = (
     "fate_oia/models/tida_temporal_encoder.py", "fate_oia/models/tida_terminal_innovation.py",
     "fate_oia/models/tida_predicate_differential.py", "fate_oia/models/tida_action_reader.py",
     "fate_oia/models/tida_flow_transition_bank.py", "fate_oia/models/tida_reason_reader.py",
-    "fate_oia/models/tida_oia_model.py", "fate_oia/losses/tida_flow_credit_losses.py",
+    "fate_oia/models/tida_temporal_utility.py", "fate_oia/models/tida_oia_model.py",
+    "fate_oia/losses/tida_flow_credit_losses.py",
     "fate_oia/losses/tida_losses.py", "fate_oia/losses/tida_loss_registry.py",
     "fate_oia/utils/tida_temporal_interventions.py", "fate_oia/utils/tida_artifacts.py", "fate_oia/utils/tida_contracts.py",
-    "fate_oia/utils/tida_stateful_sampler.py",
+    "fate_oia/utils/tida_stateful_sampler.py", "fate_oia/utils/tida_temporal_metrics.py",
     "fate_oia/explain/tida_dynamic_concepts.py", "fate_oia/engine/build_tida_clip_manifest.py",
     "fate_oia/engine/audit_tida_video_data.py", "fate_oia/engine/train_tida_oia.py",
     "fate_oia/engine/evaluate_tida_oia.py", "fate_oia/engine/profile_tida_oia.py",
@@ -117,6 +118,8 @@ def static_audit(review_dir: Path) -> dict[str, Any]:
         "trainer_to_evaluator": "collect_tida_outputs" in Path("fate_oia/engine/train_tida_oia.py").read_text(encoding="utf-8"),
         "model_to_transition_bank": "self.flow_transition_bank(" in Path("fate_oia/models/tida_oia_model.py").read_text(encoding="utf-8"),
         "trainer_to_margin_credit": "counterfactual_outputs=" in Path("fate_oia/engine/train_tida_oia.py").read_text(encoding="utf-8"),
+        "model_to_conditional_utility": "transition_tokens_by_scale=flow" in Path("fate_oia/models/tida_oia_model.py").read_text(encoding="utf-8"),
+        "trainer_to_temporal_metrics": "temporal_contribution_metrics" in Path("fate_oia/engine/train_tida_oia.py").read_text(encoding="utf-8"),
     }
     _write(review_dir, "call_graph.json", {"pass": all(call_graph_requirements.values()), "edges": call_graph_requirements})
     checkpoint_source = Path("fate_oia/engine/train_tida_oia.py").read_text(encoding="utf-8")
@@ -323,17 +326,27 @@ def dynamic_audit(args: Any, review_dir: Path) -> dict[str, Any]:
     transition = {
         "pass": bool(
             output["transition_tokens"].shape == (1, 32, 384)
+            and output["transition_tokens_by_scale"].shape == (1, 32, 4, 384)
+            and torch.allclose(output["transition_tokens"], output["transition_tokens_by_scale"].mean(2), atol=1e-6)
             and torch.isfinite(output["transition_tokens"]).all()
+            and torch.isfinite(output["motion_salience"]).all()
             and output["transition_reliability"].shape == (1, 32)
             and output["action_flow_route_mass"].shape == (1, 4)
             and output["reason_flow_route_mass"].shape == (1, 21)
+            and torch.allclose(output["action_flow_route_mass"], output["action_temporal_budget"], atol=1e-6)
+            and torch.allclose(output["reason_flow_route_mass"], output["reason_temporal_budget"], atol=1e-6)
+            and output["action_temporal_budget"].max() <= 0.6001
+            and output["reason_temporal_budget"].max() <= 0.5001
         ),
         "transition_shape": list(output["transition_tokens"].shape),
+        "transition_scales_shape": list(output["transition_tokens_by_scale"].shape),
         "velocity_reverse_cosine": float(torch.nn.functional.cosine_similarity(
             output["velocity"].flatten(1), reversed_output["velocity"].flatten(1), dim=-1
         ).mean()),
         "action_flow_route_mass_mean": float(output["action_flow_route_mass"].mean()),
         "reason_flow_route_mass_mean": float(output["reason_flow_route_mass"].mean()),
+        "action_budget_by_target": output["action_temporal_budget"].mean(0).detach().cpu().tolist(),
+        "reason_budget_by_target": output["reason_temporal_budget"].mean(0).detach().cpu().tolist(),
     }
     _write(review_dir, "flow_transition_audit.json", transition)
     expected_confidence = (
@@ -342,7 +355,9 @@ def dynamic_audit(args: Any, review_dir: Path) -> dict[str, Any]:
             [
                 output["innovation_reliability"][:, 4:],
                 output["innovation_reliability"][:, :4],
-                output["transition_reliability"],
+                output["transition_reliability"].repeat_interleave(4, dim=1)
+                if model.reason_reader.conditional_utility_enabled
+                else output["transition_reliability"],
             ],
             dim=1,
         )[:, None]
@@ -409,8 +424,8 @@ def _flow_mechanism_pass(
         tensor is not None
         and bool(torch.isfinite(tensor).all())
         and float(tensor.mean()) > 0.01
-        and float(tensor.max()) <= 0.3501
-        for tensor in (action_flow_route, reason_flow_route)
+        and float(tensor.max()) <= cap
+        for tensor, cap in ((action_flow_route, 0.6001), (reason_flow_route, 0.5001))
     )
     return bool(raw.get("available")) and int(raw.get("sample_count", 0)) >= 128 and route_ok and all((
         advantage("history_off", "action") > 0.0,

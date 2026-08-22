@@ -27,6 +27,15 @@ def test_transition_bank_returns_four_typed_scales():
     )
 
 
+def test_transition_token_is_always_the_mean_of_typed_scales():
+    bank = TIDAFlowTransitionBank(dim=8, region_count=5)
+    with torch.no_grad():
+        bank.scale_residuals[0][-1].bias.fill_(1.0)
+    output = bank(*_inputs(valid=True))
+    torch.testing.assert_close(output["transition_tokens"], output["transition_tokens_by_scale"].mean(2))
+    assert not torch.equal(output["transition_tokens"], output["legacy_transition_tokens"])
+
+
 def test_motion_salience_is_finite_non_saturated_and_zero_without_history():
     module = TIDAFlowTransitionBank(dim=8, region_count=5)
     real = module(*_inputs())
