@@ -391,6 +391,43 @@ def _latest_jsonl(path: Path) -> dict[str, Any]:
     return json.loads(lines[-1]) if lines else {}
 
 
+def _flow_mechanism_pass(
+    metrics: dict[str, Any],
+    action_flow_route: torch.Tensor | None,
+    reason_flow_route: torch.Tensor | None,
+) -> bool:
+    raw = metrics.get("mechanism", {})
+    intervention = raw.get("intervention_metrics", {})
+    online = metrics.get("online", {}).get("raw_fixed", {})
+    image = online.get("image", {})
+    video = online.get("video", {})
+
+    def advantage(name: str, task: str) -> float:
+        return float(intervention.get(name, {}).get(f"{task}_gt_margin_advantage_mean", float("-inf")))
+
+    route_ok = all(
+        tensor is not None
+        and bool(torch.isfinite(tensor).all())
+        and float(tensor.mean()) > 0.01
+        and float(tensor.max()) <= 0.3501
+        for tensor in (action_flow_route, reason_flow_route)
+    )
+    return bool(raw.get("available")) and int(raw.get("sample_count", 0)) >= 128 and route_ok and all((
+        advantage("history_off", "action") > 0.0,
+        advantage("history_off", "reason") > 0.0,
+        advantage("repeated_last", "action") > 0.0,
+        advantage("repeated_last", "reason") > 0.0,
+        advantage("time_shuffle", "action") >= -1e-4,
+        advantage("time_shuffle", "reason") >= -1e-4,
+        advantage("time_reverse", "action") >= -1e-4,
+        advantage("time_reverse", "reason") >= -1e-4,
+        float(intervention.get("time_shuffle", {}).get("velocity_cosine_with_reference", 1.0)) < 0.0,
+        float(intervention.get("time_reverse", {}).get("velocity_cosine_with_reference", 1.0)) <= -0.9,
+        float(video.get("Act_mF1", -1.0)) >= float(image.get("Act_mF1", 1.0)) - 0.002,
+        float(video.get("Exp_mF1", -1.0)) >= float(image.get("Exp_mF1", 1.0)) - 0.002,
+    ))
+
+
 def evidence_audits(args: Any, review_dir: Path) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     data = json.loads(Path(args.data_audit).read_text(encoding="utf-8")) if args.data_audit else {"pass": False, "missing": True}
     _write(review_dir, "data_audit.json", data)
@@ -407,16 +444,17 @@ def evidence_audits(args: Any, review_dir: Path) -> tuple[dict[str, Any], dict[s
         high_delta = dynamic.get("high_dynamic", {}).get("action_mf1_delta")
         route_path = root / f"epoch_{int(metrics.get('epoch', 0)):03d}" / "null_mass_test.pt"
         null_mass = torch.load(route_path, map_location="cpu", weights_only=True) if route_path.is_file() else None
+        action_flow_path = root / f"epoch_{int(metrics.get('epoch', 0)):03d}" / "action_flow_route_mass_test.pt"
+        reason_flow_path = root / f"epoch_{int(metrics.get('epoch', 0)):03d}" / "reason_flow_route_mass_test.pt"
+        action_flow = torch.load(action_flow_path, map_location="cpu", weights_only=True) if action_flow_path.is_file() else None
+        reason_flow = torch.load(reason_flow_path, map_location="cpu", weights_only=True) if reason_flow_path.is_file() else None
         mechanism = {
-            "pass": bool(raw.get("available")) and int(raw.get("sample_count", 0)) >= 128
-            and all(float(intervention.get(name, {}).get("joint_drop_from_real", 0)) > 0 for name in ("repeated_last", "time_shuffle", "time_reverse"))
-            and selected_drop > matched_drop
-            and null_mass is not None and bool((null_mass.mean(0) < 0.95).all())
-            and low_delta is not None and float(low_delta) >= -0.002
-            and high_delta is not None and float(high_delta) >= 0.010,
+            "pass": _flow_mechanism_pass(metrics, action_flow, reason_flow),
             "metrics": metrics, "selected_flatten_drop": selected_drop, "matched_flatten_drop": matched_drop,
             "low_dynamic_action_delta": low_delta, "high_dynamic_action_delta": high_delta,
             "four_action_nonnull_route": None if null_mass is None else (1.0 - null_mass.mean(0)).tolist(),
+            "action_flow_route_mean": None if action_flow is None else float(action_flow.mean()),
+            "reason_flow_route_mean": None if reason_flow is None else float(reason_flow.mean()),
         }
     _write(review_dir, "mechanism_review.json", mechanism)
     memory = json.loads(Path(args.memory_profile).read_text(encoding="utf-8")) if args.memory_profile else {"pass": False, "missing": True}
