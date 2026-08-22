@@ -348,6 +348,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--checkpoint-view", choices=("online", "ema"), default="online")
     parser.add_argument("--clip-manifest", required=True)
     parser.add_argument("--image-checkpoint", required=True)
     parser.add_argument("--output-dir", required=True)
