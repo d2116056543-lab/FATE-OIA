@@ -28,6 +28,16 @@ def test_counterfactual_credit_is_zero_only_after_real_history_wins():
     assert losing_real.grad is not None and torch.isfinite(losing_real.grad).all()
 
 
+def test_counterfactual_credit_backpropagates_opposing_paired_gradients():
+    target = torch.tensor([[1.0, 0.0]])
+    real = torch.tensor([[0.0, 0.0]], requires_grad=True)
+    counterfactual = torch.tensor([[1.0, -1.0]], requires_grad=True)
+    counterfactual_margin_credit_loss(real, counterfactual, target, margin=0.2).backward()
+    assert real.grad is not None and counterfactual.grad is not None
+    torch.testing.assert_close(real.grad, -counterfactual.grad)
+    assert real.grad[0, 0] < 0 and real.grad[0, 1] > 0
+
+
 def test_reason_credit_uses_pu_negative_weights_without_downweighting_positives():
     real = torch.tensor([[0.0, 0.0]])
     counterfactual = torch.tensor([[1.0, 1.0]])

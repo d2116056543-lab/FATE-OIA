@@ -28,7 +28,10 @@ def counterfactual_margin_credit_loss(
     margin: float = 0.02,
 ) -> torch.Tensor:
     real_margin = signed_gt_margin(real_logits, target)
-    counterfactual_margin = signed_gt_margin(counterfactual_logits.detach(), target)
+    # Backpropagate through both members of the same-image pair. Shared static
+    # terms then cancel, so the hinge assigns credit to the history-sensitive
+    # path instead of merely raising the real branch's static logits.
+    counterfactual_margin = signed_gt_margin(counterfactual_logits, target)
     return _weighted_mean(F.relu(counterfactual_margin - real_margin + float(margin)), sample_weight)
 
 
