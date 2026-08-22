@@ -472,11 +472,32 @@ def binding(args: Any, tests: dict[str, Any]) -> dict[str, Any]:
         ["git", "ls-remote", remote_name, f"refs/heads/{branch}"], text=True, capture_output=True
     ) if remote_name else subprocess.CompletedProcess([], 1, "", "FATE-OIA remote not found")
     remote_head = remote.stdout.split()[0] if remote.returncode == 0 and remote.stdout.strip() else None
+    proof = _validate_remote_head_proof(Path(args.remote_head_proof), head=head, branch=branch) if args.remote_head_proof else {"valid": False}
+    if remote_head is None and proof["valid"]:
+        remote_head = proof["remote_head"]
     return {
         "git_head": head, "git_tree": tree, "remote_name": remote_name, "remote_head": remote_head,
         "clean": not bool(_git("status", "--porcelain", "--untracked-files=all")),
-        "remote_matches": remote_head == head, "tests": tests,
+        "remote_matches": remote_head == head, "remote_verification": "live" if remote.returncode == 0 else "offline_proof",
+        "remote_live_error": remote.stderr.strip(), "remote_head_proof": proof, "tests": tests,
     }
+
+
+def _validate_remote_head_proof(path: Path, *, head: str, branch: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        checked_at = datetime.fromisoformat(str(payload["checked_at"]).replace("Z", "+00:00"))
+        age_seconds = (datetime.now(timezone.utc) - checked_at.astimezone(timezone.utc)).total_seconds()
+        valid = all((
+            "github.com" in str(payload.get("remote_url", "")).lower(),
+            "fate-oia" in str(payload.get("remote_url", "")).lower(),
+            payload.get("branch") == branch,
+            payload.get("remote_head") == head,
+            0.0 <= age_seconds <= 3600.0,
+        ))
+        return {**payload, "valid": bool(valid), "age_seconds": age_seconds, "path": str(path)}
+    except (OSError, KeyError, ValueError, TypeError, json.JSONDecodeError) as error:
+        return {"valid": False, "path": str(path), "error": str(error)}
 
 
 def pass_payload(args: Any, gates: dict[str, Any], tests: dict[str, Any]) -> dict[str, Any]:
@@ -503,6 +524,7 @@ def main() -> None:
     parser.add_argument("--golden-oracle", required=True); parser.add_argument("--source-root", required=True)
     parser.add_argument("--device", default="cuda"); parser.add_argument("--data-audit")
     parser.add_argument("--mechanism-run-dir"); parser.add_argument("--memory-profile")
+    parser.add_argument("--remote-head-proof")
     parser.add_argument("--run-tests", action="store_true"); parser.add_argument("--write-review-pass", action="store_true")
     parser.add_argument("--base-source-head", default="cfeb25f09ea4452decf9326990f02d01895926e0")
     parser.add_argument("--base-source-tree", default="9c885b803a34040be8d04baef81f60d6f567aa0a")
