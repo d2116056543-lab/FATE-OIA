@@ -133,7 +133,13 @@ class TIDAReasonReader(nn.Module):
                     image_logits.detach(), target_motion, target_consistency,
                     target_compatibility, history_available.detach(),
                 )
-                flow_mix = utility["budget"]
+                legacy_budget = self.flow_mix_cap * flow_strength.expand(-1, self.num_reasons)
+                available = history_available.detach()[:, None].to(legacy_budget.dtype)
+                flow_mix = available * (
+                    legacy_budget
+                    + (self.temporal_utility.max_budget - legacy_budget) * utility["need"]
+                )
+                utility["budget"] = flow_mix
             else:
                 utility = {}
                 target_motion = flow_strength.expand(-1, self.num_reasons)

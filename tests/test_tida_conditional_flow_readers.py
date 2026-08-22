@@ -37,6 +37,7 @@ def test_action_conditional_utility_routes_typed_scales_with_target_specific_bud
     assert output["action_route"].shape == (2, 4, 20)
     assert torch.allclose(output["action_flow_route_mass"], output["action_temporal_budget"], atol=1e-6)
     assert output["action_temporal_budget"].max() <= 0.60 + 1e-7
+    assert output["action_temporal_budget"].min() >= reader.flow_mix_cap - 1e-7
     assert torch.unique(output["action_temporal_budget"].round(decimals=6)).numel() > 2
 
 
@@ -76,6 +77,7 @@ def test_reason_conditional_utility_keeps_shared_inputs_behind_firewall():
     assert output["reason_temporal_budget"].shape == (2, 5)
     assert torch.allclose(output["reason_flow_route_mass"], output["reason_temporal_budget"], atol=1e-6)
     assert output["reason_temporal_budget"].max() <= 0.50 + 1e-7
+    assert output["reason_temporal_budget"].min() >= reader.flow_mix_cap - 1e-7
     assert reasons.grad is not None and reasons.grad.abs().sum() > 0
     assert predicates.grad is None
     assert actions.grad is None
