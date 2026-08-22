@@ -65,6 +65,7 @@ def collect_tida_outputs(
         "action_temporal_budget", "reason_temporal_budget",
         "action_temporal_need", "reason_temporal_need",
         "action_temporal_target_motion", "reason_temporal_target_motion",
+        "reason_pu_weight",
         "velocity_norm", "acceleration_norm",
     )}
     audit_keys = (
@@ -106,6 +107,14 @@ def collect_tida_outputs(
         }
         for key, value in values.items():
             store[key].append(value.detach().float().cpu())
+        image_branch = output.get("image_branch", {})
+        contradiction = image_branch.get("contradiction_score") if isinstance(image_branch, dict) else None
+        reason_negative_weight = (
+            torch.full_like(batch["reason"], 0.2)
+            if contradiction is None
+            else 0.2 + 0.8 * contradiction.detach().clamp(0.0, 1.0)
+        )
+        reason_pu = torch.where(batch["reason"] > 0.5, torch.ones_like(reason_negative_weight), reason_negative_weight)
         for key, value in {
             "rho": output["innovation_reliability"], "action_delta": output["action_temporal_delta"],
             "reason_delta": output["reason_temporal_delta"], "null_mass": output["action_null_mass"],
@@ -123,6 +132,7 @@ def collect_tida_outputs(
             "reason_temporal_need": output["reason_temporal_need"],
             "action_temporal_target_motion": output["action_temporal_target_motion"],
             "reason_temporal_target_motion": output["reason_temporal_target_motion"],
+            "reason_pu_weight": reason_pu,
             "velocity_norm": output["velocity"].norm(dim=-1),
             "acceleration_norm": output["acceleration"].norm(dim=-1),
         }.items():
@@ -247,6 +257,7 @@ def temporal_contribution_metrics(rows: dict[str, Any]) -> dict[str, Any]:
         ),
         "reason": paired_temporal_contribution(
             rows["image_reason"], rows["video_reason"], rows["reason_target"], motion_score=motion,
+            pu_negative_weight=rows.get("reason_pu_weight"),
         ),
     }
 
@@ -317,6 +328,7 @@ def save_epoch_outputs(output_dir: Path, epoch: int, rows: dict[str, Any], metri
         "action_temporal_budget", "reason_temporal_budget",
         "action_temporal_need", "reason_temporal_need",
         "action_temporal_target_motion", "reason_temporal_target_motion",
+        "reason_pu_weight",
         "velocity_norm", "acceleration_norm",
         "terminal_prediction_history", "terminal_prediction_no_history", "terminal_target_evidence",
         "terminal_error_history", "terminal_error_no_history", "innovation_token",
