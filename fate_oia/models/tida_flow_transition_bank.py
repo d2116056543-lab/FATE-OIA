@@ -15,6 +15,21 @@ def _masked_recent_mean(values: torch.Tensor, valid: torch.Tensor, decay: float 
     return (values * expanded).sum(1) / expanded.sum(1).clamp_min(1e-6)
 
 
+def _endpoint_slope(values: torch.Tensor, timestamps: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    batch, steps = valid.shape
+    indices = torch.arange(steps, device=values.device).view(1, steps).expand(batch, -1)
+    first_index = indices.masked_fill(~valid, steps).min(1).values.clamp_max(steps - 1)
+    last_index = indices.masked_fill(~valid, -1).max(1).values.clamp_min(0)
+    batch_index = torch.arange(batch, device=values.device)
+    first = values[batch_index, first_index]
+    last = values[batch_index, last_index]
+    delta_t = (timestamps[batch_index, last_index] - timestamps[batch_index, first_index]).clamp_min(1e-6)
+    expand = (slice(None),) + (None,) * (values.ndim - 2)
+    slope = (last - first) / delta_t[expand]
+    enough = valid.sum(1) >= 2
+    return slope * enough[expand].to(slope.dtype)
+
+
 class TIDAFlowTransitionBank(nn.Module):
     """Compact signed motion factors built from ordered query trajectories."""
 
@@ -49,9 +64,13 @@ class TIDAFlowTransitionBank(nn.Module):
         midpoint = 0.5 * (timestamps[:, 1:] + timestamps[:, :-1])
         acceleration_steps, acceleration_valid = finite_difference(velocity_steps, midpoint, velocity_valid)
 
-        velocity = _masked_recent_mean(velocity_steps, velocity_valid)
+        # Endpoint displacement is strictly antisymmetric under sequence
+        # reversal even for the quadratic, non-uniform frame timestamps used
+        # by TIDA. Recent finite differences remain useful for acceleration
+        # and persistence, but must not define the primary signed direction.
+        velocity = _endpoint_slope(query_trajectory, timestamps, valid_mask)
         acceleration = _masked_recent_mean(acceleration_steps, acceleration_valid)
-        region_velocity = _masked_recent_mean(region_steps, velocity_valid)
+        region_velocity = _endpoint_slope(region_mass, timestamps, valid_mask)
 
         direction = torch.sign(velocity_steps)
         reference = torch.sign(velocity)[:, None]

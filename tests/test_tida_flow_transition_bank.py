@@ -46,3 +46,15 @@ def test_terminal_target_jump_is_not_part_of_history_flow_derivatives():
     real = module(history, regions, timestamps, torch.ones(1, 4, dtype=torch.bool))
     reversed_history = module(history.flip(1), regions.flip(1), timestamps, torch.ones(1, 4, dtype=torch.bool))
     torch.testing.assert_close(real["velocity"], -reversed_history["velocity"], atol=1e-6, rtol=0)
+
+
+def test_endpoint_velocity_reverses_with_nonuniform_timestamps():
+    module = TIDAFlowTransitionBank(dim=4, region_count=3).eval()
+    history = torch.randn(1, 5, 2, 4)
+    regions = torch.randn(1, 5, 2, 3)
+    timestamps = torch.tensor([[0.0, 0.2, 0.8, 2.0, 5.0]])
+    valid = torch.ones(1, 5, dtype=torch.bool)
+    real = module(history, regions, timestamps, valid)
+    reverse = module(history.flip(1), regions.flip(1), timestamps, valid)
+    torch.testing.assert_close(real["velocity"], -reverse["velocity"], atol=1e-6, rtol=0)
+    torch.testing.assert_close(real["region_velocity"], -reverse["region_velocity"], atol=1e-6, rtol=0)
