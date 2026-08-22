@@ -478,6 +478,8 @@ def build_runtime(args: Any, evaluation_only: bool = False) -> TIDARuntime:
         conditional_temporal_utility=bool(config["model"].get("conditional_temporal_utility", False)),
         action_temporal_budget_cap=float(config["model"].get("action_temporal_budget_cap", 0.60)),
         reason_temporal_budget_cap=float(config["model"].get("reason_temporal_budget_cap", 0.50)),
+        confidence_aware_reason_gate=bool(config["model"].get("confidence_aware_reason_gate", False)),
+        reason_gate_temperature=float(config["model"].get("reason_gate_temperature", 0.5)),
     ).to(device)
     batch_size = int(_arg(args, "batch_size", 2))
     workers = int(_arg(args, "num_workers", config["data"]["num_workers"]))

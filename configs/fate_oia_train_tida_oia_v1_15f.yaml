@@ -58,6 +58,8 @@ model:
   transition_scales: [velocity, acceleration, region_velocity, persistence]
   action_temporal_budget_cap: 0.60
   reason_temporal_budget_cap: 0.50
+  confidence_aware_reason_gate: true
+  reason_gate_temperature: 0.50
 loss:
   terminal_hist: 0.25
   terminal_no_history: 0.0
