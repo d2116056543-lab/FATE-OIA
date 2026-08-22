@@ -1,6 +1,7 @@
 param(
     [string]$OutputDir = "F:\FATE_Drive_runs\tida_ctu_refinement_v2",
     [string]$Checkpoint = "F:\FATE_Drive_runs\tida_flow_credit_full_362d540\checkpoint_best_test_joint.pth",
+    [ValidateSet("online", "ema")][string]$CheckpointView = "ema",
     [int]$Epochs = 3,
     [int]$BatchSize = 4,
     [int]$GradAccum = 8,
@@ -28,6 +29,7 @@ if ($TrainOwners) {
     --clip-manifest $manifest `
     --image-checkpoint $imageCheckpoint `
     --checkpoint $Checkpoint `
+    --checkpoint-view $CheckpointView `
     --output-dir $OutputDir `
     --epochs $Epochs `
     --batch-size $BatchSize `
