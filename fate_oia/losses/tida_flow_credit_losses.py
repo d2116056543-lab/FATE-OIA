@@ -10,6 +10,35 @@ def signed_gt_margin(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor
     return (2.0 * target.to(logits.dtype) - 1.0) * logits
 
 
+def conditional_credit_weight(need: torch.Tensor) -> torch.Tensor:
+    """Emphasize paired credit where the label-independent utility predicts need."""
+    return (0.25 + 0.75 * need.detach().clamp(0.0, 1.0)).to(need.dtype)
+
+
+def conditional_no_harm_weight(need: torch.Tensor) -> torch.Tensor:
+    """Protect the image fallback most strongly when temporal utility is low."""
+    return (1.0 - 0.75 * need.detach().clamp(0.0, 1.0)).to(need.dtype)
+
+
+def temporal_utility_calibration_loss(
+    budget: torch.Tensor,
+    real_logits: torch.Tensor,
+    counterfactual_logits: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    max_budget: float = 1.0,
+    temperature: float = 0.20,
+) -> torch.Tensor:
+    """Fit temporal budget to detached, target-signed paired benefit."""
+    if budget.shape != real_logits.shape or real_logits.shape != counterfactual_logits.shape:
+        raise ValueError("budget and paired logits must have identical shapes")
+    benefit = (
+        signed_gt_margin(real_logits, target) - signed_gt_margin(counterfactual_logits, target)
+    ).detach()
+    soft_target = float(max_budget) * torch.sigmoid(benefit / float(temperature))
+    return F.smooth_l1_loss(budget, soft_target)
+
+
 def _weighted_mean(value: torch.Tensor, weight: torch.Tensor | None) -> torch.Tensor:
     if weight is None:
         return value.mean()

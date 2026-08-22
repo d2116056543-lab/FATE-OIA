@@ -7,8 +7,11 @@ import torch.nn.functional as F
 
 from .asymmetric_loss import asymmetric_loss_with_logits
 from .tida_flow_credit_losses import (
+    conditional_credit_weight,
+    conditional_no_harm_weight,
     counterfactual_margin_credit_loss,
     image_fallback_no_harm_loss,
+    temporal_utility_calibration_loss,
     transition_alignment_loss,
 )
 
@@ -227,9 +230,13 @@ def build_tida_loss_registry(
         ),
     )
     counterfactual_outputs = counterfactual_outputs or {}
+    action_need = output.get("action_temporal_need", torch.ones_like(action_target))
+    action_credit_weight = conditional_credit_weight(action_need)
+    action_no_harm_weight = conditional_no_harm_weight(action_need)
     action_credit = [
         counterfactual_margin_credit_loss(
-            output["video_action_logits"], value["video_action_logits"], action_target, margin=0.02
+            output["video_action_logits"], value["video_action_logits"], action_target,
+            sample_weight=action_credit_weight, margin=0.02
         )
         for value in counterfactual_outputs.values()
     ]
@@ -241,11 +248,31 @@ def build_tida_loss_registry(
     )
     registry.add(
         "action_flow_no_harm",
-        image_fallback_no_harm_loss(output["image_action_logits"], output["video_action_logits"], action_target),
+        image_fallback_no_harm_loss(
+            output["image_action_logits"], output["video_action_logits"], action_target,
+            sample_weight=action_no_harm_weight,
+        ),
+    )
+    action_utility = [
+        temporal_utility_calibration_loss(
+            output["action_temporal_budget"], output["video_action_logits"],
+            value["video_action_logits"], action_target,
+            max_budget=0.60,
+        )
+        for value in counterfactual_outputs.values()
+    ]
+    registry.add(
+        "action_utility_calibration",
+        torch.stack(action_utility).mean() if action_utility else output["video_action_logits"].sum() * 0.0,
+        available=bool(action_utility),
+        unavailable_reason=None if action_utility else "counterfactual evaluated at optimizer boundary only",
     )
     image_branch = output.get("image_branch", {})
     contradiction = image_branch.get("contradiction_score") if isinstance(image_branch, dict) else None
     reason_weights = reason_pu_weight(reason_target, contradiction)
+    reason_need = output.get("reason_temporal_need", torch.ones_like(reason_target))
+    reason_credit_weight = reason_weights * conditional_credit_weight(reason_need)
+    reason_no_harm_weight = reason_weights * conditional_no_harm_weight(reason_need)
     registry.add("reason_partial", reason_partial_asl_loss(output["video_reason_logits"], reason_target, contradiction))
     registry.add(
         "reason_rank",
@@ -256,7 +283,7 @@ def build_tida_loss_registry(
     reason_credit = [
         counterfactual_margin_credit_loss(
             output["video_reason_logits"], value["video_reason_logits"], reason_target,
-            sample_weight=reason_weights, margin=0.015,
+            sample_weight=reason_credit_weight, margin=0.015,
         )
         for value in counterfactual_outputs.values()
     ]
@@ -270,7 +297,20 @@ def build_tida_loss_registry(
         "reason_flow_no_harm",
         image_fallback_no_harm_loss(
             output["image_reason_logits"], output["video_reason_logits"], reason_target,
-            sample_weight=reason_weights,
+            sample_weight=reason_no_harm_weight,
         ),
+    )
+    reason_utility = [
+        temporal_utility_calibration_loss(
+            output["reason_temporal_budget"], output["video_reason_logits"],
+            value["video_reason_logits"], reason_target, max_budget=0.50,
+        )
+        for value in counterfactual_outputs.values()
+    ]
+    registry.add(
+        "reason_utility_calibration",
+        torch.stack(reason_utility).mean() if reason_utility else output["video_reason_logits"].sum() * 0.0,
+        available=bool(reason_utility),
+        unavailable_reason=None if reason_utility else "counterfactual evaluated at optimizer boundary only",
     )
     return registry

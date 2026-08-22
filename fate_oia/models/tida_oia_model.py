@@ -103,6 +103,9 @@ class TIDAOIAModel(nn.Module):
         context_chunk_size: int = 2,
         action_evidence_trust_cap: float = 0.25,
         reason_evidence_trust_cap: float = 0.25,
+        conditional_temporal_utility: bool = False,
+        action_temporal_budget_cap: float = 0.60,
+        reason_temporal_budget_cap: float = 0.50,
     ) -> None:
         super().__init__()
         self.image_model = image_model
@@ -132,12 +135,16 @@ class TIDAOIAModel(nn.Module):
             num_predicates,
             kappa=0.15,
             evidence_trust_cap=action_evidence_trust_cap,
+            conditional_utility_enabled=conditional_temporal_utility,
+            conditional_flow_mix_cap=action_temporal_budget_cap,
         )
         self.reason_reader = TIDAReasonReader(
             dim,
             num_reasons,
             kappa=0.12,
             evidence_trust_cap=reason_evidence_trust_cap,
+            conditional_utility_enabled=conditional_temporal_utility,
+            conditional_flow_mix_cap=reason_temporal_budget_cap,
         )
         self.query_identity = nn.Parameter(torch.randn(num_actions + num_predicates, dim) * 0.02)
         self.predicate_identity = nn.Parameter(torch.randn(num_predicates, dim) * 0.02)
@@ -241,6 +248,8 @@ class TIDAOIAModel(nn.Module):
             timestamps[:, :-1],
             frame_valid_mask[:, :-1],
         )
+        image_action = image["action_logits_final"].detach()
+        image_reason = image["reason_logits_final"].detach()
         factor_reliability = torch.cat([rho[:, self.num_actions :], rho[:, : self.num_actions]], dim=1)
         action = self.action_reader(
             action_nodes, differential["predicate_differential_state"], xi[:, : self.num_actions],
@@ -248,6 +257,11 @@ class TIDAOIAModel(nn.Module):
             predicate_key_state=differential["predicate_routing_key_state"],
             transition_state=flow["transition_tokens"],
             transition_reliability=flow["transition_reliability"],
+            transition_tokens_by_scale=flow["transition_tokens_by_scale"],
+            motion_salience=flow["motion_salience"],
+            transition_consistency=flow["transition_consistency"],
+            history_available=flow["history_available"],
+            image_logits=image_action,
         )
         reason = self.reason_reader(
             reason_nodes, differential["predicate_differential_state"],
@@ -255,9 +269,12 @@ class TIDAOIAModel(nn.Module):
             temporal_scale=temporal_reason_scale,
             transition_state=flow["transition_tokens"],
             transition_reliability=flow["transition_reliability"],
+            transition_tokens_by_scale=flow["transition_tokens_by_scale"],
+            motion_salience=flow["motion_salience"],
+            transition_consistency=flow["transition_consistency"],
+            history_available=flow["history_available"],
+            image_logits=image_reason,
         )
-        image_action = image["action_logits_final"].detach()
-        image_reason = image["reason_logits_final"].detach()
         return {
             **temporal, **innovation, **differential, **flow, **action, **reason,
             "terminal_target_evidence": terminal_target_evidence,

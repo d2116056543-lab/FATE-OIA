@@ -49,3 +49,25 @@ def test_full_model_returns_formal_shapes_and_zero_scale_fallback():
     assert torch.equal(out["action_temporal_route"], out["action_route"])
     assert torch.equal(out["video_action_logits"], out["image_action_logits"])
     assert torch.equal(out["video_reason_logits"], out["image_reason_logits"])
+
+
+def test_full_model_surfaces_conditional_temporal_utility_diagnostics():
+    roles = {"static_anchor": [f"p{i}" for i in range(8)], "dynamic_actor": [f"p{i}" for i in range(8, 24)], "terminal_context": [f"p{i}" for i in range(24, 32)]}
+    model = TIDAOIAModel(
+        _ImageBase(), dim=8, predicate_roles=roles, context_chunk_size=7,
+        conditional_temporal_utility=True,
+        action_temporal_budget_cap=0.60,
+        reason_temporal_budget_cap=0.50,
+    ).eval()
+    out = model(
+        torch.randn(1, 3, 360, 640), torch.randn(1, 14, 3, 192, 344),
+        torch.linspace(-5, 0, 15).unsqueeze(0), torch.ones(1, 15, dtype=torch.bool),
+        temporal_action_scale=1.0, temporal_reason_scale=1.0,
+    )
+    assert out["transition_tokens_by_scale"].shape == (1, 32, 4, 8)
+    assert out["action_temporal_budget"].shape == (1, 4)
+    assert out["reason_temporal_budget"].shape == (1, 21)
+    assert out["action_temporal_budget"].max() <= 0.60 + 1e-7
+    assert out["reason_temporal_budget"].max() <= 0.50 + 1e-7
+    assert torch.equal(out["video_action_logits"], out["image_action_logits"] + out["action_temporal_delta"])
+    assert torch.equal(out["video_reason_logits"], out["image_reason_logits"] + out["reason_temporal_delta"])

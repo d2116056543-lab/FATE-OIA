@@ -5,6 +5,8 @@ import math
 import torch
 from torch import nn
 
+from .tida_temporal_utility import TIDAConditionalTemporalUtility
+
 
 class TIDAReasonReader(nn.Module):
     """Private reason correction with an explicit detach firewall."""
@@ -15,11 +17,15 @@ class TIDAReasonReader(nn.Module):
         num_reasons: int = 21,
         kappa: float = 0.12,
         evidence_trust_cap: float = 0.25,
+        conditional_utility_enabled: bool = False,
+        conditional_flow_mix_cap: float = 0.50,
+        conditional_flow_mix_floor: float = 0.0,
     ) -> None:
         super().__init__()
         self.num_reasons = int(num_reasons)
         self.kappa = float(kappa)
         self.evidence_trust_cap = float(evidence_trust_cap)
+        self.conditional_utility_enabled = bool(conditional_utility_enabled)
         if not 0.0 < self.evidence_trust_cap <= 1.0:
             raise ValueError("evidence_trust_cap must be in (0, 1]")
         self.reason_query = nn.Linear(dim, dim)
@@ -34,6 +40,10 @@ class TIDAReasonReader(nn.Module):
         nn.init.zeros_(self.flow_value.weight)
         nn.init.zeros_(self.flow_value.bias)
         self.flow_mix_cap = 0.35
+        self.temporal_utility = TIDAConditionalTemporalUtility(
+            max_budget=conditional_flow_mix_cap,
+            min_budget=conditional_flow_mix_floor,
+        )
 
     def forward(
         self,
@@ -45,6 +55,11 @@ class TIDAReasonReader(nn.Module):
         temporal_scale: float | torch.Tensor,
         transition_state: torch.Tensor | None = None,
         transition_reliability: torch.Tensor | None = None,
+        transition_tokens_by_scale: torch.Tensor | None = None,
+        motion_salience: torch.Tensor | None = None,
+        transition_consistency: torch.Tensor | None = None,
+        history_available: torch.Tensor | None = None,
+        image_logits: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         factors = torch.cat([predicate_state.detach(), action_innovation.detach()], dim=1)
         weights = reliability.detach().clamp(0, 1)
@@ -78,6 +93,26 @@ class TIDAReasonReader(nn.Module):
                 raise ValueError("transition reliability is required with transition state")
             flow_state = transition_state.detach()
             flow_weights = transition_reliability.detach().clamp(0, 1)
+            flow_motion = None
+            flow_consistency = None
+            if self.conditional_utility_enabled:
+                required = {
+                    "transition_tokens_by_scale": transition_tokens_by_scale,
+                    "motion_salience": motion_salience,
+                    "transition_consistency": transition_consistency,
+                    "history_available": history_available,
+                    "image_logits": image_logits,
+                }
+                missing = [name for name, value in required.items() if value is None]
+                if missing:
+                    raise ValueError(f"conditional temporal utility requires {', '.join(missing)}")
+                if transition_tokens_by_scale.ndim != 4:
+                    raise ValueError("transition_tokens_by_scale must be [B,P,S,D]")
+                scales = transition_tokens_by_scale.shape[2]
+                flow_state = transition_tokens_by_scale.detach().flatten(1, 2)
+                flow_weights = flow_weights.repeat_interleave(scales, dim=1)
+                flow_motion = motion_salience.detach().repeat_interleave(scales, dim=1)
+                flow_consistency = transition_consistency.detach().repeat_interleave(scales, dim=1)
             flow_strength = flow_weights.max(-1, keepdim=True).values
             flow_keys = self.flow_key(flow_state)
             flow_values = self.flow_value(flow_state)
@@ -90,7 +125,21 @@ class TIDAReasonReader(nn.Module):
             # As in the action reader, measured motion owns the route budget;
             # reason queries can select a transition but cannot suppress all
             # temporal evidence through a learned null competition.
-            flow_mix = self.flow_mix_cap * flow_strength.expand(-1, self.num_reasons)
+            if self.conditional_utility_enabled:
+                target_motion = torch.einsum("brp,bp->br", flow_distribution, flow_motion)
+                target_consistency = torch.einsum("brp,bp->br", flow_distribution, flow_consistency)
+                target_compatibility = torch.einsum("brp,brp->br", flow_distribution, flow_score)
+                utility = self.temporal_utility(
+                    image_logits.detach(), target_motion, target_consistency,
+                    target_compatibility, history_available.detach(),
+                )
+                flow_mix = utility["budget"]
+            else:
+                utility = {}
+                target_motion = flow_strength.expand(-1, self.num_reasons)
+                target_consistency = flow_strength.expand(-1, self.num_reasons)
+                target_compatibility = flow_score.mean(-1)
+                flow_mix = self.flow_mix_cap * flow_strength.expand(-1, self.num_reasons)
             base_mix = 1.0 - flow_mix
             attention = torch.cat(
                 [
@@ -129,6 +178,7 @@ class TIDAReasonReader(nn.Module):
         effective_trust = self.evidence_trust_cap * evidence_confidence
         delta = scale * effective_trust * self.kappa * torch.tanh(raw_delta / self.kappa)
         delta = torch.where(no_reliable_factor[:, None], torch.zeros_like(delta), delta)
+        temporal_budget = flow_route_mass
         return {
             "reason_temporal_route": attention,
             "reason_temporal_evidence": private,
@@ -141,4 +191,9 @@ class TIDAReasonReader(nn.Module):
             "reason_raw_temporal_delta": raw_delta,
             "reason_temporal_delta": delta,
             "reason_flow_route_mass": flow_route_mass,
+            "reason_temporal_budget": temporal_budget,
+            "reason_temporal_target_motion": target_motion if transition_state is not None else torch.zeros_like(temporal_budget),
+            "reason_temporal_target_consistency": target_consistency if transition_state is not None else torch.zeros_like(temporal_budget),
+            "reason_temporal_compatibility": target_compatibility if transition_state is not None else torch.zeros_like(temporal_budget),
+            "reason_temporal_need": utility.get("need", temporal_budget) if transition_state is not None else temporal_budget,
         }
