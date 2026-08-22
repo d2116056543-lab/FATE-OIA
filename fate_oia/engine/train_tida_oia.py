@@ -504,12 +504,24 @@ def build_runtime(args: Any, evaluation_only: bool = False) -> TIDARuntime:
     return TIDARuntime(config, model, loaders, device, image_checkpoint, clip_manifest, train_sampler)
 
 
-def build_optimizer(model: TIDAOIAModel, config: dict[str, Any]) -> torch.optim.Optimizer:
+def build_optimizer(
+    model: TIDAOIAModel,
+    config: dict[str, Any],
+    train_owners: set[str] | None = None,
+) -> torch.optim.Optimizer:
     owners = model.owner_parameters()
     assert_owner_exact_cover(model, owners)
+    if train_owners is not None:
+        unknown = train_owners - set(owners)
+        if unknown:
+            raise ValueError(f"unknown optimizer owners: {sorted(unknown)}")
+        if not train_owners:
+            raise ValueError("train_owners cannot be empty")
     groups = []
     for owner, parameters in owners.items():
         lr = float(config["training"]["lr"][owner])
+        if train_owners is not None and owner not in train_owners:
+            lr = 0.0
         groups.append({"params": parameters, "lr": lr, "base_lr": lr, "name": owner})
     return torch.optim.AdamW(groups, weight_decay=float(config["training"]["weight_decay"]))
 
@@ -663,7 +675,11 @@ def train(args: Any) -> None:
     if run_kind == "full" and schedule_override is not None:
         raise ValueError("formal full training forbids schedule_total_updates override")
     grad_accum = int(_arg(args, "gradient_accumulation_steps", 15))
-    optimizer = build_optimizer(model, config)
+    train_owners_arg = _arg(args, "train_owners", None)
+    train_owners = None if not train_owners_arg else {
+        value.strip() for value in str(train_owners_arg).split(",") if value.strip()
+    }
+    optimizer = build_optimizer(model, config, train_owners=train_owners)
     ema = TIDATrainableEMA(model, decay=float(config["training"]["ema_decay"]))
     updates_per_epoch = math.ceil(len(runtime.loaders["train_core"]) / grad_accum)
     total_updates = resolve_schedule_total_updates(
@@ -701,6 +717,7 @@ def train(args: Any) -> None:
         "max_optimizer_updates": max_optimizer_updates,
         "schedule_total_updates": total_updates,
         "schedule_override": schedule_override is not None,
+        "train_owners": sorted(train_owners) if train_owners is not None else "all",
     }
     atomic_write_json(output_dir / "run_manifest.json", manifest)
     Path(output_dir / "config_resolved.yaml").write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
@@ -979,6 +996,7 @@ def main() -> None:
     parser.add_argument("--max-samples", type=int)
     parser.add_argument("--max-optimizer-updates", type=int)
     parser.add_argument("--schedule-total-updates", type=int)
+    parser.add_argument("--train-owners", help="comma-separated optimizer owners; other owner LRs are zero")
     args = parser.parse_args()
     train(args)
 
