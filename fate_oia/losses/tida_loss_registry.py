@@ -37,14 +37,17 @@ class TIDALossRegistry:
         "action_base_protect": 0.10,
         "action_delta": 0.005,
         "action_route_sparse": 0.005,
-        "action_flow_credit": 0.08,
-        "action_flow_no_harm": 0.10,
+        # Paired flow credit must be large enough to compete with the direct
+        # task loss, while no-harm keeps the frozen image fallback dominant
+        # whenever ordered history is not useful.
+        "action_flow_credit": 0.50,
+        "action_flow_no_harm": 0.15,
         "reason_partial": 1.00,
         "reason_rank": 0.08,
         "reason_soft_f1": 0.04,
         "reason_delta": 0.005,
-        "reason_flow_credit": 0.06,
-        "reason_flow_no_harm": 0.08,
+        "reason_flow_credit": 0.30,
+        "reason_flow_no_harm": 0.12,
     }
 
     def __init__(self, weights: dict[str, float] | None = None) -> None:
