@@ -366,6 +366,7 @@ def main() -> None:
             "image": branch_metrics(rows, thresholds["image"])["image"],
             "video": branch_metrics(rows, thresholds["video"])["video"],
         },
+        "temporal_contribution": temporal_contribution_metrics(rows),
     }
     atomic_write_json(Path(args.output_dir) / "evaluation.json", metrics)
     print(json.dumps(metrics, default=str), flush=True)
