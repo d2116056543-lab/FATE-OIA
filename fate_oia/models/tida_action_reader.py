@@ -31,6 +31,12 @@ class TIDAActionReader(nn.Module):
         self.visual_value_projection = nn.Linear(dim, dim)
         self.action_output_weight = nn.Parameter(torch.zeros(num_actions, dim))
         self.null_key = nn.Parameter(torch.zeros(dim))
+        self.flow_query = nn.Linear(dim, dim)
+        self.flow_key = nn.Linear(dim, dim)
+        self.flow_value = nn.Linear(dim, dim)
+        self.flow_output_weight = nn.Parameter(torch.zeros(num_actions, dim))
+        self.flow_null_key = nn.Parameter(torch.zeros(dim))
+        self.flow_mix_cap = 0.35
 
     def _reconcile(self, contribution: torch.Tensor, delta: torch.Tensor) -> torch.Tensor:
         residual = delta - contribution.sum(-1)
@@ -50,21 +56,12 @@ class TIDAActionReader(nn.Module):
         transition_reliability: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         batch = action_nodes.shape[0]
-        base_factors = [predicate_state, action_innovation]
-        base_keys = [
+        factors = torch.cat([predicate_state, action_innovation], dim=1)
+        key_factors = torch.cat([
             predicate_state if predicate_key_state is None else predicate_key_state,
             action_innovation,
-        ]
-        if transition_state is not None:
-            if transition_reliability is None:
-                raise ValueError("transition reliability is required with transition state")
-            base_factors.append(transition_state)
-            base_keys.append(transition_state)
-            reliability = torch.cat([reliability, transition_reliability], dim=1)
-        factors = torch.cat(base_factors, dim=1)
-        key_factors = torch.cat(base_keys, dim=1)
-        expected = self.num_predicates + self.num_actions + (0 if transition_state is None else transition_state.shape[1])
-        if factors.shape[1] != expected:
+        ], dim=1)
+        if factors.shape[1] != self.num_predicates + self.num_actions:
             raise ValueError("factor bank must contain predicate and action innovation factors")
         if reliability.shape != factors.shape[:2]:
             raise ValueError("reliability shape mismatch")
@@ -74,28 +71,76 @@ class TIDAActionReader(nn.Module):
         null_score = torch.einsum("bad,d->ba", query, self.null_key)[:, :, None] / math.sqrt(keys.shape[-1])
         nonnull_reliability = reliability.detach().clamp(0, 1)
         null_reliability = (1.0 - nonnull_reliability.max(-1, keepdim=True).values).clamp_min(self.eps)
-        factor_reliability = torch.cat([nonnull_reliability, null_reliability], dim=-1)
+        base_reliability = torch.cat([nonnull_reliability, null_reliability], dim=-1)
         route_score = torch.cat([nonnull_score, null_score], dim=-1)
-        route = entmax15_bisect(route_score + factor_reliability.clamp_min(self.eps).log()[:, None], dim=-1)
+        base_route = entmax15_bisect(route_score + base_reliability.clamp_min(self.eps).log()[:, None], dim=-1)
         visual_value = self.visual_value_projection(factors)
         null_value = torch.zeros(batch, 1, visual_value.shape[-1], device=visual_value.device, dtype=visual_value.dtype)
-        factor_value = torch.cat([visual_value, null_value], dim=1)[:, None].expand(-1, self.num_actions, -1, -1)
-        factor_score = torch.einsum("bafd,ad->baf", factor_value, self.action_output_weight)
+        base_value = torch.cat([visual_value, null_value], dim=1)[:, None].expand(-1, self.num_actions, -1, -1)
+        base_score = torch.einsum("bafd,ad->baf", base_value, self.action_output_weight)
+
+        if transition_state is None:
+            route = base_route
+            factor_value = base_value
+            factor_score = base_score
+            factor_reliability = base_reliability
+            all_keys = torch.cat([keys, self.null_key.view(1, 1, -1).expand(batch, -1, -1)], dim=1)
+            flow_route_mass = route[..., :0].sum(-1)
+        else:
+            if transition_reliability is None:
+                raise ValueError("transition reliability is required with transition state")
+            flow_reliability = transition_reliability.detach().clamp(0, 1)
+            flow_null_reliability = (1.0 - flow_reliability.max(-1, keepdim=True).values).clamp_min(self.eps)
+            flow_factor_reliability = torch.cat([flow_reliability, flow_null_reliability], dim=-1)
+            flow_keys = self.flow_key(transition_state)
+            flow_query = self.flow_query(action_nodes)
+            flow_score_nonnull = torch.einsum("bad,bpd->bap", flow_query, flow_keys) / math.sqrt(flow_keys.shape[-1])
+            flow_null_score = torch.einsum("bad,d->ba", flow_query, self.flow_null_key)[:, :, None] / math.sqrt(flow_keys.shape[-1])
+            flow_route = entmax15_bisect(
+                torch.cat([flow_score_nonnull, flow_null_score], dim=-1)
+                + flow_factor_reliability.clamp_min(self.eps).log()[:, None],
+                dim=-1,
+            )
+            flow_values = self.flow_value(transition_state)
+            flow_null_value = torch.zeros(batch, 1, flow_values.shape[-1], device=flow_values.device, dtype=flow_values.dtype)
+            flow_value = torch.cat([flow_values, flow_null_value], dim=1)[:, None].expand(-1, self.num_actions, -1, -1)
+            flow_score = torch.einsum("bapd,ad->bap", flow_value, self.flow_output_weight)
+            base_confidence = (base_route[..., :-1] * nonnull_reliability[:, None]).sum(-1)
+            flow_confidence = (flow_route[..., :-1] * flow_reliability[:, None]).sum(-1)
+            flow_mix = self.flow_mix_cap * flow_confidence / (base_confidence + flow_confidence + self.eps)
+            base_mix = 1.0 - flow_mix
+            route = torch.cat(
+                [
+                    base_mix[..., None] * base_route[..., :-1],
+                    flow_mix[..., None] * flow_route[..., :-1],
+                    base_mix[..., None] * base_route[..., -1:] + flow_mix[..., None] * flow_route[..., -1:],
+                ],
+                dim=-1,
+            )
+            factor_value = torch.cat([base_value[..., :-1, :], flow_value[..., :-1, :], null_value[:, None].expand(-1, self.num_actions, -1, -1)], dim=2)
+            factor_score = torch.cat([base_score[..., :-1], flow_score[..., :-1], base_score[..., -1:]], dim=-1)
+            factor_reliability = torch.cat(
+                [nonnull_reliability, flow_reliability, (1.0 - torch.cat([nonnull_reliability, flow_reliability], dim=1).max(-1, keepdim=True).values).clamp_min(self.eps)],
+                dim=-1,
+            )
+            all_keys = torch.cat(
+                [keys, flow_keys, self.null_key.view(1, 1, -1).expand(batch, -1, -1)], dim=1
+            )
+            flow_start = self.num_predicates + self.num_actions
+            flow_route_mass = route[..., flow_start:-1].sum(-1)
         raw_contribution = route * factor_score
         raw_sum = raw_contribution.sum(-1)
         scale = torch.as_tensor(temporal_scale, device=raw_sum.device, dtype=raw_sum.dtype)
-        evidence_confidence = (route[..., :-1] * nonnull_reliability[:, None]).sum(-1)
+        evidence_confidence = (route[..., :-1] * factor_reliability[:, None, :-1]).sum(-1)
         effective_trust = self.evidence_trust_cap * evidence_confidence
         delta = scale * effective_trust * self.kappa * torch.tanh(raw_sum / self.kappa)
         ratio = torch.where(raw_sum.abs() > self.eps, delta / raw_sum, torch.ones_like(raw_sum))
         bounded = raw_contribution * ratio[..., None]
         bounded = torch.where((raw_sum.abs() > self.eps)[..., None], bounded, torch.zeros_like(bounded))
         bounded = self._reconcile(bounded, delta)
-        flow_start = self.num_predicates + self.num_actions
-        flow_route_mass = route[..., flow_start:-1].sum(-1) if transition_state is not None else route[..., :0].sum(-1)
         return {
             "action_route": route,
-            "action_factor_keys": torch.cat([keys, self.null_key.view(1, 1, -1).expand(batch, -1, -1)], dim=1),
+            "action_factor_keys": all_keys,
             "action_factor_value": factor_value,
             "action_factor_reliability": factor_reliability,
             "action_raw_factor_contribution": raw_contribution,

@@ -17,7 +17,20 @@ def test_action_reader_routes_transition_family_and_preserves_zero_scale_fallbac
     )
     assert output["action_route"].shape == (2, 4, 11)
     assert output["action_flow_route_mass"].shape == (2, 4)
+    assert torch.all(output["action_flow_route_mass"] > 0)
     assert torch.count_nonzero(output["action_temporal_delta"]) == 0
+
+
+def test_reliable_flow_route_gives_action_flow_output_weight_gradient():
+    module = TIDAActionReader(dim=8, num_actions=4, num_predicates=3)
+    output = module(
+        torch.randn(2, 4, 8), torch.randn(2, 3, 8), torch.randn(2, 4, 8),
+        torch.ones(2, 7), temporal_scale=1.0,
+        transition_state=torch.randn(2, 3, 8), transition_reliability=torch.ones(2, 3),
+    )
+    output["action_temporal_delta"].sum().backward()
+    assert module.flow_output_weight.grad is not None
+    assert module.flow_output_weight.grad.abs().sum() > 0
 
 
 def test_reason_flow_keeps_transition_and_action_inputs_behind_detach_firewall():
@@ -41,3 +54,5 @@ def test_reason_flow_keeps_transition_and_action_inputs_behind_detach_firewall()
     assert predicate.grad is None
     assert action.grad is None
     assert transition.grad is None
+    assert output["reason_flow_route_mass"].min() > 0
+    assert module.flow_value.weight.grad is not None and module.flow_value.weight.grad.abs().sum() > 0

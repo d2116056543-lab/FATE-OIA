@@ -28,6 +28,13 @@ class TIDAReasonReader(nn.Module):
         self.null_key = nn.Parameter(torch.zeros(dim))
         self.delta_query = nn.Linear(dim, dim, bias=False)
         self.delta_value = nn.Linear(dim, dim, bias=False)
+        self.flow_query = nn.Linear(dim, dim)
+        self.flow_key = nn.Linear(dim, dim)
+        self.flow_value = nn.Linear(dim, dim)
+        nn.init.zeros_(self.flow_value.weight)
+        nn.init.zeros_(self.flow_value.bias)
+        self.flow_null_key = nn.Parameter(torch.zeros(dim))
+        self.flow_mix_cap = 0.35
 
     def forward(
         self,
@@ -40,13 +47,7 @@ class TIDAReasonReader(nn.Module):
         transition_state: torch.Tensor | None = None,
         transition_reliability: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        factor_parts = [predicate_state.detach(), action_innovation.detach()]
-        if transition_state is not None:
-            if transition_reliability is None:
-                raise ValueError("transition reliability is required with transition state")
-            factor_parts.append(transition_state.detach())
-            reliability = torch.cat([reliability, transition_reliability.detach()], dim=1)
-        factors = torch.cat(factor_parts, dim=1)
+        factors = torch.cat([predicate_state.detach(), action_innovation.detach()], dim=1)
         weights = reliability.detach().clamp(0, 1)
         query = self.reason_query(reason_nodes)
         keys = self.factor_key(factors)
@@ -59,14 +60,68 @@ class TIDAReasonReader(nn.Module):
         relative_reliability = weights / weights.sum(-1, keepdim=True).clamp_min(1e-7)
         nonnull_prior = relative_reliability * evidence_strength
         null_reliability = (1.0 - evidence_strength).clamp_min(1e-7)
-        factor_reliability = torch.cat([nonnull_prior, null_reliability], dim=-1)
+        base_factor_reliability = torch.cat([nonnull_prior, null_reliability], dim=-1)
         score = torch.einsum("brd,bfd->brf", query, keys) / math.sqrt(keys.shape[-1])
-        attention = torch.softmax(score + factor_reliability.clamp_min(1e-7).log()[:, None], dim=-1)
+        base_attention = torch.softmax(score + base_factor_reliability.clamp_min(1e-7).log()[:, None], dim=-1)
         no_reliable_factor = ~weights.gt(0).any(dim=-1)
-        null_route = torch.zeros_like(attention)
+        null_route = torch.zeros_like(base_attention)
         null_route[..., -1] = 1.0
-        attention = torch.where(no_reliable_factor[:, None, None], null_route, attention)
-        private = torch.einsum("brf,bfd->brd", attention, values)
+        base_attention = torch.where(no_reliable_factor[:, None, None], null_route, base_attention)
+
+        if transition_state is None:
+            attention = base_attention
+            factor_reliability = base_factor_reliability
+            nonnull_weights = weights
+            private = torch.einsum("brf,bfd->brd", attention, values)
+            flow_route_mass = attention[..., :0].sum(-1)
+        else:
+            if transition_reliability is None:
+                raise ValueError("transition reliability is required with transition state")
+            flow_state = transition_state.detach()
+            flow_weights = transition_reliability.detach().clamp(0, 1)
+            flow_strength = flow_weights.max(-1, keepdim=True).values
+            flow_prior = flow_weights / flow_weights.sum(-1, keepdim=True).clamp_min(1e-7) * flow_strength
+            flow_null_reliability = (1.0 - flow_strength).clamp_min(1e-7)
+            flow_factor_reliability = torch.cat([flow_prior, flow_null_reliability], dim=-1)
+            flow_keys = self.flow_key(flow_state)
+            flow_values = self.flow_value(flow_state)
+            flow_null_key = self.flow_null_key.view(1, 1, -1).expand(flow_state.shape[0], -1, -1)
+            flow_values_with_null = torch.cat([flow_values, torch.zeros_like(flow_null_key)], dim=1)
+            flow_score = torch.einsum("brd,bpd->brp", self.flow_query(reason_nodes), torch.cat([flow_keys, flow_null_key], dim=1)) / math.sqrt(flow_keys.shape[-1])
+            flow_attention = torch.softmax(
+                flow_score + flow_factor_reliability.clamp_min(1e-7).log()[:, None], dim=-1
+            )
+            no_flow = ~flow_weights.gt(0).any(dim=-1)
+            no_reliable_factor = no_reliable_factor & no_flow
+            flow_null_route = torch.zeros_like(flow_attention)
+            flow_null_route[..., -1] = 1.0
+            flow_attention = torch.where(no_flow[:, None, None], flow_null_route, flow_attention)
+            base_confidence = (base_attention[..., :-1] * weights[:, None]).sum(-1)
+            flow_confidence = (flow_attention[..., :-1] * flow_weights[:, None]).sum(-1)
+            flow_mix = self.flow_mix_cap * flow_confidence / (base_confidence + flow_confidence + 1e-7)
+            base_mix = 1.0 - flow_mix
+            attention = torch.cat(
+                [
+                    base_mix[..., None] * base_attention[..., :-1],
+                    flow_mix[..., None] * flow_attention[..., :-1],
+                    base_mix[..., None] * base_attention[..., -1:] + flow_mix[..., None] * flow_attention[..., -1:],
+                ],
+                dim=-1,
+            )
+            base_private = torch.einsum("brf,bfd->brd", base_attention, values)
+            flow_private = torch.einsum("brp,bpd->brd", flow_attention, flow_values_with_null)
+            private = base_mix[..., None] * base_private + flow_mix[..., None] * flow_private
+            factor_reliability = torch.cat(
+                [
+                    weights,
+                    flow_weights,
+                    (1.0 - torch.cat([weights, flow_weights], dim=1).max(-1, keepdim=True).values).clamp_min(1e-7),
+                ],
+                dim=-1,
+            )
+            nonnull_weights = torch.cat([weights, flow_weights], dim=1)
+            flow_start = predicate_state.shape[1] + action_innovation.shape[1]
+            flow_route_mass = attention[..., flow_start:-1].sum(-1)
         # Keep each reason's correction private. A query-evidence interaction
         # preserves label-specific signs while guaranteeing zero evidence gives
         # an exact zero correction without a static-query or bias shortcut.
@@ -78,12 +133,10 @@ class TIDAReasonReader(nn.Module):
         # Non-null attention alone only proves that a factor was selected. It
         # does not prove that the selected factor is reliable. Bound the side
         # residual by the reliability actually transported through the route.
-        evidence_confidence = (attention[..., :-1] * weights[:, None, :]).sum(-1)
+        evidence_confidence = (attention[..., :-1] * nonnull_weights[:, None, :]).sum(-1)
         effective_trust = self.evidence_trust_cap * evidence_confidence
         delta = scale * effective_trust * self.kappa * torch.tanh(raw_delta / self.kappa)
         delta = torch.where(no_reliable_factor[:, None], torch.zeros_like(delta), delta)
-        flow_start = predicate_state.shape[1] + action_innovation.shape[1]
-        flow_route_mass = attention[..., flow_start:-1].sum(-1) if transition_state is not None else attention[..., :0].sum(-1)
         return {
             "reason_temporal_route": attention,
             "reason_temporal_evidence": private,
