@@ -35,7 +35,6 @@ class TIDAActionReader(nn.Module):
         self.flow_key = nn.Linear(dim, dim)
         self.flow_value = nn.Linear(dim, dim)
         self.flow_output_weight = nn.Parameter(torch.zeros(num_actions, dim))
-        self.flow_null_key = nn.Parameter(torch.zeros(dim))
         self.flow_mix_cap = 0.35
 
     def _reconcile(self, contribution: torch.Tensor, delta: torch.Tensor) -> torch.Tensor:
@@ -90,35 +89,32 @@ class TIDAActionReader(nn.Module):
             if transition_reliability is None:
                 raise ValueError("transition reliability is required with transition state")
             flow_reliability = transition_reliability.detach().clamp(0, 1)
-            flow_null_reliability = (1.0 - flow_reliability.max(-1, keepdim=True).values).clamp_min(self.eps)
-            flow_factor_reliability = torch.cat([flow_reliability, flow_null_reliability], dim=-1)
             flow_keys = self.flow_key(transition_state)
             flow_query = self.flow_query(action_nodes)
             flow_score_nonnull = torch.einsum("bad,bpd->bap", flow_query, flow_keys) / math.sqrt(flow_keys.shape[-1])
-            flow_null_score = torch.einsum("bad,d->ba", flow_query, self.flow_null_key)[:, :, None] / math.sqrt(flow_keys.shape[-1])
-            flow_route = entmax15_bisect(
-                torch.cat([flow_score_nonnull, flow_null_score], dim=-1)
-                + flow_factor_reliability.clamp_min(self.eps).log()[:, None],
+            flow_distribution = entmax15_bisect(
+                flow_score_nonnull + flow_reliability.clamp_min(self.eps).log()[:, None],
                 dim=-1,
             )
+            flow_strength = flow_reliability.max(-1, keepdim=True).values
             flow_values = self.flow_value(transition_state)
-            flow_null_value = torch.zeros(batch, 1, flow_values.shape[-1], device=flow_values.device, dtype=flow_values.dtype)
-            flow_value = torch.cat([flow_values, flow_null_value], dim=1)[:, None].expand(-1, self.num_actions, -1, -1)
+            flow_value = flow_values[:, None].expand(-1, self.num_actions, -1, -1)
             flow_score = torch.einsum("bapd,ad->bap", flow_value, self.flow_output_weight)
-            base_confidence = (base_route[..., :-1] * nonnull_reliability[:, None]).sum(-1)
-            flow_confidence = (flow_route[..., :-1] * flow_reliability[:, None]).sum(-1)
-            flow_mix = self.flow_mix_cap * flow_confidence / (base_confidence + flow_confidence + self.eps)
+            # Reliability decides how much temporal evidence exists. The target
+            # query only distributes that fixed budget and cannot learn to route
+            # all motion into a null token to evade counterfactual supervision.
+            flow_mix = self.flow_mix_cap * flow_strength.expand(-1, self.num_actions)
             base_mix = 1.0 - flow_mix
             route = torch.cat(
                 [
                     base_mix[..., None] * base_route[..., :-1],
-                    flow_mix[..., None] * flow_route[..., :-1],
-                    base_mix[..., None] * base_route[..., -1:] + flow_mix[..., None] * flow_route[..., -1:],
+                    flow_mix[..., None] * flow_distribution,
+                    base_mix[..., None] * base_route[..., -1:],
                 ],
                 dim=-1,
             )
-            factor_value = torch.cat([base_value[..., :-1, :], flow_value[..., :-1, :], null_value[:, None].expand(-1, self.num_actions, -1, -1)], dim=2)
-            factor_score = torch.cat([base_score[..., :-1], flow_score[..., :-1], base_score[..., -1:]], dim=-1)
+            factor_value = torch.cat([base_value[..., :-1, :], flow_value, null_value[:, None].expand(-1, self.num_actions, -1, -1)], dim=2)
+            factor_score = torch.cat([base_score[..., :-1], flow_score, base_score[..., -1:]], dim=-1)
             factor_reliability = torch.cat(
                 [nonnull_reliability, flow_reliability, (1.0 - torch.cat([nonnull_reliability, flow_reliability], dim=1).max(-1, keepdim=True).values).clamp_min(self.eps)],
                 dim=-1,

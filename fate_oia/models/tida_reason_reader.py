@@ -33,7 +33,6 @@ class TIDAReasonReader(nn.Module):
         self.flow_value = nn.Linear(dim, dim)
         nn.init.zeros_(self.flow_value.weight)
         nn.init.zeros_(self.flow_value.bias)
-        self.flow_null_key = nn.Parameter(torch.zeros(dim))
         self.flow_mix_cap = 0.35
 
     def forward(
@@ -80,36 +79,29 @@ class TIDAReasonReader(nn.Module):
             flow_state = transition_state.detach()
             flow_weights = transition_reliability.detach().clamp(0, 1)
             flow_strength = flow_weights.max(-1, keepdim=True).values
-            flow_prior = flow_weights / flow_weights.sum(-1, keepdim=True).clamp_min(1e-7) * flow_strength
-            flow_null_reliability = (1.0 - flow_strength).clamp_min(1e-7)
-            flow_factor_reliability = torch.cat([flow_prior, flow_null_reliability], dim=-1)
             flow_keys = self.flow_key(flow_state)
             flow_values = self.flow_value(flow_state)
-            flow_null_key = self.flow_null_key.view(1, 1, -1).expand(flow_state.shape[0], -1, -1)
-            flow_values_with_null = torch.cat([flow_values, torch.zeros_like(flow_null_key)], dim=1)
-            flow_score = torch.einsum("brd,bpd->brp", self.flow_query(reason_nodes), torch.cat([flow_keys, flow_null_key], dim=1)) / math.sqrt(flow_keys.shape[-1])
-            flow_attention = torch.softmax(
-                flow_score + flow_factor_reliability.clamp_min(1e-7).log()[:, None], dim=-1
+            flow_score = torch.einsum("brd,bpd->brp", self.flow_query(reason_nodes), flow_keys) / math.sqrt(flow_keys.shape[-1])
+            flow_distribution = torch.softmax(
+                flow_score + flow_weights.clamp_min(1e-7).log()[:, None], dim=-1
             )
             no_flow = ~flow_weights.gt(0).any(dim=-1)
             no_reliable_factor = no_reliable_factor & no_flow
-            flow_null_route = torch.zeros_like(flow_attention)
-            flow_null_route[..., -1] = 1.0
-            flow_attention = torch.where(no_flow[:, None, None], flow_null_route, flow_attention)
-            base_confidence = (base_attention[..., :-1] * weights[:, None]).sum(-1)
-            flow_confidence = (flow_attention[..., :-1] * flow_weights[:, None]).sum(-1)
-            flow_mix = self.flow_mix_cap * flow_confidence / (base_confidence + flow_confidence + 1e-7)
+            # As in the action reader, measured motion owns the route budget;
+            # reason queries can select a transition but cannot suppress all
+            # temporal evidence through a learned null competition.
+            flow_mix = self.flow_mix_cap * flow_strength.expand(-1, self.num_reasons)
             base_mix = 1.0 - flow_mix
             attention = torch.cat(
                 [
                     base_mix[..., None] * base_attention[..., :-1],
-                    flow_mix[..., None] * flow_attention[..., :-1],
-                    base_mix[..., None] * base_attention[..., -1:] + flow_mix[..., None] * flow_attention[..., -1:],
+                    flow_mix[..., None] * flow_distribution,
+                    base_mix[..., None] * base_attention[..., -1:],
                 ],
                 dim=-1,
             )
             base_private = torch.einsum("brf,bfd->brd", base_attention, values)
-            flow_private = torch.einsum("brp,bpd->brd", flow_attention, flow_values_with_null)
+            flow_private = torch.einsum("brp,bpd->brd", flow_distribution, flow_values)
             private = base_mix[..., None] * base_private + flow_mix[..., None] * flow_private
             factor_reliability = torch.cat(
                 [
