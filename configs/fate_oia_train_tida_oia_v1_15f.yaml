@@ -54,6 +54,10 @@ model:
   action_evidence_trust_cap: 0.25
   reason_kappa: 0.12
   reason_evidence_trust_cap: 0.25
+  conditional_temporal_utility: true
+  transition_scales: [velocity, acceleration, region_velocity, persistence]
+  action_temporal_budget_cap: 0.60
+  reason_temporal_budget_cap: 0.50
 loss:
   terminal_hist: 0.25
   terminal_no_history: 0.0
@@ -68,12 +72,14 @@ loss:
   action_route_sparse: 0.005
   action_flow_credit: 0.50
   action_flow_no_harm: 0.15
+  action_utility_calibration: 0.05
   reason_partial: 1.00
   reason_rank: 0.08
   reason_soft_f1: 0.04
   reason_delta: 0.005
   reason_flow_credit: 0.30
   reason_flow_no_harm: 0.12
+  reason_utility_calibration: 0.04
 training:
   seed: 20260821
   epochs: 10

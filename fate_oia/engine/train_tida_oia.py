@@ -448,6 +448,9 @@ def build_runtime(args: Any, evaluation_only: bool = False) -> TIDARuntime:
         context_chunk_size=int(_arg(args, "context_chunk_size", config["model"]["context_chunk_size"])),
         action_evidence_trust_cap=float(config["model"].get("action_evidence_trust_cap", 0.25)),
         reason_evidence_trust_cap=float(config["model"].get("reason_evidence_trust_cap", 0.25)),
+        conditional_temporal_utility=bool(config["model"].get("conditional_temporal_utility", False)),
+        action_temporal_budget_cap=float(config["model"].get("action_temporal_budget_cap", 0.60)),
+        reason_temporal_budget_cap=float(config["model"].get("reason_temporal_budget_cap", 0.50)),
     ).to(device)
     batch_size = int(_arg(args, "batch_size", 2))
     workers = int(_arg(args, "num_workers", config["data"]["num_workers"]))

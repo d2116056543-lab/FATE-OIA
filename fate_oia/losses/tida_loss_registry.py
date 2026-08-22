@@ -20,8 +20,10 @@ class TIDALossRegistry:
         "flow_transition_align",
         "action_asl", "action_smooth_ap", "action_base_protect", "action_delta", "action_route_sparse",
         "action_flow_credit", "action_flow_no_harm",
+        "action_utility_calibration",
         "reason_partial", "reason_rank", "reason_soft_f1", "reason_delta",
         "reason_flow_credit", "reason_flow_no_harm",
+        "reason_utility_calibration",
     )
     default_weights = {
         "terminal_hist": 0.25,
@@ -42,12 +44,14 @@ class TIDALossRegistry:
         # whenever ordered history is not useful.
         "action_flow_credit": 0.50,
         "action_flow_no_harm": 0.15,
+        "action_utility_calibration": 0.05,
         "reason_partial": 1.00,
         "reason_rank": 0.08,
         "reason_soft_f1": 0.04,
         "reason_delta": 0.005,
         "reason_flow_credit": 0.30,
         "reason_flow_no_harm": 0.12,
+        "reason_utility_calibration": 0.04,
     }
 
     def __init__(self, weights: dict[str, float] | None = None) -> None:
