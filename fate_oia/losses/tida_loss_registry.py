@@ -22,7 +22,7 @@ class TIDALossRegistry:
         "action_flow_credit", "action_flow_no_harm",
         "action_utility_calibration",
         "reason_partial", "reason_rank", "reason_soft_f1", "reason_delta",
-        "reason_flow_credit", "reason_flow_no_harm",
+        "reason_flow_credit", "reason_flow_no_harm", "reason_positive_no_harm",
         "reason_utility_calibration",
     )
     default_weights = {
@@ -51,6 +51,7 @@ class TIDALossRegistry:
         "reason_delta": 0.005,
         "reason_flow_credit": 0.30,
         "reason_flow_no_harm": 0.12,
+        "reason_positive_no_harm": 0.25,
         "reason_utility_calibration": 0.04,
     }
 

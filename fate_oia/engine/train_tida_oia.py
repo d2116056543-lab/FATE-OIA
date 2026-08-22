@@ -253,7 +253,8 @@ def reason_firewall_gradient_audit(
 ) -> dict[str, float]:
     reason_names = (
         "reason_partial", "reason_rank", "reason_soft_f1", "reason_delta",
-        "reason_flow_credit", "reason_flow_no_harm", "reason_utility_calibration",
+        "reason_flow_credit", "reason_flow_no_harm", "reason_positive_no_harm",
+        "reason_utility_calibration",
     )
     action_names = (
         "action_asl", "action_smooth_ap", "action_base_protect", "action_delta",
