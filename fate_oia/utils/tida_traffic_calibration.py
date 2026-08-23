@@ -71,7 +71,11 @@ def fit_action_traffic_calibration_oof(
     traffic_delta: torch.Tensor,
     target: torch.Tensor,
     *,
-    candidates: tuple[float, ...] = (0.0, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0),
+    candidates: tuple[float, ...] = (
+        -32.0, -16.0, -8.0, -4.0, -2.0, -1.0, -0.5,
+        0.0,
+        0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0,
+    ),
     folds: int = 5,
     min_oof_gain: float = 0.0,
     seed: int = 3407,

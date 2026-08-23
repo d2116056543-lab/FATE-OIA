@@ -32,9 +32,20 @@ def test_oof_trajectory_calibration_selects_useful_scale_and_is_reproducible():
 def test_oof_trajectory_calibration_falls_back_to_zero_when_delta_is_harmful():
     target = torch.tensor([[1.0], [1.0], [0.0], [0.0]]).repeat(8, 1)
     semantic = (2.0 * target - 1.0) * 0.2
-    harmful = -(2.0 * target - 1.0) * 0.2
+    harmful = torch.zeros_like(target)
     result = fit_action_traffic_calibration_oof(
         semantic, harmful, target, candidates=(0.0, 1.0, 2.0), folds=4
     )
     assert result["scales"].item() == 0.0
     assert result["oof_gain_by_action"].item() == 0.0
+
+
+def test_oof_trajectory_calibration_can_correct_action_specific_orientation():
+    target = torch.tensor([[1.0], [1.0], [0.0], [0.0]]).repeat(8, 1)
+    semantic = torch.zeros_like(target)
+    reversed_delta = -(2.0 * target - 1.0) * 0.1
+    result = fit_action_traffic_calibration_oof(
+        semantic, reversed_delta, target, candidates=(-1.0, 0.0, 1.0), folds=4
+    )
+    assert result["scales"].item() == -1.0
+    assert result["oof_gain_by_action"].item() > 0.3
