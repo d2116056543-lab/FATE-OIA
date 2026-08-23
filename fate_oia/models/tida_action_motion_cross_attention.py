@@ -24,8 +24,8 @@ class TIDAActionMotionCrossAttention(nn.Module):
             nn.LayerNorm(dim),
         )
         self.patch_motion_projection = nn.Sequential(
-            nn.LayerNorm(dim + 5),
-            nn.Linear(dim + 5, dim),
+            nn.LayerNorm(dim + 8),
+            nn.Linear(dim + 8, dim),
             nn.GELU(),
             nn.LayerNorm(dim),
         )
@@ -84,6 +84,8 @@ class TIDAActionMotionCrossAttention(nn.Module):
 
         motion = self.motion_projection(torch.cat((velocity, acceleration), dim=-1))
         patch_displacement = action_nodes.new_zeros(batch, frames - 1, self.num_actions, 2)
+        patch_common_displacement = action_nodes.new_zeros(batch, frames - 1, 2)
+        patch_exclusive_displacement = action_nodes.new_zeros(batch, frames - 1, self.num_actions, 2)
         patch_confidence = action_nodes.new_zeros(batch, frames - 1, self.num_actions)
         patch_motion_energy = action_nodes.new_zeros(batch, frames - 1, self.num_actions)
         if patch_tokens is not None or patch_xy is not None or patch_weight is not None:
@@ -105,19 +107,26 @@ class TIDAActionMotionCrossAttention(nn.Module):
             source_weight = patch_weight[:, :-1]
             source_weight = source_weight / source_weight.sum(-1, keepdim=True).clamp_min(1e-8)
             patch_displacement = torch.einsum("bfak,bfakc->bfac", source_weight, displacement)
+            confidence_per_action = (source_weight * correspondence.max(-1).values).sum(-1)
+            common_weight = confidence_per_action / confidence_per_action.sum(-1, keepdim=True).clamp_min(1e-8)
+            patch_common_displacement = torch.einsum("bfa,bfac->bfc", common_weight, patch_displacement)
+            patch_exclusive_displacement = patch_displacement - patch_common_displacement[:, :, None]
             appearance = torch.einsum(
                 "bfak,bfakd->bfad", source_weight, matched_token - patch_tokens[:, :-1]
             )
             magnitude = displacement.square().sum(-1).sqrt()
             radial = (displacement * patch_xy[:, :-1]).sum(-1)
             patch_motion_energy = (source_weight * magnitude).sum(-1)
+            exclusive_motion_energy = patch_exclusive_displacement.square().sum(-1).sqrt()
             expansion = (source_weight * radial).sum(-1)
-            patch_confidence = (source_weight * correspondence.max(-1).values).sum(-1)
+            patch_confidence = confidence_per_action
             patch_descriptor = torch.cat(
                 (
                     appearance,
                     patch_displacement,
+                    patch_exclusive_displacement,
                     patch_motion_energy[..., None],
+                    exclusive_motion_energy[..., None],
                     expansion[..., None],
                     patch_confidence[..., None],
                 ),
@@ -158,6 +167,8 @@ class TIDAActionMotionCrossAttention(nn.Module):
             "traffic_same_action_mass": same_action_mass,
             "traffic_motion_energy": motion_energy,
             "traffic_patch_displacement": patch_displacement,
+            "traffic_patch_common_displacement": patch_common_displacement,
+            "traffic_patch_exclusive_displacement": patch_exclusive_displacement,
             "traffic_patch_match_confidence": patch_confidence,
             "traffic_patch_motion_energy": patch_motion_energy,
             "traffic_history_available": history_available,

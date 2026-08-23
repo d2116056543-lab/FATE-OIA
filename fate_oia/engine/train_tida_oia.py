@@ -897,6 +897,12 @@ def train(args: Any) -> None:
                 "traffic_motion_energy": float(output["traffic_motion_energy"].mean().detach().cpu()),
                 "traffic_patch_motion_energy": float(output["traffic_patch_motion_energy"].mean().detach().cpu()),
                 "traffic_patch_match_confidence": float(output["traffic_patch_match_confidence"].mean().detach().cpu()),
+                "traffic_patch_common_motion_rms": float(
+                    output["traffic_patch_common_displacement"].float().square().mean().sqrt().detach().cpu()
+                ),
+                "traffic_patch_exclusive_motion_rms": float(
+                    output["traffic_patch_exclusive_displacement"].float().square().mean().sqrt().detach().cpu()
+                ),
                 "action_evidence_confidence_mean": float(output["action_evidence_confidence"].mean().detach().cpu()),
                 "action_effective_trust_mean": float(output["action_effective_trust"].mean().detach().cpu()),
                 "reason_delta_rms": float(output["reason_temporal_delta"].float().square().mean().sqrt().detach().cpu()),

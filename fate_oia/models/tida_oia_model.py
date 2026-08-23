@@ -464,6 +464,10 @@ class TIDAOIAModel(nn.Module):
             "traffic_motion_energy": image_action.new_zeros(batch, intervals),
             "traffic_history_available": torch.zeros(batch, dtype=torch.bool, device=image_action.device),
             "traffic_patch_displacement": image_action.new_zeros(batch, intervals, self.num_actions, 2),
+            "traffic_patch_common_displacement": image_action.new_zeros(batch, intervals, 2),
+            "traffic_patch_exclusive_displacement": image_action.new_zeros(
+                batch, intervals, self.num_actions, 2
+            ),
             "traffic_patch_match_confidence": image_action.new_zeros(batch, intervals, self.num_actions),
             "traffic_patch_motion_energy": image_action.new_zeros(batch, intervals, self.num_actions),
         }
