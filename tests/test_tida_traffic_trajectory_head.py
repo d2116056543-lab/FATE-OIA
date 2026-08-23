@@ -46,6 +46,22 @@ def test_head_changes_with_temporal_order_and_keeps_reason_firewall():
     assert reason.grad is None
 
 
+def test_head_encodes_order_when_motion_multiset_is_unchanged():
+    args = list(_inputs(batch=1, frames=5))
+    # Hold geometry fixed so the only signal is the ordered appearance sequence.
+    args[2] = torch.zeros_like(args[2])
+    args[5] = torch.zeros_like(args[5])
+    args[6] = torch.zeros_like(args[6])
+    head = TIDATrafficTrajectoryHead(dim=16, num_actions=4, num_heads=4)
+    with torch.no_grad():
+        head.output.weight.fill_(0.05)
+        head.trust_raw.add_(1.0)
+    ordered = head(*args)["traffic_trajectory_delta"]
+    args[1] = args[1].flip(3)
+    reversed_order = head(*args)["traffic_trajectory_delta"]
+    assert not torch.allclose(ordered, reversed_order, atol=1e-7)
+
+
 def test_head_first_backward_reaches_zero_initialized_output():
     args = _inputs(batch=1)
     head = TIDATrafficTrajectoryHead(dim=16, num_actions=4, num_heads=4)

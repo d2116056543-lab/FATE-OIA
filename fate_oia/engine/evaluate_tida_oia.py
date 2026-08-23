@@ -57,7 +57,8 @@ def collect_tida_outputs(
     collect_audit_tensors: bool = False,
 ) -> dict[str, Any]:
     store = {key: [] for key in (
-        "image_action", "semantic_action", "geometric_action", "traffic_action", "trajectory_action", "video_action",
+        "image_action", "semantic_action", "geometric_action", "traffic_action", "trajectory_action",
+        "semantic_trajectory_action", "video_action",
         "image_reason", "semantic_reason", "geometric_reason", "video_reason",
         "prefix_action", "prefix_reason", "action_target", "reason_target",
     )}
@@ -122,6 +123,7 @@ def collect_tida_outputs(
             "geometric_action": output["geometric_video_action_logits"],
             "traffic_action": output["traffic_video_action_logits"],
             "trajectory_action": output["trajectory_video_action_logits"],
+            "semantic_trajectory_action": output["semantic_trajectory_video_action_logits"],
             "video_action": output["video_action_logits"],
             "image_reason": output["image_reason_logits"],
             "semantic_reason": output["semantic_video_reason_logits"],
@@ -535,7 +537,8 @@ def trajectory_traffic_effectiveness_metrics(
         threshold=thresholds,
     )
     trajectory = aie_branch_metrics(
-        rows["trajectory_action"], rows["image_reason"], rows["action_target"], rows["reason_target"],
+        rows["semantic_trajectory_action"], rows["image_reason"],
+        rows["action_target"], rows["reason_target"],
         threshold=thresholds,
     )
     final = aie_branch_metrics(
@@ -551,7 +554,7 @@ def trajectory_traffic_effectiveness_metrics(
             rows["action_target"][mask], rows["reason_target"][mask], threshold=thresholds,
         )
         trajectory_slice = aie_branch_metrics(
-            rows["trajectory_action"][mask], rows["image_reason"][mask],
+            rows["semantic_trajectory_action"][mask], rows["image_reason"][mask],
             rows["action_target"][mask], rows["reason_target"][mask], threshold=thresholds,
         )
         dynamic[name] = {
@@ -569,7 +572,7 @@ def trajectory_traffic_effectiveness_metrics(
     entropy = -(attention * attention.clamp_min(1e-8).log()).sum(-1)
     normalized_entropy = entropy / torch.log(torch.tensor(max(attention.shape[-1], 2), dtype=entropy.dtype))
     paired = paired_temporal_contribution(
-        rows["semantic_action"], rows["trajectory_action"], rows["action_target"],
+        rows["semantic_action"], rows["semantic_trajectory_action"], rows["action_target"],
         motion_score=score, bootstrap_samples=500,
     )
     mechanism = rows.get("_mechanism", {})

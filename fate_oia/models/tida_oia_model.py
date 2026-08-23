@@ -467,6 +467,12 @@ class TIDAOIAModel(nn.Module):
             "traffic_trajectory_delta": traffic_trajectory_delta,
             "trajectory_video_action_logits_raw": image_action + traffic_trajectory_delta_raw,
             "trajectory_video_action_logits": image_action + traffic_trajectory_delta,
+            "semantic_trajectory_video_action_logits_raw": (
+                image_action + semantic_action_delta + traffic_trajectory_delta_raw
+            ),
+            "semantic_trajectory_video_action_logits": (
+                image_action + semantic_action_delta + traffic_trajectory_delta
+            ),
             "geometric_prefix_action_delta": geometric_prefix_action_delta,
             "geometric_prefix_action_logits_raw": image_action[:, None] + geometric_prefix_action_delta_raw,
             "geometric_prefix_action_logits": image_action[:, None] + geometric_prefix_action_delta,

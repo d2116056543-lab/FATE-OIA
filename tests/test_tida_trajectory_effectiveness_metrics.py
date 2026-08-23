@@ -7,11 +7,12 @@ from fate_oia.engine.evaluate_tida_oia import trajectory_traffic_effectiveness_m
 def test_trajectory_metrics_expose_dynamic_gain_transport_and_grounding_quality():
     target = torch.tensor([[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 1.0, 0.0]] * 8)
     sign = 2.0 * target - 1.0
-    semantic = 0.15 * sign
+    semantic = -0.05 * sign
     delta = 0.10 * sign
     rows = {
         "semantic_action": semantic,
-        "trajectory_action": semantic + delta,
+        "trajectory_action": delta,
+        "semantic_trajectory_action": semantic + delta,
         "video_action": semantic + delta,
         "image_reason": torch.zeros(16, 21),
         "video_reason": torch.zeros(16, 21),
@@ -25,6 +26,7 @@ def test_trajectory_metrics_expose_dynamic_gain_transport_and_grounding_quality(
         "trajectory_exclusive_displacement": torch.ones(16, 4, 3, 4, 2) * 0.1,
     }
     metrics = trajectory_traffic_effectiveness_metrics(rows)
+    assert metrics["overall"]["trajectory_incremental_action_mf1"] > 0
     assert metrics["target_transport"]["action_signed_margin_mean"] > 0
     assert metrics["target_transport"]["correction_to_harm_ratio"] > 1
     assert metrics["grounding_quality"]["cycle_confidence_mean"] == pytest.approx(0.9)

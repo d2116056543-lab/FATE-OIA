@@ -1,8 +1,11 @@
 param(
     [string]$OutputDir = "F:\FATE_Drive_runs\tida_trajectory_v5_full_head_probe",
+    [int]$Epochs = 1,
     [int]$BatchSize = 4,
     [int]$GradAccum = 8,
-    [int]$NumWorkers = 4
+    [int]$NumWorkers = 4,
+    [int]$ContextChunkSize = 2,
+    [int]$MaxOptimizerUpdates = 77
 )
 
 $ErrorActionPreference = "Stop"
@@ -24,15 +27,15 @@ $ErrorActionPreference = "Continue"
     --checkpoint F:\FATE_Drive_runs\tida_ctu_reason_ema_v5\checkpoint_best_test_joint.pth `
     --checkpoint-view ema `
     --output-dir $OutputDir `
-    --epochs 1 `
+    --epochs $Epochs `
     --batch-size $BatchSize `
     --gradient-accumulation-steps $GradAccum `
-    --context-chunk-size 2 `
+    --context-chunk-size $ContextChunkSize `
     --num-workers $NumWorkers `
     --device cuda `
     --run-kind smoke `
-    --max-optimizer-updates 77 `
-    --schedule-total-updates 77 `
+    --max-optimizer-updates $MaxOptimizerUpdates `
+    --schedule-total-updates $MaxOptimizerUpdates `
     --train-owners traffic_trajectory 2>&1 | Tee-Object -FilePath $log
 
 $code = $LASTEXITCODE

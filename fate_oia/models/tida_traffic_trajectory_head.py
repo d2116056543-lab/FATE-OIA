@@ -98,15 +98,34 @@ class TIDATrafficTrajectoryHead(nn.Module):
         )
         first = torch.zeros_like(motion_features[..., :1, :])
         motion_features = torch.cat((first, motion_features), dim=3)
-        frame_tokens = trajectory_appearance + self.motion_projection(motion_features)
+        position = torch.arange(frames, device=trajectory_appearance.device, dtype=trajectory_appearance.dtype)
+        frequency = torch.exp(
+            torch.arange(0, dim, 2, device=position.device, dtype=position.dtype)
+            * (-math.log(10000.0) / max(dim, 1))
+        )
+        temporal_position = trajectory_appearance.new_zeros(frames, dim)
+        temporal_position[:, 0::2] = torch.sin(position[:, None] * frequency[None])
+        temporal_position[:, 1::2] = torch.cos(position[:, None] * frequency[None, : temporal_position[:, 1::2].shape[1]])
+        frame_tokens = (
+            trajectory_appearance
+            + self.motion_projection(motion_features)
+            + 0.1 * temporal_position[None, None, None]
+        )
 
         valid_frame = trajectory_visibility > 0
         encoded = self.temporal_encoder(
             frame_tokens.reshape(batch * actions * tracks, frames, dim),
             src_key_padding_mask=(~valid_frame).reshape(batch * actions * tracks, frames),
         ).reshape(batch, actions, tracks, frames, dim)
-        frame_weight = trajectory_visibility / trajectory_visibility.sum(-1, keepdim=True).clamp_min(1e-8)
-        trajectory_tokens = torch.einsum("bakt,baktd->bakd", frame_weight, encoded)
+        recency = torch.linspace(
+            0.25, 1.0, frames, device=trajectory_visibility.device, dtype=trajectory_visibility.dtype
+        )
+        frame_weight = trajectory_visibility * recency
+        frame_weight = frame_weight / frame_weight.sum(-1, keepdim=True).clamp_min(1e-8)
+        pooled = torch.einsum("bakt,baktd->bakd", frame_weight, encoded)
+        # The terminal token is the real target-frame anchor; mixing it with a
+        # recency-weighted history summary preserves identity and chronology.
+        trajectory_tokens = 0.5 * (pooled + encoded[..., -1, :])
 
         unit = displacement / speed[..., None].clamp_min(1e-6)
         orientation = torch.einsum("baktc,hc->bakth", unit, self.direction_bins)
