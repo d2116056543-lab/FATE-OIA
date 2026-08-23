@@ -369,6 +369,22 @@ def build_tida_loss_registry(
     prefix_action_target = action_target[:, None].expand(-1, 4, -1).flatten(0, 1)
     registry.add("geometric_action_prefix", action_macro_asl_loss(prefix_action, prefix_action_target))
     registry.add("geometric_action_delta", output["geometric_action_delta_raw"].square().mean())
+    registry.add(
+        "traffic_action_aux",
+        target_conditioned_geometric_correction_loss(
+            output["semantic_video_action_logits"], output["traffic_action_delta_raw"],
+            action_target, output["traffic_motion_energy"],
+        ),
+    )
+    registry.add(
+        "traffic_action_rank",
+        target_conditioned_geometric_ranking_loss(
+            output["semantic_video_action_logits"], output["traffic_action_delta_raw"],
+            action_target, output["traffic_motion_energy"], None,
+            rank_reference.get("action_logits"), rank_reference.get("action_target"),
+        ),
+    )
+    registry.add("traffic_action_delta", output["traffic_action_delta_raw"].square().mean())
     image_branch = output.get("image_branch", {})
     contradiction = image_branch.get("contradiction_score") if isinstance(image_branch, dict) else None
     reason_weights = reason_pu_weight(reason_target, contradiction)

@@ -113,3 +113,28 @@ def test_geometric_raw_branch_learns_while_deployment_scale_is_zero():
     loss.backward()
     assert model.geometric_heads.action_output.weight.grad.abs().sum() > 0
     assert model.geometric_heads.reason_output.weight.grad.abs().sum() > 0
+
+
+def test_traffic_action_motion_is_in_final_action_and_not_reason():
+    roles = {"static_anchor": [f"p{i}" for i in range(8)], "dynamic_actor": [f"p{i}" for i in range(8, 24)], "terminal_context": [f"p{i}" for i in range(24, 32)]}
+    model = TIDAOIAModel(
+        _ImageBase(), dim=8, num_actions=4, num_reasons=21, num_predicates=32,
+        predicate_roles=roles, context_chunk_size=7,
+        traffic_action_enabled=True,
+    )
+    out = model(
+        torch.randn(1, 3, 360, 640), torch.randn(1, 14, 3, 192, 344),
+        torch.linspace(-5, 0, 15).unsqueeze(0), torch.ones(1, 15, dtype=torch.bool),
+        temporal_action_scale=1.0, temporal_reason_scale=1.0,
+    )
+    assert out["traffic_action_delta"].shape == (1, 4)
+    assert out["traffic_action_attention"].shape[:2] == (1, 4)
+    assert torch.allclose(
+        out["video_action_logits"],
+        out["image_action_logits"] + out["semantic_action_temporal_delta"]
+        + out["geometric_action_delta"] + out["traffic_action_delta"],
+    )
+    gradient = torch.autograd.grad(
+        out["video_reason_logits"].sum(), list(model.traffic_action.parameters()), allow_unused=True
+    )
+    assert all(value is None or torch.equal(value, torch.zeros_like(value)) for value in gradient)

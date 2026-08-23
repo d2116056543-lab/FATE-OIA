@@ -5,6 +5,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from .tida_action_motion_cross_attention import TIDAActionMotionCrossAttention
 from .tida_action_reader import TIDAActionReader
 from .tida_context_encoder import TIDAContextEncoder
 from .tida_flow_transition_bank import TIDAFlowTransitionBank
@@ -130,6 +131,8 @@ class TIDAOIAModel(nn.Module):
         geometric_flow_hidden_dim: int = 64,
         geometric_action_cap: float = 0.20,
         geometric_reason_cap: float = 0.15,
+        traffic_action_enabled: bool = False,
+        traffic_action_cap: float = 0.15,
     ) -> None:
         super().__init__()
         self.image_model = image_model
@@ -183,6 +186,13 @@ class TIDAOIAModel(nn.Module):
         )
         if not self.geometric_flow_enabled:
             for parameter in self.geometric_heads.parameters():
+                parameter.requires_grad = False
+        self.traffic_action_enabled = bool(traffic_action_enabled)
+        self.traffic_action = TIDAActionMotionCrossAttention(
+            dim=dim, num_actions=num_actions, cap=traffic_action_cap
+        )
+        if not self.traffic_action_enabled:
+            for parameter in self.traffic_action.parameters():
                 parameter.requires_grad = False
         self.query_identity = nn.Parameter(torch.randn(num_actions + num_predicates, dim) * 0.02)
         self.predicate_identity = nn.Parameter(torch.randn(num_predicates, dim) * 0.02)
@@ -241,6 +251,10 @@ class TIDAOIAModel(nn.Module):
         if self.geometric_flow_enabled:
             owners["geometric_action"] = list(self.geometric_heads.action_parameters())
             owners["geometric_reason"] = list(self.geometric_heads.reason_parameters())
+        if self.traffic_action_enabled:
+            owners["traffic_action"] = [
+                parameter for parameter in self.traffic_action.parameters() if parameter.requires_grad
+            ]
         # Query identities are the shortcut-free prior for terminal prediction.
         owners["history_reader"] += [self.query_identity, self.predicate_identity]
         return owners
@@ -327,9 +341,22 @@ class TIDAOIAModel(nn.Module):
         geometric_reason_delta = geometric_reason_delta_raw * temporal_reason_scale
         geometric_prefix_action_delta = geometric_prefix_action_delta_raw * temporal_action_scale
         geometric_prefix_reason_delta = geometric_prefix_reason_delta_raw * temporal_reason_scale
+        traffic = (
+            self.traffic_action(
+                action_nodes,
+                history_tokens[:, :, : self.num_actions],
+                timestamps[:, : history_tokens.shape[1]],
+                frame_valid_mask[:, : history_tokens.shape[1]],
+                image_action,
+            )
+            if self.traffic_action_enabled
+            else self._empty_traffic_action(image_action, history_tokens.shape[1])
+        )
+        traffic_action_delta_raw = traffic["traffic_action_delta"]
+        traffic_action_delta = traffic_action_delta_raw * temporal_action_scale
         semantic_action_delta = action["action_temporal_delta"]
         semantic_reason_delta = reason_delta_raw
-        action_delta = semantic_action_delta + geometric_action_delta
+        action_delta = semantic_action_delta + geometric_action_delta + traffic_action_delta
         reason_delta_raw = semantic_reason_delta + geometric_reason_delta
         semantic_reason_effective = (
             confidence_aware_reason_delta(
@@ -361,7 +388,7 @@ class TIDAOIAModel(nn.Module):
         )
         return {
             **temporal, **innovation, **differential, **flow, **action, **reason,
-            **geometric,
+            **geometric, **traffic,
             "terminal_target_evidence": terminal_target_evidence,
             "terminal_query_identity": terminal_query_identity,
             "predicate_innovation_token": xi[:, self.num_actions :],
@@ -371,6 +398,10 @@ class TIDAOIAModel(nn.Module):
             "geometric_action_delta": geometric_action_delta,
             "geometric_action_delta_raw": geometric_action_delta_raw,
             "geometric_video_action_logits_raw": image_action + geometric_action_delta_raw,
+            "traffic_action_delta_raw": traffic_action_delta_raw,
+            "traffic_action_delta": traffic_action_delta,
+            "traffic_video_action_logits_raw": image_action + traffic_action_delta_raw,
+            "traffic_video_action_logits": image_action + traffic_action_delta,
             "geometric_prefix_action_delta": geometric_prefix_action_delta,
             "geometric_prefix_action_logits_raw": image_action[:, None] + geometric_prefix_action_delta_raw,
             "geometric_prefix_action_logits": image_action[:, None] + geometric_prefix_action_delta,
@@ -408,6 +439,22 @@ class TIDAOIAModel(nn.Module):
                 self.predicate_names, differential["predicate_region_mass_velocity"], rho[:, self.num_actions :]
             ),
             "target_predicate_region_mass": target_region_mass,
+        }
+
+    def _empty_traffic_action(
+        self, image_action: torch.Tensor, history_frames: int
+    ) -> dict[str, torch.Tensor]:
+        batch = image_action.shape[0]
+        intervals = max(int(history_frames) - 1, 0)
+        return {
+            "traffic_action_delta": torch.zeros_like(image_action),
+            "traffic_action_context": image_action.new_zeros(batch, self.num_actions, self.query_identity.shape[-1]),
+            "traffic_action_attention": image_action.new_zeros(
+                batch, self.num_actions, intervals * self.num_actions
+            ),
+            "traffic_same_action_mass": torch.zeros_like(image_action),
+            "traffic_motion_energy": image_action.new_zeros(batch, intervals),
+            "traffic_history_available": torch.zeros(batch, dtype=torch.bool, device=image_action.device),
         }
 
     def _empty_geometric(

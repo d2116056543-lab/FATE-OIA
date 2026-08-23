@@ -57,7 +57,7 @@ def collect_tida_outputs(
     collect_audit_tensors: bool = False,
 ) -> dict[str, Any]:
     store = {key: [] for key in (
-        "image_action", "semantic_action", "geometric_action", "video_action",
+        "image_action", "semantic_action", "geometric_action", "traffic_action", "video_action",
         "image_reason", "semantic_reason", "geometric_reason", "video_reason",
         "prefix_action", "prefix_reason", "action_target", "reason_target",
     )}
@@ -73,6 +73,8 @@ def collect_tida_outputs(
         "velocity_norm", "acceleration_norm",
         "geometric_motion_energy", "geometric_global_horizontal", "geometric_global_expansion",
         "geometric_region_motion", "geometric_action_delta", "geometric_reason_delta",
+        "traffic_motion_energy", "traffic_action_delta", "traffic_action_attention",
+        "traffic_same_action_mass",
     )}
     audit_keys = (
         "terminal_prediction_history", "terminal_prediction_no_history", "terminal_target_evidence",
@@ -110,6 +112,7 @@ def collect_tida_outputs(
             "image_action": output["image_action_logits"],
             "semantic_action": output["semantic_video_action_logits"],
             "geometric_action": output["geometric_video_action_logits"],
+            "traffic_action": output["traffic_video_action_logits"],
             "video_action": output["video_action_logits"],
             "image_reason": output["image_reason_logits"],
             "semantic_reason": output["semantic_video_reason_logits"],
@@ -155,6 +158,10 @@ def collect_tida_outputs(
             "geometric_region_motion": output["geometric_region_motion"],
             "geometric_action_delta": output["geometric_action_delta"],
             "geometric_reason_delta": output["geometric_reason_delta_effective"],
+            "traffic_motion_energy": output["traffic_motion_energy"],
+            "traffic_action_delta": output["traffic_action_delta"],
+            "traffic_action_attention": output["traffic_action_attention"],
+            "traffic_same_action_mass": output["traffic_same_action_mass"],
         }.items():
             diagnostics[key].append(value.detach().float().cpu())
         if collect_audit_tensors:
@@ -355,6 +362,76 @@ def geometric_temporal_effectiveness_metrics(
     }
 
 
+def traffic_action_effectiveness_metrics(
+    rows: dict[str, Any], thresholds: torch.Tensor | float = 0.5
+) -> dict[str, Any]:
+    """Measure whether ordered traffic motion improves a specific action target."""
+    semantic = aie_branch_metrics(
+        rows["semantic_action"], rows["semantic_reason"],
+        rows["action_target"], rows["reason_target"], threshold=thresholds,
+    )
+    final = aie_branch_metrics(
+        rows["video_action"], rows["video_reason"],
+        rows["action_target"], rows["reason_target"], threshold=thresholds,
+    )
+    traffic_only = aie_branch_metrics(
+        rows["traffic_action"], rows["image_reason"],
+        rows["action_target"], rows["reason_target"], threshold=thresholds,
+    )
+    score = rows["traffic_motion_energy"].mean(1)
+    low_cut, high_cut = torch.quantile(score, 0.25), torch.quantile(score, 0.75)
+    strata: dict[str, Any] = {}
+    for name, mask in (("low_motion", score <= low_cut), ("high_motion", score >= high_cut)):
+        semantic_slice = aie_branch_metrics(
+            rows["semantic_action"][mask], rows["semantic_reason"][mask],
+            rows["action_target"][mask], rows["reason_target"][mask], threshold=thresholds,
+        )
+        final_slice = aie_branch_metrics(
+            rows["video_action"][mask], rows["video_reason"][mask],
+            rows["action_target"][mask], rows["reason_target"][mask], threshold=thresholds,
+        )
+        strata[name] = {
+            "count": int(mask.sum()),
+            "motion_energy_mean": float(score[mask].mean()),
+            "traffic_incremental_action_mf1": final_slice["Act_mF1"] - semantic_slice["Act_mF1"],
+            "traffic_incremental_action_map": final_slice["Act_mAP"] - semantic_slice["Act_mAP"],
+            "semantic": semantic_slice,
+            "final": final_slice,
+        }
+
+    sign = 2.0 * rows["action_target"] - 1.0
+    signed_margin = sign * rows["traffic_action_delta"]
+    attention = rows["traffic_action_attention"]
+    attention_entropy = -(attention * attention.clamp_min(1e-8).log()).sum(-1)
+    normalizer = torch.log(torch.tensor(max(attention.shape[-1], 2), dtype=attention.dtype))
+    return {
+        "overall": {
+            "semantic": semantic,
+            "traffic_only": traffic_only,
+            "final": final,
+            "traffic_incremental_action_mf1": final["Act_mF1"] - semantic["Act_mF1"],
+            "traffic_incremental_action_of1": final["Act_oF1"] - semantic["Act_oF1"],
+            "traffic_incremental_action_map": final["Act_mAP"] - semantic["Act_mAP"],
+        },
+        "motion_quantiles": {
+            "p25": float(low_cut), "p50": float(torch.quantile(score, 0.5)), "p75": float(high_cut),
+        },
+        "motion_strata": strata,
+        "target_transport": {
+            "action_signed_margin_mean": float(signed_margin.mean()),
+            "action_benefit_rate": float((signed_margin > 0).float().mean()),
+            "action_signed_margin_by_label": signed_margin.mean(0).tolist(),
+            "action_benefit_rate_by_label": (signed_margin > 0).float().mean(0).tolist(),
+            "action_delta_rms": float(rows["traffic_action_delta"].square().mean().sqrt()),
+        },
+        "attention": {
+            "normalized_entropy_mean": float((attention_entropy / normalizer).mean()),
+            "same_action_mass_mean": float(rows["traffic_same_action_mass"].mean()),
+            "same_action_mass_by_target": rows["traffic_same_action_mass"].mean(0).tolist(),
+        },
+    }
+
+
 def fit_train_calib_thresholds(rows: dict[str, Any]) -> dict[str, torch.Tensor]:
     video_logits = torch.cat([rows["video_action"], rows["video_reason"]], dim=-1)
     image_logits = torch.cat([rows["image_action"], rows["image_reason"]], dim=-1)
@@ -410,13 +487,16 @@ def save_epoch_outputs(output_dir: Path, epoch: int, rows: dict[str, Any], metri
     geometric_effectiveness = metrics.get("online", {}).get("geometric_effectiveness")
     if geometric_effectiveness is not None:
         atomic_write_json(epoch_dir / "geometric_temporal_effectiveness.json", geometric_effectiveness)
+    traffic_effectiveness = metrics.get("online", {}).get("traffic_action_effectiveness")
+    if traffic_effectiveness is not None:
+        atomic_write_json(epoch_dir / "traffic_action_effectiveness.json", traffic_effectiveness)
     atomic_write_json(epoch_dir / "file_names_test.json", rows["file_names"])
     if "dynamic_concepts" in rows:
         with (epoch_dir / "dynamic_concepts_test.jsonl").open("w", encoding="utf-8", newline="\n") as handle:
             for file_name, concepts in zip(rows["file_names"], rows["dynamic_concepts"]):
                 handle.write(json.dumps({"file_name": file_name, "dynamic_concepts": concepts}, ensure_ascii=False) + "\n")
     tensor_keys = (
-        "image_action", "semantic_action", "geometric_action", "video_action",
+        "image_action", "semantic_action", "geometric_action", "traffic_action", "video_action",
         "image_reason", "semantic_reason", "geometric_reason", "video_reason",
         "prefix_action", "prefix_reason", "action_target", "reason_target",
         "rho", "action_delta", "reason_delta", "null_mass", "route_entropy",
@@ -430,6 +510,8 @@ def save_epoch_outputs(output_dir: Path, epoch: int, rows: dict[str, Any], metri
         "velocity_norm", "acceleration_norm",
         "geometric_motion_energy", "geometric_global_horizontal", "geometric_global_expansion",
         "geometric_region_motion", "geometric_action_delta", "geometric_reason_delta",
+        "traffic_motion_energy", "traffic_action_delta", "traffic_action_attention",
+        "traffic_same_action_mass",
         "terminal_prediction_history", "terminal_prediction_no_history", "terminal_target_evidence",
         "terminal_error_history", "terminal_error_no_history", "innovation_token",
         "predicate_differential_state", "predicate_velocity_norm", "predicate_acceleration_norm",
@@ -469,6 +551,7 @@ def main() -> None:
         "temporal_contribution": temporal_contribution_metrics(rows),
         "geometric_branches_raw_fixed": geometric_branch_metrics(rows),
         "geometric_effectiveness": geometric_temporal_effectiveness_metrics(rows),
+        "traffic_action_effectiveness": traffic_action_effectiveness_metrics(rows),
     }
     atomic_write_json(Path(args.output_dir) / "evaluation.json", metrics)
     print(json.dumps(metrics, default=str), flush=True)
