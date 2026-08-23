@@ -10,9 +10,9 @@ V5.5 produces strong ordered-vs-reversed context contrast (`order_contrast_rms=1
 
 ## Architecture
 
-The head computes ordered and reversed trajectory contexts with shared encoders. Their difference produces an order-discriminability gate, not an action sign. A separate ordered-content correction reads the ordered context, the context difference, action identity, and the detached base action logit. The correction is zero-initialized, bounded by the configured cap, and multiplied by learned trust, support, and order discriminability.
+The head computes ordered and reversed trajectory contexts with shared encoders. Their difference produces both an order-discriminability gate and the only evidence input to the correction readout. The readout receives signed contrast, contrast magnitude, and their products with learned action identity. It cannot read ordered appearance, visual action nodes, or base logits, which prevents a static action/calibration shortcut. Detached base uncertainty can only shrink the residual budget. The correction is zero-initialized and bounded by the configured cap, learned trust, support, order discriminability, and uncertainty.
 
-The reversed path produces an independent control correction through the same readout. Training requires the ordered correction to improve the GT margin more than the reversed control, while boundary correction and ranking losses determine the correction sign. Time reversal is therefore a preference control rather than an artificial opposite action label.
+The reversed path produces an independent control correction through the same readout. Even-magnitude features make it non-antisymmetric, while the absence of any ordered-control contrast forces both corrections to zero. Training requires the ordered correction to improve the GT margin more than the reversed control, while boundary correction and ranking losses determine the correction sign. Time reversal is therefore a preference control rather than an artificial opposite action label.
 
 ## Safety
 

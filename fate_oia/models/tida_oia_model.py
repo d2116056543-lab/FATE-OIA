@@ -561,6 +561,7 @@ class TIDAOIAModel(nn.Module):
             "traffic_trajectory_trust": image_action.new_zeros(batch, actions),
             "traffic_trajectory_support": image_action.new_zeros(batch, actions),
             "trajectory_order_gate": image_action.new_zeros(batch, actions),
+            "trajectory_uncertainty_gate": image_action.new_zeros(batch, actions),
             "trajectory_attention": image_action.new_zeros(batch, actions, tracks),
             "trajectory_tokens": image_action.new_zeros(batch, actions, tracks, dim),
             "trajectory_direction_histogram": image_action.new_zeros(batch, actions, tracks, 8),

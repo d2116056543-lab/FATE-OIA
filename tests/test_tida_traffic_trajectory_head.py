@@ -104,7 +104,23 @@ def test_head_conditions_credit_on_frozen_base_uncertainty():
         head.output.weight.fill_(0.05)
     uncertain = head(*args, base_action_logits=torch.zeros(1, 4))["traffic_trajectory_delta"]
     confident = head(*args, base_action_logits=torch.full((1, 4), 4.0))["traffic_trajectory_delta"]
-    assert not torch.allclose(uncertain, confident, atol=1e-7)
+    assert torch.equal(torch.sign(uncertain), torch.sign(confident))
+    assert torch.all(uncertain.abs() >= confident.abs())
+
+
+def test_head_emits_no_credit_when_order_has_no_contrast():
+    args = list(_inputs(batch=1, frames=5))
+    args[1] = args[1][..., :1, :].expand_as(args[1]).clone()
+    args[2] = torch.zeros_like(args[2])
+    args[5] = torch.zeros_like(args[5])
+    args[6] = torch.zeros_like(args[6])
+    head = TIDATrafficTrajectoryHead(dim=16, num_actions=4, num_heads=4)
+    with torch.no_grad():
+        head.output.weight.fill_(0.05)
+        head.output.bias.fill_(0.25)
+    out = head(*args, base_action_logits=torch.zeros(1, 4))
+    assert torch.allclose(out["trajectory_order_gate"], torch.zeros(1, 4), atol=1e-7)
+    assert torch.allclose(out["traffic_trajectory_delta"], torch.zeros(1, 4), atol=1e-7)
 
 
 def test_head_reports_nonzero_order_contrast_without_action_prior():

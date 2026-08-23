@@ -943,6 +943,9 @@ def train(args: Any) -> None:
                 "trajectory_order_gate_mean": float(
                     output["trajectory_order_gate"].mean().detach().cpu()
                 ),
+                "trajectory_uncertainty_gate_mean": float(
+                    output["trajectory_uncertainty_gate"].mean().detach().cpu()
+                ),
                 "traffic_trajectory_cycle_confidence_mean": float(
                     output["trajectory_cycle_confidence"].mean().detach().cpu()
                 ),

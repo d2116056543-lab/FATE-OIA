@@ -4,7 +4,7 @@
 
 **Goal:** Learn useful signed action credit from ordered traffic trajectories while using reversed trajectories only as causal controls.
 
-**Architecture:** Shared trajectory encoders produce ordered and reversed contexts. Order contrast gates a separate base-conditioned ordered-content correction; control corrections are independently decoded with shared weights.
+**Architecture:** Shared trajectory encoders produce ordered and reversed contexts. Only their signed/magnitude contrast and learned action identity enter the correction readout; detached base uncertainty only gates its budget. Control corrections are independently decoded with shared weights.
 
 **Tech Stack:** Python 3.9, PyTorch, pytest, frozen DINO video inference.
 
