@@ -27,6 +27,9 @@ class TIDATrafficTrajectoryHead(nn.Module):
         self.action_identity = nn.Parameter(torch.randn(num_actions, dim) * 0.02)
         self.motion_projection = nn.Sequential(nn.Linear(9, dim), nn.GELU(), nn.LayerNorm(dim))
         self.direction_projection = nn.Sequential(nn.Linear(8, dim), nn.GELU())
+        self.interaction_projection = nn.Sequential(
+            nn.Linear(8, dim), nn.GELU(), nn.LayerNorm(dim)
+        )
         temporal_layer = nn.TransformerEncoderLayer(
             dim, num_heads, 2 * dim, dropout=0.0, batch_first=True, norm_first=True
         )
@@ -125,6 +128,55 @@ class TIDATrafficTrajectoryHead(nn.Module):
         ).clamp_min(1e-8)
         trajectory_tokens = trajectory_tokens + self.direction_projection(direction_histogram)
 
+        # Explicit inter-trajectory geometry complements self-attention with the
+        # driving-relevant relations it otherwise has to rediscover from few clips.
+        mean_velocity = (displacement * pair_weight[..., None]).sum(-2) / pair_weight.sum(
+            -1, keepdim=True
+        ).clamp_min(1.0)
+        final_position = trajectory_xy[..., -1, :]
+        relative_position = (
+            final_position[:, :, None, :, :] - final_position[:, :, :, None, :]
+        )
+        relative_velocity = (
+            mean_velocity[:, :, None, :, :] - mean_velocity[:, :, :, None, :]
+        )
+        distance = relative_position.square().sum(-1).sqrt()
+        closing = -(relative_position * relative_velocity).sum(-1) / distance.clamp_min(1e-4)
+        crossing = (
+            relative_position[..., 0] * relative_velocity[..., 1]
+            - relative_position[..., 1] * relative_velocity[..., 0]
+        ).abs() / distance.clamp_min(1e-4)
+        proximity = torch.exp(-2.0 * distance)
+        closing_positive = closing.relu()
+        ttc_risk = closing_positive / (distance + closing_positive + 1e-4)
+        interaction_features = torch.cat(
+            (
+                relative_position,
+                relative_velocity,
+                closing[..., None],
+                crossing[..., None],
+                proximity[..., None],
+                ttc_risk[..., None],
+            ),
+            dim=-1,
+        )
+        track_valid_for_relation = valid_frame.any(-1)
+        off_diagonal = ~torch.eye(tracks, dtype=torch.bool, device=distance.device)[None, None]
+        relation_valid = (
+            track_valid_for_relation[..., :, None]
+            & track_valid_for_relation[..., None, :]
+            & off_diagonal
+        )
+        relation_weight = proximity * relation_valid.to(proximity.dtype)
+        relation_weight = relation_weight / relation_weight.sum(-1, keepdim=True).clamp_min(1e-8)
+        interaction_summary = torch.einsum(
+            "bakj,bakjf->bakf", relation_weight, interaction_features
+        )
+        interaction_risk = torch.einsum(
+            "bakj,bakj->bak", relation_weight, 0.5 * (ttc_risk + crossing.tanh())
+        )
+        trajectory_tokens = trajectory_tokens + self.interaction_projection(interaction_summary)
+
         relation = self.relation_encoder(
             trajectory_tokens.reshape(batch * actions, tracks, dim)
         ).reshape(batch, actions, tracks, dim)
@@ -151,6 +203,8 @@ class TIDATrafficTrajectoryHead(nn.Module):
             "acceleration": acceleration_norm * pair_weight,
             "radial": radial * pair_weight,
             "pair_confidence": confidence * pair_weight,
+            "interaction_risk": interaction_risk,
+            "interaction_summary": interaction_summary,
         }
 
     def forward(
@@ -251,5 +305,7 @@ class TIDATrafficTrajectoryHead(nn.Module):
             "trajectory_acceleration": ordered["acceleration"],
             "trajectory_radial_motion": ordered["radial"],
             "trajectory_pair_confidence": ordered["pair_confidence"],
+            "trajectory_interaction_risk": ordered["interaction_risk"],
+            "trajectory_interaction_summary": ordered["interaction_summary"],
             "trajectory_order_contrast_rms": order_rms,
         }

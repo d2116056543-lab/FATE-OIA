@@ -88,7 +88,7 @@ def collect_tida_outputs(
         "trajectory_order_contrast_rms",
         "trajectory_cycle_confidence", "trajectory_common_displacement",
         "trajectory_exclusive_displacement", "trajectory_xy",
-        "trajectory_local_candidate_coverage",
+        "trajectory_local_candidate_coverage", "trajectory_interaction_risk",
     )}
     audit_keys = (
         "terminal_prediction_history", "terminal_prediction_no_history", "terminal_target_evidence",
@@ -203,6 +203,7 @@ def collect_tida_outputs(
             "trajectory_local_candidate_coverage": output[
                 "trajectory_local_candidate_coverage"
             ],
+            "trajectory_interaction_risk": output["trajectory_interaction_risk"],
         }.items():
             diagnostics[key].append(value.detach().float().cpu())
         if collect_audit_tensors:
@@ -625,6 +626,7 @@ def trajectory_traffic_effectiveness_metrics(
     }
     local_coverage = rows.get("trajectory_local_candidate_coverage")
     common_displacement = rows.get("trajectory_common_displacement")
+    interaction_risk = rows.get("trajectory_interaction_risk")
     return {
         "overall": {
             "semantic": semantic, "trajectory_only": trajectory, "final": final,
@@ -654,6 +656,9 @@ def trajectory_traffic_effectiveness_metrics(
             "order_contrast_rms_mean": float(rows["trajectory_order_contrast_rms"].mean()),
             "order_gate_mean": float(rows["trajectory_order_gate"].mean()),
             "uncertainty_gate_mean": float(rows["trajectory_uncertainty_gate"].mean()),
+            "interaction_risk_mean": (
+                None if interaction_risk is None else float(interaction_risk.mean())
+            ),
             "dense_local_matching_available": local_coverage is not None,
             "local_candidate_coverage_mean": (
                 None if local_coverage is None else float(local_coverage.mean())
@@ -768,7 +773,7 @@ def save_epoch_outputs(output_dir: Path, epoch: int, rows: dict[str, Any], metri
         "trajectory_order_contrast_rms",
         "trajectory_cycle_confidence", "trajectory_common_displacement",
         "trajectory_exclusive_displacement", "trajectory_xy",
-        "trajectory_local_candidate_coverage",
+        "trajectory_local_candidate_coverage", "trajectory_interaction_risk",
         "terminal_prediction_history", "terminal_prediction_no_history", "terminal_target_evidence",
         "terminal_error_history", "terminal_error_no_history", "innovation_token",
         "predicate_differential_state", "predicate_velocity_norm", "predicate_acceleration_norm",

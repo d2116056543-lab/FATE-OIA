@@ -46,7 +46,7 @@ def trajectory_selected_control_loss(
     target: torch.Tensor,
     trajectory_support: torch.Tensor,
     *,
-    margin_fraction: float = 0.10,
+    margin_fraction: float = 0.25,
     trajectory_trust: torch.Tensor | None = None,
     trajectory_order_gate: torch.Tensor | None = None,
     trajectory_uncertainty_gate: torch.Tensor | None = None,
@@ -70,7 +70,9 @@ def trajectory_selected_control_loss(
     selected_margin = sign * (deploy_base + selected_delta)
     control_margin = sign * (deploy_base + control_delta.detach())
     boundary = torch.sigmoid((0.80 - deploy_base.abs()) / 0.20)
-    weight = boundary * (0.10 + 0.90 * trajectory_support.detach().clamp(0.0, 1.0))
+    support = trajectory_support.detach().clamp(0.0, 1.0)
+    support_gate = support / (support + 0.05)
+    weight = boundary * (0.10 + 0.90 * support_gate)
     trust = (
         torch.ones_like(trajectory_support)
         if trajectory_trust is None else trajectory_trust.detach().clamp(0.0, 1.0)
@@ -86,7 +88,7 @@ def trajectory_selected_control_loss(
     )
     reachable_margin = (
         float(margin_fraction) * float(trajectory_cap)
-        * trajectory_support.detach().clamp(0.0, 1.0) * trust * order_gate * uncertainty_gate
+        * support_gate * trust * order_gate * uncertainty_gate
     )
     violation = F.relu(reachable_margin + control_margin - selected_margin)
     return _weighted_mean(violation, weight)

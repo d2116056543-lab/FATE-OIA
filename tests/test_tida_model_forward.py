@@ -154,6 +154,7 @@ def test_trajectory_relational_traffic_is_terminal_anchored_and_in_final_action_
     )
     assert out["trajectory_xy"].shape == (1, 4, 4, 15, 2)
     assert out["trajectory_local_candidate_coverage"].shape == (1, 4, 4, 15)
+    assert out["trajectory_interaction_risk"].shape == (1, 4, 4)
     assert out["trajectory_attention"].shape == (1, 4, 4)
     assert out["terminal_action_patch_xy"].shape == (1, 4, 4, 2)
     torch.testing.assert_close(out["trajectory_xy"][..., -1, :], out["terminal_action_patch_xy"])

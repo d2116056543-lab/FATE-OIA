@@ -955,6 +955,9 @@ def train(args: Any) -> None:
                 "traffic_trajectory_local_candidate_coverage_mean": float(
                     output["trajectory_local_candidate_coverage"].mean().detach().cpu()
                 ),
+                "traffic_trajectory_interaction_risk_mean": float(
+                    output["trajectory_interaction_risk"].mean().detach().cpu()
+                ),
                 "traffic_trajectory_attention_entropy": float(
                     (-(output["trajectory_attention"] * output["trajectory_attention"].clamp_min(1e-8).log())
                      .sum(-1).mean()).detach().cpu()

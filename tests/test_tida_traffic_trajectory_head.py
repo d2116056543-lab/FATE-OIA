@@ -159,3 +159,32 @@ def test_head_reports_nonzero_order_contrast_without_action_prior():
     assert torch.all(out["trajectory_order_contrast_rms"] > 0)
     assert out["trajectory_order_gate"].shape == (1, 4)
     assert torch.all((out["trajectory_order_gate"] > 0) & (out["trajectory_order_gate"] < 1))
+
+
+def test_head_encodes_permutation_invariant_inter_trajectory_risk():
+    args = list(_inputs(batch=1, tracks=3, frames=5))
+    # Two tracks converge in the image plane while the third stays distant.
+    t = torch.linspace(0.0, 1.0, 5)
+    args[2][:, :, 0, :, 0] = -0.8 + 0.7 * t
+    args[2][:, :, 1, :, 0] = 0.8 - 0.7 * t
+    args[2][:, :, 2, :, 0] = 0.9
+    args[2][..., 1] = 0.2
+    args[6] = args[2][..., 1:, :] - args[2][..., :-1, :] - args[5][:, None, None]
+    head = TIDATrafficTrajectoryHead(dim=16, num_actions=4, num_heads=4)
+    original = head(*args)
+    assert original["trajectory_interaction_risk"].shape == (1, 4, 3)
+    assert torch.isfinite(original["trajectory_interaction_risk"]).all()
+    assert original["trajectory_interaction_risk"][..., :2].mean() > original[
+        "trajectory_interaction_risk"
+    ][..., 2].mean()
+
+    permutation = torch.tensor([2, 0, 1])
+    for index in (1, 2, 3, 4, 6, 7):
+        args[index] = args[index].index_select(2, permutation)
+    permuted = head(*args)
+    torch.testing.assert_close(
+        original["trajectory_interaction_risk"].index_select(2, permutation),
+        permuted["trajectory_interaction_risk"],
+        atol=1e-5,
+        rtol=1e-5,
+    )
