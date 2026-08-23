@@ -458,7 +458,7 @@ def traffic_action_effectiveness_metrics(
             "patch_match_confidence_mean": float(patch_confidence.mean()),
             "patch_motion_energy_mean": float(patch_energy.mean()),
             "patch_displacement_xy_mean": patch_displacement.mean((0, 1)).tolist(),
-            "patch_common_displacement_xy_mean": patch_common.mean(0).tolist(),
+            "patch_common_displacement_xy_mean": patch_common.mean((0, 1)).tolist(),
             "patch_exclusive_displacement_xy_by_action": patch_exclusive.mean((0, 1)).tolist(),
             "patch_exclusive_motion_rms_by_action": patch_exclusive.square().mean((0, 1, 3)).sqrt().tolist(),
         },
