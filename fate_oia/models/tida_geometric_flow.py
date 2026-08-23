@@ -91,7 +91,8 @@ class TIDAGeometricFlowEncoder(nn.Module):
         height, width = self.flow_hw
         y = torch.linspace(-1.0, 1.0, height, device=flow.device, dtype=flow.dtype).view(1, 1, 1, height, 1)
         x = torch.linspace(-1.0, 1.0, width, device=flow.device, dtype=flow.dtype).view(1, 1, 1, 1, width)
-        energy = (horizontal.square() + vertical.square() + 1e-8).sqrt()
+        energy_sq = horizontal.square() + vertical.square()
+        energy = energy_sq.clamp_min(1e-12).sqrt() - 1e-6
         global_horizontal = horizontal.mean((-2, -1)).squeeze(-1)
         global_vertical = vertical.mean((-2, -1)).squeeze(-1)
         expansion = (horizontal * x + vertical * y).mean((-2, -1)).squeeze(-1)

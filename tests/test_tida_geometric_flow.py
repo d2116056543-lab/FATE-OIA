@@ -40,12 +40,12 @@ def test_outward_motion_has_positive_expansion():
 
 def test_history_off_is_exact_zero_and_gradients_are_finite():
     model = TIDAGeometricFlowEncoder(hidden_dim=32, flow_hw=(16, 24))
-    frames = torch.rand(2, 5, 3, 32, 48)
+    frames = torch.rand(2, 5, 3, 32, 48, requires_grad=True)
     off = model(frames, torch.zeros(2, 5, dtype=torch.bool))
     assert torch.equal(off["flow_state"], torch.zeros_like(off["flow_state"]))
     on = model(frames, torch.ones(2, 5, dtype=torch.bool))
     on["flow_state"].square().mean().backward()
-    assert all(parameter.grad is None or torch.isfinite(parameter.grad).all() for parameter in model.parameters())
+    assert frames.grad is not None and torch.isfinite(frames.grad).all()
 
 
 def test_region_outputs_are_real_and_not_broadcast_copies():
