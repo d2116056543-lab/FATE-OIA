@@ -95,3 +95,21 @@ def test_geometric_flow_is_in_final_logits_and_keeps_owner_firewall():
         out["video_reason_logits"].sum(), list(model.geometric_heads.action_parameters()), allow_unused=True
     )
     assert all(value is None for value in reason_grads)
+
+
+def test_geometric_raw_branch_learns_while_deployment_scale_is_zero():
+    roles = {"static_anchor": [f"p{i}" for i in range(8)], "dynamic_actor": [f"p{i}" for i in range(8, 24)], "terminal_context": [f"p{i}" for i in range(24, 32)]}
+    model = TIDAOIAModel(
+        _ImageBase(), dim=8, predicate_roles=roles, context_chunk_size=7,
+        geometric_flow_enabled=True, geometric_flow_hidden_dim=32,
+    )
+    out = model(
+        torch.randn(1, 3, 360, 640), torch.randn(1, 14, 3, 192, 344),
+        torch.linspace(-5, 0, 15).unsqueeze(0), torch.ones(1, 15, dtype=torch.bool),
+        temporal_action_scale=0.0, temporal_reason_scale=0.0,
+    )
+    assert torch.equal(out["video_action_logits"], out["image_action_logits"])
+    loss = out["geometric_video_action_logits_raw"].sum() + out["geometric_reason_delta_raw"].sum()
+    loss.backward()
+    assert model.geometric_heads.action_output.weight.grad.abs().sum() > 0
+    assert model.geometric_heads.reason_output.weight.grad.abs().sum() > 0
