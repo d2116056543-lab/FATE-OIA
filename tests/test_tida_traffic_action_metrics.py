@@ -30,3 +30,30 @@ def test_traffic_effectiveness_measures_target_transport_and_attention():
     assert result["attention"]["same_action_mass_mean"] == 0.25
     assert "high_motion" in result["motion_strata"]
     assert "traffic_incremental_action_map" in result["overall"]
+
+
+def test_traffic_effectiveness_reduces_common_motion_over_batch_and_time():
+    target = torch.zeros(2, 4)
+    common = torch.arange(12, dtype=torch.float32).reshape(2, 3, 2)
+    rows = {
+        "image_action": torch.zeros(2, 4),
+        "semantic_action": torch.zeros(2, 4),
+        "traffic_action": torch.zeros(2, 4),
+        "video_action": torch.zeros(2, 4),
+        "image_reason": torch.zeros(2, 21),
+        "semantic_reason": torch.zeros(2, 21),
+        "video_reason": torch.zeros(2, 21),
+        "action_target": target,
+        "reason_target": torch.zeros(2, 21),
+        "traffic_action_delta": torch.zeros(2, 4),
+        "traffic_motion_energy": torch.ones(2, 3),
+        "traffic_action_attention": torch.full((2, 4, 12), 1.0 / 12),
+        "traffic_same_action_mass": torch.full((2, 4), 0.25),
+        "traffic_patch_displacement": torch.zeros(2, 3, 4, 2),
+        "traffic_patch_common_displacement": common,
+        "traffic_patch_exclusive_displacement": torch.zeros(2, 3, 4, 2),
+        "traffic_patch_match_confidence": torch.ones(2, 3, 4),
+        "traffic_patch_motion_energy": torch.ones(2, 3, 4),
+    }
+    result = traffic_action_effectiveness_metrics(rows)
+    assert result["attention"]["patch_common_displacement_xy_mean"] == common.mean((0, 1)).tolist()
