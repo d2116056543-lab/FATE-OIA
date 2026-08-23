@@ -88,11 +88,13 @@ loss:
   reason_flow_no_harm: 0.12
   reason_positive_no_harm: 0.25
   reason_utility_calibration: 0.04
-  geometric_action_aux: 0.20
-  geometric_action_prefix: 0.08
+  geometric_action_aux: 0.08
+  geometric_action_rank: 0.30
+  geometric_action_prefix: 0.04
   geometric_action_delta: 0.002
-  geometric_reason_aux: 0.15
-  geometric_reason_prefix: 0.06
+  geometric_reason_aux: 0.05
+  geometric_reason_rank: 0.01
+  geometric_reason_prefix: 0.03
   geometric_reason_delta: 0.002
 training:
   seed: 20260821

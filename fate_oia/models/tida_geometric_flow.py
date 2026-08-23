@@ -51,6 +51,79 @@ class TIDAGeometricFlowEncoder(nn.Module):
             gray.flatten(0, 1), self.flow_hw, mode="bilinear", align_corners=False
         ).view(batch, steps, 1, *self.flow_hw)
 
+    def _correlation_descriptor(self, gray: torch.Tensor) -> torch.Tensor:
+        padded = F.pad(gray, (1, 1, 1, 1), mode="replicate")
+        grad_x = F.conv2d(padded, self.sobel_x)
+        grad_y = F.conv2d(padded, self.sobel_y)
+        local_mean = F.avg_pool2d(gray, 3, stride=1, padding=1)
+        centered = gray - local_mean
+        local_scale = F.avg_pool2d(centered.square(), 3, stride=1, padding=1).clamp_min(1e-8).sqrt()
+        return F.normalize(torch.cat((centered, grad_x, grad_y, local_scale), dim=1), dim=1, eps=1e-6)
+
+    def _local_correlation_match(
+        self, previous: torch.Tensor, current: torch.Tensor, radius: int = 4
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Match local descriptors without materializing a dense token feature tensor."""
+        previous_descriptor = self._correlation_descriptor(previous)
+        current_descriptor = self._correlation_descriptor(current)
+        batch, channels, height, width = previous_descriptor.shape
+        kernel = 2 * int(radius) + 1
+        candidates = F.unfold(current_descriptor, kernel_size=kernel, padding=radius)
+        candidates = candidates.view(batch, channels, kernel * kernel, height, width)
+        score = (previous_descriptor[:, :, None] * candidates).sum(1) / 0.12
+        probability = score.softmax(1)
+        offset_y, offset_x = torch.meshgrid(
+            torch.arange(-radius, radius + 1, device=previous.device, dtype=previous.dtype),
+            torch.arange(-radius, radius + 1, device=previous.device, dtype=previous.dtype),
+            indexing="ij",
+        )
+        offset_x = offset_x.flatten().view(1, -1, 1, 1)
+        offset_y = offset_y.flatten().view(1, -1, 1, 1)
+        horizontal = (probability * offset_x).sum(1, keepdim=True)
+        vertical = (probability * offset_y).sum(1, keepdim=True)
+        entropy = -(probability * probability.clamp_min(1e-8).log()).sum(1, keepdim=True)
+        confidence = (1.0 - entropy / torch.log(previous.new_tensor(float(kernel * kernel)))).clamp(0.0, 1.0)
+        temporal_strength = F.avg_pool2d((current - previous).abs(), 3, stride=1, padding=1)
+        confidence = confidence * temporal_strength / (temporal_strength + 0.01)
+        return horizontal, vertical, confidence
+
+    def _multiscale_correlation_flow(
+        self, previous: torch.Tensor, current: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        full_x, full_y, full_confidence = self._local_correlation_match(previous, current)
+        coarse_hw = (max(8, previous.shape[-2] // 2), max(8, previous.shape[-1] // 2))
+        coarse_previous = F.interpolate(previous, coarse_hw, mode="bilinear", align_corners=False)
+        coarse_current = F.interpolate(current, coarse_hw, mode="bilinear", align_corners=False)
+        coarse_x, coarse_y, coarse_confidence = self._local_correlation_match(coarse_previous, coarse_current)
+        coarse_x = 2.0 * F.interpolate(coarse_x, previous.shape[-2:], mode="bilinear", align_corners=False)
+        coarse_y = 2.0 * F.interpolate(coarse_y, previous.shape[-2:], mode="bilinear", align_corners=False)
+        coarse_confidence = F.interpolate(
+            coarse_confidence, previous.shape[-2:], mode="bilinear", align_corners=False
+        )
+        weight = (full_confidence + coarse_confidence).clamp_min(1e-6)
+        horizontal = (full_confidence * full_x + coarse_confidence * coarse_x) / weight
+        vertical = (full_confidence * full_y + coarse_confidence * coarse_y) / weight
+        confidence = 1.0 - (1.0 - full_confidence) * (1.0 - coarse_confidence)
+        correlation_x = torch.tanh(horizontal / 4.0) * confidence
+        correlation_y = torch.tanh(vertical / 4.0) * confidence
+
+        # Correlation handles sparse large displacement, while the differential
+        # branch preserves local radial expansion/contraction at object edges.
+        midpoint = 0.5 * (previous + current)
+        padded = F.pad(midpoint, (1, 1, 1, 1), mode="replicate")
+        grad_x = F.conv2d(padded, self.sobel_x)
+        grad_y = F.conv2d(padded, self.sobel_y)
+        grad_t = current - previous
+        denominator = grad_x.square() + grad_y.square() + 2e-3
+        differential_confidence = (denominator - 2e-3).clamp_min(0.0)
+        differential_confidence = differential_confidence / (differential_confidence + 0.02)
+        differential_x = torch.tanh(-grad_t * grad_x / denominator) * differential_confidence
+        differential_y = torch.tanh(-grad_t * grad_y / denominator) * differential_confidence
+        horizontal = 0.75 * correlation_x + 0.25 * differential_x
+        vertical = 0.75 * correlation_y + 0.25 * differential_y
+        combined_confidence = 1.0 - (1.0 - confidence) * (1.0 - differential_confidence)
+        return horizontal, vertical, combined_confidence
+
     def forward(
         self,
         frames: torch.Tensor,
@@ -61,19 +134,12 @@ class TIDAGeometricFlowEncoder(nn.Module):
             raise ValueError("frames and valid mask must be [B,T,3,H,W] and [B,T]")
         gray = self._gray(frames)
         previous, current = gray[:, :-1], gray[:, 1:]
-        midpoint = 0.5 * (previous + current)
-        flat = midpoint.flatten(0, 1)
-        padded = F.pad(flat, (1, 1, 1, 1), mode="replicate")
-        grad_x = F.conv2d(padded, self.sobel_x).view_as(midpoint)
-        grad_y = F.conv2d(padded, self.sobel_y).view_as(midpoint)
-        grad_t = current - previous
-        denominator = grad_x.square() + grad_y.square() + 2e-3
-        horizontal = (-grad_t * grad_x / denominator).tanh()
-        vertical = (-grad_t * grad_y / denominator).tanh()
-        confidence = (denominator - 2e-3).clamp_min(0.0)
-        confidence = confidence / (confidence + 0.02)
-        horizontal = horizontal * confidence
-        vertical = vertical * confidence
+        flat_previous = previous.flatten(0, 1)
+        flat_current = current.flatten(0, 1)
+        horizontal, vertical, confidence = self._multiscale_correlation_flow(flat_previous, flat_current)
+        horizontal = horizontal.view_as(previous)
+        vertical = vertical.view_as(previous)
+        confidence = confidence.view_as(previous)
 
         pair_valid = frame_valid_mask[:, 1:].bool() & frame_valid_mask[:, :-1].bool()
         pair_weight = pair_valid[:, :, None, None, None].to(horizontal.dtype)
@@ -143,6 +209,7 @@ class TIDAGeometricFlowEncoder(nn.Module):
         prefix_states = prefix_states * prefix_available[..., None].to(prefix_states.dtype)
         return {
             "flow_field": flow,
+            "flow_match_confidence": confidence * pair_weight,
             "flow_descriptor_sequence": descriptor,
             "flow_state": flow_state,
             "prefix_flow_states": prefix_states,
