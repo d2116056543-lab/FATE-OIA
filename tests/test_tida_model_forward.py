@@ -71,3 +71,27 @@ def test_full_model_surfaces_conditional_temporal_utility_diagnostics():
     assert out["reason_temporal_budget"].max() <= 0.50 + 1e-7
     assert torch.equal(out["video_action_logits"], out["image_action_logits"] + out["action_temporal_delta"])
     assert torch.equal(out["video_reason_logits"], out["image_reason_logits"] + out["reason_temporal_delta"])
+
+
+def test_geometric_flow_is_in_final_logits_and_keeps_owner_firewall():
+    roles = {"static_anchor": [f"p{i}" for i in range(8)], "dynamic_actor": [f"p{i}" for i in range(8, 24)], "terminal_context": [f"p{i}" for i in range(24, 32)]}
+    model = TIDAOIAModel(
+        _ImageBase(), dim=8, predicate_roles=roles, context_chunk_size=7,
+        geometric_flow_enabled=True, geometric_flow_hidden_dim=32,
+    ).eval()
+    out = model(
+        torch.randn(1, 3, 360, 640), torch.randn(1, 14, 3, 192, 344),
+        torch.linspace(-5, 0, 15).unsqueeze(0), torch.ones(1, 15, dtype=torch.bool),
+        temporal_action_scale=1.0, temporal_reason_scale=1.0,
+    )
+    assert out["geometric_flow_field"].shape == (1, 13, 2, 45, 80)
+    assert out["prefix_video_action_logits"].shape == (1, 4, 4)
+    assert out["prefix_video_reason_logits"].shape == (1, 4, 21)
+    torch.testing.assert_close(
+        out["video_action_logits"],
+        out["image_action_logits"] + out["semantic_action_temporal_delta"] + out["geometric_action_delta"],
+    )
+    reason_grads = torch.autograd.grad(
+        out["video_reason_logits"].sum(), list(model.geometric_heads.action_parameters()), allow_unused=True
+    )
+    assert all(value is None for value in reason_grads)

@@ -56,7 +56,11 @@ def collect_tida_outputs(
     collect_mechanism: bool = False, mechanism_samples: int = 128,
     collect_audit_tensors: bool = False,
 ) -> dict[str, Any]:
-    store = {key: [] for key in ("image_action", "video_action", "image_reason", "video_reason", "action_target", "reason_target")}
+    store = {key: [] for key in (
+        "image_action", "semantic_action", "geometric_action", "video_action",
+        "image_reason", "semantic_reason", "geometric_reason", "video_reason",
+        "prefix_action", "prefix_reason", "action_target", "reason_target",
+    )}
     diagnostics = {key: [] for key in (
         "rho", "action_delta", "reason_delta", "null_mass", "route_entropy",
         "action_evidence_confidence", "action_effective_trust",
@@ -67,6 +71,8 @@ def collect_tida_outputs(
         "action_temporal_target_motion", "reason_temporal_target_motion",
         "reason_pu_weight",
         "velocity_norm", "acceleration_norm",
+        "geometric_motion_energy", "geometric_global_horizontal", "geometric_global_expansion",
+        "geometric_region_motion", "geometric_action_delta", "geometric_reason_delta",
     )}
     audit_keys = (
         "terminal_prediction_history", "terminal_prediction_no_history", "terminal_target_evidence",
@@ -101,8 +107,16 @@ def collect_tida_outputs(
             temporal_action_scale=temporal_scale, temporal_reason_scale=temporal_scale,
         )
         values = {
-            "image_action": output["image_action_logits"], "video_action": output["video_action_logits"],
-            "image_reason": output["image_reason_logits"], "video_reason": output["video_reason_logits"],
+            "image_action": output["image_action_logits"],
+            "semantic_action": output["semantic_video_action_logits"],
+            "geometric_action": output["geometric_video_action_logits"],
+            "video_action": output["video_action_logits"],
+            "image_reason": output["image_reason_logits"],
+            "semantic_reason": output["semantic_video_reason_logits"],
+            "geometric_reason": output["geometric_video_reason_logits"],
+            "video_reason": output["video_reason_logits"],
+            "prefix_action": output["prefix_video_action_logits"],
+            "prefix_reason": output["prefix_video_reason_logits"],
             "action_target": batch["action"], "reason_target": batch["reason"],
         }
         for key, value in values.items():
@@ -135,6 +149,12 @@ def collect_tida_outputs(
             "reason_pu_weight": reason_pu,
             "velocity_norm": output["velocity"].norm(dim=-1),
             "acceleration_norm": output["acceleration"].norm(dim=-1),
+            "geometric_motion_energy": output["geometric_motion_energy"],
+            "geometric_global_horizontal": output["geometric_global_horizontal"],
+            "geometric_global_expansion": output["geometric_global_expansion"],
+            "geometric_region_motion": output["geometric_region_motion"],
+            "geometric_action_delta": output["geometric_action_delta"],
+            "geometric_reason_delta": output["geometric_reason_delta_effective"],
         }.items():
             diagnostics[key].append(value.detach().float().cpu())
         if collect_audit_tensors:
@@ -262,6 +282,79 @@ def temporal_contribution_metrics(rows: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def geometric_branch_metrics(rows: dict[str, Any], thresholds: torch.Tensor | float = 0.5) -> dict[str, Any]:
+    branches = {
+        "image_only": ("image_action", "image_reason"),
+        "semantic_temporal_only": ("semantic_action", "semantic_reason"),
+        "geometric_temporal_only": ("geometric_action", "geometric_reason"),
+        "semantic_plus_geometric": ("video_action", "video_reason"),
+    }
+    return {
+        name: aie_branch_metrics(
+            rows[action_key], rows[reason_key], rows["action_target"], rows["reason_target"], threshold=thresholds
+        )
+        for name, (action_key, reason_key) in branches.items()
+    }
+
+
+def geometric_temporal_effectiveness_metrics(
+    rows: dict[str, Any], thresholds: torch.Tensor | float = 0.5
+) -> dict[str, Any]:
+    score = rows["geometric_motion_energy"].mean(1)
+    low_cut = torch.quantile(score, 0.25)
+    high_cut = torch.quantile(score, 0.75)
+    subset_rows = {}
+    for name, mask in (("low_motion", score <= low_cut), ("high_motion", score >= high_cut)):
+        sliced = {
+            key: value[mask] for key, value in rows.items()
+            if torch.is_tensor(value) and value.shape[0] == mask.shape[0]
+        }
+        branch = geometric_branch_metrics(sliced, thresholds)
+        semantic = branch["semantic_temporal_only"]
+        final = branch["semantic_plus_geometric"]
+        subset_rows[name] = {
+            "count": int(mask.sum()), "motion_energy_mean": float(score[mask].mean()),
+            "branches": branch,
+            "geometric_incremental_action_mf1": final["Act_mF1"] - semantic["Act_mF1"],
+            "geometric_incremental_reason_mf1": final["Exp_mF1"] - semantic["Exp_mF1"],
+            "geometric_incremental_action_map": final["Act_mAP"] - semantic["Act_mAP"],
+            "geometric_incremental_reason_map": final["Exp_mAP"] - semantic["Exp_mAP"],
+        }
+
+    prefix_metrics = []
+    for index, fraction in enumerate((0.25, 0.50, 0.75, 1.0)):
+        metric = aie_branch_metrics(
+            rows["prefix_action"][:, index], rows["prefix_reason"][:, index],
+            rows["action_target"], rows["reason_target"], threshold=thresholds,
+        )
+        prefix_metrics.append({"history_fraction": fraction, **metric})
+    action_auc = sum(row["Act_mF1"] for row in prefix_metrics) / len(prefix_metrics)
+    reason_auc = sum(row["Exp_mF1"] for row in prefix_metrics) / len(prefix_metrics)
+
+    action_sign = 2.0 * rows["action_target"] - 1.0
+    reason_sign = 2.0 * rows["reason_target"] - 1.0
+    action_margin = action_sign * rows["geometric_action_delta"]
+    reason_margin = reason_sign * rows["geometric_reason_delta"]
+    return {
+        "motion_quantiles": {
+            "p25": float(low_cut), "p50": float(torch.quantile(score, 0.5)), "p75": float(high_cut)
+        },
+        "subsets": subset_rows,
+        "anticipation_curve": prefix_metrics,
+        "anticipation_auc": {"action_mf1": action_auc, "reason_mf1": reason_auc},
+        "target_transport": {
+            "action_signed_margin_mean": float(action_margin.mean()),
+            "reason_signed_margin_mean": float(reason_margin.mean()),
+            "action_benefit_rate": float((action_margin > 0).float().mean()),
+            "reason_benefit_rate": float((reason_margin > 0).float().mean()),
+            "action_signed_margin_by_label": action_margin.mean(0).tolist(),
+            "reason_signed_margin_by_label": reason_margin.mean(0).tolist(),
+            "action_delta_rms": float(rows["geometric_action_delta"].square().mean().sqrt()),
+            "reason_delta_rms": float(rows["geometric_reason_delta"].square().mean().sqrt()),
+        },
+    }
+
+
 def fit_train_calib_thresholds(rows: dict[str, Any]) -> dict[str, torch.Tensor]:
     video_logits = torch.cat([rows["video_action"], rows["video_reason"]], dim=-1)
     image_logits = torch.cat([rows["image_action"], rows["image_reason"]], dim=-1)
@@ -314,13 +407,18 @@ def save_epoch_outputs(output_dir: Path, epoch: int, rows: dict[str, Any], metri
     contribution = metrics.get("online", {}).get("temporal_contribution")
     if contribution is not None:
         atomic_write_json(epoch_dir / "temporal_contribution_metrics.json", contribution)
+    geometric_effectiveness = metrics.get("online", {}).get("geometric_effectiveness")
+    if geometric_effectiveness is not None:
+        atomic_write_json(epoch_dir / "geometric_temporal_effectiveness.json", geometric_effectiveness)
     atomic_write_json(epoch_dir / "file_names_test.json", rows["file_names"])
     if "dynamic_concepts" in rows:
         with (epoch_dir / "dynamic_concepts_test.jsonl").open("w", encoding="utf-8", newline="\n") as handle:
             for file_name, concepts in zip(rows["file_names"], rows["dynamic_concepts"]):
                 handle.write(json.dumps({"file_name": file_name, "dynamic_concepts": concepts}, ensure_ascii=False) + "\n")
     tensor_keys = (
-        "image_action", "video_action", "image_reason", "video_reason", "action_target", "reason_target",
+        "image_action", "semantic_action", "geometric_action", "video_action",
+        "image_reason", "semantic_reason", "geometric_reason", "video_reason",
+        "prefix_action", "prefix_reason", "action_target", "reason_target",
         "rho", "action_delta", "reason_delta", "null_mass", "route_entropy",
         "action_evidence_confidence", "action_effective_trust",
         "reason_evidence_confidence", "reason_effective_trust",
@@ -330,6 +428,8 @@ def save_epoch_outputs(output_dir: Path, epoch: int, rows: dict[str, Any], metri
         "action_temporal_target_motion", "reason_temporal_target_motion",
         "reason_pu_weight",
         "velocity_norm", "acceleration_norm",
+        "geometric_motion_energy", "geometric_global_horizontal", "geometric_global_expansion",
+        "geometric_region_motion", "geometric_action_delta", "geometric_reason_delta",
         "terminal_prediction_history", "terminal_prediction_no_history", "terminal_target_evidence",
         "terminal_error_history", "terminal_error_no_history", "innovation_token",
         "predicate_differential_state", "predicate_velocity_norm", "predicate_acceleration_norm",
@@ -367,6 +467,8 @@ def main() -> None:
             "video": branch_metrics(rows, thresholds["video"])["video"],
         },
         "temporal_contribution": temporal_contribution_metrics(rows),
+        "geometric_branches_raw_fixed": geometric_branch_metrics(rows),
+        "geometric_effectiveness": geometric_temporal_effectiveness_metrics(rows),
     }
     atomic_write_json(Path(args.output_dir) / "evaluation.json", metrics)
     print(json.dumps(metrics, default=str), flush=True)

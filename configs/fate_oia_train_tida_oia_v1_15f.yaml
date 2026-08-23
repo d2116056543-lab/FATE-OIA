@@ -60,6 +60,11 @@ model:
   reason_temporal_budget_cap: 0.50
   confidence_aware_reason_gate: true
   reason_gate_temperature: 0.50
+  geometric_flow_enabled: true
+  geometric_flow_hidden_dim: 64
+  geometric_action_cap: 0.20
+  geometric_reason_cap: 0.15
+  geometric_flow_hw: [45, 80]
 loss:
   terminal_hist: 0.25
   terminal_no_history: 0.0
@@ -83,6 +88,12 @@ loss:
   reason_flow_no_harm: 0.12
   reason_positive_no_harm: 0.25
   reason_utility_calibration: 0.04
+  geometric_action_aux: 0.20
+  geometric_action_prefix: 0.08
+  geometric_action_delta: 0.002
+  geometric_reason_aux: 0.15
+  geometric_reason_prefix: 0.06
+  geometric_reason_delta: 0.002
 training:
   seed: 20260821
   epochs: 10
@@ -107,6 +118,8 @@ training:
     flow_transition: 0.00015
     temporal_action: 0.0003
     temporal_reason: 0.00015
+    geometric_action: 0.0005
+    geometric_reason: 0.0003
 memory_probe:
   max_reserved_gib: 45.0
   max_growth_gib: 0.25

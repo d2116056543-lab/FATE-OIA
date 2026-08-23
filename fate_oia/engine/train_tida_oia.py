@@ -21,6 +21,8 @@ from fate_oia.engine.evaluate_tida_oia import (
     collect_tida_outputs,
     dynamic_slice_metrics,
     fit_train_calib_thresholds,
+    geometric_branch_metrics,
+    geometric_temporal_effectiveness_metrics,
     save_epoch_outputs,
     temporal_contribution_metrics,
 )
@@ -255,15 +257,17 @@ def reason_firewall_gradient_audit(
         "reason_partial", "reason_rank", "reason_soft_f1", "reason_delta",
         "reason_flow_credit", "reason_flow_no_harm", "reason_positive_no_harm",
         "reason_utility_calibration",
+        "geometric_reason_aux", "geometric_reason_prefix", "geometric_reason_delta",
     )
     action_names = (
         "action_asl", "action_smooth_ap", "action_base_protect", "action_delta",
         "action_flow_credit", "action_flow_no_harm", "action_utility_calibration",
+        "geometric_action_aux", "geometric_action_prefix", "geometric_action_delta",
     )
     reason_loss = sum(registry.rows[name].weight * registry.rows[name].value for name in reason_names)
     action_loss = sum(registry.rows[name].weight * registry.rows[name].value for name in action_names)
-    action_parameters = list(model.action_reader.parameters())
-    reason_parameters = list(model.reason_reader.parameters())
+    action_parameters = list(model.action_reader.parameters()) + list(model.geometric_heads.action_parameters())
+    reason_parameters = list(model.reason_reader.parameters()) + list(model.geometric_heads.reason_parameters())
     reason_to_action = torch.autograd.grad(
         reason_loss, action_parameters, retain_graph=True, allow_unused=True
     )
@@ -480,6 +484,10 @@ def build_runtime(args: Any, evaluation_only: bool = False) -> TIDARuntime:
         reason_temporal_budget_cap=float(config["model"].get("reason_temporal_budget_cap", 0.50)),
         confidence_aware_reason_gate=bool(config["model"].get("confidence_aware_reason_gate", False)),
         reason_gate_temperature=float(config["model"].get("reason_gate_temperature", 0.5)),
+        geometric_flow_enabled=bool(config["model"].get("geometric_flow_enabled", False)),
+        geometric_flow_hidden_dim=int(config["model"].get("geometric_flow_hidden_dim", 64)),
+        geometric_action_cap=float(config["model"].get("geometric_action_cap", 0.20)),
+        geometric_reason_cap=float(config["model"].get("geometric_reason_cap", 0.15)),
     ).to(device)
     batch_size = int(_arg(args, "batch_size", 2))
     workers = int(_arg(args, "num_workers", config["data"]["num_workers"]))
@@ -657,6 +665,8 @@ def _view_metrics(test_rows, calib_rows):
         "raw_fixed": raw, "deploy": deploy, "thresholds": thresholds,
         "dynamic_slices": dynamic_slice_metrics(test_rows, thresholds["video"]),
         "temporal_contribution": temporal_contribution_metrics(test_rows),
+        "geometric_branches_raw_fixed": geometric_branch_metrics(test_rows),
+        "geometric_effectiveness": geometric_temporal_effectiveness_metrics(test_rows),
     }
 
 

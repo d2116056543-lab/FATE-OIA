@@ -8,6 +8,7 @@ from torch import nn
 from .tida_action_reader import TIDAActionReader
 from .tida_context_encoder import TIDAContextEncoder
 from .tida_flow_transition_bank import TIDAFlowTransitionBank
+from .tida_geometric_flow import TIDAGeometricFlowDecisionHeads, TIDAGeometricFlowEncoder
 from .tida_predicate_differential import TIDAPredicateDifferential
 from .tida_reason_reader import TIDAReasonReader
 from .tida_temporal_encoder import TIDATemporalEncoder
@@ -125,6 +126,10 @@ class TIDAOIAModel(nn.Module):
         reason_temporal_budget_cap: float = 0.50,
         confidence_aware_reason_gate: bool = False,
         reason_gate_temperature: float = 0.5,
+        geometric_flow_enabled: bool = False,
+        geometric_flow_hidden_dim: int = 64,
+        geometric_action_cap: float = 0.20,
+        geometric_reason_cap: float = 0.15,
     ) -> None:
         super().__init__()
         self.image_model = image_model
@@ -167,6 +172,18 @@ class TIDAOIAModel(nn.Module):
         )
         self.confidence_aware_reason_gate = bool(confidence_aware_reason_gate)
         self.reason_gate_temperature = float(reason_gate_temperature)
+        self.geometric_flow_enabled = bool(geometric_flow_enabled)
+        self.geometric_flow = TIDAGeometricFlowEncoder(hidden_dim=geometric_flow_hidden_dim)
+        self.geometric_heads = TIDAGeometricFlowDecisionHeads(
+            hidden_dim=geometric_flow_hidden_dim,
+            num_actions=num_actions,
+            num_reasons=num_reasons,
+            action_cap=geometric_action_cap,
+            reason_cap=geometric_reason_cap,
+        )
+        if not self.geometric_flow_enabled:
+            for parameter in self.geometric_heads.parameters():
+                parameter.requires_grad = False
         self.query_identity = nn.Parameter(torch.randn(num_actions + num_predicates, dim) * 0.02)
         self.predicate_identity = nn.Parameter(torch.randn(num_predicates, dim) * 0.02)
         self.num_actions = int(num_actions)
@@ -221,6 +238,9 @@ class TIDAOIAModel(nn.Module):
         owners: dict[str, list[nn.Parameter]] = {}
         for owner, module_name in self.OWNER_MODULES.items():
             owners[owner] = [parameter for parameter in getattr(self, module_name).parameters() if parameter.requires_grad]
+        if self.geometric_flow_enabled:
+            owners["geometric_action"] = list(self.geometric_heads.action_parameters())
+            owners["geometric_reason"] = list(self.geometric_heads.reason_parameters())
         # Query identities are the shortcut-free prior for terminal prediction.
         owners["history_reader"] += [self.query_identity, self.predicate_identity]
         return owners
@@ -242,6 +262,7 @@ class TIDAOIAModel(nn.Module):
         *,
         temporal_action_scale: float | torch.Tensor,
         temporal_reason_scale: float | torch.Tensor,
+        geometric: dict[str, torch.Tensor] | None = None,
     ) -> dict[str, Any]:
         action_nodes = image["action_nodes_primary"].detach()
         reason_nodes = image["reason_nodes_primary"].detach()
@@ -297,6 +318,36 @@ class TIDAOIAModel(nn.Module):
             image_logits=image_reason,
         )
         reason_delta_raw = reason["reason_temporal_delta"]
+        geometric = geometric or self._empty_geometric(image_action, image_reason)
+        geometric_action_delta = geometric["geometric_action_delta"] * temporal_action_scale
+        geometric_reason_delta = geometric["geometric_reason_delta"] * temporal_reason_scale
+        geometric_prefix_action_delta = geometric["geometric_prefix_action_delta"] * temporal_action_scale
+        geometric_prefix_reason_delta = geometric["geometric_prefix_reason_delta"] * temporal_reason_scale
+        semantic_action_delta = action["action_temporal_delta"]
+        semantic_reason_delta = reason_delta_raw
+        action_delta = semantic_action_delta + geometric_action_delta
+        reason_delta_raw = semantic_reason_delta + geometric_reason_delta
+        semantic_reason_effective = (
+            confidence_aware_reason_delta(
+                image_reason, semantic_reason_delta, temperature=self.reason_gate_temperature
+            )
+            if self.confidence_aware_reason_gate else semantic_reason_delta
+        )
+        geometric_reason_effective = (
+            confidence_aware_reason_delta(
+                image_reason, geometric_reason_delta, temperature=self.reason_gate_temperature
+            )
+            if self.confidence_aware_reason_gate else geometric_reason_delta
+        )
+        prefix_reason_raw = semantic_reason_delta[:, None] + geometric_prefix_reason_delta
+        prefix_reason_effective = (
+            confidence_aware_reason_delta(
+                image_reason[:, None].expand_as(prefix_reason_raw),
+                prefix_reason_raw,
+                temperature=self.reason_gate_temperature,
+            )
+            if self.confidence_aware_reason_gate else prefix_reason_raw
+        )
         reason_delta = (
             confidence_aware_reason_delta(
                 image_reason, reason_delta_raw, temperature=self.reason_gate_temperature,
@@ -306,13 +357,31 @@ class TIDAOIAModel(nn.Module):
         )
         return {
             **temporal, **innovation, **differential, **flow, **action, **reason,
+            **geometric,
             "terminal_target_evidence": terminal_target_evidence,
             "terminal_query_identity": terminal_query_identity,
             "predicate_innovation_token": xi[:, self.num_actions :],
             "predicate_innovation_reliability": rho[:, self.num_actions :],
             "image_action_logits": image_action,
-            "video_action_logits": image_action + action["action_temporal_delta"],
+            "semantic_action_temporal_delta": semantic_action_delta,
+            "geometric_action_delta": geometric_action_delta,
+            "geometric_prefix_action_delta": geometric_prefix_action_delta,
+            "geometric_prefix_action_logits": image_action[:, None] + geometric_prefix_action_delta,
+            "prefix_video_action_logits": image_action[:, None] + semantic_action_delta[:, None] + geometric_prefix_action_delta,
+            "action_temporal_delta": action_delta,
+            "semantic_video_action_logits": image_action + semantic_action_delta,
+            "geometric_video_action_logits": image_action + geometric_action_delta,
+            "video_action_logits": image_action + action_delta,
             "image_reason_logits": image_reason,
+            "semantic_reason_temporal_delta": semantic_reason_delta,
+            "semantic_reason_temporal_delta_effective": semantic_reason_effective,
+            "semantic_video_reason_logits": image_reason + semantic_reason_effective,
+            "geometric_reason_delta": geometric_reason_delta,
+            "geometric_reason_delta_effective": geometric_reason_effective,
+            "geometric_video_reason_logits": image_reason + geometric_reason_effective,
+            "geometric_prefix_reason_delta": geometric_prefix_reason_delta,
+            "geometric_prefix_reason_logits": image_reason[:, None] + geometric_prefix_reason_delta,
+            "prefix_video_reason_logits": image_reason[:, None] + prefix_reason_effective,
             "reason_temporal_delta_raw": reason_delta_raw,
             "reason_temporal_delta": reason_delta,
             "reason_negative_suppression": (reason_delta_raw - reason_delta).clamp_max(0.0).abs(),
@@ -330,6 +399,65 @@ class TIDAOIAModel(nn.Module):
                 self.predicate_names, differential["predicate_region_mass_velocity"], rho[:, self.num_actions :]
             ),
             "target_predicate_region_mass": target_region_mass,
+        }
+
+    def _empty_geometric(
+        self, image_action: torch.Tensor, image_reason: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        batch = image_action.shape[0]
+        zero_action = torch.zeros_like(image_action)
+        zero_reason = torch.zeros_like(image_reason)
+        return {
+            "geometric_action_delta": zero_action,
+            "geometric_reason_delta": zero_reason,
+            "geometric_prefix_action_delta": zero_action[:, None].expand(-1, 4, -1),
+            "geometric_prefix_reason_delta": zero_reason[:, None].expand(-1, 4, -1),
+            "geometric_motion_energy": image_action.new_zeros(batch, 1),
+            "geometric_global_horizontal": image_action.new_zeros(batch, 1),
+            "geometric_global_expansion": image_action.new_zeros(batch, 1),
+            "geometric_region_motion": image_action.new_zeros(batch, 1, 5, 3),
+            "geometric_flow_field": image_action.new_zeros(batch, 1, 2, 45, 80),
+            "geometric_history_available": torch.zeros(batch, dtype=torch.bool, device=image_action.device),
+        }
+
+    def _encode_geometric(
+        self,
+        context_images: torch.Tensor,
+        timestamps: torch.Tensor,
+        frame_valid_mask: torch.Tensor,
+        intervention: str | None = None,
+    ) -> dict[str, torch.Tensor]:
+        if not self.geometric_flow_enabled:
+            return {}
+        frames = context_images
+        valid = frame_valid_mask[:, :-1]
+        if intervention == "history_off":
+            valid = torch.zeros_like(valid)
+        elif intervention == "repeated_last":
+            frames = frames[:, -1:].expand_as(frames)
+        elif intervention == "time_reverse":
+            frames = frames.flip(1)
+        elif intervention == "time_shuffle":
+            order = torch.cat(
+                (torch.arange(0, frames.shape[1], 2, device=frames.device),
+                 torch.arange(1, frames.shape[1], 2, device=frames.device))
+            )
+            frames = frames.index_select(1, order)
+        measured = self.geometric_flow(frames, valid, timestamps[:, :-1])
+        decisions = self.geometric_heads(measured["flow_state"], measured["history_available"])
+        prefixes = self.geometric_heads.forward_prefixes(
+            measured["prefix_flow_states"], measured["prefix_available"]
+        )
+        return {
+            **decisions,
+            **prefixes,
+            "geometric_motion_energy": measured["motion_energy"],
+            "geometric_global_horizontal": measured["global_horizontal"],
+            "geometric_global_expansion": measured["global_expansion"],
+            "geometric_region_motion": measured["region_motion"],
+            "geometric_flow_field": measured["flow_field"],
+            "geometric_history_available": measured["history_available"],
+            "geometric_prefix_fractions": measured["prefix_fractions"],
         }
 
     def rerun_temporal_from_output(
@@ -354,10 +482,14 @@ class TIDAOIAModel(nn.Module):
         if intervention == "history_off":
             rerun_valid = rerun_valid.clone()
             rerun_valid[:, :-1] = False
+        geometric = self._encode_geometric(
+            output["_geometric_context_images"], output["timestamps"], output["frame_valid_mask"], intervention
+        )
         return self.decode_encoded_history(
             history, output["history_query_region_mass"], output["timestamps"], rerun_valid,
             output["terminal_target_evidence"], output["terminal_query_identity"], output["image_branch"],
             temporal_action_scale=temporal_action_scale, temporal_reason_scale=temporal_reason_scale,
+            geometric=geometric,
         )
 
     def forward(
@@ -406,9 +538,13 @@ class TIDAOIAModel(nn.Module):
             target_evidence, terminal_query_identity, image,
             temporal_action_scale=temporal_action_scale,
             temporal_reason_scale=temporal_reason_scale,
+            geometric=self._encode_geometric(
+                context_images, timestamps, effective_frame_valid_mask, intervention
+            ),
         )
         return {
             **context,
             **temporal_output,
             "image_branch": image,
+            "_geometric_context_images": context_images,
         }
