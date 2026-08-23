@@ -4,6 +4,7 @@ from typing import Any
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from .tida_action_motion_cross_attention import TIDAActionMotionCrossAttention
 from .tida_action_reader import TIDAActionReader
@@ -303,6 +304,8 @@ class TIDAOIAModel(nn.Module):
         terminal_action_patch_tokens: torch.Tensor | None = None,
         terminal_action_patch_xy: torch.Tensor | None = None,
         terminal_action_patch_weight: torch.Tensor | None = None,
+        dense_trajectory_patch_tokens: torch.Tensor | None = None,
+        dense_trajectory_grid_hw: tuple[int, int] | None = None,
     ) -> dict[str, Any]:
         action_nodes = image["action_nodes_primary"].detach()
         reason_nodes = image["reason_nodes_primary"].detach()
@@ -396,6 +399,8 @@ class TIDAOIAModel(nn.Module):
                 torch.cat((history_action_patch_xy, terminal_action_patch_xy[:, None]), dim=1),
                 torch.cat((history_action_patch_weight, terminal_action_patch_weight[:, None]), dim=1),
                 frame_valid_mask,
+                dense_patch_tokens=dense_trajectory_patch_tokens,
+                dense_grid_hw=dense_trajectory_grid_hw,
             )
             trajectory = {
                 **trajectory_field,
@@ -580,6 +585,9 @@ class TIDAOIAModel(nn.Module):
             "trajectory_common_displacement": image_action.new_zeros(batch, intervals, 2),
             "trajectory_exclusive_displacement": image_action.new_zeros(batch, actions, tracks, intervals, 2),
             "trajectory_anchor_weight": image_action.new_zeros(batch, actions, tracks),
+            "trajectory_local_candidate_coverage": image_action.new_zeros(
+                batch, actions, tracks, total_frames
+            ),
         }
 
     @staticmethod
@@ -688,6 +696,9 @@ class TIDAOIAModel(nn.Module):
         patch_tokens = self._intervene_patch_history(output["history_action_patch_tokens"], intervention)
         patch_xy = self._intervene_patch_history(output["history_action_patch_xy"], intervention)
         patch_weight = self._intervene_patch_history(output["history_action_patch_weight"], intervention)
+        dense_history = self._intervene_patch_history(
+            output["history_patch_tokens_last"], intervention
+        )
         return self.decode_encoded_history(
             history, output["history_query_region_mass"], output["timestamps"], rerun_valid,
             output["terminal_target_evidence"], output["terminal_query_identity"], output["image_branch"],
@@ -699,6 +710,10 @@ class TIDAOIAModel(nn.Module):
             terminal_action_patch_tokens=output["terminal_action_patch_tokens"],
             terminal_action_patch_xy=output["terminal_action_patch_xy"],
             terminal_action_patch_weight=output["terminal_action_patch_weight"],
+            dense_trajectory_patch_tokens=torch.cat(
+                (dense_history, output["terminal_patch_tokens_context_grid"][:, None]), dim=1
+            ),
+            dense_trajectory_grid_hw=output["history_grid_hw"],
         )
 
     def forward(
@@ -735,6 +750,16 @@ class TIDAOIAModel(nn.Module):
             context_images, action_nodes, predicate_tokens, self.predicate_identity,
             canonicalize_horizontal_flip=canonicalize_horizontal_flip,
         )
+        target_grid_height, target_grid_width = target_field["grid_hw"]
+        history_grid_height, history_grid_width = context["history_grid_hw"]
+        terminal_patch_tokens_context_grid = F.interpolate(
+            target_field["patch_tokens_last"].transpose(1, 2).reshape(
+                target_image.shape[0], -1, target_grid_height, target_grid_width
+            ),
+            size=(history_grid_height, history_grid_width),
+            mode="bilinear",
+            align_corners=True,
+        ).flatten(2).transpose(1, 2)
         history_tokens = context["history_query_tokens"]
         effective_frame_valid_mask = frame_valid_mask
         if intervention is not None:
@@ -770,6 +795,12 @@ class TIDAOIAModel(nn.Module):
             terminal_action_patch_tokens=terminal_patches["tokens"],
             terminal_action_patch_xy=terminal_patches["xy"],
             terminal_action_patch_weight=terminal_patches["weights"],
+            dense_trajectory_patch_tokens=torch.cat(
+                (self._intervene_patch_history(context["history_patch_tokens_last"], intervention),
+                 terminal_patch_tokens_context_grid[:, None]),
+                dim=1,
+            ),
+            dense_trajectory_grid_hw=context["history_grid_hw"],
         )
         return {
             **context,
@@ -779,5 +810,6 @@ class TIDAOIAModel(nn.Module):
             "terminal_action_patch_xy": terminal_patches["xy"],
             "terminal_action_patch_weight": terminal_patches["weights"],
             "terminal_action_patch_indices": terminal_patches["indices"],
+            "terminal_patch_tokens_context_grid": terminal_patch_tokens_context_grid,
             "_geometric_context_images": context_images,
         }

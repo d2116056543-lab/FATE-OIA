@@ -87,6 +87,7 @@ def collect_tida_outputs(
         "trajectory_order_contrast_rms",
         "trajectory_cycle_confidence", "trajectory_common_displacement",
         "trajectory_exclusive_displacement", "trajectory_xy",
+        "trajectory_local_candidate_coverage",
     )}
     audit_keys = (
         "terminal_prediction_history", "terminal_prediction_no_history", "terminal_target_evidence",
@@ -197,6 +198,9 @@ def collect_tida_outputs(
             "trajectory_common_displacement": output["trajectory_common_displacement"],
             "trajectory_exclusive_displacement": output["trajectory_exclusive_displacement"],
             "trajectory_xy": output["trajectory_xy"],
+            "trajectory_local_candidate_coverage": output[
+                "trajectory_local_candidate_coverage"
+            ],
         }.items():
             diagnostics[key].append(value.detach().float().cpu())
         if collect_audit_tensors:
@@ -617,6 +621,8 @@ def trajectory_traffic_effectiveness_metrics(
         "tp_to_fn": (semantic_pred & (~trajectory_pred) & positive).sum(0).tolist(),
         "tn_to_fp": ((~semantic_pred) & trajectory_pred & (~positive)).sum(0).tolist(),
     }
+    local_coverage = rows.get("trajectory_local_candidate_coverage")
+    common_displacement = rows.get("trajectory_common_displacement")
     return {
         "overall": {
             "semantic": semantic, "trajectory_only": trajectory, "final": final,
@@ -645,6 +651,18 @@ def trajectory_traffic_effectiveness_metrics(
             "order_contrast_rms_mean": float(rows["trajectory_order_contrast_rms"].mean()),
             "order_gate_mean": float(rows["trajectory_order_gate"].mean()),
             "uncertainty_gate_mean": float(rows["trajectory_uncertainty_gate"].mean()),
+            "dense_local_matching_available": local_coverage is not None,
+            "local_candidate_coverage_mean": (
+                None if local_coverage is None else float(local_coverage.mean())
+            ),
+            "exclusive_to_common_motion_ratio": (
+                None
+                if common_displacement is None
+                else float(
+                    rows["trajectory_exclusive_displacement"].square().mean().sqrt()
+                    / common_displacement.square().mean().sqrt().clamp_min(1e-8)
+                )
+            ),
         },
         "decision_flips": decision_flips,
         "causal_temporal_interventions": causal,
@@ -746,6 +764,7 @@ def save_epoch_outputs(output_dir: Path, epoch: int, rows: dict[str, Any], metri
         "trajectory_order_contrast_rms",
         "trajectory_cycle_confidence", "trajectory_common_displacement",
         "trajectory_exclusive_displacement", "trajectory_xy",
+        "trajectory_local_candidate_coverage",
         "terminal_prediction_history", "terminal_prediction_no_history", "terminal_target_evidence",
         "terminal_error_history", "terminal_error_no_history", "innovation_token",
         "predicate_differential_state", "predicate_velocity_norm", "predicate_acceleration_norm",
@@ -769,11 +788,19 @@ def main() -> None:
     parser.add_argument("--image-checkpoint", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--max-samples", type=int)
+    parser.add_argument("--collect-mechanism", action="store_true")
     args = parser.parse_args()
     from fate_oia.engine.train_tida_oia import build_runtime
 
     runtime = build_runtime(args, evaluation_only=True)
-    rows = collect_tida_outputs(runtime.model, runtime.loaders["test"], runtime.device)
+    rows = collect_tida_outputs(
+        runtime.model,
+        runtime.loaders["test"],
+        runtime.device,
+        collect_mechanism=args.collect_mechanism,
+        mechanism_samples=args.max_samples or 128,
+    )
     calib = collect_tida_outputs(runtime.model, runtime.loaders["train_calib"], runtime.device)
     thresholds = fit_train_calib_thresholds(calib)
     metrics = {

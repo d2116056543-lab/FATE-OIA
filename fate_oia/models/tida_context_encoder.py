@@ -53,7 +53,7 @@ class TIDAContextEncoder(nn.Module):
         if context_images.ndim != 5:
             raise ValueError("context_images must be [B,T,3,H,W]")
         batch, frames, channels, height, width = context_images.shape
-        tokens, attentions, region_masses = [], [], []
+        tokens, attentions, region_masses, dense_patch_fields = [], [], [], []
         action_patch_tokens, action_patch_xy, action_patch_weights = [], [], []
         for start in range(0, frames, self.context_chunk_size):
             stop = min(start + self.context_chunk_size, frames)
@@ -76,6 +76,9 @@ class TIDAContextEncoder(nn.Module):
             tokens.append(read["query_tokens"].reshape(batch, repeats, -1, action_nodes.shape[-1]))
             attentions.append(read["query_attention"].reshape(batch, repeats, -1, field["patch_tokens_by_layer"].shape[2]))
             region_masses.append(read["query_region_mass"].reshape(batch, repeats, -1, 5))
+            dense_patch_fields.append(
+                field["patch_tokens_last"].reshape(batch, repeats, -1, action_nodes.shape[-1])
+            )
             selected = self.select_action_patches(
                 field, read["query_attention"][:, : action_nodes.shape[1]]
             )
@@ -90,6 +93,7 @@ class TIDAContextEncoder(nn.Module):
             "history_action_patch_tokens": torch.cat(action_patch_tokens, dim=1),
             "history_action_patch_xy": torch.cat(action_patch_xy, dim=1),
             "history_action_patch_weight": torch.cat(action_patch_weights, dim=1),
+            "history_patch_tokens_last": torch.cat(dense_patch_fields, dim=1),
             "history_grid_hw": (height // self.dino_extractor.patch_size, width // self.dino_extractor.patch_size),
         }
 
