@@ -73,6 +73,18 @@ def action_base_protect_loss(
     return ((1.0 - rho) * F.relu(image_margin - video_margin - float(epsilon))).mean(0).mean()
 
 
+def _target_motion_weight(motion_energy: torch.Tensor, num_targets: int) -> torch.Tensor:
+    if motion_energy.ndim == 2:
+        motion = motion_energy.detach().mean(1, keepdim=True).expand(-1, num_targets)
+        scale = 0.05
+    elif motion_energy.ndim == 3 and motion_energy.shape[-1] == num_targets:
+        motion = motion_energy.detach().mean(1)
+        scale = 0.10
+    else:
+        raise ValueError("motion_energy must be [B,T] or [B,T,num_targets]")
+    return 0.25 + 0.75 * torch.tanh(motion / scale)
+
+
 def target_conditioned_geometric_correction_loss(
     base_logits: torch.Tensor,
     geometric_delta: torch.Tensor,
@@ -87,8 +99,7 @@ def target_conditioned_geometric_correction_loss(
     base_margin = sign * base_logits.detach()
     final_margin = sign * (base_logits.detach() + geometric_delta)
     need = torch.sigmoid((0.75 - base_margin) / 0.25).detach()
-    motion = motion_energy.detach().mean(1, keepdim=True)
-    motion_weight = 0.5 + 0.5 * torch.tanh(motion / 0.05)
+    motion_weight = _target_motion_weight(motion_energy, base_logits.shape[1])
     weight = need * motion_weight
     if label_weight is not None:
         weight = weight * label_weight.detach()
@@ -113,10 +124,10 @@ def target_conditioned_geometric_ranking_loss(
 ) -> torch.Tensor:
     """Improve hard positive-negative ordering using only motion-conditioned residuals."""
     final_logits = base_logits.detach() + geometric_delta
-    motion = motion_energy.detach().mean(1)
-    sample_motion_weight = 0.5 + 0.5 * torch.tanh(motion / 0.05)
+    target_motion_weight = _target_motion_weight(motion_energy, base_logits.shape[1])
     losses = []
     for label in range(base_logits.shape[1]):
+        sample_motion_weight = target_motion_weight[:, label]
         positive_mask = target[:, label] > 0.5
         negative_mask = ~positive_mask
         positive = final_logits[positive_mask, label]
@@ -373,14 +384,14 @@ def build_tida_loss_registry(
         "traffic_action_aux",
         target_conditioned_geometric_correction_loss(
             output["semantic_video_action_logits"], output["traffic_action_delta_raw"],
-            action_target, output["traffic_motion_energy"],
+            action_target, output["traffic_patch_effective_motion"],
         ),
     )
     registry.add(
         "traffic_action_rank",
         target_conditioned_geometric_ranking_loss(
             output["semantic_video_action_logits"], output["traffic_action_delta_raw"],
-            action_target, output["traffic_motion_energy"], None,
+            action_target, output["traffic_patch_effective_motion"], None,
             rank_reference.get("action_logits"), rank_reference.get("action_target"),
         ),
     )

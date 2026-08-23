@@ -99,3 +99,5 @@ def test_sparse_patch_correspondence_separates_common_and_action_specific_motion
     torch.testing.assert_close(raw, torch.tensor([0.2, 0.6]), atol=1e-4, rtol=0)
     torch.testing.assert_close(exclusive, torch.tensor([-0.2, 0.2]), atol=1e-4, rtol=0)
     torch.testing.assert_close(exclusive.mean(), torch.tensor(0.0), atol=1e-5, rtol=0)
+    assert result["traffic_patch_exclusive_motion_energy"].shape == (1, 1, 2)
+    assert result["traffic_patch_effective_motion"].min() > 0

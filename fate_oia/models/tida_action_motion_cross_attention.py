@@ -86,6 +86,7 @@ class TIDAActionMotionCrossAttention(nn.Module):
         patch_displacement = action_nodes.new_zeros(batch, frames - 1, self.num_actions, 2)
         patch_common_displacement = action_nodes.new_zeros(batch, frames - 1, 2)
         patch_exclusive_displacement = action_nodes.new_zeros(batch, frames - 1, self.num_actions, 2)
+        patch_exclusive_motion_energy = action_nodes.new_zeros(batch, frames - 1, self.num_actions)
         patch_confidence = action_nodes.new_zeros(batch, frames - 1, self.num_actions)
         patch_motion_energy = action_nodes.new_zeros(batch, frames - 1, self.num_actions)
         if patch_tokens is not None or patch_xy is not None or patch_weight is not None:
@@ -117,7 +118,7 @@ class TIDAActionMotionCrossAttention(nn.Module):
             magnitude = displacement.square().sum(-1).sqrt()
             radial = (displacement * patch_xy[:, :-1]).sum(-1)
             patch_motion_energy = (source_weight * magnitude).sum(-1)
-            exclusive_motion_energy = patch_exclusive_displacement.square().sum(-1).sqrt()
+            patch_exclusive_motion_energy = patch_exclusive_displacement.square().sum(-1).sqrt()
             expansion = (source_weight * radial).sum(-1)
             patch_confidence = confidence_per_action
             patch_descriptor = torch.cat(
@@ -126,7 +127,7 @@ class TIDAActionMotionCrossAttention(nn.Module):
                     patch_displacement,
                     patch_exclusive_displacement,
                     patch_motion_energy[..., None],
-                    exclusive_motion_energy[..., None],
+                    patch_exclusive_motion_energy[..., None],
                     expansion[..., None],
                     patch_confidence[..., None],
                 ),
@@ -169,6 +170,8 @@ class TIDAActionMotionCrossAttention(nn.Module):
             "traffic_patch_displacement": patch_displacement,
             "traffic_patch_common_displacement": patch_common_displacement,
             "traffic_patch_exclusive_displacement": patch_exclusive_displacement,
+            "traffic_patch_exclusive_motion_energy": patch_exclusive_motion_energy,
+            "traffic_patch_effective_motion": patch_exclusive_motion_energy * patch_confidence,
             "traffic_patch_match_confidence": patch_confidence,
             "traffic_patch_motion_energy": patch_motion_energy,
             "traffic_history_available": history_available,

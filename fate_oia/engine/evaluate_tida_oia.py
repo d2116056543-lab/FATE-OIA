@@ -77,7 +77,8 @@ def collect_tida_outputs(
         "traffic_same_action_mass",
         "traffic_patch_displacement", "traffic_patch_common_displacement",
         "traffic_patch_exclusive_displacement", "traffic_patch_match_confidence",
-        "traffic_patch_motion_energy",
+        "traffic_patch_motion_energy", "traffic_patch_exclusive_motion_energy",
+        "traffic_patch_effective_motion",
     )}
     audit_keys = (
         "terminal_prediction_history", "terminal_prediction_no_history", "terminal_target_evidence",
@@ -170,6 +171,8 @@ def collect_tida_outputs(
             "traffic_patch_exclusive_displacement": output["traffic_patch_exclusive_displacement"],
             "traffic_patch_match_confidence": output["traffic_patch_match_confidence"],
             "traffic_patch_motion_energy": output["traffic_patch_motion_energy"],
+            "traffic_patch_exclusive_motion_energy": output["traffic_patch_exclusive_motion_energy"],
+            "traffic_patch_effective_motion": output["traffic_patch_effective_motion"],
         }.items():
             diagnostics[key].append(value.detach().float().cpu())
         if collect_audit_tensors:
@@ -386,7 +389,12 @@ def traffic_action_effectiveness_metrics(
         rows["traffic_action"], rows["image_reason"],
         rows["action_target"], rows["reason_target"], threshold=thresholds,
     )
-    score = rows["traffic_motion_energy"].mean(1)
+    if "traffic_patch_effective_motion" in rows:
+        score = rows["traffic_patch_effective_motion"].mean((1, 2))
+        motion_source = "exclusive_patch_motion_x_match_confidence"
+    else:
+        score = rows["traffic_motion_energy"].mean(1)
+        motion_source = "action_token_velocity"
     low_cut, high_cut = torch.quantile(score, 0.25), torch.quantile(score, 0.75)
     strata: dict[str, Any] = {}
     for name, mask in (("low_motion", score <= low_cut), ("high_motion", score >= high_cut)):
@@ -405,7 +413,43 @@ def traffic_action_effectiveness_metrics(
             "traffic_incremental_action_map": final_slice["Act_mAP"] - semantic_slice["Act_mAP"],
             "semantic": semantic_slice,
             "final": final_slice,
-        }
+            }
+
+    benefit_curve = []
+    boundaries = torch.quantile(score, torch.linspace(0, 1, 6, device=score.device))
+    for index in range(5):
+        lower, upper = boundaries[index], boundaries[index + 1]
+        mask = (score >= lower) & ((score <= upper) if index == 4 else (score < upper))
+        if not mask.any():
+            benefit_curve.append({"bin": index, "count": 0, "available": False})
+            continue
+        semantic_slice = aie_branch_metrics(
+            rows["semantic_action"][mask], rows["semantic_reason"][mask],
+            rows["action_target"][mask], rows["reason_target"][mask], threshold=thresholds,
+        )
+        final_slice = aie_branch_metrics(
+            rows["video_action"][mask], rows["video_reason"][mask],
+            rows["action_target"][mask], rows["reason_target"][mask], threshold=thresholds,
+        )
+        benefit_curve.append({
+            "bin": index, "count": int(mask.sum()), "available": True,
+            "motion_mean": float(score[mask].mean()),
+            "action_mf1_delta": final_slice["Act_mF1"] - semantic_slice["Act_mF1"],
+            "action_map_delta": final_slice["Act_mAP"] - semantic_slice["Act_mAP"],
+        })
+
+    threshold = torch.as_tensor(thresholds, device=score.device, dtype=rows["semantic_action"].dtype)
+    if threshold.ndim:
+        threshold = threshold.flatten()[: rows["action_target"].shape[1]]
+    semantic_pred = torch.sigmoid(rows["semantic_action"]) >= threshold
+    final_pred = torch.sigmoid(rows["video_action"]) >= threshold
+    positive = rows["action_target"] > 0.5
+    flip_counts = {
+        "fn_to_tp": ((~semantic_pred) & final_pred & positive).sum(0).tolist(),
+        "fp_to_tn": (semantic_pred & (~final_pred) & (~positive)).sum(0).tolist(),
+        "tp_to_fn": (semantic_pred & (~final_pred) & positive).sum(0).tolist(),
+        "tn_to_fp": ((~semantic_pred) & final_pred & (~positive)).sum(0).tolist(),
+    }
 
     sign = 2.0 * rows["action_target"] - 1.0
     signed_margin = sign * rows["traffic_action_delta"]
@@ -440,9 +484,12 @@ def traffic_action_effectiveness_metrics(
             "traffic_incremental_action_map": final["Act_mAP"] - semantic["Act_mAP"],
         },
         "motion_quantiles": {
+            "source": motion_source,
             "p25": float(low_cut), "p50": float(torch.quantile(score, 0.5)), "p75": float(high_cut),
         },
         "motion_strata": strata,
+        "dynamic_benefit_curve": benefit_curve,
+        "corrective_flip_counts_by_action": flip_counts,
         "target_transport": {
             "action_signed_margin_mean": float(signed_margin.mean()),
             "action_benefit_rate": float((signed_margin > 0).float().mean()),
@@ -547,7 +594,8 @@ def save_epoch_outputs(output_dir: Path, epoch: int, rows: dict[str, Any], metri
         "traffic_same_action_mass",
         "traffic_patch_displacement", "traffic_patch_common_displacement",
         "traffic_patch_exclusive_displacement", "traffic_patch_match_confidence",
-        "traffic_patch_motion_energy",
+        "traffic_patch_motion_energy", "traffic_patch_exclusive_motion_energy",
+        "traffic_patch_effective_motion",
         "terminal_prediction_history", "terminal_prediction_no_history", "terminal_target_evidence",
         "terminal_error_history", "terminal_error_no_history", "innovation_token",
         "predicate_differential_state", "predicate_velocity_norm", "predicate_acceleration_norm",
