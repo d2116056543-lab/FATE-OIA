@@ -66,7 +66,7 @@ model:
   geometric_reason_cap: 0.15
   geometric_flow_hw: [45, 80]
   traffic_action_enabled: true
-  traffic_action_cap: 0.15
+  traffic_action_cap: 0.05
   traffic_motion_topk: 12
 loss:
   terminal_hist: 0.25
@@ -128,7 +128,7 @@ training:
     temporal_reason: 0.00015
     geometric_action: 0.0005
     geometric_reason: 0.0003
-    traffic_action: 0.0005
+    traffic_action: 0.00015
 memory_probe:
   max_reserved_gib: 45.0
   max_growth_gib: 0.25
