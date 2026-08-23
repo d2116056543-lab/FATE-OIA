@@ -23,7 +23,7 @@ def test_selected_control_requires_ordered_trajectory_to_improve_gt_margin():
     base = torch.zeros(2, 2)
     target = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
     support = torch.ones_like(base)
-    selected = torch.tensor([[0.01, -0.01], [-0.01, 0.01]], requires_grad=True)
+    selected = torch.tensor([[0.004, -0.004], [-0.004, 0.004]], requires_grad=True)
     control_good = torch.zeros_like(selected)
     control_bad = 2.0 * selected.detach()
     good_loss = trajectory_selected_control_loss(base, selected, control_good, target, support)
@@ -47,3 +47,17 @@ def test_boundary_correction_uses_train_calib_deploy_boundary():
         base, opposed, target, support, deploy_boundary_logits=deploy_boundary
     )
     assert aligned_loss < opposed_loss
+
+
+def test_selected_control_margin_is_reachable_at_low_support():
+    base = torch.zeros(1, 1)
+    target = torch.ones_like(base)
+    support = torch.full_like(base, 0.10)
+    trust = torch.full_like(base, 0.25)
+    selected = torch.tensor([[0.0003]], requires_grad=True)
+    control = torch.zeros_like(selected)
+    loss = trajectory_selected_control_loss(
+        base, selected, control, target, support,
+        trajectory_trust=trust, trajectory_cap=0.08,
+    )
+    assert loss.item() == 0.0

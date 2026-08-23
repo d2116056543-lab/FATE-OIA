@@ -423,6 +423,8 @@ def build_tida_loss_registry(
             output["semantic_video_action_logits"], output["traffic_trajectory_delta_raw"],
             value["traffic_trajectory_delta_raw"], action_target,
             output["traffic_trajectory_support"],
+            trajectory_trust=output["traffic_trajectory_trust"],
+            trajectory_cap=0.08,
             deploy_boundary_logits=deploy_action_boundary_logits,
         )
         for value in counterfactual_outputs.values()

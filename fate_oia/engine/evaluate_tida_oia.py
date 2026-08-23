@@ -585,6 +585,20 @@ def trajectory_traffic_effectiveness_metrics(
         for name, value in interventions.items()
         if name in {"time_shuffle", "time_reverse", "repeated_last", "history_off"}
     }
+    threshold = torch.as_tensor(
+        thresholds, device=rows["semantic_action"].device, dtype=rows["semantic_action"].dtype
+    )
+    if threshold.ndim:
+        threshold = threshold.flatten()[: rows["action_target"].shape[1]]
+    semantic_pred = torch.sigmoid(rows["semantic_action"]) >= threshold
+    trajectory_pred = torch.sigmoid(rows["semantic_trajectory_action"]) >= threshold
+    positive = rows["action_target"] > 0.5
+    decision_flips = {
+        "fn_to_tp": ((~semantic_pred) & trajectory_pred & positive).sum(0).tolist(),
+        "fp_to_tn": (semantic_pred & (~trajectory_pred) & (~positive)).sum(0).tolist(),
+        "tp_to_fn": (semantic_pred & (~trajectory_pred) & positive).sum(0).tolist(),
+        "tn_to_fp": ((~semantic_pred) & trajectory_pred & (~positive)).sum(0).tolist(),
+    }
     return {
         "overall": {
             "semantic": semantic, "trajectory_only": trajectory, "final": final,
@@ -609,6 +623,7 @@ def trajectory_traffic_effectiveness_metrics(
             "effective_track_count_mean": float(torch.exp(entropy).mean()),
             "exclusive_motion_rms": float(rows["trajectory_exclusive_displacement"].square().mean().sqrt()),
         },
+        "decision_flips": decision_flips,
         "causal_temporal_interventions": causal,
     }
 
@@ -670,6 +685,11 @@ def save_epoch_outputs(output_dir: Path, epoch: int, rows: dict[str, Any], metri
     traffic_effectiveness = metrics.get("online", {}).get("traffic_action_effectiveness")
     if traffic_effectiveness is not None:
         atomic_write_json(epoch_dir / "traffic_action_effectiveness.json", traffic_effectiveness)
+    trajectory_effectiveness = metrics.get("online", {}).get("trajectory_traffic_effectiveness")
+    if trajectory_effectiveness is not None:
+        atomic_write_json(
+            epoch_dir / "trajectory_traffic_effectiveness.json", trajectory_effectiveness
+        )
     atomic_write_json(epoch_dir / "file_names_test.json", rows["file_names"])
     if "dynamic_concepts" in rows:
         with (epoch_dir / "dynamic_concepts_test.jsonl").open("w", encoding="utf-8", newline="\n") as handle:
@@ -696,6 +716,10 @@ def save_epoch_outputs(output_dir: Path, epoch: int, rows: dict[str, Any], metri
         "traffic_patch_exclusive_displacement", "traffic_patch_match_confidence",
         "traffic_patch_motion_energy", "traffic_patch_exclusive_motion_energy",
         "traffic_patch_effective_motion",
+        "traffic_trajectory_delta", "traffic_trajectory_support", "trajectory_attention",
+        "trajectory_speed", "trajectory_acceleration", "trajectory_radial_motion",
+        "trajectory_cycle_confidence", "trajectory_common_displacement",
+        "trajectory_exclusive_displacement", "trajectory_xy",
         "terminal_prediction_history", "terminal_prediction_no_history", "terminal_target_evidence",
         "terminal_error_history", "terminal_error_no_history", "innovation_token",
         "predicate_differential_state", "predicate_velocity_norm", "predicate_acceleration_norm",
@@ -736,6 +760,7 @@ def main() -> None:
         "geometric_branches_raw_fixed": geometric_branch_metrics(rows),
         "geometric_effectiveness": geometric_temporal_effectiveness_metrics(rows),
         "traffic_action_effectiveness": traffic_action_effectiveness_metrics(rows),
+        "trajectory_traffic_effectiveness": trajectory_traffic_effectiveness_metrics(rows),
     }
     atomic_write_json(Path(args.output_dir) / "evaluation.json", metrics)
     print(json.dumps(metrics, default=str), flush=True)

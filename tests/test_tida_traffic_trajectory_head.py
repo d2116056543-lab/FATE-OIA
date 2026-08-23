@@ -83,3 +83,22 @@ def test_head_cannot_emit_action_prior_without_trajectory_evidence():
     out = head(*args)
     assert torch.count_nonzero(out["traffic_trajectory_delta"]) == 0
     assert torch.count_nonzero(out["traffic_trajectory_support"]) == 0
+
+
+def test_head_uses_antisymmetric_order_credit():
+    args = list(_inputs(batch=1, frames=5))
+    head = TIDATrafficTrajectoryHead(dim=16, num_actions=4, num_heads=4)
+    with torch.no_grad():
+        head.output.weight.fill_(0.05)
+        head.trust_raw.add_(1.0)
+    ordered = head(*args)["traffic_trajectory_delta"]
+
+    args[1] = args[1].flip(3)
+    args[2] = args[2].flip(3)
+    args[3] = args[3].flip(3)
+    args[4] = args[4].flip(3)
+    args[5] = -args[5].flip(1)
+    args[6] = -args[6].flip(3)
+    reversed_delta = head(*args)["traffic_trajectory_delta"]
+
+    assert torch.allclose(ordered, -reversed_delta, atol=1e-6)

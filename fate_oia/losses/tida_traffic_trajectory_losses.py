@@ -46,7 +46,9 @@ def trajectory_selected_control_loss(
     target: torch.Tensor,
     trajectory_support: torch.Tensor,
     *,
-    margin: float = 0.02,
+    margin_fraction: float = 0.10,
+    trajectory_trust: torch.Tensor | None = None,
+    trajectory_cap: float = 0.08,
     deploy_boundary_logits: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Require ordered selected trajectories to beat same-clip temporal controls."""
@@ -67,5 +69,13 @@ def trajectory_selected_control_loss(
     control_margin = sign * (deploy_base + control_delta.detach())
     boundary = torch.sigmoid((0.80 - deploy_base.abs()) / 0.20)
     weight = boundary * (0.10 + 0.90 * trajectory_support.detach().clamp(0.0, 1.0))
-    violation = F.relu(float(margin) + control_margin - selected_margin)
+    trust = (
+        torch.ones_like(trajectory_support)
+        if trajectory_trust is None else trajectory_trust.detach().clamp(0.0, 1.0)
+    )
+    reachable_margin = (
+        float(margin_fraction) * float(trajectory_cap)
+        * trajectory_support.detach().clamp(0.0, 1.0) * trust
+    )
+    violation = F.relu(reachable_margin + control_margin - selected_margin)
     return _weighted_mean(violation, weight)

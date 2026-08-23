@@ -1,7 +1,10 @@
 import torch
 import pytest
 
-from fate_oia.engine.evaluate_tida_oia import trajectory_traffic_effectiveness_metrics
+from fate_oia.engine.evaluate_tida_oia import (
+    save_epoch_outputs,
+    trajectory_traffic_effectiveness_metrics,
+)
 
 
 def test_trajectory_metrics_expose_dynamic_gain_transport_and_grounding_quality():
@@ -31,3 +34,52 @@ def test_trajectory_metrics_expose_dynamic_gain_transport_and_grounding_quality(
     assert metrics["target_transport"]["correction_to_harm_ratio"] > 1
     assert metrics["grounding_quality"]["cycle_confidence_mean"] == pytest.approx(0.9)
     assert metrics["dynamic_conditioned"]["high_motion"]["count"] > 0
+
+
+def test_trajectory_metrics_report_corrective_and_harmful_flips():
+    target = torch.tensor([[1.0], [0.0], [0.0], [1.0]])
+    semantic = torch.tensor([[-0.2], [0.2], [-0.2], [0.2]])
+    trajectory = torch.tensor([[0.2], [-0.2], [-0.3], [0.3]])
+    rows = {
+        "semantic_action": semantic,
+        "semantic_trajectory_action": trajectory,
+        "video_action": trajectory,
+        "image_reason": torch.zeros(4, 21),
+        "video_reason": torch.zeros(4, 21),
+        "action_target": target,
+        "reason_target": torch.zeros(4, 21),
+        "traffic_trajectory_delta": trajectory - semantic,
+        "traffic_trajectory_support": torch.ones(4, 1),
+        "trajectory_attention": torch.ones(4, 1, 1),
+        "trajectory_speed": torch.ones(4, 1, 1, 1),
+        "trajectory_cycle_confidence": torch.ones(4, 1, 1, 2),
+        "trajectory_exclusive_displacement": torch.ones(4, 1, 1, 1, 2),
+    }
+    metrics = trajectory_traffic_effectiveness_metrics(rows)
+    assert metrics["decision_flips"]["fn_to_tp"] == [1]
+    assert metrics["decision_flips"]["fp_to_tn"] == [1]
+    assert metrics["decision_flips"]["tn_to_fp"] == [0]
+    assert metrics["decision_flips"]["tp_to_fn"] == [0]
+
+
+def test_epoch_artifacts_persist_trajectory_metrics_and_tensors(tmp_path):
+    trajectory_metrics = {"overall": {"trajectory_incremental_action_mf1": 0.01}}
+    rows = {
+        "file_names": ["clip.mp4"],
+        "traffic_trajectory_delta": torch.ones(1, 4),
+        "traffic_trajectory_support": torch.ones(1, 4),
+        "trajectory_attention": torch.ones(1, 4, 2),
+        "trajectory_speed": torch.ones(1, 4, 2, 3),
+        "trajectory_xy": torch.ones(1, 4, 2, 4, 2),
+    }
+    save_epoch_outputs(
+        tmp_path, 0, rows,
+        {"online": {"trajectory_traffic_effectiveness": trajectory_metrics}},
+        {"image": torch.full((25,), 0.5), "video": torch.full((25,), 0.5)},
+        {"available": True},
+    )
+    epoch_dir = tmp_path / "epoch_000"
+    assert (epoch_dir / "trajectory_traffic_effectiveness.json").exists()
+    assert (epoch_dir / "traffic_trajectory_delta_test.pt").exists()
+    assert (epoch_dir / "trajectory_attention_test.pt").exists()
+    assert (epoch_dir / "trajectory_xy_test.pt").exists()
