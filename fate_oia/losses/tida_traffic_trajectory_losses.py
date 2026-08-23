@@ -8,6 +8,32 @@ def _weighted_mean(value: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return (value * weight).sum() / weight.sum().clamp_min(1e-8)
 
 
+def _class_balanced_action_mean(
+    value: torch.Tensor,
+    weight: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    """Average positive/negative evidence equally within each action.
+
+    Traffic corrections are sparse and boundary-focused. A global weighted mean
+    otherwise lets the much larger easy class determine the delta orientation.
+    Missing classes in a mini-batch are ignored rather than assigned zero loss.
+    """
+    target = target.float()
+    class_means = []
+    class_valid = []
+    for class_mask in (target, 1.0 - target):
+        class_weight = weight * class_mask
+        denominator = class_weight.sum(dim=0)
+        class_means.append((value * class_weight).sum(dim=0) / denominator.clamp_min(1e-8))
+        class_valid.append(denominator > 0)
+    means = torch.stack(class_means, dim=0)
+    valid = torch.stack(class_valid, dim=0)
+    action_mean = (means * valid).sum(dim=0) / valid.sum(dim=0).clamp_min(1)
+    action_valid = valid.any(dim=0)
+    return (action_mean * action_valid).sum() / action_valid.sum().clamp_min(1)
+
+
 def trajectory_boundary_correction_loss(
     base_logits: torch.Tensor,
     trajectory_delta: torch.Tensor,
@@ -36,7 +62,9 @@ def trajectory_boundary_correction_loss(
     correction = 0.20 * F.softplus((float(target_margin) - final_margin) / 0.20)
     confident = torch.sigmoid((base_margin - 0.75) / 0.15).detach()
     no_harm = F.relu(base_margin - final_margin - 0.002)
-    return _weighted_mean(correction, weight) + 0.5 * _weighted_mean(no_harm, confident + 1e-4)
+    return _class_balanced_action_mean(correction, weight, target) + 0.5 * _class_balanced_action_mean(
+        no_harm, confident + 1e-4, target
+    )
 
 
 def trajectory_selected_control_loss(
@@ -91,4 +119,4 @@ def trajectory_selected_control_loss(
         * support_gate * trust * order_gate * uncertainty_gate
     )
     violation = F.relu(reachable_margin + control_margin - selected_margin)
-    return _weighted_mean(violation, weight)
+    return _class_balanced_action_mean(violation, weight, target)

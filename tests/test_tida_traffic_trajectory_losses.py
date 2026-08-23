@@ -91,3 +91,39 @@ def test_selected_control_reachable_margin_includes_order_gate():
         trajectory_trust=trust, trajectory_order_gate=order_gate, trajectory_cap=0.08,
     )
     assert loss.item() == 0.0
+
+
+def test_boundary_correction_is_invariant_to_negative_replication_per_action():
+    base = torch.zeros(2, 1)
+    target = torch.tensor([[1.0], [0.0]])
+    support = torch.ones_like(base)
+    delta = torch.tensor([[-0.01], [-0.01]])
+    reference = trajectory_boundary_correction_loss(base, delta, target, support)
+
+    repeated = trajectory_boundary_correction_loss(
+        torch.cat((base[:1], base[1:].repeat(20, 1))),
+        torch.cat((delta[:1], delta[1:].repeat(20, 1))),
+        torch.cat((target[:1], target[1:].repeat(20, 1))),
+        torch.cat((support[:1], support[1:].repeat(20, 1))),
+    )
+    assert torch.allclose(reference, repeated, atol=1e-7)
+
+
+def test_selected_control_is_invariant_to_negative_replication_per_action():
+    base = torch.zeros(2, 1)
+    target = torch.tensor([[1.0], [0.0]])
+    support = torch.ones_like(base)
+    selected = torch.tensor([[-0.001], [-0.001]])
+    control = torch.zeros_like(selected)
+    reference = trajectory_selected_control_loss(
+        base, selected, control, target, support,
+    )
+
+    repeated = trajectory_selected_control_loss(
+        torch.cat((base[:1], base[1:].repeat(20, 1))),
+        torch.cat((selected[:1], selected[1:].repeat(20, 1))),
+        torch.cat((control[:1], control[1:].repeat(20, 1))),
+        torch.cat((target[:1], target[1:].repeat(20, 1))),
+        torch.cat((support[:1], support[1:].repeat(20, 1))),
+    )
+    assert torch.allclose(reference, repeated, atol=1e-7)
