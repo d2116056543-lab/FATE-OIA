@@ -133,6 +133,7 @@ class TIDAOIAModel(nn.Module):
         geometric_reason_cap: float = 0.15,
         traffic_action_enabled: bool = False,
         traffic_action_cap: float = 0.15,
+        traffic_motion_topk: int = 12,
     ) -> None:
         super().__init__()
         self.image_model = image_model
@@ -145,7 +146,8 @@ class TIDAOIAModel(nn.Module):
         selected_layers = tuple(self.image_model.foundation.dino.selected_layers)
         self.query_reader = TIDATerminalQueryReader(dim, num_actions, num_predicates, selected_layers)
         self.context_encoder = TIDAContextEncoder(
-            self.image_model.foundation.dino, self.query_reader, context_chunk_size=context_chunk_size
+            self.image_model.foundation.dino, self.query_reader,
+            context_chunk_size=context_chunk_size, motion_topk=traffic_motion_topk,
         )
         self.temporal_encoder = TIDATemporalEncoder(dim=dim, num_layers=2, num_heads=4, dropout=0.10)
         self.terminal_innovation = TIDATerminalInnovation(dim=dim)
@@ -277,6 +279,9 @@ class TIDAOIAModel(nn.Module):
         temporal_action_scale: float | torch.Tensor,
         temporal_reason_scale: float | torch.Tensor,
         geometric: dict[str, torch.Tensor] | None = None,
+        history_action_patch_tokens: torch.Tensor | None = None,
+        history_action_patch_xy: torch.Tensor | None = None,
+        history_action_patch_weight: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         action_nodes = image["action_nodes_primary"].detach()
         reason_nodes = image["reason_nodes_primary"].detach()
@@ -348,6 +353,9 @@ class TIDAOIAModel(nn.Module):
                 timestamps[:, : history_tokens.shape[1]],
                 frame_valid_mask[:, : history_tokens.shape[1]],
                 image_action,
+                patch_tokens=history_action_patch_tokens,
+                patch_xy=history_action_patch_xy,
+                patch_weight=history_action_patch_weight,
             )
             if self.traffic_action_enabled
             else self._empty_traffic_action(image_action, history_tokens.shape[1])
@@ -455,7 +463,28 @@ class TIDAOIAModel(nn.Module):
             "traffic_same_action_mass": torch.zeros_like(image_action),
             "traffic_motion_energy": image_action.new_zeros(batch, intervals),
             "traffic_history_available": torch.zeros(batch, dtype=torch.bool, device=image_action.device),
+            "traffic_patch_displacement": image_action.new_zeros(batch, intervals, self.num_actions, 2),
+            "traffic_patch_common_displacement": image_action.new_zeros(batch, intervals, 2),
+            "traffic_patch_exclusive_displacement": image_action.new_zeros(
+                batch, intervals, self.num_actions, 2
+            ),
+            "traffic_patch_match_confidence": image_action.new_zeros(batch, intervals, self.num_actions),
+            "traffic_patch_motion_energy": image_action.new_zeros(batch, intervals, self.num_actions),
         }
+
+    @staticmethod
+    def _intervene_patch_history(value: torch.Tensor, intervention: str | None) -> torch.Tensor:
+        if intervention == "repeated_last":
+            return value[:, -1:].expand_as(value)
+        if intervention == "time_reverse":
+            return value.flip(1)
+        if intervention == "time_shuffle":
+            order = torch.cat(
+                (torch.arange(0, value.shape[1], 2, device=value.device),
+                 torch.arange(1, value.shape[1], 2, device=value.device))
+            )
+            return value.index_select(1, order)
+        return value
 
     def _empty_geometric(
         self, image_action: torch.Tensor, image_reason: torch.Tensor
@@ -546,11 +575,17 @@ class TIDAOIAModel(nn.Module):
             output["_geometric_context_images"], output["timestamps"], output["frame_valid_mask"], intervention,
             output["image_action_logits"], output["image_reason_logits"],
         )
+        patch_tokens = self._intervene_patch_history(output["history_action_patch_tokens"], intervention)
+        patch_xy = self._intervene_patch_history(output["history_action_patch_xy"], intervention)
+        patch_weight = self._intervene_patch_history(output["history_action_patch_weight"], intervention)
         return self.decode_encoded_history(
             history, output["history_query_region_mass"], output["timestamps"], rerun_valid,
             output["terminal_target_evidence"], output["terminal_query_identity"], output["image_branch"],
             temporal_action_scale=temporal_action_scale, temporal_reason_scale=temporal_reason_scale,
             geometric=geometric,
+            history_action_patch_tokens=patch_tokens,
+            history_action_patch_xy=patch_xy,
+            history_action_patch_weight=patch_weight,
         )
 
     def forward(
@@ -602,6 +637,15 @@ class TIDAOIAModel(nn.Module):
             geometric=self._encode_geometric(
                 context_images, timestamps, effective_frame_valid_mask, intervention,
                 image["action_logits_final"].detach(), image["reason_logits_final"].detach(),
+            ),
+            history_action_patch_tokens=self._intervene_patch_history(
+                context["history_action_patch_tokens"], intervention
+            ),
+            history_action_patch_xy=self._intervene_patch_history(
+                context["history_action_patch_xy"], intervention
+            ),
+            history_action_patch_weight=self._intervene_patch_history(
+                context["history_action_patch_weight"], intervention
             ),
         )
         return {

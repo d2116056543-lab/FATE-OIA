@@ -75,6 +75,9 @@ def collect_tida_outputs(
         "geometric_region_motion", "geometric_action_delta", "geometric_reason_delta",
         "traffic_motion_energy", "traffic_action_delta", "traffic_action_attention",
         "traffic_same_action_mass",
+        "traffic_patch_displacement", "traffic_patch_common_displacement",
+        "traffic_patch_exclusive_displacement", "traffic_patch_match_confidence",
+        "traffic_patch_motion_energy",
     )}
     audit_keys = (
         "terminal_prediction_history", "terminal_prediction_no_history", "terminal_target_evidence",
@@ -162,6 +165,11 @@ def collect_tida_outputs(
             "traffic_action_delta": output["traffic_action_delta"],
             "traffic_action_attention": output["traffic_action_attention"],
             "traffic_same_action_mass": output["traffic_same_action_mass"],
+            "traffic_patch_displacement": output["traffic_patch_displacement"],
+            "traffic_patch_common_displacement": output["traffic_patch_common_displacement"],
+            "traffic_patch_exclusive_displacement": output["traffic_patch_exclusive_displacement"],
+            "traffic_patch_match_confidence": output["traffic_patch_match_confidence"],
+            "traffic_patch_motion_energy": output["traffic_patch_motion_energy"],
         }.items():
             diagnostics[key].append(value.detach().float().cpu())
         if collect_audit_tensors:
@@ -404,6 +412,24 @@ def traffic_action_effectiveness_metrics(
     attention = rows["traffic_action_attention"]
     attention_entropy = -(attention * attention.clamp_min(1e-8).log()).sum(-1)
     normalizer = torch.log(torch.tensor(max(attention.shape[-1], 2), dtype=attention.dtype))
+    batch, actions = rows["action_target"].shape
+    intervals = rows["traffic_motion_energy"].shape[1]
+    patch_available = "traffic_patch_displacement" in rows
+    patch_displacement = rows.get(
+        "traffic_patch_displacement", attention.new_zeros(batch, intervals, actions, 2)
+    )
+    patch_common = rows.get(
+        "traffic_patch_common_displacement", attention.new_zeros(batch, intervals, 2)
+    )
+    patch_exclusive = rows.get(
+        "traffic_patch_exclusive_displacement", attention.new_zeros(batch, intervals, actions, 2)
+    )
+    patch_confidence = rows.get(
+        "traffic_patch_match_confidence", attention.new_zeros(batch, intervals, actions)
+    )
+    patch_energy = rows.get(
+        "traffic_patch_motion_energy", attention.new_zeros(batch, intervals, actions)
+    )
     return {
         "overall": {
             "semantic": semantic,
@@ -428,6 +454,13 @@ def traffic_action_effectiveness_metrics(
             "normalized_entropy_mean": float((attention_entropy / normalizer).mean()),
             "same_action_mass_mean": float(rows["traffic_same_action_mass"].mean()),
             "same_action_mass_by_target": rows["traffic_same_action_mass"].mean(0).tolist(),
+            "patch_correspondence_available": patch_available,
+            "patch_match_confidence_mean": float(patch_confidence.mean()),
+            "patch_motion_energy_mean": float(patch_energy.mean()),
+            "patch_displacement_xy_mean": patch_displacement.mean((0, 1)).tolist(),
+            "patch_common_displacement_xy_mean": patch_common.mean(0).tolist(),
+            "patch_exclusive_displacement_xy_by_action": patch_exclusive.mean((0, 1)).tolist(),
+            "patch_exclusive_motion_rms_by_action": patch_exclusive.square().mean((0, 1, 3)).sqrt().tolist(),
         },
     }
 
@@ -512,6 +545,9 @@ def save_epoch_outputs(output_dir: Path, epoch: int, rows: dict[str, Any], metri
         "geometric_region_motion", "geometric_action_delta", "geometric_reason_delta",
         "traffic_motion_energy", "traffic_action_delta", "traffic_action_attention",
         "traffic_same_action_mass",
+        "traffic_patch_displacement", "traffic_patch_common_displacement",
+        "traffic_patch_exclusive_displacement", "traffic_patch_match_confidence",
+        "traffic_patch_motion_energy",
         "terminal_prediction_history", "terminal_prediction_no_history", "terminal_target_evidence",
         "terminal_error_history", "terminal_error_no_history", "innovation_token",
         "predicate_differential_state", "predicate_velocity_norm", "predicate_acceleration_norm",

@@ -498,6 +498,7 @@ def build_runtime(args: Any, evaluation_only: bool = False) -> TIDARuntime:
         geometric_reason_cap=float(config["model"].get("geometric_reason_cap", 0.15)),
         traffic_action_enabled=bool(config["model"].get("traffic_action_enabled", False)),
         traffic_action_cap=float(config["model"].get("traffic_action_cap", 0.15)),
+        traffic_motion_topk=int(config["model"].get("traffic_motion_topk", 12)),
     ).to(device)
     batch_size = int(_arg(args, "batch_size", 2))
     workers = int(_arg(args, "num_workers", config["data"]["num_workers"]))
@@ -894,6 +895,14 @@ def train(args: Any) -> None:
                 "traffic_action_delta_rms": float(output["traffic_action_delta"].float().square().mean().sqrt().detach().cpu()),
                 "traffic_same_action_mass": float(output["traffic_same_action_mass"].mean().detach().cpu()),
                 "traffic_motion_energy": float(output["traffic_motion_energy"].mean().detach().cpu()),
+                "traffic_patch_motion_energy": float(output["traffic_patch_motion_energy"].mean().detach().cpu()),
+                "traffic_patch_match_confidence": float(output["traffic_patch_match_confidence"].mean().detach().cpu()),
+                "traffic_patch_common_motion_rms": float(
+                    output["traffic_patch_common_displacement"].float().square().mean().sqrt().detach().cpu()
+                ),
+                "traffic_patch_exclusive_motion_rms": float(
+                    output["traffic_patch_exclusive_displacement"].float().square().mean().sqrt().detach().cpu()
+                ),
                 "action_evidence_confidence_mean": float(output["action_evidence_confidence"].mean().detach().cpu()),
                 "action_effective_trust_mean": float(output["action_effective_trust"].mean().detach().cpu()),
                 "reason_delta_rms": float(output["reason_temporal_delta"].float().square().mean().sqrt().detach().cpu()),
