@@ -25,6 +25,7 @@ from fate_oia.engine.evaluate_tida_oia import (
     geometric_temporal_effectiveness_metrics,
     save_epoch_outputs,
     temporal_contribution_metrics,
+    traffic_action_effectiveness_metrics,
 )
 from fate_oia.engine.train_aie_oia import build_model as build_aie_model, canonical_model_state_dict
 from fate_oia.engine.train_vetra_strong_refine import build_refiner
@@ -263,11 +264,18 @@ def reason_firewall_gradient_audit(
         "action_asl", "action_smooth_ap", "action_base_protect", "action_delta",
         "action_flow_credit", "action_flow_no_harm", "action_utility_calibration",
         "geometric_action_aux", "geometric_action_rank", "geometric_action_prefix", "geometric_action_delta",
+        "traffic_action_aux", "traffic_action_rank", "traffic_action_delta",
     )
     reason_loss = sum(registry.rows[name].weight * registry.rows[name].value for name in reason_names)
     action_loss = sum(registry.rows[name].weight * registry.rows[name].value for name in action_names)
-    action_parameters = list(model.action_reader.parameters()) + list(model.geometric_heads.action_parameters())
-    reason_parameters = list(model.reason_reader.parameters()) + list(model.geometric_heads.reason_parameters())
+    action_parameters = [parameter for parameter in (
+        list(model.action_reader.parameters())
+        + list(model.geometric_heads.action_parameters())
+        + list(model.traffic_action.parameters())
+    ) if parameter.requires_grad]
+    reason_parameters = [parameter for parameter in (
+        list(model.reason_reader.parameters()) + list(model.geometric_heads.reason_parameters())
+    ) if parameter.requires_grad]
     reason_to_action = torch.autograd.grad(
         reason_loss, action_parameters, retain_graph=True, allow_unused=True
     )
@@ -488,6 +496,8 @@ def build_runtime(args: Any, evaluation_only: bool = False) -> TIDARuntime:
         geometric_flow_hidden_dim=int(config["model"].get("geometric_flow_hidden_dim", 64)),
         geometric_action_cap=float(config["model"].get("geometric_action_cap", 0.20)),
         geometric_reason_cap=float(config["model"].get("geometric_reason_cap", 0.15)),
+        traffic_action_enabled=bool(config["model"].get("traffic_action_enabled", False)),
+        traffic_action_cap=float(config["model"].get("traffic_action_cap", 0.15)),
     ).to(device)
     batch_size = int(_arg(args, "batch_size", 2))
     workers = int(_arg(args, "num_workers", config["data"]["num_workers"]))
@@ -667,6 +677,7 @@ def _view_metrics(test_rows, calib_rows):
         "temporal_contribution": temporal_contribution_metrics(test_rows),
         "geometric_branches_raw_fixed": geometric_branch_metrics(test_rows),
         "geometric_effectiveness": geometric_temporal_effectiveness_metrics(test_rows),
+        "traffic_action_effectiveness": traffic_action_effectiveness_metrics(test_rows),
     }
 
 
@@ -880,6 +891,9 @@ def train(args: Any) -> None:
                 "rho_mean": float(output["innovation_reliability"].mean().detach().cpu()),
                 "rho_nonzero_rate": float((output["innovation_reliability"] > 0).float().mean().detach().cpu()),
                 "action_delta_rms": float(output["action_temporal_delta"].float().square().mean().sqrt().detach().cpu()),
+                "traffic_action_delta_rms": float(output["traffic_action_delta"].float().square().mean().sqrt().detach().cpu()),
+                "traffic_same_action_mass": float(output["traffic_same_action_mass"].mean().detach().cpu()),
+                "traffic_motion_energy": float(output["traffic_motion_energy"].mean().detach().cpu()),
                 "action_evidence_confidence_mean": float(output["action_evidence_confidence"].mean().detach().cpu()),
                 "action_effective_trust_mean": float(output["action_effective_trust"].mean().detach().cpu()),
                 "reason_delta_rms": float(output["reason_temporal_delta"].float().square().mean().sqrt().detach().cpu()),
