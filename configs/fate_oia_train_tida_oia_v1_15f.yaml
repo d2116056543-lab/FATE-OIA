@@ -67,6 +67,7 @@ model:
   geometric_flow_hw: [45, 80]
   traffic_action_enabled: true
   traffic_action_cap: 0.15
+  traffic_motion_topk: 12
 loss:
   terminal_hist: 0.25
   terminal_no_history: 0.0

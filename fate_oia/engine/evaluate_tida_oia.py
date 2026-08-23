@@ -75,6 +75,7 @@ def collect_tida_outputs(
         "geometric_region_motion", "geometric_action_delta", "geometric_reason_delta",
         "traffic_motion_energy", "traffic_action_delta", "traffic_action_attention",
         "traffic_same_action_mass",
+        "traffic_patch_displacement", "traffic_patch_match_confidence", "traffic_patch_motion_energy",
     )}
     audit_keys = (
         "terminal_prediction_history", "terminal_prediction_no_history", "terminal_target_evidence",
@@ -162,6 +163,9 @@ def collect_tida_outputs(
             "traffic_action_delta": output["traffic_action_delta"],
             "traffic_action_attention": output["traffic_action_attention"],
             "traffic_same_action_mass": output["traffic_same_action_mass"],
+            "traffic_patch_displacement": output["traffic_patch_displacement"],
+            "traffic_patch_match_confidence": output["traffic_patch_match_confidence"],
+            "traffic_patch_motion_energy": output["traffic_patch_motion_energy"],
         }.items():
             diagnostics[key].append(value.detach().float().cpu())
         if collect_audit_tensors:
@@ -428,6 +432,9 @@ def traffic_action_effectiveness_metrics(
             "normalized_entropy_mean": float((attention_entropy / normalizer).mean()),
             "same_action_mass_mean": float(rows["traffic_same_action_mass"].mean()),
             "same_action_mass_by_target": rows["traffic_same_action_mass"].mean(0).tolist(),
+            "patch_match_confidence_mean": float(rows["traffic_patch_match_confidence"].mean()),
+            "patch_motion_energy_mean": float(rows["traffic_patch_motion_energy"].mean()),
+            "patch_displacement_xy_mean": rows["traffic_patch_displacement"].mean((0, 1)).tolist(),
         },
     }
 
@@ -512,6 +519,7 @@ def save_epoch_outputs(output_dir: Path, epoch: int, rows: dict[str, Any], metri
         "geometric_region_motion", "geometric_action_delta", "geometric_reason_delta",
         "traffic_motion_energy", "traffic_action_delta", "traffic_action_attention",
         "traffic_same_action_mass",
+        "traffic_patch_displacement", "traffic_patch_match_confidence", "traffic_patch_motion_energy",
         "terminal_prediction_history", "terminal_prediction_no_history", "terminal_target_evidence",
         "terminal_error_history", "terminal_error_no_history", "innovation_token",
         "predicate_differential_state", "predicate_velocity_norm", "predicate_acceleration_norm",

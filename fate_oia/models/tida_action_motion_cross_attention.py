@@ -23,6 +23,12 @@ class TIDAActionMotionCrossAttention(nn.Module):
             nn.GELU(),
             nn.LayerNorm(dim),
         )
+        self.patch_motion_projection = nn.Sequential(
+            nn.LayerNorm(dim + 5),
+            nn.Linear(dim + 5, dim),
+            nn.GELU(),
+            nn.LayerNorm(dim),
+        )
         self.query_projection = nn.Linear(dim, dim, bias=False)
         self.key_projection = nn.Linear(dim, dim, bias=False)
         self.value_projection = nn.Linear(dim, dim, bias=False)
@@ -51,6 +57,10 @@ class TIDAActionMotionCrossAttention(nn.Module):
         timestamps: torch.Tensor,
         frame_valid_mask: torch.Tensor,
         base_logits: torch.Tensor,
+        *,
+        patch_tokens: torch.Tensor | None = None,
+        patch_xy: torch.Tensor | None = None,
+        patch_weight: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         if action_nodes.ndim != 3 or action_nodes.shape[1:] != (self.num_actions, self.dim):
             raise ValueError("action_nodes must have shape [B,A,D]")
@@ -73,6 +83,47 @@ class TIDAActionMotionCrossAttention(nn.Module):
             acceleration[:, 1:] = (velocity[:, 1:] - velocity[:, :-1]) / midpoint_dt[:, :, None, None]
 
         motion = self.motion_projection(torch.cat((velocity, acceleration), dim=-1))
+        patch_displacement = action_nodes.new_zeros(batch, frames - 1, self.num_actions, 2)
+        patch_confidence = action_nodes.new_zeros(batch, frames - 1, self.num_actions)
+        patch_motion_energy = action_nodes.new_zeros(batch, frames - 1, self.num_actions)
+        if patch_tokens is not None or patch_xy is not None or patch_weight is not None:
+            if patch_tokens is None or patch_xy is None or patch_weight is None:
+                raise ValueError("patch_tokens, patch_xy, and patch_weight must be provided together")
+            if patch_tokens.ndim != 5 or patch_tokens.shape[:3] != (batch, frames, self.num_actions):
+                raise ValueError("patch_tokens must be [B,T,A,K,D]")
+            if patch_tokens.shape[-1] != self.dim or patch_xy.shape != (*patch_tokens.shape[:-1], 2):
+                raise ValueError("patch token dimensions or coordinates do not match")
+            if patch_weight.shape != patch_tokens.shape[:-1]:
+                raise ValueError("patch_weight must be [B,T,A,K]")
+            previous = torch.nn.functional.normalize(patch_tokens[:, :-1], dim=-1)
+            current = torch.nn.functional.normalize(patch_tokens[:, 1:], dim=-1)
+            similarity = torch.einsum("bfaid,bfajd->bfaij", previous, current) / 0.07
+            correspondence = torch.softmax(similarity, dim=-1)
+            matched_xy = torch.einsum("bfaij,bfajc->bfaic", correspondence, patch_xy[:, 1:])
+            matched_token = torch.einsum("bfaij,bfajd->bfaid", correspondence, patch_tokens[:, 1:])
+            displacement = matched_xy - patch_xy[:, :-1]
+            source_weight = patch_weight[:, :-1]
+            source_weight = source_weight / source_weight.sum(-1, keepdim=True).clamp_min(1e-8)
+            patch_displacement = torch.einsum("bfak,bfakc->bfac", source_weight, displacement)
+            appearance = torch.einsum(
+                "bfak,bfakd->bfad", source_weight, matched_token - patch_tokens[:, :-1]
+            )
+            magnitude = displacement.square().sum(-1).sqrt()
+            radial = (displacement * patch_xy[:, :-1]).sum(-1)
+            patch_motion_energy = (source_weight * magnitude).sum(-1)
+            expansion = (source_weight * radial).sum(-1)
+            patch_confidence = (source_weight * correspondence.max(-1).values).sum(-1)
+            patch_descriptor = torch.cat(
+                (
+                    appearance,
+                    patch_displacement,
+                    patch_motion_energy[..., None],
+                    expansion[..., None],
+                    patch_confidence[..., None],
+                ),
+                dim=-1,
+            )
+            motion = motion + self.patch_motion_projection(patch_descriptor)
         motion = motion + self.action_identity[None, None]
         motion_flat = motion.flatten(1, 2)
         key = self.key_projection(motion_flat)
@@ -106,5 +157,8 @@ class TIDAActionMotionCrossAttention(nn.Module):
             "traffic_action_attention": attention,
             "traffic_same_action_mass": same_action_mass,
             "traffic_motion_energy": motion_energy,
+            "traffic_patch_displacement": patch_displacement,
+            "traffic_patch_match_confidence": patch_confidence,
+            "traffic_patch_motion_energy": patch_motion_energy,
             "traffic_history_available": history_available,
         }

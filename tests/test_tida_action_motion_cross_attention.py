@@ -43,3 +43,22 @@ def test_action_targets_have_distinct_same_action_attention_diagnostic():
     result = module(*_inputs(batch=1))
     assert result["traffic_same_action_mass"].shape == (1, 4)
     assert torch.all((result["traffic_same_action_mass"] >= 0) & (result["traffic_same_action_mass"] <= 1))
+
+
+def test_sparse_patch_correspondence_recovers_directional_displacement():
+    module = TIDAActionMotionCrossAttention(dim=32, num_actions=4, cap=0.15)
+    action_nodes, history, timestamps, valid, logits = _inputs(batch=1, frames=2)
+    patch = torch.randn(1, 2, 4, 2, 32)
+    patch[:, 1] = patch[:, 0]
+    xy = torch.zeros(1, 2, 4, 2, 2)
+    xy[:, 0, :, 0, 0] = -0.8
+    xy[:, 0, :, 1, 0] = -0.4
+    xy[:, 1, :, 0, 0] = 0.4
+    xy[:, 1, :, 1, 0] = 0.8
+    weight = torch.full((1, 2, 4, 2), 0.5)
+    result = module(
+        action_nodes, history, timestamps, valid, logits,
+        patch_tokens=patch, patch_xy=xy, patch_weight=weight,
+    )
+    assert result["traffic_patch_displacement"][..., 0].mean() > 0.5
+    assert result["traffic_patch_match_confidence"].mean() > 0.5
