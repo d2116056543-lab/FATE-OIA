@@ -73,6 +73,32 @@ def action_base_protect_loss(
     return ((1.0 - rho) * F.relu(image_margin - video_margin - float(epsilon))).mean(0).mean()
 
 
+def target_conditioned_geometric_correction_loss(
+    base_logits: torch.Tensor,
+    geometric_delta: torch.Tensor,
+    target: torch.Tensor,
+    motion_energy: torch.Tensor,
+    label_weight: torch.Tensor | None = None,
+    *,
+    target_margin: float = 0.20,
+) -> torch.Tensor:
+    """Correct low-margin dynamic examples while preserving confident base decisions."""
+    sign = 2.0 * target.float() - 1.0
+    base_margin = sign * base_logits.detach()
+    final_margin = sign * (base_logits.detach() + geometric_delta)
+    need = torch.sigmoid((0.75 - base_margin) / 0.25).detach()
+    motion = motion_energy.detach().mean(1, keepdim=True)
+    motion_weight = 0.5 + 0.5 * torch.tanh(motion / 0.05)
+    weight = need * motion_weight
+    if label_weight is not None:
+        weight = weight * label_weight.detach()
+    correction = F.softplus((float(target_margin) - final_margin) / 0.20) * 0.20
+    correction = (correction * weight).sum() / weight.sum().clamp_min(1.0)
+    confident = torch.sigmoid((base_margin - 0.50) / 0.20).detach()
+    protect = (F.relu(base_margin - final_margin - 0.002) * confident).sum() / confident.sum().clamp_min(1.0)
+    return correction + 0.5 * protect
+
+
 def action_route_sparse_loss(
     route: torch.Tensor,
     factor_keys: torch.Tensor,
@@ -270,7 +296,10 @@ def build_tida_loss_registry(
     )
     registry.add(
         "geometric_action_aux",
-        action_macro_asl_loss(output["geometric_video_action_logits_raw"], action_target),
+        target_conditioned_geometric_correction_loss(
+            output["semantic_video_action_logits"], output["geometric_action_delta_raw"],
+            action_target, output["geometric_motion_energy"],
+        ),
     )
     prefix_action = output["geometric_prefix_action_logits_raw"].flatten(0, 1)
     prefix_action_target = action_target[:, None].expand(-1, 4, -1).flatten(0, 1)
@@ -330,8 +359,9 @@ def build_tida_loss_registry(
     )
     registry.add(
         "geometric_reason_aux",
-        reason_partial_asl_loss(
-            output["image_reason_logits"] + output["geometric_reason_delta_raw"], reason_target, contradiction
+        target_conditioned_geometric_correction_loss(
+            output["semantic_video_reason_logits"], output["geometric_reason_delta_raw"],
+            reason_target, output["geometric_motion_energy"], reason_weights, target_margin=0.15,
         ),
     )
     prefix_reason = output["geometric_prefix_reason_logits_raw"].flatten(0, 1)

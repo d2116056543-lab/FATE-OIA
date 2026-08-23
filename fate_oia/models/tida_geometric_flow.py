@@ -29,8 +29,8 @@ class TIDAGeometricFlowEncoder(nn.Module):
         super().__init__()
         self.hidden_dim = int(hidden_dim)
         self.flow_hw = tuple(int(value) for value in flow_hw)
-        if self.hidden_dim < self.descriptor_dim:
-            raise ValueError(f"hidden_dim must be at least {self.descriptor_dim}")
+        if self.hidden_dim < 3 * self.descriptor_dim:
+            raise ValueError(f"hidden_dim must be at least {3 * self.descriptor_dim}")
         sobel_x = torch.tensor(
             [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]
         ).view(1, 1, 3, 3) / 8.0
@@ -114,8 +114,11 @@ class TIDAGeometricFlowEncoder(nn.Module):
         descriptor = descriptor * pair_valid[..., None].to(descriptor.dtype)
         valid_count = pair_valid.sum(1, keepdim=True).clamp_min(1).to(descriptor.dtype)
         summary = descriptor.sum(1) / valid_count
-        padding = summary.new_zeros(summary.shape[0], self.hidden_dim - self.descriptor_dim)
-        flow_state = torch.cat((summary, padding), dim=-1)
+        recent = descriptor[:, -1]
+        trend = recent - summary
+        measured_state = torch.cat((summary, recent, trend), dim=-1)
+        padding = summary.new_zeros(summary.shape[0], self.hidden_dim - 3 * self.descriptor_dim)
+        flow_state = torch.cat((measured_state, padding), dim=-1)
         history_available = pair_valid.any(1)
         flow_state = flow_state * history_available[:, None].to(flow_state.dtype)
         prefix_indices = torch.tensor(
@@ -127,10 +130,13 @@ class TIDAGeometricFlowEncoder(nn.Module):
         prefix_summary = torch.stack(
             [cumulative[:, index - 1] / valid_cumulative[:, index - 1, None] for index in prefix_indices], dim=1
         )
+        prefix_recent = torch.stack([descriptor[:, index - 1] for index in prefix_indices], dim=1)
+        prefix_trend = prefix_recent - prefix_summary
+        prefix_measured = torch.cat((prefix_summary, prefix_recent, prefix_trend), dim=-1)
         prefix_padding = prefix_summary.new_zeros(
-            prefix_summary.shape[0], prefix_summary.shape[1], self.hidden_dim - self.descriptor_dim
+            prefix_summary.shape[0], prefix_summary.shape[1], self.hidden_dim - 3 * self.descriptor_dim
         )
-        prefix_states = torch.cat((prefix_summary, prefix_padding), dim=-1)
+        prefix_states = torch.cat((prefix_measured, prefix_padding), dim=-1)
         prefix_available = torch.stack(
             [pair_valid[:, :index].any(1) for index in prefix_indices], dim=1
         )
@@ -157,14 +163,32 @@ class _IndependentFlowHead(nn.Module):
     def __init__(self, hidden_dim: int, output_dim: int, cap: float) -> None:
         super().__init__()
         self.norm = nn.LayerNorm(hidden_dim)
-        self.hidden = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.GELU())
-        self.output = nn.Linear(hidden_dim, output_dim)
+        self.flow_projection = nn.Linear(hidden_dim, hidden_dim)
+        self.target_embedding = nn.Parameter(torch.randn(output_dim, hidden_dim) * 0.02)
+        self.context_projection = nn.Linear(2, hidden_dim)
+        self.hidden = nn.Sequential(nn.GELU(), nn.Linear(hidden_dim, hidden_dim), nn.GELU())
+        self.output = nn.Linear(hidden_dim, 1)
+        self.gate = nn.Linear(hidden_dim, 1)
         nn.init.zeros_(self.output.weight)
         nn.init.zeros_(self.output.bias)
+        nn.init.zeros_(self.gate.weight)
+        nn.init.constant_(self.gate.bias, -1.0)
+        self.output_dim = int(output_dim)
         self.cap = float(cap)
 
-    def forward(self, state: torch.Tensor, available: torch.Tensor) -> torch.Tensor:
-        value = self.cap * torch.tanh(self.output(self.hidden(self.norm(state))))
+    def forward(
+        self, state: torch.Tensor, available: torch.Tensor, base_logits: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        if base_logits is None:
+            base_logits = state.new_zeros(*state.shape[:-1], self.output_dim)
+        if base_logits.shape != (*state.shape[:-1], self.output_dim):
+            raise ValueError("base logits do not match target-conditioned flow state")
+        uncertainty = torch.exp(-base_logits.detach().abs())
+        context = torch.stack((base_logits.detach(), uncertainty), dim=-1)
+        flow = self.flow_projection(self.norm(state))[..., None, :]
+        target = self.target_embedding.view(*([1] * (state.ndim - 1)), self.output_dim, state.shape[-1])
+        hidden = self.hidden(flow + target + self.context_projection(context))
+        value = self.cap * torch.tanh(self.output(hidden).squeeze(-1)) * torch.sigmoid(self.gate(hidden).squeeze(-1))
         return value * available[..., None].to(value.dtype)
 
 
@@ -191,9 +215,15 @@ class TIDAGeometricFlowDecisionHeads(nn.Module):
     def reason_parameters(self):
         return self.reason_head.parameters()
 
-    def forward(self, flow_state: torch.Tensor, history_available: torch.Tensor) -> dict[str, torch.Tensor]:
-        action = self.action_head(flow_state, history_available)
-        reason = self.reason_head(flow_state, history_available)
+    def forward(
+        self,
+        flow_state: torch.Tensor,
+        history_available: torch.Tensor,
+        action_base_logits: torch.Tensor | None = None,
+        reason_base_logits: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        action = self.action_head(flow_state, history_available, action_base_logits)
+        reason = self.reason_head(flow_state, history_available, reason_base_logits)
         return {
             "geometric_action_delta": action,
             "geometric_reason_delta": reason,
@@ -202,9 +232,17 @@ class TIDAGeometricFlowDecisionHeads(nn.Module):
         }
 
     def forward_prefixes(
-        self, prefix_flow_states: torch.Tensor, prefix_available: torch.Tensor
+        self,
+        prefix_flow_states: torch.Tensor,
+        prefix_available: torch.Tensor,
+        action_base_logits: torch.Tensor | None = None,
+        reason_base_logits: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
+        if action_base_logits is not None:
+            action_base_logits = action_base_logits[:, None].expand(-1, prefix_flow_states.shape[1], -1)
+        if reason_base_logits is not None:
+            reason_base_logits = reason_base_logits[:, None].expand(-1, prefix_flow_states.shape[1], -1)
         return {
-            "geometric_prefix_action_delta": self.action_head(prefix_flow_states, prefix_available),
-            "geometric_prefix_reason_delta": self.reason_head(prefix_flow_states, prefix_available),
+            "geometric_prefix_action_delta": self.action_head(prefix_flow_states, prefix_available, action_base_logits),
+            "geometric_prefix_reason_delta": self.reason_head(prefix_flow_states, prefix_available, reason_base_logits),
         }

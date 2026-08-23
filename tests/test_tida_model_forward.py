@@ -77,7 +77,7 @@ def test_geometric_flow_is_in_final_logits_and_keeps_owner_firewall():
     roles = {"static_anchor": [f"p{i}" for i in range(8)], "dynamic_actor": [f"p{i}" for i in range(8, 24)], "terminal_context": [f"p{i}" for i in range(24, 32)]}
     model = TIDAOIAModel(
         _ImageBase(), dim=8, predicate_roles=roles, context_chunk_size=7,
-        geometric_flow_enabled=True, geometric_flow_hidden_dim=32,
+        geometric_flow_enabled=True, geometric_flow_hidden_dim=64,
     ).eval()
     out = model(
         torch.randn(1, 3, 360, 640), torch.randn(1, 14, 3, 192, 344),
@@ -101,7 +101,7 @@ def test_geometric_raw_branch_learns_while_deployment_scale_is_zero():
     roles = {"static_anchor": [f"p{i}" for i in range(8)], "dynamic_actor": [f"p{i}" for i in range(8, 24)], "terminal_context": [f"p{i}" for i in range(24, 32)]}
     model = TIDAOIAModel(
         _ImageBase(), dim=8, predicate_roles=roles, context_chunk_size=7,
-        geometric_flow_enabled=True, geometric_flow_hidden_dim=32,
+        geometric_flow_enabled=True, geometric_flow_hidden_dim=64,
     )
     out = model(
         torch.randn(1, 3, 360, 640), torch.randn(1, 14, 3, 192, 344),
