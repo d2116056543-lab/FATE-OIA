@@ -21,9 +21,11 @@ class TIDALossRegistry:
         "action_asl", "action_smooth_ap", "action_base_protect", "action_delta", "action_route_sparse",
         "action_flow_credit", "action_flow_no_harm",
         "action_utility_calibration",
+        "geometric_action_aux", "geometric_action_prefix", "geometric_action_delta",
         "reason_partial", "reason_rank", "reason_soft_f1", "reason_delta",
         "reason_flow_credit", "reason_flow_no_harm", "reason_positive_no_harm",
         "reason_utility_calibration",
+        "geometric_reason_aux", "geometric_reason_prefix", "geometric_reason_delta",
     )
     default_weights = {
         "terminal_hist": 0.25,
@@ -45,6 +47,9 @@ class TIDALossRegistry:
         "action_flow_credit": 0.50,
         "action_flow_no_harm": 0.15,
         "action_utility_calibration": 0.05,
+        "geometric_action_aux": 0.20,
+        "geometric_action_prefix": 0.08,
+        "geometric_action_delta": 0.002,
         "reason_partial": 1.00,
         "reason_rank": 0.08,
         "reason_soft_f1": 0.04,
@@ -53,6 +58,9 @@ class TIDALossRegistry:
         "reason_flow_no_harm": 0.12,
         "reason_positive_no_harm": 0.25,
         "reason_utility_calibration": 0.04,
+        "geometric_reason_aux": 0.15,
+        "geometric_reason_prefix": 0.06,
+        "geometric_reason_delta": 0.002,
     }
 
     def __init__(self, weights: dict[str, float] | None = None) -> None:
