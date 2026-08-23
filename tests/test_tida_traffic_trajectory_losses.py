@@ -3,6 +3,7 @@ import torch
 from fate_oia.losses.tida_traffic_trajectory_losses import (
     trajectory_boundary_correction_loss,
     trajectory_selected_control_loss,
+    trajectory_utility_calibration_loss,
 )
 
 
@@ -127,3 +128,15 @@ def test_selected_control_is_invariant_to_negative_replication_per_action():
         torch.cat((support[:1], support[1:].repeat(20, 1))),
     )
     assert torch.allclose(reference, repeated, atol=1e-7)
+
+
+def test_utility_calibration_opens_for_helpful_and_closes_for_harmful_candidates():
+    target = torch.tensor([[1.0, 0.0]])
+    candidate = torch.tensor([[0.02, 0.02]])
+    correct_logits = torch.tensor([[5.0, -5.0]], requires_grad=True)
+    reversed_logits = -correct_logits.detach()
+    correct_loss = trajectory_utility_calibration_loss(correct_logits, candidate, target)
+    reversed_loss = trajectory_utility_calibration_loss(reversed_logits, candidate, target)
+    assert correct_loss < reversed_loss
+    correct_loss.backward()
+    assert correct_logits.grad is not None and torch.isfinite(correct_logits.grad).all()

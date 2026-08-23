@@ -46,11 +46,14 @@ class TIDATrafficTrajectoryHead(nn.Module):
         self.readout = nn.Sequential(nn.LayerNorm(4 * dim), nn.Linear(4 * dim, dim), nn.GELU())
         self.order_gate_projection = nn.Linear(2 * dim, 1)
         self.output = nn.Linear(dim, 1)
+        self.utility_projection = nn.Linear(dim, 1)
         self.trust_raw = nn.Parameter(torch.zeros(num_actions))
         nn.init.zeros_(self.order_gate_projection.weight)
         nn.init.zeros_(self.order_gate_projection.bias)
         nn.init.zeros_(self.output.weight)
         nn.init.zeros_(self.output.bias)
+        nn.init.zeros_(self.utility_projection.weight)
+        nn.init.constant_(self.utility_projection.bias, math.log(999.0))
         angles = torch.arange(8, dtype=torch.float32) * (2.0 * math.pi / 8.0)
         self.register_buffer("direction_bins", torch.stack((angles.cos(), angles.sin()), dim=-1))
 
@@ -286,14 +289,21 @@ class TIDATrafficTrajectoryHead(nn.Module):
         trajectory_support = 0.5 * (ordered["support"] + reversed_order["support"])
         support_gate = trajectory_support / (trajectory_support + 0.05)
         budget = self.cap * trust * support_gate * order_gate * uncertainty_gate
-        delta = budget * torch.tanh(evidence_logit)
-        control_delta = budget * torch.tanh(control_logit)
+        candidate_delta = budget * torch.tanh(evidence_logit)
+        candidate_control_delta = budget * torch.tanh(control_logit)
+        utility_logit = self.utility_projection(hidden).squeeze(-1)
+        utility_gate = torch.sigmoid(utility_logit)
+        delta = utility_gate * candidate_delta
+        control_delta = utility_gate * candidate_control_delta
 
         return {
             "traffic_trajectory_delta": delta,
             "traffic_trajectory_control_delta": control_delta,
             "traffic_trajectory_credit_logit": evidence_logit,
             "traffic_trajectory_control_logit": control_logit,
+            "traffic_trajectory_candidate_delta": candidate_delta,
+            "traffic_trajectory_utility_logit": utility_logit,
+            "traffic_trajectory_utility_gate": utility_gate,
             "traffic_trajectory_context": ordered["context"],
             "traffic_trajectory_trust": trust,
             "traffic_trajectory_support": trajectory_support,

@@ -104,6 +104,7 @@ loss:
   trajectory_action_boundary: 0.0
   trajectory_action_rank: 0.0
   trajectory_selected_control: 0.0
+  trajectory_utility_calibration: 0.0
   trajectory_delta: 0.0
   geometric_reason_aux: 0.0
   geometric_reason_rank: 0.0

@@ -266,7 +266,8 @@ def reason_firewall_gradient_audit(
         "action_flow_credit", "action_flow_no_harm", "action_utility_calibration",
         "geometric_action_aux", "geometric_action_rank", "geometric_action_prefix", "geometric_action_delta",
         "traffic_action_aux", "traffic_action_rank", "traffic_action_delta",
-        "trajectory_action_boundary", "trajectory_action_rank", "trajectory_selected_control", "trajectory_delta",
+        "trajectory_action_boundary", "trajectory_action_rank", "trajectory_selected_control",
+        "trajectory_utility_calibration", "trajectory_delta",
     )
     reason_loss = sum(
         registry.rows[name].weight * registry.rows[name].value for name in reason_names if name in registry.rows
@@ -957,6 +958,9 @@ def train(args: Any) -> None:
                 ),
                 "traffic_trajectory_interaction_risk_mean": float(
                     output["trajectory_interaction_risk"].mean().detach().cpu()
+                ),
+                "traffic_trajectory_utility_gate_mean": float(
+                    output["traffic_trajectory_utility_gate"].mean().detach().cpu()
                 ),
                 "traffic_trajectory_attention_entropy": float(
                     (-(output["trajectory_attention"] * output["trajectory_attention"].clamp_min(1e-8).log())

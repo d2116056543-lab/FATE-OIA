@@ -18,6 +18,7 @@ from .tida_flow_credit_losses import (
 from .tida_traffic_trajectory_losses import (
     trajectory_boundary_correction_loss,
     trajectory_selected_control_loss,
+    trajectory_utility_calibration_loss,
 )
 
 
@@ -448,6 +449,14 @@ def build_tida_loss_registry(
         if trajectory_controls else output["traffic_trajectory_delta_raw"].sum() * 0.0,
         available=bool(trajectory_controls),
         unavailable_reason=None if trajectory_controls else "counterfactual evaluated at optimizer boundary only",
+    )
+    registry.add(
+        "trajectory_utility_calibration",
+        trajectory_utility_calibration_loss(
+            output["traffic_trajectory_utility_logit"],
+            output["traffic_trajectory_candidate_delta"],
+            action_target,
+        ),
     )
     registry.add("trajectory_delta", output["traffic_trajectory_delta_raw"].square().mean())
     image_branch = output.get("image_branch", {})

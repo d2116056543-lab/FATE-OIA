@@ -120,3 +120,22 @@ def trajectory_selected_control_loss(
     )
     violation = F.relu(reachable_margin + control_margin - selected_margin)
     return _class_balanced_action_mean(violation, weight, target)
+
+
+def trajectory_utility_calibration_loss(
+    utility_logits: torch.Tensor,
+    candidate_delta: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    """Teach an inference-only gate to retain helpful trajectory candidates.
+
+    The correctness target is detached and label-derived only inside this loss;
+    labels never enter the model forward or the deployed utility gate.
+    """
+    if not (utility_logits.shape == candidate_delta.shape == target.shape):
+        raise ValueError("trajectory utility tensors must have identical [B,A] shapes")
+    sign = 2.0 * target.float() - 1.0
+    helpful = (sign * candidate_delta.detach() > 0).to(utility_logits.dtype)
+    confidence = (candidate_delta.detach().abs() / 0.02).clamp(0.0, 1.0)
+    value = F.binary_cross_entropy_with_logits(utility_logits, helpful, reduction="none")
+    return _class_balanced_action_mean(value, 0.25 + 0.75 * confidence, helpful)

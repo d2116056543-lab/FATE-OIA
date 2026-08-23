@@ -22,6 +22,20 @@ def gt_margin_advantage(
     return sign * (real_logits - counterfactual_logits)
 
 
+def _binary_rank_auc(score: torch.Tensor, target: torch.Tensor) -> float | None:
+    score = score.flatten().float()
+    target = target.flatten().bool()
+    positives = int(target.sum())
+    negatives = int((~target).sum())
+    if positives == 0 or negatives == 0:
+        return None
+    order = score.argsort()
+    ranks = torch.empty_like(score)
+    ranks[order] = torch.arange(1, score.numel() + 1, device=score.device, dtype=score.dtype)
+    numerator = ranks[target].sum() - positives * (positives + 1) / 2.0
+    return float(numerator / (positives * negatives))
+
+
 def _device_batch(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
     return {key: value.to(device, non_blocking=True) if torch.is_tensor(value) else value for key, value in batch.items()}
 
@@ -81,6 +95,8 @@ def collect_tida_outputs(
         "traffic_patch_motion_energy", "traffic_patch_exclusive_motion_energy",
         "traffic_patch_effective_motion",
         "traffic_trajectory_delta", "traffic_trajectory_control_delta",
+        "traffic_trajectory_candidate_delta", "traffic_trajectory_utility_logit",
+        "traffic_trajectory_utility_gate",
         "traffic_trajectory_support", "trajectory_support_gate",
         "trajectory_order_gate", "trajectory_uncertainty_gate",
         "trajectory_attention",
@@ -187,6 +203,9 @@ def collect_tida_outputs(
             "traffic_patch_effective_motion": output["traffic_patch_effective_motion"],
             "traffic_trajectory_delta": output["traffic_trajectory_delta"],
             "traffic_trajectory_control_delta": output["traffic_trajectory_control_delta"],
+            "traffic_trajectory_candidate_delta": output["traffic_trajectory_candidate_delta"],
+            "traffic_trajectory_utility_logit": output["traffic_trajectory_utility_logit"],
+            "traffic_trajectory_utility_gate": output["traffic_trajectory_utility_gate"],
             "traffic_trajectory_support": output["traffic_trajectory_support"],
             "trajectory_support_gate": output["trajectory_support_gate"],
             "trajectory_order_gate": output["trajectory_order_gate"],
@@ -627,6 +646,27 @@ def trajectory_traffic_effectiveness_metrics(
     local_coverage = rows.get("trajectory_local_candidate_coverage")
     common_displacement = rows.get("trajectory_common_displacement")
     interaction_risk = rows.get("trajectory_interaction_risk")
+    utility_gate = rows.get("traffic_trajectory_utility_gate")
+    candidate_delta = rows.get("traffic_trajectory_candidate_delta")
+    utility_quality = {"available": False}
+    if utility_gate is not None and candidate_delta is not None:
+        candidate_helpful = sign * candidate_delta > 0
+        selected = utility_gate >= 0.5
+        selected_signed = signed[selected]
+        utility_quality = {
+            "available": True,
+            "gate_mean": float(utility_gate.mean()),
+            "gate_p50": float(torch.quantile(utility_gate, 0.50)),
+            "gate_p95": float(torch.quantile(utility_gate, 0.95)),
+            "selected_rate": float(selected.float().mean()),
+            "helpfulness_auc": _binary_rank_auc(utility_gate, candidate_helpful),
+            "selected_benefit_rate": (
+                0.0 if selected_signed.numel() == 0 else float((selected_signed > 1e-4).float().mean())
+            ),
+            "selected_harm_rate": (
+                0.0 if selected_signed.numel() == 0 else float((selected_signed < -1e-4).float().mean())
+            ),
+        }
     return {
         "overall": {
             "semantic": semantic, "trajectory_only": trajectory, "final": final,
@@ -672,6 +712,7 @@ def trajectory_traffic_effectiveness_metrics(
                 )
             ),
         },
+        "utility_quality": utility_quality,
         "decision_flips": decision_flips,
         "causal_temporal_interventions": causal,
     }
@@ -766,6 +807,8 @@ def save_epoch_outputs(output_dir: Path, epoch: int, rows: dict[str, Any], metri
         "traffic_patch_motion_energy", "traffic_patch_exclusive_motion_energy",
         "traffic_patch_effective_motion",
         "traffic_trajectory_delta", "traffic_trajectory_control_delta",
+        "traffic_trajectory_candidate_delta", "traffic_trajectory_utility_logit",
+        "traffic_trajectory_utility_gate",
         "traffic_trajectory_support", "trajectory_support_gate",
         "trajectory_order_gate", "trajectory_uncertainty_gate",
         "trajectory_attention",
