@@ -148,11 +148,13 @@ class TIDATrafficTrajectoryHead(nn.Module):
         attention = entmax15_bisect(scores, dim=-1)
         attention = torch.where(has_track, attention, torch.zeros_like(attention))
         context = torch.einsum("bak,bakd->bad", attention, self.value(relation))
-        hidden = self.readout(torch.cat((action_nodes, context), dim=-1))
-        trust = torch.sigmoid(self.trust_raw)[None].expand(batch, -1)
-        delta = self.cap * torch.tanh(self.output(hidden).squeeze(-1)) * trust
         track_support = (confidence * pair_weight).sum(-1) / pair_weight.sum(-1).clamp_min(1.0)
         trajectory_support = (attention * track_support).sum(-1)
+        hidden = self.readout(torch.cat((action_nodes, context), dim=-1))
+        null_hidden = self.readout(torch.cat((action_nodes, torch.zeros_like(context)), dim=-1))
+        trust = torch.sigmoid(self.trust_raw)[None].expand(batch, -1)
+        evidence_logit = self.output(hidden).squeeze(-1) - self.output(null_hidden).squeeze(-1)
+        delta = self.cap * torch.tanh(evidence_logit) * trust * trajectory_support
 
         return {
             "traffic_trajectory_delta": delta,

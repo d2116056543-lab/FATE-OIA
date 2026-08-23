@@ -69,3 +69,17 @@ def test_head_first_backward_reaches_zero_initialized_output():
     loss.backward()
     assert head.output.weight.grad is not None
     assert head.output.weight.grad.abs().sum() > 0
+
+
+def test_head_cannot_emit_action_prior_without_trajectory_evidence():
+    args = list(_inputs(batch=1))
+    args[4] = torch.zeros_like(args[4])
+    args[6] = torch.zeros_like(args[6])
+    head = TIDATrafficTrajectoryHead(dim=16, num_actions=4, num_heads=4)
+    with torch.no_grad():
+        head.output.weight.fill_(0.05)
+        head.output.bias.fill_(0.25)
+        head.trust_raw.add_(2.0)
+    out = head(*args)
+    assert torch.count_nonzero(out["traffic_trajectory_delta"]) == 0
+    assert torch.count_nonzero(out["traffic_trajectory_support"]) == 0
