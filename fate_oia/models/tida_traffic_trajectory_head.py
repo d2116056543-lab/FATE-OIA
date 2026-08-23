@@ -213,8 +213,11 @@ class TIDATrafficTrajectoryHead(nn.Module):
         hidden = self.readout(credit_features(order_contrast))
         reverse_hidden = self.readout(credit_features(-order_contrast))
         trust = torch.sigmoid(self.trust_raw)[None].expand(batch, -1)
-        evidence_logit = self.output(hidden).squeeze(-1)
-        control_logit = self.output(reverse_hidden).squeeze(-1)
+        ordered_readout = self.output(hidden).squeeze(-1)
+        reversed_readout = self.output(reverse_hidden).squeeze(-1)
+        # Temporal credit must exclude any order-independent class prior or output bias.
+        evidence_logit = 0.5 * (ordered_readout - reversed_readout)
+        control_logit = -evidence_logit
         order_rms = order_contrast.square().mean(-1).sqrt()
         learned_order_gate = torch.sigmoid(
             self.order_gate_projection(
@@ -225,7 +228,8 @@ class TIDATrafficTrajectoryHead(nn.Module):
         order_gate = order_strength * (0.5 + 0.5 * learned_order_gate)
         uncertainty_gate = 0.25 + 0.75 * torch.exp(-base_action_logits.detach().abs())
         trajectory_support = 0.5 * (ordered["support"] + reversed_order["support"])
-        budget = self.cap * trust * trajectory_support * order_gate * uncertainty_gate
+        support_gate = trajectory_support / (trajectory_support + 0.05)
+        budget = self.cap * trust * support_gate * order_gate * uncertainty_gate
         delta = budget * torch.tanh(evidence_logit)
         control_delta = budget * torch.tanh(control_logit)
 
@@ -237,6 +241,7 @@ class TIDATrafficTrajectoryHead(nn.Module):
             "traffic_trajectory_context": ordered["context"],
             "traffic_trajectory_trust": trust,
             "traffic_trajectory_support": trajectory_support,
+            "trajectory_support_gate": support_gate,
             "trajectory_order_gate": order_gate,
             "trajectory_uncertainty_gate": uncertainty_gate,
             "trajectory_attention": ordered["attention"],

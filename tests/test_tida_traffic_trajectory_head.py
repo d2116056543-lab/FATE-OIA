@@ -85,16 +85,44 @@ def test_head_cannot_emit_action_prior_without_trajectory_evidence():
     assert torch.count_nonzero(out["traffic_trajectory_support"]) == 0
 
 
-def test_head_decodes_reversed_trajectory_as_control_not_opposite_label():
+def test_head_decodes_reversed_trajectory_as_antisymmetric_control():
     args = list(_inputs(batch=1, frames=5))
     head = TIDATrafficTrajectoryHead(dim=16, num_actions=4, num_heads=4)
     with torch.no_grad():
         head.output.weight.fill_(0.05)
     out = head(*args, base_action_logits=torch.zeros(1, 4))
     assert out["traffic_trajectory_control_delta"].shape == (1, 4)
-    assert not torch.allclose(
+    assert torch.allclose(
         out["traffic_trajectory_delta"], -out["traffic_trajectory_control_delta"], atol=1e-6
     )
+
+
+def test_head_cancels_order_independent_output_bias():
+    args = _inputs(batch=1, frames=5)
+    head = TIDATrafficTrajectoryHead(dim=16, num_actions=4, num_heads=4)
+    with torch.no_grad():
+        head.output.weight.zero_()
+        head.output.bias.fill_(0.75)
+    out = head(*args, base_action_logits=torch.zeros(1, 4))
+    assert torch.allclose(out["traffic_trajectory_delta"], torch.zeros(1, 4), atol=1e-7)
+    assert torch.allclose(out["traffic_trajectory_control_delta"], torch.zeros(1, 4), atol=1e-7)
+
+
+def test_head_uses_saturating_support_gate_instead_of_linear_suppression():
+    high_args = list(_inputs(batch=1, frames=5))
+    low_args = [value.clone() if torch.is_tensor(value) else value for value in high_args]
+    low_args[3].fill_(0.10)
+    head = TIDATrafficTrajectoryHead(dim=16, num_actions=4, num_heads=4)
+    with torch.no_grad():
+        head.output.weight.fill_(0.05)
+        head.trust_raw.add_(1.0)
+    high = head(*high_args, base_action_logits=torch.zeros(1, 4))
+    low = head(*low_args, base_action_logits=torch.zeros(1, 4))
+    assert torch.all(low["trajectory_support_gate"] > low["traffic_trajectory_support"])
+    ratio = low["traffic_trajectory_delta"].abs().mean() / high[
+        "traffic_trajectory_delta"
+    ].abs().mean().clamp_min(1e-8)
+    assert ratio > 0.50
 
 
 def test_head_conditions_credit_on_frozen_base_uncertainty():

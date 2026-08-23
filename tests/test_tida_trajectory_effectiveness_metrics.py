@@ -13,6 +13,7 @@ from fate_oia.engine.evaluate_tida_oia import (
 def test_collect_outputs_collects_every_declared_trajectory_diagnostic():
     source = inspect.getsource(collect_tida_outputs)
     assert source.count('"trajectory_order_contrast_rms"') >= 2
+    assert source.count('"trajectory_support_gate"') >= 2
 
 
 def test_trajectory_metrics_expose_dynamic_gain_transport_and_grounding_quality():
@@ -32,6 +33,7 @@ def test_trajectory_metrics_expose_dynamic_gain_transport_and_grounding_quality(
         "traffic_trajectory_delta": delta,
         "traffic_trajectory_control_delta": torch.zeros_like(delta),
         "traffic_trajectory_support": torch.full((16, 4), 0.8),
+        "trajectory_support_gate": torch.full((16, 4), 0.94),
         "trajectory_order_gate": torch.full((16, 4), 0.6),
         "trajectory_uncertainty_gate": torch.full((16, 4), 0.7),
         "trajectory_attention": torch.full((16, 4, 3), 1.0 / 3.0),
@@ -46,6 +48,7 @@ def test_trajectory_metrics_expose_dynamic_gain_transport_and_grounding_quality(
     assert metrics["target_transport"]["ordered_control_advantage_mean"] > 0
     assert metrics["target_transport"]["correction_to_harm_ratio"] > 1
     assert metrics["grounding_quality"]["cycle_confidence_mean"] == pytest.approx(0.9)
+    assert metrics["grounding_quality"]["support_gate_mean"] == pytest.approx(0.94)
     assert metrics["dynamic_conditioned"]["high_motion"]["count"] > 0
 
 
@@ -64,6 +67,7 @@ def test_trajectory_metrics_report_corrective_and_harmful_flips():
         "traffic_trajectory_delta": trajectory - semantic,
         "traffic_trajectory_control_delta": torch.zeros_like(trajectory),
         "traffic_trajectory_support": torch.ones(4, 1),
+        "trajectory_support_gate": torch.ones(4, 1),
         "trajectory_order_gate": torch.ones(4, 1),
         "trajectory_uncertainty_gate": torch.ones(4, 1),
         "trajectory_attention": torch.ones(4, 1, 1),
@@ -86,6 +90,7 @@ def test_epoch_artifacts_persist_trajectory_metrics_and_tensors(tmp_path):
         "traffic_trajectory_delta": torch.ones(1, 4),
         "traffic_trajectory_control_delta": torch.zeros(1, 4),
         "traffic_trajectory_support": torch.ones(1, 4),
+        "trajectory_support_gate": torch.ones(1, 4),
         "trajectory_order_gate": torch.ones(1, 4),
         "trajectory_uncertainty_gate": torch.ones(1, 4),
         "trajectory_attention": torch.ones(1, 4, 2),
@@ -102,5 +107,6 @@ def test_epoch_artifacts_persist_trajectory_metrics_and_tensors(tmp_path):
     epoch_dir = tmp_path / "epoch_000"
     assert (epoch_dir / "trajectory_traffic_effectiveness.json").exists()
     assert (epoch_dir / "traffic_trajectory_delta_test.pt").exists()
+    assert (epoch_dir / "trajectory_support_gate_test.pt").exists()
     assert (epoch_dir / "trajectory_attention_test.pt").exists()
     assert (epoch_dir / "trajectory_xy_test.pt").exists()

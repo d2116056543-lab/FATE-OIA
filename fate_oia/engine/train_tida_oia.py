@@ -940,6 +940,9 @@ def train(args: Any) -> None:
                 "traffic_trajectory_support_mean": float(
                     output["traffic_trajectory_support"].mean().detach().cpu()
                 ),
+                "trajectory_support_gate_mean": float(
+                    output["trajectory_support_gate"].mean().detach().cpu()
+                ),
                 "trajectory_order_gate_mean": float(
                     output["trajectory_order_gate"].mean().detach().cpu()
                 ),
