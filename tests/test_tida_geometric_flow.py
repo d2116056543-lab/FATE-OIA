@@ -26,6 +26,16 @@ def test_horizontal_translation_has_direction_and_reversal_changes_sign():
     assert reversed_output["global_horizontal"].mean() < 0
 
 
+def test_sparse_large_translation_is_recovered_by_multiscale_correlation():
+    model = TIDAGeometricFlowEncoder(hidden_dim=64, flow_hw=(24, 32))
+    base = torch.zeros(1, 3, 48, 64)
+    base[:, :, 10:30, 6:18] = 1.0
+    frames = torch.stack([torch.roll(base, shifts=8 * step, dims=-1) for step in range(3)], dim=1)
+    output = model(frames, torch.ones(1, 3, dtype=torch.bool))
+    assert output["flow_match_confidence"].mean() > 0
+    assert output["global_horizontal"].mean() > 0.01
+
+
 def test_outward_motion_has_positive_expansion():
     model = TIDAGeometricFlowEncoder(hidden_dim=64, flow_hw=(20, 28))
     frames = []

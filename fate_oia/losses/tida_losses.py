@@ -99,6 +99,62 @@ def target_conditioned_geometric_correction_loss(
     return correction + 0.5 * protect
 
 
+def target_conditioned_geometric_ranking_loss(
+    base_logits: torch.Tensor,
+    geometric_delta: torch.Tensor,
+    target: torch.Tensor,
+    motion_energy: torch.Tensor,
+    label_weight: torch.Tensor | None = None,
+    reference_logits: torch.Tensor | None = None,
+    reference_target: torch.Tensor | None = None,
+    *,
+    margin: float = 0.10,
+    temperature: float = 0.10,
+) -> torch.Tensor:
+    """Improve hard positive-negative ordering using only motion-conditioned residuals."""
+    final_logits = base_logits.detach() + geometric_delta
+    motion = motion_energy.detach().mean(1)
+    sample_motion_weight = 0.5 + 0.5 * torch.tanh(motion / 0.05)
+    losses = []
+    for label in range(base_logits.shape[1]):
+        positive_mask = target[:, label] > 0.5
+        negative_mask = ~positive_mask
+        positive = final_logits[positive_mask, label]
+        negative = final_logits[negative_mask, label]
+        base_positive = base_logits.detach()[positive_mask, label]
+        base_negative = base_logits.detach()[negative_mask, label]
+        terms = []
+        if positive.numel() and negative.numel():
+            hardness = torch.sigmoid((base_negative[:, None] - base_positive[None] + 0.30) / 0.15)
+            pair_motion = 0.5 * (
+                sample_motion_weight[negative_mask, None] + sample_motion_weight[None, positive_mask]
+            )
+            pair_weight = hardness * pair_motion
+            if label_weight is not None:
+                pair_weight = pair_weight * label_weight.detach()[negative_mask, label, None]
+            raw = F.softplus((float(margin) + negative[:, None] - positive[None]) / float(temperature))
+            terms.append(float(temperature) * (raw * pair_weight).sum() / pair_weight.sum().clamp_min(1e-8))
+        if reference_logits is not None and reference_target is not None:
+            reference_positive = reference_logits.detach()[reference_target[:, label] > 0.5, label]
+            reference_negative = reference_logits.detach()[reference_target[:, label] <= 0.5, label]
+            if positive.numel() and reference_negative.numel():
+                raw = F.softplus(
+                    (float(margin) + reference_negative[:, None] - positive[None]) / float(temperature)
+                )
+                terms.append(float(temperature) * (raw * sample_motion_weight[positive_mask][None]).mean())
+            if negative.numel() and reference_positive.numel():
+                raw = F.softplus(
+                    (float(margin) + negative[:, None] - reference_positive[None]) / float(temperature)
+                )
+                current_weight = sample_motion_weight[negative_mask]
+                if label_weight is not None:
+                    current_weight = current_weight * label_weight.detach()[negative_mask, label]
+                terms.append(float(temperature) * (raw * current_weight[:, None]).mean())
+        if terms:
+            losses.append(torch.stack(terms).mean())
+    return torch.stack(losses).mean() if losses else geometric_delta.sum() * 0.0
+
+
 def action_route_sparse_loss(
     route: torch.Tensor,
     factor_keys: torch.Tensor,
@@ -301,6 +357,14 @@ def build_tida_loss_registry(
             action_target, output["geometric_motion_energy"],
         ),
     )
+    registry.add(
+        "geometric_action_rank",
+        target_conditioned_geometric_ranking_loss(
+            output["semantic_video_action_logits"], output["geometric_action_delta_raw"],
+            action_target, output["geometric_motion_energy"], None,
+            rank_reference.get("action_logits"), rank_reference.get("action_target"),
+        ),
+    )
     prefix_action = output["geometric_prefix_action_logits_raw"].flatten(0, 1)
     prefix_action_target = action_target[:, None].expand(-1, 4, -1).flatten(0, 1)
     registry.add("geometric_action_prefix", action_macro_asl_loss(prefix_action, prefix_action_target))
@@ -362,6 +426,13 @@ def build_tida_loss_registry(
         target_conditioned_geometric_correction_loss(
             output["semantic_video_reason_logits"], output["geometric_reason_delta_raw"],
             reason_target, output["geometric_motion_energy"], reason_weights, target_margin=0.15,
+        ),
+    )
+    registry.add(
+        "geometric_reason_rank",
+        target_conditioned_geometric_ranking_loss(
+            output["semantic_video_reason_logits"], output["geometric_reason_delta_raw"],
+            reason_target, output["geometric_motion_energy"], reason_weights,
         ),
     )
     prefix_reason = output["geometric_prefix_reason_logits_raw"].flatten(0, 1)

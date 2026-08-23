@@ -257,12 +257,12 @@ def reason_firewall_gradient_audit(
         "reason_partial", "reason_rank", "reason_soft_f1", "reason_delta",
         "reason_flow_credit", "reason_flow_no_harm", "reason_positive_no_harm",
         "reason_utility_calibration",
-        "geometric_reason_aux", "geometric_reason_prefix", "geometric_reason_delta",
+        "geometric_reason_aux", "geometric_reason_rank", "geometric_reason_prefix", "geometric_reason_delta",
     )
     action_names = (
         "action_asl", "action_smooth_ap", "action_base_protect", "action_delta",
         "action_flow_credit", "action_flow_no_harm", "action_utility_calibration",
-        "geometric_action_aux", "geometric_action_prefix", "geometric_action_delta",
+        "geometric_action_aux", "geometric_action_rank", "geometric_action_prefix", "geometric_action_delta",
     )
     reason_loss = sum(registry.rows[name].weight * registry.rows[name].value for name in reason_names)
     action_loss = sum(registry.rows[name].weight * registry.rows[name].value for name in action_names)
