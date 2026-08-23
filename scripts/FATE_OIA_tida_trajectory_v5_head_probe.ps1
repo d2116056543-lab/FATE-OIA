@@ -13,6 +13,10 @@ $exitFile = Join-Path $OutputDir "process_exit_code.txt"
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 Set-Location $repo
 
+# Windows PowerShell 5.1 wraps native stderr as NativeCommandError. DINO uses
+# stderr for informational messages, so keep strict setup handling while the
+# native training process is allowed to stream both channels into the log.
+$ErrorActionPreference = "Continue"
 & $python -u -m fate_oia.engine.train_tida_oia `
     --config configs\fate_oia_train_tida_oia_v5_trajectory.yaml `
     --clip-manifest E:\sbw\FATE_Drive\fate_oia_tida_oia_v1_worktree\artifacts\tida_clip_manifest.jsonl `
@@ -32,5 +36,6 @@ Set-Location $repo
     --train-owners traffic_trajectory 2>&1 | Tee-Object -FilePath $log
 
 $code = $LASTEXITCODE
+$ErrorActionPreference = "Stop"
 Set-Content -LiteralPath $exitFile -Value $code -Encoding ascii
 exit $code
