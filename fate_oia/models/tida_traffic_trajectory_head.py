@@ -28,8 +28,10 @@ class TIDATrafficTrajectoryHead(nn.Module):
         self.motion_projection = nn.Sequential(nn.Linear(9, dim), nn.GELU(), nn.LayerNorm(dim))
         self.direction_projection = nn.Sequential(nn.Linear(8, dim), nn.GELU())
         self.interaction_projection = nn.Sequential(
-            nn.Linear(8, dim), nn.GELU(), nn.LayerNorm(dim)
+            nn.Linear(8, dim), nn.GELU(), nn.Linear(dim, dim)
         )
+        nn.init.zeros_(self.interaction_projection[-1].weight)
+        nn.init.zeros_(self.interaction_projection[-1].bias)
         temporal_layer = nn.TransformerEncoderLayer(
             dim, num_heads, 2 * dim, dropout=0.0, batch_first=True, norm_first=True
         )

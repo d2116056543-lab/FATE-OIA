@@ -188,3 +188,16 @@ def test_head_encodes_permutation_invariant_inter_trajectory_risk():
         atol=1e-5,
         rtol=1e-5,
     )
+
+
+def test_interaction_encoder_is_zero_effect_but_not_gradient_dead():
+    args = _inputs(batch=1, tracks=3, frames=5)
+    head = TIDATrafficTrajectoryHead(dim=16, num_actions=4, num_heads=4)
+    with torch.no_grad():
+        projected = head.interaction_projection(torch.randn(2, 8))
+    assert torch.count_nonzero(projected) == 0
+    with torch.no_grad():
+        head.output.weight.fill_(0.05)
+    head(*args)["traffic_trajectory_delta"].sum().backward()
+    zero_up = head.interaction_projection[-1]
+    assert zero_up.weight.grad is not None and zero_up.weight.grad.abs().sum() > 0
