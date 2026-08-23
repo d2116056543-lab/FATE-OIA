@@ -187,6 +187,7 @@ def collect_tida_outputs(
             "trajectory_speed": output["trajectory_speed"],
             "trajectory_acceleration": output["trajectory_acceleration"],
             "trajectory_radial_motion": output["trajectory_radial_motion"],
+            "trajectory_order_contrast_rms": output["trajectory_order_contrast_rms"],
             "trajectory_cycle_confidence": output["trajectory_cycle_confidence"],
             "trajectory_common_displacement": output["trajectory_common_displacement"],
             "trajectory_exclusive_displacement": output["trajectory_exclusive_displacement"],
@@ -223,6 +224,14 @@ def collect_tida_outputs(
                 mechanism_outputs[name]["reason"].append(changed["video_reason_logits"].detach().float().cpu())
                 mechanism_outputs[name]["velocity"].append(changed["velocity"].detach().float().cpu())
             mechanism_count += batch["target_image"].shape[0]
+    missing_collections = [
+        key for key, values in (store | diagnostics).items() if not values
+    ]
+    if missing_collections:
+        raise RuntimeError(
+            "collect_tida_outputs did not collect declared fields: "
+            + ", ".join(missing_collections)
+        )
     result = {key: torch.cat(value) for key, value in store.items()} | {
         key: torch.cat(value) for key, value in diagnostics.items()
     } | {"file_names": file_names}

@@ -1,10 +1,18 @@
+import inspect
+
 import torch
 import pytest
 
 from fate_oia.engine.evaluate_tida_oia import (
+    collect_tida_outputs,
     save_epoch_outputs,
     trajectory_traffic_effectiveness_metrics,
 )
+
+
+def test_collect_outputs_collects_every_declared_trajectory_diagnostic():
+    source = inspect.getsource(collect_tida_outputs)
+    assert source.count('"trajectory_order_contrast_rms"') >= 2
 
 
 def test_trajectory_metrics_expose_dynamic_gain_transport_and_grounding_quality():
