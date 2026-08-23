@@ -435,6 +435,8 @@ class TIDAOIAModel(nn.Module):
         timestamps: torch.Tensor,
         frame_valid_mask: torch.Tensor,
         intervention: str | None = None,
+        action_base_logits: torch.Tensor | None = None,
+        reason_base_logits: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         if not self.geometric_flow_enabled:
             return {}
@@ -453,9 +455,11 @@ class TIDAOIAModel(nn.Module):
             )
             frames = frames.index_select(1, order)
         measured = self.geometric_flow(frames, valid, timestamps[:, :-1])
-        decisions = self.geometric_heads(measured["flow_state"], measured["history_available"])
+        decisions = self.geometric_heads(
+            measured["flow_state"], measured["history_available"], action_base_logits, reason_base_logits
+        )
         prefixes = self.geometric_heads.forward_prefixes(
-            measured["prefix_flow_states"], measured["prefix_available"]
+            measured["prefix_flow_states"], measured["prefix_available"], action_base_logits, reason_base_logits
         )
         return {
             **decisions,
@@ -492,7 +496,8 @@ class TIDAOIAModel(nn.Module):
             rerun_valid = rerun_valid.clone()
             rerun_valid[:, :-1] = False
         geometric = self._encode_geometric(
-            output["_geometric_context_images"], output["timestamps"], output["frame_valid_mask"], intervention
+            output["_geometric_context_images"], output["timestamps"], output["frame_valid_mask"], intervention,
+            output["image_action_logits"], output["image_reason_logits"],
         )
         return self.decode_encoded_history(
             history, output["history_query_region_mass"], output["timestamps"], rerun_valid,
@@ -548,7 +553,8 @@ class TIDAOIAModel(nn.Module):
             temporal_action_scale=temporal_action_scale,
             temporal_reason_scale=temporal_reason_scale,
             geometric=self._encode_geometric(
-                context_images, timestamps, effective_frame_valid_mask, intervention
+                context_images, timestamps, effective_frame_valid_mask, intervention,
+                image["action_logits_final"].detach(), image["reason_logits_final"].detach(),
             ),
         )
         return {
