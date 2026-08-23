@@ -559,6 +559,7 @@ class TIDAOIAModel(nn.Module):
             "trajectory_acceleration": image_action.new_zeros(batch, actions, tracks, intervals),
             "trajectory_radial_motion": image_action.new_zeros(batch, actions, tracks, intervals),
             "trajectory_pair_confidence": image_action.new_zeros(batch, actions, tracks, intervals),
+            "trajectory_order_contrast_rms": image_action.new_zeros(batch, actions),
             "trajectory_xy": image_action.new_zeros(batch, actions, tracks, total_frames, 2),
             "trajectory_visibility": image_action.new_zeros(batch, actions, tracks, total_frames),
             "trajectory_cycle_confidence": image_action.new_zeros(batch, actions, tracks, total_frames),

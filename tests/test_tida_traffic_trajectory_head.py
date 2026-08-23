@@ -102,3 +102,11 @@ def test_head_uses_antisymmetric_order_credit():
     reversed_delta = head(*args)["traffic_trajectory_delta"]
 
     assert torch.allclose(ordered, -reversed_delta, atol=1e-6)
+
+
+def test_head_reports_nonzero_order_contrast_without_action_prior():
+    args = _inputs(batch=1, frames=5)
+    head = TIDATrafficTrajectoryHead(dim=16, num_actions=4, num_heads=4)
+    out = head(*args)
+    assert out["trajectory_order_contrast_rms"].shape == (1, 4)
+    assert torch.all(out["trajectory_order_contrast_rms"] > 0)

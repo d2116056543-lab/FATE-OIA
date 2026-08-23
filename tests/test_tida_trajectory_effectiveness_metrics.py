@@ -27,6 +27,7 @@ def test_trajectory_metrics_expose_dynamic_gain_transport_and_grounding_quality(
         "trajectory_speed": torch.ones(16, 4, 3, 4),
         "trajectory_cycle_confidence": torch.full((16, 4, 3, 5), 0.9),
         "trajectory_exclusive_displacement": torch.ones(16, 4, 3, 4, 2) * 0.1,
+        "trajectory_order_contrast_rms": torch.full((16, 4), 0.2),
     }
     metrics = trajectory_traffic_effectiveness_metrics(rows)
     assert metrics["overall"]["trajectory_incremental_action_mf1"] > 0
@@ -54,6 +55,7 @@ def test_trajectory_metrics_report_corrective_and_harmful_flips():
         "trajectory_speed": torch.ones(4, 1, 1, 1),
         "trajectory_cycle_confidence": torch.ones(4, 1, 1, 2),
         "trajectory_exclusive_displacement": torch.ones(4, 1, 1, 1, 2),
+        "trajectory_order_contrast_rms": torch.full((4, 1), 0.2),
     }
     metrics = trajectory_traffic_effectiveness_metrics(rows)
     assert metrics["decision_flips"]["fn_to_tp"] == [1]
@@ -71,6 +73,7 @@ def test_epoch_artifacts_persist_trajectory_metrics_and_tensors(tmp_path):
         "trajectory_attention": torch.ones(1, 4, 2),
         "trajectory_speed": torch.ones(1, 4, 2, 3),
         "trajectory_xy": torch.ones(1, 4, 2, 4, 2),
+        "trajectory_order_contrast_rms": torch.ones(1, 4),
     }
     save_epoch_outputs(
         tmp_path, 0, rows,

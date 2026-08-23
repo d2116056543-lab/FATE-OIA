@@ -193,10 +193,12 @@ class TIDATrafficTrajectoryHead(nn.Module):
             -exclusive_displacement.flip(3),
             anchor_weight,
         )
-        hidden = self.readout(torch.cat((action_nodes, ordered["context"]), dim=-1))
-        reverse_hidden = self.readout(
-            torch.cat((action_nodes, reversed_order["context"]), dim=-1)
+        order_contrast = ordered["context"] - reversed_order["context"]
+        contrast_features = torch.cat(
+            (order_contrast, action_nodes * order_contrast), dim=-1
         )
+        hidden = self.readout(contrast_features)
+        reverse_hidden = self.readout(-contrast_features)
         trust = torch.sigmoid(self.trust_raw)[None].expand(batch, -1)
         evidence_logit = 0.5 * (
             self.output(hidden).squeeze(-1) - self.output(reverse_hidden).squeeze(-1)
@@ -216,4 +218,5 @@ class TIDATrafficTrajectoryHead(nn.Module):
             "trajectory_acceleration": ordered["acceleration"],
             "trajectory_radial_motion": ordered["radial"],
             "trajectory_pair_confidence": ordered["pair_confidence"],
+            "trajectory_order_contrast_rms": order_contrast.square().mean(-1).sqrt(),
         }

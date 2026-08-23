@@ -82,6 +82,7 @@ def collect_tida_outputs(
         "traffic_patch_effective_motion",
         "traffic_trajectory_delta", "traffic_trajectory_support", "trajectory_attention",
         "trajectory_speed", "trajectory_acceleration", "trajectory_radial_motion",
+        "trajectory_order_contrast_rms",
         "trajectory_cycle_confidence", "trajectory_common_displacement",
         "trajectory_exclusive_displacement", "trajectory_xy",
     )}
@@ -622,6 +623,7 @@ def trajectory_traffic_effectiveness_metrics(
             "normalized_attention_entropy_mean": float(normalized_entropy.mean()),
             "effective_track_count_mean": float(torch.exp(entropy).mean()),
             "exclusive_motion_rms": float(rows["trajectory_exclusive_displacement"].square().mean().sqrt()),
+            "order_contrast_rms_mean": float(rows["trajectory_order_contrast_rms"].mean()),
         },
         "decision_flips": decision_flips,
         "causal_temporal_interventions": causal,
@@ -718,6 +720,7 @@ def save_epoch_outputs(output_dir: Path, epoch: int, rows: dict[str, Any], metri
         "traffic_patch_effective_motion",
         "traffic_trajectory_delta", "traffic_trajectory_support", "trajectory_attention",
         "trajectory_speed", "trajectory_acceleration", "trajectory_radial_motion",
+        "trajectory_order_contrast_rms",
         "trajectory_cycle_confidence", "trajectory_common_displacement",
         "trajectory_exclusive_displacement", "trajectory_xy",
         "terminal_prediction_history", "terminal_prediction_no_history", "terminal_target_evidence",
