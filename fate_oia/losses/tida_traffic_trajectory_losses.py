@@ -15,13 +15,21 @@ def trajectory_boundary_correction_loss(
     trajectory_support: torch.Tensor,
     *,
     target_margin: float = 0.20,
+    deploy_boundary_logits: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Use traffic trajectories where the frozen image decision is uncertain."""
     if not (base_logits.shape == trajectory_delta.shape == target.shape == trajectory_support.shape):
         raise ValueError("trajectory boundary tensors must have identical [B,A] shapes")
     sign = 2.0 * target.float() - 1.0
-    base_margin = sign * base_logits.detach()
-    final_margin = sign * (base_logits.detach() + trajectory_delta)
+    boundary_logits = (
+        torch.zeros(base_logits.shape[-1], device=base_logits.device, dtype=base_logits.dtype)
+        if deploy_boundary_logits is None else deploy_boundary_logits.to(base_logits)
+    )
+    if boundary_logits.shape != (base_logits.shape[-1],):
+        raise ValueError("deploy_boundary_logits must be [A]")
+    deploy_base = base_logits.detach() - boundary_logits
+    base_margin = sign * deploy_base
+    final_margin = sign * (deploy_base + trajectory_delta)
     boundary = torch.sigmoid((0.80 - base_margin.abs()) / 0.20).detach()
     support = trajectory_support.detach().clamp(0.0, 1.0)
     weight = boundary * (0.10 + 0.90 * support)
@@ -39,6 +47,7 @@ def trajectory_selected_control_loss(
     trajectory_support: torch.Tensor,
     *,
     margin: float = 0.02,
+    deploy_boundary_logits: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Require ordered selected trajectories to beat same-clip temporal controls."""
     if not (
@@ -47,9 +56,16 @@ def trajectory_selected_control_loss(
     ):
         raise ValueError("selected/control tensors must have identical [B,A] shapes")
     sign = 2.0 * target.float() - 1.0
-    selected_margin = sign * (base_logits.detach() + selected_delta)
-    control_margin = sign * (base_logits.detach() + control_delta.detach())
-    boundary = torch.sigmoid((0.80 - base_logits.detach().abs()) / 0.20)
+    boundary_logits = (
+        torch.zeros(base_logits.shape[-1], device=base_logits.device, dtype=base_logits.dtype)
+        if deploy_boundary_logits is None else deploy_boundary_logits.to(base_logits)
+    )
+    if boundary_logits.shape != (base_logits.shape[-1],):
+        raise ValueError("deploy_boundary_logits must be [A]")
+    deploy_base = base_logits.detach() - boundary_logits
+    selected_margin = sign * (deploy_base + selected_delta)
+    control_margin = sign * (deploy_base + control_delta.detach())
+    boundary = torch.sigmoid((0.80 - deploy_base.abs()) / 0.20)
     weight = boundary * (0.10 + 0.90 * trajectory_support.detach().clamp(0.0, 1.0))
     violation = F.relu(float(margin) + control_margin - selected_margin)
     return _weighted_mean(violation, weight)

@@ -773,15 +773,25 @@ def train(args: Any) -> None:
     atomic_write_json(output_dir / "owner_map.json", {name: [id(parameter) for parameter in values] for name, values in model.owner_parameters().items()})
 
     baseline_path = output_dir / "TIDA_IMAGE_BASELINE_COVERED_SUBSET.json"
+    model.eval()
+    baseline_calib_rows = collect_tida_outputs(
+        model, runtime.loaders["train_calib"], device, temporal_scale=0.0
+    )
+    baseline_thresholds = fit_train_calib_thresholds(baseline_calib_rows)
+    action_deploy_boundary_logits = torch.logit(
+        baseline_thresholds["image"][: model.num_actions].to(device).clamp(1e-5, 1.0 - 1e-5)
+    )
+    manifest["trajectory_boundary_source"] = "train_calib_image_baseline"
+    manifest["trajectory_action_boundary_logits"] = action_deploy_boundary_logits.detach().cpu().tolist()
+    atomic_write_json(output_dir / "run_manifest.json", manifest)
     if start_epoch == 0 and not baseline_path.exists():
-        model.eval()
-        baseline_calib_rows = collect_tida_outputs(model, runtime.loaders["train_calib"], device, temporal_scale=0.0)
         baseline_test_rows = collect_tida_outputs(model, runtime.loaders["test"], device, temporal_scale=0.0)
-        baseline_thresholds = fit_train_calib_thresholds(baseline_calib_rows)
         atomic_write_json(baseline_path, {
             "pass": True, "covered_test_count": len(baseline_test_rows["file_names"]),
             "raw_fixed": branch_metrics(baseline_test_rows)["image"],
             "deploy": branch_metrics(baseline_test_rows, baseline_thresholds["image"])["image"],
+            "action_threshold_prob": baseline_thresholds["image"][: model.num_actions].tolist(),
+            "action_threshold_logit": action_deploy_boundary_logits.detach().cpu().tolist(),
             "threshold_fit_split": "train_calib", "test_labels_used_for_parameters": False,
         })
 
@@ -846,6 +856,7 @@ def train(args: Any) -> None:
                     counterfactual_outputs=counterfactual_outputs,
                     rank_reference=rank_window_reference(rank_window),
                     weights=config["loss"],
+                    deploy_action_boundary_logits=action_deploy_boundary_logits,
                 )
                 loss = registry.total() / grad_accum
             forward_timer.end_forward()

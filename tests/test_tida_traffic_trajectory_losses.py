@@ -31,3 +31,19 @@ def test_selected_control_requires_ordered_trajectory_to_improve_gt_margin():
     assert good_loss < bad_loss
     good_loss.backward()
     assert selected.grad is not None and selected.grad.abs().sum() > 0
+
+
+def test_boundary_correction_uses_train_calib_deploy_boundary():
+    base = torch.tensor([[0.55, -0.55]])
+    deploy_boundary = torch.tensor([0.60, -0.60])
+    target = torch.tensor([[1.0, 0.0]])
+    support = torch.ones_like(base)
+    aligned = torch.tensor([[0.20, -0.20]])
+    opposed = -aligned
+    aligned_loss = trajectory_boundary_correction_loss(
+        base, aligned, target, support, deploy_boundary_logits=deploy_boundary
+    )
+    opposed_loss = trajectory_boundary_correction_loss(
+        base, opposed, target, support, deploy_boundary_logits=deploy_boundary
+    )
+    assert aligned_loss < opposed_loss

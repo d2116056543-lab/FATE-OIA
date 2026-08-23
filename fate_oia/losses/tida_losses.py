@@ -273,6 +273,7 @@ def build_tida_loss_registry(
     counterfactual_outputs: dict[str, dict[str, torch.Tensor]] | None = None,
     rank_reference: dict[str, torch.Tensor] | None = None,
     weights: dict[str, float] | None = None,
+    deploy_action_boundary_logits: torch.Tensor | None = None,
 ):
     from .tida_loss_registry import TIDALossRegistry
 
@@ -406,6 +407,7 @@ def build_tida_loss_registry(
         trajectory_boundary_correction_loss(
             output["semantic_video_action_logits"], output["traffic_trajectory_delta_raw"],
             action_target, output["traffic_trajectory_support"],
+            deploy_boundary_logits=deploy_action_boundary_logits,
         ),
     )
     registry.add(
@@ -421,6 +423,7 @@ def build_tida_loss_registry(
             output["semantic_video_action_logits"], output["traffic_trajectory_delta_raw"],
             value["traffic_trajectory_delta_raw"], action_target,
             output["traffic_trajectory_support"],
+            deploy_boundary_logits=deploy_action_boundary_logits,
         )
         for value in counterfactual_outputs.values()
     ]
