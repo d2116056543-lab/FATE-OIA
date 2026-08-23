@@ -903,6 +903,9 @@ def train(args: Any) -> None:
                 "traffic_patch_exclusive_motion_rms": float(
                     output["traffic_patch_exclusive_displacement"].float().square().mean().sqrt().detach().cpu()
                 ),
+                "traffic_patch_effective_motion_mean": float(
+                    output["traffic_patch_effective_motion"].mean().detach().cpu()
+                ),
                 "action_evidence_confidence_mean": float(output["action_evidence_confidence"].mean().detach().cpu()),
                 "action_effective_trust_mean": float(output["action_effective_trust"].mean().detach().cpu()),
                 "reason_delta_rms": float(output["reason_temporal_delta"].float().square().mean().sqrt().detach().cpu()),

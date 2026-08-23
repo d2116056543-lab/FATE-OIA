@@ -468,6 +468,10 @@ class TIDAOIAModel(nn.Module):
             "traffic_patch_exclusive_displacement": image_action.new_zeros(
                 batch, intervals, self.num_actions, 2
             ),
+            "traffic_patch_exclusive_motion_energy": image_action.new_zeros(
+                batch, intervals, self.num_actions
+            ),
+            "traffic_patch_effective_motion": image_action.new_zeros(batch, intervals, self.num_actions),
             "traffic_patch_match_confidence": image_action.new_zeros(batch, intervals, self.num_actions),
             "traffic_patch_motion_energy": image_action.new_zeros(batch, intervals, self.num_actions),
         }

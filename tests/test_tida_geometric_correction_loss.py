@@ -28,6 +28,17 @@ def test_confident_correct_base_is_protected_from_harmful_delta():
     assert harmful > safe
 
 
+def test_action_specific_motion_focuses_correction_gradient_on_supported_action():
+    base = torch.zeros(2, 2)
+    target = torch.tensor([[1.0, 1.0], [0.0, 0.0]])
+    delta = torch.zeros_like(base, requires_grad=True)
+    motion = torch.zeros(2, 3, 2)
+    motion[:, :, 0] = 0.2
+    loss = target_conditioned_geometric_correction_loss(base, delta, target, motion)
+    loss.backward()
+    assert delta.grad[:, 0].abs().mean() > delta.grad[:, 1].abs().mean()
+
+
 def test_geometric_ranking_loss_rewards_correct_pair_order_and_is_differentiable():
     base = torch.tensor([[0.1], [0.2], [-0.2], [0.0]])
     target = torch.tensor([[1.0], [0.0], [1.0], [0.0]])

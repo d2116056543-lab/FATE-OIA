@@ -77,7 +77,8 @@ def collect_tida_outputs(
         "traffic_same_action_mass",
         "traffic_patch_displacement", "traffic_patch_common_displacement",
         "traffic_patch_exclusive_displacement", "traffic_patch_match_confidence",
-        "traffic_patch_motion_energy",
+        "traffic_patch_motion_energy", "traffic_patch_exclusive_motion_energy",
+        "traffic_patch_effective_motion",
     )}
     audit_keys = (
         "terminal_prediction_history", "terminal_prediction_no_history", "terminal_target_evidence",
@@ -170,6 +171,8 @@ def collect_tida_outputs(
             "traffic_patch_exclusive_displacement": output["traffic_patch_exclusive_displacement"],
             "traffic_patch_match_confidence": output["traffic_patch_match_confidence"],
             "traffic_patch_motion_energy": output["traffic_patch_motion_energy"],
+            "traffic_patch_exclusive_motion_energy": output["traffic_patch_exclusive_motion_energy"],
+            "traffic_patch_effective_motion": output["traffic_patch_effective_motion"],
         }.items():
             diagnostics[key].append(value.detach().float().cpu())
         if collect_audit_tensors:
@@ -386,7 +389,12 @@ def traffic_action_effectiveness_metrics(
         rows["traffic_action"], rows["image_reason"],
         rows["action_target"], rows["reason_target"], threshold=thresholds,
     )
-    score = rows["traffic_motion_energy"].mean(1)
+    if "traffic_patch_effective_motion" in rows:
+        score = rows["traffic_patch_effective_motion"].mean((1, 2))
+        motion_source = "exclusive_patch_motion_x_match_confidence"
+    else:
+        score = rows["traffic_motion_energy"].mean(1)
+        motion_source = "action_token_velocity"
     low_cut, high_cut = torch.quantile(score, 0.25), torch.quantile(score, 0.75)
     strata: dict[str, Any] = {}
     for name, mask in (("low_motion", score <= low_cut), ("high_motion", score >= high_cut)):
@@ -440,6 +448,7 @@ def traffic_action_effectiveness_metrics(
             "traffic_incremental_action_map": final["Act_mAP"] - semantic["Act_mAP"],
         },
         "motion_quantiles": {
+            "source": motion_source,
             "p25": float(low_cut), "p50": float(torch.quantile(score, 0.5)), "p75": float(high_cut),
         },
         "motion_strata": strata,
@@ -547,7 +556,8 @@ def save_epoch_outputs(output_dir: Path, epoch: int, rows: dict[str, Any], metri
         "traffic_same_action_mass",
         "traffic_patch_displacement", "traffic_patch_common_displacement",
         "traffic_patch_exclusive_displacement", "traffic_patch_match_confidence",
-        "traffic_patch_motion_energy",
+        "traffic_patch_motion_energy", "traffic_patch_exclusive_motion_energy",
+        "traffic_patch_effective_motion",
         "terminal_prediction_history", "terminal_prediction_no_history", "terminal_target_evidence",
         "terminal_error_history", "terminal_error_no_history", "innovation_token",
         "predicate_differential_state", "predicate_velocity_norm", "predicate_acceleration_norm",
