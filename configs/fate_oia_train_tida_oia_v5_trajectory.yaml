@@ -1,5 +1,5 @@
 experiment:
-  name: tida_oia_flow_credit_v1
+  name: tida_oia_trajectory_relational_credit_v5
   direct_video: true
   eval_splits: [test]
   best_selection_split: test
@@ -65,10 +65,10 @@ model:
   geometric_action_cap: 0.20
   geometric_reason_cap: 0.15
   geometric_flow_hw: [45, 80]
-  traffic_action_enabled: true
+  traffic_action_enabled: false
   traffic_action_cap: 0.05
   traffic_motion_topk: 12
-  traffic_trajectory_enabled: false
+  traffic_trajectory_enabled: true
   traffic_trajectory_cap: 0.08
   traffic_trajectory_heads: 4
 loss:
@@ -98,19 +98,19 @@ loss:
   geometric_action_rank: 0.0
   geometric_action_prefix: 0.0
   geometric_action_delta: 0.0
-  traffic_action_aux: 0.08
-  traffic_action_rank: 0.35
-  traffic_action_delta: 0.002
-  trajectory_action_boundary: 0.0
-  trajectory_action_rank: 0.0
-  trajectory_selected_control: 0.0
-  trajectory_delta: 0.0
+  traffic_action_aux: 0.0
+  traffic_action_rank: 0.0
+  traffic_action_delta: 0.0
+  trajectory_action_boundary: 0.12
+  trajectory_action_rank: 0.25
+  trajectory_selected_control: 0.15
+  trajectory_delta: 0.002
   geometric_reason_aux: 0.0
   geometric_reason_rank: 0.0
   geometric_reason_prefix: 0.0
   geometric_reason_delta: 0.0
 training:
-  seed: 20260821
+  seed: 20260823
   epochs: 10
   precision: bf16
   optimizer: AdamW
@@ -136,7 +136,7 @@ training:
     geometric_action: 0.0005
     geometric_reason: 0.0003
     traffic_action: 0.00015
-    traffic_trajectory: 0.0002
+    traffic_trajectory: 0.0003
 memory_probe:
   max_reserved_gib: 45.0
   max_growth_gib: 0.25
@@ -146,7 +146,6 @@ memory_probe:
     - {name: A, batch_size: 4, gradient_accumulation_steps: 8, context_chunk_size: 2}
     - {name: B, batch_size: 3, gradient_accumulation_steps: 10, context_chunk_size: 3}
     - {name: C, batch_size: 2, gradient_accumulation_steps: 15, context_chunk_size: 5}
-    - {name: D, batch_size: 1, gradient_accumulation_steps: 30, context_chunk_size: 7}
 runtime:
   foreground_only: true
   no_feature_cache: true

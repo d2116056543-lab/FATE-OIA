@@ -15,6 +15,8 @@ from .tida_reason_reader import TIDAReasonReader
 from .tida_temporal_encoder import TIDATemporalEncoder
 from .tida_terminal_innovation import TIDATerminalInnovation
 from .tida_terminal_query_reader import TIDATerminalQueryReader
+from .tida_traffic_trajectories import TIDATrafficTrajectoryBuilder
+from .tida_traffic_trajectory_head import TIDATrafficTrajectoryHead
 from ..explain.tida_dynamic_concepts import translate_dynamic_concepts
 
 
@@ -134,6 +136,9 @@ class TIDAOIAModel(nn.Module):
         traffic_action_enabled: bool = False,
         traffic_action_cap: float = 0.15,
         traffic_motion_topk: int = 12,
+        traffic_trajectory_enabled: bool = False,
+        traffic_trajectory_cap: float = 0.08,
+        traffic_trajectory_heads: int = 4,
     ) -> None:
         super().__init__()
         self.image_model = image_model
@@ -196,6 +201,15 @@ class TIDAOIAModel(nn.Module):
         if not self.traffic_action_enabled:
             for parameter in self.traffic_action.parameters():
                 parameter.requires_grad = False
+        self.traffic_trajectory_enabled = bool(traffic_trajectory_enabled)
+        self.traffic_trajectory_builder = TIDATrafficTrajectoryBuilder()
+        self.traffic_trajectory_head = TIDATrafficTrajectoryHead(
+            dim=dim, num_actions=num_actions, num_heads=traffic_trajectory_heads,
+            cap=traffic_trajectory_cap,
+        )
+        if not self.traffic_trajectory_enabled:
+            for parameter in self.traffic_trajectory_head.parameters():
+                parameter.requires_grad = False
         self.query_identity = nn.Parameter(torch.randn(num_actions + num_predicates, dim) * 0.02)
         self.predicate_identity = nn.Parameter(torch.randn(num_predicates, dim) * 0.02)
         self.num_actions = int(num_actions)
@@ -257,6 +271,10 @@ class TIDAOIAModel(nn.Module):
             owners["traffic_action"] = [
                 parameter for parameter in self.traffic_action.parameters() if parameter.requires_grad
             ]
+        if self.traffic_trajectory_enabled:
+            owners["traffic_trajectory"] = [
+                parameter for parameter in self.traffic_trajectory_head.parameters() if parameter.requires_grad
+            ]
         # Query identities are the shortcut-free prior for terminal prediction.
         owners["history_reader"] += [self.query_identity, self.predicate_identity]
         return owners
@@ -282,6 +300,9 @@ class TIDAOIAModel(nn.Module):
         history_action_patch_tokens: torch.Tensor | None = None,
         history_action_patch_xy: torch.Tensor | None = None,
         history_action_patch_weight: torch.Tensor | None = None,
+        terminal_action_patch_tokens: torch.Tensor | None = None,
+        terminal_action_patch_xy: torch.Tensor | None = None,
+        terminal_action_patch_weight: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         action_nodes = image["action_nodes_primary"].detach()
         reason_nodes = image["reason_nodes_primary"].detach()
@@ -362,9 +383,41 @@ class TIDAOIAModel(nn.Module):
         )
         traffic_action_delta_raw = traffic["traffic_action_delta"]
         traffic_action_delta = traffic_action_delta_raw * temporal_action_scale
+        trajectory = self._empty_traffic_trajectory(image_action, history_tokens.shape[1] + 1)
+        if self.traffic_trajectory_enabled:
+            required = (
+                history_action_patch_tokens, history_action_patch_xy, history_action_patch_weight,
+                terminal_action_patch_tokens, terminal_action_patch_xy, terminal_action_patch_weight,
+            )
+            if any(value is None for value in required):
+                raise ValueError("trajectory traffic requires history and terminal action patches")
+            trajectory_field = self.traffic_trajectory_builder(
+                torch.cat((history_action_patch_tokens, terminal_action_patch_tokens[:, None]), dim=1),
+                torch.cat((history_action_patch_xy, terminal_action_patch_xy[:, None]), dim=1),
+                torch.cat((history_action_patch_weight, terminal_action_patch_weight[:, None]), dim=1),
+                frame_valid_mask,
+            )
+            trajectory = {
+                **trajectory_field,
+                **self.traffic_trajectory_head(
+                    action_nodes,
+                    trajectory_field["trajectory_appearance"],
+                    trajectory_field["trajectory_xy"],
+                    trajectory_field["trajectory_visibility"],
+                    trajectory_field["trajectory_pair_valid"],
+                    trajectory_field["trajectory_common_displacement"],
+                    trajectory_field["trajectory_exclusive_displacement"],
+                    trajectory_field["trajectory_anchor_weight"],
+                ),
+            }
+        traffic_trajectory_delta_raw = trajectory["traffic_trajectory_delta"]
+        traffic_trajectory_delta = traffic_trajectory_delta_raw * temporal_action_scale
         semantic_action_delta = action["action_temporal_delta"]
         semantic_reason_delta = reason_delta_raw
-        action_delta = semantic_action_delta + geometric_action_delta + traffic_action_delta
+        action_delta = (
+            semantic_action_delta + geometric_action_delta + traffic_action_delta
+            + traffic_trajectory_delta
+        )
         reason_delta_raw = semantic_reason_delta + geometric_reason_delta
         semantic_reason_effective = (
             confidence_aware_reason_delta(
@@ -396,7 +449,7 @@ class TIDAOIAModel(nn.Module):
         )
         return {
             **temporal, **innovation, **differential, **flow, **action, **reason,
-            **geometric, **traffic,
+            **geometric, **traffic, **trajectory,
             "terminal_target_evidence": terminal_target_evidence,
             "terminal_query_identity": terminal_query_identity,
             "predicate_innovation_token": xi[:, self.num_actions :],
@@ -410,6 +463,10 @@ class TIDAOIAModel(nn.Module):
             "traffic_action_delta": traffic_action_delta,
             "traffic_video_action_logits_raw": image_action + traffic_action_delta_raw,
             "traffic_video_action_logits": image_action + traffic_action_delta,
+            "traffic_trajectory_delta_raw": traffic_trajectory_delta_raw,
+            "traffic_trajectory_delta": traffic_trajectory_delta,
+            "trajectory_video_action_logits_raw": image_action + traffic_trajectory_delta_raw,
+            "trajectory_video_action_logits": image_action + traffic_trajectory_delta,
             "geometric_prefix_action_delta": geometric_prefix_action_delta,
             "geometric_prefix_action_logits_raw": image_action[:, None] + geometric_prefix_action_delta_raw,
             "geometric_prefix_action_logits": image_action[:, None] + geometric_prefix_action_delta,
@@ -474,6 +531,38 @@ class TIDAOIAModel(nn.Module):
             "traffic_patch_effective_motion": image_action.new_zeros(batch, intervals, self.num_actions),
             "traffic_patch_match_confidence": image_action.new_zeros(batch, intervals, self.num_actions),
             "traffic_patch_motion_energy": image_action.new_zeros(batch, intervals, self.num_actions),
+        }
+
+    def _empty_traffic_trajectory(
+        self, image_action: torch.Tensor, total_frames: int
+    ) -> dict[str, torch.Tensor]:
+        batch = image_action.shape[0]
+        actions = self.num_actions
+        tracks = self.context_encoder.motion_topk
+        dim = self.query_identity.shape[-1]
+        intervals = max(int(total_frames) - 1, 1)
+        return {
+            "traffic_trajectory_delta": torch.zeros_like(image_action),
+            "traffic_trajectory_context": image_action.new_zeros(batch, actions, dim),
+            "traffic_trajectory_trust": image_action.new_zeros(batch, actions),
+            "traffic_trajectory_support": image_action.new_zeros(batch, actions),
+            "trajectory_attention": image_action.new_zeros(batch, actions, tracks),
+            "trajectory_tokens": image_action.new_zeros(batch, actions, tracks, dim),
+            "trajectory_direction_histogram": image_action.new_zeros(batch, actions, tracks, 8),
+            "trajectory_speed": image_action.new_zeros(batch, actions, tracks, intervals),
+            "trajectory_acceleration": image_action.new_zeros(batch, actions, tracks, intervals),
+            "trajectory_radial_motion": image_action.new_zeros(batch, actions, tracks, intervals),
+            "trajectory_pair_confidence": image_action.new_zeros(batch, actions, tracks, intervals),
+            "trajectory_xy": image_action.new_zeros(batch, actions, tracks, total_frames, 2),
+            "trajectory_visibility": image_action.new_zeros(batch, actions, tracks, total_frames),
+            "trajectory_cycle_confidence": image_action.new_zeros(batch, actions, tracks, total_frames),
+            "trajectory_pair_valid": torch.zeros(
+                batch, actions, tracks, intervals, dtype=torch.bool, device=image_action.device
+            ),
+            "trajectory_displacement": image_action.new_zeros(batch, actions, tracks, intervals, 2),
+            "trajectory_common_displacement": image_action.new_zeros(batch, intervals, 2),
+            "trajectory_exclusive_displacement": image_action.new_zeros(batch, actions, tracks, intervals, 2),
+            "trajectory_anchor_weight": image_action.new_zeros(batch, actions, tracks),
         }
 
     @staticmethod
@@ -590,6 +679,9 @@ class TIDAOIAModel(nn.Module):
             history_action_patch_tokens=patch_tokens,
             history_action_patch_xy=patch_xy,
             history_action_patch_weight=patch_weight,
+            terminal_action_patch_tokens=output["terminal_action_patch_tokens"],
+            terminal_action_patch_xy=output["terminal_action_patch_xy"],
+            terminal_action_patch_weight=output["terminal_action_patch_weight"],
         )
 
     def forward(
@@ -614,6 +706,13 @@ class TIDAOIAModel(nn.Module):
         predicate_tokens = image["predicate_tokens"].detach()
         target_evidence = torch.cat([action_nodes, predicate_tokens], dim=1)
         terminal_query_identity = self.query_identity[None].expand(target_image.shape[0], -1, -1)
+        terminal_read = self.query_reader(
+            target_field["patch_tokens_by_layer"], action_nodes, predicate_tokens,
+            self.predicate_identity, grid_hw=target_field["grid_hw"],
+        )
+        terminal_patches = self.context_encoder.select_action_patches(
+            target_field, terminal_read["query_attention"][:, : self.num_actions]
+        )
 
         context = self.context_encoder(
             context_images, action_nodes, predicate_tokens, self.predicate_identity,
@@ -651,10 +750,17 @@ class TIDAOIAModel(nn.Module):
             history_action_patch_weight=self._intervene_patch_history(
                 context["history_action_patch_weight"], intervention
             ),
+            terminal_action_patch_tokens=terminal_patches["tokens"],
+            terminal_action_patch_xy=terminal_patches["xy"],
+            terminal_action_patch_weight=terminal_patches["weights"],
         )
         return {
             **context,
             **temporal_output,
             "image_branch": image,
+            "terminal_action_patch_tokens": terminal_patches["tokens"],
+            "terminal_action_patch_xy": terminal_patches["xy"],
+            "terminal_action_patch_weight": terminal_patches["weights"],
+            "terminal_action_patch_indices": terminal_patches["indices"],
             "_geometric_context_images": context_images,
         }

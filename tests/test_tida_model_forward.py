@@ -138,3 +138,33 @@ def test_traffic_action_motion_is_in_final_action_and_not_reason():
         out["video_reason_logits"].sum(), list(model.traffic_action.parameters()), allow_unused=True
     )
     assert all(value is None or torch.equal(value, torch.zeros_like(value)) for value in gradient)
+
+
+def test_trajectory_relational_traffic_is_terminal_anchored_and_in_final_action_only():
+    roles = {"static_anchor": [f"p{i}" for i in range(8)], "dynamic_actor": [f"p{i}" for i in range(8, 24)], "terminal_context": [f"p{i}" for i in range(24, 32)]}
+    model = TIDAOIAModel(
+        _ImageBase(), dim=8, num_actions=4, num_reasons=21, num_predicates=32,
+        predicate_roles=roles, context_chunk_size=7, traffic_motion_topk=4,
+        traffic_trajectory_enabled=True, traffic_trajectory_cap=0.08,
+    )
+    out = model(
+        torch.randn(1, 3, 360, 640), torch.randn(1, 14, 3, 192, 344),
+        torch.linspace(-5, 0, 15).unsqueeze(0), torch.ones(1, 15, dtype=torch.bool),
+        temporal_action_scale=1.0, temporal_reason_scale=1.0,
+    )
+    assert out["trajectory_xy"].shape == (1, 4, 4, 15, 2)
+    assert out["trajectory_attention"].shape == (1, 4, 4)
+    assert out["terminal_action_patch_xy"].shape == (1, 4, 4, 2)
+    torch.testing.assert_close(out["trajectory_xy"][..., -1, :], out["terminal_action_patch_xy"])
+    torch.testing.assert_close(
+        out["video_action_logits"],
+        out["image_action_logits"] + out["semantic_action_temporal_delta"]
+        + out["geometric_action_delta"] + out["traffic_action_delta"]
+        + out["traffic_trajectory_delta"],
+    )
+    assert torch.count_nonzero(out["traffic_trajectory_delta"]) == 0
+    assert "traffic_trajectory" in model.owner_parameters()
+    gradient = torch.autograd.grad(
+        out["video_reason_logits"].sum(), list(model.traffic_trajectory_head.parameters()), allow_unused=True
+    )
+    assert all(value is None or torch.equal(value, torch.zeros_like(value)) for value in gradient)

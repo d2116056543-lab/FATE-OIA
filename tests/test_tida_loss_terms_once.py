@@ -26,6 +26,7 @@ def test_required_loss_names_and_yaml_weights_match_strict_contract():
         "action_utility_calibration",
         "geometric_action_aux", "geometric_action_rank", "geometric_action_prefix", "geometric_action_delta",
         "traffic_action_aux", "traffic_action_rank", "traffic_action_delta",
+        "trajectory_action_boundary", "trajectory_action_rank", "trajectory_selected_control", "trajectory_delta",
         "reason_partial", "reason_rank", "reason_soft_f1", "reason_delta",
         "reason_flow_credit", "reason_flow_no_harm", "reason_positive_no_harm",
         "reason_utility_calibration",

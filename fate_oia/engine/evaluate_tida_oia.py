@@ -57,7 +57,7 @@ def collect_tida_outputs(
     collect_audit_tensors: bool = False,
 ) -> dict[str, Any]:
     store = {key: [] for key in (
-        "image_action", "semantic_action", "geometric_action", "traffic_action", "video_action",
+        "image_action", "semantic_action", "geometric_action", "traffic_action", "trajectory_action", "video_action",
         "image_reason", "semantic_reason", "geometric_reason", "video_reason",
         "prefix_action", "prefix_reason", "action_target", "reason_target",
     )}
@@ -79,6 +79,10 @@ def collect_tida_outputs(
         "traffic_patch_exclusive_displacement", "traffic_patch_match_confidence",
         "traffic_patch_motion_energy", "traffic_patch_exclusive_motion_energy",
         "traffic_patch_effective_motion",
+        "traffic_trajectory_delta", "traffic_trajectory_support", "trajectory_attention",
+        "trajectory_speed", "trajectory_acceleration", "trajectory_radial_motion",
+        "trajectory_cycle_confidence", "trajectory_common_displacement",
+        "trajectory_exclusive_displacement", "trajectory_xy",
     )}
     audit_keys = (
         "terminal_prediction_history", "terminal_prediction_no_history", "terminal_target_evidence",
@@ -117,6 +121,7 @@ def collect_tida_outputs(
             "semantic_action": output["semantic_video_action_logits"],
             "geometric_action": output["geometric_video_action_logits"],
             "traffic_action": output["traffic_video_action_logits"],
+            "trajectory_action": output["trajectory_video_action_logits"],
             "video_action": output["video_action_logits"],
             "image_reason": output["image_reason_logits"],
             "semantic_reason": output["semantic_video_reason_logits"],
@@ -173,6 +178,16 @@ def collect_tida_outputs(
             "traffic_patch_motion_energy": output["traffic_patch_motion_energy"],
             "traffic_patch_exclusive_motion_energy": output["traffic_patch_exclusive_motion_energy"],
             "traffic_patch_effective_motion": output["traffic_patch_effective_motion"],
+            "traffic_trajectory_delta": output["traffic_trajectory_delta"],
+            "traffic_trajectory_support": output["traffic_trajectory_support"],
+            "trajectory_attention": output["trajectory_attention"],
+            "trajectory_speed": output["trajectory_speed"],
+            "trajectory_acceleration": output["trajectory_acceleration"],
+            "trajectory_radial_motion": output["trajectory_radial_motion"],
+            "trajectory_cycle_confidence": output["trajectory_cycle_confidence"],
+            "trajectory_common_displacement": output["trajectory_common_displacement"],
+            "trajectory_exclusive_displacement": output["trajectory_exclusive_displacement"],
+            "trajectory_xy": output["trajectory_xy"],
         }.items():
             diagnostics[key].append(value.detach().float().cpu())
         if collect_audit_tensors:
@@ -450,7 +465,6 @@ def traffic_action_effectiveness_metrics(
         "tp_to_fn": (semantic_pred & (~final_pred) & positive).sum(0).tolist(),
         "tn_to_fp": ((~semantic_pred) & final_pred & (~positive)).sum(0).tolist(),
     }
-
     sign = 2.0 * rows["action_target"] - 1.0
     signed_margin = sign * rows["traffic_action_delta"]
     attention = rows["traffic_action_attention"]
@@ -511,6 +525,89 @@ def traffic_action_effectiveness_metrics(
         },
     }
 
+
+def trajectory_traffic_effectiveness_metrics(
+    rows: dict[str, Any], thresholds: torch.Tensor | float = 0.5
+) -> dict[str, Any]:
+    """Quantify target transport, dynamic utility, grounding quality, and causal dependence."""
+    semantic = aie_branch_metrics(
+        rows["semantic_action"], rows["image_reason"], rows["action_target"], rows["reason_target"],
+        threshold=thresholds,
+    )
+    trajectory = aie_branch_metrics(
+        rows["trajectory_action"], rows["image_reason"], rows["action_target"], rows["reason_target"],
+        threshold=thresholds,
+    )
+    final = aie_branch_metrics(
+        rows["video_action"], rows["video_reason"], rows["action_target"], rows["reason_target"],
+        threshold=thresholds,
+    )
+    score = rows["trajectory_speed"].mean((1, 2, 3))
+    low_cut, high_cut = torch.quantile(score, 0.25), torch.quantile(score, 0.75)
+    dynamic = {}
+    for name, mask in (("low_motion", score <= low_cut), ("high_motion", score >= high_cut)):
+        base_slice = aie_branch_metrics(
+            rows["semantic_action"][mask], rows["image_reason"][mask],
+            rows["action_target"][mask], rows["reason_target"][mask], threshold=thresholds,
+        )
+        trajectory_slice = aie_branch_metrics(
+            rows["trajectory_action"][mask], rows["image_reason"][mask],
+            rows["action_target"][mask], rows["reason_target"][mask], threshold=thresholds,
+        )
+        dynamic[name] = {
+            "count": int(mask.sum()), "motion_mean": float(score[mask].mean()),
+            "Act_mF1_semantic": base_slice["Act_mF1"],
+            "Act_mF1_trajectory": trajectory_slice["Act_mF1"],
+            "Act_mF1_gain": trajectory_slice["Act_mF1"] - base_slice["Act_mF1"],
+            "Act_mAP_gain": trajectory_slice["Act_mAP"] - base_slice["Act_mAP"],
+        }
+    sign = 2.0 * rows["action_target"] - 1.0
+    signed = sign * rows["traffic_trajectory_delta"]
+    benefit = int((signed > 1e-4).sum())
+    harm = int((signed < -1e-4).sum())
+    attention = rows["trajectory_attention"]
+    entropy = -(attention * attention.clamp_min(1e-8).log()).sum(-1)
+    normalized_entropy = entropy / torch.log(torch.tensor(max(attention.shape[-1], 2), dtype=entropy.dtype))
+    paired = paired_temporal_contribution(
+        rows["semantic_action"], rows["trajectory_action"], rows["action_target"],
+        motion_score=score, bootstrap_samples=500,
+    )
+    mechanism = rows.get("_mechanism", {})
+    interventions = mechanism.get("intervention_metrics", {}) if isinstance(mechanism, dict) else {}
+    causal = {
+        name: {
+            "action_mf1_drop_from_ordered": value.get("action_mf1_drop_from_real"),
+            "action_gt_margin_advantage_mean": value.get("action_gt_margin_advantage_mean"),
+        }
+        for name, value in interventions.items()
+        if name in {"time_shuffle", "time_reverse", "repeated_last", "history_off"}
+    }
+    return {
+        "overall": {
+            "semantic": semantic, "trajectory_only": trajectory, "final": final,
+            "trajectory_incremental_action_mf1": trajectory["Act_mF1"] - semantic["Act_mF1"],
+            "trajectory_incremental_action_map": trajectory["Act_mAP"] - semantic["Act_mAP"],
+        },
+        "dynamic_conditioned": dynamic,
+        "target_transport": {
+            "action_signed_margin_mean": float(signed.mean()),
+            "action_signed_margin_by_label": signed.mean(0).tolist(),
+            "benefit_count": benefit, "harm_count": harm,
+            "benefit_rate": float((signed > 1e-4).float().mean()),
+            "harm_rate": float((signed < -1e-4).float().mean()),
+            "correction_to_harm_ratio": float((benefit + 1) / (harm + 1)),
+            "paired_bootstrap": paired,
+        },
+        "grounding_quality": {
+            "support_mean": float(rows["traffic_trajectory_support"].mean()),
+            "supported_action_rate": float((rows["traffic_trajectory_support"] > 0.20).float().mean()),
+            "cycle_confidence_mean": float(rows["trajectory_cycle_confidence"].mean()),
+            "normalized_attention_entropy_mean": float(normalized_entropy.mean()),
+            "effective_track_count_mean": float(torch.exp(entropy).mean()),
+            "exclusive_motion_rms": float(rows["trajectory_exclusive_displacement"].square().mean().sqrt()),
+        },
+        "causal_temporal_interventions": causal,
+    }
 
 def fit_train_calib_thresholds(rows: dict[str, Any]) -> dict[str, torch.Tensor]:
     video_logits = torch.cat([rows["video_action"], rows["video_reason"]], dim=-1)

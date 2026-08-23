@@ -26,6 +26,7 @@ from fate_oia.engine.evaluate_tida_oia import (
     save_epoch_outputs,
     temporal_contribution_metrics,
     traffic_action_effectiveness_metrics,
+    trajectory_traffic_effectiveness_metrics,
 )
 from fate_oia.engine.train_aie_oia import build_model as build_aie_model, canonical_model_state_dict
 from fate_oia.engine.train_vetra_strong_refine import build_refiner
@@ -265,13 +266,20 @@ def reason_firewall_gradient_audit(
         "action_flow_credit", "action_flow_no_harm", "action_utility_calibration",
         "geometric_action_aux", "geometric_action_rank", "geometric_action_prefix", "geometric_action_delta",
         "traffic_action_aux", "traffic_action_rank", "traffic_action_delta",
+        "trajectory_action_boundary", "trajectory_action_rank", "trajectory_selected_control", "trajectory_delta",
     )
-    reason_loss = sum(registry.rows[name].weight * registry.rows[name].value for name in reason_names)
-    action_loss = sum(registry.rows[name].weight * registry.rows[name].value for name in action_names)
+    reason_loss = sum(
+        registry.rows[name].weight * registry.rows[name].value for name in reason_names if name in registry.rows
+    )
+    action_loss = sum(
+        registry.rows[name].weight * registry.rows[name].value for name in action_names if name in registry.rows
+    )
+    trajectory_head = getattr(model, "traffic_trajectory_head", None)
     action_parameters = [parameter for parameter in (
         list(model.action_reader.parameters())
         + list(model.geometric_heads.action_parameters())
         + list(model.traffic_action.parameters())
+        + ([] if trajectory_head is None else list(trajectory_head.parameters()))
     ) if parameter.requires_grad]
     reason_parameters = [parameter for parameter in (
         list(model.reason_reader.parameters()) + list(model.geometric_heads.reason_parameters())
@@ -499,6 +507,9 @@ def build_runtime(args: Any, evaluation_only: bool = False) -> TIDARuntime:
         traffic_action_enabled=bool(config["model"].get("traffic_action_enabled", False)),
         traffic_action_cap=float(config["model"].get("traffic_action_cap", 0.15)),
         traffic_motion_topk=int(config["model"].get("traffic_motion_topk", 12)),
+        traffic_trajectory_enabled=bool(config["model"].get("traffic_trajectory_enabled", False)),
+        traffic_trajectory_cap=float(config["model"].get("traffic_trajectory_cap", 0.08)),
+        traffic_trajectory_heads=int(config["model"].get("traffic_trajectory_heads", 4)),
     ).to(device)
     batch_size = int(_arg(args, "batch_size", 2))
     workers = int(_arg(args, "num_workers", config["data"]["num_workers"]))
@@ -679,6 +690,9 @@ def _view_metrics(test_rows, calib_rows):
         "geometric_branches_raw_fixed": geometric_branch_metrics(test_rows),
         "geometric_effectiveness": geometric_temporal_effectiveness_metrics(test_rows),
         "traffic_action_effectiveness": traffic_action_effectiveness_metrics(test_rows),
+        "trajectory_traffic_effectiveness": trajectory_traffic_effectiveness_metrics(
+            test_rows, thresholds["video"]
+        ),
     }
 
 
@@ -905,6 +919,19 @@ def train(args: Any) -> None:
                 ),
                 "traffic_patch_effective_motion_mean": float(
                     output["traffic_patch_effective_motion"].mean().detach().cpu()
+                ),
+                "traffic_trajectory_delta_rms": float(
+                    output["traffic_trajectory_delta"].float().square().mean().sqrt().detach().cpu()
+                ),
+                "traffic_trajectory_support_mean": float(
+                    output["traffic_trajectory_support"].mean().detach().cpu()
+                ),
+                "traffic_trajectory_cycle_confidence_mean": float(
+                    output["trajectory_cycle_confidence"].mean().detach().cpu()
+                ),
+                "traffic_trajectory_attention_entropy": float(
+                    (-(output["trajectory_attention"] * output["trajectory_attention"].clamp_min(1e-8).log())
+                     .sum(-1).mean()).detach().cpu()
                 ),
                 "action_evidence_confidence_mean": float(output["action_evidence_confidence"].mean().detach().cpu()),
                 "action_effective_trust_mean": float(output["action_effective_trust"].mean().detach().cpu()),

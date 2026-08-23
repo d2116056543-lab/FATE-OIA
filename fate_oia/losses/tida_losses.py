@@ -15,6 +15,10 @@ from .tida_flow_credit_losses import (
     temporal_utility_calibration_loss,
     transition_alignment_loss,
 )
+from .tida_traffic_trajectory_losses import (
+    trajectory_boundary_correction_loss,
+    trajectory_selected_control_loss,
+)
 
 
 def terminal_gain_loss(error_history: torch.Tensor, error_no_history: torch.Tensor, margin: float = 0.03) -> torch.Tensor:
@@ -396,6 +400,38 @@ def build_tida_loss_registry(
         ),
     )
     registry.add("traffic_action_delta", output["traffic_action_delta_raw"].square().mean())
+    trajectory_motion = output["trajectory_speed"].mean(2).permute(0, 2, 1)
+    registry.add(
+        "trajectory_action_boundary",
+        trajectory_boundary_correction_loss(
+            output["semantic_video_action_logits"], output["traffic_trajectory_delta_raw"],
+            action_target, output["traffic_trajectory_support"],
+        ),
+    )
+    registry.add(
+        "trajectory_action_rank",
+        target_conditioned_geometric_ranking_loss(
+            output["semantic_video_action_logits"], output["traffic_trajectory_delta_raw"],
+            action_target, trajectory_motion, output["traffic_trajectory_support"],
+            rank_reference.get("action_logits"), rank_reference.get("action_target"),
+        ),
+    )
+    trajectory_controls = [
+        trajectory_selected_control_loss(
+            output["semantic_video_action_logits"], output["traffic_trajectory_delta_raw"],
+            value["traffic_trajectory_delta_raw"], action_target,
+            output["traffic_trajectory_support"],
+        )
+        for value in counterfactual_outputs.values()
+    ]
+    registry.add(
+        "trajectory_selected_control",
+        torch.stack(trajectory_controls).mean()
+        if trajectory_controls else output["traffic_trajectory_delta_raw"].sum() * 0.0,
+        available=bool(trajectory_controls),
+        unavailable_reason=None if trajectory_controls else "counterfactual evaluated at optimizer boundary only",
+    )
+    registry.add("trajectory_delta", output["traffic_trajectory_delta_raw"].square().mean())
     image_branch = output.get("image_branch", {})
     contradiction = image_branch.get("contradiction_score") if isinstance(image_branch, dict) else None
     reason_weights = reason_pu_weight(reason_target, contradiction)
