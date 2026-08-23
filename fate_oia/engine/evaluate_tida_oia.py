@@ -413,7 +413,43 @@ def traffic_action_effectiveness_metrics(
             "traffic_incremental_action_map": final_slice["Act_mAP"] - semantic_slice["Act_mAP"],
             "semantic": semantic_slice,
             "final": final_slice,
-        }
+            }
+
+    benefit_curve = []
+    boundaries = torch.quantile(score, torch.linspace(0, 1, 6, device=score.device))
+    for index in range(5):
+        lower, upper = boundaries[index], boundaries[index + 1]
+        mask = (score >= lower) & ((score <= upper) if index == 4 else (score < upper))
+        if not mask.any():
+            benefit_curve.append({"bin": index, "count": 0, "available": False})
+            continue
+        semantic_slice = aie_branch_metrics(
+            rows["semantic_action"][mask], rows["semantic_reason"][mask],
+            rows["action_target"][mask], rows["reason_target"][mask], threshold=thresholds,
+        )
+        final_slice = aie_branch_metrics(
+            rows["video_action"][mask], rows["video_reason"][mask],
+            rows["action_target"][mask], rows["reason_target"][mask], threshold=thresholds,
+        )
+        benefit_curve.append({
+            "bin": index, "count": int(mask.sum()), "available": True,
+            "motion_mean": float(score[mask].mean()),
+            "action_mf1_delta": final_slice["Act_mF1"] - semantic_slice["Act_mF1"],
+            "action_map_delta": final_slice["Act_mAP"] - semantic_slice["Act_mAP"],
+        })
+
+    threshold = torch.as_tensor(thresholds, device=score.device, dtype=rows["semantic_action"].dtype)
+    if threshold.ndim:
+        threshold = threshold.flatten()[: rows["action_target"].shape[1]]
+    semantic_pred = torch.sigmoid(rows["semantic_action"]) >= threshold
+    final_pred = torch.sigmoid(rows["video_action"]) >= threshold
+    positive = rows["action_target"] > 0.5
+    flip_counts = {
+        "fn_to_tp": ((~semantic_pred) & final_pred & positive).sum(0).tolist(),
+        "fp_to_tn": (semantic_pred & (~final_pred) & (~positive)).sum(0).tolist(),
+        "tp_to_fn": (semantic_pred & (~final_pred) & positive).sum(0).tolist(),
+        "tn_to_fp": ((~semantic_pred) & final_pred & (~positive)).sum(0).tolist(),
+    }
 
     sign = 2.0 * rows["action_target"] - 1.0
     signed_margin = sign * rows["traffic_action_delta"]
@@ -452,6 +488,8 @@ def traffic_action_effectiveness_metrics(
             "p25": float(low_cut), "p50": float(torch.quantile(score, 0.5)), "p75": float(high_cut),
         },
         "motion_strata": strata,
+        "dynamic_benefit_curve": benefit_curve,
+        "corrective_flip_counts_by_action": flip_counts,
         "target_transport": {
             "action_signed_margin_mean": float(signed_margin.mean()),
             "action_benefit_rate": float((signed_margin > 0).float().mean()),

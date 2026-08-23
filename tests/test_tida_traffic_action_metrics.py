@@ -30,6 +30,9 @@ def test_traffic_effectiveness_measures_target_transport_and_attention():
     assert result["attention"]["same_action_mass_mean"] == 0.25
     assert "high_motion" in result["motion_strata"]
     assert "traffic_incremental_action_map" in result["overall"]
+    assert len(result["dynamic_benefit_curve"]) == 5
+    assert result["corrective_flip_counts_by_action"]["fp_to_tn"] == [1, 1, 1, 1]
+    assert result["corrective_flip_counts_by_action"]["tp_to_fn"] == [0, 0, 0, 0]
 
 
 def test_traffic_effectiveness_reduces_common_motion_over_batch_and_time():
