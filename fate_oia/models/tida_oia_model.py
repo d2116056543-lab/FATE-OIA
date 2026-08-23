@@ -319,10 +319,14 @@ class TIDAOIAModel(nn.Module):
         )
         reason_delta_raw = reason["reason_temporal_delta"]
         geometric = geometric or self._empty_geometric(image_action, image_reason)
-        geometric_action_delta = geometric["geometric_action_delta"] * temporal_action_scale
-        geometric_reason_delta = geometric["geometric_reason_delta"] * temporal_reason_scale
-        geometric_prefix_action_delta = geometric["geometric_prefix_action_delta"] * temporal_action_scale
-        geometric_prefix_reason_delta = geometric["geometric_prefix_reason_delta"] * temporal_reason_scale
+        geometric_action_delta_raw = geometric["geometric_action_delta"]
+        geometric_reason_delta_raw = geometric["geometric_reason_delta"]
+        geometric_prefix_action_delta_raw = geometric["geometric_prefix_action_delta"]
+        geometric_prefix_reason_delta_raw = geometric["geometric_prefix_reason_delta"]
+        geometric_action_delta = geometric_action_delta_raw * temporal_action_scale
+        geometric_reason_delta = geometric_reason_delta_raw * temporal_reason_scale
+        geometric_prefix_action_delta = geometric_prefix_action_delta_raw * temporal_action_scale
+        geometric_prefix_reason_delta = geometric_prefix_reason_delta_raw * temporal_reason_scale
         semantic_action_delta = action["action_temporal_delta"]
         semantic_reason_delta = reason_delta_raw
         action_delta = semantic_action_delta + geometric_action_delta
@@ -365,7 +369,10 @@ class TIDAOIAModel(nn.Module):
             "image_action_logits": image_action,
             "semantic_action_temporal_delta": semantic_action_delta,
             "geometric_action_delta": geometric_action_delta,
+            "geometric_action_delta_raw": geometric_action_delta_raw,
+            "geometric_video_action_logits_raw": image_action + geometric_action_delta_raw,
             "geometric_prefix_action_delta": geometric_prefix_action_delta,
+            "geometric_prefix_action_logits_raw": image_action[:, None] + geometric_prefix_action_delta_raw,
             "geometric_prefix_action_logits": image_action[:, None] + geometric_prefix_action_delta,
             "prefix_video_action_logits": image_action[:, None] + semantic_action_delta[:, None] + geometric_prefix_action_delta,
             "action_temporal_delta": action_delta,
@@ -377,9 +384,11 @@ class TIDAOIAModel(nn.Module):
             "semantic_reason_temporal_delta_effective": semantic_reason_effective,
             "semantic_video_reason_logits": image_reason + semantic_reason_effective,
             "geometric_reason_delta": geometric_reason_delta,
+            "geometric_reason_delta_raw": geometric_reason_delta_raw,
             "geometric_reason_delta_effective": geometric_reason_effective,
             "geometric_video_reason_logits": image_reason + geometric_reason_effective,
             "geometric_prefix_reason_delta": geometric_prefix_reason_delta,
+            "geometric_prefix_reason_logits_raw": image_reason[:, None] + geometric_prefix_reason_delta_raw,
             "geometric_prefix_reason_logits": image_reason[:, None] + geometric_prefix_reason_delta,
             "prefix_video_reason_logits": image_reason[:, None] + prefix_reason_effective,
             "reason_temporal_delta_raw": reason_delta_raw,

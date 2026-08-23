@@ -270,12 +270,12 @@ def build_tida_loss_registry(
     )
     registry.add(
         "geometric_action_aux",
-        action_macro_asl_loss(output["geometric_video_action_logits"], action_target),
+        action_macro_asl_loss(output["geometric_video_action_logits_raw"], action_target),
     )
-    prefix_action = output["geometric_prefix_action_logits"].flatten(0, 1)
+    prefix_action = output["geometric_prefix_action_logits_raw"].flatten(0, 1)
     prefix_action_target = action_target[:, None].expand(-1, 4, -1).flatten(0, 1)
     registry.add("geometric_action_prefix", action_macro_asl_loss(prefix_action, prefix_action_target))
-    registry.add("geometric_action_delta", output["geometric_action_delta"].square().mean())
+    registry.add("geometric_action_delta", output["geometric_action_delta_raw"].square().mean())
     image_branch = output.get("image_branch", {})
     contradiction = image_branch.get("contradiction_score") if isinstance(image_branch, dict) else None
     reason_weights = reason_pu_weight(reason_target, contradiction)
@@ -330,14 +330,16 @@ def build_tida_loss_registry(
     )
     registry.add(
         "geometric_reason_aux",
-        reason_partial_asl_loss(output["geometric_video_reason_logits"], reason_target, contradiction),
+        reason_partial_asl_loss(
+            output["image_reason_logits"] + output["geometric_reason_delta_raw"], reason_target, contradiction
+        ),
     )
-    prefix_reason = output["geometric_prefix_reason_logits"].flatten(0, 1)
+    prefix_reason = output["geometric_prefix_reason_logits_raw"].flatten(0, 1)
     prefix_reason_target = reason_target[:, None].expand(-1, 4, -1).flatten(0, 1)
     prefix_contradiction = None if contradiction is None else contradiction[:, None].expand(-1, 4, -1).flatten(0, 1)
     registry.add(
         "geometric_reason_prefix",
         reason_partial_asl_loss(prefix_reason, prefix_reason_target, prefix_contradiction),
     )
-    registry.add("geometric_reason_delta", output["geometric_reason_delta"].square().mean())
+    registry.add("geometric_reason_delta", output["geometric_reason_delta_raw"].square().mean())
     return registry
