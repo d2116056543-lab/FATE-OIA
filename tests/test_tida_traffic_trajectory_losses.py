@@ -61,3 +61,18 @@ def test_selected_control_margin_is_reachable_at_low_support():
         trajectory_trust=trust, trajectory_cap=0.08,
     )
     assert loss.item() == 0.0
+
+
+def test_selected_control_reachable_margin_includes_order_gate():
+    base = torch.zeros(1, 1)
+    target = torch.ones_like(base)
+    support = torch.ones_like(base)
+    trust = torch.full_like(base, 0.5)
+    order_gate = torch.full_like(base, 0.25)
+    # 0.10 * 0.08 * 1.0 * 0.5 * 0.25 = 0.001
+    selected = torch.tensor([[0.0011]], requires_grad=True)
+    loss = trajectory_selected_control_loss(
+        base, selected, torch.zeros_like(selected), target, support,
+        trajectory_trust=trust, trajectory_order_gate=order_gate, trajectory_cap=0.08,
+    )
+    assert loss.item() == 0.0

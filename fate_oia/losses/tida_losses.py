@@ -421,9 +421,20 @@ def build_tida_loss_registry(
     trajectory_controls = [
         trajectory_selected_control_loss(
             output["semantic_video_action_logits"], output["traffic_trajectory_delta_raw"],
+            output["traffic_trajectory_control_delta_raw"], action_target,
+            output["traffic_trajectory_support"],
+            trajectory_trust=output["traffic_trajectory_trust"],
+            trajectory_order_gate=output["trajectory_order_gate"],
+            trajectory_cap=0.08,
+            deploy_boundary_logits=deploy_action_boundary_logits,
+        )
+    ] + [
+        trajectory_selected_control_loss(
+            output["semantic_video_action_logits"], output["traffic_trajectory_delta_raw"],
             value["traffic_trajectory_delta_raw"], action_target,
             output["traffic_trajectory_support"],
             trajectory_trust=output["traffic_trajectory_trust"],
+            trajectory_order_gate=output["trajectory_order_gate"],
             trajectory_cap=0.08,
             deploy_boundary_logits=deploy_action_boundary_logits,
         )

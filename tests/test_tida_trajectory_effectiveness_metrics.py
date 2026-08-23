@@ -30,7 +30,9 @@ def test_trajectory_metrics_expose_dynamic_gain_transport_and_grounding_quality(
         "action_target": target,
         "reason_target": torch.zeros(16, 21),
         "traffic_trajectory_delta": delta,
+        "traffic_trajectory_control_delta": torch.zeros_like(delta),
         "traffic_trajectory_support": torch.full((16, 4), 0.8),
+        "trajectory_order_gate": torch.full((16, 4), 0.6),
         "trajectory_attention": torch.full((16, 4, 3), 1.0 / 3.0),
         "trajectory_speed": torch.ones(16, 4, 3, 4),
         "trajectory_cycle_confidence": torch.full((16, 4, 3, 5), 0.9),
@@ -40,6 +42,7 @@ def test_trajectory_metrics_expose_dynamic_gain_transport_and_grounding_quality(
     metrics = trajectory_traffic_effectiveness_metrics(rows)
     assert metrics["overall"]["trajectory_incremental_action_mf1"] > 0
     assert metrics["target_transport"]["action_signed_margin_mean"] > 0
+    assert metrics["target_transport"]["ordered_control_advantage_mean"] > 0
     assert metrics["target_transport"]["correction_to_harm_ratio"] > 1
     assert metrics["grounding_quality"]["cycle_confidence_mean"] == pytest.approx(0.9)
     assert metrics["dynamic_conditioned"]["high_motion"]["count"] > 0
@@ -58,7 +61,9 @@ def test_trajectory_metrics_report_corrective_and_harmful_flips():
         "action_target": target,
         "reason_target": torch.zeros(4, 21),
         "traffic_trajectory_delta": trajectory - semantic,
+        "traffic_trajectory_control_delta": torch.zeros_like(trajectory),
         "traffic_trajectory_support": torch.ones(4, 1),
+        "trajectory_order_gate": torch.ones(4, 1),
         "trajectory_attention": torch.ones(4, 1, 1),
         "trajectory_speed": torch.ones(4, 1, 1, 1),
         "trajectory_cycle_confidence": torch.ones(4, 1, 1, 2),
@@ -77,7 +82,9 @@ def test_epoch_artifacts_persist_trajectory_metrics_and_tensors(tmp_path):
     rows = {
         "file_names": ["clip.mp4"],
         "traffic_trajectory_delta": torch.ones(1, 4),
+        "traffic_trajectory_control_delta": torch.zeros(1, 4),
         "traffic_trajectory_support": torch.ones(1, 4),
+        "trajectory_order_gate": torch.ones(1, 4),
         "trajectory_attention": torch.ones(1, 4, 2),
         "trajectory_speed": torch.ones(1, 4, 2, 3),
         "trajectory_xy": torch.ones(1, 4, 2, 4, 2),

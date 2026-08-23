@@ -934,8 +934,14 @@ def train(args: Any) -> None:
                 "traffic_trajectory_delta_rms": float(
                     output["traffic_trajectory_delta"].float().square().mean().sqrt().detach().cpu()
                 ),
+                "traffic_trajectory_control_delta_rms": float(
+                    output["traffic_trajectory_control_delta"].float().square().mean().sqrt().detach().cpu()
+                ),
                 "traffic_trajectory_support_mean": float(
                     output["traffic_trajectory_support"].mean().detach().cpu()
+                ),
+                "trajectory_order_gate_mean": float(
+                    output["trajectory_order_gate"].mean().detach().cpu()
                 ),
                 "traffic_trajectory_cycle_confidence_mean": float(
                     output["trajectory_cycle_confidence"].mean().detach().cpu()

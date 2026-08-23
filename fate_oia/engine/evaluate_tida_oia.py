@@ -80,7 +80,8 @@ def collect_tida_outputs(
         "traffic_patch_exclusive_displacement", "traffic_patch_match_confidence",
         "traffic_patch_motion_energy", "traffic_patch_exclusive_motion_energy",
         "traffic_patch_effective_motion",
-        "traffic_trajectory_delta", "traffic_trajectory_support", "trajectory_attention",
+        "traffic_trajectory_delta", "traffic_trajectory_control_delta",
+        "traffic_trajectory_support", "trajectory_order_gate", "trajectory_attention",
         "trajectory_speed", "trajectory_acceleration", "trajectory_radial_motion",
         "trajectory_order_contrast_rms",
         "trajectory_cycle_confidence", "trajectory_common_displacement",
@@ -182,7 +183,9 @@ def collect_tida_outputs(
             "traffic_patch_exclusive_motion_energy": output["traffic_patch_exclusive_motion_energy"],
             "traffic_patch_effective_motion": output["traffic_patch_effective_motion"],
             "traffic_trajectory_delta": output["traffic_trajectory_delta"],
+            "traffic_trajectory_control_delta": output["traffic_trajectory_control_delta"],
             "traffic_trajectory_support": output["traffic_trajectory_support"],
+            "trajectory_order_gate": output["trajectory_order_gate"],
             "trajectory_attention": output["trajectory_attention"],
             "trajectory_speed": output["trajectory_speed"],
             "trajectory_acceleration": output["trajectory_acceleration"],
@@ -576,6 +579,9 @@ def trajectory_traffic_effectiveness_metrics(
         }
     sign = 2.0 * rows["action_target"] - 1.0
     signed = sign * rows["traffic_trajectory_delta"]
+    signed_control_advantage = sign * (
+        rows["traffic_trajectory_delta"] - rows["traffic_trajectory_control_delta"]
+    )
     benefit = int((signed > 1e-4).sum())
     harm = int((signed < -1e-4).sum())
     attention = rows["trajectory_attention"]
@@ -619,6 +625,8 @@ def trajectory_traffic_effectiveness_metrics(
         "target_transport": {
             "action_signed_margin_mean": float(signed.mean()),
             "action_signed_margin_by_label": signed.mean(0).tolist(),
+            "ordered_control_advantage_mean": float(signed_control_advantage.mean()),
+            "ordered_control_advantage_by_label": signed_control_advantage.mean(0).tolist(),
             "benefit_count": benefit, "harm_count": harm,
             "benefit_rate": float((signed > 1e-4).float().mean()),
             "harm_rate": float((signed < -1e-4).float().mean()),
@@ -633,6 +641,7 @@ def trajectory_traffic_effectiveness_metrics(
             "effective_track_count_mean": float(torch.exp(entropy).mean()),
             "exclusive_motion_rms": float(rows["trajectory_exclusive_displacement"].square().mean().sqrt()),
             "order_contrast_rms_mean": float(rows["trajectory_order_contrast_rms"].mean()),
+            "order_gate_mean": float(rows["trajectory_order_gate"].mean()),
         },
         "decision_flips": decision_flips,
         "causal_temporal_interventions": causal,
@@ -727,7 +736,8 @@ def save_epoch_outputs(output_dir: Path, epoch: int, rows: dict[str, Any], metri
         "traffic_patch_exclusive_displacement", "traffic_patch_match_confidence",
         "traffic_patch_motion_energy", "traffic_patch_exclusive_motion_energy",
         "traffic_patch_effective_motion",
-        "traffic_trajectory_delta", "traffic_trajectory_support", "trajectory_attention",
+        "traffic_trajectory_delta", "traffic_trajectory_control_delta",
+        "traffic_trajectory_support", "trajectory_order_gate", "trajectory_attention",
         "trajectory_speed", "trajectory_acceleration", "trajectory_radial_motion",
         "trajectory_order_contrast_rms",
         "trajectory_cycle_confidence", "trajectory_common_displacement",

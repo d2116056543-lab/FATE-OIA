@@ -408,10 +408,13 @@ class TIDAOIAModel(nn.Module):
                     trajectory_field["trajectory_common_displacement"],
                     trajectory_field["trajectory_exclusive_displacement"],
                     trajectory_field["trajectory_anchor_weight"],
+                    base_action_logits=image_action + action["action_temporal_delta"],
                 ),
             }
         traffic_trajectory_delta_raw = trajectory["traffic_trajectory_delta"]
+        traffic_trajectory_control_delta_raw = trajectory["traffic_trajectory_control_delta"]
         traffic_trajectory_delta = traffic_trajectory_delta_raw * temporal_action_scale
+        traffic_trajectory_control_delta = traffic_trajectory_control_delta_raw * temporal_action_scale
         semantic_action_delta = action["action_temporal_delta"]
         semantic_reason_delta = reason_delta_raw
         action_delta = (
@@ -465,6 +468,8 @@ class TIDAOIAModel(nn.Module):
             "traffic_video_action_logits": image_action + traffic_action_delta,
             "traffic_trajectory_delta_raw": traffic_trajectory_delta_raw,
             "traffic_trajectory_delta": traffic_trajectory_delta,
+            "traffic_trajectory_control_delta_raw": traffic_trajectory_control_delta_raw,
+            "traffic_trajectory_control_delta": traffic_trajectory_control_delta,
             "trajectory_video_action_logits_raw": image_action + traffic_trajectory_delta_raw,
             "trajectory_video_action_logits": image_action + traffic_trajectory_delta,
             "semantic_trajectory_video_action_logits_raw": (
@@ -549,9 +554,13 @@ class TIDAOIAModel(nn.Module):
         intervals = max(int(total_frames) - 1, 1)
         return {
             "traffic_trajectory_delta": torch.zeros_like(image_action),
+            "traffic_trajectory_control_delta": torch.zeros_like(image_action),
+            "traffic_trajectory_credit_logit": torch.zeros_like(image_action),
+            "traffic_trajectory_control_logit": torch.zeros_like(image_action),
             "traffic_trajectory_context": image_action.new_zeros(batch, actions, dim),
             "traffic_trajectory_trust": image_action.new_zeros(batch, actions),
             "traffic_trajectory_support": image_action.new_zeros(batch, actions),
+            "trajectory_order_gate": image_action.new_zeros(batch, actions),
             "trajectory_attention": image_action.new_zeros(batch, actions, tracks),
             "trajectory_tokens": image_action.new_zeros(batch, actions, tracks, dim),
             "trajectory_direction_histogram": image_action.new_zeros(batch, actions, tracks, 8),

@@ -85,23 +85,26 @@ def test_head_cannot_emit_action_prior_without_trajectory_evidence():
     assert torch.count_nonzero(out["traffic_trajectory_support"]) == 0
 
 
-def test_head_uses_antisymmetric_order_credit():
+def test_head_decodes_reversed_trajectory_as_control_not_opposite_label():
     args = list(_inputs(batch=1, frames=5))
     head = TIDATrafficTrajectoryHead(dim=16, num_actions=4, num_heads=4)
     with torch.no_grad():
         head.output.weight.fill_(0.05)
-        head.trust_raw.add_(1.0)
-    ordered = head(*args)["traffic_trajectory_delta"]
+    out = head(*args, base_action_logits=torch.zeros(1, 4))
+    assert out["traffic_trajectory_control_delta"].shape == (1, 4)
+    assert not torch.allclose(
+        out["traffic_trajectory_delta"], -out["traffic_trajectory_control_delta"], atol=1e-6
+    )
 
-    args[1] = args[1].flip(3)
-    args[2] = args[2].flip(3)
-    args[3] = args[3].flip(3)
-    args[4] = args[4].flip(3)
-    args[5] = -args[5].flip(1)
-    args[6] = -args[6].flip(3)
-    reversed_delta = head(*args)["traffic_trajectory_delta"]
 
-    assert torch.allclose(ordered, -reversed_delta, atol=1e-6)
+def test_head_conditions_credit_on_frozen_base_uncertainty():
+    args = _inputs(batch=1, frames=5)
+    head = TIDATrafficTrajectoryHead(dim=16, num_actions=4, num_heads=4)
+    with torch.no_grad():
+        head.output.weight.fill_(0.05)
+    uncertain = head(*args, base_action_logits=torch.zeros(1, 4))["traffic_trajectory_delta"]
+    confident = head(*args, base_action_logits=torch.full((1, 4), 4.0))["traffic_trajectory_delta"]
+    assert not torch.allclose(uncertain, confident, atol=1e-7)
 
 
 def test_head_reports_nonzero_order_contrast_without_action_prior():
@@ -110,3 +113,5 @@ def test_head_reports_nonzero_order_contrast_without_action_prior():
     out = head(*args)
     assert out["trajectory_order_contrast_rms"].shape == (1, 4)
     assert torch.all(out["trajectory_order_contrast_rms"] > 0)
+    assert out["trajectory_order_gate"].shape == (1, 4)
+    assert torch.all((out["trajectory_order_gate"] > 0) & (out["trajectory_order_gate"] < 1))
