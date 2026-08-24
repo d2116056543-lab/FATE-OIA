@@ -1,6 +1,9 @@
 import torch
 
-from fate_oia.engine.export_tida_traffic_trajectories import trajectory_case_trace
+from fate_oia.engine.export_tida_traffic_trajectories import (
+    _draw_transport_summary,
+    trajectory_case_trace,
+)
 
 
 def test_trajectory_case_trace_contains_exact_target_transport_and_tracks():
@@ -23,3 +26,16 @@ def test_trajectory_case_trace_contains_exact_target_transport_and_tracks():
     assert len(trace["actions"][0]["tracks"]) == 2
     reconstructed = torch.tensor(trace["image_action_logits"]) + torch.tensor(trace["trajectory_delta"])
     torch.testing.assert_close(reconstructed, torch.tensor(trace["trajectory_action_logits"]))
+
+
+def test_transport_summary_visualizes_order_state_and_total_credit(tmp_path):
+    output = {
+        "traffic_trajectory_order_delta": torch.tensor([[0.01, -0.02, 0.03, -0.04]]),
+        "traffic_trajectory_state_effective_delta": torch.tensor([[0.02, -0.01, 0.01, -0.02]]),
+        "traffic_trajectory_delta": torch.tensor([[0.03, -0.03, 0.04, -0.06]]),
+        "traffic_trajectory_utility_gate": torch.tensor([[0.8, 0.6, 0.7, 0.5]]),
+        "trajectory_interaction_risk": torch.full((1, 4, 3), 0.25),
+    }
+    target = tmp_path / "traffic_credit.png"
+    _draw_transport_summary(output, 0, target)
+    assert target.exists() and target.stat().st_size > 0

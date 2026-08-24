@@ -90,6 +90,37 @@ def _draw_action_trajectories(image: np.ndarray, xy: torch.Tensor, attention: to
     plt.close(fig)
 
 
+def _draw_transport_summary(output: dict[str, torch.Tensor], index: int, path: Path) -> None:
+    """Show how time-arrow and motion-state evidence reach each action logit."""
+    import matplotlib.pyplot as plt
+
+    order = output["traffic_trajectory_order_delta"][index].float().detach().cpu().numpy()
+    state = output["traffic_trajectory_state_effective_delta"][index].float().detach().cpu().numpy()
+    total = output["traffic_trajectory_delta"][index].float().detach().cpu().numpy()
+    utility = output["traffic_trajectory_utility_gate"][index].float().detach().cpu().numpy()
+    risk = output["trajectory_interaction_risk"][index].float().mean(-1).detach().cpu().numpy()
+    x = np.arange(len(ACTION_NAMES))
+    width = 0.24
+    fig, axis = plt.subplots(figsize=(10, 5.2), dpi=130)
+    axis.axhline(0.0, color="#222222", linewidth=0.8)
+    axis.bar(x - width, order, width, label="time-arrow credit", color="#4c78a8")
+    axis.bar(x, state, width, label="motion-state credit", color="#f58518")
+    axis.bar(x + width, total, width, label="deployed total", color="#54a24b")
+    axis.set_xticks(x, ACTION_NAMES)
+    axis.set_ylabel("action logit contribution")
+    axis.set_title("Traffic-flow transport into action decisions")
+    axis.legend(loc="upper left")
+    auxiliary = axis.twinx()
+    auxiliary.plot(x, utility, "o--", color="#b279a2", label="utility gate")
+    auxiliary.plot(x, risk, "s--", color="#e45756", label="interaction risk")
+    auxiliary.set_ylim(0.0, max(1.0, float(max(utility.max(), risk.max())) * 1.1))
+    auxiliary.set_ylabel("gate / interaction risk")
+    auxiliary.legend(loc="upper right")
+    fig.tight_layout()
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+
+
 @torch.no_grad()
 def export(args: argparse.Namespace) -> None:
     from PIL import Image
@@ -121,6 +152,7 @@ def export(args: argparse.Namespace) -> None:
                     target, output["trajectory_xy"][index], output["trajectory_attention"][index],
                     action, case_dir / f"trajectory_{name}.png",
                 )
+            _draw_transport_summary(output, index, case_dir / "traffic_credit_transport.png")
             trace = trajectory_case_trace(output, index, file_name)
             sign = 2.0 * batch["action"][index].float() - 1.0
             trace["ordered_vs_control_gt_margin"] = {
@@ -139,6 +171,7 @@ def export(args: argparse.Namespace) -> None:
                 "<html><body><h1>TIDA Trajectory-Relational Traffic Credit</h1>"
                 "<p>Line width is target-conditioned trajectory attention; the endpoint is the target-frame anchor.</p>"
                 + images
+                + "<h2>Action transport</h2><img src='traffic_credit_transport.png' width='96%'>"
                 + "<p>Exact transport and ordered-vs-control margins are in trajectory_target_transport.json.</p>"
                 "</body></html>", encoding="utf-8",
             )
