@@ -28,6 +28,8 @@ def _rgb(tensor: torch.Tensor) -> np.ndarray:
 def trajectory_case_trace(output: dict[str, torch.Tensor], index: int, file_name: str) -> dict[str, Any]:
     image_logits = output["image_action_logits"][index].float().detach().cpu()
     delta = output["traffic_trajectory_delta"][index].float().detach().cpu()
+    boundary = output["traffic_adaptive_boundary_delta"][index].float().detach().cpu()
+    base_video = output["video_action_logits_base"][index].float().detach().cpu()
     action_zeros = torch.zeros_like(output["traffic_trajectory_delta"])
     track_zeros = output["trajectory_attention"].new_zeros(output["trajectory_attention"].shape)
     actions = []
@@ -61,6 +63,9 @@ def trajectory_case_trace(output: dict[str, torch.Tensor], index: int, file_name
             "interaction_risk_mean": float(
                 output.get("trajectory_interaction_risk", track_zeros)[index, action].mean()
             ),
+            "adaptive_boundary_delta": float(boundary[action]),
+            "base_video_logit": float(base_video[action]),
+            "deploy_video_logit": float(base_video[action] - boundary[action]),
             "logit_delta": float(delta[action]), "tracks": tracks,
         })
     return {
@@ -68,6 +73,8 @@ def trajectory_case_trace(output: dict[str, torch.Tensor], index: int, file_name
         "image_action_logits": image_logits.tolist(),
         "trajectory_delta": delta.tolist(),
         "trajectory_action_logits": (image_logits + delta).tolist(),
+        "video_action_logits_base": base_video.tolist(),
+        "traffic_adaptive_boundary_delta": boundary.tolist(),
         "full_video_action_logits": output["video_action_logits"][index].float().detach().cpu().tolist(),
         "actions": actions,
     }
@@ -100,6 +107,7 @@ def _draw_transport_summary(output: dict[str, torch.Tensor], index: int, path: P
     order = output["traffic_trajectory_order_delta"][index].float().detach().cpu().numpy()
     state = output["traffic_trajectory_state_effective_delta"][index].float().detach().cpu().numpy()
     total = output["traffic_trajectory_delta"][index].float().detach().cpu().numpy()
+    boundary = output["traffic_adaptive_boundary_delta"][index].float().detach().cpu().numpy()
     utility = output["traffic_trajectory_utility_gate"][index].float().detach().cpu().numpy()
     state_utility = output.get(
         "traffic_trajectory_state_utility_gate", output["traffic_trajectory_utility_gate"]
@@ -112,6 +120,8 @@ def _draw_transport_summary(output: dict[str, torch.Tensor], index: int, path: P
     axis.bar(x - width, order, width, label="time-arrow credit", color="#4c78a8")
     axis.bar(x, state, width, label="motion-state credit", color="#f58518")
     axis.bar(x + width, total, width, label="deployed total", color="#54a24b")
+    axis.plot(x, -boundary, "D-", color="#111111", linewidth=1.6,
+              label="adaptive boundary logit shift")
     axis.set_xticks(x, ACTION_NAMES)
     axis.set_ylabel("action logit contribution")
     axis.set_title("Traffic-flow transport into action decisions")

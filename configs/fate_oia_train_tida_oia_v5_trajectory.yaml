@@ -75,6 +75,8 @@ model:
   traffic_trajectory_state_strength_scale: 8.0
   traffic_trajectory_state_cap_ratio: 1.0
   traffic_trajectory_state_utility_open_prior: 0.10
+  traffic_adaptive_boundary_enabled: true
+  traffic_adaptive_boundary_cap: 0.25
 loss:
   terminal_hist: 0.25
   terminal_no_history: 0.0
@@ -143,6 +145,7 @@ training:
     traffic_action: 0.00015
     traffic_trajectory: 0.0003
     traffic_trajectory_utility: 0.0005
+    traffic_adaptive_boundary: 0.0005
 memory_probe:
   max_reserved_gib: 45.0
   max_growth_gib: 0.25

@@ -18,6 +18,7 @@ from .tida_terminal_innovation import TIDATerminalInnovation
 from .tida_terminal_query_reader import TIDATerminalQueryReader
 from .tida_traffic_trajectories import TIDATrafficTrajectoryBuilder
 from .tida_traffic_trajectory_head import TIDATrafficTrajectoryHead
+from .tida_traffic_boundary import TIDATrafficAdaptiveBoundary
 from ..explain.tida_dynamic_concepts import translate_dynamic_concepts
 
 
@@ -144,6 +145,8 @@ class TIDAOIAModel(nn.Module):
         traffic_trajectory_state_strength_scale: float = 8.0,
         traffic_trajectory_state_cap_ratio: float = 1.0,
         traffic_trajectory_state_utility_open_prior: float = 0.10,
+        traffic_adaptive_boundary_enabled: bool = True,
+        traffic_adaptive_boundary_cap: float = 0.25,
     ) -> None:
         super().__init__()
         self.image_model = image_model
@@ -216,6 +219,13 @@ class TIDAOIAModel(nn.Module):
             state_cap_ratio=traffic_trajectory_state_cap_ratio,
             state_utility_open_prior=traffic_trajectory_state_utility_open_prior,
         )
+        self.traffic_adaptive_boundary_enabled = bool(traffic_adaptive_boundary_enabled)
+        self.traffic_adaptive_boundary = TIDATrafficAdaptiveBoundary(
+            num_actions=num_actions, state_dim=8, cap=traffic_adaptive_boundary_cap
+        )
+        if not self.traffic_adaptive_boundary_enabled:
+            for parameter in self.traffic_adaptive_boundary.parameters():
+                parameter.requires_grad = False
         if not self.traffic_trajectory_enabled:
             for parameter in self.traffic_trajectory_head.parameters():
                 parameter.requires_grad = False
@@ -300,6 +310,11 @@ class TIDAOIAModel(nn.Module):
                     self.traffic_trajectory_head.state_utility_projection,
                 )
                 for parameter in module.parameters()
+                if parameter.requires_grad
+            ]
+        if self.traffic_adaptive_boundary_enabled:
+            owners["traffic_adaptive_boundary"] = [
+                parameter for parameter in self.traffic_adaptive_boundary.parameters()
                 if parameter.requires_grad
             ]
         # Query identities are the shortcut-free prior for terminal prediction.
@@ -452,6 +467,24 @@ class TIDAOIAModel(nn.Module):
             semantic_action_delta + geometric_action_delta + traffic_action_delta
             + traffic_trajectory_delta
         )
+        video_action_base = image_action + action_delta
+        if self.traffic_adaptive_boundary_enabled:
+            adaptive_boundary = self.traffic_adaptive_boundary(
+                video_action_base,
+                trajectory["traffic_trajectory_order_delta"],
+                trajectory["traffic_trajectory_state_features"],
+                trajectory["traffic_trajectory_support"],
+                trajectory["trajectory_state_strength"],
+                trajectory["trajectory_interaction_risk"],
+            )
+        else:
+            adaptive_boundary = {
+                "traffic_adaptive_boundary_delta": torch.zeros_like(video_action_base),
+                "traffic_adaptive_deploy_action_logits": video_action_base,
+                "traffic_adaptive_boundary_features": video_action_base.new_zeros(
+                    video_action_base.shape[0], self.num_actions, 22
+                ),
+            }
         reason_delta_raw = semantic_reason_delta + geometric_reason_delta
         semantic_reason_effective = (
             confidence_aware_reason_delta(
@@ -483,7 +516,7 @@ class TIDAOIAModel(nn.Module):
         )
         return {
             **temporal, **innovation, **differential, **flow, **action, **reason,
-            **geometric, **traffic, **trajectory,
+            **geometric, **traffic, **trajectory, **adaptive_boundary,
             "terminal_target_evidence": terminal_target_evidence,
             "terminal_query_identity": terminal_query_identity,
             "predicate_innovation_token": xi[:, self.num_actions :],
@@ -516,7 +549,8 @@ class TIDAOIAModel(nn.Module):
             "action_temporal_delta": action_delta,
             "semantic_video_action_logits": image_action + semantic_action_delta,
             "geometric_video_action_logits": image_action + geometric_action_delta,
-            "video_action_logits": image_action + action_delta,
+            "video_action_logits_base": video_action_base,
+            "video_action_logits": adaptive_boundary["traffic_adaptive_deploy_action_logits"],
             "image_reason_logits": image_reason,
             "semantic_reason_temporal_delta": semantic_reason_delta,
             "semantic_reason_temporal_delta_effective": semantic_reason_effective,
@@ -614,6 +648,7 @@ class TIDAOIAModel(nn.Module):
             "trajectory_radial_motion": image_action.new_zeros(batch, actions, tracks, intervals),
             "trajectory_pair_confidence": image_action.new_zeros(batch, actions, tracks, intervals),
             "trajectory_order_contrast_rms": image_action.new_zeros(batch, actions),
+            "trajectory_interaction_risk": image_action.new_zeros(batch, actions, tracks),
             "trajectory_xy": image_action.new_zeros(batch, actions, tracks, total_frames, 2),
             "trajectory_visibility": image_action.new_zeros(batch, actions, tracks, total_frames),
             "trajectory_cycle_confidence": image_action.new_zeros(batch, actions, tracks, total_frames),

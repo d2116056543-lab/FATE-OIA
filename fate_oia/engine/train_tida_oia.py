@@ -26,6 +26,7 @@ from fate_oia.engine.evaluate_tida_oia import (
     save_epoch_outputs,
     temporal_contribution_metrics,
     traffic_action_effectiveness_metrics,
+    traffic_adaptive_boundary_effectiveness_metrics,
     trajectory_traffic_effectiveness_metrics,
 )
 from fate_oia.engine.train_aie_oia import build_model as build_aie_model, canonical_model_state_dict
@@ -523,6 +524,12 @@ def build_runtime(args: Any, evaluation_only: bool = False) -> TIDARuntime:
         traffic_trajectory_state_utility_open_prior=float(
             config["model"].get("traffic_trajectory_state_utility_open_prior", 0.10)
         ),
+        traffic_adaptive_boundary_enabled=bool(
+            config["model"].get("traffic_adaptive_boundary_enabled", True)
+        ),
+        traffic_adaptive_boundary_cap=float(
+            config["model"].get("traffic_adaptive_boundary_cap", 0.25)
+        ),
     ).to(device)
     batch_size = int(_arg(args, "batch_size", 2))
     workers = int(_arg(args, "num_workers", config["data"]["num_workers"]))
@@ -705,6 +712,11 @@ def _view_metrics(test_rows, calib_rows):
         "traffic_action_effectiveness": traffic_action_effectiveness_metrics(test_rows),
         "trajectory_traffic_effectiveness": trajectory_traffic_effectiveness_metrics(
             test_rows, thresholds["video"]
+        ),
+        "traffic_adaptive_boundary_effectiveness": (
+            traffic_adaptive_boundary_effectiveness_metrics(
+                test_rows, thresholds["video"]
+            )
         ),
     }
 
@@ -985,6 +997,9 @@ def train(args: Any) -> None:
                 ),
                 "traffic_trajectory_state_utility_gate_mean": float(
                     output["traffic_trajectory_state_utility_gate"].mean().detach().cpu()
+                ),
+                "traffic_adaptive_boundary_delta_rms": float(
+                    output["traffic_adaptive_boundary_delta"].float().square().mean().sqrt().detach().cpu()
                 ),
                 "traffic_trajectory_attention_entropy": float(
                     (-(output["trajectory_attention"] * output["trajectory_attention"].clamp_min(1e-8).log())

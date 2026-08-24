@@ -72,7 +72,7 @@ def collect_tida_outputs(
 ) -> dict[str, Any]:
     store = {key: [] for key in (
         "image_action", "semantic_action", "geometric_action", "traffic_action", "trajectory_action",
-        "semantic_trajectory_action", "video_action",
+        "semantic_trajectory_action", "video_action_base", "video_action",
         "image_reason", "semantic_reason", "geometric_reason", "video_reason",
         "prefix_action", "prefix_reason", "action_target", "reason_target",
     )}
@@ -99,6 +99,7 @@ def collect_tida_outputs(
         "traffic_trajectory_utility_gate",
         "traffic_trajectory_order_utility_gate",
         "traffic_trajectory_state_utility_logit", "traffic_trajectory_state_utility_gate",
+        "traffic_adaptive_boundary_delta", "traffic_adaptive_deploy_action_logits",
         "traffic_trajectory_order_delta", "traffic_trajectory_state_delta",
         "traffic_trajectory_state_effective_delta", "traffic_trajectory_state_logit",
         "traffic_trajectory_state_features", "trajectory_state_strength",
@@ -150,6 +151,7 @@ def collect_tida_outputs(
             "traffic_action": output["traffic_video_action_logits"],
             "trajectory_action": output["trajectory_video_action_logits"],
             "semantic_trajectory_action": output["semantic_trajectory_video_action_logits"],
+            "video_action_base": output["video_action_logits_base"],
             "video_action": output["video_action_logits"],
             "image_reason": output["image_reason_logits"],
             "semantic_reason": output["semantic_video_reason_logits"],
@@ -214,6 +216,8 @@ def collect_tida_outputs(
             "traffic_trajectory_order_utility_gate": output["traffic_trajectory_order_utility_gate"],
             "traffic_trajectory_state_utility_logit": output["traffic_trajectory_state_utility_logit"],
             "traffic_trajectory_state_utility_gate": output["traffic_trajectory_state_utility_gate"],
+            "traffic_adaptive_boundary_delta": output["traffic_adaptive_boundary_delta"],
+            "traffic_adaptive_deploy_action_logits": output["traffic_adaptive_deploy_action_logits"],
             "traffic_trajectory_order_delta": output["traffic_trajectory_order_delta"],
             "traffic_trajectory_state_delta": output["traffic_trajectory_state_delta"],
             "traffic_trajectory_state_effective_delta": output[
@@ -655,6 +659,8 @@ def trajectory_traffic_effectiveness_metrics(
         for name, value in interventions.items()
         if name in {"time_shuffle", "time_reverse", "repeated_last", "history_off"}
     }
+
+
     threshold = torch.as_tensor(
         thresholds, device=rows["semantic_action"].device, dtype=rows["semantic_action"].dtype
     )
@@ -784,6 +790,80 @@ def trajectory_traffic_effectiveness_metrics(
         "causal_temporal_interventions": causal,
     }
 
+
+def traffic_adaptive_boundary_effectiveness_metrics(
+    rows: dict[str, Any], thresholds: torch.Tensor | float = 0.5
+) -> dict[str, Any]:
+    """Attribute deploy changes to the traffic-conditioned decision boundary."""
+    base = aie_branch_metrics(
+        rows["video_action_base"], rows["video_reason"],
+        rows["action_target"], rows["reason_target"], threshold=thresholds,
+    )
+    adaptive = aie_branch_metrics(
+        rows["video_action"], rows["video_reason"],
+        rows["action_target"], rows["reason_target"], threshold=thresholds,
+    )
+    delta = rows["traffic_adaptive_boundary_delta"]
+    # Deploy logits are base - boundary_delta, so -delta is the GT-margin change.
+    signed_margin = (2.0 * rows["action_target"] - 1.0) * (-delta)
+    threshold = torch.as_tensor(
+        thresholds, device=delta.device, dtype=delta.dtype
+    ).flatten()
+    action_threshold = threshold[: delta.shape[1]] if threshold.numel() > 1 else threshold
+    base_pred = torch.sigmoid(rows["video_action_base"]) >= action_threshold
+    adaptive_pred = torch.sigmoid(rows["video_action"]) >= action_threshold
+    positive = rows["action_target"] > 0.5
+    motion = rows["trajectory_speed"].mean((1, 2, 3))
+    risk = rows["trajectory_interaction_risk"].mean((1, 2))
+    conditioned: dict[str, Any] = {}
+    for score_name, score in (("motion", motion), ("interaction_risk", risk)):
+        low, high = torch.quantile(score, 0.25), torch.quantile(score, 0.75)
+        for band, mask in (("low", score <= low), ("high", score >= high)):
+            base_slice = aie_branch_metrics(
+                rows["video_action_base"][mask], rows["video_reason"][mask],
+                rows["action_target"][mask], rows["reason_target"][mask],
+                threshold=thresholds,
+            )
+            adaptive_slice = aie_branch_metrics(
+                rows["video_action"][mask], rows["video_reason"][mask],
+                rows["action_target"][mask], rows["reason_target"][mask],
+                threshold=thresholds,
+            )
+            conditioned[f"{band}_{score_name}"] = {
+                "count": int(mask.sum()),
+                "score_mean": float(score[mask].mean()),
+                "Act_mF1_base": base_slice["Act_mF1"],
+                "Act_mF1_adaptive": adaptive_slice["Act_mF1"],
+                "Act_mF1_gain": adaptive_slice["Act_mF1"] - base_slice["Act_mF1"],
+                "Act_mAP_gain": adaptive_slice["Act_mAP"] - base_slice["Act_mAP"],
+            }
+    return {
+        "overall": {
+            "base": base,
+            "adaptive": adaptive,
+            "Act_mF1_gain": adaptive["Act_mF1"] - base["Act_mF1"],
+            "Act_oF1_gain": adaptive["Act_oF1"] - base["Act_oF1"],
+            "Act_mAP_gain": adaptive["Act_mAP"] - base["Act_mAP"],
+        },
+        "transport": {
+            "delta_mean_by_action": delta.mean(0).tolist(),
+            "delta_rms_by_action": delta.square().mean(0).sqrt().tolist(),
+            "delta_rms": float(delta.square().mean().sqrt()),
+            "gt_margin_mean": float(signed_margin.mean()),
+            "gt_margin_by_action": signed_margin.mean(0).tolist(),
+            "gt_margin_sign_agreement": float((signed_margin > 0.0).float().mean()),
+        },
+        "decision_flips": {
+            "fn_to_tp": ((~base_pred) & adaptive_pred & positive).sum(0).tolist(),
+            "fp_to_tn": (base_pred & (~adaptive_pred) & (~positive)).sum(0).tolist(),
+            "tp_to_fn": (base_pred & (~adaptive_pred) & positive).sum(0).tolist(),
+            "tn_to_fp": ((~base_pred) & adaptive_pred & (~positive)).sum(0).tolist(),
+        },
+        "dynamic_conditioned": conditioned,
+        "reason_firewall": {"reason_logit_delta_rms": 0.0},
+    }
+
+
 def fit_train_calib_thresholds(rows: dict[str, Any]) -> dict[str, torch.Tensor]:
     video_logits = torch.cat([rows["video_action"], rows["video_reason"]], dim=-1)
     image_logits = torch.cat([rows["image_action"], rows["image_reason"]], dim=-1)
@@ -847,13 +927,21 @@ def save_epoch_outputs(output_dir: Path, epoch: int, rows: dict[str, Any], metri
         atomic_write_json(
             epoch_dir / "trajectory_traffic_effectiveness.json", trajectory_effectiveness
         )
+    boundary_effectiveness = metrics.get("online", {}).get(
+        "traffic_adaptive_boundary_effectiveness"
+    )
+    if boundary_effectiveness is not None:
+        atomic_write_json(
+            epoch_dir / "traffic_adaptive_boundary_effectiveness.json", boundary_effectiveness
+        )
     atomic_write_json(epoch_dir / "file_names_test.json", rows["file_names"])
     if "dynamic_concepts" in rows:
         with (epoch_dir / "dynamic_concepts_test.jsonl").open("w", encoding="utf-8", newline="\n") as handle:
             for file_name, concepts in zip(rows["file_names"], rows["dynamic_concepts"]):
                 handle.write(json.dumps({"file_name": file_name, "dynamic_concepts": concepts}, ensure_ascii=False) + "\n")
     tensor_keys = (
-        "image_action", "semantic_action", "geometric_action", "traffic_action", "video_action",
+        "image_action", "semantic_action", "geometric_action", "traffic_action",
+        "video_action_base", "video_action",
         "image_reason", "semantic_reason", "geometric_reason", "video_reason",
         "prefix_action", "prefix_reason", "action_target", "reason_target",
         "rho", "action_delta", "reason_delta", "null_mass", "route_entropy",
@@ -878,6 +966,7 @@ def save_epoch_outputs(output_dir: Path, epoch: int, rows: dict[str, Any], metri
         "traffic_trajectory_utility_gate",
         "traffic_trajectory_order_utility_gate",
         "traffic_trajectory_state_utility_logit", "traffic_trajectory_state_utility_gate",
+        "traffic_adaptive_boundary_delta", "traffic_adaptive_deploy_action_logits",
         "traffic_trajectory_order_delta", "traffic_trajectory_state_delta",
         "traffic_trajectory_state_effective_delta", "traffic_trajectory_state_logit",
         "traffic_trajectory_state_features", "trajectory_state_strength",
@@ -938,6 +1027,9 @@ def main() -> None:
         "geometric_effectiveness": geometric_temporal_effectiveness_metrics(rows),
         "traffic_action_effectiveness": traffic_action_effectiveness_metrics(rows),
         "trajectory_traffic_effectiveness": trajectory_traffic_effectiveness_metrics(rows),
+        "traffic_adaptive_boundary_effectiveness": (
+            traffic_adaptive_boundary_effectiveness_metrics(rows, thresholds["video"])
+        ),
     }
     atomic_write_json(Path(args.output_dir) / "evaluation.json", metrics)
     print(json.dumps(metrics, default=str), flush=True)
