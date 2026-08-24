@@ -138,6 +138,7 @@ training:
     geometric_reason: 0.0003
     traffic_action: 0.00015
     traffic_trajectory: 0.0002
+    traffic_trajectory_utility: 0.0005
 memory_probe:
   max_reserved_gib: 45.0
   max_growth_gib: 0.25

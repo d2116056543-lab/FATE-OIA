@@ -273,8 +273,16 @@ class TIDAOIAModel(nn.Module):
                 parameter for parameter in self.traffic_action.parameters() if parameter.requires_grad
             ]
         if self.traffic_trajectory_enabled:
+            utility_ids = {
+                id(parameter) for parameter in self.traffic_trajectory_head.utility_projection.parameters()
+            }
             owners["traffic_trajectory"] = [
-                parameter for parameter in self.traffic_trajectory_head.parameters() if parameter.requires_grad
+                parameter for parameter in self.traffic_trajectory_head.parameters()
+                if parameter.requires_grad and id(parameter) not in utility_ids
+            ]
+            owners["traffic_trajectory_utility"] = [
+                parameter for parameter in self.traffic_trajectory_head.utility_projection.parameters()
+                if parameter.requires_grad
             ]
         # Query identities are the shortcut-free prior for terminal prediction.
         owners["history_reader"] += [self.query_identity, self.predicate_identity]
