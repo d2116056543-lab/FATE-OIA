@@ -2,6 +2,7 @@ import torch
 
 from fate_oia.engine.fit_tida_traffic_boundary_cv import (
     _balanced_boundary_loss,
+    _concatenate_rows,
     _fit_thresholds,
     _macro_f1,
 )
@@ -22,3 +23,11 @@ def test_balanced_boundary_loss_has_finite_action_specific_gradient():
     loss.backward()
     assert torch.isfinite(loss)
     assert delta.grad is not None and delta.grad.abs().sum() > 0
+
+
+def test_cv_row_concatenation_preserves_all_sources():
+    rows = _concatenate_rows([
+        {"x": torch.ones(2, 3)}, {"x": torch.zeros(4, 3)}
+    ])
+    assert rows["x"].shape == (6, 3)
+    assert rows["x"][:2].sum() == 6

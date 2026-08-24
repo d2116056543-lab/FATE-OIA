@@ -93,10 +93,23 @@ def _head_forward(head, rows: dict[str, torch.Tensor], index: torch.Tensor, devi
     return head(*values)
 
 
-def fit_cv(runtime, *, folds: int, steps: int, lr: float) -> tuple[
+def _concatenate_rows(parts: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+    if not parts:
+        raise ValueError("at least one calibration row set is required")
+    return {key: torch.cat([part[key] for part in parts], dim=0) for key in parts[0]}
+
+
+def fit_cv(
+    runtime, *, folds: int, steps: int, lr: float,
+    include_train_core: bool = False, max_delta: float = 0.05,
+) -> tuple[
     list[dict[str, torch.Tensor]], torch.Tensor, dict[str, Any], dict[str, torch.Tensor]
 ]:
-    calib = _collect(runtime.model, runtime.loaders["train_calib"], runtime.device)
+    threshold_calib = _collect(runtime.model, runtime.loaders["train_calib"], runtime.device)
+    parts = [threshold_calib]
+    if include_train_core:
+        parts.insert(0, _collect(runtime.model, runtime.loaders["train_core"], runtime.device))
+    calib = _concatenate_rows(parts)
     target = calib["action_target"].to(runtime.device)
     count = target.shape[0]
     assignment = torch.arange(count, device=runtime.device).remainder(folds)
@@ -107,6 +120,7 @@ def fit_cv(runtime, *, folds: int, steps: int, lr: float) -> tuple[
         fit_index = torch.where(assignment != fold)[0].cpu()
         hold_index = torch.where(assignment == fold)[0].cpu()
         head = copy.deepcopy(runtime.model.traffic_adaptive_boundary).to(runtime.device)
+        head.cap = float(max_delta)
         with torch.no_grad():
             head.network[-1].weight.zero_()
             head.network[-1].bias.zero_()
@@ -156,7 +170,7 @@ def fit_cv(runtime, *, folds: int, steps: int, lr: float) -> tuple[
         })
     return accepted_states, torch.stack(fold_thresholds).median(0).values, {
         "calib_count": count, "folds": diagnostics,
-    }, calib
+    }, threshold_calib
 
 
 def main() -> None:
@@ -174,16 +188,20 @@ def main() -> None:
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--steps", type=int, default=200)
     parser.add_argument("--lr", type=float, default=0.003)
+    parser.add_argument("--include-train-core", action="store_true")
+    parser.add_argument("--max-delta", type=float, default=0.05)
     args = parser.parse_args()
     runtime = build_runtime(args, evaluation_only=True)
     states, action_threshold, diagnostics, calib_rows = fit_cv(
-        runtime, folds=args.folds, steps=args.steps, lr=args.lr
+        runtime, folds=args.folds, steps=args.steps, lr=args.lr,
+        include_train_core=args.include_train_core, max_delta=args.max_delta,
     )
     test = _collect(runtime.model, runtime.loaders["test"], runtime.device)
     deltas = []
     all_index = torch.arange(test["action_target"].shape[0])
     for state in states:
         head = copy.deepcopy(runtime.model.traffic_adaptive_boundary).to(runtime.device)
+        head.cap = float(args.max_delta)
         head.load_state_dict(state)
         with torch.no_grad():
             deltas.append(_head_forward(head, test, all_index, runtime.device)["traffic_adaptive_boundary_delta"].cpu())
@@ -204,6 +222,8 @@ def main() -> None:
         "test_labels_used_for_fit_or_selection": False,
         "diagnostics": diagnostics,
         "action_thresholds": action_threshold.tolist(),
+        "include_train_core": bool(args.include_train_core),
+        "max_delta": float(args.max_delta),
         "ensemble_delta_rms": float(ensemble_delta.square().mean().sqrt()),
         "metrics": {key: metrics[key] for key in (
             "Act_mF1", "Act_oF1", "Act_mAP", "Act_per_label_f1",
@@ -215,7 +235,10 @@ def main() -> None:
     (output / "traffic_boundary_cv_result.json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    torch.save({"head_states": states, "action_thresholds": action_threshold}, output / "traffic_boundary_cv_heads.pt")
+    torch.save({
+        "head_states": states, "action_thresholds": action_threshold,
+        "max_delta": float(args.max_delta),
+    }, output / "traffic_boundary_cv_heads.pt")
     print(json.dumps(payload, ensure_ascii=False), flush=True)
 
 
