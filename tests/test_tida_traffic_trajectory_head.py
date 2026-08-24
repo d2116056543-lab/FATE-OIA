@@ -201,3 +201,58 @@ def test_interaction_encoder_is_zero_effect_but_not_gradient_dead():
     head(*args)["traffic_trajectory_delta"].sum().backward()
     zero_up = head.interaction_projection[-1]
     assert zero_up.weight.grad is not None and zero_up.weight.grad.abs().sum() > 0
+
+
+def test_motion_state_channel_is_zero_effect_but_trainable_on_first_backward():
+    args = _inputs(batch=1, tracks=3, frames=5)
+    head = TIDATrafficTrajectoryHead(dim=16, num_actions=4, num_heads=4)
+    out = head(*args, base_action_logits=torch.zeros(1, 4))
+    assert torch.count_nonzero(out["traffic_trajectory_state_delta"]) == 0
+    assert torch.count_nonzero(out["traffic_trajectory_state_logit"]) == 0
+    out["traffic_trajectory_candidate_delta"].sum().backward()
+    assert head.state_output.weight.grad is not None
+    assert head.state_output.weight.grad.abs().sum() > 0
+
+
+def test_motion_state_credit_uses_geometry_not_appearance_shortcuts():
+    args = list(_inputs(batch=1, tracks=3, frames=5))
+    head = TIDATrafficTrajectoryHead(dim=16, num_actions=4, num_heads=4)
+    with torch.no_grad():
+        head.state_output.weight.fill_(0.05)
+    original = head(*args, base_action_logits=torch.zeros(1, 4))
+    changed_appearance = [value.clone() if torch.is_tensor(value) else value for value in args]
+    changed_appearance[1] = torch.randn_like(changed_appearance[1]) * 50.0
+    changed = head(*changed_appearance, base_action_logits=torch.zeros(1, 4))
+    torch.testing.assert_close(
+        original["traffic_trajectory_state_delta"],
+        changed["traffic_trajectory_state_delta"],
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
+def test_motion_state_credit_survives_zero_appearance_order_contrast():
+    args = list(_inputs(batch=1, tracks=3, frames=5))
+    args[1] = args[1][..., :1, :].expand_as(args[1]).clone()
+    head = TIDATrafficTrajectoryHead(dim=16, num_actions=4, num_heads=4)
+    with torch.no_grad():
+        head.output.weight.zero_()
+        head.state_output.weight.fill_(0.05)
+    out = head(*args, base_action_logits=torch.zeros(1, 4))
+    assert torch.count_nonzero(out["traffic_trajectory_order_delta"]) == 0
+    assert torch.count_nonzero(out["traffic_trajectory_state_delta"]) > 0
+    assert torch.all(out["traffic_trajectory_candidate_delta"].abs() <= head.cap + 1e-7)
+
+
+def test_motion_state_channel_can_be_disabled_for_exact_branch_ablation():
+    args = _inputs(batch=1, tracks=3, frames=5)
+    head = TIDATrafficTrajectoryHead(
+        dim=16, num_actions=4, num_heads=4, state_enabled=False
+    )
+    with torch.no_grad():
+        head.output.weight.fill_(0.05)
+    out = head(*args, base_action_logits=torch.zeros(1, 4))
+    assert torch.count_nonzero(out["traffic_trajectory_state_delta"]) == 0
+    torch.testing.assert_close(
+        out["traffic_trajectory_candidate_delta"], out["traffic_trajectory_order_delta"]
+    )

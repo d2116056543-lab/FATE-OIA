@@ -28,6 +28,8 @@ def _rgb(tensor: torch.Tensor) -> np.ndarray:
 def trajectory_case_trace(output: dict[str, torch.Tensor], index: int, file_name: str) -> dict[str, Any]:
     image_logits = output["image_action_logits"][index].float().detach().cpu()
     delta = output["traffic_trajectory_delta"][index].float().detach().cpu()
+    action_zeros = torch.zeros_like(output["traffic_trajectory_delta"])
+    track_zeros = output["trajectory_attention"].new_zeros(output["trajectory_attention"].shape)
     actions = []
     for action, name in enumerate(ACTION_NAMES):
         tracks = []
@@ -47,6 +49,15 @@ def trajectory_case_trace(output: dict[str, torch.Tensor], index: int, file_name
             "action_id": action, "action_name": name,
             "trust": float(output["traffic_trajectory_trust"][index, action]),
             "support": float(output["traffic_trajectory_support"][index, action]),
+            "state_strength": float(output.get("trajectory_state_strength", action_zeros)[index, action]),
+            "utility_gate": float(output.get("traffic_trajectory_utility_gate", action_zeros)[index, action]),
+            "order_logit_delta": float(output.get("traffic_trajectory_order_delta", action_zeros)[index, action]),
+            "motion_state_logit_delta": float(
+                output.get("traffic_trajectory_state_effective_delta", action_zeros)[index, action]
+            ),
+            "interaction_risk_mean": float(
+                output.get("trajectory_interaction_risk", track_zeros)[index, action].mean()
+            ),
             "logit_delta": float(delta[action]), "tracks": tracks,
         })
     return {

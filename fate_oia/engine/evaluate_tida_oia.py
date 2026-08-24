@@ -97,6 +97,9 @@ def collect_tida_outputs(
         "traffic_trajectory_delta", "traffic_trajectory_control_delta",
         "traffic_trajectory_candidate_delta", "traffic_trajectory_utility_logit",
         "traffic_trajectory_utility_gate",
+        "traffic_trajectory_order_delta", "traffic_trajectory_state_delta",
+        "traffic_trajectory_state_effective_delta", "traffic_trajectory_state_logit",
+        "traffic_trajectory_state_features", "trajectory_state_strength",
         "traffic_trajectory_support", "trajectory_support_gate",
         "trajectory_order_gate", "trajectory_uncertainty_gate",
         "trajectory_attention",
@@ -206,6 +209,14 @@ def collect_tida_outputs(
             "traffic_trajectory_candidate_delta": output["traffic_trajectory_candidate_delta"],
             "traffic_trajectory_utility_logit": output["traffic_trajectory_utility_logit"],
             "traffic_trajectory_utility_gate": output["traffic_trajectory_utility_gate"],
+            "traffic_trajectory_order_delta": output["traffic_trajectory_order_delta"],
+            "traffic_trajectory_state_delta": output["traffic_trajectory_state_delta"],
+            "traffic_trajectory_state_effective_delta": output[
+                "traffic_trajectory_state_effective_delta"
+            ],
+            "traffic_trajectory_state_logit": output["traffic_trajectory_state_logit"],
+            "traffic_trajectory_state_features": output["traffic_trajectory_state_features"],
+            "trajectory_state_strength": output["trajectory_state_strength"],
             "traffic_trajectory_support": output["traffic_trajectory_support"],
             "trajectory_support_gate": output["trajectory_support_gate"],
             "trajectory_order_gate": output["trajectory_order_gate"],
@@ -610,6 +621,16 @@ def trajectory_traffic_effectiveness_metrics(
     signed_control_advantage = sign * (
         rows["traffic_trajectory_delta"] - rows["traffic_trajectory_control_delta"]
     )
+    state_effective_delta = rows.get(
+        "traffic_trajectory_state_effective_delta", torch.zeros_like(rows["traffic_trajectory_delta"])
+    )
+    state_order_delta = rows.get(
+        "traffic_trajectory_order_delta", rows["traffic_trajectory_delta"]
+    )
+    state_strength = rows.get(
+        "trajectory_state_strength", torch.zeros_like(rows["traffic_trajectory_delta"])
+    )
+    signed_state = sign * state_effective_delta
     benefit = int((signed > 1e-4).sum())
     harm = int((signed < -1e-4).sum())
     attention = rows["trajectory_attention"]
@@ -667,6 +688,12 @@ def trajectory_traffic_effectiveness_metrics(
                 0.0 if selected_signed.numel() == 0 else float((selected_signed < -1e-4).float().mean())
             ),
         }
+    state_risk_correlation = None
+    if interaction_risk is not None:
+        state_flat = state_strength.flatten().float()
+        risk_flat = interaction_risk.mean(-1).flatten().float()
+        if state_flat.std() > 1e-8 and risk_flat.std() > 1e-8:
+            state_risk_correlation = float(torch.corrcoef(torch.stack((state_flat, risk_flat)))[0, 1])
     return {
         "overall": {
             "semantic": semantic, "trajectory_only": trajectory, "final": final,
@@ -684,6 +711,18 @@ def trajectory_traffic_effectiveness_metrics(
             "harm_rate": float((signed < -1e-4).float().mean()),
             "correction_to_harm_ratio": float((benefit + 1) / (harm + 1)),
             "paired_bootstrap": paired,
+        },
+        "motion_state_transport": {
+            "signed_margin_mean": float(signed_state.mean()),
+            "signed_margin_by_label": signed_state.mean(0).tolist(),
+            "benefit_rate": float((signed_state > 1e-4).float().mean()),
+            "harm_rate": float((signed_state < -1e-4).float().mean()),
+            "state_delta_rms": float(
+                state_effective_delta.square().mean().sqrt()
+            ),
+            "order_delta_rms": float(state_order_delta.square().mean().sqrt()),
+            "state_strength_mean": float(state_strength.mean()),
+            "interaction_risk_correlation": state_risk_correlation,
         },
         "grounding_quality": {
             "support_mean": float(rows["traffic_trajectory_support"].mean()),
@@ -809,6 +848,9 @@ def save_epoch_outputs(output_dir: Path, epoch: int, rows: dict[str, Any], metri
         "traffic_trajectory_delta", "traffic_trajectory_control_delta",
         "traffic_trajectory_candidate_delta", "traffic_trajectory_utility_logit",
         "traffic_trajectory_utility_gate",
+        "traffic_trajectory_order_delta", "traffic_trajectory_state_delta",
+        "traffic_trajectory_state_effective_delta", "traffic_trajectory_state_logit",
+        "traffic_trajectory_state_features", "trajectory_state_strength",
         "traffic_trajectory_support", "trajectory_support_gate",
         "trajectory_order_gate", "trajectory_uncertainty_gate",
         "trajectory_attention",

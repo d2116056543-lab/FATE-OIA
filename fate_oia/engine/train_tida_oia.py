@@ -511,6 +511,15 @@ def build_runtime(args: Any, evaluation_only: bool = False) -> TIDARuntime:
         traffic_trajectory_enabled=bool(config["model"].get("traffic_trajectory_enabled", False)),
         traffic_trajectory_cap=float(config["model"].get("traffic_trajectory_cap", 0.08)),
         traffic_trajectory_heads=int(config["model"].get("traffic_trajectory_heads", 4)),
+        traffic_trajectory_state_enabled=bool(
+            config["model"].get("traffic_trajectory_state_enabled", True)
+        ),
+        traffic_trajectory_state_strength_scale=float(
+            config["model"].get("traffic_trajectory_state_strength_scale", 8.0)
+        ),
+        traffic_trajectory_state_cap_ratio=float(
+            config["model"].get("traffic_trajectory_state_cap_ratio", 1.0)
+        ),
     ).to(device)
     batch_size = int(_arg(args, "batch_size", 2))
     workers = int(_arg(args, "num_workers", config["data"]["num_workers"]))
@@ -934,6 +943,15 @@ def train(args: Any) -> None:
                 ),
                 "traffic_trajectory_delta_rms": float(
                     output["traffic_trajectory_delta"].float().square().mean().sqrt().detach().cpu()
+                ),
+                "traffic_trajectory_order_delta_rms": float(
+                    output["traffic_trajectory_order_delta"].float().square().mean().sqrt().detach().cpu()
+                ),
+                "traffic_trajectory_state_delta_rms": float(
+                    output["traffic_trajectory_state_effective_delta"].float().square().mean().sqrt().detach().cpu()
+                ),
+                "traffic_trajectory_state_strength_mean": float(
+                    output["trajectory_state_strength"].mean().detach().cpu()
                 ),
                 "traffic_trajectory_control_delta_rms": float(
                     output["traffic_trajectory_control_delta"].float().square().mean().sqrt().detach().cpu()

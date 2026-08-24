@@ -71,6 +71,9 @@ model:
   traffic_trajectory_enabled: true
   traffic_trajectory_cap: 0.08
   traffic_trajectory_heads: 4
+  traffic_trajectory_state_enabled: true
+  traffic_trajectory_state_strength_scale: 8.0
+  traffic_trajectory_state_cap_ratio: 1.0
 loss:
   terminal_hist: 0.25
   terminal_no_history: 0.0

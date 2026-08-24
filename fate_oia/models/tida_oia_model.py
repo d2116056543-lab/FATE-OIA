@@ -140,6 +140,9 @@ class TIDAOIAModel(nn.Module):
         traffic_trajectory_enabled: bool = False,
         traffic_trajectory_cap: float = 0.08,
         traffic_trajectory_heads: int = 4,
+        traffic_trajectory_state_enabled: bool = True,
+        traffic_trajectory_state_strength_scale: float = 8.0,
+        traffic_trajectory_state_cap_ratio: float = 1.0,
     ) -> None:
         super().__init__()
         self.image_model = image_model
@@ -207,6 +210,9 @@ class TIDAOIAModel(nn.Module):
         self.traffic_trajectory_head = TIDATrafficTrajectoryHead(
             dim=dim, num_actions=num_actions, num_heads=traffic_trajectory_heads,
             cap=traffic_trajectory_cap,
+            state_enabled=traffic_trajectory_state_enabled,
+            state_strength_scale=traffic_trajectory_state_strength_scale,
+            state_cap_ratio=traffic_trajectory_state_cap_ratio,
         )
         if not self.traffic_trajectory_enabled:
             for parameter in self.traffic_trajectory_head.parameters():
@@ -274,14 +280,24 @@ class TIDAOIAModel(nn.Module):
             ]
         if self.traffic_trajectory_enabled:
             utility_ids = {
-                id(parameter) for parameter in self.traffic_trajectory_head.utility_projection.parameters()
+                id(parameter)
+                for module in (
+                    self.traffic_trajectory_head.utility_projection,
+                    self.traffic_trajectory_head.state_utility_projection,
+                )
+                for parameter in module.parameters()
             }
             owners["traffic_trajectory"] = [
                 parameter for parameter in self.traffic_trajectory_head.parameters()
                 if parameter.requires_grad and id(parameter) not in utility_ids
             ]
             owners["traffic_trajectory_utility"] = [
-                parameter for parameter in self.traffic_trajectory_head.utility_projection.parameters()
+                parameter
+                for module in (
+                    self.traffic_trajectory_head.utility_projection,
+                    self.traffic_trajectory_head.state_utility_projection,
+                )
+                for parameter in module.parameters()
                 if parameter.requires_grad
             ]
         # Query identities are the shortcut-free prior for terminal prediction.
@@ -571,6 +587,12 @@ class TIDAOIAModel(nn.Module):
             "traffic_trajectory_credit_logit": torch.zeros_like(image_action),
             "traffic_trajectory_control_logit": torch.zeros_like(image_action),
             "traffic_trajectory_candidate_delta": torch.zeros_like(image_action),
+            "traffic_trajectory_order_delta": torch.zeros_like(image_action),
+            "traffic_trajectory_state_delta": torch.zeros_like(image_action),
+            "traffic_trajectory_state_effective_delta": torch.zeros_like(image_action),
+            "traffic_trajectory_state_logit": torch.zeros_like(image_action),
+            "traffic_trajectory_state_features": image_action.new_zeros(batch, actions, 8),
+            "trajectory_state_strength": torch.zeros_like(image_action),
             "traffic_trajectory_utility_logit": torch.zeros_like(image_action),
             "traffic_trajectory_utility_gate": torch.zeros_like(image_action),
             "traffic_trajectory_context": image_action.new_zeros(batch, actions, dim),

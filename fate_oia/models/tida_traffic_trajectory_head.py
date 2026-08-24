@@ -17,13 +17,22 @@ class TIDATrafficTrajectoryHead(nn.Module):
         num_actions: int = 4,
         num_heads: int = 4,
         cap: float = 0.08,
+        state_enabled: bool = True,
+        state_strength_scale: float = 8.0,
+        state_cap_ratio: float = 1.0,
     ) -> None:
         super().__init__()
-        if dim <= 0 or num_actions <= 0 or num_heads <= 0 or dim % num_heads or cap <= 0:
+        if (
+            dim <= 0 or num_actions <= 0 or num_heads <= 0 or dim % num_heads or cap <= 0
+            or state_strength_scale <= 0 or not 0 <= state_cap_ratio <= 1
+        ):
             raise ValueError("invalid trajectory head dimensions")
         self.dim = int(dim)
         self.num_actions = int(num_actions)
         self.cap = float(cap)
+        self.state_enabled = bool(state_enabled)
+        self.state_strength_scale = float(state_strength_scale)
+        self.state_cap_ratio = float(state_cap_ratio)
         self.action_identity = nn.Parameter(torch.randn(num_actions, dim) * 0.02)
         self.motion_projection = nn.Sequential(nn.Linear(9, dim), nn.GELU(), nn.LayerNorm(dim))
         self.direction_projection = nn.Sequential(nn.Linear(8, dim), nn.GELU())
@@ -44,16 +53,31 @@ class TIDATrafficTrajectoryHead(nn.Module):
         self.key = nn.Linear(dim, dim, bias=False)
         self.value = nn.Linear(dim, dim, bias=False)
         self.readout = nn.Sequential(nn.LayerNorm(4 * dim), nn.Linear(4 * dim, dim), nn.GELU())
+        self.state_projection = nn.Sequential(
+            nn.LayerNorm(8), nn.Linear(8, dim), nn.GELU(), nn.Linear(dim, dim), nn.GELU()
+        )
         self.order_gate_projection = nn.Linear(2 * dim, 1)
         self.output = nn.Linear(dim, 1)
+        self.state_output = nn.Linear(dim, 1)
         self.utility_projection = nn.Linear(dim, 1)
+        self.state_utility_projection = nn.Linear(dim, 1)
         self.trust_raw = nn.Parameter(torch.zeros(num_actions))
         nn.init.zeros_(self.order_gate_projection.weight)
         nn.init.zeros_(self.order_gate_projection.bias)
         nn.init.zeros_(self.output.weight)
         nn.init.zeros_(self.output.bias)
+        nn.init.zeros_(self.state_output.weight)
+        nn.init.zeros_(self.state_output.bias)
         nn.init.zeros_(self.utility_projection.weight)
         nn.init.constant_(self.utility_projection.bias, math.log(999.0))
+        nn.init.zeros_(self.state_utility_projection.weight)
+        nn.init.zeros_(self.state_utility_projection.bias)
+        if not self.state_enabled:
+            for module in (
+                self.state_projection, self.state_output, self.state_utility_projection
+            ):
+                for parameter in module.parameters():
+                    parameter.requires_grad = False
         angles = torch.arange(8, dtype=torch.float32) * (2.0 * math.pi / 8.0)
         self.register_buffer("direction_bins", torch.stack((angles.cos(), angles.sin()), dim=-1))
 
@@ -182,6 +206,48 @@ class TIDATrafficTrajectoryHead(nn.Module):
         )
         trajectory_tokens = trajectory_tokens + self.interaction_projection(interaction_summary)
 
+        # Geometry-only traffic state survives time-arrow differencing without
+        # opening an appearance shortcut into the action decision. Each action
+        # receives the exclusive motion and interaction state of its own tracks.
+        exclusive_speed = exclusive_displacement.square().sum(-1).sqrt()
+        exclusive_acceleration = torch.zeros_like(exclusive_speed)
+        if frames > 2:
+            exclusive_acceleration[..., 1:] = (
+                exclusive_displacement[..., 1:, :] - exclusive_displacement[..., :-1, :]
+            ).square().sum(-1).sqrt()
+        state_pair_weight = pair_weight * confidence
+        state_denominator = state_pair_weight.sum(-1, keepdim=True).clamp_min(1e-8)
+        mean_exclusive = (
+            exclusive_displacement * state_pair_weight[..., None]
+        ).sum(-2) / state_denominator
+        mean_abs_exclusive = (
+            exclusive_displacement.abs() * state_pair_weight[..., None]
+        ).sum(-2) / state_denominator
+        mean_exclusive_speed = (
+            exclusive_speed * state_pair_weight
+        ).sum(-1, keepdim=True) / state_denominator
+        max_exclusive_speed = (
+            exclusive_speed.masked_fill(state_pair_weight <= 0, 0.0).amax(-1, keepdim=True)
+        )
+        mean_exclusive_acceleration = (
+            exclusive_acceleration * state_pair_weight
+        ).sum(-1, keepdim=True) / state_denominator
+        state_track_features = torch.cat(
+            (
+                mean_exclusive,
+                mean_abs_exclusive,
+                mean_exclusive_speed,
+                max_exclusive_speed,
+                mean_exclusive_acceleration,
+                interaction_risk[..., None],
+            ),
+            dim=-1,
+        )
+        state_track_support = state_pair_weight.mean(-1)
+        state_track_weight = anchor_weight.detach().clamp_min(0.0) * state_track_support
+        state_track_weight = state_track_weight / state_track_weight.sum(-1, keepdim=True).clamp_min(1e-8)
+        motion_state_features = torch.einsum("bak,bakf->baf", state_track_weight, state_track_features)
+
         relation = self.relation_encoder(
             trajectory_tokens.reshape(batch * actions, tracks, dim)
         ).reshape(batch, actions, tracks, dim)
@@ -210,6 +276,7 @@ class TIDATrafficTrajectoryHead(nn.Module):
             "pair_confidence": confidence * pair_weight,
             "interaction_risk": interaction_risk,
             "interaction_summary": interaction_summary,
+            "motion_state_features": motion_state_features,
         }
 
     def forward(
@@ -271,6 +338,7 @@ class TIDATrafficTrajectoryHead(nn.Module):
 
         hidden = self.readout(credit_features(order_contrast))
         reverse_hidden = self.readout(credit_features(-order_contrast))
+        state_hidden = self.state_projection(ordered["motion_state_features"])
         trust = torch.sigmoid(self.trust_raw)[None].expand(batch, -1)
         ordered_readout = self.output(hidden).squeeze(-1)
         reversed_readout = self.output(reverse_hidden).squeeze(-1)
@@ -288,10 +356,26 @@ class TIDATrafficTrajectoryHead(nn.Module):
         uncertainty_gate = 0.25 + 0.75 * torch.exp(-base_action_logits.detach().abs())
         trajectory_support = 0.5 * (ordered["support"] + reversed_order["support"])
         support_gate = trajectory_support / (trajectory_support + 0.05)
-        budget = self.cap * trust * support_gate * order_gate * uncertainty_gate
-        candidate_delta = budget * torch.tanh(evidence_logit)
-        candidate_control_delta = budget * torch.tanh(control_logit)
+        order_budget = self.cap * trust * support_gate * order_gate * uncertainty_gate
+        order_delta = order_budget * torch.tanh(evidence_logit)
+        order_control_delta = order_budget * torch.tanh(control_logit)
+        state_logit = self.state_output(state_hidden).squeeze(-1)
+        state_strength = 1.0 - torch.exp(
+            -self.state_strength_scale * ordered["motion_state_features"].abs().mean(-1)
+        )
+        state_budget = (
+            self.cap * self.state_cap_ratio * trust * support_gate * uncertainty_gate * state_strength
+        )
+        state_delta = state_budget * torch.tanh(state_logit)
+        if not self.state_enabled:
+            state_logit = torch.zeros_like(state_logit)
+            state_strength = torch.zeros_like(state_strength)
+            state_delta = torch.zeros_like(state_delta)
+        candidate_delta = (order_delta + state_delta).clamp(-self.cap, self.cap)
+        candidate_control_delta = order_control_delta.clamp(-self.cap, self.cap)
         utility_logit = self.utility_projection(hidden).squeeze(-1)
+        if self.state_enabled:
+            utility_logit = utility_logit + self.state_utility_projection(state_hidden).squeeze(-1)
         utility_gate = torch.sigmoid(utility_logit)
         delta = utility_gate * candidate_delta
         control_delta = utility_gate * candidate_control_delta
@@ -302,6 +386,12 @@ class TIDATrafficTrajectoryHead(nn.Module):
             "traffic_trajectory_credit_logit": evidence_logit,
             "traffic_trajectory_control_logit": control_logit,
             "traffic_trajectory_candidate_delta": candidate_delta,
+            "traffic_trajectory_order_delta": order_delta,
+            "traffic_trajectory_state_delta": state_delta,
+            "traffic_trajectory_state_effective_delta": utility_gate * state_delta,
+            "traffic_trajectory_state_logit": state_logit,
+            "traffic_trajectory_state_features": ordered["motion_state_features"],
+            "trajectory_state_strength": state_strength,
             "traffic_trajectory_utility_logit": utility_logit,
             "traffic_trajectory_utility_gate": utility_gate,
             "traffic_trajectory_context": ordered["context"],
