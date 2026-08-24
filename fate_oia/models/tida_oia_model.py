@@ -145,7 +145,7 @@ class TIDAOIAModel(nn.Module):
         traffic_trajectory_state_strength_scale: float = 8.0,
         traffic_trajectory_state_cap_ratio: float = 1.0,
         traffic_trajectory_state_utility_open_prior: float = 0.10,
-        traffic_adaptive_boundary_enabled: bool = True,
+        traffic_adaptive_boundary_enabled: bool = False,
         traffic_adaptive_boundary_cap: float = 0.25,
     ) -> None:
         super().__init__()

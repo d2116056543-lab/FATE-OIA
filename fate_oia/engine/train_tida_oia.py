@@ -525,7 +525,7 @@ def build_runtime(args: Any, evaluation_only: bool = False) -> TIDARuntime:
             config["model"].get("traffic_trajectory_state_utility_open_prior", 0.10)
         ),
         traffic_adaptive_boundary_enabled=bool(
-            config["model"].get("traffic_adaptive_boundary_enabled", True)
+            config["model"].get("traffic_adaptive_boundary_enabled", False)
         ),
         traffic_adaptive_boundary_cap=float(
             config["model"].get("traffic_adaptive_boundary_cap", 0.25)
