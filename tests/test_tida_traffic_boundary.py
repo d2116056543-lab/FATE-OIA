@@ -19,7 +19,8 @@ def test_traffic_boundary_is_exact_zero_effect_and_trainable_at_initialization()
     inputs = _inputs()
     output = head(*inputs)
     torch.testing.assert_close(output["traffic_adaptive_deploy_action_logits"], inputs[0])
-    output["traffic_adaptive_deploy_action_logits"].sum().backward()
+    action_weight = torch.tensor([1.0, -1.0, 0.5, -0.5])
+    (output["traffic_adaptive_deploy_action_logits"] * action_weight).sum().backward()
     assert head.network[-1].weight.grad is not None
     assert head.network[-1].weight.grad.abs().sum() > 0
 
@@ -44,3 +45,17 @@ def test_traffic_boundary_is_action_specific_and_bounded():
     output = head(*inputs)
     assert torch.all(output["traffic_adaptive_boundary_delta"].abs() <= 0.2 + 1e-7)
     assert output["traffic_adaptive_boundary_delta"].std() > 0
+
+
+def test_traffic_boundary_removes_per_sample_common_mode_bias():
+    head = TIDATrafficAdaptiveBoundary(cap=0.2)
+    with torch.no_grad():
+        head.network[-1].weight.fill_(1.0)
+        head.network[-1].bias.fill_(3.0)
+    output = head(*_inputs())
+    torch.testing.assert_close(
+        output["traffic_adaptive_boundary_delta"].mean(-1),
+        torch.zeros(2),
+        atol=1e-7,
+        rtol=0.0,
+    )

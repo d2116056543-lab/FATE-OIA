@@ -57,7 +57,13 @@ class TIDATrafficAdaptiveBoundary(nn.Module):
         )
         identity = self.action_embedding[None].expand(batch, -1, -1)
         features = torch.cat((state_features.detach(), scalar, identity), dim=-1)
-        boundary_delta = self.cap * torch.tanh(self.network(features).squeeze(-1))
+        raw_delta = torch.tanh(self.network(features).squeeze(-1))
+        # CalAlign owns common threshold shifts. Traffic evidence may only
+        # redistribute action boundaries within a sample, preventing the
+        # auxiliary branch from degenerating into a duplicate global bias.
+        boundary_delta = 0.5 * self.cap * (
+            raw_delta - raw_delta.mean(dim=-1, keepdim=True)
+        )
         return {
             "traffic_adaptive_boundary_delta": boundary_delta,
             "traffic_adaptive_deploy_action_logits": base_logits - boundary_delta,
