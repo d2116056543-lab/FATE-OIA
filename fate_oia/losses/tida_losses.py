@@ -454,8 +454,10 @@ def build_tida_loss_registry(
         "trajectory_utility_calibration",
         trajectory_utility_calibration_loss(
             output["traffic_trajectory_utility_logit"],
-            output["traffic_trajectory_candidate_delta"],
+            output["traffic_trajectory_order_delta"],
             action_target,
+            state_utility_logits=output["traffic_trajectory_state_utility_logit"],
+            state_candidate_delta=output["traffic_trajectory_state_delta"],
         ),
     )
     registry.add("trajectory_delta", output["traffic_trajectory_delta_raw"].square().mean())

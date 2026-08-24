@@ -51,6 +51,9 @@ def trajectory_case_trace(output: dict[str, torch.Tensor], index: int, file_name
             "support": float(output["traffic_trajectory_support"][index, action]),
             "state_strength": float(output.get("trajectory_state_strength", action_zeros)[index, action]),
             "utility_gate": float(output.get("traffic_trajectory_utility_gate", action_zeros)[index, action]),
+            "state_utility_gate": float(
+                output.get("traffic_trajectory_state_utility_gate", action_zeros)[index, action]
+            ),
             "order_logit_delta": float(output.get("traffic_trajectory_order_delta", action_zeros)[index, action]),
             "motion_state_logit_delta": float(
                 output.get("traffic_trajectory_state_effective_delta", action_zeros)[index, action]
@@ -98,6 +101,9 @@ def _draw_transport_summary(output: dict[str, torch.Tensor], index: int, path: P
     state = output["traffic_trajectory_state_effective_delta"][index].float().detach().cpu().numpy()
     total = output["traffic_trajectory_delta"][index].float().detach().cpu().numpy()
     utility = output["traffic_trajectory_utility_gate"][index].float().detach().cpu().numpy()
+    state_utility = output.get(
+        "traffic_trajectory_state_utility_gate", output["traffic_trajectory_utility_gate"]
+    )[index].float().detach().cpu().numpy()
     risk = output["trajectory_interaction_risk"][index].float().mean(-1).detach().cpu().numpy()
     x = np.arange(len(ACTION_NAMES))
     width = 0.24
@@ -112,6 +118,7 @@ def _draw_transport_summary(output: dict[str, torch.Tensor], index: int, path: P
     axis.legend(loc="upper left")
     auxiliary = axis.twinx()
     auxiliary.plot(x, utility, "o--", color="#b279a2", label="utility gate")
+    auxiliary.plot(x, state_utility, "^--", color="#ff9da6", label="state utility gate")
     auxiliary.plot(x, risk, "s--", color="#e45756", label="interaction risk")
     auxiliary.set_ylim(0.0, max(1.0, float(max(utility.max(), risk.max())) * 1.1))
     auxiliary.set_ylabel("gate / interaction risk")

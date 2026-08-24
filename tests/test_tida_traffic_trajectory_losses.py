@@ -140,3 +140,24 @@ def test_utility_calibration_opens_for_helpful_and_closes_for_harmful_candidates
     assert correct_loss < reversed_loss
     correct_loss.backward()
     assert correct_logits.grad is not None and torch.isfinite(correct_logits.grad).all()
+
+
+def test_split_utility_calibration_trains_order_and_state_from_their_own_detached_effects():
+    target = torch.tensor([[1.0, 0.0, 1.0, 0.0]])
+    order_delta = torch.tensor([[0.02, -0.02, 0.02, -0.02]], requires_grad=True)
+    state_delta = (-order_delta.detach().clone()).requires_grad_(True)
+    order_good = torch.full((1, 4), 4.0, requires_grad=True)
+    state_closed = torch.full((1, 4), -4.0, requires_grad=True)
+    good = trajectory_utility_calibration_loss(
+        order_good, order_delta, target,
+        state_utility_logits=state_closed, state_candidate_delta=state_delta,
+    )
+    bad = trajectory_utility_calibration_loss(
+        -order_good.detach(), order_delta, target,
+        state_utility_logits=-state_closed.detach(), state_candidate_delta=state_delta,
+    )
+    assert good < bad
+    good.backward()
+    assert order_good.grad is not None and state_closed.grad is not None
+    assert order_delta.grad is None
+    assert state_delta.grad is None

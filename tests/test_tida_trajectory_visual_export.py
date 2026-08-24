@@ -34,6 +34,7 @@ def test_transport_summary_visualizes_order_state_and_total_credit(tmp_path):
         "traffic_trajectory_state_effective_delta": torch.tensor([[0.02, -0.01, 0.01, -0.02]]),
         "traffic_trajectory_delta": torch.tensor([[0.03, -0.03, 0.04, -0.06]]),
         "traffic_trajectory_utility_gate": torch.tensor([[0.8, 0.6, 0.7, 0.5]]),
+        "traffic_trajectory_state_utility_gate": torch.tensor([[0.2, 0.1, 0.3, 0.1]]),
         "trajectory_interaction_risk": torch.full((1, 4, 3), 0.25),
     }
     target = tmp_path / "traffic_credit.png"

@@ -20,11 +20,13 @@ class TIDATrafficTrajectoryHead(nn.Module):
         state_enabled: bool = True,
         state_strength_scale: float = 8.0,
         state_cap_ratio: float = 1.0,
+        state_utility_open_prior: float = 0.10,
     ) -> None:
         super().__init__()
         if (
             dim <= 0 or num_actions <= 0 or num_heads <= 0 or dim % num_heads or cap <= 0
             or state_strength_scale <= 0 or not 0 <= state_cap_ratio <= 1
+            or not 0 < state_utility_open_prior < 0.5
         ):
             raise ValueError("invalid trajectory head dimensions")
         self.dim = int(dim)
@@ -33,6 +35,9 @@ class TIDATrafficTrajectoryHead(nn.Module):
         self.state_enabled = bool(state_enabled)
         self.state_strength_scale = float(state_strength_scale)
         self.state_cap_ratio = float(state_cap_ratio)
+        self.state_utility_prior_logit = math.log(
+            float(state_utility_open_prior) / (1.0 - float(state_utility_open_prior))
+        )
         self.action_identity = nn.Parameter(torch.randn(num_actions, dim) * 0.02)
         self.motion_projection = nn.Sequential(nn.Linear(9, dim), nn.GELU(), nn.LayerNorm(dim))
         self.direction_projection = nn.Sequential(nn.Linear(8, dim), nn.GELU())
@@ -373,12 +378,22 @@ class TIDATrafficTrajectoryHead(nn.Module):
             state_delta = torch.zeros_like(state_delta)
         candidate_delta = (order_delta + state_delta).clamp(-self.cap, self.cap)
         candidate_control_delta = order_control_delta.clamp(-self.cap, self.cap)
-        utility_logit = self.utility_projection(hidden).squeeze(-1)
-        if self.state_enabled:
-            utility_logit = utility_logit + self.state_utility_projection(state_hidden).squeeze(-1)
-        utility_gate = torch.sigmoid(utility_logit)
-        delta = utility_gate * candidate_delta
-        control_delta = utility_gate * candidate_control_delta
+        # Preserve the proven order branch while preventing a newly introduced
+        # state branch from inheriting its compatibility-biased, almost-open gate.
+        order_utility_logit = self.utility_projection(hidden).squeeze(-1)
+        order_utility_gate = torch.sigmoid(order_utility_logit)
+        state_utility_logit = (
+            self.state_utility_projection(state_hidden).squeeze(-1)
+            + self.state_utility_prior_logit
+        )
+        state_utility_gate = torch.sigmoid(state_utility_logit)
+        if not self.state_enabled:
+            state_utility_logit = torch.zeros_like(state_utility_logit)
+            state_utility_gate = torch.zeros_like(state_utility_gate)
+        delta = (
+            order_utility_gate * order_delta + state_utility_gate * state_delta
+        ).clamp(-self.cap, self.cap)
+        control_delta = order_utility_gate * candidate_control_delta
 
         return {
             "traffic_trajectory_delta": delta,
@@ -388,12 +403,15 @@ class TIDATrafficTrajectoryHead(nn.Module):
             "traffic_trajectory_candidate_delta": candidate_delta,
             "traffic_trajectory_order_delta": order_delta,
             "traffic_trajectory_state_delta": state_delta,
-            "traffic_trajectory_state_effective_delta": utility_gate * state_delta,
+            "traffic_trajectory_state_effective_delta": state_utility_gate * state_delta,
             "traffic_trajectory_state_logit": state_logit,
             "traffic_trajectory_state_features": ordered["motion_state_features"],
             "trajectory_state_strength": state_strength,
-            "traffic_trajectory_utility_logit": utility_logit,
-            "traffic_trajectory_utility_gate": utility_gate,
+            "traffic_trajectory_utility_logit": order_utility_logit,
+            "traffic_trajectory_utility_gate": order_utility_gate,
+            "traffic_trajectory_order_utility_gate": order_utility_gate,
+            "traffic_trajectory_state_utility_logit": state_utility_logit,
+            "traffic_trajectory_state_utility_gate": state_utility_gate,
             "traffic_trajectory_context": ordered["context"],
             "traffic_trajectory_trust": trust,
             "traffic_trajectory_support": trajectory_support,

@@ -97,6 +97,8 @@ def collect_tida_outputs(
         "traffic_trajectory_delta", "traffic_trajectory_control_delta",
         "traffic_trajectory_candidate_delta", "traffic_trajectory_utility_logit",
         "traffic_trajectory_utility_gate",
+        "traffic_trajectory_order_utility_gate",
+        "traffic_trajectory_state_utility_logit", "traffic_trajectory_state_utility_gate",
         "traffic_trajectory_order_delta", "traffic_trajectory_state_delta",
         "traffic_trajectory_state_effective_delta", "traffic_trajectory_state_logit",
         "traffic_trajectory_state_features", "trajectory_state_strength",
@@ -209,6 +211,9 @@ def collect_tida_outputs(
             "traffic_trajectory_candidate_delta": output["traffic_trajectory_candidate_delta"],
             "traffic_trajectory_utility_logit": output["traffic_trajectory_utility_logit"],
             "traffic_trajectory_utility_gate": output["traffic_trajectory_utility_gate"],
+            "traffic_trajectory_order_utility_gate": output["traffic_trajectory_order_utility_gate"],
+            "traffic_trajectory_state_utility_logit": output["traffic_trajectory_state_utility_logit"],
+            "traffic_trajectory_state_utility_gate": output["traffic_trajectory_state_utility_gate"],
             "traffic_trajectory_order_delta": output["traffic_trajectory_order_delta"],
             "traffic_trajectory_state_delta": output["traffic_trajectory_state_delta"],
             "traffic_trajectory_state_effective_delta": output[
@@ -668,7 +673,7 @@ def trajectory_traffic_effectiveness_metrics(
     common_displacement = rows.get("trajectory_common_displacement")
     interaction_risk = rows.get("trajectory_interaction_risk")
     utility_gate = rows.get("traffic_trajectory_utility_gate")
-    candidate_delta = rows.get("traffic_trajectory_candidate_delta")
+    candidate_delta = rows.get("traffic_trajectory_order_delta")
     utility_quality = {"available": False}
     if utility_gate is not None and candidate_delta is not None:
         candidate_helpful = sign * candidate_delta > 0
@@ -686,6 +691,28 @@ def trajectory_traffic_effectiveness_metrics(
             ),
             "selected_harm_rate": (
                 0.0 if selected_signed.numel() == 0 else float((selected_signed < -1e-4).float().mean())
+            ),
+        }
+    state_utility_gate = rows.get("traffic_trajectory_state_utility_gate")
+    state_utility_quality = {"available": False}
+    if state_utility_gate is not None:
+        state_candidate_helpful = sign * rows["traffic_trajectory_state_delta"] > 0
+        state_selected = state_utility_gate >= 0.5
+        state_selected_signed = signed_state[state_selected]
+        state_utility_quality = {
+            "available": True,
+            "gate_mean": float(state_utility_gate.mean()),
+            "gate_p50": float(torch.quantile(state_utility_gate, 0.50)),
+            "gate_p95": float(torch.quantile(state_utility_gate, 0.95)),
+            "selected_rate": float(state_selected.float().mean()),
+            "helpfulness_auc": _binary_rank_auc(state_utility_gate, state_candidate_helpful),
+            "selected_benefit_rate": (
+                0.0 if state_selected_signed.numel() == 0
+                else float((state_selected_signed > 1e-4).float().mean())
+            ),
+            "selected_harm_rate": (
+                0.0 if state_selected_signed.numel() == 0
+                else float((state_selected_signed < -1e-4).float().mean())
             ),
         }
     state_risk_correlation = None
@@ -723,6 +750,7 @@ def trajectory_traffic_effectiveness_metrics(
             "order_delta_rms": float(state_order_delta.square().mean().sqrt()),
             "state_strength_mean": float(state_strength.mean()),
             "interaction_risk_correlation": state_risk_correlation,
+            "utility_quality": state_utility_quality,
         },
         "grounding_quality": {
             "support_mean": float(rows["traffic_trajectory_support"].mean()),
@@ -848,6 +876,8 @@ def save_epoch_outputs(output_dir: Path, epoch: int, rows: dict[str, Any], metri
         "traffic_trajectory_delta", "traffic_trajectory_control_delta",
         "traffic_trajectory_candidate_delta", "traffic_trajectory_utility_logit",
         "traffic_trajectory_utility_gate",
+        "traffic_trajectory_order_utility_gate",
+        "traffic_trajectory_state_utility_logit", "traffic_trajectory_state_utility_gate",
         "traffic_trajectory_order_delta", "traffic_trajectory_state_delta",
         "traffic_trajectory_state_effective_delta", "traffic_trajectory_state_logit",
         "traffic_trajectory_state_features", "trajectory_state_strength",

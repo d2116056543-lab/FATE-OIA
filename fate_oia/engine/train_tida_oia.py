@@ -520,6 +520,9 @@ def build_runtime(args: Any, evaluation_only: bool = False) -> TIDARuntime:
         traffic_trajectory_state_cap_ratio=float(
             config["model"].get("traffic_trajectory_state_cap_ratio", 1.0)
         ),
+        traffic_trajectory_state_utility_open_prior=float(
+            config["model"].get("traffic_trajectory_state_utility_open_prior", 0.10)
+        ),
     ).to(device)
     batch_size = int(_arg(args, "batch_size", 2))
     workers = int(_arg(args, "num_workers", config["data"]["num_workers"]))
@@ -979,6 +982,9 @@ def train(args: Any) -> None:
                 ),
                 "traffic_trajectory_utility_gate_mean": float(
                     output["traffic_trajectory_utility_gate"].mean().detach().cpu()
+                ),
+                "traffic_trajectory_state_utility_gate_mean": float(
+                    output["traffic_trajectory_state_utility_gate"].mean().detach().cpu()
                 ),
                 "traffic_trajectory_attention_entropy": float(
                     (-(output["trajectory_attention"] * output["trajectory_attention"].clamp_min(1e-8).log())

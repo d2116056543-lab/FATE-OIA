@@ -143,6 +143,7 @@ class TIDAOIAModel(nn.Module):
         traffic_trajectory_state_enabled: bool = True,
         traffic_trajectory_state_strength_scale: float = 8.0,
         traffic_trajectory_state_cap_ratio: float = 1.0,
+        traffic_trajectory_state_utility_open_prior: float = 0.10,
     ) -> None:
         super().__init__()
         self.image_model = image_model
@@ -213,6 +214,7 @@ class TIDAOIAModel(nn.Module):
             state_enabled=traffic_trajectory_state_enabled,
             state_strength_scale=traffic_trajectory_state_strength_scale,
             state_cap_ratio=traffic_trajectory_state_cap_ratio,
+            state_utility_open_prior=traffic_trajectory_state_utility_open_prior,
         )
         if not self.traffic_trajectory_enabled:
             for parameter in self.traffic_trajectory_head.parameters():
@@ -595,6 +597,9 @@ class TIDAOIAModel(nn.Module):
             "trajectory_state_strength": torch.zeros_like(image_action),
             "traffic_trajectory_utility_logit": torch.zeros_like(image_action),
             "traffic_trajectory_utility_gate": torch.zeros_like(image_action),
+            "traffic_trajectory_order_utility_gate": torch.zeros_like(image_action),
+            "traffic_trajectory_state_utility_logit": torch.zeros_like(image_action),
+            "traffic_trajectory_state_utility_gate": torch.zeros_like(image_action),
             "traffic_trajectory_context": image_action.new_zeros(batch, actions, dim),
             "traffic_trajectory_trust": image_action.new_zeros(batch, actions),
             "traffic_trajectory_support": image_action.new_zeros(batch, actions),

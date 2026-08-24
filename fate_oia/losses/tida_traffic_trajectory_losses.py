@@ -126,6 +126,9 @@ def trajectory_utility_calibration_loss(
     utility_logits: torch.Tensor,
     candidate_delta: torch.Tensor,
     target: torch.Tensor,
+    *,
+    state_utility_logits: torch.Tensor | None = None,
+    state_candidate_delta: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Teach an inference-only gate to retain helpful trajectory candidates.
 
@@ -138,4 +141,19 @@ def trajectory_utility_calibration_loss(
     helpful = (sign * candidate_delta.detach() > 0).to(utility_logits.dtype)
     confidence = (candidate_delta.detach().abs() / 0.02).clamp(0.0, 1.0)
     value = F.binary_cross_entropy_with_logits(utility_logits, helpful, reduction="none")
-    return _class_balanced_action_mean(value, 0.25 + 0.75 * confidence, helpful)
+    order_loss = _class_balanced_action_mean(value, 0.25 + 0.75 * confidence, helpful)
+    if state_utility_logits is None and state_candidate_delta is None:
+        return order_loss
+    if state_utility_logits is None or state_candidate_delta is None:
+        raise ValueError("state utility logits and candidate delta must be provided together")
+    if not (state_utility_logits.shape == state_candidate_delta.shape == target.shape):
+        raise ValueError("state utility tensors must have identical [B,A] shapes")
+    state_helpful = (sign * state_candidate_delta.detach() > 0).to(state_utility_logits.dtype)
+    state_confidence = (state_candidate_delta.detach().abs() / 0.005).clamp(0.0, 1.0)
+    state_value = F.binary_cross_entropy_with_logits(
+        state_utility_logits, state_helpful, reduction="none"
+    )
+    state_loss = _class_balanced_action_mean(
+        state_value, 0.25 + 0.75 * state_confidence, state_helpful
+    )
+    return 0.5 * (order_loss + state_loss)

@@ -256,3 +256,23 @@ def test_motion_state_channel_can_be_disabled_for_exact_branch_ablation():
     torch.testing.assert_close(
         out["traffic_trajectory_candidate_delta"], out["traffic_trajectory_order_delta"]
     )
+
+
+def test_motion_state_uses_an_independent_conservatively_initialized_utility_gate():
+    args = _inputs(batch=2, tracks=3, frames=5)
+    head = TIDATrafficTrajectoryHead(dim=16, num_actions=4, num_heads=4)
+    with torch.no_grad():
+        head.output.weight.fill_(0.05)
+        head.state_output.weight.fill_(0.05)
+    out = head(*args, base_action_logits=torch.zeros(2, 4))
+    assert torch.all(out["traffic_trajectory_order_utility_gate"] > 0.99)
+    assert torch.all(out["traffic_trajectory_state_utility_gate"] < 0.15)
+    expected = (
+        out["traffic_trajectory_order_utility_gate"] * out["traffic_trajectory_order_delta"]
+        + out["traffic_trajectory_state_utility_gate"] * out["traffic_trajectory_state_delta"]
+    ).clamp(-head.cap, head.cap)
+    torch.testing.assert_close(out["traffic_trajectory_delta"], expected)
+    torch.testing.assert_close(
+        out["traffic_trajectory_state_effective_delta"],
+        out["traffic_trajectory_state_utility_gate"] * out["traffic_trajectory_state_delta"],
+    )
