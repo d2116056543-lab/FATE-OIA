@@ -74,6 +74,7 @@ def collect_tida_outputs(
         "image_action", "semantic_action", "geometric_action", "traffic_action", "trajectory_action",
         "semantic_trajectory_action", "video_action_base", "video_action",
         "image_reason", "semantic_reason", "geometric_reason", "video_reason",
+        "pre_relational_action", "pre_relational_reason",
         "prefix_action", "prefix_reason", "action_target", "reason_target",
     )}
     diagnostics = {key: [] for key in (
@@ -111,7 +112,66 @@ def collect_tida_outputs(
         "trajectory_cycle_confidence", "trajectory_common_displacement",
         "trajectory_exclusive_displacement", "trajectory_xy",
         "trajectory_local_candidate_coverage", "trajectory_interaction_risk",
+        "relational_action_delta", "relational_reason_delta",
+        "relational_action_selected_deleted_delta", "relational_action_random_deleted_delta",
+        "relational_reason_selected_deleted_delta", "relational_reason_random_deleted_delta",
+        "relational_action_support", "relational_reason_support",
+        "relational_action_attention", "relational_reason_attention",
+        "relational_action_pair_attention", "relational_reason_pair_attention",
+        "relational_interaction_risk", "relational_motion_features",
+        "semantic_trajectory_xy", "relational_selected_track", "relational_random_track",
+        "relational_action_selected_track", "relational_action_random_track",
+        "relational_reason_selected_track", "relational_reason_random_track",
+        "terminal_semantic_predicate_ids",
     )}
+    if getattr(model, "object_intent_enabled", False):
+        store.update({
+            "pre_object_intent_action": [],
+            "pre_object_intent_reason": [],
+        })
+        diagnostics.update({key: [] for key in (
+            "object_intent_action_delta", "object_intent_reason_delta",
+            "object_intent_action_candidate", "object_intent_reason_candidate",
+            "object_intent_action_unary_candidate", "object_intent_reason_unary_candidate",
+            "object_intent_action_pair_candidate", "object_intent_reason_pair_candidate",
+            "object_intent_action_pair_attention", "object_intent_reason_pair_attention",
+            "object_intent_action_pair_support", "object_intent_reason_pair_support",
+            "object_intent_action_selected_pair", "object_intent_action_control_pair",
+            "object_intent_reason_selected_pair", "object_intent_reason_control_pair",
+            "object_intent_action_selected_pair_deleted_candidate",
+            "object_intent_action_control_pair_deleted_candidate",
+            "object_intent_reason_selected_pair_deleted_candidate",
+            "object_intent_reason_control_pair_deleted_candidate",
+            "object_intent_pair_min_future_distance",
+            "object_intent_pair_distance_reduction",
+            "object_intent_action_deploy_gate", "object_intent_reason_deploy_gate",
+            "object_intent_action_deploy_scale", "object_intent_reason_deploy_scale",
+            "object_intent_action_utility_cutoff", "object_intent_reason_utility_cutoff",
+            "object_intent_action_utility_logit", "object_intent_reason_utility_logit",
+            "object_intent_action_utility_gate", "object_intent_reason_utility_gate",
+            "object_intent_action_utility_selected", "object_intent_reason_utility_selected",
+            "object_intent_action_selected_deleted_delta",
+            "object_intent_action_control_deleted_delta",
+            "object_intent_reason_selected_deleted_delta",
+            "object_intent_reason_control_deleted_delta",
+            "object_intent_action_support", "object_intent_reason_support",
+            "object_intent_action_attention", "object_intent_reason_attention",
+            "object_intent_action_semantic_attention",
+            "object_intent_action_motion_attention",
+            "object_intent_reason_semantic_attention",
+            "object_intent_reason_motion_attention",
+            "object_intent_action_motion_mix", "object_intent_reason_motion_mix",
+            "object_intent_action_selected_track", "object_intent_action_control_track",
+            "object_intent_reason_selected_track", "object_intent_reason_control_track",
+            "object_intent_interaction_risk", "object_intent_future_xy",
+            "object_intent_future_ego_distance", "object_intent_future_approach_risk",
+            "object_intent_ego_relative_xy",
+            "object_intent_track_support", "object_tracks_xy", "object_tracks_visibility",
+            "object_intent_track_role_probs", "object_intent_track_foreground_probability",
+            "object_intent_action_role_mass", "object_intent_reason_role_mass",
+            "object_intent_track_role_consistency",
+            "object_intent_semantic_temporal_weights",
+        )})
     audit_keys = (
         "terminal_prediction_history", "terminal_prediction_no_history", "terminal_target_evidence",
         "terminal_error_history", "terminal_error_no_history", "innovation_token",
@@ -143,6 +203,8 @@ def collect_tida_outputs(
         output = model(
             batch["target_image"], batch["context_images"], batch["timestamps"], batch["frame_valid_mask"],
             temporal_action_scale=temporal_scale, temporal_reason_scale=temporal_scale,
+            object_tracks_xy=batch.get("object_tracks_xy"),
+            object_tracks_visibility=batch.get("object_tracks_visibility"),
         )
         values = {
             "image_action": output["image_action_logits"],
@@ -157,10 +219,17 @@ def collect_tida_outputs(
             "semantic_reason": output["semantic_video_reason_logits"],
             "geometric_reason": output["geometric_video_reason_logits"],
             "video_reason": output["video_reason_logits"],
+            "pre_relational_action": output["pre_relational_video_action_logits"],
+            "pre_relational_reason": output["pre_relational_video_reason_logits"],
             "prefix_action": output["prefix_video_action_logits"],
             "prefix_reason": output["prefix_video_reason_logits"],
             "action_target": batch["action"], "reason_target": batch["reason"],
         }
+        if "pre_object_intent_video_action_logits" in output:
+            values.update({
+                "pre_object_intent_action": output["pre_object_intent_video_action_logits"],
+                "pre_object_intent_reason": output["pre_object_intent_video_reason_logits"],
+            })
         for key, value in values.items():
             store[key].append(value.detach().float().cpu())
         image_branch = output.get("image_branch", {})
@@ -243,8 +312,168 @@ def collect_tida_outputs(
                 "trajectory_local_candidate_coverage"
             ],
             "trajectory_interaction_risk": output["trajectory_interaction_risk"],
+            "relational_action_delta": output["relational_action_delta_scaled"],
+            "relational_reason_delta": output["relational_reason_delta_scaled"],
+            "relational_action_selected_deleted_delta": output[
+                "relational_action_selected_deleted_delta"
+            ],
+            "relational_action_random_deleted_delta": output[
+                "relational_action_random_deleted_delta"
+            ],
+            "relational_reason_selected_deleted_delta": output[
+                "relational_reason_selected_deleted_delta"
+            ],
+            "relational_reason_random_deleted_delta": output[
+                "relational_reason_random_deleted_delta"
+            ],
+            "relational_action_support": output["relational_action_support"],
+            "relational_reason_support": output["relational_reason_support"],
+            "relational_action_attention": output["relational_action_attention"],
+            "relational_reason_attention": output["relational_reason_attention"],
+            "relational_action_pair_attention": output["relational_action_pair_attention"],
+            "relational_reason_pair_attention": output["relational_reason_pair_attention"],
+            "relational_interaction_risk": output["relational_interaction_risk"],
+            "relational_motion_features": output["relational_motion_features"],
+            "semantic_trajectory_xy": output["semantic_trajectory_xy"],
+            "relational_selected_track": output["relational_selected_track"],
+            "relational_random_track": output["relational_random_track"],
+            "relational_action_selected_track": output[
+                "relational_action_selected_track"
+            ],
+            "relational_action_random_track": output[
+                "relational_action_random_track"
+            ],
+            "relational_reason_selected_track": output[
+                "relational_reason_selected_track"
+            ],
+            "relational_reason_random_track": output[
+                "relational_reason_random_track"
+            ],
+            "terminal_semantic_predicate_ids": output["terminal_semantic_predicate_ids"],
         }.items():
             diagnostics[key].append(value.detach().float().cpu())
+        if "object_intent_action_delta_scaled" in output:
+            for key, value in {
+                "object_intent_action_delta": output["object_intent_action_delta_scaled"],
+                "object_intent_reason_delta": output["object_intent_reason_delta_scaled"],
+                "object_intent_action_candidate": output["object_intent_action_candidate"],
+                "object_intent_reason_candidate": output["object_intent_reason_candidate"],
+                "object_intent_action_unary_candidate": output["object_intent_action_unary_candidate"],
+                "object_intent_reason_unary_candidate": output["object_intent_reason_unary_candidate"],
+                "object_intent_action_pair_candidate": output["object_intent_action_pair_candidate"],
+                "object_intent_reason_pair_candidate": output["object_intent_reason_pair_candidate"],
+                "object_intent_action_pair_attention": output["object_intent_action_pair_attention"],
+                "object_intent_reason_pair_attention": output["object_intent_reason_pair_attention"],
+                "object_intent_action_pair_support": output["object_intent_action_pair_support"],
+                "object_intent_reason_pair_support": output["object_intent_reason_pair_support"],
+                "object_intent_action_selected_pair": output["object_intent_action_selected_pair"],
+                "object_intent_action_control_pair": output["object_intent_action_control_pair"],
+                "object_intent_reason_selected_pair": output["object_intent_reason_selected_pair"],
+                "object_intent_reason_control_pair": output["object_intent_reason_control_pair"],
+                "object_intent_action_selected_pair_deleted_candidate": output[
+                    "object_intent_action_selected_pair_deleted_candidate"
+                ],
+                "object_intent_action_control_pair_deleted_candidate": output[
+                    "object_intent_action_control_pair_deleted_candidate"
+                ],
+                "object_intent_reason_selected_pair_deleted_candidate": output[
+                    "object_intent_reason_selected_pair_deleted_candidate"
+                ],
+                "object_intent_reason_control_pair_deleted_candidate": output[
+                    "object_intent_reason_control_pair_deleted_candidate"
+                ],
+                "object_intent_pair_min_future_distance": output[
+                    "object_intent_pair_min_future_distance"
+                ],
+                "object_intent_pair_distance_reduction": output[
+                    "object_intent_pair_distance_reduction"
+                ],
+                "object_intent_action_deploy_gate": output["object_intent_action_deploy_gate"],
+                "object_intent_reason_deploy_gate": output["object_intent_reason_deploy_gate"],
+                "object_intent_action_deploy_scale": output["object_intent_action_deploy_scale"],
+                "object_intent_reason_deploy_scale": output["object_intent_reason_deploy_scale"],
+                "object_intent_action_utility_cutoff": output["object_intent_action_utility_cutoff"],
+                "object_intent_reason_utility_cutoff": output["object_intent_reason_utility_cutoff"],
+                "object_intent_action_utility_logit": output["object_intent_action_utility_logit"],
+                "object_intent_reason_utility_logit": output["object_intent_reason_utility_logit"],
+                "object_intent_action_utility_gate": output["object_intent_action_utility_gate"],
+                "object_intent_reason_utility_gate": output["object_intent_reason_utility_gate"],
+                "object_intent_action_utility_selected": output["object_intent_action_utility_selected"],
+                "object_intent_reason_utility_selected": output["object_intent_reason_utility_selected"],
+                "object_intent_action_selected_deleted_delta": output[
+                    "object_intent_action_selected_deleted_delta"
+                ],
+                "object_intent_action_control_deleted_delta": output[
+                    "object_intent_action_control_deleted_delta"
+                ],
+                "object_intent_reason_selected_deleted_delta": output[
+                    "object_intent_reason_selected_deleted_delta"
+                ],
+                "object_intent_reason_control_deleted_delta": output[
+                    "object_intent_reason_control_deleted_delta"
+                ],
+                "object_intent_action_support": output["object_intent_action_support"],
+                "object_intent_reason_support": output["object_intent_reason_support"],
+                "object_intent_action_attention": output["object_intent_action_attention"],
+                "object_intent_reason_attention": output["object_intent_reason_attention"],
+                "object_intent_action_semantic_attention": output[
+                    "object_intent_action_semantic_attention"
+                ],
+                "object_intent_action_motion_attention": output[
+                    "object_intent_action_motion_attention"
+                ],
+                "object_intent_reason_semantic_attention": output[
+                    "object_intent_reason_semantic_attention"
+                ],
+                "object_intent_reason_motion_attention": output[
+                    "object_intent_reason_motion_attention"
+                ],
+                "object_intent_action_motion_mix": output[
+                    "object_intent_action_motion_mix"
+                ],
+                "object_intent_reason_motion_mix": output[
+                    "object_intent_reason_motion_mix"
+                ],
+                "object_intent_action_selected_track": output[
+                    "object_intent_action_selected_track"
+                ],
+                "object_intent_action_control_track": output[
+                    "object_intent_action_control_track"
+                ],
+                "object_intent_reason_selected_track": output[
+                    "object_intent_reason_selected_track"
+                ],
+                "object_intent_reason_control_track": output[
+                    "object_intent_reason_control_track"
+                ],
+                "object_intent_interaction_risk": output["object_intent_interaction_risk"],
+                "object_intent_future_xy": output["object_intent_future_xy"],
+                "object_intent_future_ego_distance": output[
+                    "object_intent_future_ego_distance"
+                ],
+                "object_intent_future_approach_risk": output[
+                    "object_intent_future_approach_risk"
+                ],
+                "object_intent_ego_relative_xy": output[
+                    "object_intent_ego_relative_xy"
+                ],
+                "object_intent_track_support": output["object_intent_track_support"],
+                "object_intent_track_role_probs": output["object_intent_track_role_probs"],
+                "object_intent_track_foreground_probability": output[
+                    "object_intent_track_foreground_probability"
+                ],
+                "object_intent_action_role_mass": output["object_intent_action_role_mass"],
+                "object_intent_reason_role_mass": output["object_intent_reason_role_mass"],
+                "object_intent_track_role_consistency": output[
+                    "object_intent_track_role_consistency"
+                ],
+                "object_intent_semantic_temporal_weights": output[
+                    "object_intent_semantic_temporal_weights"
+                ],
+                "object_tracks_xy": output["object_tracks_xy"],
+                "object_tracks_visibility": output["object_tracks_visibility"],
+            }.items():
+                diagnostics[key].append(value.detach().float().cpu())
         if collect_audit_tensors:
             for key in audit_keys:
                 value = output[key].detach().cpu()
@@ -888,6 +1117,8 @@ def collect_intervention_audit(model, loader, device: torch.device, max_samples:
         output = model(
             batch["target_image"], batch["context_images"], batch["timestamps"], batch["frame_valid_mask"],
             temporal_action_scale=1.0, temporal_reason_scale=1.0,
+            object_tracks_xy=batch.get("object_tracks_xy"),
+            object_tracks_visibility=batch.get("object_tracks_visibility"),
         )
         target_encode_calls += 1
         base = output["terminal_error_history"].mean()
@@ -934,6 +1165,22 @@ def save_epoch_outputs(output_dir: Path, epoch: int, rows: dict[str, Any], metri
         atomic_write_json(
             epoch_dir / "traffic_adaptive_boundary_effectiveness.json", boundary_effectiveness
         )
+    relational_effectiveness = metrics.get("online", {}).get(
+        "relational_traffic_effectiveness"
+    )
+    if relational_effectiveness is not None:
+        atomic_write_json(
+            epoch_dir / "relational_traffic_effectiveness.json",
+            relational_effectiveness,
+        )
+    object_intent_effectiveness = metrics.get("online", {}).get(
+        "object_intent_traffic_effectiveness"
+    )
+    if object_intent_effectiveness is not None:
+        atomic_write_json(
+            epoch_dir / "object_intent_traffic_effectiveness.json",
+            object_intent_effectiveness,
+        )
     atomic_write_json(epoch_dir / "file_names_test.json", rows["file_names"])
     if "dynamic_concepts" in rows:
         with (epoch_dir / "dynamic_concepts_test.jsonl").open("w", encoding="utf-8", newline="\n") as handle:
@@ -978,6 +1225,59 @@ def save_epoch_outputs(output_dir: Path, epoch: int, rows: dict[str, Any], metri
         "trajectory_cycle_confidence", "trajectory_common_displacement",
         "trajectory_exclusive_displacement", "trajectory_xy",
         "trajectory_local_candidate_coverage", "trajectory_interaction_risk",
+        "pre_relational_action", "pre_relational_reason",
+        "relational_action_delta", "relational_reason_delta",
+        "relational_action_selected_deleted_delta", "relational_action_random_deleted_delta",
+        "relational_reason_selected_deleted_delta", "relational_reason_random_deleted_delta",
+        "relational_action_support", "relational_reason_support",
+        "relational_action_attention", "relational_reason_attention",
+        "relational_action_pair_attention", "relational_reason_pair_attention",
+        "relational_interaction_risk", "relational_motion_features",
+        "semantic_trajectory_xy", "relational_selected_track", "relational_random_track",
+        "relational_action_selected_track", "relational_action_random_track",
+        "relational_reason_selected_track", "relational_reason_random_track",
+        "terminal_semantic_predicate_ids",
+        "pre_object_intent_action", "pre_object_intent_reason",
+        "object_intent_action_delta", "object_intent_reason_delta",
+            "object_intent_action_candidate", "object_intent_reason_candidate",
+        "object_intent_action_unary_candidate", "object_intent_reason_unary_candidate",
+        "object_intent_action_pair_candidate", "object_intent_reason_pair_candidate",
+        "object_intent_action_pair_attention", "object_intent_reason_pair_attention",
+        "object_intent_action_pair_support", "object_intent_reason_pair_support",
+        "object_intent_action_selected_pair", "object_intent_action_control_pair",
+        "object_intent_reason_selected_pair", "object_intent_reason_control_pair",
+        "object_intent_action_selected_pair_deleted_candidate",
+        "object_intent_action_control_pair_deleted_candidate",
+        "object_intent_reason_selected_pair_deleted_candidate",
+        "object_intent_reason_control_pair_deleted_candidate",
+        "object_intent_pair_min_future_distance", "object_intent_pair_distance_reduction",
+        "object_intent_action_deploy_gate", "object_intent_reason_deploy_gate",
+        "object_intent_action_deploy_scale", "object_intent_reason_deploy_scale",
+        "object_intent_action_utility_cutoff", "object_intent_reason_utility_cutoff",
+        "object_intent_action_utility_logit", "object_intent_reason_utility_logit",
+        "object_intent_action_utility_gate", "object_intent_reason_utility_gate",
+        "object_intent_action_utility_selected", "object_intent_reason_utility_selected",
+        "object_intent_action_selected_deleted_delta",
+        "object_intent_action_control_deleted_delta",
+        "object_intent_reason_selected_deleted_delta",
+        "object_intent_reason_control_deleted_delta",
+        "object_intent_action_support", "object_intent_reason_support",
+        "object_intent_action_attention", "object_intent_reason_attention",
+        "object_intent_action_semantic_attention",
+        "object_intent_action_motion_attention",
+        "object_intent_reason_semantic_attention",
+        "object_intent_reason_motion_attention",
+        "object_intent_action_motion_mix", "object_intent_reason_motion_mix",
+        "object_intent_action_selected_track", "object_intent_action_control_track",
+        "object_intent_reason_selected_track", "object_intent_reason_control_track",
+        "object_intent_interaction_risk", "object_intent_future_xy",
+        "object_intent_future_ego_distance", "object_intent_future_approach_risk",
+        "object_intent_ego_relative_xy",
+        "object_intent_track_support", "object_tracks_xy", "object_tracks_visibility",
+        "object_intent_track_role_probs", "object_intent_track_foreground_probability",
+        "object_intent_action_role_mass", "object_intent_reason_role_mass",
+        "object_intent_track_role_consistency",
+        "object_intent_semantic_temporal_weights",
         "terminal_prediction_history", "terminal_prediction_no_history", "terminal_target_evidence",
         "terminal_error_history", "terminal_error_no_history", "innovation_token",
         "predicate_differential_state", "predicate_velocity_norm", "predicate_acceleration_norm",

@@ -6,6 +6,8 @@ from typing import Any
 import torch
 from torch import nn
 
+from .tida_relational_traffic_flow import select_semantic_traffic_seeds
+
 
 class TIDAContextEncoder(nn.Module):
     """Chunked history encoder that does not register a second DINO owner."""
@@ -46,6 +48,7 @@ class TIDAContextEncoder(nn.Module):
         predicate_tokens: torch.Tensor,
         predicate_identities: torch.Tensor,
         *,
+        predicate_reliability: torch.Tensor | None = None,
         canonicalize_horizontal_flip: bool = False,
     ) -> dict[str, Any]:
         if self.query_reader is None:
@@ -55,6 +58,14 @@ class TIDAContextEncoder(nn.Module):
         batch, frames, channels, height, width = context_images.shape
         tokens, attentions, region_masses, dense_patch_fields = [], [], [], []
         action_patch_tokens, action_patch_xy, action_patch_weights = [], [], []
+        semantic_patch_tokens, semantic_patch_xy, semantic_patch_weights = [], [], []
+        semantic_predicate_ids = []
+        if predicate_reliability is None:
+            predicate_reliability = predicate_tokens.new_ones(
+                batch, predicate_tokens.shape[1]
+            )
+        if predicate_reliability.shape != predicate_tokens.shape[:2]:
+            raise ValueError("predicate_reliability must be [B,P]")
         for start in range(0, frames, self.context_chunk_size):
             stop = min(start + self.context_chunk_size, frames)
             images = context_images[:, start:stop].reshape(-1, channels, height, width)
@@ -86,6 +97,28 @@ class TIDAContextEncoder(nn.Module):
             action_patch_tokens.append(selected["tokens"].reshape(batch, repeats, action_nodes.shape[1], topk, -1))
             action_patch_xy.append(selected["xy"].reshape(batch, repeats, action_nodes.shape[1], topk, 2))
             action_patch_weights.append(selected["weights"].reshape(batch, repeats, action_nodes.shape[1], topk))
+            semantic = select_semantic_traffic_seeds(
+                field["patch_tokens_last"],
+                read["query_attention"][:, action_nodes.shape[1] :],
+                predicate_reliability[:, None].expand(-1, repeats, -1).reshape(
+                    -1, predicate_tokens.shape[1]
+                ),
+                grid_hw=field["grid_hw"],
+                topk=self.motion_topk,
+            )
+            semantic_topk = semantic["tokens"].shape[2]
+            semantic_patch_tokens.append(
+                semantic["tokens"].reshape(batch, repeats, 1, semantic_topk, -1)
+            )
+            semantic_patch_xy.append(
+                semantic["xy"].reshape(batch, repeats, 1, semantic_topk, 2)
+            )
+            semantic_patch_weights.append(
+                semantic["weights"].reshape(batch, repeats, 1, semantic_topk)
+            )
+            semantic_predicate_ids.append(
+                semantic["predicate_ids"].reshape(batch, repeats, semantic_topk)
+            )
         return {
             "history_query_tokens": torch.cat(tokens, dim=1),
             "history_query_attention": torch.cat(attentions, dim=1),
@@ -93,6 +126,10 @@ class TIDAContextEncoder(nn.Module):
             "history_action_patch_tokens": torch.cat(action_patch_tokens, dim=1),
             "history_action_patch_xy": torch.cat(action_patch_xy, dim=1),
             "history_action_patch_weight": torch.cat(action_patch_weights, dim=1),
+            "history_semantic_patch_tokens": torch.cat(semantic_patch_tokens, dim=1),
+            "history_semantic_patch_xy": torch.cat(semantic_patch_xy, dim=1),
+            "history_semantic_patch_weight": torch.cat(semantic_patch_weights, dim=1),
+            "history_semantic_predicate_ids": torch.cat(semantic_predicate_ids, dim=1),
             "history_patch_tokens_last": torch.cat(dense_patch_fields, dim=1),
             "history_grid_hw": (height // self.dino_extractor.patch_size, width // self.dino_extractor.patch_size),
         }

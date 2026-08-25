@@ -51,6 +51,14 @@ from fate_oia.utils.tida_contracts import (
     validate_training_protocol,
 )
 from fate_oia.utils.tida_stateful_sampler import TIDAStatefulRandomSampler
+from fate_oia.utils.tida_relational_traffic_metrics import relational_traffic_metrics
+from fate_oia.utils.tida_object_intent_metrics import (
+    apply_object_intent_gates_to_rows,
+    apply_object_intent_utility_policy_to_rows,
+    fit_object_intent_gates_from_rows,
+    fit_object_intent_utility_policy_oof,
+    object_intent_traffic_metrics,
+)
 from fate_oia.utils.vetra_stage_contracts import sha256_file
 
 
@@ -261,6 +269,10 @@ def reason_firewall_gradient_audit(
         "reason_flow_credit", "reason_flow_no_harm", "reason_positive_no_harm",
         "reason_utility_calibration",
         "geometric_reason_aux", "geometric_reason_rank", "geometric_reason_prefix", "geometric_reason_delta",
+        "relational_reason_aux", "relational_reason_rank", "relational_reason_deletion",
+        "object_intent_reason_aux", "object_intent_reason_rank",
+        "object_intent_reason_deletion", "object_intent_reason_pair_deletion",
+        "object_intent_reason_no_harm", "object_intent_reason_utility",
     )
     action_names = (
         "action_asl", "action_smooth_ap", "action_base_protect", "action_delta",
@@ -269,6 +281,11 @@ def reason_firewall_gradient_audit(
         "traffic_action_aux", "traffic_action_rank", "traffic_action_delta",
         "trajectory_action_boundary", "trajectory_action_rank", "trajectory_selected_control",
         "trajectory_utility_calibration", "trajectory_delta",
+        "relational_action_aux", "relational_action_rank", "relational_action_deletion",
+        "object_intent_action_aux", "object_intent_action_rank",
+        "object_intent_action_smooth_ap", "object_intent_action_deletion",
+        "object_intent_action_pair_deletion", "object_intent_action_no_harm",
+        "object_intent_action_utility",
     )
     reason_loss = sum(
         registry.rows[name].weight * registry.rows[name].value for name in reason_names if name in registry.rows
@@ -277,14 +294,34 @@ def reason_firewall_gradient_audit(
         registry.rows[name].weight * registry.rows[name].value for name in action_names if name in registry.rows
     )
     trajectory_head = getattr(model, "traffic_trajectory_head", None)
+    relational = getattr(model, "relational_traffic", None)
+    object_intent = getattr(model, "object_intent", None)
+
+    def parameters(module) -> list[torch.nn.Parameter]:
+        return [] if module is None else list(module.parameters())
+
     action_parameters = [parameter for parameter in (
         list(model.action_reader.parameters())
         + list(model.geometric_heads.action_parameters())
         + list(model.traffic_action.parameters())
         + ([] if trajectory_head is None else list(trajectory_head.parameters()))
+        + ([] if relational is None else parameters(relational.action_encoder))
+        + ([] if relational is None else parameters(relational.action_output))
+        + ([] if object_intent is None else parameters(object_intent.action_encoder))
+        + ([] if object_intent is None else parameters(object_intent.action_output))
+        + ([] if object_intent is None else parameters(object_intent.action_pair_encoder))
+        + ([] if object_intent is None else parameters(object_intent.action_pair_output))
+        + ([] if object_intent is None else parameters(object_intent.action_utility))
     ) if parameter.requires_grad]
     reason_parameters = [parameter for parameter in (
         list(model.reason_reader.parameters()) + list(model.geometric_heads.reason_parameters())
+        + ([] if relational is None else parameters(relational.reason_encoder))
+        + ([] if relational is None else parameters(relational.reason_output))
+        + ([] if object_intent is None else parameters(object_intent.reason_encoder))
+        + ([] if object_intent is None else parameters(object_intent.reason_output))
+        + ([] if object_intent is None else parameters(object_intent.reason_pair_encoder))
+        + ([] if object_intent is None else parameters(object_intent.reason_pair_output))
+        + ([] if object_intent is None else parameters(object_intent.reason_utility))
     ) if parameter.requires_grad]
     reason_to_action = torch.autograd.grad(
         reason_loss, action_parameters, retain_graph=True, allow_unused=True
@@ -415,7 +452,7 @@ def _worker_init(_worker_id: int) -> None:
 
 def make_loader(
     dataset, batch_size: int, shuffle: bool, workers: int, config: dict[str, Any],
-    generator=None, sampler=None,
+    generator=None, sampler=None, partition: str = "train_core",
 ) -> DataLoader:
     data = config["data"]
     kwargs: dict[str, Any] = {
@@ -424,7 +461,13 @@ def make_loader(
         "shuffle": bool(shuffle) if sampler is None else False,
         "num_workers": int(workers),
         "pin_memory": bool(data["pin_memory"]),
-        "persistent_workers": bool(data["persistent_workers"]) and workers > 0,
+        # Evaluation traverses several splits serially. Keeping each worker pool
+        # alive multiplies decoded-frame memory without improving reuse.
+        "persistent_workers": (
+            bool(data["persistent_workers"])
+            and workers > 0
+            and partition == "train_core"
+        ),
         "collate_fn": tida_video_collate,
         "worker_init_fn": _worker_init,
         "generator": generator,
@@ -434,6 +477,12 @@ def make_loader(
     if workers > 0:
         kwargs["prefetch_factor"] = int(data["prefetch_factor"])
     return DataLoader(**kwargs)
+
+
+def _partition_sample_limit(
+    partition: str, train_limit: int | None, eval_limit: int | None,
+) -> int | None:
+    return train_limit if partition == "train_core" else eval_limit
 
 
 def _checkpoint_scales(checkpoint: dict[str, Any], image_config: dict[str, Any]) -> tuple[float, float]:
@@ -477,6 +526,39 @@ def checkpoint_trainable_state(payload: dict[str, Any], view: str) -> dict[str, 
     if state_key not in payload:
         raise RuntimeError(f"checkpoint does not contain requested {view} state")
     return payload[state_key]
+
+
+@torch.no_grad()
+def load_compatible_trainable_state(
+    model: torch.nn.Module, state: dict[str, torch.Tensor]
+) -> dict[str, list[str]]:
+    """Migrate an older object route while preserving newly added role columns."""
+    trainable = {
+        name: parameter for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+    report = {"exact": [], "prefix_migrated": [], "new": [], "unexpected": []}
+    for name, value in state.items():
+        if name not in trainable:
+            report["unexpected"].append(name)
+            continue
+        target = trainable[name]
+        if target.shape == value.shape:
+            target.copy_(value.to(target))
+            report["exact"].append(name)
+        elif (
+            name.endswith(".motion.0.weight") and target.ndim == value.ndim == 2
+            and target.shape[0] == value.shape[0] and target.shape[1] > value.shape[1]
+        ):
+            target[:, : value.shape[1]].copy_(value.to(target))
+            report["prefix_migrated"].append(name)
+        else:
+            raise RuntimeError(
+                f"unsupported checkpoint migration for {name}: {tuple(value.shape)} -> {tuple(target.shape)}"
+            )
+    loaded = set(report["exact"]) | set(report["prefix_migrated"])
+    report["new"] = sorted(name for name in trainable if name not in loaded)
+    return report
 
 
 def build_runtime(args: Any, evaluation_only: bool = False) -> TIDARuntime:
@@ -524,26 +606,85 @@ def build_runtime(args: Any, evaluation_only: bool = False) -> TIDARuntime:
         traffic_trajectory_state_utility_open_prior=float(
             config["model"].get("traffic_trajectory_state_utility_open_prior", 0.10)
         ),
+        relational_traffic_enabled=bool(
+            config["model"].get("relational_traffic_enabled", False)
+        ),
+        relational_traffic_action_cap=float(
+            config["model"].get("relational_traffic_action_cap", 0.12)
+        ),
+        relational_traffic_reason_cap=float(
+            config["model"].get("relational_traffic_reason_cap", 0.10)
+        ),
+        relational_traffic_reason_indices=tuple(
+            int(value) for value in config["model"].get(
+                "relational_traffic_reason_indices", range(int(config["model"]["num_reasons"]))
+            )
+        ),
+        relational_traffic_heads=int(
+            config["model"].get("relational_traffic_heads", 4)
+        ),
         traffic_adaptive_boundary_enabled=bool(
             config["model"].get("traffic_adaptive_boundary_enabled", False)
         ),
         traffic_adaptive_boundary_cap=float(
             config["model"].get("traffic_adaptive_boundary_cap", 0.25)
         ),
+        object_intent_enabled=bool(config["model"].get("object_intent_enabled", False)),
+        object_tracker_repository=str(
+            config["model"].get("object_tracker_repository", r"E:\sbw\deps\co-tracker")
+        ),
+        object_tracker_model_name=str(
+            config["model"].get("object_tracker_model_name", "cotracker3_offline")
+        ),
+        object_tracker_grid_size=int(config["model"].get("object_tracker_grid_size", 8)),
+        object_intent_action_cap=float(config["model"].get("object_intent_action_cap", 0.08)),
+        object_intent_reason_cap=float(config["model"].get("object_intent_reason_cap", 0.06)),
+        object_intent_heads=int(config["model"].get("object_intent_heads", 4)),
+        object_intent_reason_indices=tuple(
+            int(value) for value in config["model"].get(
+                "object_intent_reason_indices", range(int(config["model"]["num_reasons"]))
+            )
+        ),
+        object_intent_role_checkpoint=config["model"].get("object_intent_role_checkpoint"),
     ).to(device)
     batch_size = int(_arg(args, "batch_size", 2))
     workers = int(_arg(args, "num_workers", config["data"]["num_workers"]))
     max_samples = _arg(args, "max_samples", None)
+    max_eval_samples = _arg(args, "max_eval_samples", None)
+    max_calib_samples = _arg(args, "max_calib_samples", max_eval_samples)
+    max_test_samples = _arg(args, "max_test_samples", max_eval_samples)
+    object_track_store = _arg(args, "object_track_store", None)
+    frame_store_root = _arg(args, "frame_store_root", None)
     datasets = {
         partition: BDDOIAVideoDataset(
             clip_manifest,
             partition,
             training=partition == "train_core" and not evaluation_only,
             seed=20260821,
-            max_samples=max_samples,
+            max_samples=(
+                max_samples if partition == "train_core" else
+                max_calib_samples if partition == "train_calib" else
+                max_test_samples if partition == "test" else max_eval_samples
+            ),
+            object_track_store_path=object_track_store,
+            frame_store_root=frame_store_root,
         )
         for partition in ("train_core", "train_calib", "train_audit", "test")
     }
+    expanded_manifest_value = config["data"].get("expanded_test_manifest_path")
+    if expanded_manifest_value:
+        expanded_manifest = Path(expanded_manifest_value)
+        if not expanded_manifest.is_file():
+            raise FileNotFoundError(f"expanded test manifest not found: {expanded_manifest}")
+        datasets["expanded_test"] = BDDOIAVideoDataset(
+            expanded_manifest,
+            "test",
+            training=False,
+            seed=20260825,
+            max_samples=_partition_sample_limit(
+                "expanded_test", max_samples, max_eval_samples
+            ),
+        )
     train_sampler = TIDAStatefulRandomSampler(datasets["train_core"], seed=20260821)
     loaders = {
         partition: make_loader(
@@ -552,6 +693,7 @@ def build_runtime(args: Any, evaluation_only: bool = False) -> TIDARuntime:
             shuffle=partition == "train_core" and not evaluation_only,
             workers=workers,
             config=config,
+            partition=partition,
             sampler=train_sampler if partition == "train_core" and not evaluation_only else None,
         )
         for partition, dataset in datasets.items()
@@ -560,9 +702,10 @@ def build_runtime(args: Any, evaluation_only: bool = False) -> TIDARuntime:
     if checkpoint:
         payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
         checkpoint_view = _arg(args, "checkpoint_view", "online")
-        trainable = dict(model.named_parameters())
-        for name, value in checkpoint_trainable_state(payload, checkpoint_view).items():
-            trainable[name].data.copy_(value.to(trainable[name]))
+        migration = load_compatible_trainable_state(
+            model, checkpoint_trainable_state(payload, checkpoint_view)
+        )
+        print(json.dumps({"checkpoint_migration": migration}), flush=True)
     return TIDARuntime(config, model, loaders, device, image_checkpoint, clip_manifest, train_sampler)
 
 
@@ -696,29 +839,171 @@ def _restore_training_state(
     return int(runtime.train_sampler.epoch), int(payload["optimizer_update"]), dict(payload["best"])
 
 
-def _view_metrics(test_rows, calib_rows):
-    thresholds = fit_train_calib_thresholds(calib_rows)
-    raw = branch_metrics(test_rows)
-    deploy = {
+def train_locked_deployment_views(test_rows, thresholds):
+    """Keep the established image CalAlign boundary as the primary video deploy policy."""
+    return {
         "image": branch_metrics(test_rows, thresholds["image"])["image"],
-        "video": branch_metrics(test_rows, thresholds["video"])["video"],
+        "video_stable": branch_metrics(test_rows, thresholds["image"])["video"],
+        "video_adaptive": branch_metrics(test_rows, thresholds["video"])["video"],
     }
+
+
+def apply_locked_image_thresholds(
+    fitted: dict[str, torch.Tensor],
+    locked: list[float] | tuple[float, ...],
+    *,
+    source: str,
+) -> dict[str, torch.Tensor]:
+    provenance = str(source).lower()
+    if "train_calib" not in provenance or "test" in provenance or "oracle" in provenance:
+        raise ValueError("locked deployment thresholds must come from train_calib only")
+    value = torch.as_tensor(locked, dtype=fitted["image"].dtype, device=fitted["image"].device)
+    if value.shape != fitted["image"].shape or not ((value > 0) & (value < 1)).all():
+        raise ValueError("locked image thresholds must match all action/reason labels and lie in (0,1)")
+    return {
+        **fitted,
+        "image_fitted_diagnostic": fitted["image"].clone(),
+        "image": value,
+    }
+
+
+def _deployment_thresholds(calib_rows, deployment_config):
+    thresholds = fit_train_calib_thresholds(calib_rows)
+    locked = deployment_config.get("locked_image_thresholds")
+    if locked is not None:
+        thresholds = apply_locked_image_thresholds(
+            thresholds,
+            locked,
+            source=deployment_config.get("locked_image_threshold_source", ""),
+        )
+    return thresholds
+
+
+def _view_metrics(test_rows, calib_rows, deployment_config):
+    thresholds = _deployment_thresholds(calib_rows, deployment_config)
+    raw = branch_metrics(test_rows)
+    deploy = train_locked_deployment_views(test_rows, thresholds)
     return {
         "raw_fixed": raw, "deploy": deploy, "thresholds": thresholds,
-        "dynamic_slices": dynamic_slice_metrics(test_rows, thresholds["video"]),
+        "primary_deploy_policy": "video_stable_image_train_calib_threshold",
+        "dynamic_slices": dynamic_slice_metrics(test_rows, thresholds["image"]),
         "temporal_contribution": temporal_contribution_metrics(test_rows),
         "geometric_branches_raw_fixed": geometric_branch_metrics(test_rows),
         "geometric_effectiveness": geometric_temporal_effectiveness_metrics(test_rows),
         "traffic_action_effectiveness": traffic_action_effectiveness_metrics(test_rows),
         "trajectory_traffic_effectiveness": trajectory_traffic_effectiveness_metrics(
-            test_rows, thresholds["video"]
+            test_rows, thresholds["image"]
         ),
         "traffic_adaptive_boundary_effectiveness": (
             traffic_adaptive_boundary_effectiveness_metrics(
-                test_rows, thresholds["video"]
+                test_rows, thresholds["image"]
             )
         ),
+        "relational_traffic_effectiveness": relational_traffic_metrics(test_rows),
+        "object_intent_traffic_effectiveness": (
+            object_intent_traffic_metrics(test_rows, thresholds["image"])
+            if "object_intent_action_delta" in test_rows else None
+        ),
     }
+
+
+def calibrate_object_intent_deployment(model, calib_rows, deployment_config):
+    if not getattr(model, "object_intent_enabled", False):
+        return calib_rows, None
+    locked_thresholds = deployment_config.get("locked_image_thresholds")
+    if locked_thresholds is None:
+        raise ValueError("object-intent deployment requires locked train-calib thresholds")
+    fit = fit_object_intent_gates_from_rows(
+        calib_rows,
+        min_samples=int(deployment_config.get("object_intent_min_calib_samples", 16)),
+        min_nll_improvement=float(
+            deployment_config.get("object_intent_min_nll_improvement", 1e-4)
+        ),
+        thresholds=torch.as_tensor(locked_thresholds),
+        min_f1_improvement=float(
+            deployment_config.get("object_intent_min_fixed_f1_improvement", 0.0)
+        ),
+    )
+    action_gate = fit["action"]["gate"]
+    reason_gate = fit["reason"]["gate"]
+    utility_available = all(
+        f"object_intent_{branch}_utility_gate" in calib_rows
+        for branch in ("action", "reason")
+    )
+    if utility_available:
+        action_count = calib_rows["action_target"].shape[1]
+        action_policy = fit_object_intent_utility_policy_oof(
+            calib_rows["pre_object_intent_action"],
+            calib_rows["object_intent_action_candidate"],
+            calib_rows["object_intent_action_utility_gate"],
+            calib_rows["action_target"],
+            torch.as_tensor(locked_thresholds)[:action_count],
+            scales=tuple(deployment_config.get(
+                "object_intent_action_utility_scales", [0, 4, 8, 16, 32, 64]
+            )),
+            cutoffs=tuple(deployment_config.get(
+                "object_intent_utility_cutoffs", [0, 0.4, 0.5, 0.6, 0.7, 0.8]
+            )),
+            folds=int(deployment_config.get("object_intent_utility_oof_folds", 5)),
+            min_oof_gain=float(deployment_config.get("object_intent_utility_min_oof_gain", 0.0)),
+            max_selected_rate=float(deployment_config.get("object_intent_utility_max_selected_rate", 1.0)),
+            min_selected_benefit_rate=float(deployment_config.get("object_intent_utility_min_selected_benefit_rate", 0.5)),
+            min_nll_improvement=float(deployment_config.get("object_intent_utility_min_nll_improvement", 0.0)),
+            min_brier_improvement=float(deployment_config.get("object_intent_utility_min_brier_improvement", 0.0)),
+            quantile_coverages=tuple(deployment_config.get("object_intent_utility_quantile_coverages", [])),
+            cap=float(model.object_intent.action_cap),
+        )
+        reason_policy = fit_object_intent_utility_policy_oof(
+            calib_rows["pre_object_intent_reason"],
+            calib_rows["object_intent_reason_candidate"],
+            calib_rows["object_intent_reason_utility_gate"],
+            calib_rows["reason_target"],
+            torch.as_tensor(locked_thresholds)[action_count:],
+            scales=tuple(deployment_config.get(
+                "object_intent_reason_utility_scales", [0, 2, 4, 8, 16, 32]
+            )),
+            cutoffs=tuple(deployment_config.get(
+                "object_intent_utility_cutoffs", [0, 0.4, 0.5, 0.6, 0.7, 0.8]
+            )),
+            folds=int(deployment_config.get("object_intent_utility_oof_folds", 5)),
+            min_oof_gain=float(deployment_config.get("object_intent_utility_min_oof_gain", 0.0)),
+            max_selected_rate=float(deployment_config.get("object_intent_utility_max_selected_rate", 1.0)),
+            min_selected_benefit_rate=float(deployment_config.get("object_intent_utility_min_selected_benefit_rate", 0.5)),
+            min_nll_improvement=float(deployment_config.get("object_intent_utility_min_nll_improvement", 0.0)),
+            min_brier_improvement=float(deployment_config.get("object_intent_utility_min_brier_improvement", 0.0)),
+            quantile_coverages=tuple(deployment_config.get("object_intent_utility_quantile_coverages", [])),
+            cap=float(model.object_intent.reason_cap),
+        )
+        model.object_intent.set_deployment_policy(
+            action_policy["gate"], reason_policy["gate"],
+            action_scale=action_policy["scale"], reason_scale=reason_policy["scale"],
+            action_cutoff=action_policy["cutoff"], reason_cutoff=reason_policy["cutoff"],
+            source="train_calib_oof_utility_policy",
+        )
+        calibrated_rows = apply_object_intent_utility_policy_to_rows(
+            calib_rows, action_policy, reason_policy,
+            action_cap=float(model.object_intent.action_cap),
+            reason_cap=float(model.object_intent.reason_cap),
+        )
+        fit = {"action": {**fit["action"], **action_policy},
+               "reason": {**fit["reason"], **reason_policy}}
+    else:
+        model.object_intent.set_deployment_gates(
+            action_gate, reason_gate, source="train_calib_proper_score"
+        )
+        calibrated_rows = apply_object_intent_gates_to_rows(
+            calib_rows, action_gate.cpu(), reason_gate.cpu()
+        )
+
+    def serialize(value):
+        if torch.is_tensor(value):
+            return value.tolist()
+        return value
+    serializable = {
+        task: {key: serialize(value) for key, value in values.items()}
+        for task, values in fit.items()
+    }
+    return calibrated_rows, serializable
 
 
 def completion_pass(
@@ -736,6 +1021,8 @@ def completion_pass(
 def train(args: Any) -> None:
     runtime = build_runtime(args)
     config, model, device = runtime.config, runtime.model, runtime.device
+    object_track_store = _arg(args, "object_track_store", None)
+    frame_store_root = _arg(args, "frame_store_root", None)
     output_dir = Path(_arg(args, "output_dir")); output_dir.mkdir(parents=True, exist_ok=True)
     epochs = int(_arg(args, "epochs", config["training"]["epochs"]))
     run_kind = _arg(args, "run_kind", "full")
@@ -752,6 +1039,12 @@ def train(args: Any) -> None:
     train_owners = None if not train_owners_arg else {
         value.strip() for value in str(train_owners_arg).split(",") if value.strip()
     }
+    utility_only_owners = {
+        "object_intent_action_utility", "object_intent_reason_utility"
+    }
+    utility_only_training = (
+        train_owners is not None and train_owners <= utility_only_owners
+    )
     optimizer = build_optimizer(model, config, train_owners=train_owners)
     ema = TIDATrainableEMA(model, decay=float(config["training"]["ema_decay"]))
     updates_per_epoch = math.ceil(len(runtime.loaders["train_core"]) / grad_accum)
@@ -791,7 +1084,28 @@ def train(args: Any) -> None:
         "schedule_total_updates": total_updates,
         "schedule_override": schedule_override is not None,
         "train_owners": sorted(train_owners) if train_owners is not None else "all",
+        "utility_only_training": utility_only_training,
+        "counterfactual_reruns_skipped_for_utility_only": utility_only_training,
+        "max_train_samples": _arg(args, "max_samples", None),
+        "max_eval_samples": _arg(args, "max_eval_samples", None),
+        "max_calib_samples": _arg(args, "max_calib_samples", None),
+        "max_test_samples": _arg(args, "max_test_samples", None),
+        "skip_ema_eval": bool(_arg(args, "skip_ema_eval", False)),
+        "skip_expanded_eval": bool(_arg(args, "skip_expanded_eval", False)),
         "checkpoint_view": _arg(args, "checkpoint_view", "online"),
+        "object_track_store": str(Path(object_track_store).resolve()) if object_track_store else None,
+        "object_track_store_sha256": file_sha256(object_track_store) if object_track_store else None,
+        "object_track_store_semantics": (
+            "frozen_cotracker_coordinates_only_no_dino_features_no_logits"
+            if object_track_store else "online_frozen_cotracker"
+        ),
+        "object_intent_role_checkpoint": config["model"].get("object_intent_role_checkpoint"),
+        "object_intent_role_checkpoint_sha256": (
+            file_sha256(config["model"]["object_intent_role_checkpoint"])
+            if config["model"].get("object_intent_role_checkpoint") else None
+        ),
+        "frame_store_root": str(Path(frame_store_root).resolve()) if frame_store_root else None,
+        "frame_store_semantics": "raw_rgb_jpeg_only_no_features" if frame_store_root else "online_video_decode",
     }
     atomic_write_json(output_dir / "run_manifest.json", manifest)
     Path(output_dir / "config_resolved.yaml").write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
@@ -802,7 +1116,9 @@ def train(args: Any) -> None:
     baseline_calib_rows = collect_tida_outputs(
         model, runtime.loaders["train_calib"], device, temporal_scale=0.0
     )
-    baseline_thresholds = fit_train_calib_thresholds(baseline_calib_rows)
+    baseline_thresholds = _deployment_thresholds(
+        baseline_calib_rows, config.get("deployment", {})
+    )
     action_deploy_boundary_logits = torch.logit(
         baseline_thresholds["image"][: model.num_actions].to(device).clamp(1e-5, 1.0 - 1e-5)
     )
@@ -827,6 +1143,7 @@ def train(args: Any) -> None:
     forward_timer = TIDAForwardTimer(model, device)
     frozen_image_hash = module_state_sha256(model.image_model)
     print_interval = int(config["runtime"]["print_every_optimizer_updates"])
+    initial_telemetry = bool(config["runtime"].get("initial_supervision_telemetry", True))
     completed_epochs = start_epoch
     for epoch in range(start_epoch, epochs):
         if runtime.train_sampler.epoch != epoch:
@@ -844,7 +1161,10 @@ def train(args: Any) -> None:
         for micro_step, batch in enumerate(runtime.loaders["train_core"]):
             batch_arrival = time.perf_counter()
             if micro_count == 0:
-                telemetry_window = optimizer_update == 0 or (optimizer_update + 1) % print_interval == 0
+                telemetry_window = (
+                    (initial_telemetry and optimizer_update == 0)
+                    or (optimizer_update + 1) % print_interval == 0
+                )
                 forward_timer.active = telemetry_window
                 forward_timer.reset()
                 telemetry_decode_time = 0.0
@@ -868,8 +1188,13 @@ def train(args: Any) -> None:
                 output = model(
                     batch["target_image"], batch["context_images"], batch["timestamps"], batch["frame_valid_mask"],
                     temporal_action_scale=schedule["temporal_scale"], temporal_reason_scale=schedule["temporal_scale"],
+                    object_tracks_xy=batch.get("object_tracks_xy"),
+                    object_tracks_visibility=batch.get("object_tracks_visibility"),
                 )
-                counterfactual_enabled = micro_count + 1 == grad_accum or micro_step + 1 == epoch_batch_count
+                counterfactual_enabled = (
+                    not utility_only_training
+                    and (micro_count + 1 == grad_accum or micro_step + 1 == epoch_batch_count)
+                )
                 counterfactual_errors, counterfactual_outputs = _counterfactual_outputs(
                     model, output, optimizer_update, schedule["temporal_scale"], enabled=counterfactual_enabled
                 )
@@ -930,6 +1255,16 @@ def train(args: Any) -> None:
             )
             optimizer_update += 1; micro_count = 0
             rank_window_samples = sum(value.shape[0] for value in rank_window.get("action_logits", []))
+            action_sign = 2.0 * batch["action"].float() - 1.0
+            reason_sign = 2.0 * batch["reason"].float() - 1.0
+            relational_action_deletion_gap = action_sign * (
+                output["relational_action_random_deleted_delta"]
+                - output["relational_action_selected_deleted_delta"]
+            )
+            relational_reason_deletion_gap = reason_sign * (
+                output["relational_reason_random_deleted_delta"]
+                - output["relational_reason_selected_deleted_delta"]
+            )
             row = {
                 "epoch": epoch, "micro_step": micro_step, "optimizer_update": optimizer_update,
                 "total_updates": total_updates, "temporal_scale": schedule["temporal_scale"],
@@ -1005,6 +1340,41 @@ def train(args: Any) -> None:
                     (-(output["trajectory_attention"] * output["trajectory_attention"].clamp_min(1e-8).log())
                      .sum(-1).mean()).detach().cpu()
                 ),
+                "relational_action_delta_rms": float(
+                    output["relational_action_delta_scaled"].float().square().mean().sqrt().detach().cpu()
+                ),
+                "relational_reason_delta_rms": float(
+                    output["relational_reason_delta_scaled"].float().square().mean().sqrt().detach().cpu()
+                ),
+                "relational_action_support_mean": float(
+                    output["relational_action_support"].mean().detach().cpu()
+                ),
+                "relational_reason_support_mean": float(
+                    output["relational_reason_support"].mean().detach().cpu()
+                ),
+                "relational_action_attention_entropy": float(
+                    (-(output["relational_action_attention"]
+                       * output["relational_action_attention"].clamp_min(1e-8).log())
+                     .sum(-1).mean()).detach().cpu()
+                ),
+                "relational_reason_attention_entropy": float(
+                    (-(output["relational_reason_attention"]
+                       * output["relational_reason_attention"].clamp_min(1e-8).log())
+                     .sum(-1).mean()).detach().cpu()
+                ),
+                "relational_action_selected_minus_random_gap": float(
+                    relational_action_deletion_gap.mean().detach().cpu()
+                ),
+                "relational_reason_selected_minus_random_gap": float(
+                    relational_reason_deletion_gap.mean().detach().cpu()
+                ),
+                "relational_interaction_risk_mean": float(
+                    output["relational_interaction_risk"].mean().detach().cpu()
+                ),
+                "relational_named_predicate_coverage": float(
+                    output["terminal_semantic_predicate_ids"].unique().numel()
+                    / max(model.num_predicates, 1)
+                ),
                 "action_evidence_confidence_mean": float(output["action_evidence_confidence"].mean().detach().cpu()),
                 "action_effective_trust_mean": float(output["action_effective_trust"].mean().detach().cpu()),
                 "reason_delta_rms": float(output["reason_temporal_delta"].float().square().mean().sqrt().detach().cpu()),
@@ -1014,6 +1384,188 @@ def train(args: Any) -> None:
                 "rank_window_samples": int(rank_window_samples),
                 "gpu_peak_reserved_gib": torch.cuda.max_memory_reserved(device) / 2**30 if device.type == "cuda" else 0.0,
             }
+            if "object_intent_action_delta_scaled" in output:
+                object_action_gap = action_sign * (
+                    output["object_intent_action_control_deleted_delta"]
+                    - output["object_intent_action_selected_deleted_delta"]
+                )
+                object_reason_gap = reason_sign * (
+                    output["object_intent_reason_control_deleted_delta"]
+                    - output["object_intent_reason_selected_deleted_delta"]
+                )
+                object_action_candidate_gap = action_sign * (
+                    output["object_intent_action_control_deleted_candidate"]
+                    - output["object_intent_action_selected_deleted_candidate"]
+                )
+                object_reason_candidate_gap = reason_sign * (
+                    output["object_intent_reason_control_deleted_candidate"]
+                    - output["object_intent_reason_selected_deleted_candidate"]
+                )
+                object_action_pair_gap = action_sign * (
+                    output["object_intent_action_control_pair_deleted_candidate"]
+                    - output["object_intent_action_selected_pair_deleted_candidate"]
+                )
+                object_reason_pair_gap = reason_sign * (
+                    output["object_intent_reason_control_pair_deleted_candidate"]
+                    - output["object_intent_reason_selected_pair_deleted_candidate"]
+                )
+                action_pair_attention = output["object_intent_action_pair_attention"]
+                reason_pair_attention = output["object_intent_reason_pair_attention"]
+                action_utility = output["object_intent_action_utility_gate"]
+                reason_utility = output["object_intent_reason_utility_gate"]
+                action_utility_selected = output[
+                    "object_intent_action_utility_selected"
+                ].bool()
+                reason_utility_selected = output[
+                    "object_intent_reason_utility_selected"
+                ].bool()
+                action_helpful = (
+                    action_sign * output["object_intent_action_candidate"] > 0
+                )
+                reason_helpful = (
+                    reason_sign * output["object_intent_reason_candidate"] > 0
+                )
+
+                def selected_rate(mask: torch.Tensor, selected: torch.Tensor) -> float:
+                    count = selected.sum().clamp_min(1)
+                    return float((mask & selected).sum().float().div(count).detach().cpu())
+
+                row.update({
+                    "object_intent_action_delta_rms": float(
+                        output["object_intent_action_delta_scaled"].float().square().mean().sqrt().detach().cpu()
+                    ),
+                    "object_intent_reason_delta_rms": float(
+                        output["object_intent_reason_delta_scaled"].float().square().mean().sqrt().detach().cpu()
+                    ),
+                    "object_intent_action_candidate_rms": float(
+                        output["object_intent_action_candidate"].float().square().mean().sqrt().detach().cpu()
+                    ),
+                    "object_intent_reason_candidate_rms": float(
+                        output["object_intent_reason_candidate"].float().square().mean().sqrt().detach().cpu()
+                    ),
+                    "object_intent_action_pair_candidate_rms": float(
+                        output["object_intent_action_pair_candidate"].float().square().mean().sqrt().detach().cpu()
+                    ),
+                    "object_intent_reason_pair_candidate_rms": float(
+                        output["object_intent_reason_pair_candidate"].float().square().mean().sqrt().detach().cpu()
+                    ),
+                    "object_intent_action_deploy_gate_rate": float(
+                        output["object_intent_action_deploy_gate"].mean().detach().cpu()
+                    ),
+                    "object_intent_reason_deploy_gate_rate": float(
+                        output["object_intent_reason_deploy_gate"].mean().detach().cpu()
+                    ),
+                    "object_intent_action_utility_mean": float(
+                        action_utility.mean().detach().cpu()
+                    ),
+                    "object_intent_reason_utility_mean": float(
+                        reason_utility.mean().detach().cpu()
+                    ),
+                    "object_intent_action_utility_selected_rate": float(
+                        action_utility_selected.float().mean().detach().cpu()
+                    ),
+                    "object_intent_reason_utility_selected_rate": float(
+                        reason_utility_selected.float().mean().detach().cpu()
+                    ),
+                    "object_intent_action_candidate_helpful_rate": float(
+                        action_helpful.float().mean().detach().cpu()
+                    ),
+                    "object_intent_reason_candidate_helpful_rate": float(
+                        reason_helpful.float().mean().detach().cpu()
+                    ),
+                    "object_intent_action_selected_benefit_rate": selected_rate(
+                        action_helpful, action_utility_selected
+                    ),
+                    "object_intent_action_selected_harm_rate": selected_rate(
+                        ~action_helpful, action_utility_selected
+                    ),
+                    "object_intent_reason_selected_benefit_rate": selected_rate(
+                        reason_helpful, reason_utility_selected
+                    ),
+                    "object_intent_reason_selected_harm_rate": selected_rate(
+                        ~reason_helpful, reason_utility_selected
+                    ),
+                    "object_intent_action_support_mean": float(
+                        output["object_intent_action_support"].mean().detach().cpu()
+                    ),
+                    "object_intent_reason_support_mean": float(
+                        output["object_intent_reason_support"].mean().detach().cpu()
+                    ),
+                    "object_intent_action_attention_entropy": float(
+                        (-(output["object_intent_action_attention"]
+                           * output["object_intent_action_attention"].clamp_min(1e-8).log())
+                         .sum(-1).mean()).detach().cpu()
+                    ),
+                    "object_intent_reason_attention_entropy": float(
+                        (-(output["object_intent_reason_attention"]
+                           * output["object_intent_reason_attention"].clamp_min(1e-8).log())
+                        .sum(-1).mean()).detach().cpu()
+                    ),
+                    "object_intent_action_motion_mix_mean": float(
+                        output["object_intent_action_motion_mix"].mean().detach().cpu()
+                    ),
+                    "object_intent_reason_motion_mix_mean": float(
+                        output["object_intent_reason_motion_mix"].mean().detach().cpu()
+                    ),
+                    "object_intent_action_motion_semantic_route_disagreement": float(
+                        (
+                            output["object_intent_action_motion_attention"].argmax(-1)
+                            != output["object_intent_action_semantic_attention"].argmax(-1)
+                        ).float().mean().detach().cpu()
+                    ),
+                    "object_intent_reason_motion_semantic_route_disagreement": float(
+                        (
+                            output["object_intent_reason_motion_attention"].argmax(-1)
+                            != output["object_intent_reason_semantic_attention"].argmax(-1)
+                        ).float().mean().detach().cpu()
+                    ),
+                    "object_intent_action_selected_minus_control_gap": float(
+                        object_action_gap.mean().detach().cpu()
+                    ),
+                    "object_intent_reason_selected_minus_control_gap": float(
+                        object_reason_gap.mean().detach().cpu()
+                    ),
+                    "object_intent_action_candidate_selected_minus_control_gap": float(
+                        object_action_candidate_gap.mean().detach().cpu()
+                    ),
+                    "object_intent_reason_candidate_selected_minus_control_gap": float(
+                        object_reason_candidate_gap.mean().detach().cpu()
+                    ),
+                    "object_intent_action_pair_selected_minus_control_gap": float(
+                        object_action_pair_gap.mean().detach().cpu()
+                    ),
+                    "object_intent_reason_pair_selected_minus_control_gap": float(
+                        object_reason_pair_gap.mean().detach().cpu()
+                    ),
+                    "object_intent_action_pair_attention_entropy": float(
+                        (-(action_pair_attention * action_pair_attention.clamp_min(1e-8).log())
+                         .sum((-1, -2)).mean()).detach().cpu()
+                    ),
+                    "object_intent_reason_pair_attention_entropy": float(
+                        (-(reason_pair_attention * reason_pair_attention.clamp_min(1e-8).log())
+                         .sum((-1, -2)).mean()).detach().cpu()
+                    ),
+                    "object_intent_pair_min_future_distance_mean": float(
+                        output["object_intent_pair_min_future_distance"].mean().detach().cpu()
+                    ),
+                    "object_intent_pair_distance_reduction_mean": float(
+                        output["object_intent_pair_distance_reduction"].mean().detach().cpu()
+                    ),
+                    "object_intent_interaction_risk_mean": float(
+                        output["object_intent_interaction_risk"].mean().detach().cpu()
+                    ),
+                    "object_intent_track_role_consistency_mean": float(
+                        output["object_intent_track_role_consistency"].mean().detach().cpu()
+                    ),
+                    "object_intent_effective_semantic_frames_mean": float(
+                        (-(output["object_intent_semantic_temporal_weights"]
+                           * output["object_intent_semantic_temporal_weights"].clamp_min(1e-8).log())
+                         .sum(1)).exp().mean().detach().cpu()
+                    ),
+                    "object_tracks_visibility_rate": float(
+                        output["object_tracks_visibility"].float().mean().detach().cpu()
+                    ),
+                })
             if telemetry_window:
                 stage_times = {
                     key: value for key, value in forward_timer.totals.items()
@@ -1057,24 +1609,97 @@ def train(args: Any) -> None:
         epoch_exhausted = runtime.train_sampler.epoch_complete
         if epoch_exhausted:
             runtime.train_sampler.advance_epoch()
+        eval_every_epochs = max(1, int(_arg(args, "eval_every_epochs", 1)))
+        reached_update_limit = (
+            max_optimizer_updates is not None
+            and optimizer_update >= int(max_optimizer_updates)
+        )
+        should_evaluate = (
+            (epoch + 1) % eval_every_epochs == 0
+            or epoch + 1 == epochs
+            or reached_update_limit
+        )
+        if not should_evaluate:
+            payload = _checkpoint_payload(
+                runtime, optimizer, ema, epoch, optimizer_update, best,
+                runtime.train_sampler, total_updates=total_updates,
+                git_head=git_head, git_tree=git_tree, config_path=config_path,
+                predicate_role_path=predicate_role_path,
+            )
+            save_checkpoint_atomic(output_dir / f"checkpoint_epoch_{epoch:03d}.pth", payload)
+            save_checkpoint_atomic(output_dir / "checkpoint_latest.pth", payload)
+            print(json.dumps({
+                "event": "tida_epoch_train_only",
+                "epoch": epoch,
+                "optimizer_update": optimizer_update,
+                "evaluation_deferred_until_epoch": min(
+                    epochs - 1, epoch + eval_every_epochs
+                ),
+            }), flush=True)
+            model.train()
+            completed_epochs = epoch + 1 if epoch_exhausted else epoch
+            continue
         model.eval()
         online_calib = collect_tida_outputs(model, runtime.loaders["train_calib"], device)
+        online_calib, online_object_gate_fit = calibrate_object_intent_deployment(
+            model, online_calib, config.get("deployment", {})
+        )
         online_test = collect_tida_outputs(
             model, runtime.loaders["test"], device,
             collect_mechanism=True, mechanism_samples=int(config["runtime"]["fixed_test_audit_samples"]),
             collect_audit_tensors=True,
         )
-        online = _view_metrics(online_test, online_calib)
+        online = _view_metrics(online_test, online_calib, config.get("deployment", {}))
         mechanism = online_test.pop("_mechanism")
-        with ema.average_parameters(model):
-            ema_calib = collect_tida_outputs(model, runtime.loaders["train_calib"], device)
-            ema_test = collect_tida_outputs(model, runtime.loaders["test"], device)
-            ema_metrics = _view_metrics(ema_test, ema_calib)
-        metrics = {"epoch": epoch, "online": online, "ema": ema_metrics, "mechanism": mechanism, "epoch_seconds": time.perf_counter() - epoch_start}
+        expanded_metrics = None
+        if (
+            "expanded_test" in runtime.loaders
+            and not bool(_arg(args, "skip_expanded_eval", False))
+        ):
+            expanded_rows = collect_tida_outputs(
+                model, runtime.loaders["expanded_test"], device
+            )
+            expanded_metrics = _view_metrics(
+                expanded_rows, online_calib, config.get("deployment", {})
+            )
+        if bool(_arg(args, "skip_ema_eval", False)):
+            ema_metrics = online
+            ema_object_gate_fit = online_object_gate_fit
+        else:
+            online_action_gate = model.object_intent.action_deploy_gate.clone()
+            online_reason_gate = model.object_intent.reason_deploy_gate.clone()
+            with ema.average_parameters(model):
+                ema_calib = collect_tida_outputs(
+                    model, runtime.loaders["train_calib"], device
+                )
+                ema_calib, ema_object_gate_fit = calibrate_object_intent_deployment(
+                    model, ema_calib, config.get("deployment", {})
+                )
+                ema_test = collect_tida_outputs(
+                    model, runtime.loaders["test"], device
+                )
+                ema_metrics = _view_metrics(
+                    ema_test, ema_calib, config.get("deployment", {})
+                )
+            model.object_intent.set_deployment_gates(
+                online_action_gate, online_reason_gate, source="train_calib_online_restore"
+            )
+        metrics = {
+            "epoch": epoch,
+            "online": online,
+            "ema": ema_metrics,
+            "expanded_test_online": expanded_metrics,
+            "mechanism": mechanism,
+            "object_intent_deployment_gate_fit": {
+                "online": online_object_gate_fit,
+                "ema": ema_object_gate_fit,
+            },
+            "epoch_seconds": time.perf_counter() - epoch_start,
+        }
         append_jsonl(output_dir / "metrics_summary.jsonl", metrics)
         selected_name, selected = max(
             (("online", online), ("ema", ema_metrics)),
-            key=lambda pair: float(pair[1]["deploy"]["video"]["joint"]),
+            key=lambda pair: float(pair[1]["deploy"]["video_stable"]["joint"]),
         )
         payload = _checkpoint_payload(
             runtime, optimizer, ema, epoch, optimizer_update, best, runtime.train_sampler,
@@ -1084,10 +1709,10 @@ def train(args: Any) -> None:
         payload.update({"metrics": metrics, "selected_view": selected_name})
         checkpoint_epoch = output_dir / f"checkpoint_epoch_{epoch:03d}.pth"
         criteria = {
-            "joint": float(selected["deploy"]["video"]["joint"]),
-            "action_mf1": float(selected["deploy"]["video"]["Act_mF1"]),
+            "joint": float(selected["deploy"]["video_stable"]["joint"]),
+            "action_mf1": float(selected["deploy"]["video_stable"]["Act_mF1"]),
             "action_map": float(selected["raw_fixed"]["video"]["Act_mAP"]),
-            "exp_mf1": float(selected["deploy"]["video"]["Exp_mF1"]),
+            "exp_mf1": float(selected["deploy"]["video_stable"]["Exp_mF1"]),
             "exp_map": float(selected["raw_fixed"]["video"]["Exp_mAP"]),
         }
         checkpoint_names = {
@@ -1143,9 +1768,17 @@ def main() -> None:
     parser.add_argument("--checkpoint-view", choices=("online", "ema"), default="online")
     parser.add_argument("--run-kind", choices=("smoke", "profile", "full"), default="full")
     parser.add_argument("--max-samples", type=int)
+    parser.add_argument("--max-eval-samples", type=int)
+    parser.add_argument("--max-calib-samples", type=int)
+    parser.add_argument("--max-test-samples", type=int)
+    parser.add_argument("--skip-ema-eval", action="store_true")
+    parser.add_argument("--skip-expanded-eval", action="store_true")
+    parser.add_argument("--eval-every-epochs", type=int, default=1)
     parser.add_argument("--max-optimizer-updates", type=int)
     parser.add_argument("--schedule-total-updates", type=int)
     parser.add_argument("--train-owners", help="comma-separated optimizer owners; other owner LRs are zero")
+    parser.add_argument("--object-track-store", help="audited frozen-CoTracker coordinate observations")
+    parser.add_argument("--frame-store-root", help="fixed sampled raw RGB JPEG frames; never model features")
     args = parser.parse_args()
     train(args)
 

@@ -14,11 +14,16 @@ def test_context_encoder_preserves_sparse_action_grounded_patch_evidence():
         torch.randn(1, 4, 8),
         torch.randn(1, 2, 8),
         torch.randn(2, 8),
+        predicate_reliability=torch.tensor([[0.8, 0.2]]),
     )
     assert result["history_action_patch_tokens"].shape == (1, 2, 4, 6, 8)
     assert result["history_action_patch_xy"].shape == (1, 2, 4, 6, 2)
     assert result["history_action_patch_weight"].shape == (1, 2, 4, 6)
     assert result["history_patch_tokens_last"].shape == (1, 2, 24 * 43, 8)
     assert result["history_grid_hw"] == (24, 43)
+    assert result["history_semantic_patch_tokens"].shape == (1, 2, 1, 6, 8)
+    assert result["history_semantic_patch_xy"].shape == (1, 2, 1, 6, 2)
+    assert result["history_semantic_patch_weight"].shape == (1, 2, 1, 6)
+    assert result["history_semantic_predicate_ids"].shape == (1, 2, 6)
     torch.testing.assert_close(result["history_action_patch_weight"].sum(-1), torch.ones(1, 2, 4))
     assert torch.all((result["history_action_patch_xy"] >= -1) & (result["history_action_patch_xy"] <= 1))

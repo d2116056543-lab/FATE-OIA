@@ -1,0 +1,241 @@
+experiment:
+  name: tida_track_aligned_object_semantics_v8_9_10k
+  direct_video: true
+  eval_splits: [test]
+  diagnostic_eval_splits: [expanded_test]
+  best_selection_split: test
+  best_selection_metric: video_stable_deploy_joint
+  internal_test_selected: true
+  publication_eligible: false
+data:
+  manifest_path: 'E:\sbw\FATE_Drive\fate_oia_tida_relational_flow_v8_10k_worktree\artifacts\tida_10k_v8\tida_10k_primary_manifest.jsonl'
+  expanded_test_manifest_path: 'E:\sbw\FATE_Drive\fate_oia_tida_relational_flow_v8_10k_worktree\artifacts\tida_10k_v8\tida_10k_expanded_test_manifest.jsonl'
+  partition_seed: 20260825
+  train_core_count: 5584
+  train_calib_count: 779
+  train_audit_count: 1024
+  test_count: 885
+  expanded_test_count: 1328
+  accepted_source_count: 9513
+  rejected_source_count: 487
+  target_height: 360
+  target_width: 640
+  context_height: 192
+  context_width: 344
+  history_frames: 14
+  clip_seconds: 5.0
+  num_workers: 8
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 4
+backbone:
+  arch: vit_small
+  patch_size: 8
+  selected_layers: [3, 7, 11]
+  pretrained_weights: ckp/reference/dino_deitsmall8_pretrain.pth
+  freeze_backbone: true
+  no_grad_backbone: true
+  feature_cache_enabled: false
+  token_compression: none
+image_base:
+  checkpoint: 'F:\FATE_Drive_runs\vetra_replay_from_scratch_v2_full_20260819_retry1\checkpoint_stage_b_continued.pth'
+  config: configs/fate_oia_train_360x640_vetra_staged_from_scratch_v1.yaml
+  action_scale: 1.0
+  reason_scale: 0.60
+model:
+  dim: 384
+  num_actions: 4
+  num_reasons: 21
+  num_predicates: 32
+  context_chunk_size: 2
+  temporal_layers: 2
+  temporal_heads: 4
+  temporal_dropout: 0.10
+  action_kappa: 0.15
+  action_evidence_trust_cap: 0.25
+  reason_kappa: 0.12
+  reason_evidence_trust_cap: 0.25
+  conditional_temporal_utility: true
+  transition_scales: [velocity, acceleration, region_velocity, persistence]
+  action_temporal_budget_cap: 0.60
+  reason_temporal_budget_cap: 0.50
+  confidence_aware_reason_gate: true
+  reason_gate_temperature: 0.50
+  geometric_flow_enabled: false
+  geometric_flow_hidden_dim: 64
+  geometric_action_cap: 0.20
+  geometric_reason_cap: 0.15
+  traffic_action_enabled: false
+  traffic_action_cap: 0.05
+  traffic_motion_topk: 12
+  traffic_trajectory_enabled: true
+  traffic_trajectory_cap: 0.08
+  traffic_trajectory_heads: 4
+  # Expanded-data audit found this state residual harmful on every action.
+  traffic_trajectory_state_enabled: false
+  traffic_trajectory_state_strength_scale: 8.0
+  traffic_trajectory_state_cap_ratio: 1.0
+  traffic_trajectory_state_utility_open_prior: 0.10
+  relational_traffic_enabled: false
+  relational_traffic_action_cap: 0.10
+  relational_traffic_reason_cap: 0.08
+  # Only reasons whose truth can change with participant motion receive a
+  # traffic-flow residual. Static traffic-control/lane evidence stays visual.
+  relational_traffic_reason_indices: [1, 2, 5, 6, 7, 8, 10, 14, 16, 20]
+  relational_traffic_heads: 4
+  traffic_adaptive_boundary_enabled: false
+  traffic_adaptive_boundary_cap: 0.25
+  object_intent_enabled: true
+  object_tracker_repository: 'E:\sbw\deps\co-tracker'
+  object_tracker_model_name: cotracker3_offline
+  object_tracker_grid_size: 8
+  object_intent_action_cap: 0.08
+  object_intent_reason_cap: 0.06
+  object_intent_heads: 4
+  object_intent_reason_indices: [1, 2, 5, 6, 7, 8, 10, 14, 16, 20]
+  object_intent_role_checkpoint: 'F:\FATE_Drive_runs\tida_object_role_head_1000_v88\checkpoint_best_role_head.pth'
+loss:
+  terminal_hist: 0.25
+  terminal_no_history: 0.0
+  terminal_gain: 0.05
+  temporal_order: 0.025
+  repeated_last_contrast: 0.025
+  flow_transition_align: 0.05
+  action_asl: 1.00
+  action_smooth_ap: 0.15
+  action_base_protect: 0.10
+  action_delta: 0.005
+  action_route_sparse: 0.005
+  action_flow_credit: 0.50
+  action_flow_no_harm: 0.15
+  action_utility_calibration: 0.05
+  reason_partial: 1.00
+  reason_rank: 0.08
+  reason_soft_f1: 0.04
+  reason_delta: 0.005
+  reason_flow_credit: 0.30
+  reason_flow_no_harm: 0.12
+  reason_positive_no_harm: 0.25
+  reason_utility_calibration: 0.04
+  geometric_action_aux: 0.0
+  geometric_action_rank: 0.0
+  geometric_action_prefix: 0.0
+  geometric_action_delta: 0.0
+  traffic_action_aux: 0.0
+  traffic_action_rank: 0.0
+  traffic_action_delta: 0.0
+  trajectory_action_boundary: 0.10
+  trajectory_action_rank: 0.20
+  trajectory_selected_control: 0.12
+  trajectory_utility_calibration: 0.08
+  trajectory_delta: 0.002
+  geometric_reason_aux: 0.0
+  geometric_reason_rank: 0.0
+  geometric_reason_prefix: 0.0
+  geometric_reason_delta: 0.0
+  relational_action_aux: 0.0
+  relational_action_rank: 0.0
+  relational_action_deletion: 0.0
+  relational_action_no_harm: 0.0
+  relational_reason_aux: 0.0
+  relational_reason_rank: 0.0
+  relational_reason_deletion: 0.0
+  relational_reason_no_harm: 0.0
+  relational_delta: 0.0
+  # Candidate learning is allowed to explore; train-calib proper-score gates
+  # remain the hard deployment boundary that protects the strong fallback.
+  object_intent_action_aux: 0.15
+  object_intent_action_rank: 0.10
+  object_intent_action_smooth_ap: 0.50
+  object_intent_action_deletion: 0.05
+  object_intent_action_pair_deletion: 0.05
+  object_intent_action_no_harm: 0.03
+  object_intent_action_utility: 0.10
+  object_intent_reason_aux: 0.15
+  object_intent_reason_rank: 0.15
+  object_intent_reason_deletion: 0.02
+  object_intent_reason_pair_deletion: 0.02
+  object_intent_reason_no_harm: 0.05
+  object_intent_reason_utility: 0.05
+  object_intent_delta: 0.001
+training:
+  seed: 20260825
+  epochs: 10
+  precision: bf16
+  optimizer: AdamW
+  weight_decay: 0.05
+  global_grad_clip: 1.0
+  warmup_ratio: 0.05
+  temporal_ramp_end_ratio: 0.20
+  flow_phases:
+    foundation_end_ratio: 0.05
+    credit_end_ratio: 0.20
+    final_phase: SAFE_JOINT
+  min_lr_ratio: 0.10
+  ema_decay: 0.998
+  no_metric_early_stop: true
+  lr:
+    history_reader: 0.00005
+    temporal_encoder: 0.00005
+    innovation_predictor: 0.00005
+    predicate_differential: 0.00005
+    flow_transition: 0.000075
+    temporal_action: 0.00010
+    temporal_reason: 0.000075
+    geometric_action: 0.0001
+    geometric_reason: 0.0001
+    traffic_action: 0.0001
+    traffic_trajectory: 0.00015
+    traffic_trajectory_utility: 0.00025
+    relational_traffic_action: 0.00030
+    relational_traffic_reason: 0.00020
+    traffic_adaptive_boundary: 0.0001
+    object_intent_action: 0.00050
+    object_intent_reason: 0.00030
+    object_intent_action_utility: 0.00050
+    object_intent_reason_utility: 0.00030
+memory_probe:
+  max_reserved_gib: 43.0
+  max_growth_gib: 0.25
+  warmup_updates: 5
+  measured_updates: 20
+  candidates:
+    - {name: A, batch_size: 6, gradient_accumulation_steps: 5, context_chunk_size: 2}
+    - {name: B, batch_size: 5, gradient_accumulation_steps: 6, context_chunk_size: 2}
+    - {name: C, batch_size: 4, gradient_accumulation_steps: 8, context_chunk_size: 2}
+    - {name: D, batch_size: 3, gradient_accumulation_steps: 10, context_chunk_size: 3}
+    - {name: E, batch_size: 2, gradient_accumulation_steps: 15, context_chunk_size: 5}
+runtime:
+  initial_supervision_telemetry: false
+  foreground_only: true
+  no_feature_cache: true
+  require_no_token_compression: true
+  test_every_epoch: true
+  expanded_test_every_epoch: true
+  save_every_epoch: true
+  intervention_interval_updates: 4
+  fixed_test_audit_samples: 128
+  print_every_optimizer_updates: 50
+  exact_resume: true
+deployment:
+  object_intent_min_calib_samples: 16
+  object_intent_min_nll_improvement: 0.000001
+  object_intent_min_fixed_f1_improvement: 0.0
+  object_intent_utility_oof_folds: 5
+  object_intent_utility_min_oof_gain: 0.0
+  object_intent_utility_max_selected_rate: 0.50
+  object_intent_utility_min_selected_benefit_rate: 0.65
+  object_intent_utility_min_nll_improvement: 0.0
+  object_intent_utility_min_brier_improvement: 0.0
+  object_intent_utility_quantile_coverages: [0.25, 0.50]
+  object_intent_action_utility_scales: [0, 4, 8, 16, 32, 64]
+  object_intent_reason_utility_scales: [0, 2, 4, 8, 16, 32]
+  object_intent_utility_cutoffs: [0.0, 0.4, 0.5, 0.6, 0.7, 0.8]
+  calibration_source: train_calib
+  primary_threshold_source: image_train_calib_locked
+  reason_beta_source: [train_calib, train_audit]
+  reason_beta_candidates: [0.0, 0.25, 0.5, 0.75, 1.0]
+  test_oracle_writeback: false
+  stage_c_nested_oof: true
+  locked_image_threshold_source: v7_1_train_calib
+  locked_image_thresholds: [0.59000003, 0.65999997, 0.60000002, 0.61000001, 0.62000000, 0.63999998, 0.55000001, 0.74000001, 0.69999999, 0.5, 0.12000000, 0.64999998, 0.43000000, 0.05, 0.42000002, 0.55000001, 0.34999999, 0.56000000, 0.73000002, 0.64999998, 0.68000001, 0.61000001, 0.63, 0.68000001, 0.66999996]

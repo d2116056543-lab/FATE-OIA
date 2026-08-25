@@ -20,6 +20,10 @@ from .tida_traffic_trajectory_losses import (
     trajectory_selected_control_loss,
     trajectory_utility_calibration_loss,
 )
+from .tida_relational_traffic_losses import (
+    relational_deletion_contrast_loss,
+    relational_proper_no_harm_loss,
+)
 
 
 def terminal_gain_loss(error_history: torch.Tensor, error_no_history: torch.Tensor, margin: float = 0.03) -> torch.Tensor:
@@ -33,6 +37,29 @@ def terminal_order_loss(real_error: torch.Tensor, counterfactual_error: torch.Te
 def action_macro_asl_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     raw = asymmetric_loss_with_logits(logits, target.float(), gamma_neg=4, gamma_pos=0, clip=0.05, reduction="none")
     return raw.mean(0).mean()
+
+
+def object_intent_utility_loss(
+    utility_logits: torch.Tensor,
+    candidate_delta: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    element_weight: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Train utility without allowing labels to reshape the candidate route."""
+    if not (utility_logits.shape == candidate_delta.shape == target.shape):
+        raise ValueError("object utility tensors must share [B,L]")
+    sign = 2.0 * target.float() - 1.0
+    helpful = (sign * candidate_delta.detach() > 0).to(utility_logits.dtype)
+    confidence = 0.25 + 0.75 * (
+        candidate_delta.detach().abs() / 0.01
+    ).clamp(0.0, 1.0)
+    if element_weight is not None:
+        confidence = confidence * element_weight.to(confidence)
+    value = F.binary_cross_entropy_with_logits(
+        utility_logits, helpful, reduction="none"
+    )
+    return (value * confidence).sum() / confidence.sum().clamp_min(1.0)
 
 
 def action_smooth_ap_loss(
@@ -461,6 +488,46 @@ def build_tida_loss_registry(
         ),
     )
     registry.add("trajectory_delta", output["traffic_trajectory_delta_raw"].square().mean())
+    relational_motion = output["relational_motion_features"].abs().mean(-1)
+    registry.add(
+        "relational_action_aux",
+        target_conditioned_geometric_correction_loss(
+            output["pre_relational_video_action_logits"],
+            output["relational_action_delta"],
+            action_target,
+            relational_motion,
+        ),
+    )
+    registry.add(
+        "relational_action_rank",
+        target_conditioned_geometric_ranking_loss(
+            output["pre_relational_video_action_logits"],
+            output["relational_action_delta"],
+            action_target,
+            relational_motion,
+            output["relational_action_support"],
+            rank_reference.get("action_logits"),
+            rank_reference.get("action_target"),
+        ),
+    )
+    registry.add(
+        "relational_action_deletion",
+        relational_deletion_contrast_loss(
+            output["relational_action_delta"],
+            output["relational_action_selected_deleted_delta"],
+            output["relational_action_random_deleted_delta"],
+            action_target,
+            output["relational_action_support"],
+        ),
+    )
+    registry.add(
+        "relational_action_no_harm",
+        relational_proper_no_harm_loss(
+            output["pre_relational_video_action_logits"],
+            output["relational_action_delta"],
+            action_target,
+        ),
+    )
     image_branch = output.get("image_branch", {})
     contradiction = image_branch.get("contradiction_score") if isinstance(image_branch, dict) else None
     reason_weights = reason_pu_weight(reason_target, contradiction)
@@ -535,4 +602,199 @@ def build_tida_loss_registry(
         reason_partial_asl_loss(prefix_reason, prefix_reason_target, prefix_contradiction),
     )
     registry.add("geometric_reason_delta", output["geometric_reason_delta_raw"].square().mean())
+    registry.add(
+        "relational_reason_aux",
+        target_conditioned_geometric_correction_loss(
+            output["pre_relational_video_reason_logits"],
+            output["relational_reason_delta"],
+            reason_target,
+            relational_motion,
+            reason_weights,
+            target_margin=0.15,
+        ),
+    )
+    registry.add(
+        "relational_reason_rank",
+        target_conditioned_geometric_ranking_loss(
+            output["pre_relational_video_reason_logits"],
+            output["relational_reason_delta"],
+            reason_target,
+            relational_motion,
+            reason_weights,
+        ),
+    )
+    registry.add(
+        "relational_reason_deletion",
+        relational_deletion_contrast_loss(
+            output["relational_reason_delta"],
+            output["relational_reason_selected_deleted_delta"],
+            output["relational_reason_random_deleted_delta"],
+            reason_target,
+            output["relational_reason_support"],
+            element_weight=reason_weights,
+        ),
+    )
+    registry.add(
+        "relational_reason_no_harm",
+        relational_proper_no_harm_loss(
+            output["pre_relational_video_reason_logits"],
+            output["relational_reason_delta"],
+            reason_target,
+            element_weight=reason_weights,
+        ),
+    )
+    registry.add(
+        "relational_delta",
+        0.5 * (
+            output["relational_action_delta"].square().mean()
+            + output["relational_reason_delta"].square().mean()
+        ),
+    )
+    if "object_intent_action_delta" in output:
+        # Interaction risk is an observed feature, not a universal proxy for
+        # label utility. Query-private motion attention learns its target
+        # relevance; forcing larger loss weights on high-risk clips caused the
+        # empirically observed inverse risk/utility correlation.
+        object_motion = torch.ones_like(
+            output["object_intent_interaction_risk"]
+        ).detach()
+        # Training always optimizes the un-gated candidates. Train-calib gates
+        # protect deployment only and must never sever the learning path.
+        action_candidate = output["object_intent_action_candidate"]
+        reason_candidate = output["object_intent_reason_candidate"]
+        registry.add(
+            "object_intent_action_aux",
+            target_conditioned_geometric_correction_loss(
+                output["pre_object_intent_video_action_logits"],
+                action_candidate,
+                action_target,
+                object_motion,
+            ),
+        )
+        registry.add(
+            "object_intent_action_rank",
+            target_conditioned_geometric_ranking_loss(
+                output["pre_object_intent_video_action_logits"],
+                action_candidate,
+                action_target,
+                object_motion,
+                output["object_intent_action_support"],
+                rank_reference.get("action_logits"),
+                rank_reference.get("action_target"),
+            ),
+        )
+        registry.add(
+            "object_intent_action_smooth_ap",
+            action_smooth_ap_loss(
+                output["pre_object_intent_video_action_logits"].detach()
+                + action_candidate,
+                action_target,
+                rank_reference.get("action_logits"),
+                rank_reference.get("action_target"),
+            ),
+        )
+        registry.add(
+            "object_intent_action_deletion",
+            relational_deletion_contrast_loss(
+                action_candidate,
+                output["object_intent_action_selected_deleted_candidate"],
+                output["object_intent_action_control_deleted_candidate"],
+                action_target,
+                output["object_intent_action_support"],
+            ),
+        )
+        registry.add(
+            "object_intent_action_pair_deletion",
+            relational_deletion_contrast_loss(
+                action_candidate,
+                output["object_intent_action_selected_pair_deleted_candidate"],
+                output["object_intent_action_control_pair_deleted_candidate"],
+                action_target,
+                output["object_intent_action_pair_support"],
+            ),
+        )
+        registry.add(
+            "object_intent_action_no_harm",
+            relational_proper_no_harm_loss(
+                output["pre_object_intent_video_action_logits"],
+                action_candidate,
+                action_target,
+            ),
+        )
+        registry.add(
+            "object_intent_action_utility",
+            object_intent_utility_loss(
+                output["object_intent_action_utility_logit"],
+                action_candidate,
+                action_target,
+            ),
+        )
+        registry.add(
+            "object_intent_reason_aux",
+            target_conditioned_geometric_correction_loss(
+                output["pre_object_intent_video_reason_logits"],
+                reason_candidate,
+                reason_target,
+                object_motion,
+                reason_weights,
+                target_margin=0.15,
+            ),
+        )
+        registry.add(
+            "object_intent_reason_rank",
+            target_conditioned_geometric_ranking_loss(
+                output["pre_object_intent_video_reason_logits"],
+                reason_candidate,
+                reason_target,
+                object_motion,
+                reason_weights,
+            ),
+        )
+        registry.add(
+            "object_intent_reason_deletion",
+            relational_deletion_contrast_loss(
+                reason_candidate,
+                output["object_intent_reason_selected_deleted_candidate"],
+                output["object_intent_reason_control_deleted_candidate"],
+                reason_target,
+                output["object_intent_reason_support"],
+                element_weight=reason_weights,
+            ),
+        )
+        registry.add(
+            "object_intent_reason_pair_deletion",
+            relational_deletion_contrast_loss(
+                reason_candidate,
+                output["object_intent_reason_selected_pair_deleted_candidate"],
+                output["object_intent_reason_control_pair_deleted_candidate"],
+                reason_target,
+                output["object_intent_reason_pair_support"],
+                element_weight=reason_weights,
+            ),
+        )
+        registry.add(
+            "object_intent_reason_no_harm",
+            relational_proper_no_harm_loss(
+                output["pre_object_intent_video_reason_logits"],
+                reason_candidate,
+                reason_target,
+                element_weight=reason_weights,
+            ),
+        )
+        registry.add(
+            "object_intent_reason_utility",
+            object_intent_utility_loss(
+                output["object_intent_reason_utility_logit"],
+                reason_candidate,
+                reason_target,
+                element_weight=reason_weights,
+            ),
+        )
+        registry.add(
+            "object_intent_delta",
+            0.5 * (
+                action_candidate.square().mean()
+                + reason_candidate.square().mean()
+            ),
+        )
     return registry

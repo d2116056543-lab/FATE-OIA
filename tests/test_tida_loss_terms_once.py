@@ -45,3 +45,12 @@ def test_custom_loss_weights_are_used_by_total():
     for name in registry.required_terms:
         registry.add(name, torch.tensor(2.0))
     assert registry.total().item() == 5.0
+
+
+def test_future_pair_deletion_losses_are_registered_trainable_terms():
+    assert "object_intent_action_pair_deletion" in TIDALossRegistry.optional_terms
+    assert "object_intent_reason_pair_deletion" in TIDALossRegistry.optional_terms
+    assert "object_intent_action_utility" in TIDALossRegistry.optional_terms
+    assert "object_intent_reason_utility" in TIDALossRegistry.optional_terms
+    assert TIDALossRegistry.default_weights["object_intent_action_pair_deletion"] >= 0.0
+    assert TIDALossRegistry.default_weights["object_intent_reason_pair_deletion"] >= 0.0

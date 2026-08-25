@@ -6,6 +6,7 @@ from fate_oia.losses.tida_flow_credit_losses import (
     positive_label_no_harm_loss,
     temporal_utility_calibration_loss,
 )
+from fate_oia.losses.tida_losses import object_intent_utility_loss
 
 
 def test_utility_calibration_prefers_high_budget_for_positive_temporal_benefit():
@@ -27,6 +28,15 @@ def test_utility_target_is_detached_from_paired_logits():
     assert budget.grad is not None and budget.grad.abs().sum() > 0
     assert real.grad is None
     assert counterfactual.grad is None
+
+
+def test_object_intent_utility_target_is_detached_from_candidate():
+    utility = torch.zeros(2, 4, requires_grad=True)
+    candidate = torch.randn(2, 4, requires_grad=True)
+    target = torch.randint(0, 2, (2, 4)).float()
+    object_intent_utility_loss(utility, candidate, target).backward()
+    assert utility.grad is not None and utility.grad.abs().sum() > 0
+    assert candidate.grad is None
 
 
 def test_conditional_credit_and_no_harm_weights_are_complementary():

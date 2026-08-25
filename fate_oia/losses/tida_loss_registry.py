@@ -30,6 +30,23 @@ class TIDALossRegistry:
         "reason_utility_calibration",
         "geometric_reason_aux", "geometric_reason_rank", "geometric_reason_prefix", "geometric_reason_delta",
     )
+    optional_terms = (
+        "relational_action_aux", "relational_action_rank", "relational_action_deletion",
+        "relational_action_no_harm",
+        "relational_reason_aux", "relational_reason_rank", "relational_reason_deletion",
+        "relational_reason_no_harm",
+        "relational_delta",
+        "object_intent_action_aux", "object_intent_action_rank",
+        "object_intent_action_smooth_ap",
+        "object_intent_action_deletion", "object_intent_action_pair_deletion",
+        "object_intent_action_no_harm",
+        "object_intent_action_utility",
+        "object_intent_reason_aux", "object_intent_reason_rank",
+        "object_intent_reason_deletion", "object_intent_reason_pair_deletion",
+        "object_intent_reason_no_harm",
+        "object_intent_reason_utility",
+        "object_intent_delta",
+    )
     default_weights = {
         "terminal_hist": 0.25,
         # Kept as a diagnostic row, never optimized. Optimizing this branch
@@ -74,19 +91,42 @@ class TIDALossRegistry:
         "geometric_reason_rank": 0.01,
         "geometric_reason_prefix": 0.03,
         "geometric_reason_delta": 0.002,
+        "relational_action_aux": 0.0,
+        "relational_action_rank": 0.0,
+        "relational_action_deletion": 0.0,
+        "relational_action_no_harm": 0.0,
+        "relational_reason_aux": 0.0,
+        "relational_reason_rank": 0.0,
+        "relational_reason_deletion": 0.0,
+        "relational_reason_no_harm": 0.0,
+        "relational_delta": 0.0,
+        "object_intent_action_aux": 0.0,
+        "object_intent_action_rank": 0.0,
+        "object_intent_action_smooth_ap": 0.0,
+        "object_intent_action_deletion": 0.0,
+        "object_intent_action_pair_deletion": 0.0,
+        "object_intent_action_no_harm": 0.0,
+        "object_intent_action_utility": 0.0,
+        "object_intent_reason_aux": 0.0,
+        "object_intent_reason_rank": 0.0,
+        "object_intent_reason_deletion": 0.0,
+        "object_intent_reason_pair_deletion": 0.0,
+        "object_intent_reason_no_harm": 0.0,
+        "object_intent_reason_utility": 0.0,
+        "object_intent_delta": 0.0,
     }
 
     def __init__(self, weights: dict[str, float] | None = None) -> None:
         self.weights = dict(self.default_weights)
         if weights:
-            unknown = set(weights) - set(self.required_terms)
+            unknown = set(weights) - set(self.required_terms) - set(self.optional_terms)
             if unknown:
                 raise ValueError(f"unknown TIDA loss weights: {sorted(unknown)}")
             self.weights.update({name: float(value) for name, value in weights.items()})
         self.rows: dict[str, TIDALossRow] = {}
 
     def add(self, name: str, value: torch.Tensor, *, available: bool = True, unavailable_reason: str | None = None) -> None:
-        if name not in self.required_terms:
+        if name not in self.required_terms and name not in self.optional_terms:
             raise ValueError(f"unregistered loss term: {name}")
         if name in self.rows:
             raise ValueError(f"loss term added twice: {name}")

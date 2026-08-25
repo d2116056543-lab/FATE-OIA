@@ -13,6 +13,12 @@ from .tida_flow_transition_bank import TIDAFlowTransitionBank
 from .tida_geometric_flow import TIDAGeometricFlowDecisionHeads, TIDAGeometricFlowEncoder
 from .tida_predicate_differential import TIDAPredicateDifferential
 from .tida_reason_reader import TIDAReasonReader
+from .tida_relational_traffic_flow import (
+    TIDARelationalTrafficFlow,
+    select_semantic_traffic_seeds,
+)
+from .tida_object_intent_flow import TIDAObjectIntentTransport
+from .tida_object_tracker import TIDAFrozenPointTracker
 from .tida_temporal_encoder import TIDATemporalEncoder
 from .tida_terminal_innovation import TIDATerminalInnovation
 from .tida_terminal_query_reader import TIDATerminalQueryReader
@@ -145,8 +151,23 @@ class TIDAOIAModel(nn.Module):
         traffic_trajectory_state_strength_scale: float = 8.0,
         traffic_trajectory_state_cap_ratio: float = 1.0,
         traffic_trajectory_state_utility_open_prior: float = 0.10,
+        relational_traffic_enabled: bool = False,
+        relational_traffic_action_cap: float = 0.12,
+        relational_traffic_reason_cap: float = 0.10,
+        relational_traffic_heads: int = 4,
+        relational_traffic_reason_indices: tuple[int, ...] | None = None,
         traffic_adaptive_boundary_enabled: bool = False,
         traffic_adaptive_boundary_cap: float = 0.25,
+        object_intent_enabled: bool = False,
+        object_tracker: nn.Module | None = None,
+        object_tracker_repository: str = r"E:\sbw\deps\co-tracker",
+        object_tracker_model_name: str = "cotracker3_offline",
+        object_tracker_grid_size: int = 8,
+        object_intent_action_cap: float = 0.08,
+        object_intent_reason_cap: float = 0.06,
+        object_intent_heads: int = 4,
+        object_intent_reason_indices: tuple[int, ...] | None = None,
+        object_intent_role_checkpoint: str | None = None,
     ) -> None:
         super().__init__()
         self.image_model = image_model
@@ -219,6 +240,19 @@ class TIDAOIAModel(nn.Module):
             state_cap_ratio=traffic_trajectory_state_cap_ratio,
             state_utility_open_prior=traffic_trajectory_state_utility_open_prior,
         )
+        self.relational_traffic_enabled = bool(relational_traffic_enabled)
+        self.relational_traffic = TIDARelationalTrafficFlow(
+            dim=dim,
+            num_actions=num_actions,
+            num_reasons=num_reasons,
+            heads=relational_traffic_heads,
+            action_cap=relational_traffic_action_cap,
+            reason_cap=relational_traffic_reason_cap,
+            reason_traffic_indices=relational_traffic_reason_indices,
+        )
+        if not self.relational_traffic_enabled:
+            for parameter in self.relational_traffic.parameters():
+                parameter.requires_grad = False
         self.traffic_adaptive_boundary_enabled = bool(traffic_adaptive_boundary_enabled)
         self.traffic_adaptive_boundary = TIDATrafficAdaptiveBoundary(
             num_actions=num_actions, state_dim=8, cap=traffic_adaptive_boundary_cap
@@ -228,6 +262,28 @@ class TIDAOIAModel(nn.Module):
                 parameter.requires_grad = False
         if not self.traffic_trajectory_enabled:
             for parameter in self.traffic_trajectory_head.parameters():
+                parameter.requires_grad = False
+        self.object_intent_enabled = bool(object_intent_enabled)
+        if self.object_intent_enabled:
+            self.object_tracker = object_tracker or TIDAFrozenPointTracker.from_local_repository(
+                object_tracker_repository,
+                model_name=object_tracker_model_name,
+                grid_size=object_tracker_grid_size,
+            )
+        else:
+            self.object_tracker = object_tracker
+        self.object_intent = TIDAObjectIntentTransport(
+            dim=dim,
+            num_actions=num_actions,
+            num_reasons=num_reasons,
+            heads=object_intent_heads,
+            action_cap=object_intent_action_cap,
+            reason_cap=object_intent_reason_cap,
+            reason_traffic_indices=object_intent_reason_indices,
+            role_checkpoint=object_intent_role_checkpoint,
+        )
+        if not self.object_intent_enabled:
+            for parameter in self.object_intent.parameters():
                 parameter.requires_grad = False
         self.query_identity = nn.Parameter(torch.randn(num_actions + num_predicates, dim) * 0.02)
         self.predicate_identity = nn.Parameter(torch.randn(num_predicates, dim) * 0.02)
@@ -312,9 +368,59 @@ class TIDAOIAModel(nn.Module):
                 for parameter in module.parameters()
                 if parameter.requires_grad
             ]
+        if self.relational_traffic_enabled:
+            owners["relational_traffic_action"] = [
+                parameter
+                for module in (
+                    self.relational_traffic.action_encoder,
+                    self.relational_traffic.action_output,
+                )
+                for parameter in module.parameters()
+                if parameter.requires_grad
+            ]
+            owners["relational_traffic_reason"] = [
+                parameter
+                for module in (
+                    self.relational_traffic.reason_encoder,
+                    self.relational_traffic.reason_output,
+                )
+                for parameter in module.parameters()
+                if parameter.requires_grad
+            ]
         if self.traffic_adaptive_boundary_enabled:
             owners["traffic_adaptive_boundary"] = [
                 parameter for parameter in self.traffic_adaptive_boundary.parameters()
+                if parameter.requires_grad
+            ]
+        if self.object_intent_enabled:
+            owners["object_intent_action"] = [
+                parameter
+                for module in (
+                    self.object_intent.action_encoder,
+                    self.object_intent.action_output,
+                    self.object_intent.action_pair_encoder,
+                    self.object_intent.action_pair_output,
+                )
+                for parameter in module.parameters()
+                if parameter.requires_grad
+            ]
+            owners["object_intent_reason"] = [
+                parameter
+                for module in (
+                    self.object_intent.reason_encoder,
+                    self.object_intent.reason_output,
+                    self.object_intent.reason_pair_encoder,
+                    self.object_intent.reason_pair_output,
+                )
+                for parameter in module.parameters()
+                if parameter.requires_grad
+            ]
+            owners["object_intent_action_utility"] = [
+                parameter for parameter in self.object_intent.action_utility.parameters()
+                if parameter.requires_grad
+            ]
+            owners["object_intent_reason_utility"] = [
+                parameter for parameter in self.object_intent.reason_utility.parameters()
                 if parameter.requires_grad
             ]
         # Query identities are the shortcut-free prior for terminal prediction.
@@ -347,6 +453,12 @@ class TIDAOIAModel(nn.Module):
         terminal_action_patch_weight: torch.Tensor | None = None,
         dense_trajectory_patch_tokens: torch.Tensor | None = None,
         dense_trajectory_grid_hw: tuple[int, int] | None = None,
+        history_semantic_patch_tokens: torch.Tensor | None = None,
+        history_semantic_patch_xy: torch.Tensor | None = None,
+        history_semantic_patch_weight: torch.Tensor | None = None,
+        terminal_semantic_patch_tokens: torch.Tensor | None = None,
+        terminal_semantic_patch_xy: torch.Tensor | None = None,
+        terminal_semantic_patch_weight: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         action_nodes = image["action_nodes_primary"].detach()
         reason_nodes = image["reason_nodes_primary"].detach()
@@ -461,11 +573,59 @@ class TIDAOIAModel(nn.Module):
         traffic_trajectory_control_delta_raw = trajectory["traffic_trajectory_control_delta"]
         traffic_trajectory_delta = traffic_trajectory_delta_raw * temporal_action_scale
         traffic_trajectory_control_delta = traffic_trajectory_control_delta_raw * temporal_action_scale
+        relational = self._empty_relational_traffic(image_action, image_reason)
+        if self.relational_traffic_enabled:
+            semantic_required = (
+                history_semantic_patch_tokens,
+                history_semantic_patch_xy,
+                history_semantic_patch_weight,
+                terminal_semantic_patch_tokens,
+                terminal_semantic_patch_xy,
+                terminal_semantic_patch_weight,
+            )
+            if any(value is None for value in semantic_required):
+                raise ValueError("relational traffic requires semantic history and terminal patches")
+            semantic_field = self.traffic_trajectory_builder(
+                torch.cat(
+                    (history_semantic_patch_tokens, terminal_semantic_patch_tokens[:, None]), dim=1
+                ),
+                torch.cat((history_semantic_patch_xy, terminal_semantic_patch_xy[:, None]), dim=1),
+                torch.cat(
+                    (history_semantic_patch_weight, terminal_semantic_patch_weight[:, None]), dim=1
+                ),
+                frame_valid_mask,
+                dense_patch_tokens=dense_trajectory_patch_tokens,
+                dense_grid_hw=dense_trajectory_grid_hw,
+            )
+            relational_output = self.relational_traffic(
+                    action_nodes,
+                    reason_nodes,
+                    semantic_field["trajectory_appearance"],
+                    semantic_field["trajectory_xy"],
+                    semantic_field["trajectory_visibility"],
+                    semantic_field["trajectory_pair_valid"],
+                    semantic_field["trajectory_common_displacement"],
+                    semantic_field["trajectory_exclusive_displacement"],
+                    semantic_field["trajectory_anchor_weight"],
+                )
+            relational = {
+                **relational_output,
+                **{
+                    f"semantic_{key}": value
+                    for key, value in semantic_field.items()
+                },
+            }
+        relational_action_delta = relational["relational_action_delta"] * temporal_action_scale
+        relational_reason_delta = relational["relational_reason_delta"] * temporal_reason_scale
         semantic_action_delta = action["action_temporal_delta"]
         semantic_reason_delta = reason_delta_raw
         action_delta = (
             semantic_action_delta + geometric_action_delta + traffic_action_delta
-            + traffic_trajectory_delta
+            + traffic_trajectory_delta + relational_action_delta
+        )
+        pre_relational_action_logits = (
+            image_action + semantic_action_delta + geometric_action_delta
+            + traffic_action_delta + traffic_trajectory_delta
         )
         video_action_base = image_action + action_delta
         if self.traffic_adaptive_boundary_enabled:
@@ -485,7 +645,8 @@ class TIDAOIAModel(nn.Module):
                     video_action_base.shape[0], self.num_actions, 22
                 ),
             }
-        reason_delta_raw = semantic_reason_delta + geometric_reason_delta
+        reason_delta_without_relational = semantic_reason_delta + geometric_reason_delta
+        reason_delta_raw = reason_delta_without_relational + relational_reason_delta
         semantic_reason_effective = (
             confidence_aware_reason_delta(
                 image_reason, semantic_reason_delta, temperature=self.reason_gate_temperature
@@ -514,9 +675,18 @@ class TIDAOIAModel(nn.Module):
             if self.confidence_aware_reason_gate
             else reason_delta_raw
         )
+        pre_relational_reason_delta = (
+            confidence_aware_reason_delta(
+                image_reason,
+                reason_delta_without_relational,
+                temperature=self.reason_gate_temperature,
+            )
+            if self.confidence_aware_reason_gate
+            else reason_delta_without_relational
+        )
         return {
             **temporal, **innovation, **differential, **flow, **action, **reason,
-            **geometric, **traffic, **trajectory, **adaptive_boundary,
+            **geometric, **traffic, **trajectory, **relational, **adaptive_boundary,
             "terminal_target_evidence": terminal_target_evidence,
             "terminal_query_identity": terminal_query_identity,
             "predicate_innovation_token": xi[:, self.num_actions :],
@@ -534,6 +704,10 @@ class TIDAOIAModel(nn.Module):
             "traffic_trajectory_delta": traffic_trajectory_delta,
             "traffic_trajectory_control_delta_raw": traffic_trajectory_control_delta_raw,
             "traffic_trajectory_control_delta": traffic_trajectory_control_delta,
+            "relational_action_delta_scaled": relational_action_delta,
+            "relational_reason_delta_scaled": relational_reason_delta,
+            "pre_relational_video_action_logits": pre_relational_action_logits,
+            "pre_relational_video_reason_logits": image_reason + pre_relational_reason_delta,
             "trajectory_video_action_logits_raw": image_action + traffic_trajectory_delta_raw,
             "trajectory_video_action_logits": image_action + traffic_trajectory_delta,
             "semantic_trajectory_video_action_logits_raw": (
@@ -580,6 +754,63 @@ class TIDAOIAModel(nn.Module):
                 self.predicate_names, differential["predicate_region_mass_velocity"], rho[:, self.num_actions :]
             ),
             "target_predicate_region_mass": target_region_mass,
+        }
+
+    def _empty_relational_traffic(
+        self, image_action: torch.Tensor, image_reason: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        batch = image_action.shape[0]
+        tracks = self.context_encoder.motion_topk
+        dim = self.query_identity.shape[-1]
+        return {
+            "relational_action_delta": torch.zeros_like(image_action),
+            "relational_reason_delta": torch.zeros_like(image_reason),
+            "relational_action_candidate": torch.zeros_like(image_action),
+            "relational_reason_candidate": torch.zeros_like(image_reason),
+            "relational_action_selected_deleted_delta": torch.zeros_like(image_action),
+            "relational_action_random_deleted_delta": torch.zeros_like(image_action),
+            "relational_reason_selected_deleted_delta": torch.zeros_like(image_reason),
+            "relational_reason_random_deleted_delta": torch.zeros_like(image_reason),
+            "relational_selected_track": torch.zeros(
+                batch, dtype=torch.long, device=image_action.device
+            ),
+            "relational_random_track": torch.ones(
+                batch, dtype=torch.long, device=image_action.device
+            ),
+            "relational_action_selected_track": torch.zeros(
+                batch, self.num_actions, dtype=torch.long, device=image_action.device
+            ),
+            "relational_action_random_track": torch.ones(
+                batch, self.num_actions, dtype=torch.long, device=image_action.device
+            ),
+            "relational_reason_selected_track": torch.zeros(
+                batch, image_reason.shape[1], dtype=torch.long,
+                device=image_action.device,
+            ),
+            "relational_reason_random_track": torch.ones(
+                batch, image_reason.shape[1], dtype=torch.long,
+                device=image_action.device,
+            ),
+            "relational_action_attention": image_action.new_zeros(
+                batch, self.num_actions, tracks
+            ),
+            "relational_reason_attention": image_reason.new_zeros(
+                batch, image_reason.shape[1], tracks
+            ),
+            "relational_action_pair_attention": image_action.new_zeros(
+                batch, self.num_actions, tracks, tracks
+            ),
+            "relational_reason_pair_attention": image_reason.new_zeros(
+                batch, image_reason.shape[1], tracks, tracks
+            ),
+            "relational_action_support": torch.zeros_like(image_action),
+            "relational_reason_support": torch.zeros_like(image_reason),
+            "relational_track_support": image_action.new_zeros(batch, tracks),
+            "relational_motion_features": image_action.new_zeros(batch, tracks, 14),
+            "relational_pair_features": image_action.new_zeros(batch, tracks, tracks, 8),
+            "relational_pair_weights": image_action.new_zeros(batch, tracks, tracks),
+            "relational_interaction_risk": image_action.new_zeros(batch, tracks, tracks),
+            "semantic_trajectory_xy": image_action.new_zeros(batch, 1, tracks, 1, 2),
         }
 
     def _empty_traffic_action(
@@ -741,6 +972,63 @@ class TIDAOIAModel(nn.Module):
             "geometric_prefix_fractions": measured["prefix_fractions"],
         }
 
+    @staticmethod
+    def _intervene_object_tracks(
+        xy: torch.Tensor, visibility: torch.Tensor, intervention: str | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if intervention is None:
+            return xy, visibility
+        history_xy, terminal_xy = xy[:, :-1], xy[:, -1:]
+        history_visibility, terminal_visibility = visibility[:, :-1], visibility[:, -1:]
+        if intervention == "history_off":
+            history_visibility = torch.zeros_like(history_visibility)
+        elif intervention == "repeated_last":
+            history_xy = terminal_xy.expand_as(history_xy)
+            history_visibility = terminal_visibility.expand_as(history_visibility)
+        elif intervention == "time_reverse":
+            history_xy = history_xy.flip(1)
+            history_visibility = history_visibility.flip(1)
+        elif intervention == "time_shuffle":
+            order = torch.cat(
+                (
+                    torch.arange(0, history_xy.shape[1], 2, device=xy.device),
+                    torch.arange(1, history_xy.shape[1], 2, device=xy.device),
+                )
+            )
+            history_xy = history_xy.index_select(1, order)
+            history_visibility = history_visibility.index_select(1, order)
+        return (
+            torch.cat((history_xy, terminal_xy), dim=1),
+            torch.cat((history_visibility, terminal_visibility), dim=1),
+        )
+
+    @staticmethod
+    def _merge_object_intent(
+        temporal_output: dict[str, Any],
+        tracker_output: dict[str, torch.Tensor],
+        object_output: dict[str, torch.Tensor],
+        temporal_action_scale: float | torch.Tensor,
+        temporal_reason_scale: float | torch.Tensor,
+    ) -> dict[str, Any]:
+        action_delta = object_output["object_intent_action_delta"] * temporal_action_scale
+        reason_delta = object_output["object_intent_reason_delta"] * temporal_reason_scale
+        pre_action = temporal_output["video_action_logits"]
+        pre_reason = temporal_output["video_reason_logits"]
+        return {
+            **temporal_output,
+            **tracker_output,
+            **object_output,
+            "pre_object_intent_video_action_logits": pre_action,
+            "pre_object_intent_video_reason_logits": pre_reason,
+            "object_intent_action_delta_scaled": action_delta,
+            "object_intent_reason_delta_scaled": reason_delta,
+            "video_action_logits_base": temporal_output["video_action_logits_base"] + action_delta,
+            "video_action_logits": pre_action + action_delta,
+            "video_reason_logits": pre_reason + reason_delta,
+            "action_temporal_delta": temporal_output["action_temporal_delta"] + action_delta,
+            "reason_temporal_delta": temporal_output["reason_temporal_delta"] + reason_delta,
+        }
+
     def rerun_temporal_from_output(
         self,
         output: dict[str, Any],
@@ -770,10 +1058,22 @@ class TIDAOIAModel(nn.Module):
         patch_tokens = self._intervene_patch_history(output["history_action_patch_tokens"], intervention)
         patch_xy = self._intervene_patch_history(output["history_action_patch_xy"], intervention)
         patch_weight = self._intervene_patch_history(output["history_action_patch_weight"], intervention)
+        semantic_patch_tokens = self._intervene_patch_history(
+            output["history_semantic_patch_tokens"], intervention
+        )
+        semantic_patch_xy = self._intervene_patch_history(
+            output["history_semantic_patch_xy"], intervention
+        )
+        semantic_patch_weight = self._intervene_patch_history(
+            output["history_semantic_patch_weight"], intervention
+        )
         dense_history = self._intervene_patch_history(
             output["history_patch_tokens_last"], intervention
         )
-        return self.decode_encoded_history(
+        dense_trajectory_patch_tokens = torch.cat(
+            (dense_history, output["terminal_patch_tokens_context_grid"][:, None]), dim=1
+        )
+        rerun = self.decode_encoded_history(
             history, output["history_query_region_mass"], output["timestamps"], rerun_valid,
             output["terminal_target_evidence"], output["terminal_query_identity"], output["image_branch"],
             temporal_action_scale=temporal_action_scale, temporal_reason_scale=temporal_reason_scale,
@@ -784,10 +1084,43 @@ class TIDAOIAModel(nn.Module):
             terminal_action_patch_tokens=output["terminal_action_patch_tokens"],
             terminal_action_patch_xy=output["terminal_action_patch_xy"],
             terminal_action_patch_weight=output["terminal_action_patch_weight"],
-            dense_trajectory_patch_tokens=torch.cat(
-                (dense_history, output["terminal_patch_tokens_context_grid"][:, None]), dim=1
-            ),
+            history_semantic_patch_tokens=semantic_patch_tokens,
+            history_semantic_patch_xy=semantic_patch_xy,
+            history_semantic_patch_weight=semantic_patch_weight,
+            terminal_semantic_patch_tokens=output["terminal_semantic_patch_tokens"],
+            terminal_semantic_patch_xy=output["terminal_semantic_patch_xy"],
+            terminal_semantic_patch_weight=output["terminal_semantic_patch_weight"],
+            dense_trajectory_patch_tokens=dense_trajectory_patch_tokens,
             dense_trajectory_grid_hw=output["history_grid_hw"],
+        )
+        if not self.object_intent_enabled:
+            return rerun
+        track_xy, track_visibility = self._intervene_object_tracks(
+            output["object_tracks_xy"], output["object_tracks_visibility"], intervention
+        )
+        object_output = self.object_intent(
+            track_xy,
+            track_visibility,
+            output["_object_terminal_patch_tokens"],
+            output["_object_terminal_grid_hw"],
+            output["image_branch"]["action_nodes_primary"].detach(),
+            output["image_branch"]["reason_nodes_primary"].detach(),
+            timestamps=output["timestamps"],
+            temporal_patch_tokens=dense_trajectory_patch_tokens,
+            temporal_grid_hw=output["history_grid_hw"],
+            base_action_logits=rerun["video_action_logits"].detach(),
+            base_reason_logits=rerun["video_reason_logits"].detach(),
+        )
+        return self._merge_object_intent(
+            rerun,
+            {
+                "object_tracks_xy": track_xy,
+                "object_tracks_visibility": track_visibility,
+                "object_tracks_visibility_rate": track_visibility.float().mean((1, 2)),
+            },
+            object_output,
+            temporal_action_scale,
+            temporal_reason_scale,
         )
 
     def forward(
@@ -801,6 +1134,8 @@ class TIDAOIAModel(nn.Module):
         temporal_reason_scale: float | torch.Tensor,
         intervention: str | None = None,
         canonicalize_horizontal_flip: bool = False,
+        object_tracks_xy: torch.Tensor | None = None,
+        object_tracks_visibility: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         with torch.no_grad():
             target_field = self.image_model.encode_images(target_image)
@@ -819,9 +1154,21 @@ class TIDAOIAModel(nn.Module):
         terminal_patches = self.context_encoder.select_action_patches(
             target_field, terminal_read["query_attention"][:, : self.num_actions]
         )
+        predicate_reliability = image.get(
+            "predicate_probs",
+            predicate_tokens.new_ones(predicate_tokens.shape[:2]),
+        ).detach()
+        terminal_semantic_patches = select_semantic_traffic_seeds(
+            target_field["patch_tokens_last"],
+            terminal_read["query_attention"][:, self.num_actions :],
+            predicate_reliability,
+            grid_hw=target_field["grid_hw"],
+            topk=self.context_encoder.motion_topk,
+        )
 
         context = self.context_encoder(
             context_images, action_nodes, predicate_tokens, self.predicate_identity,
+            predicate_reliability=predicate_reliability,
             canonicalize_horizontal_flip=canonicalize_horizontal_flip,
         )
         target_grid_height, target_grid_width = target_field["grid_hw"]
@@ -848,6 +1195,15 @@ class TIDAOIAModel(nn.Module):
             if intervention == "history_off":
                 effective_frame_valid_mask = frame_valid_mask.clone()
                 effective_frame_valid_mask[:, :-1] = False
+        dense_trajectory_patch_tokens = torch.cat(
+            (
+                self._intervene_patch_history(
+                    context["history_patch_tokens_last"], intervention
+                ),
+                terminal_patch_tokens_context_grid[:, None],
+            ),
+            dim=1,
+        )
         temporal_output = self.decode_encoded_history(
             history_tokens, context["history_query_region_mass"], timestamps, effective_frame_valid_mask,
             target_evidence, terminal_query_identity, image,
@@ -869,13 +1225,89 @@ class TIDAOIAModel(nn.Module):
             terminal_action_patch_tokens=terminal_patches["tokens"],
             terminal_action_patch_xy=terminal_patches["xy"],
             terminal_action_patch_weight=terminal_patches["weights"],
-            dense_trajectory_patch_tokens=torch.cat(
-                (self._intervene_patch_history(context["history_patch_tokens_last"], intervention),
-                 terminal_patch_tokens_context_grid[:, None]),
-                dim=1,
+            history_semantic_patch_tokens=self._intervene_patch_history(
+                context["history_semantic_patch_tokens"], intervention
             ),
+            history_semantic_patch_xy=self._intervene_patch_history(
+                context["history_semantic_patch_xy"], intervention
+            ),
+            history_semantic_patch_weight=self._intervene_patch_history(
+                context["history_semantic_patch_weight"], intervention
+            ),
+            terminal_semantic_patch_tokens=terminal_semantic_patches["tokens"],
+            terminal_semantic_patch_xy=terminal_semantic_patches["xy"],
+            terminal_semantic_patch_weight=terminal_semantic_patches["weights"],
+            dense_trajectory_patch_tokens=dense_trajectory_patch_tokens,
             dense_trajectory_grid_hw=context["history_grid_hw"],
         )
+        object_output: dict[str, torch.Tensor] = {}
+        if self.object_intent_enabled:
+            if (object_tracks_xy is None) != (object_tracks_visibility is None):
+                raise ValueError("precomputed object tracks require both xy and visibility")
+            if object_tracks_xy is None:
+                target_for_tracker = F.interpolate(
+                    target_image, size=context_images.shape[-2:], mode="bilinear", align_corners=False,
+                )
+                tracker_context = context_images
+                if intervention == "repeated_last":
+                    tracker_context = target_for_tracker[:, None].expand_as(context_images)
+                elif intervention == "time_reverse":
+                    tracker_context = context_images.flip(1)
+                elif intervention == "time_shuffle":
+                    order = torch.cat((
+                        torch.arange(0, context_images.shape[1], 2, device=context_images.device),
+                        torch.arange(1, context_images.shape[1], 2, device=context_images.device),
+                    ))
+                    tracker_context = context_images.index_select(1, order)
+                tracker_output = self.object_tracker(
+                    torch.cat((tracker_context, target_for_tracker[:, None]), dim=1)
+                )
+                tracker_xy = tracker_output["object_tracks_xy"]
+                tracker_visibility = tracker_output["object_tracks_visibility"]
+            else:
+                tracker_xy = object_tracks_xy
+                tracker_visibility = object_tracks_visibility.bool()
+                tracker_output = {
+                    "object_tracks_xy": tracker_xy,
+                    "object_tracks_visibility": tracker_visibility,
+                }
+                if intervention is not None:
+                    tracker_xy, tracker_visibility = self._intervene_object_tracks(
+                        tracker_xy, tracker_visibility, intervention
+                    )
+            if intervention == "history_off":
+                tracker_visibility = tracker_visibility.clone()
+                tracker_visibility[:, :-1] = False
+            if canonicalize_horizontal_flip:
+                tracker_xy = tracker_xy.clone()
+                tracker_xy[..., 0] = -tracker_xy[..., 0]
+            object_output = self.object_intent(
+                tracker_xy,
+                tracker_visibility,
+                target_field["patch_tokens_last"],
+                target_field["grid_hw"],
+                action_nodes,
+                reason_nodes,
+                timestamps=timestamps,
+                temporal_patch_tokens=dense_trajectory_patch_tokens,
+                temporal_grid_hw=context["history_grid_hw"],
+                base_action_logits=temporal_output["video_action_logits"].detach(),
+                base_reason_logits=temporal_output["video_reason_logits"].detach(),
+            )
+            temporal_output = self._merge_object_intent(
+                temporal_output,
+                {
+                    **tracker_output,
+                    "object_tracks_xy": tracker_xy,
+                    "object_tracks_visibility": tracker_visibility,
+                    "object_tracks_visibility_rate": tracker_visibility.float().mean((1, 2)),
+                },
+                object_output,
+                temporal_action_scale,
+                temporal_reason_scale,
+            )
+            temporal_output["_object_terminal_patch_tokens"] = target_field["patch_tokens_last"]
+            temporal_output["_object_terminal_grid_hw"] = target_field["grid_hw"]
         return {
             **context,
             **temporal_output,
@@ -884,6 +1316,11 @@ class TIDAOIAModel(nn.Module):
             "terminal_action_patch_xy": terminal_patches["xy"],
             "terminal_action_patch_weight": terminal_patches["weights"],
             "terminal_action_patch_indices": terminal_patches["indices"],
+            "terminal_semantic_patch_tokens": terminal_semantic_patches["tokens"],
+            "terminal_semantic_patch_xy": terminal_semantic_patches["xy"],
+            "terminal_semantic_patch_weight": terminal_semantic_patches["weights"],
+            "terminal_semantic_patch_indices": terminal_semantic_patches["indices"],
+            "terminal_semantic_predicate_ids": terminal_semantic_patches["predicate_ids"],
             "terminal_patch_tokens_context_grid": terminal_patch_tokens_context_grid,
             "_geometric_context_images": context_images,
         }
