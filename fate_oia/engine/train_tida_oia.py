@@ -1180,7 +1180,10 @@ def train(args: Any) -> None:
         ):
             raise ValueError("verified baseline artifact does not match this utility-only run")
         locked = config.get("deployment", {}).get("locked_image_thresholds")
-        if locked is None or len(locked) != model.num_actions + model.num_reasons:
+        expected_labels = (
+            model.object_intent.num_actions + model.object_intent.num_reasons
+        )
+        if locked is None or len(locked) != expected_labels:
             raise ValueError("utility-only baseline reuse requires locked image thresholds")
         baseline_thresholds = {
             "image": torch.as_tensor(locked, dtype=torch.float32, device=device)
