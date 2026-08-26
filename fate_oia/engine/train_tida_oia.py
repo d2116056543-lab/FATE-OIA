@@ -55,6 +55,7 @@ from fate_oia.utils.tida_relational_traffic_metrics import relational_traffic_me
 from fate_oia.utils.tida_object_intent_metrics import (
     apply_object_intent_gates_to_rows,
     apply_object_intent_utility_policy_to_rows,
+    combine_object_intent_utility_policies,
     fit_object_intent_gates_from_rows,
     fit_object_intent_utility_policy_oof,
     object_intent_traffic_metrics,
@@ -927,17 +928,13 @@ def calibrate_object_intent_deployment(model, calib_rows, deployment_config):
     action_gate = fit["action"]["gate"]
     reason_gate = fit["reason"]["gate"]
     utility_available = all(
-        f"object_intent_{branch}_utility_gate" in calib_rows
+        f"object_intent_{branch}_{kind}_utility_gate" in calib_rows
         for branch in ("action", "reason")
+        for kind in ("directional", "risk")
     )
     if utility_available:
         action_count = calib_rows["action_target"].shape[1]
-        action_policy = fit_object_intent_utility_policy_oof(
-            calib_rows["pre_object_intent_action"],
-            calib_rows["object_intent_action_candidate"],
-            calib_rows["object_intent_action_utility_gate"],
-            calib_rows["action_target"],
-            torch.as_tensor(locked_thresholds)[:action_count],
+        common_policy_kwargs = dict(
             scales=tuple(deployment_config.get(
                 "object_intent_action_utility_scales", [0, 4, 8, 16, 32, 64]
             )),
@@ -956,10 +953,29 @@ def calibrate_object_intent_deployment(model, calib_rows, deployment_config):
             quantile_coverages=tuple(deployment_config.get("object_intent_utility_quantile_coverages", [])),
             cap=float(model.object_intent.action_cap),
         )
-        reason_policy = fit_object_intent_utility_policy_oof(
+        action_directional_policy = fit_object_intent_utility_policy_oof(
+            calib_rows["pre_object_intent_action"],
+            calib_rows["object_intent_action_candidate"],
+            calib_rows["object_intent_action_directional_utility_gate"],
+            calib_rows["action_target"],
+            torch.as_tensor(locked_thresholds)[:action_count],
+            **common_policy_kwargs,
+        )
+        action_risk_policy = fit_object_intent_utility_policy_oof(
+            calib_rows["pre_object_intent_action"],
+            calib_rows["object_intent_action_candidate"],
+            calib_rows["object_intent_action_risk_utility_gate"],
+            calib_rows["action_target"],
+            torch.as_tensor(locked_thresholds)[:action_count],
+            **common_policy_kwargs,
+        )
+        action_policy = combine_object_intent_utility_policies(
+            action_directional_policy, action_risk_policy
+        )
+        reason_directional_policy = fit_object_intent_utility_policy_oof(
             calib_rows["pre_object_intent_reason"],
             calib_rows["object_intent_reason_candidate"],
-            calib_rows["object_intent_reason_utility_gate"],
+            calib_rows["object_intent_reason_directional_utility_gate"],
             calib_rows["reason_target"],
             torch.as_tensor(locked_thresholds)[action_count:],
             scales=tuple(deployment_config.get(
@@ -980,10 +996,39 @@ def calibrate_object_intent_deployment(model, calib_rows, deployment_config):
             quantile_coverages=tuple(deployment_config.get("object_intent_utility_quantile_coverages", [])),
             cap=float(model.object_intent.reason_cap),
         )
+        reason_risk_policy = fit_object_intent_utility_policy_oof(
+            calib_rows["pre_object_intent_reason"],
+            calib_rows["object_intent_reason_candidate"],
+            calib_rows["object_intent_reason_risk_utility_gate"],
+            calib_rows["reason_target"],
+            torch.as_tensor(locked_thresholds)[action_count:],
+            scales=tuple(deployment_config.get(
+                "object_intent_reason_utility_scales", [0, 2, 4, 8, 16, 32]
+            )),
+            cutoffs=tuple(deployment_config.get(
+                "object_intent_utility_cutoffs", [0, 0.4, 0.5, 0.6, 0.7, 0.8]
+            )),
+            folds=int(deployment_config.get("object_intent_utility_oof_folds", 5)),
+            min_oof_gain=float(deployment_config.get("object_intent_utility_min_oof_gain", 0.0)),
+            max_selected_rate=float(deployment_config.get("object_intent_utility_max_selected_rate", 1.0)),
+            min_selected_benefit_rate=float(deployment_config.get("object_intent_utility_min_selected_benefit_rate", 0.5)),
+            min_positive_fold_fraction=float(deployment_config.get("object_intent_utility_min_positive_fold_fraction", 0.0)),
+            min_non_degrading_fold_fraction=float(deployment_config.get("object_intent_utility_min_non_degrading_fold_fraction", 0.0)),
+            fold_degradation_tolerance=float(deployment_config.get("object_intent_utility_fold_degradation_tolerance", 0.0)),
+            min_nll_improvement=float(deployment_config.get("object_intent_utility_min_nll_improvement", 0.0)),
+            min_brier_improvement=float(deployment_config.get("object_intent_utility_min_brier_improvement", 0.0)),
+            quantile_coverages=tuple(deployment_config.get("object_intent_utility_quantile_coverages", [])),
+            cap=float(model.object_intent.reason_cap),
+        )
+        reason_policy = combine_object_intent_utility_policies(
+            reason_directional_policy, reason_risk_policy
+        )
         model.object_intent.set_deployment_policy(
             action_policy["gate"], reason_policy["gate"],
             action_scale=action_policy["scale"], reason_scale=reason_policy["scale"],
             action_cutoff=action_policy["cutoff"], reason_cutoff=reason_policy["cutoff"],
+            action_utility_source=action_policy["utility_source"],
+            reason_utility_source=reason_policy["utility_source"],
             source="train_calib_oof_utility_policy",
         )
         calibrated_rows = apply_object_intent_utility_policy_to_rows(

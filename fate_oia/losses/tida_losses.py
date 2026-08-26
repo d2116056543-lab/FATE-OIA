@@ -62,6 +62,44 @@ def object_intent_utility_loss(
     return (value * confidence).sum() / confidence.sum().clamp_min(1.0)
 
 
+def object_intent_risk_utility_loss(
+    utility_logits: torch.Tensor,
+    candidate_delta: torch.Tensor,
+    target: torch.Tensor,
+    base_logits: torch.Tensor,
+    *,
+    element_weight: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Learn selective utility where the frozen baseline still needs help.
+
+    The directional utility head learns whether a candidate points toward the
+    target. This complementary head discounts already-certain correct logits,
+    concentrating capacity on errors and near-boundary decisions. Labels and
+    baseline logits are detached, so this supervision cannot reshape either
+    the candidate route or the strong image branch.
+    """
+    if not (
+        utility_logits.shape == candidate_delta.shape == target.shape
+        == base_logits.shape
+    ):
+        raise ValueError("risk utility tensors must share [B,L]")
+    sign = 2.0 * target.float() - 1.0
+    detached_delta = candidate_delta.detach()
+    detached_margin = (sign * base_logits.detach())
+    helpful = (sign * detached_delta > 0).to(utility_logits.dtype)
+    need = torch.sigmoid(-detached_margin).to(utility_logits.dtype)
+    candidate_confidence = 0.25 + 0.75 * (
+        detached_delta.abs() / 0.01
+    ).clamp(0.0, 1.0)
+    confidence = (0.10 + 0.90 * need) * candidate_confidence
+    if element_weight is not None:
+        confidence = confidence * element_weight.to(confidence)
+    value = F.binary_cross_entropy_with_logits(
+        utility_logits, helpful, reduction="none"
+    )
+    return (value * confidence).sum() / confidence.sum().clamp_min(1.0)
+
+
 def action_smooth_ap_loss(
     logits: torch.Tensor,
     target: torch.Tensor,
@@ -723,10 +761,18 @@ def build_tida_loss_registry(
         )
         registry.add(
             "object_intent_action_utility",
-            object_intent_utility_loss(
-                output["object_intent_action_utility_logit"],
-                action_candidate,
-                action_target,
+            0.5 * (
+                object_intent_utility_loss(
+                    output["object_intent_action_directional_utility_logit"],
+                    action_candidate,
+                    action_target,
+                )
+                + object_intent_risk_utility_loss(
+                    output["object_intent_action_risk_utility_logit"],
+                    action_candidate,
+                    action_target,
+                    output["pre_object_intent_video_action_logits"],
+                )
             ),
         )
         registry.add(
@@ -783,11 +829,20 @@ def build_tida_loss_registry(
         )
         registry.add(
             "object_intent_reason_utility",
-            object_intent_utility_loss(
-                output["object_intent_reason_utility_logit"],
-                reason_candidate,
-                reason_target,
-                element_weight=reason_weights,
+            0.5 * (
+                object_intent_utility_loss(
+                    output["object_intent_reason_directional_utility_logit"],
+                    reason_candidate,
+                    reason_target,
+                    element_weight=reason_weights,
+                )
+                + object_intent_risk_utility_loss(
+                    output["object_intent_reason_risk_utility_logit"],
+                    reason_candidate,
+                    reason_target,
+                    output["pre_object_intent_video_reason_logits"],
+                    element_weight=reason_weights,
+                )
             ),
         )
         registry.add(

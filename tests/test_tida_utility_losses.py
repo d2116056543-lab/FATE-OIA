@@ -6,7 +6,10 @@ from fate_oia.losses.tida_flow_credit_losses import (
     positive_label_no_harm_loss,
     temporal_utility_calibration_loss,
 )
-from fate_oia.losses.tida_losses import object_intent_utility_loss
+from fate_oia.losses.tida_losses import (
+    object_intent_risk_utility_loss,
+    object_intent_utility_loss,
+)
 
 
 def test_utility_calibration_prefers_high_budget_for_positive_temporal_benefit():
@@ -37,6 +40,23 @@ def test_object_intent_utility_target_is_detached_from_candidate():
     object_intent_utility_loss(utility, candidate, target).backward()
     assert utility.grad is not None and utility.grad.abs().sum() > 0
     assert candidate.grad is None
+
+
+def test_object_intent_risk_utility_prioritizes_uncertain_helpful_routes():
+    target = torch.ones(2, 1)
+    candidate = torch.full((2, 1), 0.02, requires_grad=True)
+    base = torch.tensor([[-0.2], [4.0]], requires_grad=True)
+    good = torch.tensor([[4.0], [-4.0]], requires_grad=True)
+    bad = (-good.detach().clone()).requires_grad_(True)
+
+    good_loss = object_intent_risk_utility_loss(good, candidate, target, base)
+    bad_loss = object_intent_risk_utility_loss(bad, candidate, target, base)
+
+    assert good_loss < bad_loss
+    good_loss.backward()
+    assert good.grad is not None and good.grad.abs().sum() > 0
+    assert candidate.grad is None
+    assert base.grad is None
 
 
 def test_conditional_credit_and_no_harm_weights_are_complementary():

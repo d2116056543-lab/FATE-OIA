@@ -2,6 +2,7 @@ import torch
 
 from fate_oia.utils.tida_object_intent_metrics import (
     apply_object_intent_utility_policy_to_rows,
+    combine_object_intent_utility_policies,
     fit_object_intent_deployment_gates,
     fit_object_intent_utility_policy_oof,
     object_intent_traffic_metrics,
@@ -312,3 +313,48 @@ def test_inactive_utility_policy_is_not_reported_as_selected():
 
     assert not applied["object_intent_action_utility_selected"].bool().any()
     assert not applied["object_intent_reason_utility_selected"].bool().any()
+
+
+def test_dual_utility_policy_selects_best_source_per_label():
+    directional = {
+        "gate": torch.tensor([1.0, 0.0]),
+        "scale": torch.tensor([8.0, 0.0]),
+        "cutoff": torch.tensor([0.5, 0.0]),
+        "oof_gain": torch.tensor([0.03, 0.0]),
+    }
+    risk = {
+        "gate": torch.tensor([0.0, 1.0]),
+        "scale": torch.tensor([0.0, 16.0]),
+        "cutoff": torch.tensor([0.0, 0.6]),
+        "oof_gain": torch.tensor([0.0, 0.04]),
+    }
+
+    combined = combine_object_intent_utility_policies(directional, risk)
+
+    assert combined["utility_source"].tolist() == [0, 1]
+    assert combined["scale"].tolist() == [8.0, 16.0]
+    torch.testing.assert_close(combined["oof_gain"], torch.tensor([0.03, 0.04]))
+
+
+def test_apply_dual_policy_uses_selected_utility_without_test_labels():
+    rows = {
+        "pre_object_intent_action": torch.zeros(2, 2),
+        "pre_object_intent_reason": torch.zeros(2, 2),
+        "object_intent_action_candidate": torch.full((2, 2), 0.01),
+        "object_intent_reason_candidate": torch.full((2, 2), 0.01),
+        "object_intent_action_utility_gate": torch.tensor([[0.9, 0.1], [0.9, 0.1]]),
+        "object_intent_reason_utility_gate": torch.tensor([[0.9, 0.1], [0.9, 0.1]]),
+        "object_intent_action_risk_utility_gate": torch.tensor([[0.1, 0.9], [0.1, 0.9]]),
+        "object_intent_reason_risk_utility_gate": torch.tensor([[0.1, 0.9], [0.1, 0.9]]),
+    }
+    policy = {
+        "gate": torch.ones(2),
+        "scale": torch.ones(2),
+        "cutoff": torch.full((2,), 0.5),
+        "utility_source": torch.tensor([0, 1]),
+    }
+
+    applied = apply_object_intent_utility_policy_to_rows(rows, policy, policy)
+
+    assert applied["object_intent_action_utility_selected"].all()
+    assert applied["object_intent_action_utility_source"][0].tolist() == [0, 1]

@@ -416,12 +416,20 @@ class TIDAOIAModel(nn.Module):
                 if parameter.requires_grad
             ]
             owners["object_intent_action_utility"] = [
-                parameter for parameter in self.object_intent.action_utility.parameters()
-                if parameter.requires_grad
+                parameter
+                for module in (
+                    self.object_intent.action_utility,
+                    self.object_intent.action_risk_utility,
+                )
+                for parameter in module.parameters() if parameter.requires_grad
             ]
             owners["object_intent_reason_utility"] = [
-                parameter for parameter in self.object_intent.reason_utility.parameters()
-                if parameter.requires_grad
+                parameter
+                for module in (
+                    self.object_intent.reason_utility,
+                    self.object_intent.reason_risk_utility,
+                )
+                for parameter in module.parameters() if parameter.requires_grad
             ]
         # Query identities are the shortcut-free prior for terminal prediction.
         owners["history_reader"] += [self.query_identity, self.predicate_identity]

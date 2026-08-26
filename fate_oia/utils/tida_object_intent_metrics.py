@@ -422,6 +422,32 @@ def fit_object_intent_utility_policy_oof(
     }
 
 
+def combine_object_intent_utility_policies(
+    directional: dict[str, torch.Tensor],
+    risk: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Choose the stronger train-calib OOF utility source per label.
+
+    Source 0 is directional utility and source 1 is baseline-risk utility.
+    Both underlying fitters include a strict zero candidate, so choosing the
+    larger OOF gain cannot force an unsupported route open.
+    """
+    required = ("gate", "scale", "cutoff", "oof_gain")
+    if any(key not in directional or key not in risk for key in required):
+        raise ValueError("dual utility policies are missing required fields")
+    if any(directional[key].shape != risk[key].shape for key in required):
+        raise ValueError("dual utility policy shapes must match")
+    use_risk = risk["oof_gain"] > directional["oof_gain"]
+    result = {
+        key: torch.where(use_risk, risk[key], directional[key])
+        for key in required
+    }
+    result["utility_source"] = use_risk.to(torch.long)
+    result["directional_oof_gain"] = directional["oof_gain"]
+    result["risk_oof_gain"] = risk["oof_gain"]
+    return result
+
+
 def fit_object_intent_gates_from_rows(
     rows: dict[str, torch.Tensor],
     *,
@@ -496,7 +522,16 @@ def apply_object_intent_utility_policy_to_rows(
 
     def apply(branch: str, policy: dict[str, torch.Tensor], cap: float) -> torch.Tensor:
         candidate = rows[f"object_intent_{branch}_candidate"]
-        utility = rows[f"object_intent_{branch}_utility_gate"]
+        directional = rows.get(
+            f"object_intent_{branch}_directional_utility_gate",
+            rows[f"object_intent_{branch}_utility_gate"],
+        )
+        risk = rows.get(f"object_intent_{branch}_risk_utility_gate", directional)
+        source = policy.get(
+            "utility_source",
+            torch.zeros(candidate.shape[1], dtype=torch.long, device=candidate.device),
+        ).to(device=candidate.device, dtype=torch.long)
+        utility = torch.where(source[None] == 1, risk, directional)
         gate = policy["gate"].to(candidate)
         scale = policy["scale"].to(candidate)
         cutoff = policy["cutoff"].to(candidate)
@@ -509,6 +544,7 @@ def apply_object_intent_utility_policy_to_rows(
         rows[f"object_intent_{branch}_deploy_scale"] = scale[None].expand_as(candidate)
         rows[f"object_intent_{branch}_utility_cutoff"] = cutoff[None].expand_as(candidate)
         rows[f"object_intent_{branch}_utility_selected"] = selected.to(candidate.dtype)
+        rows[f"object_intent_{branch}_utility_source"] = source[None].expand_as(candidate)
         for kind in ("selected", "control"):
             key = f"object_intent_{branch}_{kind}_deleted_candidate"
             if key in rows:

@@ -285,6 +285,12 @@ class TIDAObjectIntentTransport(nn.Module):
         self.register_buffer("reason_deploy_scale", torch.zeros(num_reasons))
         self.register_buffer("action_utility_cutoff", torch.ones(num_actions))
         self.register_buffer("reason_utility_cutoff", torch.ones(num_reasons))
+        self.register_buffer(
+            "action_utility_source", torch.zeros(num_actions, dtype=torch.long)
+        )
+        self.register_buffer(
+            "reason_utility_source", torch.zeros(num_reasons, dtype=torch.long)
+        )
 
         # No tensor is shared between action and reason transport. This is the
         # task firewall: explanation gradients cannot move the action route.
@@ -308,6 +314,8 @@ class TIDAObjectIntentTransport(nn.Module):
         self.reason_pair_output = nn.Linear(dim, 1, bias=False)
         self.action_utility = _PrivateUtilityHead(dim)
         self.reason_utility = _PrivateUtilityHead(dim)
+        self.action_risk_utility = _PrivateUtilityHead(dim)
+        self.reason_risk_utility = _PrivateUtilityHead(dim)
         nn.init.zeros_(self.action_output.weight)
         nn.init.zeros_(self.reason_output.weight)
         nn.init.zeros_(self.action_pair_output.weight)
@@ -344,6 +352,8 @@ class TIDAObjectIntentTransport(nn.Module):
         self.reason_deploy_scale.copy_(reason_gate.to(self.reason_deploy_scale))
         self.action_utility_cutoff.zero_()
         self.reason_utility_cutoff.zero_()
+        self.action_utility_source.zero_()
+        self.reason_utility_source.zero_()
 
     @torch.no_grad()
     def set_deployment_policy(
@@ -355,6 +365,8 @@ class TIDAObjectIntentTransport(nn.Module):
         reason_scale: torch.Tensor,
         action_cutoff: torch.Tensor,
         reason_cutoff: torch.Tensor,
+        action_utility_source: torch.Tensor | None = None,
+        reason_utility_source: torch.Tensor | None = None,
         source: str,
     ) -> None:
         provenance = str(source).lower()
@@ -378,6 +390,17 @@ class TIDAObjectIntentTransport(nn.Module):
                 raise ValueError("deployment scales must be within [-64, 64]")
             if "cutoff" in name and not ((value >= 0) & (value <= 1)).all():
                 raise ValueError("utility cutoffs must be probabilities")
+            destination.copy_(value)
+        for name, value, destination in (
+            ("action_utility_source", action_utility_source, self.action_utility_source),
+            ("reason_utility_source", reason_utility_source, self.reason_utility_source),
+        ):
+            if value is None:
+                destination.zero_()
+                continue
+            value = torch.as_tensor(value, device=destination.device, dtype=torch.long)
+            if value.shape != destination.shape or not ((value == 0) | (value == 1)).all():
+                raise ValueError(f"{name} must contain one directional/risk id per label")
             destination.copy_(value)
 
     @staticmethod
@@ -922,19 +945,39 @@ class TIDAObjectIntentTransport(nn.Module):
         reason_pair_entropy = -(
             reason_pair_attention * reason_pair_attention.clamp_min(1e-8).log()
         ).sum((-1, -2))
-        action_utility_logit = self.action_utility(
+        action_utility_features = torch.stack((
+            base_action_logits, action_candidate, action_support,
+            action_pair_support, action_entropy, action_pair_entropy,
+        ), dim=-1)
+        reason_utility_features = torch.stack((
+            base_reason_logits, reason_candidate, reason_support,
+            reason_pair_support, reason_entropy, reason_pair_entropy,
+        ), dim=-1)
+        action_directional_utility_logit = self.action_utility(
             action_nodes, action_evidence, action_pair_evidence,
-            torch.stack((
-                base_action_logits, action_candidate, action_support,
-                action_pair_support, action_entropy, action_pair_entropy,
-            ), dim=-1),
+            action_utility_features,
         )
-        reason_utility_logit = self.reason_utility(
+        reason_directional_utility_logit = self.reason_utility(
             reason_nodes, reason_evidence, reason_pair_evidence,
-            torch.stack((
-                base_reason_logits, reason_candidate, reason_support,
-                reason_pair_support, reason_entropy, reason_pair_entropy,
-            ), dim=-1),
+            reason_utility_features,
+        )
+        action_risk_utility_logit = self.action_risk_utility(
+            action_nodes, action_evidence, action_pair_evidence,
+            action_utility_features,
+        )
+        reason_risk_utility_logit = self.reason_risk_utility(
+            reason_nodes, reason_evidence, reason_pair_evidence,
+            reason_utility_features,
+        )
+        action_utility_logit = torch.where(
+            self.action_utility_source[None].to(action_candidate.device) == 1,
+            action_risk_utility_logit,
+            action_directional_utility_logit,
+        )
+        reason_utility_logit = torch.where(
+            self.reason_utility_source[None].to(reason_candidate.device) == 1,
+            reason_risk_utility_logit,
+            reason_directional_utility_logit,
         )
         action_utility_gate = action_utility_logit.sigmoid()
         reason_utility_gate = reason_utility_logit.sigmoid()
@@ -1102,6 +1145,16 @@ class TIDAObjectIntentTransport(nn.Module):
             "object_intent_reason_utility_cutoff": self.reason_utility_cutoff.to(reason_candidate)[None].expand_as(reason_candidate),
             "object_intent_action_utility_logit": action_utility_logit,
             "object_intent_reason_utility_logit": reason_utility_logit,
+            "object_intent_action_directional_utility_logit": action_directional_utility_logit,
+            "object_intent_reason_directional_utility_logit": reason_directional_utility_logit,
+            "object_intent_action_risk_utility_logit": action_risk_utility_logit,
+            "object_intent_reason_risk_utility_logit": reason_risk_utility_logit,
+            "object_intent_action_directional_utility_gate": action_directional_utility_logit.sigmoid(),
+            "object_intent_reason_directional_utility_gate": reason_directional_utility_logit.sigmoid(),
+            "object_intent_action_risk_utility_gate": action_risk_utility_logit.sigmoid(),
+            "object_intent_reason_risk_utility_gate": reason_risk_utility_logit.sigmoid(),
+            "object_intent_action_utility_source": self.action_utility_source.to(action_candidate)[None].expand_as(action_candidate),
+            "object_intent_reason_utility_source": self.reason_utility_source.to(reason_candidate)[None].expand_as(reason_candidate),
             "object_intent_action_utility_gate": action_utility_gate,
             "object_intent_reason_utility_gate": reason_utility_gate,
             "object_intent_action_utility_selected": action_selected_mask,
