@@ -20,7 +20,7 @@ New-Item -ItemType Directory -Force -Path $output | Out-Null
   --max-calib-samples 779 --max-test-samples 885 --max-optimizer-updates 699 `
   --schedule-total-updates 699 `
   --train-owners "object_intent_action_utility,object_intent_reason_utility" `
-  --eval-every-epochs 1 --run-kind full --skip-ema-eval --skip-expanded-eval --device cuda
+  --eval-every-epochs 1 --run-kind smoke --skip-ema-eval --skip-expanded-eval --device cuda
 
 $code = $LASTEXITCODE
 Set-Content -LiteralPath "$output\process_exit_code.txt" -Value $code -Encoding ascii
