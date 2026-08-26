@@ -241,6 +241,7 @@ def fit_object_intent_utility_policy_oof(
     min_selected_benefit_rate: float = 0.5,
     min_nll_improvement: float = 0.0,
     min_brier_improvement: float = 0.0,
+    min_positive_fold_fraction: float = 0.0,
     quantile_coverages: tuple[float, ...] = (),
     cap: float = 0.08,
     seed: int = 3407,
@@ -286,17 +287,19 @@ def fit_object_intent_utility_policy_oof(
     fold_ids = torch.empty(base_logits.shape[0], dtype=torch.long)
     fold_ids[permutation] = torch.arange(base_logits.shape[0]) % int(folds)
     fold_ids = fold_ids.to(base_logits.device)
-    scores = base_logits.new_zeros((len(candidates), base_logits.shape[1]))
+    fold_scores = base_logits.new_zeros(
+        (int(folds), len(candidates), base_logits.shape[1])
+    )
     for fold in range(int(folds)):
         holdout = fold_ids == fold
         for index, (scale, cutoff) in enumerate(candidates):
             selected = utility_gate[holdout] >= cutoff
             delta = (float(scale) * candidate_delta[holdout]).clamp(-float(cap), float(cap))
-            scores[index] += label_f1(
+            fold_scores[fold, index] = label_f1(
                 base_logits[holdout] + selected.to(delta.dtype) * delta,
                 target[holdout],
             )
-    scores /= float(folds)
+    scores = fold_scores.mean(0)
     candidate_selected_rate = base_logits.new_zeros(scores.shape)
     candidate_benefit_rate = base_logits.new_zeros(scores.shape)
     candidate_nll_improvement = base_logits.new_zeros(scores.shape)
@@ -327,7 +330,7 @@ def fit_object_intent_utility_policy_oof(
         ).square().mean(0)
     zero_indices = [i for i, (scale, _) in enumerate(candidates) if scale == 0.0]
     zero = zero_indices[0]
-    selected_indices, gains = [], []
+    selected_indices, gains, positive_fold_fractions = [], [], []
     for label in range(base_logits.shape[1]):
         eligible = [
             index for index, (scale, _) in enumerate(candidates)
@@ -347,11 +350,19 @@ def fit_object_intent_utility_policy_oof(
             ),
         )
         gain = scores[best, label] - scores[zero, label]
-        if float(gain) <= float(min_oof_gain):
+        positive_fold_fraction = (
+            fold_scores[:, best, label] > fold_scores[:, zero, label]
+        ).float().mean()
+        if (
+            float(gain) <= float(min_oof_gain)
+            or float(positive_fold_fraction) < float(min_positive_fold_fraction)
+        ):
             best = zero
             gain = gain.new_zeros(())
+            positive_fold_fraction = positive_fold_fraction.new_zeros(())
         selected_indices.append(best)
         gains.append(gain)
+        positive_fold_fractions.append(positive_fold_fraction)
     policy = [candidates[index] for index in selected_indices]
     return {
         "gate": base_logits.new_tensor([float(scale != 0.0) for scale, _ in policy]),
@@ -359,6 +370,8 @@ def fit_object_intent_utility_policy_oof(
         "cutoff": base_logits.new_tensor([cutoff for _, cutoff in policy]),
         "oof_gain": torch.stack(gains),
         "oof_scores": scores,
+        "oof_fold_scores": fold_scores,
+        "positive_fold_fraction": torch.stack(positive_fold_fractions),
         "selected_rate": torch.stack([
             candidate_selected_rate[index, label]
             for label, index in enumerate(selected_indices)

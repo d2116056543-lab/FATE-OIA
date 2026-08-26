@@ -225,6 +225,7 @@ deployment:
   object_intent_utility_min_oof_gain: 0.0
   object_intent_utility_max_selected_rate: 0.50
   object_intent_utility_min_selected_benefit_rate: 0.65
+  object_intent_utility_min_positive_fold_fraction: 0.80
   object_intent_utility_min_nll_improvement: 0.0
   object_intent_utility_min_brier_improvement: 0.0
   object_intent_utility_quantile_coverages: [0.25, 0.50]

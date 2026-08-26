@@ -232,6 +232,34 @@ def test_utility_policy_respects_coverage_and_benefit_precision_guards():
     assert policy["selected_rate"].tolist() == [0.0]
 
 
+def test_utility_policy_requires_cross_fold_stability():
+    samples = 100
+    generator = torch.Generator(device="cpu").manual_seed(3407)
+    permutation = torch.randperm(samples, generator=generator)
+    fold_ids = torch.empty(samples, dtype=torch.long)
+    fold_ids[permutation] = torch.arange(samples) % 5
+    target = (torch.arange(samples) % 2).float()[:, None]
+    sign = 2.0 * target - 1.0
+    base = 0.04 * sign
+    candidate = torch.zeros(samples, 1)
+    utility = torch.ones(samples, 1)
+    # Correct one deliberately flipped row in only three of five held-out folds.
+    # The mean gain is positive but is not reproducible enough for deployment.
+    for fold in range(3):
+        row = int((fold_ids == fold).nonzero()[0])
+        base[row] = -0.04 * sign[row]
+        candidate[row] = 0.02 * sign[row]
+
+    policy = fit_object_intent_utility_policy_oof(
+        base, candidate, utility, target, torch.tensor([0.5]),
+        scales=(0.0, 16.0), cutoffs=(0.0,), folds=5,
+        min_positive_fold_fraction=0.8, cap=0.08,
+    )
+
+    assert policy["scale"].tolist() == [0.0]
+    assert policy["positive_fold_fraction"].tolist() == [0.0]
+
+
 def test_inactive_utility_policy_is_not_reported_as_selected():
     rows = {
         "pre_object_intent_action": torch.zeros(4, 1),
