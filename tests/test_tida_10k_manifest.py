@@ -10,6 +10,7 @@ from fate_oia.engine.build_tida_balanced_pilot_manifest import (
     select_balanced_train_records,
     source_domain,
 )
+from fate_oia.engine.build_tida_source_complete_manifest import build_source_complete_records
 from fate_oia.datasets.tida_clip_manifest import TIDAClipRecord
 
 
@@ -217,6 +218,45 @@ def test_source_matched_merge_adds_batch1_and_batch2_without_test_leakage(tmp_pa
     train_sources = {row.source_video_id for row in merged if row.partition != "test"}
     test_sources = {row.source_video_id for row in merged if row.partition == "test"}
     assert train_sources.isdisjoint(test_sources)
+
+
+def test_source_complete_manifest_keeps_all_existing_rows_and_legal_legacy_train(tmp_path):
+    def record(name, batch, partition, source):
+        return TIDAClipRecord.from_dict({
+            "official_split": "test" if partition == "test" else "train",
+            "partition": partition, "file_name": name,
+            "target_image_path": str(tmp_path / name),
+            "clip_path": str(tmp_path / batch / f"{name}.mp4"),
+            "source_video_id": source, "duration_seconds": 5.0, "fps": 30.0,
+            "num_frames": 151, "target_timestamp_seconds": 5.0,
+            "target_frame_index": 150, "action": [1, 0, 0, 0],
+            "reason": [0] * 21, "source_batch": batch,
+        })
+
+    primary = [
+        record("b3-core.jpg", "bdd_oia_linxxx3_batch3", "train_core", "b3-core"),
+        record("fixed.jpg", "bdd_oia_1000_train_test", "test", "fixed_prev5s"),
+    ]
+    legacy = [
+        record("b1-core.jpg", "bdd_oia_1000_train_test", "train_core", "b1-core"),
+        record("b2-audit.jpg", "bdd_oia_linxxx3_batch2", "train_audit", "b2-audit"),
+        record("same-train-source.jpg", "bdd_oia_1000_train_test", "train_audit", "b3-core"),
+        record("leak.jpg", "bdd_oia_1000_train_test", "train_core", "fixed"),
+    ]
+
+    merged, audit = build_source_complete_records(primary, legacy)
+
+    assert {row.file_name for row in merged} == {
+        "b3-core.jpg", "fixed.jpg", "b1-core.jpg", "b2-audit.jpg",
+        "same-train-source.jpg",
+    }
+    assert audit["pass"] is True
+    assert audit["partition_counts"] == {
+        "train_core": 3, "train_calib": 0, "train_audit": 1, "test": 1,
+    }
+    assert audit["source_matched_merge"]["excluded_test_source_overlap"] == 1
+    assert audit["source_matched_merge"]["reassigned_existing_source_partition"] == 1
+    assert audit["train_test_source_overlap"] == 0
 
 
 def test_balanced_selection_redistributes_a_capacity_limited_domain(tmp_path):

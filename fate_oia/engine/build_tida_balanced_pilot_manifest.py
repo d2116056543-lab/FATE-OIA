@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
+from dataclasses import replace
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -9,6 +10,7 @@ from pathlib import Path
 from ..datasets.tida_clip_manifest import (
     TIDAClipRecord,
     load_manifest,
+    normalize_source_id,
     validate_records,
     write_manifest,
 )
@@ -27,13 +29,21 @@ def source_domain(record: TIDAClipRecord) -> str:
 def merge_source_matched_records(
     expanded_records: list[TIDAClipRecord],
     legacy_records: list[TIDAClipRecord],
+    *,
+    allow_existing_train_source: bool = False,
 ) -> tuple[list[TIDAClipRecord], dict[str, object]]:
     """Add source-disjoint Batch1/2 training rows to the expanded protocol."""
     test_sources = {
-        row.source_video_id for row in expanded_records if row.partition == "test"
+        normalize_source_id(row.source_video_id)
+        for row in expanded_records if row.partition == "test"
     }
     existing_train_sources = {
-        row.source_video_id for row in expanded_records if row.partition != "test"
+        normalize_source_id(row.source_video_id)
+        for row in expanded_records if row.partition != "test"
+    }
+    existing_train_partitions = {
+        normalize_source_id(row.source_video_id): row.partition
+        for row in expanded_records if row.partition != "test"
     }
     merged = list(expanded_records)
     seen_files = {row.file_name.lower() for row in merged}
@@ -42,27 +52,39 @@ def merge_source_matched_records(
     excluded_existing_source_overlap = 0
     excluded_nonlegacy_domain = 0
     excluded_duplicate_file = 0
+    reassigned_existing_source_partition = 0
     for row in legacy_records:
         domain = source_domain(row)
+        source_id = normalize_source_id(row.source_video_id)
         if row.partition == "test":
             continue
         if domain not in {"batch1", "batch2"}:
             excluded_nonlegacy_domain += 1
             continue
-        if row.source_video_id in test_sources:
+        if source_id in test_sources:
             excluded_test_source_overlap += 1
             continue
-        if row.source_video_id in existing_train_sources:
+        if not allow_existing_train_source and source_id in existing_train_sources:
             excluded_existing_source_overlap += 1
             continue
         if row.file_name.lower() in seen_files:
             excluded_duplicate_file += 1
             continue
+        if allow_existing_train_source and source_id in existing_train_partitions:
+            owner_partition = existing_train_partitions[source_id]
+            if row.partition != owner_partition:
+                row = replace(row, partition=owner_partition)
+                reassigned_existing_source_partition += 1
         merged.append(row)
         seen_files.add(row.file_name.lower())
+        existing_train_sources.add(source_id)
+        existing_train_partitions[source_id] = row.partition
         added_counts[domain] += 1
     merged.sort(key=lambda row: (row.partition, row.file_name.lower()))
-    train_sources = {row.source_video_id for row in merged if row.partition != "test"}
+    train_sources = {
+        normalize_source_id(row.source_video_id)
+        for row in merged if row.partition != "test"
+    }
     overlap = train_sources & test_sources
     if overlap:
         raise ValueError(f"source-matched merge leaked {len(overlap)} test sources")
@@ -72,6 +94,7 @@ def merge_source_matched_records(
         "excluded_existing_source_overlap": excluded_existing_source_overlap,
         "excluded_nonlegacy_domain": excluded_nonlegacy_domain,
         "excluded_duplicate_file": excluded_duplicate_file,
+        "reassigned_existing_source_partition": reassigned_existing_source_partition,
         "train_test_source_overlap": 0,
     }
 

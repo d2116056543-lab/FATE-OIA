@@ -151,3 +151,34 @@ def test_raw_frame_store_bypasses_native_video_decoder(tmp_path):
 
     assert sample["context_images"].shape == (14, 3, 192, 344)
     assert sample["frame_valid_mask"].all()
+
+
+def test_raw_frame_store_uses_semicolon_separated_fallback_roots(tmp_path):
+    target = tmp_path / "target.jpg"; Image.new("RGB", (32, 18), "white").save(target)
+    clip = tmp_path / "clip.mp4"; clip.write_bytes(b"stub")
+    row = {
+        "official_split": "train", "partition": "train_core", "file_name": "fallback.jpg",
+        "target_image_path": str(target), "clip_path": str(clip), "source_video_id": "fallback",
+        "duration_seconds": 5.0, "fps": 30.0, "num_frames": 151,
+        "target_timestamp_seconds": 5.0, "target_frame_index": 150,
+        "action": [1, 0, 0, 0], "reason": [0] * 21,
+    }
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    first = tmp_path / "frames-a"; first.mkdir()
+    second = tmp_path / "frames-b"
+    case_dir = second / "train_audit" / "fallback"; case_dir.mkdir(parents=True)
+    for position in range(14):
+        Image.new("RGB", (32, 18), (position, 0, 0)).save(case_dir / f"{position:02d}.jpg")
+
+    def forbidden_decoder(_path, _indices):
+        raise AssertionError("fallback raw-frame root must bypass video decoding")
+
+    dataset = BDDOIAVideoDataset(
+        manifest, "train_core", decoder=forbidden_decoder,
+        frame_store_root=f"{first};{second}",
+    )
+    sample = dataset[0]
+
+    assert len(dataset.frame_store_roots) == 2
+    assert sample["context_images"].shape == (14, 3, 192, 344)

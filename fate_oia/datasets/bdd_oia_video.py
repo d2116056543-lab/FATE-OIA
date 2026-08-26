@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import random
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 import torch
 from torch.utils.data import Dataset
@@ -132,7 +132,7 @@ class BDDOIAVideoDataset(Dataset):
         seed: int = 20260821,
         max_samples: int | None = None,
         object_track_store_path: str | Path | None = None,
-        frame_store_root: str | Path | None = None,
+        frame_store_root: str | Path | Sequence[str | Path] | None = None,
     ) -> None:
         self.records = [record for record in load_manifest(manifest_path) if record.partition == partition]
         if max_samples is not None:
@@ -149,9 +149,25 @@ class BDDOIAVideoDataset(Dataset):
         self.object_track_indices: dict[str, int] | None = None
         self.object_tracks_xy: torch.Tensor | None = None
         self.object_tracks_visibility: torch.Tensor | None = None
-        self.frame_store_root = Path(frame_store_root) if frame_store_root is not None else None
-        if self.frame_store_root is not None and not self.frame_store_root.is_dir():
-            raise FileNotFoundError(f"raw frame store does not exist: {self.frame_store_root}")
+        if frame_store_root is None:
+            self.frame_store_roots: tuple[Path, ...] = ()
+        elif isinstance(frame_store_root, (str, Path)):
+            values = str(frame_store_root).split(";") if isinstance(frame_store_root, str) else [frame_store_root]
+            self.frame_store_roots = tuple(Path(value) for value in values if str(value).strip())
+        else:
+            self.frame_store_roots = tuple(Path(value) for value in frame_store_root)
+        for root in self.frame_store_roots:
+            if not root.is_dir():
+                raise FileNotFoundError(f"raw frame store does not exist: {root}")
+        self.frame_store_root = self.frame_store_roots[0] if self.frame_store_roots else None
+        self.frame_case_dirs: dict[str, Path] = {}
+        for root in self.frame_store_roots:
+            for partition_dir in root.iterdir():
+                if not partition_dir.is_dir():
+                    continue
+                for case_dir in partition_dir.iterdir():
+                    if case_dir.is_dir():
+                        self.frame_case_dirs.setdefault(case_dir.name.lower(), case_dir)
         if object_track_store_path is not None:
             payload = torch.load(object_track_store_path, map_location="cpu", weights_only=True)
             names = payload["file_names"]
@@ -180,7 +196,7 @@ class BDDOIAVideoDataset(Dataset):
             index, augmentation_seed = int(index[0]), int(index[1])
         record = self.records[index]
         requested_timestamps = quadratic_multirate_timestamps()
-        if self.training and self.object_track_indices is None and self.frame_store_root is None:
+        if self.training and self.object_track_indices is None and not self.frame_store_roots:
             requested_timestamps = jitter_timestamps(requested_timestamps, random.Random(augmentation_seed))
         frame_indices = timestamps_to_indices(requested_timestamps, record.fps, record.target_frame_index)
         timestamps = (frame_indices.to(torch.float32) - float(record.target_frame_index)) / float(record.fps)
@@ -189,10 +205,13 @@ class BDDOIAVideoDataset(Dataset):
             raise ValueError(f"actual decoded timestamps are not strictly increasing: {record.file_name}")
         # The audited terminal JPEG is the prediction frame. Decoding the same
         # terminal video frame again wastes work and is discarded below.
-        if self.frame_store_root is None:
+        if not self.frame_store_roots:
             decoded, decoded_valid = self.decoder(record.clip_path, frame_indices[:-1])
         else:
-            case_dir = self.frame_store_root / record.partition / Path(record.file_name).stem
+            key = Path(record.file_name).stem.lower()
+            if key not in self.frame_case_dirs:
+                raise KeyError(f"raw frame stores are missing {record.file_name}")
+            case_dir = self.frame_case_dirs[key]
             decoded = [Image.open(case_dir / f"{position:02d}.jpg").convert("RGB") for position in range(14)]
             decoded_valid = torch.ones(14, dtype=torch.bool)
         target = Image.open(record.target_image_path).convert("RGB")

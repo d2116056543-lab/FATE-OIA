@@ -1110,7 +1110,10 @@ def train(args: Any) -> None:
             file_sha256(config["model"]["object_intent_role_checkpoint"])
             if config["model"].get("object_intent_role_checkpoint") else None
         ),
-        "frame_store_root": str(Path(frame_store_root).resolve()) if frame_store_root else None,
+        "frame_store_root": str(frame_store_root) if frame_store_root else None,
+        "frame_store_roots": [
+            str(Path(value).resolve()) for value in str(frame_store_root).split(";") if value
+        ] if frame_store_root else [],
         "frame_store_semantics": "raw_rgb_jpeg_only_no_features" if frame_store_root else "online_video_decode",
     }
     atomic_write_json(output_dir / "run_manifest.json", manifest)
