@@ -1167,12 +1167,43 @@ def train(args: Any) -> None:
 
     baseline_path = output_dir / "TIDA_IMAGE_BASELINE_COVERED_SUBSET.json"
     model.eval()
-    baseline_calib_rows = collect_tida_outputs(
-        model, runtime.loaders["train_calib"], device, temporal_scale=0.0
-    )
-    baseline_thresholds = _deployment_thresholds(
-        baseline_calib_rows, config.get("deployment", {})
-    )
+    verified_baseline_arg = _arg(args, "verified_baseline_artifact", None)
+    if utility_only_training and verified_baseline_arg:
+        verified_baseline_path = Path(verified_baseline_arg).resolve()
+        verified = json.loads(verified_baseline_path.read_text(encoding="utf-8"))
+        expected_test_count = len(runtime.loaders["test"].dataset)
+        if not (
+            verified.get("pass") is True
+            and int(verified.get("covered_test_count", -1)) == expected_test_count
+            and verified.get("threshold_fit_split") == "train_calib"
+            and verified.get("test_labels_used_for_parameters") is False
+        ):
+            raise ValueError("verified baseline artifact does not match this utility-only run")
+        locked = config.get("deployment", {}).get("locked_image_thresholds")
+        if locked is None or len(locked) != model.num_actions + model.num_reasons:
+            raise ValueError("utility-only baseline reuse requires locked image thresholds")
+        baseline_thresholds = {
+            "image": torch.as_tensor(locked, dtype=torch.float32, device=device)
+        }
+        atomic_write_json(baseline_path, {
+            **verified,
+            "reused_for_utility_only": True,
+            "verified_source_path": str(verified_baseline_path),
+            "verified_source_sha256": file_sha256(verified_baseline_path),
+            "reuse_semantics": "metrics_only_no_feature_or_logit_cache",
+        })
+        manifest["verified_baseline_reused"] = True
+        manifest["verified_baseline_artifact"] = str(verified_baseline_path)
+        manifest["verified_baseline_artifact_sha256"] = file_sha256(
+            verified_baseline_path
+        )
+    else:
+        baseline_calib_rows = collect_tida_outputs(
+            model, runtime.loaders["train_calib"], device, temporal_scale=0.0
+        )
+        baseline_thresholds = _deployment_thresholds(
+            baseline_calib_rows, config.get("deployment", {})
+        )
     action_deploy_boundary_logits = torch.logit(
         baseline_thresholds["image"][: model.num_actions].to(device).clamp(1e-5, 1.0 - 1e-5)
     )
@@ -1833,6 +1864,10 @@ def main() -> None:
     parser.add_argument("--train-owners", help="comma-separated optimizer owners; other owner LRs are zero")
     parser.add_argument("--object-track-store", help="audited frozen-CoTracker coordinate observations")
     parser.add_argument("--frame-store-root", help="fixed sampled raw RGB JPEG frames; never model features")
+    parser.add_argument(
+        "--verified-baseline-artifact",
+        help="reuse a validated metrics-only baseline for utility-only training",
+    )
     args = parser.parse_args()
     train(args)
 
