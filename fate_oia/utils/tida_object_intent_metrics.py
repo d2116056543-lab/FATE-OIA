@@ -448,6 +448,46 @@ def combine_object_intent_utility_policies(
     return result
 
 
+_OBJECT_INTENT_POLICY_KEYS = (
+    "pre_object_intent_action",
+    "pre_object_intent_reason",
+    "object_intent_action_candidate",
+    "object_intent_reason_candidate",
+    "object_intent_action_directional_utility_gate",
+    "object_intent_reason_directional_utility_gate",
+    "object_intent_action_risk_utility_gate",
+    "object_intent_reason_risk_utility_gate",
+    "action_target",
+    "reason_target",
+)
+
+
+def concatenate_object_intent_policy_rows(
+    cohorts: tuple[tuple[str, dict[str, torch.Tensor]], ...],
+) -> dict[str, torch.Tensor | dict[str, int]]:
+    """Pool independent train-only cohorts for a more stable route policy."""
+    if not cohorts:
+        raise ValueError("at least one train-only policy cohort is required")
+    sizes: dict[str, int] = {}
+    for name, rows in cohorts:
+        normalized = str(name).lower()
+        if "test" in normalized or "oracle" in normalized or not normalized.startswith("train_"):
+            raise ValueError("object-intent policy cohorts must be train-only")
+        missing = [key for key in _OBJECT_INTENT_POLICY_KEYS if key not in rows]
+        if missing:
+            raise KeyError(f"policy cohort {name} is missing: {missing}")
+        row_count = int(rows["action_target"].shape[0])
+        if row_count <= 0 or any(int(rows[key].shape[0]) != row_count for key in _OBJECT_INTENT_POLICY_KEYS):
+            raise ValueError(f"policy cohort {name} has inconsistent row counts")
+        sizes[str(name)] = row_count
+    combined: dict[str, torch.Tensor | dict[str, int]] = {
+        key: torch.cat([rows[key] for _, rows in cohorts], dim=0)
+        for key in _OBJECT_INTENT_POLICY_KEYS
+    }
+    combined["_policy_cohort_sizes"] = sizes
+    return combined
+
+
 def fit_object_intent_gates_from_rows(
     rows: dict[str, torch.Tensor],
     *,

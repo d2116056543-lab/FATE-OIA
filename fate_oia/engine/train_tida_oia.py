@@ -56,6 +56,7 @@ from fate_oia.utils.tida_object_intent_metrics import (
     apply_object_intent_gates_to_rows,
     apply_object_intent_utility_policy_to_rows,
     combine_object_intent_utility_policies,
+    concatenate_object_intent_policy_rows,
     fit_object_intent_gates_from_rows,
     fit_object_intent_utility_policy_oof,
     object_intent_traffic_metrics,
@@ -654,6 +655,7 @@ def build_runtime(args: Any, evaluation_only: bool = False) -> TIDARuntime:
     max_eval_samples = _arg(args, "max_eval_samples", None)
     max_calib_samples = _arg(args, "max_calib_samples", max_eval_samples)
     max_test_samples = _arg(args, "max_test_samples", max_eval_samples)
+    max_audit_samples = _arg(args, "max_audit_samples", max_eval_samples)
     object_track_store = _arg(args, "object_track_store", None)
     frame_store_root = _arg(args, "frame_store_root", None)
     datasets = {
@@ -665,7 +667,8 @@ def build_runtime(args: Any, evaluation_only: bool = False) -> TIDARuntime:
             max_samples=(
                 max_samples if partition == "train_core" else
                 max_calib_samples if partition == "train_calib" else
-                max_test_samples if partition == "test" else max_eval_samples
+                max_test_samples if partition == "test" else
+                max_audit_samples if partition == "train_audit" else max_eval_samples
             ),
             object_track_store_path=object_track_store,
             frame_store_root=frame_store_root,
@@ -908,14 +911,20 @@ def _view_metrics(test_rows, calib_rows, deployment_config):
     }
 
 
-def calibrate_object_intent_deployment(model, calib_rows, deployment_config):
+def calibrate_object_intent_deployment(
+    model, calib_rows, deployment_config, *, policy_rows=None,
+):
     if not getattr(model, "object_intent_enabled", False):
         return calib_rows, None
     locked_thresholds = deployment_config.get("locked_image_thresholds")
     if locked_thresholds is None:
         raise ValueError("object-intent deployment requires locked train-calib thresholds")
+    policy_rows = calib_rows if policy_rows is None else policy_rows
+    policy_cohort_sizes = policy_rows.get(
+        "_policy_cohort_sizes", {"train_calib": int(calib_rows["action_target"].shape[0])}
+    )
     fit = fit_object_intent_gates_from_rows(
-        calib_rows,
+        policy_rows,
         min_samples=int(deployment_config.get("object_intent_min_calib_samples", 16)),
         min_nll_improvement=float(
             deployment_config.get("object_intent_min_nll_improvement", 1e-4)
@@ -928,12 +937,12 @@ def calibrate_object_intent_deployment(model, calib_rows, deployment_config):
     action_gate = fit["action"]["gate"]
     reason_gate = fit["reason"]["gate"]
     utility_available = all(
-        f"object_intent_{branch}_{kind}_utility_gate" in calib_rows
+        f"object_intent_{branch}_{kind}_utility_gate" in policy_rows
         for branch in ("action", "reason")
         for kind in ("directional", "risk")
     )
     if utility_available:
-        action_count = calib_rows["action_target"].shape[1]
+        action_count = policy_rows["action_target"].shape[1]
         common_policy_kwargs = dict(
             scales=tuple(deployment_config.get(
                 "object_intent_action_utility_scales", [0, 4, 8, 16, 32, 64]
@@ -954,18 +963,18 @@ def calibrate_object_intent_deployment(model, calib_rows, deployment_config):
             cap=float(model.object_intent.action_cap),
         )
         action_directional_policy = fit_object_intent_utility_policy_oof(
-            calib_rows["pre_object_intent_action"],
-            calib_rows["object_intent_action_candidate"],
-            calib_rows["object_intent_action_directional_utility_gate"],
-            calib_rows["action_target"],
+            policy_rows["pre_object_intent_action"],
+            policy_rows["object_intent_action_candidate"],
+            policy_rows["object_intent_action_directional_utility_gate"],
+            policy_rows["action_target"],
             torch.as_tensor(locked_thresholds)[:action_count],
             **common_policy_kwargs,
         )
         action_risk_policy = fit_object_intent_utility_policy_oof(
-            calib_rows["pre_object_intent_action"],
-            calib_rows["object_intent_action_candidate"],
-            calib_rows["object_intent_action_risk_utility_gate"],
-            calib_rows["action_target"],
+            policy_rows["pre_object_intent_action"],
+            policy_rows["object_intent_action_candidate"],
+            policy_rows["object_intent_action_risk_utility_gate"],
+            policy_rows["action_target"],
             torch.as_tensor(locked_thresholds)[:action_count],
             **common_policy_kwargs,
         )
@@ -973,10 +982,10 @@ def calibrate_object_intent_deployment(model, calib_rows, deployment_config):
             action_directional_policy, action_risk_policy
         )
         reason_directional_policy = fit_object_intent_utility_policy_oof(
-            calib_rows["pre_object_intent_reason"],
-            calib_rows["object_intent_reason_candidate"],
-            calib_rows["object_intent_reason_directional_utility_gate"],
-            calib_rows["reason_target"],
+            policy_rows["pre_object_intent_reason"],
+            policy_rows["object_intent_reason_candidate"],
+            policy_rows["object_intent_reason_directional_utility_gate"],
+            policy_rows["reason_target"],
             torch.as_tensor(locked_thresholds)[action_count:],
             scales=tuple(deployment_config.get(
                 "object_intent_reason_utility_scales", [0, 2, 4, 8, 16, 32]
@@ -997,10 +1006,10 @@ def calibrate_object_intent_deployment(model, calib_rows, deployment_config):
             cap=float(model.object_intent.reason_cap),
         )
         reason_risk_policy = fit_object_intent_utility_policy_oof(
-            calib_rows["pre_object_intent_reason"],
-            calib_rows["object_intent_reason_candidate"],
-            calib_rows["object_intent_reason_risk_utility_gate"],
-            calib_rows["reason_target"],
+            policy_rows["pre_object_intent_reason"],
+            policy_rows["object_intent_reason_candidate"],
+            policy_rows["object_intent_reason_risk_utility_gate"],
+            policy_rows["reason_target"],
             torch.as_tensor(locked_thresholds)[action_count:],
             scales=tuple(deployment_config.get(
                 "object_intent_reason_utility_scales", [0, 2, 4, 8, 16, 32]
@@ -1050,6 +1059,11 @@ def calibrate_object_intent_deployment(model, calib_rows, deployment_config):
         if torch.is_tensor(value):
             return value.tolist()
         return value
+    fit["policy_provenance"] = {
+        "cohort_sizes": policy_cohort_sizes,
+        "test_labels_used": False,
+        "threshold_source": "train_calib_locked",
+    }
     serializable = {
         task: {key: serialize(value) for key, value in values.items()}
         for task, values in fit.items()
@@ -1139,6 +1153,7 @@ def train(args: Any) -> None:
         "counterfactual_reruns_skipped_for_utility_only": utility_only_training,
         "max_train_samples": _arg(args, "max_samples", None),
         "max_eval_samples": _arg(args, "max_eval_samples", None),
+        "max_audit_samples": _arg(args, "max_audit_samples", None),
         "max_calib_samples": _arg(args, "max_calib_samples", None),
         "max_test_samples": _arg(args, "max_test_samples", None),
         "skip_ema_eval": bool(_arg(args, "skip_ema_eval", False)),
@@ -1528,6 +1543,13 @@ def train(args: Any) -> None:
                     "object_intent_action_candidate_rms": float(
                         output["object_intent_action_candidate"].float().square().mean().sqrt().detach().cpu()
                     ),
+                    "object_intent_action_lateral_candidate_rms": float(
+                        output["object_intent_action_lateral_candidate"].float().square().mean().sqrt().detach().cpu()
+                    ),
+                    "object_intent_action_lateral_candidate_rms_by_label": (
+                        output["object_intent_action_lateral_candidate"].float()
+                        .square().mean(0).sqrt().detach().cpu().tolist()
+                    ),
                     "object_intent_reason_candidate_rms": float(
                         output["object_intent_reason_candidate"].float().square().mean().sqrt().detach().cpu()
                     ),
@@ -1729,8 +1751,19 @@ def train(args: Any) -> None:
             continue
         model.eval()
         online_calib = collect_tida_outputs(model, runtime.loaders["train_calib"], device)
+        online_policy_rows = None
+        if bool(config.get("deployment", {}).get(
+            "object_intent_utility_policy_use_train_audit", False
+        )):
+            online_audit = collect_tida_outputs(
+                model, runtime.loaders["train_audit"], device
+            )
+            online_policy_rows = concatenate_object_intent_policy_rows((
+                ("train_calib", online_calib), ("train_audit", online_audit),
+            ))
         online_calib, online_object_gate_fit = calibrate_object_intent_deployment(
-            model, online_calib, config.get("deployment", {})
+            model, online_calib, config.get("deployment", {}),
+            policy_rows=online_policy_rows,
         )
         online_test = collect_tida_outputs(
             model, runtime.loaders["test"], device,
@@ -1760,8 +1793,19 @@ def train(args: Any) -> None:
                 ema_calib = collect_tida_outputs(
                     model, runtime.loaders["train_calib"], device
                 )
+                ema_policy_rows = None
+                if bool(config.get("deployment", {}).get(
+                    "object_intent_utility_policy_use_train_audit", False
+                )):
+                    ema_audit = collect_tida_outputs(
+                        model, runtime.loaders["train_audit"], device
+                    )
+                    ema_policy_rows = concatenate_object_intent_policy_rows((
+                        ("train_calib", ema_calib), ("train_audit", ema_audit),
+                    ))
                 ema_calib, ema_object_gate_fit = calibrate_object_intent_deployment(
-                    model, ema_calib, config.get("deployment", {})
+                    model, ema_calib, config.get("deployment", {}),
+                    policy_rows=ema_policy_rows,
                 )
                 ema_test = collect_tida_outputs(
                     model, runtime.loaders["test"], device
@@ -1859,6 +1903,7 @@ def main() -> None:
     parser.add_argument("--max-eval-samples", type=int)
     parser.add_argument("--max-calib-samples", type=int)
     parser.add_argument("--max-test-samples", type=int)
+    parser.add_argument("--max-audit-samples", type=int)
     parser.add_argument("--skip-ema-eval", action="store_true")
     parser.add_argument("--skip-expanded-eval", action="store_true")
     parser.add_argument("--eval-every-epochs", type=int, default=1)

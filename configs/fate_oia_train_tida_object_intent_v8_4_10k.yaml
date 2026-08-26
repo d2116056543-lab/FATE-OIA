@@ -194,6 +194,7 @@ training:
     object_intent_reason: 0.00030
     object_intent_action_utility: 0.00050
     object_intent_reason_utility: 0.00030
+    object_intent_lateral_refinement: 0.00050
 memory_probe:
   max_reserved_gib: 43.0
   max_growth_gib: 0.25
@@ -218,6 +219,9 @@ runtime:
   print_every_optimizer_updates: 50
   exact_resume: true
 deployment:
+  # Policy fitting uses labels from independent train-only cohorts. Deployment
+  # thresholds remain locked to train_calib; test is evaluation-only.
+  object_intent_utility_policy_use_train_audit: true
   object_intent_min_calib_samples: 16
   object_intent_min_nll_improvement: 0.000001
   object_intent_min_fixed_f1_improvement: 0.0

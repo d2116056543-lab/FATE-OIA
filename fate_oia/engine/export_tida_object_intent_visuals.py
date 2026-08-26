@@ -15,6 +15,68 @@ def _load(epoch_dir: Path, name: str) -> torch.Tensor:
     return torch.load(epoch_dir / f"{name}_test.pt", map_location="cpu", weights_only=True)
 
 
+def _load_optional(
+    epoch_dir: Path, name: str, fallback: torch.Tensor,
+) -> torch.Tensor:
+    path = epoch_dir / f"{name}_test.pt"
+    return (
+        torch.load(path, map_location="cpu", weights_only=True)
+        if path.exists() else fallback
+    )
+
+
+def _write_effectiveness_dashboard(epoch_dir: Path, output_dir: Path) -> None:
+    source = epoch_dir / "object_intent_traffic_effectiveness.json"
+    if not source.exists():
+        return
+    metrics = json.loads(source.read_text(encoding="utf-8"))
+    summary = {}
+    rows = []
+    for branch in ("action", "reason"):
+        values = metrics[branch]
+        summary[branch] = {
+            key: values.get(key) for key in (
+                "conditional_information_gain_bits",
+                "conditional_brier_improvement",
+                "selected_minus_random_deletion_gap",
+                "selected_minus_random_deletion_gap_ci95",
+                "net_corrected_labels",
+                "net_corrected_per_1000_labels",
+                "target_effective_route_rate",
+                "target_effective_route_rate_by_label",
+                "signed_margin_by_label",
+            )
+        }
+        rows.append(
+            "<tr>" + "".join(
+                f"<td>{html.escape(str(value))}</td>" for value in (
+                    branch,
+                    values.get("conditional_information_gain_bits"),
+                    values.get("selected_minus_random_deletion_gap"),
+                    values.get("selected_minus_random_deletion_gap_ci95"),
+                    values.get("net_corrected_labels"),
+                    values.get("target_effective_route_rate"),
+                )
+            ) + "</tr>"
+        )
+    (output_dir / "traffic_effectiveness_summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    (output_dir / "traffic_effectiveness_summary.html").write_text(
+        "<html><body><h1>Target-conditioned traffic effectiveness</h1>"
+        "<p>Information gain measures predictive value conditioned on the image "
+        "baseline. Deletion gap compares target-selected evidence with a "
+        "support-matched control and includes a bootstrap confidence interval.</p>"
+        "<table border='1'><tr><th>branch</th><th>conditional info gain (bits)</th>"
+        "<th>selected-random deletion gap</th><th>95% CI</th>"
+        "<th>net corrected labels</th><th>effective route rate</th></tr>"
+        + "".join(rows) + "</table><pre>"
+        + html.escape(json.dumps(summary, ensure_ascii=False, indent=2))
+        + "</pre></body></html>",
+        encoding="utf-8",
+    )
+
+
 def _pixel(point: torch.Tensor, width: int, height: int) -> tuple[int, int]:
     return (
         int((float(point[0]) + 1.0) * 0.5 * (width - 1)),
@@ -145,6 +207,26 @@ def export_object_intent_visuals(
     pair_distance_reduction = _load(epoch_dir, "object_intent_pair_distance_reduction")
     action_utility = _load(epoch_dir, "object_intent_action_utility_gate")
     reason_utility = _load(epoch_dir, "object_intent_reason_utility_gate")
+    action_directional_utility = _load_optional(
+        epoch_dir, "object_intent_action_directional_utility_gate", action_utility
+    )
+    reason_directional_utility = _load_optional(
+        epoch_dir, "object_intent_reason_directional_utility_gate", reason_utility
+    )
+    action_risk_utility = _load_optional(
+        epoch_dir, "object_intent_action_risk_utility_gate", action_utility
+    )
+    reason_risk_utility = _load_optional(
+        epoch_dir, "object_intent_reason_risk_utility_gate", reason_utility
+    )
+    action_utility_source = _load_optional(
+        epoch_dir, "object_intent_action_utility_source",
+        torch.zeros_like(action_utility, dtype=torch.long),
+    ).long()
+    reason_utility_source = _load_optional(
+        epoch_dir, "object_intent_reason_utility_source",
+        torch.zeros_like(reason_utility, dtype=torch.long),
+    ).long()
     action_utility_selected = _load(
         epoch_dir, "object_intent_action_utility_selected"
     ).bool()
@@ -172,6 +254,7 @@ def export_object_intent_visuals(
                 image, tracks[index], visibility[index], future[index],
                 int(action_selected[index, target_id]), int(action_control[index, target_id]),
                 f"action {target_id}: utility={float(action_utility[index, target_id]):.3f} "
+                f"source={'risk' if int(action_utility_source[index, target_id]) else 'directional'} "
                 f"selected={bool(action_utility_selected[index, target_id])} "
                 f"scale={float(action_deploy_scale[index, target_id]):.1f}",
             ).save(case_dir / name)
@@ -203,6 +286,7 @@ def export_object_intent_visuals(
                 image, tracks[index], visibility[index], future[index],
                 int(reason_selected[index, target_id]), int(reason_control[index, target_id]),
                 f"reason {target_id}: utility={float(reason_utility[index, target_id]):.3f} "
+                f"source={'risk' if int(reason_utility_source[index, target_id]) else 'directional'} "
                 f"selected={bool(reason_utility_selected[index, target_id])} "
                 f"scale={float(reason_deploy_scale[index, target_id]):.1f}",
             ).save(case_dir / name)
@@ -235,6 +319,9 @@ def export_object_intent_visuals(
             "future_approach_risk_by_track": future_approach_risk[index].tolist(),
             "action": {
                 "utility": action_utility[index].tolist(),
+                "directional_utility": action_directional_utility[index].tolist(),
+                "risk_utility": action_risk_utility[index].tolist(),
+                "utility_source": action_utility_source[index].tolist(),
                 "utility_selected": action_utility_selected[index].tolist(),
                 "utility_cutoff": action_utility_cutoff[index].tolist(),
                 "deploy_scale": action_deploy_scale[index].tolist(),
@@ -256,6 +343,9 @@ def export_object_intent_visuals(
             },
             "reason": {
                 "utility": reason_utility[index].tolist(),
+                "directional_utility": reason_directional_utility[index].tolist(),
+                "risk_utility": reason_risk_utility[index].tolist(),
+                "utility_source": reason_utility_source[index].tolist(),
                 "utility_selected": reason_utility_selected[index].tolist(),
                 "utility_cutoff": reason_utility_cutoff[index].tolist(),
                 "deploy_scale": reason_deploy_scale[index].tolist(),
@@ -301,6 +391,7 @@ def export_object_intent_visuals(
         "<html><body><h1>TIDA object-intent cases</h1><ul>" + "".join(links)
         + "</ul></body></html>", encoding="utf-8",
     )
+    _write_effectiveness_dashboard(epoch_dir, output_dir)
 
 
 def main() -> None:

@@ -3,6 +3,7 @@ import torch
 from fate_oia.utils.tida_object_intent_metrics import (
     apply_object_intent_utility_policy_to_rows,
     combine_object_intent_utility_policies,
+    concatenate_object_intent_policy_rows,
     fit_object_intent_deployment_gates,
     fit_object_intent_utility_policy_oof,
     object_intent_traffic_metrics,
@@ -358,3 +359,48 @@ def test_apply_dual_policy_uses_selected_utility_without_test_labels():
 
     assert applied["object_intent_action_utility_selected"].all()
     assert applied["object_intent_action_utility_source"][0].tolist() == [0, 1]
+
+
+def test_policy_rows_concatenate_only_train_cohorts_and_preserve_order():
+    keys = (
+        "pre_object_intent_action", "pre_object_intent_reason",
+        "object_intent_action_candidate", "object_intent_reason_candidate",
+        "object_intent_action_directional_utility_gate",
+        "object_intent_reason_directional_utility_gate",
+        "object_intent_action_risk_utility_gate",
+        "object_intent_reason_risk_utility_gate",
+        "action_target", "reason_target",
+    )
+    calib = {key: torch.zeros(3, 2) for key in keys}
+    audit = {key: torch.ones(4, 2) for key in keys}
+
+    combined = concatenate_object_intent_policy_rows(
+        (("train_calib", calib), ("train_audit", audit))
+    )
+
+    assert combined["action_target"].shape == (7, 2)
+    assert combined["action_target"][:3].eq(0).all()
+    assert combined["action_target"][3:].eq(1).all()
+    assert combined["_policy_cohort_sizes"] == {"train_calib": 3, "train_audit": 4}
+
+
+def test_policy_rows_reject_test_or_oracle_cohorts():
+    rows = {
+        "pre_object_intent_action": torch.zeros(2, 1),
+        "pre_object_intent_reason": torch.zeros(2, 1),
+        "object_intent_action_candidate": torch.zeros(2, 1),
+        "object_intent_reason_candidate": torch.zeros(2, 1),
+        "object_intent_action_directional_utility_gate": torch.zeros(2, 1),
+        "object_intent_reason_directional_utility_gate": torch.zeros(2, 1),
+        "object_intent_action_risk_utility_gate": torch.zeros(2, 1),
+        "object_intent_reason_risk_utility_gate": torch.zeros(2, 1),
+        "action_target": torch.zeros(2, 1),
+        "reason_target": torch.zeros(2, 1),
+    }
+    for forbidden in ("test", "test_oracle", "oracle"):
+        try:
+            concatenate_object_intent_policy_rows(((forbidden, rows),))
+        except ValueError as error:
+            assert "train-only" in str(error)
+        else:
+            raise AssertionError(f"forbidden policy cohort {forbidden} was accepted")

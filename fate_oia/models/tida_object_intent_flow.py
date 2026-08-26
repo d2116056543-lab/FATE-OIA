@@ -242,6 +242,62 @@ class _PrivateUtilityHead(nn.Module):
         return self.network(features).squeeze(-1)
 
 
+class _LateralInteractionRefinement(nn.Module):
+    """Mirror-equivariant traffic refinement for left/right actions only."""
+
+    FEATURE_DIM = 11
+
+    def __init__(self, num_actions: int, cap: float = 0.04) -> None:
+        super().__init__()
+        if num_actions != 4:
+            raise ValueError("lateral interaction refinement requires four BDD-OIA actions")
+        self.num_actions = int(num_actions)
+        self.cap = float(cap)
+        self.network = nn.Sequential(
+            nn.LayerNorm(self.FEATURE_DIM),
+            nn.Linear(self.FEATURE_DIM, 32),
+            nn.SiLU(),
+            nn.Linear(32, 1),
+        )
+        nn.init.zeros_(self.network[-1].weight)
+        nn.init.zeros_(self.network[-1].bias)
+
+    def forward(
+        self,
+        action_attention: torch.Tensor,
+        geometry: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        if action_attention.ndim != 3 or action_attention.shape[1] != self.num_actions:
+            raise ValueError("action_attention must be [B,4,K]")
+        side_attention = action_attention[:, 2:4]
+        side_sign = side_attention.new_tensor((-1.0, 1.0))[None, :, None]
+        relative = geometry["ego_relative_xy"]
+        velocity = geometry["mean_velocity"]
+        future_x = geometry["future_xy"][..., 0]
+        support = geometry["support"]
+        weights = side_attention * support[:, None]
+        weights = weights / weights.sum(-1, keepdim=True).clamp_min(1e-8)
+
+        signed_x = side_sign * relative[:, None, :, 0]
+        signed_vx = side_sign * velocity[:, None, :, 0]
+        signed_future_x = side_sign[..., None] * future_x[:, None]
+        features = torch.cat((
+            signed_x[..., None],
+            relative[:, None, :, 1:2].expand(-1, 2, -1, -1),
+            signed_vx[..., None],
+            velocity[:, None, :, 1:2].expand(-1, 2, -1, -1),
+            signed_future_x,
+            geometry["future_approach_risk"][:, None, :, None].expand(-1, 2, -1, -1),
+            geometry["interaction_risk"][:, None, :, None].expand(-1, 2, -1, -1),
+            support[:, None, :, None].expand(-1, 2, -1, -1),
+        ), dim=-1)
+        pooled = torch.einsum("bsk,bskd->bsd", weights, features)
+        lateral = self.cap * torch.tanh(self.network(pooled).squeeze(-1))
+        result = lateral.new_zeros(lateral.shape[0], self.num_actions)
+        result[:, 2:4] = lateral
+        return result
+
+
 class TIDAObjectIntentTransport(nn.Module):
     """Target-private motion-semantic transport over reliable object tracks."""
 
@@ -316,10 +372,20 @@ class TIDAObjectIntentTransport(nn.Module):
         self.reason_utility = _PrivateUtilityHead(dim)
         self.action_risk_utility = _PrivateUtilityHead(dim)
         self.reason_risk_utility = _PrivateUtilityHead(dim)
+        self.action_lateral_refinement = _LateralInteractionRefinement(num_actions)
         nn.init.zeros_(self.action_output.weight)
         nn.init.zeros_(self.reason_output.weight)
         nn.init.zeros_(self.action_pair_output.weight)
         nn.init.zeros_(self.reason_pair_output.weight)
+
+    @staticmethod
+    def _attention_without_track(
+        attention: torch.Tensor, track_index: torch.Tensor,
+    ) -> torch.Tensor:
+        keep = torch.ones_like(attention)
+        keep.scatter_(-1, track_index[..., None], 0.0)
+        remaining = attention * keep
+        return remaining / remaining.sum(-1, keepdim=True).clamp_min(1e-8)
 
     def freeze_role_head(self) -> None:
         self.role_head.eval()
@@ -915,7 +981,12 @@ class TIDAObjectIntentTransport(nn.Module):
         reason_pair_candidate = 0.5 * self.reason_cap * reason_pair_support * torch.tanh(
             self.reason_pair_output(reason_pair_evidence).squeeze(-1)
         )
-        action_candidate = (action_unary_candidate + action_pair_candidate).clamp(
+        action_lateral_candidate = self.action_lateral_refinement(
+            action_attention, geometry
+        )
+        action_candidate = (
+            action_unary_candidate + action_pair_candidate + action_lateral_candidate
+        ).clamp(
             -self.action_cap, self.action_cap
         )
         reason_candidate = (reason_unary_candidate + reason_pair_candidate).clamp(
@@ -1008,10 +1079,12 @@ class TIDAObjectIntentTransport(nn.Module):
             reason_pair_indices, pair_support, reason_control_pair, self.reason_traffic_mask,
         )
         action_selected_pair_deleted = (
-            action_unary_candidate + action_selected_pair_deleted
+            action_unary_candidate + action_lateral_candidate
+            + action_selected_pair_deleted
         ).clamp(-self.action_cap, self.action_cap)
         action_control_pair_deleted = (
-            action_unary_candidate + action_control_pair_deleted
+            action_unary_candidate + action_lateral_candidate
+            + action_control_pair_deleted
         ).clamp(-self.action_cap, self.action_cap)
         reason_selected_pair_deleted = (
             reason_unary_candidate + reason_selected_pair_deleted
@@ -1026,6 +1099,12 @@ class TIDAObjectIntentTransport(nn.Module):
         reason_selected = reason_attention.argmax(-1)
         action_control = self._matched_control(action_attention, geometry["support"])
         reason_control = self._matched_control(reason_attention, geometry["support"])
+        action_selected_lateral = self.action_lateral_refinement(
+            self._attention_without_track(action_attention, action_selected), geometry
+        )
+        action_control_lateral = self.action_lateral_refinement(
+            self._attention_without_track(action_attention, action_control), geometry
+        )
         action_selected_deleted = self._deleted_candidate(
             self.action_encoder,
             self.action_output,
@@ -1083,10 +1162,10 @@ class TIDAObjectIntentTransport(nn.Module):
         # Unary deletion must keep the pair route fixed; otherwise its measured
         # effect also removes pair evidence and overstates the unary route.
         action_selected_deleted = (
-            action_selected_deleted + action_pair_candidate
+            action_selected_deleted + action_pair_candidate + action_selected_lateral
         ).clamp(-self.action_cap, self.action_cap)
         action_control_deleted = (
-            action_control_deleted + action_pair_candidate
+            action_control_deleted + action_pair_candidate + action_control_lateral
         ).clamp(-self.action_cap, self.action_cap)
         reason_selected_deleted = (
             reason_selected_deleted + reason_pair_candidate
@@ -1118,6 +1197,9 @@ class TIDAObjectIntentTransport(nn.Module):
         ).to(reason_candidate.dtype)
         return {
             "object_intent_action_candidate": action_candidate,
+            "object_intent_action_lateral_candidate": action_lateral_candidate,
+            "object_intent_action_selected_lateral_candidate": action_selected_lateral,
+            "object_intent_action_control_lateral_candidate": action_control_lateral,
             "object_intent_reason_candidate": reason_candidate,
             "object_intent_action_unary_candidate": action_unary_candidate,
             "object_intent_reason_unary_candidate": reason_unary_candidate,

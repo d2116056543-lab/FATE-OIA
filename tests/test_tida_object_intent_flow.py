@@ -44,6 +44,31 @@ def test_first_backward_opens_output_path_without_cross_task_gradient():
     assert all(parameter.grad is None or parameter.grad.abs().sum() == 0 for parameter in reason_parameters)
 
 
+def test_lateral_refinement_is_zero_init_bounded_and_action_private():
+    model = TIDAObjectIntentTransport(dim=16, num_actions=4, num_reasons=7, heads=4)
+    inputs = _inputs()
+    initial = model(*inputs[:3], (4, 5), *inputs[3:])
+    assert torch.equal(
+        initial["object_intent_action_lateral_candidate"], torch.zeros(2, 4)
+    )
+
+    with torch.no_grad():
+        model.action_lateral_refinement.network[-1].weight.fill_(0.25)
+        model.action_lateral_refinement.network[-1].bias.fill_(0.01)
+    output = model(*inputs[:3], (4, 5), *inputs[3:])
+    lateral = output["object_intent_action_lateral_candidate"]
+
+    assert torch.equal(lateral[:, :2], torch.zeros_like(lateral[:, :2]))
+    assert lateral[:, 2:].abs().max() <= model.action_lateral_refinement.cap
+    assert lateral[:, 2:].abs().sum() > 0
+    lateral[:, 2].sum().backward()
+    assert model.action_lateral_refinement.network[-1].weight.grad.abs().sum() > 0
+    assert all(
+        parameter.grad is None or parameter.grad.abs().sum() == 0
+        for parameter in model.reason_encoder.parameters()
+    )
+
+
 def test_invisible_tracks_cannot_receive_credit_and_time_reversal_changes_motion_evidence():
     model = TIDAObjectIntentTransport(dim=16, num_actions=4, num_reasons=7, heads=4)
     with torch.no_grad():

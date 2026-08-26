@@ -423,6 +423,11 @@ class TIDAOIAModel(nn.Module):
                 )
                 for parameter in module.parameters() if parameter.requires_grad
             ]
+            owners["object_intent_lateral_refinement"] = [
+                parameter
+                for parameter in self.object_intent.action_lateral_refinement.parameters()
+                if parameter.requires_grad
+            ]
             owners["object_intent_reason_utility"] = [
                 parameter
                 for module in (
