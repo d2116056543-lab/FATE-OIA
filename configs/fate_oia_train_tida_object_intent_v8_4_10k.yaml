@@ -146,6 +146,7 @@ loss:
   # remain the hard deployment boundary that protects the strong fallback.
   object_intent_action_aux: 0.15
   object_intent_action_rank: 0.10
+  object_intent_action_boundary: 0.50
   object_intent_action_smooth_ap: 0.50
   object_intent_action_deletion: 0.05
   object_intent_action_pair_deletion: 0.05

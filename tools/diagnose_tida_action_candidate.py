@@ -1,6 +1,7 @@
 import argparse
 import json
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import torch
@@ -13,6 +14,11 @@ ACTION_NAMES = ("forward", "stop", "left", "right")
 def load_tensor(epoch_dir: Path, name: str) -> np.ndarray:
     value = torch.load(epoch_dir / f"{name}_test.pt", map_location="cpu")
     return value.detach().float().numpy()
+
+
+def load_optional_tensor(epoch_dir: Path, name: str) -> Optional[np.ndarray]:
+    path = epoch_dir / f"{name}_test.pt"
+    return load_tensor(epoch_dir, name) if path.exists() else None
 
 
 def safe_auc(target: np.ndarray, score: np.ndarray) -> float:
@@ -42,6 +48,7 @@ def main() -> None:
     directional = load_tensor(epoch_dir, "object_intent_action_directional_utility_gate")
     risk = load_tensor(epoch_dir, "object_intent_action_risk_utility_gate")
     deployed = load_tensor(epoch_dir, "object_intent_action_delta")
+    lateral = load_optional_tensor(epoch_dir, "object_intent_action_lateral_candidate")
 
     with (epoch_dir / "calibration.json").open("r", encoding="utf-8") as handle:
         calibration = json.load(handle)
@@ -93,6 +100,24 @@ def main() -> None:
         near = np.abs(probability - threshold[action_id]) <= 0.10
         desired_sign = np.where(y > 0, 1.0, -1.0)
         sign_correct = desired_sign * d > 0
+        component_stats = {}
+        if lateral is not None:
+            components = {
+                "pre_lateral": d - lateral[:, action_id],
+                "lateral_only": lateral[:, action_id],
+                "full_candidate": d,
+            }
+            for component_name, component in components.items():
+                component_sign = desired_sign * component > 0
+                component_stats[component_name] = {
+                    "rms": float(np.sqrt(np.mean(component * component))),
+                    "sign_accuracy": float(component_sign.mean()),
+                    "near_boundary_sign_accuracy": (
+                        float(component_sign[near].mean()) if near.any() else None
+                    ),
+                    "ap": float(average_precision_score(y, component)),
+                    "auc": safe_auc(y, component),
+                }
         rows.append({
             "action_id": action_id,
             "action": name,
@@ -108,6 +133,7 @@ def main() -> None:
             "near_boundary_sign_accuracy": float(sign_correct[near].mean()) if near.any() else None,
             "candidate_rms": float(np.sqrt(np.mean(d * d))),
             "deployed_delta_rms": float(np.sqrt(np.mean(deployed[:, action_id] ** 2))),
+            "candidate_components": component_stats,
         })
 
     summary = {

@@ -285,6 +285,7 @@ def reason_firewall_gradient_audit(
         "trajectory_utility_calibration", "trajectory_delta",
         "relational_action_aux", "relational_action_rank", "relational_action_deletion",
         "object_intent_action_aux", "object_intent_action_rank",
+        "object_intent_action_boundary",
         "object_intent_action_smooth_ap", "object_intent_action_deletion",
         "object_intent_action_pair_deletion", "object_intent_action_no_harm",
         "object_intent_action_utility",

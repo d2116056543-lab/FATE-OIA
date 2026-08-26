@@ -722,6 +722,16 @@ def build_tida_loss_registry(
             ),
         )
         registry.add(
+            "object_intent_action_boundary",
+            trajectory_boundary_correction_loss(
+                output["pre_object_intent_video_action_logits"],
+                action_candidate,
+                action_target,
+                output["object_intent_action_support"],
+                deploy_boundary_logits=deploy_action_boundary_logits,
+            ),
+        )
+        registry.add(
             "object_intent_action_smooth_ap",
             action_smooth_ap_loss(
                 output["pre_object_intent_video_action_logits"].detach()
