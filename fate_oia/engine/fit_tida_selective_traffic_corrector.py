@@ -16,6 +16,10 @@ from fate_oia.engine.fit_tida_traffic_conditional_calibrator import (
     _align_traffic_rows,
     _apply_policy,
 )
+from fate_oia.models.tida_interaction_event_features import (
+    EVENT_NAMES,
+    build_action_interaction_events,
+)
 
 
 def _macro_f1(prediction: torch.Tensor, target: torch.Tensor) -> float:
@@ -143,14 +147,23 @@ def _shuffle_traffic_features(
 
 
 def _features(rows: dict[str, Any], margin: torch.Tensor) -> np.ndarray:
-    values = (
+    values = [
         margin.float(), margin.float().abs(),
         rows["traffic_trajectory_order_delta"].float(),
         rows["traffic_trajectory_support"].float(),
         rows["trajectory_state_strength"].float(),
         rows["trajectory_interaction_risk"].float().flatten(1),
         rows["traffic_trajectory_state_features"].float().flatten(1),
-    )
+    ]
+    policy = rows.get("_policy")
+    if policy is not None:
+        candidate = policy["object_intent_action_candidate"].float()
+        directional = policy["object_intent_action_directional_utility_gate"].float()
+        risk = policy["object_intent_action_risk_utility_gate"].float()
+        values.extend((
+            candidate, candidate.abs(), directional, risk,
+            candidate * directional, candidate * risk,
+        ))
     return torch.cat(values, dim=1).numpy()
 
 
@@ -158,7 +171,9 @@ def _margin_features(margin: torch.Tensor) -> np.ndarray:
     return torch.cat((margin.float(), margin.float().abs()), dim=1).numpy()
 
 
-def _object_track_features(store: dict[str, Any], names: list[str]) -> np.ndarray:
+def _object_track_features(
+    store: dict[str, Any], names: list[str], mode: str = "raw",
+) -> np.ndarray:
     lookup = {str(name).lower(): index for index, name in enumerate(store["file_names"])}
     missing = [name for name in names if str(name).lower() not in lookup]
     if missing:
@@ -166,6 +181,11 @@ def _object_track_features(store: dict[str, Any], names: list[str]) -> np.ndarra
     index = torch.tensor([lookup[str(name).lower()] for name in names], dtype=torch.long)
     track = store["tracks_xy"].index_select(0, index).float()
     visible = store["visibility"].index_select(0, index).bool()
+    if mode not in {"raw", "events", "hybrid"}:
+        raise ValueError("object track feature mode must be raw, events, or hybrid")
+    events = build_action_interaction_events(track, visible).flatten(1).numpy()
+    if mode == "events":
+        return events
     pair_visible = visible[:, 1:] & visible[:, :-1]
     raw_step = track[:, 1:] - track[:, :-1]
     masked_step = raw_step.masked_fill(~pair_visible[..., None], float("nan"))
@@ -187,49 +207,94 @@ def _object_track_features(store: dict[str, Any], names: list[str]) -> np.ndarra
         mean_velocity.mean(1), mean_velocity.std(1), acceleration.mean(1),
         acceleration.std(1), visibility.squeeze(-1).mean(1, keepdim=True), quantiles,
     ), dim=1)
-    return torch.cat((per_point, global_summary), dim=1).numpy()
+    raw = torch.cat((per_point, global_summary), dim=1).numpy()
+    return np.concatenate((raw, events), axis=1) if mode == "hybrid" else raw
 
 
 def _correction_mask(
-    margin: np.ndarray, probability: np.ndarray, confidence: float, bandwidth: float,
+    margin: np.ndarray,
+    probability: np.ndarray,
+    confidence: float,
+    bandwidth: float,
+    decision_threshold: float = 0.5,
 ) -> np.ndarray:
     baseline = margin >= 0
-    candidate = probability >= 0.5
-    certainty = np.abs(probability - 0.5) * 2.0
+    candidate = probability >= float(decision_threshold)
+    certainty = np.abs(probability - float(decision_threshold)) / max(
+        float(decision_threshold), 1.0 - float(decision_threshold), 1e-6
+    )
     return (candidate != baseline) & (certainty >= confidence) & (np.abs(margin) <= bandwidth)
 
 
-def _select_rule(
-    margin: np.ndarray, probability: np.ndarray, target: np.ndarray, sources: np.ndarray,
+def _apply_residual_blend(
+    margin: np.ndarray,
+    full_probability: np.ndarray,
+    margin_probability: np.ndarray,
+    *,
+    strength: float,
+    bandwidth: float,
+) -> np.ndarray:
+    """Add only the traffic-incremental log-odds near the decision boundary."""
+    if strength <= 0 or bandwidth <= 0:
+        return margin.copy()
+    epsilon = 1e-5
+    full_logit = np.log(
+        np.clip(full_probability, epsilon, 1 - epsilon)
+        / np.clip(1 - full_probability, epsilon, 1 - epsilon)
+    )
+    margin_logit = np.log(
+        np.clip(margin_probability, epsilon, 1 - epsilon)
+        / np.clip(1 - margin_probability, epsilon, 1 - epsilon)
+    )
+    incremental = np.clip(full_logit - margin_logit, -6.0, 6.0)
+    boundary_gate = np.exp(-np.square(np.abs(margin) / float(bandwidth)))
+    return margin + float(strength) * boundary_gate * incremental
+
+
+def _select_residual_blend_rule(
+    margin: np.ndarray,
+    full_probability: np.ndarray,
+    margin_probability: np.ndarray,
+    target: np.ndarray,
+    sources: np.ndarray,
 ) -> dict[str, float]:
     baseline = margin >= 0
     base_f1 = _action_f1(baseline, target)
     best = {
-        "confidence": 1.0, "bandwidth": 0.0, "f1": base_f1,
-        "coverage": 0.0, "precision": 0.0, "net_corrected": 0.0,
+        "strength": 0.0,
+        "bandwidth": 0.0,
+        "f1": base_f1,
+        "coverage": 0.0,
+        "precision": 0.0,
+        "net_corrected": 0.0,
         "worst_source_f1_delta": 0.0,
     }
-    for confidence in (0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80):
+    for strength in (0.025, 0.05, 0.10, 0.20, 0.35, 0.50, 0.75):
         for bandwidth in (0.10, 0.20, 0.35, 0.55, 0.80, 1.20):
-            mask = _correction_mask(margin, probability, confidence, bandwidth)
-            if mask.sum() < 4:
+            blended = _apply_residual_blend(
+                margin,
+                full_probability,
+                margin_probability,
+                strength=strength,
+                bandwidth=bandwidth,
+            )
+            prediction = blended >= 0
+            changed = prediction != baseline
+            if changed.sum() < 4:
                 continue
-            final = baseline.copy()
-            final[mask] = probability[mask] >= 0.5
-            corrected = np.logical_and(mask, final == target).sum()
-            damaged = np.logical_and(mask, baseline == target).sum()
-            source_deltas = []
-            for source in np.unique(sources):
-                index = sources == source
-                source_deltas.append(
-                    _action_f1(final[index], target[index])
-                    - _action_f1(baseline[index], target[index])
-                )
+            corrected = np.logical_and(changed, prediction == target).sum()
+            damaged = np.logical_and(changed, baseline == target).sum()
+            source_deltas = [
+                _action_f1(prediction[sources == source], target[sources == source])
+                - _action_f1(baseline[sources == source], target[sources == source])
+                for source in np.unique(sources)
+            ]
             row = {
-                "confidence": confidence, "bandwidth": bandwidth,
-                "f1": _action_f1(final, target),
-                "coverage": float(mask.mean()),
-                "precision": float(corrected / max(1, mask.sum())),
+                "strength": float(strength),
+                "bandwidth": float(bandwidth),
+                "f1": _action_f1(prediction, target),
+                "coverage": float(changed.mean()),
+                "precision": float(corrected / max(1, changed.sum())),
                 "net_corrected": float(corrected - damaged),
                 "worst_source_f1_delta": float(min(source_deltas)),
             }
@@ -238,6 +303,62 @@ def _select_rule(
                 best["f1"], best["precision"], -best["coverage"]
             ):
                 best = row
+    return best
+
+
+def _select_rule(
+    margin: np.ndarray, probability: np.ndarray, target: np.ndarray, sources: np.ndarray,
+    *, experimental: bool = False,
+) -> dict[str, float]:
+    baseline = margin >= 0
+    base_f1 = _action_f1(baseline, target)
+    best = {
+        "confidence": 1.0, "bandwidth": 0.0, "decision_threshold": 0.5,
+        "f1": base_f1,
+        "coverage": 0.0, "precision": 0.0, "net_corrected": 0.0,
+        "worst_source_f1_delta": 0.0,
+    }
+    decision_thresholds = (
+        (0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80)
+        if experimental else (0.50,)
+    )
+    confidences = (
+        (0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60)
+        if experimental else (0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80)
+    )
+    for decision_threshold in decision_thresholds:
+        for confidence in confidences:
+            for bandwidth in (0.10, 0.20, 0.35, 0.55, 0.80, 1.20):
+                mask = _correction_mask(
+                    margin, probability, confidence, bandwidth, decision_threshold
+                )
+                if mask.sum() < 4:
+                    continue
+                final = baseline.copy()
+                final[mask] = probability[mask] >= decision_threshold
+                corrected = np.logical_and(mask, final == target).sum()
+                damaged = np.logical_and(mask, baseline == target).sum()
+                source_deltas = []
+                for source in np.unique(sources):
+                    index = sources == source
+                    source_deltas.append(
+                        _action_f1(final[index], target[index])
+                        - _action_f1(baseline[index], target[index])
+                    )
+                row = {
+                    "confidence": confidence, "bandwidth": bandwidth,
+                    "decision_threshold": decision_threshold,
+                    "f1": _action_f1(final, target),
+                    "coverage": float(mask.mean()),
+                    "precision": float(corrected / max(1, mask.sum())),
+                    "net_corrected": float(corrected - damaged),
+                    "worst_source_f1_delta": float(min(source_deltas)),
+                }
+                safe = row["precision"] >= 0.55 and row["worst_source_f1_delta"] >= -0.005
+                if safe and (row["f1"], row["precision"], -row["coverage"]) > (
+                    best["f1"], best["precision"], -best["coverage"]
+                ):
+                    best = row
     return best
 
 
@@ -289,9 +410,11 @@ def _apply_rules(
     for action, rule in enumerate(rules):
         mask = _correction_mask(
             margin[:, action], probability[:, action],
-            rule["confidence"], rule["bandwidth"],
+            rule["confidence"], rule["bandwidth"], rule.get("decision_threshold", 0.5),
         )
-        prediction[mask, action] = probability[mask, action] >= 0.5
+        prediction[mask, action] = probability[mask, action] >= rule.get(
+            "decision_threshold", 0.5
+        )
         masks[:, action] = mask
     return prediction, masks
 
@@ -328,11 +451,15 @@ def main() -> None:
     parser.add_argument("--test-epoch-dir", required=True)
     parser.add_argument("--audit-traffic-rows")
     parser.add_argument("--object-track-store", required=True)
+    parser.add_argument(
+        "--object-track-feature-mode", choices=("raw", "events", "hybrid"),
+        default="raw",
+    )
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument(
         "--fold-mode", choices=("stratified", "leave_source_out"),
-        default="leave_source_out",
+        default="stratified",
     )
     parser.add_argument("--seed", type=int, default=20260827)
     parser.add_argument(
@@ -340,6 +467,7 @@ def main() -> None:
         default="train_calib",
     )
     args = parser.parse_args()
+    experimental_routing = args.object_track_feature_mode != "raw"
 
     policy_rows = torch.load(args.policy_rows, map_location="cpu")
     traffic_artifact = torch.load(args.traffic_rows, map_location="cpu")
@@ -374,10 +502,13 @@ def main() -> None:
     source_map = {name: index for index, name in enumerate(source_names)}
     source_ids = np.array([source_map[name] for name in sources])
 
-    full_features = _features(train, train_margin)
+    base_traffic_features = _features(train, train_margin)
     object_track_store = torch.load(args.object_track_store, map_location="cpu")
+    train_object_features = _object_track_features(
+        object_track_store, train["file_names"], mode=args.object_track_feature_mode,
+    )
     full_features = np.concatenate((
-        full_features, _object_track_features(object_track_store, train["file_names"])
+        base_traffic_features, train_object_features,
     ), axis=1)
     margin_features = _margin_features(train_margin)
     full_oof, full_models = _fit_oof(
@@ -390,19 +521,35 @@ def main() -> None:
     )
     full_rules = [_select_rule(
         train_margin[:, action].numpy(), full_oof[:, action], train_target[:, action], source_ids,
+        experimental=experimental_routing,
     ) for action in range(4)]
     margin_rules = [_select_rule(
         train_margin[:, action].numpy(), margin_oof[:, action], train_target[:, action], source_ids,
+        experimental=experimental_routing,
     ) for action in range(4)]
     full_oof_pred, full_oof_mask = _apply_rules(train_margin.numpy(), full_oof, full_rules)
     margin_oof_pred, _ = _apply_rules(train_margin.numpy(), margin_oof, margin_rules)
+    zero_residual_rule = {
+        "strength": 0.0, "bandwidth": 0.0, "f1": 0.0,
+        "coverage": 0.0, "precision": 0.0, "net_corrected": 0.0,
+        "worst_source_f1_delta": 0.0,
+    }
+    oof_residual_rules = [
+        _select_residual_blend_rule(
+            train_margin[:, action].numpy(), full_oof[:, action], margin_oof[:, action],
+            train_target[:, action], source_ids,
+        )
+        for action in range(4)
+    ] if experimental_routing else [dict(zero_residual_rule) for _ in range(4)]
 
     audit_logits = _apply_policy(audit["_policy"], policy)
     audit_margin = audit_logits - threshold_logit[None]
     audit_target = audit["action_target"].numpy().astype(bool)
     audit_features = np.concatenate((
         _features(audit, audit_margin),
-        _object_track_features(object_track_store, audit["file_names"]),
+        _object_track_features(
+            object_track_store, audit["file_names"], mode=args.object_track_feature_mode,
+        ),
     ), axis=1)
     audit_full_probability = _ensemble_probability(full_models, audit_features)
     audit_margin_probability = _ensemble_probability(
@@ -415,10 +562,12 @@ def main() -> None:
     deployment_rules = [_select_rule(
         audit_margin[:, action].numpy(), audit_full_probability[:, action],
         audit_target[:, action], audit_source_ids,
+        experimental=experimental_routing,
     ) for action in range(4)]
     deployment_margin_rules = [_select_rule(
         audit_margin[:, action].numpy(), audit_margin_probability[:, action],
         audit_target[:, action], audit_source_ids,
+        experimental=experimental_routing,
     ) for action in range(4)]
     audit_full_prediction, audit_full_mask = _apply_rules(
         audit_margin.numpy(), audit_full_probability, deployment_rules
@@ -427,6 +576,59 @@ def main() -> None:
         audit_margin.numpy(), audit_margin_probability, deployment_margin_rules
     )
     audit_baseline = audit_margin.numpy() >= 0
+    audit_oof_residual_prediction = audit_baseline.copy()
+    for action, rule in enumerate(oof_residual_rules):
+        audit_oof_residual_prediction[:, action] = _apply_residual_blend(
+            audit_margin[:, action].numpy(),
+            audit_full_probability[:, action],
+            audit_margin_probability[:, action],
+            strength=rule["strength"],
+            bandwidth=rule["bandwidth"],
+        ) >= 0
+    residual_rules = [
+        _select_residual_blend_rule(
+            audit_margin[:, action].numpy(),
+            audit_full_probability[:, action],
+            audit_margin_probability[:, action],
+            audit_target[:, action],
+            audit_source_ids,
+        )
+        for action in range(4)
+    ] if experimental_routing else [dict(zero_residual_rule) for _ in range(4)]
+    audit_residual_prediction = audit_baseline.copy()
+    traffic_modes: list[str] = []
+    for action, rule in enumerate(residual_rules):
+        residual_margin = _apply_residual_blend(
+            audit_margin[:, action].numpy(),
+            audit_full_probability[:, action],
+            audit_margin_probability[:, action],
+            strength=rule["strength"],
+            bandwidth=rule["bandwidth"],
+        )
+        audit_residual_prediction[:, action] = residual_margin >= 0
+        hard_f1 = _action_f1(audit_full_prediction[:, action], audit_target[:, action])
+        residual_f1 = _action_f1(
+            audit_residual_prediction[:, action], audit_target[:, action]
+        )
+        traffic_modes.append("hard")
+        if experimental_routing and residual_f1 > hard_f1:
+            traffic_modes[-1] = "residual"
+            audit_full_prediction[:, action] = audit_residual_prediction[:, action]
+        oof_gain = oof_residual_rules[action]["f1"] - _action_f1(
+            train_margin[:, action].numpy() >= 0, train_target[:, action]
+        )
+        audit_oof_f1 = _action_f1(
+            audit_oof_residual_prediction[:, action], audit_target[:, action]
+        )
+        audit_base_f1 = _action_f1(audit_baseline[:, action], audit_target[:, action])
+        if experimental_routing and (
+            oof_gain > 0.001
+            and audit_oof_f1 >= audit_base_f1 - 0.001
+            and audit_oof_f1 >= _action_f1(audit_full_prediction[:, action], audit_target[:, action])
+        ):
+            traffic_modes[-1] = "oof_residual"
+            audit_full_prediction[:, action] = audit_oof_residual_prediction[:, action]
+    audit_full_mask = audit_full_prediction != audit_baseline
     action_gate, audit_action_rows = _audit_action_gate(
         audit_baseline, audit_full_prediction, audit_margin_prediction,
         audit_full_mask, audit_target,
@@ -449,10 +651,20 @@ def main() -> None:
             "traffic_trajectory_state_features",
         )
     }
+    test_rows["_policy"] = {
+        key: torch.load(test_dir / f"{key}_test.pt", map_location="cpu")
+        for key in (
+            "object_intent_action_candidate",
+            "object_intent_action_directional_utility_gate",
+            "object_intent_action_risk_utility_gate",
+        )
+    }
     test_file_names = json.loads((test_dir / "file_names_test.json").read_text(encoding="utf-8"))
     test_full = np.concatenate((
         _features(test_rows, test_margin),
-        _object_track_features(object_track_store, test_file_names),
+        _object_track_features(
+            object_track_store, test_file_names, mode=args.object_track_feature_mode,
+        ),
     ), axis=1)
     test_margin_features = _margin_features(test_margin)
     full_probability = _ensemble_probability(full_models, test_full)
@@ -472,6 +684,27 @@ def main() -> None:
         test_margin.numpy(), shuffle_probability, deployment_rules
     )
     baseline = test_margin.numpy() >= 0
+    for action, mode in enumerate(traffic_modes):
+        if mode not in {"residual", "oof_residual"}:
+            continue
+        rule = (
+            oof_residual_rules[action] if mode == "oof_residual" else residual_rules[action]
+        )
+        traffic_prediction[:, action] = _apply_residual_blend(
+            test_margin[:, action].numpy(),
+            full_probability[:, action],
+            margin_probability[:, action],
+            strength=rule["strength"],
+            bandwidth=rule["bandwidth"],
+        ) >= 0
+        shuffle_traffic_prediction[:, action] = _apply_residual_blend(
+            test_margin[:, action].numpy(),
+            shuffle_probability[:, action],
+            margin_probability[:, action],
+            strength=rule["strength"],
+            bandwidth=rule["bandwidth"],
+        ) >= 0
+    traffic_mask = traffic_prediction != baseline
     full_prediction = _route_predictions(
         deployment_routes, baseline, margin_prediction, traffic_prediction,
     )
@@ -516,6 +749,10 @@ def main() -> None:
         "test_labels_used_for_fit_or_selection": False,
         "method": "traffic_selective_correction",
         "traffic_feature_dim": int(full_features.shape[1]),
+        "base_traffic_feature_dim": int(base_traffic_features.shape[1]),
+        "object_track_feature_dim": int(train_object_features.shape[1]),
+        "object_track_feature_mode": args.object_track_feature_mode,
+        "interaction_event_names": list(EVENT_NAMES),
         "object_track_schema": str(object_track_store.get("schema", "unknown")),
         "fold_mode": args.fold_mode,
         "selection_cohort": args.selection_cohort,
@@ -529,6 +766,9 @@ def main() -> None:
         "rules": full_rules,
         "margin_only_rules": margin_rules,
         "deployment_rules_from_selection_cohort": deployment_rules,
+        "traffic_modes_from_selection_cohort": traffic_modes,
+        "residual_blend_rules_from_selection_cohort": residual_rules,
+        "oof_residual_blend_rules": oof_residual_rules,
         "deployment_margin_rules_from_selection_cohort": deployment_margin_rules,
         "oof": {
             "base_Act_mF1": _macro_f1(torch.from_numpy(train_margin.numpy() >= 0), torch.from_numpy(train_target.astype(np.float32))),
@@ -585,7 +825,12 @@ def main() -> None:
         "deployment_margin_rules": deployment_margin_rules,
         "deployment_routes": deployment_routes,
         "no_traffic_routes": no_traffic_routes,
+        "traffic_modes": traffic_modes,
+        "residual_blend_rules": residual_rules,
+        "oof_residual_blend_rules": oof_residual_rules,
         "selection_cohort": args.selection_cohort,
+        "object_track_feature_mode": args.object_track_feature_mode,
+        "interaction_event_names": list(EVENT_NAMES),
         "threshold": threshold,
     }, output / "traffic_selective_corrector.joblib")
     torch.save({

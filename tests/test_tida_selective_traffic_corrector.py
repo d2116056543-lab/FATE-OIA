@@ -8,6 +8,9 @@ from fate_oia.engine.fit_tida_selective_traffic_corrector import (
     _features,
     _fit_oof,
     _object_track_features,
+    _apply_residual_blend,
+    _select_residual_blend_rule,
+    _select_rule,
     _risk_coverage_curve,
     _select_deployment_routes,
     _shuffle_traffic_features,
@@ -20,6 +23,36 @@ def test_correction_mask_only_changes_confident_near_boundary_disagreements():
     probability = np.array([0.1, 0.8, 0.1, 0.9])
     mask = _correction_mask(margin, probability, confidence=0.5, bandwidth=0.2)
     assert mask.tolist() == [True, False, False, True]
+
+
+def test_correction_mask_supports_train_calib_probability_threshold():
+    margin = np.array([-0.05, -0.05, 0.05])
+    probability = np.array([0.42, 0.25, 0.20])
+    mask = _correction_mask(
+        margin,
+        probability,
+        confidence=0.1,
+        bandwidth=0.2,
+        decision_threshold=0.35,
+    )
+    assert mask.tolist() == [True, False, True]
+
+
+def test_default_rule_search_preserves_v1028_half_probability_boundary():
+    margin = np.full(10, -0.05)
+    probability = np.full(10, 0.42)
+    target = np.ones(10, dtype=bool)
+    sources = np.arange(10) % 2
+
+    default_rule = _select_rule(margin, probability, target, sources)
+    experimental_rule = _select_rule(
+        margin, probability, target, sources, experimental=True
+    )
+
+    assert default_rule["decision_threshold"] == 0.5
+    assert default_rule["f1"] == 0.0
+    assert experimental_rule["decision_threshold"] < 0.5
+    assert experimental_rule["f1"] == 1.0
 
 
 def test_apply_rules_preserves_baseline_when_rule_is_closed():
@@ -41,6 +74,25 @@ def test_features_include_global_action_and_traffic_context():
     }
     result = _features(rows, torch.zeros(3, 4))
     assert result.shape == (3, 60)
+
+
+def test_features_bind_motion_to_target_private_object_semantics():
+    rows = {
+        "traffic_trajectory_order_delta": torch.zeros(2, 4),
+        "traffic_trajectory_support": torch.ones(2, 4),
+        "trajectory_state_strength": torch.ones(2, 4),
+        "trajectory_interaction_risk": torch.zeros(2, 4, 2),
+        "traffic_trajectory_state_features": torch.zeros(2, 4, 8),
+        "_policy": {
+            "object_intent_action_candidate": torch.full((2, 4), 0.2),
+            "object_intent_action_directional_utility_gate": torch.full((2, 4), 0.4),
+            "object_intent_action_risk_utility_gate": torch.full((2, 4), 0.8),
+        },
+    }
+    result = _features(rows, torch.zeros(2, 4))
+    assert result.shape == (2, 84)
+    assert np.isclose(result[0, -8], 0.08)
+    assert np.isclose(result[0, -4], 0.16)
 
 
 def test_oof_accepts_numeric_source_ids_with_numpy_string_types():
@@ -119,6 +171,27 @@ def test_object_track_features_remove_global_camera_translation():
     assert np.allclose(static_features, drift_features, atol=1e-6)
 
 
+def test_object_track_event_mode_is_compact_and_action_conditioned():
+    tracks = torch.zeros(2, 15, 4, 2)
+    tracks[0, :, 0, 1] = torch.linspace(-0.8, 0.7, 15)
+    tracks[1, :, 0, 0] = torch.linspace(0.8, 0.1, 15)
+    visibility = torch.ones(2, 15, 4, dtype=torch.bool)
+    store = {
+        "file_names": ["a.jpg", "b.jpg"],
+        "tracks_xy": tracks,
+        "visibility": visibility,
+    }
+
+    raw = _object_track_features(store, ["a.jpg", "b.jpg"], mode="raw")
+    events = _object_track_features(store, ["a.jpg", "b.jpg"], mode="events")
+    hybrid = _object_track_features(store, ["a.jpg", "b.jpg"], mode="hybrid")
+
+    assert events.shape == (2, 4 * 12)
+    assert events.shape[1] < raw.shape[1]
+    assert hybrid.shape[1] == raw.shape[1] + events.shape[1]
+    assert np.isfinite(events).all()
+
+
 def test_slice_rows_keeps_nested_policy_rows_aligned():
     rows = {
         "file_names": ["a", "b", "c"],
@@ -167,3 +240,34 @@ def test_shuffle_traffic_features_keeps_margin_prefix_fixed():
 
     assert np.array_equal(shuffled[:, :2], features[:, :2])
     assert np.array_equal(shuffled[:, 2:], features[[2, 0, 1], 2:])
+
+
+def test_residual_blend_uses_only_incremental_traffic_evidence():
+    margin = np.array([-0.05, 0.05, 0.8])
+    full = np.array([0.9, 0.1, 0.9])
+    margin_only = np.array([0.1, 0.9, 0.9])
+    blended = _apply_residual_blend(
+        margin, full, margin_only, strength=0.5, bandwidth=0.2,
+    )
+    assert blended[0] > 0
+    assert blended[1] < 0
+    assert abs(blended[2] - margin[2]) < 0.02
+    np.testing.assert_allclose(
+        _apply_residual_blend(margin, full, full, strength=0.5, bandwidth=0.2),
+        margin,
+    )
+
+
+def test_residual_rule_selects_safe_incremental_correction():
+    margin = np.array([-0.05, 0.05, -0.04, 0.04, -0.8, 0.8])
+    target = np.array([1, 0, 1, 0, 0, 1], dtype=bool)
+    margin_probability = np.array([0.1, 0.9, 0.1, 0.9, 0.1, 0.9])
+    full_probability = np.array([0.9, 0.1, 0.9, 0.1, 0.1, 0.9])
+    sources = np.zeros(len(margin), dtype=int)
+
+    rule = _select_residual_blend_rule(
+        margin, full_probability, margin_probability, target, sources,
+    )
+
+    assert rule["strength"] > 0
+    assert rule["f1"] == 1.0
