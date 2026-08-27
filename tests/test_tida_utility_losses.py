@@ -7,9 +7,32 @@ from fate_oia.losses.tida_flow_credit_losses import (
     temporal_utility_calibration_loss,
 )
 from fate_oia.losses.tida_losses import (
+    object_intent_deploy_utility_loss,
     object_intent_risk_utility_loss,
     object_intent_utility_loss,
 )
+
+
+def test_deploy_utility_prefers_error_recovery_and_rejects_boundary_damage():
+    target = torch.tensor([[1.0], [0.0]])
+    base = torch.tensor([[-0.02], [-0.02]], requires_grad=True)
+    candidate = torch.tensor([[0.01], [0.01]], requires_grad=True)
+    boundary = torch.tensor([0.0])
+    good = torch.tensor([[4.0], [-4.0]], requires_grad=True)
+    bad = (-good.detach()).requires_grad_(True)
+
+    good_loss = object_intent_deploy_utility_loss(
+        good, candidate, target, base, boundary, reference_scale=8.0
+    )
+    bad_loss = object_intent_deploy_utility_loss(
+        bad, candidate, target, base, boundary, reference_scale=8.0
+    )
+
+    assert good_loss < bad_loss
+    good_loss.backward()
+    assert good.grad is not None and good.grad.abs().sum() > 0
+    assert candidate.grad is None
+    assert base.grad is None
 
 
 def test_utility_calibration_prefers_high_budget_for_positive_temporal_benefit():

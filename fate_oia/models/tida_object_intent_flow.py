@@ -298,6 +298,21 @@ class _LateralInteractionRefinement(nn.Module):
         return result
 
 
+class _ZeroLateralInteractionRefinement(nn.Module):
+    """Shape-compatible no-op for reduced-action contract tests."""
+
+    def __init__(self, num_actions: int) -> None:
+        super().__init__()
+        self.num_actions = int(num_actions)
+        self.cap = 0.0
+
+    def forward(
+        self, action_attention: torch.Tensor, geometry: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        del geometry
+        return action_attention.new_zeros(action_attention.shape[0], self.num_actions)
+
+
 class TIDAObjectIntentTransport(nn.Module):
     """Target-private motion-semantic transport over reliable object tracks."""
 
@@ -372,7 +387,10 @@ class TIDAObjectIntentTransport(nn.Module):
         self.reason_utility = _PrivateUtilityHead(dim)
         self.action_risk_utility = _PrivateUtilityHead(dim)
         self.reason_risk_utility = _PrivateUtilityHead(dim)
-        self.action_lateral_refinement = _LateralInteractionRefinement(num_actions)
+        self.action_lateral_refinement = (
+            _LateralInteractionRefinement(num_actions)
+            if num_actions == 4 else _ZeroLateralInteractionRefinement(num_actions)
+        )
         nn.init.zeros_(self.action_output.weight)
         nn.init.zeros_(self.reason_output.weight)
         nn.init.zeros_(self.action_pair_output.weight)
@@ -452,8 +470,13 @@ class TIDAObjectIntentTransport(nn.Module):
                 raise ValueError(f"{name} shape mismatch")
             if "gate" in name and not (((value == 0) | (value == 1)).all()):
                 raise ValueError("deployment gates must be binary")
-            if "scale" in name and not ((value >= -64) & (value <= 64)).all():
-                raise ValueError("deployment scales must be within [-64, 64]")
+            scale_limit = 96 if name == "action_scale" else 64
+            if "scale" in name and not (
+                (value >= -scale_limit) & (value <= scale_limit)
+            ).all():
+                raise ValueError(
+                    f"{name} must be within [-{scale_limit}, {scale_limit}]"
+                )
             if "cutoff" in name and not ((value >= 0) & (value <= 1)).all():
                 raise ValueError("utility cutoffs must be probabilities")
             destination.copy_(value)

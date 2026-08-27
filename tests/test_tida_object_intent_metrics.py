@@ -135,6 +135,7 @@ def test_object_intent_metrics_measure_prediction_utility_and_causal_route_effec
         "object_intent_reason_utility_selected": torch.ones_like(reason_delta),
         "object_intent_action_deploy_scale": torch.ones_like(action_delta),
         "object_intent_reason_deploy_scale": torch.ones_like(reason_delta),
+        "source_batches": ["batch_a"] * 4 + ["batch_b"] * 4,
     })
 
     result = object_intent_traffic_metrics(rows, torch.full((7,), 0.5), bootstrap_samples=50)
@@ -157,6 +158,10 @@ def test_object_intent_metrics_measure_prediction_utility_and_causal_route_effec
     assert len(result["interaction_risk_quartiles"]) == 4
     assert result["action"]["utility_quality"]["selected_benefit_rate"] == 1.0
     assert len(result["action"]["utility_quality"]["coverage_risk_curve"]) == 4
+    source_metrics = result["source_generalization"]["action"]
+    assert source_metrics["source_count"] == 2
+    assert source_metrics["positive_information_gain_source_fraction"] == 1.0
+    assert source_metrics["worst_source_information_gain_bits"] > 0
 
 
 def test_fit_deployment_gates_opens_only_proper_score_improvements():
@@ -297,6 +302,35 @@ def test_utility_policy_accepts_repeatable_gain_with_quantized_neutral_folds():
     assert policy["non_degrading_fold_fraction"].tolist() == [1.0]
 
 
+def test_utility_policy_can_use_train_only_proper_score_tie_without_f1_harm():
+    samples = 100
+    target = (torch.arange(samples) % 2).float()[:, None]
+    sign = 2.0 * target - 1.0
+    base = sign.clone()
+    candidate = 0.01 * sign
+    utility = torch.ones(samples, 1)
+
+    conservative = fit_object_intent_utility_policy_oof(
+        base, candidate, utility, target, torch.tensor([0.5]),
+        scales=(0.0, 4.0), cutoffs=(0.0,), folds=5,
+        min_selected_benefit_rate=0.65,
+        min_non_degrading_fold_fraction=1.0,
+    )
+    proper_tie = fit_object_intent_utility_policy_oof(
+        base, candidate, utility, target, torch.tensor([0.5]),
+        scales=(0.0, 4.0), cutoffs=(0.0,), folds=5,
+        min_selected_benefit_rate=0.65,
+        min_non_degrading_fold_fraction=1.0,
+        allow_proper_score_tie=True,
+    )
+
+    assert conservative["scale"].tolist() == [0.0]
+    assert proper_tie["scale"].tolist() == [4.0]
+    assert proper_tie["proper_score_tie_selected"].tolist() == [1.0]
+    assert proper_tie["nll_improvement"][0] > 0
+    assert proper_tie["brier_improvement"][0] > 0
+
+
 def test_inactive_utility_policy_is_not_reported_as_selected():
     rows = {
         "pre_object_intent_action": torch.zeros(4, 1),
@@ -361,6 +395,54 @@ def test_apply_dual_policy_uses_selected_utility_without_test_labels():
     assert applied["object_intent_action_utility_source"][0].tolist() == [0, 1]
 
 
+def test_apply_dual_policy_accepts_directional_risk_artifact_without_legacy_gate():
+    rows = {
+        "pre_object_intent_action": torch.zeros(2, 1),
+        "pre_object_intent_reason": torch.zeros(2, 1),
+        "object_intent_action_candidate": torch.full((2, 1), 0.01),
+        "object_intent_reason_candidate": torch.full((2, 1), 0.01),
+        "object_intent_action_directional_utility_gate": torch.full((2, 1), 0.9),
+        "object_intent_reason_directional_utility_gate": torch.full((2, 1), 0.9),
+        "object_intent_action_risk_utility_gate": torch.full((2, 1), 0.8),
+        "object_intent_reason_risk_utility_gate": torch.full((2, 1), 0.8),
+    }
+    policy = {
+        "gate": torch.ones(1),
+        "scale": torch.ones(1),
+        "cutoff": torch.full((1,), 0.5),
+        "utility_source": torch.ones(1, dtype=torch.long),
+    }
+
+    applied = apply_object_intent_utility_policy_to_rows(rows, policy, policy)
+
+    assert applied["object_intent_action_utility_selected"].all()
+
+
+def test_dual_policy_uses_proper_score_to_break_neutral_f1_tie():
+    directional = {
+        "gate": torch.tensor([1.0]),
+        "scale": torch.tensor([8.0]),
+        "cutoff": torch.tensor([0.5]),
+        "oof_gain": torch.tensor([0.0]),
+        "nll_improvement": torch.tensor([0.001]),
+        "brier_improvement": torch.tensor([0.001]),
+    }
+    risk = {
+        "gate": torch.tensor([1.0]),
+        "scale": torch.tensor([16.0]),
+        "cutoff": torch.tensor([0.6]),
+        "oof_gain": torch.tensor([0.0]),
+        "nll_improvement": torch.tensor([0.004]),
+        "brier_improvement": torch.tensor([0.003]),
+    }
+
+    combined = combine_object_intent_utility_policies(directional, risk)
+
+    assert combined["utility_source"].item() == 1
+    assert combined["scale"].item() == 16.0
+    assert combined["risk_proper_gain"].item() > combined["directional_proper_gain"].item()
+
+
 def test_policy_rows_concatenate_only_train_cohorts_and_preserve_order():
     keys = (
         "pre_object_intent_action", "pre_object_intent_reason",
@@ -373,6 +455,10 @@ def test_policy_rows_concatenate_only_train_cohorts_and_preserve_order():
     )
     calib = {key: torch.zeros(3, 2) for key in keys}
     audit = {key: torch.ones(4, 2) for key in keys}
+    calib["source_batches"] = ["batch1", "batch1", "batch2"]
+    calib["file_names"] = ["c0.mp4", "c1.mp4", "c2.mp4"]
+    audit["source_batches"] = ["batch3"] * 4
+    audit["file_names"] = [f"a{index}.mp4" for index in range(4)]
 
     combined = concatenate_object_intent_policy_rows(
         (("train_calib", calib), ("train_audit", audit))
@@ -382,6 +468,47 @@ def test_policy_rows_concatenate_only_train_cohorts_and_preserve_order():
     assert combined["action_target"][:3].eq(0).all()
     assert combined["action_target"][3:].eq(1).all()
     assert combined["_policy_cohort_sizes"] == {"train_calib": 3, "train_audit": 4}
+    assert combined["source_batches"] == [
+        "batch1", "batch1", "batch2", "batch3", "batch3", "batch3", "batch3",
+    ]
+    assert combined["file_names"] == [
+        "c0.mp4", "c1.mp4", "c2.mp4", "a0.mp4", "a1.mp4", "a2.mp4", "a3.mp4",
+    ]
+
+
+def test_utility_policy_leave_source_out_rejects_large_source_spurious_gain():
+    large, small = 100, 10
+    source_groups = torch.cat((
+        torch.zeros(large, dtype=torch.long),
+        torch.ones(small, dtype=torch.long),
+        torch.full((small,), 2, dtype=torch.long),
+    ))
+    target = torch.cat((
+        torch.ones(large, 1), torch.zeros(small * 2, 1),
+    ))
+    base = torch.cat((
+        torch.full((large, 1), -0.02), torch.full((small * 2, 1), -0.02),
+    ))
+    candidate = torch.full_like(base, 0.02)
+    utility = torch.ones_like(base)
+
+    random_oof = fit_object_intent_utility_policy_oof(
+        base, candidate, utility, target, torch.tensor([0.5]),
+        scales=(0.0, 4.0), cutoffs=(0.0,), folds=3,
+        min_selected_benefit_rate=0.0,
+    )
+    source_oof = fit_object_intent_utility_policy_oof(
+        base, candidate, utility, target, torch.tensor([0.5]),
+        scales=(0.0, 4.0), cutoffs=(0.0,), folds=3,
+        min_selected_benefit_rate=0.0,
+        min_positive_fold_fraction=0.6,
+        fold_group_ids=source_groups,
+    )
+
+    assert random_oof["scale"].item() > 0
+    assert source_oof["scale"].item() == 0
+    assert source_oof["fold_strategy"] == "leave_source_out"
+    assert source_oof["source_group_count"] == 3
 
 
 def test_policy_rows_reject_test_or_oracle_cohorts():

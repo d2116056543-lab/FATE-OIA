@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import torch
 from torch.nn import functional as F
 
@@ -245,8 +247,10 @@ def fit_object_intent_utility_policy_oof(
     min_non_degrading_fold_fraction: float = 0.0,
     fold_degradation_tolerance: float = 0.0,
     quantile_coverages: tuple[float, ...] = (),
+    allow_proper_score_tie: bool = False,
     cap: float = 0.08,
     seed: int = 3407,
+    fold_group_ids: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor | list[dict[str, float]]]:
     """Fit selective route scale/cutoff using train-calib labels only."""
     if not (
@@ -284,11 +288,24 @@ def fit_object_intent_utility_policy_oof(
         (float(scale), float(cutoff))
         for scale in scales for cutoff in cutoff_values
     ]
-    generator = torch.Generator(device="cpu").manual_seed(int(seed))
-    permutation = torch.randperm(base_logits.shape[0], generator=generator)
-    fold_ids = torch.empty(base_logits.shape[0], dtype=torch.long)
-    fold_ids[permutation] = torch.arange(base_logits.shape[0]) % int(folds)
-    fold_ids = fold_ids.to(base_logits.device)
+    if fold_group_ids is None:
+        generator = torch.Generator(device="cpu").manual_seed(int(seed))
+        permutation = torch.randperm(base_logits.shape[0], generator=generator)
+        fold_ids = torch.empty(base_logits.shape[0], dtype=torch.long)
+        fold_ids[permutation] = torch.arange(base_logits.shape[0]) % int(folds)
+        fold_ids = fold_ids.to(base_logits.device)
+        fold_strategy = "random_oof"
+        source_group_count = 0
+    else:
+        fold_group_ids = torch.as_tensor(fold_group_ids, device=base_logits.device)
+        if fold_group_ids.ndim != 1 or fold_group_ids.shape[0] != base_logits.shape[0]:
+            raise ValueError("fold_group_ids must contain one source id per row")
+        _, fold_ids = torch.unique(fold_group_ids, sorted=True, return_inverse=True)
+        source_group_count = int(fold_ids.max().item()) + 1
+        if source_group_count < 2:
+            raise ValueError("leave-source-out fitting requires at least two source groups")
+        folds = source_group_count
+        fold_strategy = "leave_source_out"
     fold_scores = base_logits.new_zeros(
         (int(folds), len(candidates), base_logits.shape[1])
     )
@@ -347,32 +364,63 @@ def fit_object_intent_utility_policy_oof(
                 and float(candidate_brier_improvement[index, label]) >= float(min_brier_improvement)
             )
         ]
-        best = max(
-            eligible,
-            key=lambda index: (
+        def candidate_key(index: int) -> tuple[float, float, float, float, float]:
+            proper_score = (
+                float(candidate_nll_improvement[index, label])
+                + float(candidate_brier_improvement[index, label])
+                if allow_proper_score_tie else 0.0
+            )
+            return (
                 float(scores[index, label]),
+                proper_score,
                 -abs(candidates[index][0]),
                 candidates[index][1],
-            ),
-        )
-        gain = scores[best, label] - scores[zero, label]
-        fold_gain = fold_scores[:, best, label] - fold_scores[:, zero, label]
-        positive_fold_fraction = (
-            fold_gain > 0
-        ).float().mean()
-        non_degrading_fold_fraction = (
-            fold_gain >= -float(fold_degradation_tolerance)
-        ).float().mean()
-        best_candidate_indices.append(best)
-        best_candidate_gains.append(gain)
-        best_candidate_positive_fractions.append(positive_fold_fraction)
-        best_candidate_non_degrading_fractions.append(non_degrading_fold_fraction)
-        if (
-            float(gain) <= float(min_oof_gain)
-            or float(positive_fold_fraction) < float(min_positive_fold_fraction)
-            or float(non_degrading_fold_fraction) < float(min_non_degrading_fold_fraction)
-        ):
-            best = zero
+                -float(index),
+            )
+
+        unconstrained_best = max(eligible, key=candidate_key)
+
+        def stability(index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+            gain_value = scores[index, label] - scores[zero, label]
+            fold_gain_value = fold_scores[:, index, label] - fold_scores[:, zero, label]
+            positive_fraction = (fold_gain_value > 0).float().mean()
+            non_degrading_fraction = (
+                fold_gain_value >= -float(fold_degradation_tolerance)
+            ).float().mean()
+            proper_tie_value = bool(
+                allow_proper_score_tie
+                and abs(float(gain_value)) <= 1e-12
+                and float(candidate_nll_improvement[index, label]) > 0.0
+                and float(candidate_brier_improvement[index, label]) > 0.0
+            )
+            return gain_value, positive_fraction, non_degrading_fraction, proper_tie_value
+
+        diagnostic = stability(unconstrained_best)
+        best_candidate_indices.append(unconstrained_best)
+        best_candidate_gains.append(diagnostic[0])
+        best_candidate_positive_fractions.append(diagnostic[1])
+        best_candidate_non_degrading_fractions.append(diagnostic[2])
+
+        stable_eligible = [zero]
+        for index in eligible:
+            if index == zero:
+                continue
+            candidate_gain, candidate_positive, candidate_non_degrading, candidate_tie = stability(index)
+            gain_passes = float(candidate_gain) > float(min_oof_gain) or candidate_tie
+            positive_passes = (
+                candidate_tie
+                or float(candidate_positive) >= float(min_positive_fold_fraction)
+            )
+            if (
+                gain_passes
+                and positive_passes
+                and float(candidate_non_degrading) >= float(min_non_degrading_fold_fraction)
+            ):
+                stable_eligible.append(index)
+
+        best = max(stable_eligible, key=candidate_key)
+        gain, positive_fold_fraction, non_degrading_fold_fraction, _ = stability(best)
+        if best == zero:
             gain = gain.new_zeros(())
             positive_fold_fraction = positive_fold_fraction.new_zeros(())
             non_degrading_fold_fraction = non_degrading_fold_fraction.new_zeros(())
@@ -386,6 +434,15 @@ def fit_object_intent_utility_policy_oof(
         "scale": base_logits.new_tensor([scale for scale, _ in policy]),
         "cutoff": base_logits.new_tensor([cutoff for _, cutoff in policy]),
         "oof_gain": torch.stack(gains),
+        "proper_score_tie_selected": base_logits.new_tensor([
+            float(
+                selected_indices[label] != zero
+                and abs(float(gains[label])) <= 1e-12
+                and float(candidate_nll_improvement[selected_indices[label], label]) > 0.0
+                and float(candidate_brier_improvement[selected_indices[label], label]) > 0.0
+            )
+            for label in range(base_logits.shape[1])
+        ]),
         "oof_scores": scores,
         "oof_fold_scores": fold_scores,
         "positive_fold_fraction": torch.stack(positive_fold_fractions),
@@ -419,6 +476,8 @@ def fit_object_intent_utility_policy_oof(
         "candidates": [
             {"scale": scale, "cutoff": cutoff} for scale, cutoff in candidates
         ],
+        "fold_strategy": fold_strategy,
+        "source_group_count": source_group_count,
     }
 
 
@@ -437,14 +496,38 @@ def combine_object_intent_utility_policies(
         raise ValueError("dual utility policies are missing required fields")
     if any(directional[key].shape != risk[key].shape for key in required):
         raise ValueError("dual utility policy shapes must match")
-    use_risk = risk["oof_gain"] > directional["oof_gain"]
+    directional_proper_gain = directional.get(
+        "nll_improvement", torch.zeros_like(directional["oof_gain"])
+    ) + directional.get(
+        "brier_improvement", torch.zeros_like(directional["oof_gain"])
+    )
+    risk_proper_gain = risk.get(
+        "nll_improvement", torch.zeros_like(risk["oof_gain"])
+    ) + risk.get(
+        "brier_improvement", torch.zeros_like(risk["oof_gain"])
+    )
+    gain_tied = torch.isclose(
+        risk["oof_gain"], directional["oof_gain"], atol=1e-8, rtol=0.0
+    )
+    use_risk = (risk["oof_gain"] > directional["oof_gain"]) | (
+        gain_tied & (risk_proper_gain > directional_proper_gain)
+    )
     result = {
         key: torch.where(use_risk, risk[key], directional[key])
         for key in required
     }
     result["utility_source"] = use_risk.to(torch.long)
+    result["proper_score_tie_selected"] = torch.where(
+        use_risk,
+        risk.get("proper_score_tie_selected", torch.zeros_like(risk["gate"])),
+        directional.get(
+            "proper_score_tie_selected", torch.zeros_like(directional["gate"])
+        ),
+    )
     result["directional_oof_gain"] = directional["oof_gain"]
     result["risk_oof_gain"] = risk["oof_gain"]
+    result["directional_proper_gain"] = directional_proper_gain
+    result["risk_proper_gain"] = risk_proper_gain
     return result
 
 
@@ -485,6 +568,19 @@ def concatenate_object_intent_policy_rows(
         for key in _OBJECT_INTENT_POLICY_KEYS
     }
     combined["_policy_cohort_sizes"] = sizes
+    for metadata_key in ("source_batches", "file_names"):
+        present = [metadata_key in rows for _, rows in cohorts]
+        if any(present) and not all(present):
+            raise KeyError(f"policy metadata {metadata_key} must exist in every cohort")
+        if all(present):
+            for name, rows in cohorts:
+                if len(rows[metadata_key]) != sizes[str(name)]:
+                    raise ValueError(
+                        f"policy cohort {name} has inconsistent {metadata_key} rows"
+                    )
+            combined[metadata_key] = [
+                value for _, rows in cohorts for value in rows[metadata_key]
+            ]
     return combined
 
 
@@ -562,10 +658,11 @@ def apply_object_intent_utility_policy_to_rows(
 
     def apply(branch: str, policy: dict[str, torch.Tensor], cap: float) -> torch.Tensor:
         candidate = rows[f"object_intent_{branch}_candidate"]
-        directional = rows.get(
-            f"object_intent_{branch}_directional_utility_gate",
-            rows[f"object_intent_{branch}_utility_gate"],
-        )
+        directional = rows.get(f"object_intent_{branch}_directional_utility_gate")
+        if directional is None:
+            directional = rows.get(f"object_intent_{branch}_utility_gate")
+        if directional is None:
+            raise ValueError(f"{branch} policy rows are missing a utility gate")
         risk = rows.get(f"object_intent_{branch}_risk_utility_gate", directional)
         source = policy.get(
             "utility_source",
@@ -825,6 +922,74 @@ def _utility_quality(
     }
 
 
+def _source_generalization_metrics(
+    rows: dict[str, object], branch: str, thresholds: torch.Tensor,
+) -> dict[str, object]:
+    sources = list(rows["source_batches"])
+    base = rows[f"pre_object_intent_{branch}"].float()
+    final = rows[f"video_{branch}"].float()
+    target = rows[f"{branch}_target"].float()
+    delta = rows[f"object_intent_{branch}_delta"].float()
+    selected_deleted = rows[f"object_intent_{branch}_selected_deleted_delta"].float()
+    control_deleted = rows[f"object_intent_{branch}_control_deleted_delta"].float()
+    if len(sources) != base.shape[0]:
+        raise ValueError("source_batches must contain one source name per prediction row")
+    sign = 2.0 * target - 1.0
+    source_rows = []
+    for source in sorted(set(sources)):
+        mask = torch.tensor(
+            [value == source for value in sources], dtype=torch.bool, device=base.device
+        )
+        source_base, source_final, source_target = base[mask], final[mask], target[mask]
+        base_loss = F.binary_cross_entropy_with_logits(
+            source_base, source_target, reduction="mean"
+        )
+        final_loss = F.binary_cross_entropy_with_logits(
+            source_final, source_target, reduction="mean"
+        )
+        base_prediction = source_base.sigmoid() >= thresholds[None]
+        final_prediction = source_final.sigmoid() >= thresholds[None]
+        truth = source_target > 0.5
+
+        def macro_f1(prediction: torch.Tensor) -> float:
+            tp = (prediction & truth).sum(0).float()
+            fp = (prediction & ~truth).sum(0).float()
+            fn = (~prediction & truth).sum(0).float()
+            return float((2.0 * tp / (2.0 * tp + fp + fn).clamp_min(1.0)).mean())
+
+        signed = sign[mask]
+        selected_damage = signed * (delta[mask] - selected_deleted[mask])
+        control_damage = signed * (delta[mask] - control_deleted[mask])
+        base_correct = base_prediction == truth
+        final_correct = final_prediction == truth
+        recovered = (~base_correct) & final_correct
+        damaged = base_correct & (~final_correct)
+        source_rows.append({
+            "source_batch": str(source),
+            "samples": int(mask.sum()),
+            "conditional_information_gain_bits": float(
+                (base_loss - final_loss) / math.log(2.0)
+            ),
+            "incremental_macro_f1": macro_f1(final_prediction) - macro_f1(base_prediction),
+            "selected_minus_control_deletion_gap": float(
+                (selected_damage - control_damage).mean()
+            ),
+            "errors_recovered": int(recovered.sum()),
+            "correct_predictions_damaged": int(damaged.sum()),
+            "net_corrected_labels": int(recovered.sum() - damaged.sum()),
+        })
+    gains = [row["conditional_information_gain_bits"] for row in source_rows]
+    gaps = [row["selected_minus_control_deletion_gap"] for row in source_rows]
+    return {
+        "source_count": len(source_rows),
+        "positive_information_gain_source_fraction": sum(value > 0 for value in gains) / len(gains),
+        "positive_deletion_gap_source_fraction": sum(value > 0 for value in gaps) / len(gaps),
+        "worst_source_information_gain_bits": min(gains),
+        "worst_source_deletion_gap": min(gaps),
+        "by_source": source_rows,
+    }
+
+
 def object_intent_traffic_metrics(
     rows: dict[str, torch.Tensor],
     thresholds: torch.Tensor,
@@ -941,4 +1106,13 @@ def object_intent_traffic_metrics(
         result["future_approach_effectiveness"] = _future_approach_effectiveness(
             rows, thresholds
         )
+    if "source_batches" in rows:
+        result["source_generalization"] = {
+            "action": _source_generalization_metrics(
+                rows, "action", thresholds[:action_count]
+            ),
+            "reason": _source_generalization_metrics(
+                rows, "reason", thresholds[action_count:]
+            ),
+        }
     return result

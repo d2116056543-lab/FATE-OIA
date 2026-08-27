@@ -197,6 +197,7 @@ def collect_tida_outputs(
     audit_store: dict[str, list[torch.Tensor]] = {key: [] for key in audit_keys}
     dynamic_concepts: list[dict[str, Any]] = []
     file_names: list[str] = []
+    source_batches: list[str] = []
     mechanism_rows: dict[str, list[float]] = {
         name: [] for name in (
             "history_off", "repeated_last", "time_shuffle", "time_reverse",
@@ -505,6 +506,9 @@ def collect_tida_outputs(
                 audit_store[key].append(value if key == "frame_valid_mask" else value.float())
             dynamic_concepts.extend(output["dynamic_concepts"])
         file_names.extend(batch["file_name"])
+        source_batches.extend(
+            str(meta.get("source_batch", "unknown")) for meta in batch["clip_meta"]
+        )
         if collect_mechanism and mechanism_count < mechanism_samples:
             selected, matched = select_predicate_intervention_indices(
                 output["action_route"][..., :32],
@@ -539,7 +543,7 @@ def collect_tida_outputs(
         )
     result = {key: torch.cat(value) for key, value in store.items()} | {
         key: torch.cat(value) for key, value in diagnostics.items()
-    } | {"file_names": file_names}
+    } | {"file_names": file_names, "source_batches": source_batches}
     if collect_audit_tensors:
         result.update({key: torch.cat(value) for key, value in audit_store.items()})
         result["dynamic_concepts"] = dynamic_concepts
@@ -1207,6 +1211,8 @@ def save_epoch_outputs(output_dir: Path, epoch: int, rows: dict[str, Any], metri
             object_intent_effectiveness,
         )
     atomic_write_json(epoch_dir / "file_names_test.json", rows["file_names"])
+    if "source_batches" in rows:
+        atomic_write_json(epoch_dir / "source_batches_test.json", rows["source_batches"])
     if "dynamic_concepts" in rows:
         with (epoch_dir / "dynamic_concepts_test.jsonl").open("w", encoding="utf-8", newline="\n") as handle:
             for file_name, concepts in zip(rows["file_names"], rows["dynamic_concepts"]):

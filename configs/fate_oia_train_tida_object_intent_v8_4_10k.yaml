@@ -144,10 +144,12 @@ loss:
   relational_delta: 0.0
   # Candidate learning is allowed to explore; train-calib proper-score gates
   # remain the hard deployment boundary that protects the strong fallback.
-  object_intent_action_aux: 0.15
-  object_intent_action_rank: 0.10
-  object_intent_action_boundary: 0.50
-  object_intent_action_smooth_ap: 0.50
+  # V10.9: concentrate refinement capacity on deploy-boundary mistakes. The
+  # frozen image/action fallback and reason branch remain unchanged.
+  object_intent_action_aux: 0.10
+  object_intent_action_rank: 0.05
+  object_intent_action_boundary: 1.00
+  object_intent_action_smooth_ap: 0.20
   object_intent_action_deletion: 0.05
   object_intent_action_pair_deletion: 0.05
   object_intent_action_no_harm: 0.03
@@ -191,9 +193,9 @@ training:
     relational_traffic_action: 0.00030
     relational_traffic_reason: 0.00020
     traffic_adaptive_boundary: 0.0001
-    object_intent_action: 0.00050
+    object_intent_action: 0.00010
     object_intent_reason: 0.00030
-    object_intent_action_utility: 0.00050
+    object_intent_action_utility: 0.00020
     object_intent_reason_utility: 0.00030
     object_intent_lateral_refinement: 0.00050
 memory_probe:
@@ -227,6 +229,7 @@ deployment:
   object_intent_min_nll_improvement: 0.000001
   object_intent_min_fixed_f1_improvement: 0.0
   object_intent_utility_oof_folds: 5
+  object_intent_utility_leave_source_out: true
   object_intent_utility_min_oof_gain: 0.0
   object_intent_utility_max_selected_rate: 0.50
   object_intent_utility_min_selected_benefit_rate: 0.65
@@ -235,10 +238,12 @@ deployment:
   object_intent_utility_fold_degradation_tolerance: 0.002
   object_intent_utility_min_nll_improvement: 0.0
   object_intent_utility_min_brier_improvement: 0.0
+  # Proper-score-only gains did not transfer to discrete deploy F1; keep them diagnostic.
+  object_intent_action_allow_proper_score_tie: false
   object_intent_utility_quantile_coverages: [0.25, 0.50]
-  object_intent_action_utility_scales: [0, 4, 8, 16, 32, 64]
+  object_intent_action_utility_scales: [0, 4, 8, 16, 24, 32, 48, 64]
   object_intent_reason_utility_scales: [0, 2, 4, 8, 16, 32]
-  object_intent_utility_cutoffs: [0.0, 0.4, 0.5, 0.6, 0.7, 0.8]
+  object_intent_utility_cutoffs: [0.0, 0.4, 0.5, 0.55, 0.6, 0.65, 0.7, 0.8]
   calibration_source: train_calib
   primary_threshold_source: image_train_calib_locked
   reason_beta_source: [train_calib, train_audit]

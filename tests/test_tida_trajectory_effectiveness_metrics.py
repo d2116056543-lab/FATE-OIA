@@ -87,6 +87,7 @@ def test_epoch_artifacts_persist_trajectory_metrics_and_tensors(tmp_path):
     trajectory_metrics = {"overall": {"trajectory_incremental_action_mf1": 0.01}}
     rows = {
         "file_names": ["clip.mp4"],
+        "source_batches": ["batch3"],
         "traffic_trajectory_delta": torch.ones(1, 4),
         "traffic_trajectory_control_delta": torch.zeros(1, 4),
         "traffic_trajectory_support": torch.ones(1, 4),
@@ -110,3 +111,4 @@ def test_epoch_artifacts_persist_trajectory_metrics_and_tensors(tmp_path):
     assert (epoch_dir / "trajectory_support_gate_test.pt").exists()
     assert (epoch_dir / "trajectory_attention_test.pt").exists()
     assert (epoch_dir / "trajectory_xy_test.pt").exists()
+    assert (epoch_dir / "source_batches_test.json").exists()

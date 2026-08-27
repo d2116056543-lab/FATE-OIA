@@ -100,6 +100,52 @@ def object_intent_risk_utility_loss(
     return (value * confidence).sum() / confidence.sum().clamp_min(1.0)
 
 
+def object_intent_deploy_utility_loss(
+    utility_logits: torch.Tensor,
+    candidate_delta: torch.Tensor,
+    target: torch.Tensor,
+    base_logits: torch.Tensor,
+    deploy_boundary_logits: torch.Tensor,
+    *,
+    reference_scale: float = 32.0,
+    cap: float = 0.08,
+    quality_temperature: float = 0.02,
+) -> torch.Tensor:
+    """Predict whether bounded traffic refinement helps at the deploy boundary."""
+    if not (
+        utility_logits.shape == candidate_delta.shape == target.shape
+        == base_logits.shape
+    ):
+        raise ValueError("deploy utility tensors must share [B,L]")
+    boundary = torch.as_tensor(
+        deploy_boundary_logits, dtype=base_logits.dtype, device=base_logits.device
+    )
+    if boundary.shape != (base_logits.shape[1],):
+        raise ValueError("deploy boundary must contain one logit per label")
+    with torch.no_grad():
+        base = base_logits.detach()
+        truth = target.detach().float()
+        routed = base + (
+            float(reference_scale) * candidate_delta.detach()
+        ).clamp(-float(cap), float(cap))
+        base_loss = F.binary_cross_entropy_with_logits(base, truth, reduction="none")
+        routed_loss = F.binary_cross_entropy_with_logits(routed, truth, reduction="none")
+        proper_gain = base_loss - routed_loss
+        base_correct = (base >= boundary[None]) == (truth > 0.5)
+        routed_correct = (routed >= boundary[None]) == (truth > 0.5)
+        recovered = (~base_correct & routed_correct).to(base.dtype)
+        damaged = (base_correct & ~routed_correct).to(base.dtype)
+        quality_target = torch.sigmoid(
+            proper_gain / float(quality_temperature) + 3.0 * recovered - 5.0 * damaged
+        )
+        weight = 0.25 + proper_gain.abs().div(float(quality_temperature)).clamp(0.0, 1.0)
+        weight = weight + recovered + damaged
+    value = F.binary_cross_entropy_with_logits(
+        utility_logits, quality_target.to(utility_logits.dtype), reduction="none"
+    )
+    return (value * weight).sum() / weight.sum().clamp_min(1.0)
+
+
 def action_smooth_ap_loss(
     logits: torch.Tensor,
     target: torch.Tensor,
@@ -777,11 +823,21 @@ def build_tida_loss_registry(
                     action_candidate,
                     action_target,
                 )
-                + object_intent_risk_utility_loss(
-                    output["object_intent_action_risk_utility_logit"],
-                    action_candidate,
-                    action_target,
-                    output["pre_object_intent_video_action_logits"],
+                + (
+                    object_intent_deploy_utility_loss(
+                        output["object_intent_action_risk_utility_logit"],
+                        action_candidate,
+                        action_target,
+                        output["pre_object_intent_video_action_logits"],
+                        deploy_action_boundary_logits,
+                    )
+                    if deploy_action_boundary_logits is not None
+                    else object_intent_risk_utility_loss(
+                        output["object_intent_action_risk_utility_logit"],
+                        action_candidate,
+                        action_target,
+                        output["pre_object_intent_video_action_logits"],
+                    )
                 )
             ),
         )

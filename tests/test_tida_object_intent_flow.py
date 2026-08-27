@@ -224,6 +224,20 @@ def test_harm_aware_utility_is_target_private_and_train_calib_deployed():
     assert deployed["object_intent_action_delta"].abs().max() <= 0.080001
     assert deployed["object_intent_reason_delta"].abs().max() <= 0.060001
 
+    model.set_deployment_policy(
+        action_gate, reason_gate,
+        action_scale=torch.full((4,), 96.0),
+        reason_scale=torch.full((7,), 64.0),
+        action_cutoff=torch.zeros(4), reason_cutoff=torch.zeros(7),
+        source="train_calib_oof_epoch_2",
+    )
+    high_scale = model(
+        xy, visibility, patches, (4, 5), action_nodes, reason_nodes,
+        base_action_logits=action_base, base_reason_logits=reason_base,
+    )
+    assert high_scale["object_intent_action_delta"].abs().max() <= 0.080001
+    assert high_scale["object_intent_reason_delta"].abs().max() <= 0.060001
+
     deployed["object_intent_action_utility_logit"].sum().backward()
     assert any(
         parameter.grad is not None and parameter.grad.abs().sum() > 0

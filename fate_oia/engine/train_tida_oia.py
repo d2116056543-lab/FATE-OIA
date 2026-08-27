@@ -944,6 +944,21 @@ def calibrate_object_intent_deployment(
     )
     if utility_available:
         action_count = policy_rows["action_target"].shape[1]
+        fold_group_ids = None
+        if bool(deployment_config.get("object_intent_utility_leave_source_out", False)):
+            source_batches = policy_rows.get("source_batches")
+            if not source_batches:
+                raise ValueError(
+                    "leave-source-out object-intent policy requires source_batches"
+                )
+            source_index = {
+                name: index for index, name in enumerate(sorted(set(source_batches)))
+            }
+            fold_group_ids = torch.tensor(
+                [source_index[name] for name in source_batches],
+                dtype=torch.long,
+                device=policy_rows["action_target"].device,
+            )
         common_policy_kwargs = dict(
             scales=tuple(deployment_config.get(
                 "object_intent_action_utility_scales", [0, 4, 8, 16, 32, 64]
@@ -962,6 +977,7 @@ def calibrate_object_intent_deployment(
             min_brier_improvement=float(deployment_config.get("object_intent_utility_min_brier_improvement", 0.0)),
             quantile_coverages=tuple(deployment_config.get("object_intent_utility_quantile_coverages", [])),
             cap=float(model.object_intent.action_cap),
+            fold_group_ids=fold_group_ids,
         )
         action_directional_policy = fit_object_intent_utility_policy_oof(
             policy_rows["pre_object_intent_action"],
@@ -969,6 +985,9 @@ def calibrate_object_intent_deployment(
             policy_rows["object_intent_action_directional_utility_gate"],
             policy_rows["action_target"],
             torch.as_tensor(locked_thresholds)[:action_count],
+            allow_proper_score_tie=bool(deployment_config.get(
+                "object_intent_action_allow_proper_score_tie", False
+            )),
             **common_policy_kwargs,
         )
         action_risk_policy = fit_object_intent_utility_policy_oof(
@@ -977,6 +996,9 @@ def calibrate_object_intent_deployment(
             policy_rows["object_intent_action_risk_utility_gate"],
             policy_rows["action_target"],
             torch.as_tensor(locked_thresholds)[:action_count],
+            allow_proper_score_tie=bool(deployment_config.get(
+                "object_intent_action_allow_proper_score_tie", False
+            )),
             **common_policy_kwargs,
         )
         action_policy = combine_object_intent_utility_policies(
@@ -1005,6 +1027,7 @@ def calibrate_object_intent_deployment(
             min_brier_improvement=float(deployment_config.get("object_intent_utility_min_brier_improvement", 0.0)),
             quantile_coverages=tuple(deployment_config.get("object_intent_utility_quantile_coverages", [])),
             cap=float(model.object_intent.reason_cap),
+            fold_group_ids=fold_group_ids,
         )
         reason_risk_policy = fit_object_intent_utility_policy_oof(
             policy_rows["pre_object_intent_reason"],
@@ -1029,6 +1052,7 @@ def calibrate_object_intent_deployment(
             min_brier_improvement=float(deployment_config.get("object_intent_utility_min_brier_improvement", 0.0)),
             quantile_coverages=tuple(deployment_config.get("object_intent_utility_quantile_coverages", [])),
             cap=float(model.object_intent.reason_cap),
+            fold_group_ids=fold_group_ids,
         )
         reason_policy = combine_object_intent_utility_policies(
             reason_directional_policy, reason_risk_policy
@@ -1084,9 +1108,51 @@ def completion_pass(
     return max_optimizer_updates is None or int(optimizer_updates) >= int(max_optimizer_updates)
 
 
+def training_epoch_indices(
+    start_epoch: int, epochs: int, *, evaluation_only: bool
+) -> range:
+    """Evaluation-only runs emit one complete metric snapshot and then exit."""
+    stop_epoch = min(int(epochs), int(start_epoch) + 1) if evaluation_only else int(epochs)
+    return range(int(start_epoch), stop_epoch)
+
+
+def validate_and_slice_policy_rows(rows: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Validate train-only policy rows and recover their train-calib prefix."""
+    cohort_sizes = rows.get("_policy_cohort_sizes")
+    if not isinstance(cohort_sizes, dict) or "train_calib" not in cohort_sizes:
+        raise ValueError("policy rows require train_calib cohort metadata")
+    if any(str(name).lower().startswith("test") for name in cohort_sizes):
+        raise ValueError("policy rows artifact must not contain a test cohort")
+    total = sum(int(value) for value in cohort_sizes.values())
+    required = (
+        "action_target", "reason_target", "source_batches", "file_names",
+        "pre_object_intent_action", "pre_object_intent_reason",
+    )
+    for key in required:
+        if key not in rows:
+            raise ValueError(f"policy rows missing required key: {key}")
+        if len(rows[key]) != total:
+            raise ValueError(f"policy rows {key} row count does not match cohort metadata")
+    calib_count = int(cohort_sizes["train_calib"])
+    calib_rows: dict[str, Any] = {}
+    for key, value in rows.items():
+        if key.startswith("_"):
+            continue
+        if torch.is_tensor(value) and value.ndim > 0 and value.shape[0] == total:
+            calib_rows[key] = value[:calib_count]
+        elif isinstance(value, list) and len(value) == total:
+            calib_rows[key] = value[:calib_count]
+    return rows, calib_rows
+
+
 def train(args: Any) -> None:
-    runtime = build_runtime(args)
+    evaluation_only_requested = bool(_arg(args, "evaluation_only", False))
+    runtime = build_runtime(args, evaluation_only=evaluation_only_requested)
     config, model, device = runtime.config, runtime.model, runtime.device
+    if bool(_arg(args, "random_utility_oof", False)):
+        config.setdefault("deployment", {})[
+            "object_intent_utility_leave_source_out"
+        ] = False
     object_track_store = _arg(args, "object_track_store", None)
     frame_store_root = _arg(args, "frame_store_root", None)
     output_dir = Path(_arg(args, "output_dir")); output_dir.mkdir(parents=True, exist_ok=True)
@@ -1248,8 +1314,11 @@ def train(args: Any) -> None:
     frozen_image_hash = module_state_sha256(model.image_model)
     print_interval = int(config["runtime"]["print_every_optimizer_updates"])
     initial_telemetry = bool(config["runtime"].get("initial_supervision_telemetry", True))
+    evaluation_only = evaluation_only_requested
     completed_epochs = start_epoch
-    for epoch in range(start_epoch, epochs):
+    for epoch in training_epoch_indices(
+        start_epoch, epochs, evaluation_only=evaluation_only
+    ):
         if runtime.train_sampler.epoch != epoch:
             raise RuntimeError("train sampler epoch and trainer epoch differ")
         epoch_start = time.perf_counter()
@@ -1262,7 +1331,8 @@ def train(args: Any) -> None:
         telemetry_samples = 0
         telemetry_tensors: dict[str, list[torch.Tensor]] = {}
         firewall_gradients: dict[str, float] | None = None
-        for micro_step, batch in enumerate(runtime.loaders["train_core"]):
+        train_batches = () if evaluation_only else runtime.loaders["train_core"]
+        for micro_step, batch in enumerate(train_batches):
             batch_arrival = time.perf_counter()
             if micro_count == 0:
                 telemetry_window = (
@@ -1751,17 +1821,49 @@ def train(args: Any) -> None:
             completed_epochs = epoch + 1 if epoch_exhausted else epoch
             continue
         model.eval()
-        online_calib = collect_tida_outputs(model, runtime.loaders["train_calib"], device)
-        online_policy_rows = None
-        if bool(config.get("deployment", {}).get(
-            "object_intent_utility_policy_use_train_audit", False
-        )):
-            online_audit = collect_tida_outputs(
-                model, runtime.loaders["train_audit"], device
+        policy_rows_artifact = _arg(args, "policy_rows_artifact", None)
+        if policy_rows_artifact:
+            loaded_policy_rows = torch.load(
+                Path(policy_rows_artifact).resolve(), map_location="cpu"
             )
-            online_policy_rows = concatenate_object_intent_policy_rows((
-                ("train_calib", online_calib), ("train_audit", online_audit),
-            ))
+            online_policy_rows, _ = validate_and_slice_policy_rows(
+                loaded_policy_rows
+            )
+            online_calib = collect_tida_outputs(
+                model, runtime.loaders["train_calib"], device
+            )
+            manifest["policy_rows_reused"] = True
+            manifest["policy_rows_artifact"] = str(Path(policy_rows_artifact).resolve())
+            manifest["policy_rows_artifact_sha256"] = file_sha256(
+                Path(policy_rows_artifact).resolve()
+            )
+            atomic_write_json(output_dir / "run_manifest.json", manifest)
+        else:
+            online_calib = collect_tida_outputs(
+                model, runtime.loaders["train_calib"], device
+            )
+            online_policy_cohorts = [("train_calib", online_calib)]
+            if bool(config.get("deployment", {}).get(
+                "object_intent_utility_policy_use_train_audit", False
+            )):
+                online_audit = collect_tida_outputs(
+                    model, runtime.loaders["train_audit"], device
+                )
+                online_policy_cohorts.append(("train_audit", online_audit))
+            if bool(_arg(args, "policy_use_train_core", False)):
+                online_core = collect_tida_outputs(
+                    model, runtime.loaders["train_core"], device
+                )
+                online_policy_cohorts.append(("train_core", online_core))
+            online_policy_rows = (
+                concatenate_object_intent_policy_rows(tuple(online_policy_cohorts))
+                if len(online_policy_cohorts) > 1 else None
+            )
+            if online_policy_rows is not None:
+                torch.save(
+                    online_policy_rows,
+                    output_dir / "object_intent_policy_rows_train_only.pt",
+                )
         online_calib, online_object_gate_fit = calibrate_object_intent_deployment(
             model, online_calib, config.get("deployment", {}),
             policy_rows=online_policy_rows,
@@ -1794,16 +1896,23 @@ def train(args: Any) -> None:
                 ema_calib = collect_tida_outputs(
                     model, runtime.loaders["train_calib"], device
                 )
-                ema_policy_rows = None
+                ema_policy_cohorts = [("train_calib", ema_calib)]
                 if bool(config.get("deployment", {}).get(
                     "object_intent_utility_policy_use_train_audit", False
                 )):
                     ema_audit = collect_tida_outputs(
                         model, runtime.loaders["train_audit"], device
                     )
-                    ema_policy_rows = concatenate_object_intent_policy_rows((
-                        ("train_calib", ema_calib), ("train_audit", ema_audit),
-                    ))
+                    ema_policy_cohorts.append(("train_audit", ema_audit))
+                if bool(_arg(args, "policy_use_train_core", False)):
+                    ema_core = collect_tida_outputs(
+                        model, runtime.loaders["train_core"], device
+                    )
+                    ema_policy_cohorts.append(("train_core", ema_core))
+                ema_policy_rows = (
+                    concatenate_object_intent_policy_rows(tuple(ema_policy_cohorts))
+                    if len(ema_policy_cohorts) > 1 else None
+                )
                 ema_calib, ema_object_gate_fit = calibrate_object_intent_deployment(
                     model, ema_calib, config.get("deployment", {}),
                     policy_rows=ema_policy_rows,
@@ -1909,6 +2018,22 @@ def main() -> None:
     parser.add_argument("--skip-expanded-eval", action="store_true")
     parser.add_argument("--eval-every-epochs", type=int, default=1)
     parser.add_argument("--max-optimizer-updates", type=int)
+    parser.add_argument(
+        "--evaluation-only", action="store_true",
+        help="load a checkpoint and run train-only policy fitting plus evaluation without optimizer updates",
+    )
+    parser.add_argument(
+        "--policy-use-train-core", action="store_true",
+        help="add the configured train_core subset to train-only deployment policy fitting",
+    )
+    parser.add_argument(
+        "--policy-rows-artifact",
+        help="reuse audited train-only policy rows and skip repeated train cohort forwards",
+    )
+    parser.add_argument(
+        "--random-utility-oof", action="store_true",
+        help="diagnostic: fit random OOF folds instead of leave-source-out folds",
+    )
     parser.add_argument("--schedule-total-updates", type=int)
     parser.add_argument("--train-owners", help="comma-separated optimizer owners; other owner LRs are zero")
     parser.add_argument("--object-track-store", help="audited frozen-CoTracker coordinate observations")

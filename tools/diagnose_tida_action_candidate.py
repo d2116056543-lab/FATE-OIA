@@ -35,10 +35,22 @@ def metrics(target: np.ndarray, logits: np.ndarray, threshold: float) -> dict[st
     }
 
 
+def fixed_threshold_f1(target: np.ndarray, logits: np.ndarray, threshold: float) -> float:
+    boundary = np.log(float(threshold) / (1.0 - float(threshold)))
+    prediction = logits >= boundary
+    positive = target > 0
+    true_positive = np.count_nonzero(prediction & positive)
+    false_positive = np.count_nonzero(prediction & ~positive)
+    false_negative = np.count_nonzero(~prediction & positive)
+    denominator = 2 * true_positive + false_positive + false_negative
+    return float(2 * true_positive / denominator) if denominator else 0.0
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("epoch_dir", type=Path)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--fine-grid", action="store_true")
     args = parser.parse_args()
     epoch_dir = args.epoch_dir
 
@@ -62,8 +74,16 @@ def main() -> None:
     if threshold.size != 4:
         threshold = np.asarray([0.59, 0.66, 0.60, 0.61], dtype=np.float64)
 
-    scales = np.asarray([0, 1, 2, 4, 8, 16, 24, 32, 48, 64], dtype=np.float64)
-    cutoffs = np.asarray([0, 0.25, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9], dtype=np.float64)
+    scales = (
+        np.linspace(0.0, 96.0, 97, dtype=np.float64)
+        if args.fine_grid else
+        np.asarray([0, 1, 2, 4, 8, 16, 24, 32, 48, 64], dtype=np.float64)
+    )
+    cutoffs = (
+        np.linspace(0.0, 1.0, 101, dtype=np.float64)
+        if args.fine_grid else
+        np.asarray([0, 0.25, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9], dtype=np.float64)
+    )
     rows = []
     base_f1 = []
     deployed_f1 = []
@@ -85,13 +105,15 @@ def main() -> None:
                 for cutoff in cutoffs:
                     selected = utility[:, action_id] >= cutoff
                     delta = np.clip(d * scale, -0.18, 0.18) * selected
-                    score = metrics(y, z + delta, float(threshold[action_id]))
-                    if score["f1"] > source_best["f1"] + 1e-12:
+                    score_f1 = fixed_threshold_f1(
+                        y, z + delta, float(threshold[action_id])
+                    )
+                    if score_f1 > source_best["f1"] + 1e-12:
                         source_best = {
-                            "f1": score["f1"], "scale": float(scale),
+                            "f1": score_f1, "scale": float(scale),
                             "cutoff": float(cutoff), "source": source_name,
                         }
-                    if score["f1"] > best["f1"] + 1e-12:
+                    if score_f1 > best["f1"] + 1e-12:
                         best = dict(source_best)
             source_stats[source_name] = source_best
         oracle_f1.append(best["f1"])
