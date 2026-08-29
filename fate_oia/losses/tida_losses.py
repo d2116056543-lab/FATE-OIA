@@ -282,6 +282,79 @@ def target_conditioned_geometric_ranking_loss(
     return torch.stack(losses).mean() if losses else geometric_delta.sum() * 0.0
 
 
+def target_conditioned_pu_correction_loss(
+    base_logits: torch.Tensor,
+    delta: torch.Tensor,
+    observed_positive: torch.Tensor,
+    motion_energy: torch.Tensor,
+    contradiction_scores: torch.Tensor | None = None,
+    *,
+    target_margin: float = 0.15,
+    temperature: float = 0.20,
+) -> torch.Tensor:
+    """Train reason residuals without treating every unobserved label as negative."""
+    positive = observed_positive.float()
+    contradiction = (
+        torch.zeros_like(positive)
+        if contradiction_scores is None
+        else contradiction_scores.detach().clamp(0.0, 1.0) * (1.0 - positive)
+    )
+    base = base_logits.detach()
+    final = base + delta
+    motion_weight = _target_motion_weight(motion_energy, base_logits.shape[1])
+
+    positive_need = torch.sigmoid((0.75 - base) / 0.25).detach()
+    negative_need = torch.sigmoid((0.75 + base) / 0.25).detach()
+    positive_weight = positive * positive_need * motion_weight
+    negative_weight = contradiction * negative_need * motion_weight
+
+    positive_loss = float(temperature) * F.softplus(
+        (float(target_margin) - final) / float(temperature)
+    )
+    negative_loss = float(temperature) * F.softplus(
+        (float(target_margin) + final) / float(temperature)
+    )
+    numerator = (positive_loss * positive_weight + negative_loss * negative_weight).sum()
+    denominator = (positive_weight + negative_weight).sum().clamp_min(1.0)
+    return numerator / denominator
+
+
+def target_conditioned_pu_ranking_loss(
+    base_logits: torch.Tensor,
+    delta: torch.Tensor,
+    observed_positive: torch.Tensor,
+    motion_energy: torch.Tensor,
+    contradiction_scores: torch.Tensor | None = None,
+    *,
+    margin: float = 0.10,
+    temperature: float = 0.10,
+) -> torch.Tensor:
+    """Rank observed reasons only against contradiction-certified unlabeled rows."""
+    if contradiction_scores is None:
+        return delta.sum() * 0.0
+    final = base_logits.detach() + delta
+    contradiction = contradiction_scores.detach().clamp(0.0, 1.0)
+    motion_weight = _target_motion_weight(motion_energy, base_logits.shape[1])
+    losses = []
+    for label in range(base_logits.shape[1]):
+        positive_mask = observed_positive[:, label] > 0.5
+        negative_mask = ~positive_mask
+        positive = final[positive_mask, label]
+        negative = final[negative_mask, label]
+        negative_weight = contradiction[negative_mask, label] * motion_weight[negative_mask, label]
+        if not positive.numel() or not negative.numel():
+            continue
+        positive_weight = motion_weight[positive_mask, label]
+        pair_weight = negative_weight[:, None] * positive_weight[None]
+        raw = F.softplus(
+            (float(margin) + negative[:, None] - positive[None]) / float(temperature)
+        )
+        losses.append(
+            float(temperature) * (raw * pair_weight).sum() / pair_weight.sum().clamp_min(1e-8)
+        )
+    return torch.stack(losses).mean() if losses else delta.sum() * 0.0
+
+
 def action_route_sparse_loss(
     route: torch.Tensor,
     factor_keys: torch.Tensor,
@@ -688,23 +761,23 @@ def build_tida_loss_registry(
     registry.add("geometric_reason_delta", output["geometric_reason_delta_raw"].square().mean())
     registry.add(
         "relational_reason_aux",
-        target_conditioned_geometric_correction_loss(
+        target_conditioned_pu_correction_loss(
             output["pre_relational_video_reason_logits"],
             output["relational_reason_delta"],
             reason_target,
             relational_motion,
-            reason_weights,
+            contradiction,
             target_margin=0.15,
         ),
     )
     registry.add(
         "relational_reason_rank",
-        target_conditioned_geometric_ranking_loss(
+        target_conditioned_pu_ranking_loss(
             output["pre_relational_video_reason_logits"],
             output["relational_reason_delta"],
             reason_target,
             relational_motion,
-            reason_weights,
+            contradiction,
         ),
     )
     registry.add(

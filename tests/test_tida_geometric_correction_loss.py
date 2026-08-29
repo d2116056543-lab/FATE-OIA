@@ -3,6 +3,8 @@ import torch
 from fate_oia.losses.tida_losses import (
     target_conditioned_geometric_correction_loss,
     target_conditioned_geometric_ranking_loss,
+    target_conditioned_pu_correction_loss,
+    target_conditioned_pu_ranking_loss,
 )
 
 
@@ -69,3 +71,61 @@ def test_geometric_ranking_uses_detached_cross_batch_reference_pairs():
     assert loss > 0
     loss.backward()
     assert delta.grad is not None and delta.grad.abs().sum() > 0
+
+
+def test_pu_correction_does_not_treat_unknown_reason_as_negative():
+    base = torch.zeros(1, 2)
+    target = torch.tensor([[1.0, 0.0]])
+    delta = torch.zeros_like(base, requires_grad=True)
+    loss = target_conditioned_pu_correction_loss(
+        base,
+        delta,
+        target,
+        torch.ones(1, 3) * 0.1,
+        contradiction_scores=torch.zeros_like(target),
+    )
+    loss.backward()
+    assert delta.grad[0, 0] < 0
+    assert delta.grad[0, 1] == 0
+
+
+def test_pu_correction_uses_only_certified_contradictions_as_negatives():
+    base = torch.zeros(1, 2)
+    target = torch.tensor([[1.0, 0.0]])
+    delta = torch.zeros_like(base, requires_grad=True)
+    loss = target_conditioned_pu_correction_loss(
+        base,
+        delta,
+        target,
+        torch.ones(1, 3) * 0.1,
+        contradiction_scores=torch.tensor([[0.0, 1.0]]),
+    )
+    loss.backward()
+    assert delta.grad[0, 0] < 0
+    assert delta.grad[0, 1] > 0
+
+
+def test_pu_ranking_ignores_uncertified_unlabeled_pairs():
+    base = torch.zeros(2, 1)
+    target = torch.tensor([[1.0], [0.0]])
+    delta = torch.zeros_like(base, requires_grad=True)
+    no_negative = target_conditioned_pu_ranking_loss(
+        base,
+        delta,
+        target,
+        torch.ones(2, 2) * 0.1,
+        contradiction_scores=torch.zeros_like(target),
+    )
+    assert no_negative.item() == 0.0
+
+    certified = target_conditioned_pu_ranking_loss(
+        base,
+        delta,
+        target,
+        torch.ones(2, 2) * 0.1,
+        contradiction_scores=torch.tensor([[0.0], [1.0]]),
+    )
+    assert certified > 0
+    certified.backward()
+    assert delta.grad[0, 0] < 0
+    assert delta.grad[1, 0] > 0
