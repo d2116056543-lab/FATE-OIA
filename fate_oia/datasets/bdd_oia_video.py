@@ -124,7 +124,7 @@ class BDDOIAVideoDataset(Dataset):
     def __init__(
         self,
         manifest_path: str | Path,
-        partition: str,
+        partition: str | Sequence[str],
         *,
         training: bool = False,
         transform: SynchronizedVideoTransform | None = None,
@@ -134,10 +134,14 @@ class BDDOIAVideoDataset(Dataset):
         object_track_store_path: str | Path | None = None,
         frame_store_root: str | Path | Sequence[str | Path] | None = None,
     ) -> None:
-        self.records = [record for record in load_manifest(manifest_path) if record.partition == partition]
+        partitions = {partition} if isinstance(partition, str) else set(partition)
+        self.records = [
+            record for record in load_manifest(manifest_path)
+            if record.partition in partitions
+        ]
         if max_samples is not None:
             self.records = self.records[: max(0, int(max_samples))]
-        self.partition = partition
+        self.partition = partition if isinstance(partition, str) else tuple(partition)
         self.training = training
         self.transform = transform or SynchronizedVideoTransform()
         self.decoder = decoder

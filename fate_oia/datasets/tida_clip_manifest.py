@@ -248,6 +248,8 @@ def assert_no_partition_leakage(rows: Sequence[dict[str, Any] | TIDAClipRecord])
             if value in owners and owners[value] != partition:
                 raise ValueError(f"partition leakage through {key}: {value}")
             owners[value] = partition
+    if not any(row.get("endpoint_phash") for row in normalized):
+        return
     for i, left in enumerate(normalized):
         for right in normalized[i + 1 :]:
             if left["partition"] == right["partition"]:

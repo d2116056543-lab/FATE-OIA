@@ -659,10 +659,15 @@ def build_runtime(args: Any, evaluation_only: bool = False) -> TIDARuntime:
     max_audit_samples = _arg(args, "max_audit_samples", max_eval_samples)
     object_track_store = _arg(args, "object_track_store", None)
     frame_store_root = _arg(args, "frame_store_root", None)
+    train_partitions = (
+        ("train_core", "train_calib", "train_audit")
+        if bool(config["data"].get("train_on_all_official_train", False))
+        else "train_core"
+    )
     datasets = {
         partition: BDDOIAVideoDataset(
             clip_manifest,
-            partition,
+            train_partitions if partition == "train_core" else partition,
             training=partition == "train_core" and not evaluation_only,
             seed=20260821,
             max_samples=(
