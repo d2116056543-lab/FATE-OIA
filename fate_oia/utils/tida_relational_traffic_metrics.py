@@ -5,6 +5,8 @@ import math
 import torch
 from torch.nn import functional as F
 
+from fate_oia.models.tida_interaction_event_features import EVENT_NAMES
+
 
 def _bootstrap_mean(value: torch.Tensor, samples: int, seed: int) -> list[float]:
     value = value.detach().float().flatten().cpu()
@@ -227,10 +229,60 @@ def relational_traffic_metrics(
             - quartile_rows[0]["reason_information_gain_bits"]
         ),
     }
+    physical_event_transport: dict[str, object] | None = None
+    if "relational_action_events" in rows:
+        events = rows["relational_action_events"].float()
+        action_context = rows["relational_action_event_context"].float()
+        reason_context = rows["relational_reason_event_context"].float()
+        reason_route = rows["relational_reason_event_route"].float()
+        route_entropy = -(reason_route * reason_route.clamp_min(1e-8).log()).sum(-1)
+        route_entropy = route_entropy / math.log(max(2, reason_route.shape[-1]))
+        event_strength = events.mean(-1)
+
+        positive_minus_negative = []
+        for action_index in range(events.shape[1]):
+            positive = rows["action_target"][:, action_index] > 0.5
+            negative = ~positive
+            if positive.any() and negative.any():
+                difference = (
+                    events[positive, action_index].mean(0)
+                    - events[negative, action_index].mean(0)
+                )
+                positive_minus_negative.append(difference.tolist())
+            else:
+                positive_minus_negative.append([float("nan")] * events.shape[-1])
+
+        def context_deletion_gap(prefix: str, context: torch.Tensor) -> float:
+            selected = rows[f"relational_{prefix}_event_selected_context"].float()
+            random = rows[f"relational_{prefix}_event_control_context"].float()
+            selected_change = (context - selected).square().mean(-1).sqrt()
+            random_change = (context - random).square().mean(-1).sqrt()
+            return float((selected_change - random_change).mean())
+
+        physical_event_transport = {
+            "event_names": list(EVENT_NAMES),
+            "mean_by_action": events.mean(0).tolist(),
+            "active_rate_by_action": (events > 0.05).float().mean(0).tolist(),
+            "positive_minus_negative_by_action": positive_minus_negative,
+            "action_context_rms": float(action_context.square().mean().sqrt()),
+            "reason_context_rms": float(reason_context.square().mean().sqrt()),
+            "action_selected_minus_control_context_deletion_gap": context_deletion_gap(
+                "action", action_context
+            ),
+            "reason_selected_minus_control_context_deletion_gap": context_deletion_gap(
+                "reason", reason_context
+            ),
+            "reason_route_entropy_mean": float(route_entropy.mean()),
+            "reason_route_max_mean": float(reason_route.max(-1).values.mean()),
+            "action_event_magnitude_to_delta_magnitude_spearman": _spearman(
+                event_strength.flatten(), rows["relational_action_delta"].abs().flatten()
+            ),
+        }
     return {
         "action": action,
         "reason": reason,
         "high_interaction_risk": high_result,
         "interaction_risk_quartiles": quartile_rows,
         "risk_utility_association": risk_association,
+        "physical_event_transport": physical_event_transport,
     }

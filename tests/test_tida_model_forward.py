@@ -254,6 +254,8 @@ def test_semantic_relational_traffic_reaches_action_and_reason_with_branch_firew
         _ImageBase(), dim=8, num_actions=4, num_reasons=21, num_predicates=32,
         predicate_roles=roles, context_chunk_size=7, traffic_motion_topk=4,
         relational_traffic_enabled=True,
+        relational_event_conditioning_enabled=True,
+        relational_event_conditioning_scale=0.20,
     )
     out = model(
         torch.randn(1, 3, 360, 640), torch.randn(1, 14, 3, 192, 344),
@@ -263,6 +265,9 @@ def test_semantic_relational_traffic_reaches_action_and_reason_with_branch_firew
     assert out["semantic_trajectory_xy"].shape == (1, 1, 4, 15, 2)
     assert out["relational_action_attention"].shape == (1, 4, 4)
     assert out["relational_reason_attention"].shape == (1, 21, 4)
+    assert out["relational_action_events"].shape == (1, 4, 12)
+    assert out["relational_action_event_context"].shape == (1, 4, 8)
+    assert out["relational_reason_event_context"].shape == (1, 21, 8)
     assert torch.count_nonzero(out["relational_action_delta"]) == 0
     assert torch.count_nonzero(out["relational_reason_delta"]) == 0
     assert "relational_traffic_action" in model.owner_parameters()

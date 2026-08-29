@@ -156,6 +156,8 @@ class TIDAOIAModel(nn.Module):
         relational_traffic_reason_cap: float = 0.10,
         relational_traffic_heads: int = 4,
         relational_traffic_reason_indices: tuple[int, ...] | None = None,
+        relational_event_conditioning_enabled: bool = False,
+        relational_event_conditioning_scale: float = 0.20,
         traffic_adaptive_boundary_enabled: bool = False,
         traffic_adaptive_boundary_cap: float = 0.25,
         object_intent_enabled: bool = False,
@@ -249,6 +251,8 @@ class TIDAOIAModel(nn.Module):
             action_cap=relational_traffic_action_cap,
             reason_cap=relational_traffic_reason_cap,
             reason_traffic_indices=relational_traffic_reason_indices,
+            event_conditioning_enabled=relational_event_conditioning_enabled,
+            event_conditioning_scale=relational_event_conditioning_scale,
         )
         if not self.relational_traffic_enabled:
             for parameter in self.relational_traffic.parameters():
@@ -374,6 +378,7 @@ class TIDAOIAModel(nn.Module):
                 for module in (
                     self.relational_traffic.action_encoder,
                     self.relational_traffic.action_output,
+                    self.relational_traffic.action_event_projection,
                 )
                 for parameter in module.parameters()
                 if parameter.requires_grad
@@ -383,6 +388,8 @@ class TIDAOIAModel(nn.Module):
                 for module in (
                     self.relational_traffic.reason_encoder,
                     self.relational_traffic.reason_output,
+                    self.relational_traffic.reason_event_projection,
+                    self.relational_traffic.reason_event_router,
                 )
                 for parameter in module.parameters()
                 if parameter.requires_grad
@@ -823,6 +830,54 @@ class TIDAOIAModel(nn.Module):
             "relational_pair_features": image_action.new_zeros(batch, tracks, tracks, 8),
             "relational_pair_weights": image_action.new_zeros(batch, tracks, tracks),
             "relational_interaction_risk": image_action.new_zeros(batch, tracks, tracks),
+            "relational_action_events": image_action.new_zeros(
+                batch, self.num_actions, 12
+            ),
+            "relational_reason_event_route": image_action.new_zeros(
+                batch, image_reason.shape[1], self.num_actions
+            ),
+            "relational_action_event_context": image_action.new_zeros(
+                batch, self.num_actions, dim
+            ),
+            "relational_reason_event_context": image_reason.new_zeros(
+                batch, image_reason.shape[1], dim
+            ),
+            "relational_action_selected_deleted_event_context": image_action.new_zeros(
+                batch, self.num_actions, dim
+            ),
+            "relational_action_random_deleted_event_context": image_action.new_zeros(
+                batch, self.num_actions, dim
+            ),
+            "relational_reason_selected_deleted_event_context": image_reason.new_zeros(
+                batch, image_reason.shape[1], dim
+            ),
+            "relational_reason_random_deleted_event_context": image_reason.new_zeros(
+                batch, image_reason.shape[1], dim
+            ),
+            "relational_action_event_selected_track": torch.zeros(
+                batch, self.num_actions, dtype=torch.long, device=image_action.device
+            ),
+            "relational_action_event_control_track": torch.ones(
+                batch, self.num_actions, dtype=torch.long, device=image_action.device
+            ),
+            "relational_reason_event_selected_track": torch.zeros(
+                batch, image_reason.shape[1], dtype=torch.long, device=image_action.device
+            ),
+            "relational_reason_event_control_track": torch.ones(
+                batch, image_reason.shape[1], dtype=torch.long, device=image_action.device
+            ),
+            "relational_action_event_selected_context": image_action.new_zeros(
+                batch, self.num_actions, dim
+            ),
+            "relational_action_event_control_context": image_action.new_zeros(
+                batch, self.num_actions, dim
+            ),
+            "relational_reason_event_selected_context": image_reason.new_zeros(
+                batch, image_reason.shape[1], dim
+            ),
+            "relational_reason_event_control_context": image_reason.new_zeros(
+                batch, image_reason.shape[1], dim
+            ),
             "semantic_trajectory_xy": image_action.new_zeros(batch, 1, tracks, 1, 2),
         }
 

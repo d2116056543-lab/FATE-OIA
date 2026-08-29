@@ -119,6 +119,16 @@ def collect_tida_outputs(
         "relational_action_attention", "relational_reason_attention",
         "relational_action_pair_attention", "relational_reason_pair_attention",
         "relational_interaction_risk", "relational_motion_features",
+        "relational_action_events", "relational_reason_event_route",
+        "relational_action_event_context", "relational_reason_event_context",
+        "relational_action_selected_deleted_event_context",
+        "relational_action_random_deleted_event_context",
+        "relational_reason_selected_deleted_event_context",
+        "relational_reason_random_deleted_event_context",
+        "relational_action_event_selected_track", "relational_action_event_control_track",
+        "relational_reason_event_selected_track", "relational_reason_event_control_track",
+        "relational_action_event_selected_context", "relational_action_event_control_context",
+        "relational_reason_event_selected_context", "relational_reason_event_control_context",
         "semantic_trajectory_xy", "relational_selected_track", "relational_random_track",
         "relational_action_selected_track", "relational_action_random_track",
         "relational_reason_selected_track", "relational_reason_random_track",
@@ -347,6 +357,46 @@ def collect_tida_outputs(
             "relational_reason_pair_attention": output["relational_reason_pair_attention"],
             "relational_interaction_risk": output["relational_interaction_risk"],
             "relational_motion_features": output["relational_motion_features"],
+            "relational_action_events": output["relational_action_events"],
+            "relational_reason_event_route": output["relational_reason_event_route"],
+            "relational_action_event_context": output["relational_action_event_context"],
+            "relational_reason_event_context": output["relational_reason_event_context"],
+            "relational_action_selected_deleted_event_context": output[
+                "relational_action_selected_deleted_event_context"
+            ],
+            "relational_action_random_deleted_event_context": output[
+                "relational_action_random_deleted_event_context"
+            ],
+            "relational_reason_selected_deleted_event_context": output[
+                "relational_reason_selected_deleted_event_context"
+            ],
+            "relational_reason_random_deleted_event_context": output[
+                "relational_reason_random_deleted_event_context"
+            ],
+            "relational_action_event_selected_track": output[
+                "relational_action_event_selected_track"
+            ],
+            "relational_action_event_control_track": output[
+                "relational_action_event_control_track"
+            ],
+            "relational_reason_event_selected_track": output[
+                "relational_reason_event_selected_track"
+            ],
+            "relational_reason_event_control_track": output[
+                "relational_reason_event_control_track"
+            ],
+            "relational_action_event_selected_context": output[
+                "relational_action_event_selected_context"
+            ],
+            "relational_action_event_control_context": output[
+                "relational_action_event_control_context"
+            ],
+            "relational_reason_event_selected_context": output[
+                "relational_reason_event_selected_context"
+            ],
+            "relational_reason_event_control_context": output[
+                "relational_reason_event_control_context"
+            ],
             "semantic_trajectory_xy": output["semantic_trajectory_xy"],
             "relational_selected_track": output["relational_selected_track"],
             "relational_random_track": output["relational_random_track"],
@@ -1264,6 +1314,16 @@ def save_epoch_outputs(output_dir: Path, epoch: int, rows: dict[str, Any], metri
         "relational_action_attention", "relational_reason_attention",
         "relational_action_pair_attention", "relational_reason_pair_attention",
         "relational_interaction_risk", "relational_motion_features",
+        "relational_action_events", "relational_reason_event_route",
+        "relational_action_event_context", "relational_reason_event_context",
+        "relational_action_selected_deleted_event_context",
+        "relational_action_random_deleted_event_context",
+        "relational_reason_selected_deleted_event_context",
+        "relational_reason_random_deleted_event_context",
+        "relational_action_event_selected_track", "relational_action_event_control_track",
+        "relational_reason_event_selected_track", "relational_reason_event_control_track",
+        "relational_action_event_selected_context", "relational_action_event_control_context",
+        "relational_reason_event_selected_context", "relational_reason_event_control_context",
         "semantic_trajectory_xy", "relational_selected_track", "relational_random_track",
         "relational_action_selected_track", "relational_action_random_track",
         "relational_reason_selected_track", "relational_reason_random_track",

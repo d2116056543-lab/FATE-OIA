@@ -82,6 +82,10 @@ model:
   # traffic-flow residual. Static traffic-control/lane evidence stays visual.
   relational_traffic_reason_indices: [1, 2, 5, 6, 7, 8, 10, 14, 16, 20]
   relational_traffic_heads: 4
+  # Physical interaction events condition target-private relational queries;
+  # they never add an independent action/reason logit residual.
+  relational_event_conditioning_enabled: true
+  relational_event_conditioning_scale: 0.20
   traffic_adaptive_boundary_enabled: false
   traffic_adaptive_boundary_cap: 0.25
 loss:
@@ -183,7 +187,9 @@ runtime:
   expanded_test_every_epoch: false
   save_every_epoch: true
   intervention_interval_updates: 4
-  fixed_test_audit_samples: 128
+  # Full-test metrics still use every test clip; only repeated intervention
+  # forwards use this fixed cohort to keep epoch-end audits bounded.
+  fixed_test_audit_samples: 32
   print_every_optimizer_updates: 50
   exact_resume: true
 deployment:

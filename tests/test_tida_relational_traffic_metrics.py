@@ -29,6 +29,14 @@ def test_relational_metrics_measure_transport_not_just_ablation():
         "relational_action_attention": torch.full((4, 2, 3), 1.0 / 3),
         "relational_reason_attention": torch.full((4, 2, 3), 1.0 / 3),
         "relational_interaction_risk": torch.rand(4, 3, 3),
+        "relational_action_events": torch.rand(4, 2, 12),
+        "relational_reason_event_route": torch.softmax(torch.rand(4, 2, 2), -1),
+        "relational_action_event_context": torch.rand(4, 2, 8) * 0.1,
+        "relational_reason_event_context": torch.rand(4, 2, 8) * 0.1,
+        "relational_action_event_selected_context": torch.zeros(4, 2, 8),
+        "relational_action_event_control_context": torch.rand(4, 2, 8) * 0.08,
+        "relational_reason_event_selected_context": torch.zeros(4, 2, 8),
+        "relational_reason_event_control_context": torch.rand(4, 2, 8) * 0.08,
     }
     metrics = relational_traffic_metrics(rows, bootstrap_samples=100)
     assert metrics["action"]["conditional_nll_improvement"] > 0
@@ -43,6 +51,13 @@ def test_relational_metrics_measure_transport_not_just_ablation():
     assert metrics["high_interaction_risk"]["action_deletion_gap"] > 0
     assert metrics["action"]["route_necessity_precision"] == 1.0
     assert len(metrics["interaction_risk_quartiles"]) == 4
+    event = metrics["physical_event_transport"]
+    assert len(event["event_names"]) == 12
+    assert len(event["mean_by_action"]) == 2
+    assert event["action_context_rms"] > 0
+    assert event["action_selected_minus_control_context_deletion_gap"] > 0
+    assert 0 <= event["reason_route_entropy_mean"] <= 1
+    assert "action_event_magnitude_to_delta_magnitude_spearman" in event
 
 
 def test_relational_metrics_show_utility_concentrated_in_high_risk_clips():

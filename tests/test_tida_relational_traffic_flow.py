@@ -148,8 +148,6 @@ def test_common_mode_is_removed_and_temporal_order_changes_relations():
     assert not torch.allclose(
         forward["relational_action_candidate"], reverse["relational_action_candidate"]
     )
-
-
 def test_target_conditioned_pair_context_is_zero_init_and_gets_first_step_gradient():
     model = TIDARelationalTrafficFlow(dim=16, num_actions=4, num_reasons=7, heads=4)
     with torch.no_grad():
@@ -184,3 +182,99 @@ def test_reason_traffic_relevance_mask_blocks_static_reason_residuals():
         torch.zeros(2, len(blocked)),
     )
     assert output["relational_reason_candidate"][:, [1, 5]].abs().sum() > 0
+
+
+def test_physical_events_condition_target_queries_without_breaking_zero_init():
+    model = TIDARelationalTrafficFlow(
+        dim=16,
+        num_actions=4,
+        num_reasons=7,
+        heads=4,
+        event_conditioning_enabled=True,
+        event_conditioning_scale=0.20,
+    )
+    action_nodes = torch.randn(2, 4, 16)
+    reason_nodes = torch.randn(2, 7, 16)
+    inputs = _trajectory_inputs(batch=2)
+
+    enabled = model(action_nodes, reason_nodes, *inputs)
+    model.event_conditioning_enabled = False
+    disabled = model(action_nodes, reason_nodes, *inputs)
+
+    assert enabled["relational_action_events"].shape == (2, 4, 12)
+    assert enabled["relational_reason_event_route"].shape == (2, 7, 4)
+    assert enabled["relational_action_event_context"].shape == (2, 4, 16)
+    assert enabled["relational_reason_event_context"].shape == (2, 7, 16)
+    assert torch.equal(
+        enabled["relational_action_delta"], disabled["relational_action_delta"]
+    )
+    assert torch.equal(
+        enabled["relational_reason_delta"], disabled["relational_reason_delta"]
+    )
+    assert torch.equal(
+        enabled["relational_action_event_context"],
+        torch.zeros_like(enabled["relational_action_event_context"]),
+    )
+
+
+def test_physical_event_context_is_target_private_trainable_and_time_sensitive():
+    model = TIDARelationalTrafficFlow(
+        dim=16,
+        num_actions=4,
+        num_reasons=7,
+        heads=4,
+        event_conditioning_enabled=True,
+    )
+    with torch.no_grad():
+        model.action_output.weight.fill_(0.05)
+        model.reason_output.weight.fill_(0.05)
+        model.action_event_projection[-1].weight.fill_(0.02)
+        model.reason_event_projection[-1].weight.fill_(0.02)
+    action_nodes = torch.randn(2, 4, 16)
+    reason_nodes = torch.randn(2, 7, 16)
+    inputs = _trajectory_inputs(batch=2)
+    forward = model(action_nodes, reason_nodes, *inputs)
+    reversed_inputs = list(inputs)
+    reversed_inputs[0] = reversed_inputs[0].flip(3)
+    reversed_inputs[1] = reversed_inputs[1].flip(3)
+    reversed_inputs[2] = reversed_inputs[2].flip(3)
+    reversed_inputs[3] = reversed_inputs[3].flip(3)
+    reversed_inputs[4] = -reversed_inputs[4].flip(1)
+    reversed_inputs[5] = -reversed_inputs[5].flip(3)
+    reverse = model(action_nodes, reason_nodes, *reversed_inputs)
+
+    assert forward["relational_action_event_context"].abs().amax() <= 0.20 + 1e-6
+    assert not torch.allclose(
+        forward["relational_action_events"], reverse["relational_action_events"]
+    )
+    assert not torch.allclose(
+        forward["relational_action_candidate"], reverse["relational_action_candidate"]
+    )
+    assert not torch.allclose(
+        forward["relational_action_event_context"],
+        forward["relational_action_selected_deleted_event_context"],
+    )
+    assert forward["relational_action_event_selected_track"].shape == (2, 4)
+    assert forward["relational_reason_event_selected_track"].shape == (2, 7)
+    assert torch.all(
+        forward["relational_action_event_selected_track"]
+        != forward["relational_action_event_control_track"]
+    )
+    action_selected_change = (
+        forward["relational_action_event_context"]
+        - forward["relational_action_event_selected_context"]
+    ).square().mean(-1).sqrt()
+    action_control_change = (
+        forward["relational_action_event_context"]
+        - forward["relational_action_event_control_context"]
+    ).square().mean(-1).sqrt()
+    assert torch.all(action_selected_change + 1e-7 >= action_control_change)
+
+    model.zero_grad(set_to_none=True)
+    forward["relational_reason_candidate"][:, 1].sum().backward()
+    action_event_parameters = list(model.action_event_projection.parameters())
+    assert all(
+        parameter.grad is None or parameter.grad.abs().sum() == 0
+        for parameter in action_event_parameters
+    )
+    assert model.reason_event_projection[-1].weight.grad.abs().sum() > 0

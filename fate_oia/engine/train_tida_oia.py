@@ -626,6 +626,12 @@ def build_runtime(args: Any, evaluation_only: bool = False) -> TIDARuntime:
         relational_traffic_heads=int(
             config["model"].get("relational_traffic_heads", 4)
         ),
+        relational_event_conditioning_enabled=bool(
+            config["model"].get("relational_event_conditioning_enabled", False)
+        ),
+        relational_event_conditioning_scale=float(
+            config["model"].get("relational_event_conditioning_scale", 0.20)
+        ),
         traffic_adaptive_boundary_enabled=bool(
             config["model"].get("traffic_adaptive_boundary_enabled", False)
         ),

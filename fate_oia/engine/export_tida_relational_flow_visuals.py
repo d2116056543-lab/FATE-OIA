@@ -9,6 +9,10 @@ import torch
 from PIL import Image, ImageDraw
 
 from fate_oia.datasets.tida_clip_manifest import load_manifest
+from fate_oia.models.tida_interaction_event_features import EVENT_NAMES
+
+
+ACTION_NAMES = ("forward", "stop", "left", "right")
 
 
 def _load(epoch_dir: Path, name: str) -> torch.Tensor:
@@ -67,6 +71,27 @@ def _target_route_overlay(
     return overlay
 
 
+def _physical_event_panel(events: torch.Tensor) -> Image.Image:
+    """Render target-specific physical traffic events without hiding weak values."""
+    width, row_height = 1120, 34
+    panel = Image.new("RGB", (width, 34 + row_height * len(ACTION_NAMES)), "white")
+    draw = ImageDraw.Draw(panel)
+    draw.text((8, 8), "Target-conditioned physical traffic events (0..1)", fill="black")
+    label_width = 82
+    cell_width = (width - label_width - 8) / len(EVENT_NAMES)
+    for action_index, action_name in enumerate(ACTION_NAMES):
+        y = 34 + action_index * row_height
+        draw.text((8, y + 8), action_name, fill="black")
+        for event_index, event_name in enumerate(EVENT_NAMES):
+            x0 = int(label_width + event_index * cell_width)
+            x1 = int(label_width + (event_index + 1) * cell_width - 2)
+            value = float(events[action_index, event_index])
+            color = (230 - int(150 * value), 242 - int(110 * value), 255)
+            draw.rectangle((x0, y + 2, x1, y + row_height - 3), fill=color, outline=(90, 90, 90))
+            draw.text((x0 + 3, y + 5), f"{event_name[:7]}\n{value:.2f}", fill="black")
+    return panel
+
+
 def export_relational_flow_visuals(
     epoch_dir: Path,
     manifest_path: Path,
@@ -97,6 +122,8 @@ def export_relational_flow_visuals(
     reason_control_deleted = _load(epoch_dir, "relational_reason_random_deleted_delta")
     action_target = _load(epoch_dir, "action_target")
     reason_target = _load(epoch_dir, "reason_target")
+    action_events = _load(epoch_dir, "relational_action_events")
+    reason_event_route = _load(epoch_dir, "relational_reason_event_route")
     output_dir.mkdir(parents=True, exist_ok=True)
     report_rows = []
     for index, file_name in enumerate(file_names[: int(max_cases)]):
@@ -148,6 +175,9 @@ def export_relational_flow_visuals(
             )
             draw.line((source_xy, target_xy), fill=(255, 196, 0), width=2)
         overlay.save(case_dir / "traffic_relations.png")
+        _physical_event_panel(action_events[index]).save(
+            case_dir / "physical_event_transport.png"
+        )
         action_route_files = []
         for target_id in range(action_attention.shape[1]):
             route_name = f"action_{target_id}_traffic_route.png"
@@ -212,6 +242,9 @@ def export_relational_flow_visuals(
             "reason_control_track_by_target": reason_control[index].tolist(),
             "target_effectiveness": target_effectiveness,
             "top_pair_risk": float(pair_risk.max()),
+            "physical_event_names": list(EVENT_NAMES),
+            "physical_events_by_action": action_events[index].tolist(),
+            "reason_to_action_event_route": reason_event_route[index].tolist(),
         }
         (case_dir / "transport_summary.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -221,6 +254,7 @@ def export_relational_flow_visuals(
             "<p>Red: selected necessary trajectory; gray: matched random control; "
             "cyan: other semantic tracks; yellow: high-risk interactions.</p>"
             '<img src="traffic_relations.png" style="max-width:100%">'
+            '<img src="physical_event_transport.png" style="max-width:100%">'
             + "".join(
                 f'<img src="{name}" style="max-width:48%;margin:4px">'
                 for name in action_route_files + reason_route_files

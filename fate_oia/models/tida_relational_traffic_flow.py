@@ -7,6 +7,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from .acpr_sparse_ops import entmax15_bisect
+from .tida_interaction_event_features import build_action_interaction_events
 
 
 def select_semantic_traffic_seeds(
@@ -85,7 +86,12 @@ class _TargetRelationalEncoder(nn.Module):
         relation_weight: torch.Tensor,
         support: torch.Tensor,
         track_mask: torch.Tensor | None,
+        target_context: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if target_context is not None:
+            if target_context.shape != target_nodes.shape:
+                raise ValueError("target_context must match target_nodes")
+            target_nodes = target_nodes + target_context
         relation_summary = torch.einsum(
             "bkj,bkjf->bkf", relation_weight, relation_features
         )
@@ -145,6 +151,8 @@ class TIDARelationalTrafficFlow(nn.Module):
         action_cap: float = 0.12,
         reason_cap: float = 0.10,
         reason_traffic_indices: tuple[int, ...] | None = None,
+        event_conditioning_enabled: bool = False,
+        event_conditioning_scale: float = 0.20,
     ) -> None:
         super().__init__()
         if dim <= 0 or heads <= 0 or dim % heads or action_cap <= 0 or reason_cap <= 0:
@@ -153,6 +161,10 @@ class TIDARelationalTrafficFlow(nn.Module):
         self.num_reasons = int(num_reasons)
         self.action_cap = float(action_cap)
         self.reason_cap = float(reason_cap)
+        if not 0.0 < float(event_conditioning_scale) <= 1.0:
+            raise ValueError("event_conditioning_scale must lie in (0,1]")
+        self.event_conditioning_enabled = bool(event_conditioning_enabled)
+        self.event_conditioning_scale = float(event_conditioning_scale)
         reason_mask = torch.ones(self.num_reasons, dtype=torch.bool)
         if reason_traffic_indices is not None:
             reason_mask.zero_()
@@ -171,6 +183,151 @@ class TIDARelationalTrafficFlow(nn.Module):
         self.reason_output = nn.Linear(dim, 1, bias=False)
         nn.init.zeros_(self.action_output.weight)
         nn.init.zeros_(self.reason_output.weight)
+        self.action_event_projection = nn.Sequential(
+            nn.LayerNorm(12), nn.Linear(12, dim), nn.GELU(), nn.Linear(dim, dim)
+        )
+        self.reason_event_projection = nn.Sequential(
+            nn.LayerNorm(12), nn.Linear(12, dim), nn.GELU(), nn.Linear(dim, dim)
+        )
+        self.reason_event_router = nn.Linear(dim, self.num_actions)
+        # Exact baseline compatibility comes from a zero-output projection,
+        # while the non-zero scale lets the final layer learn on step one.
+        nn.init.zeros_(self.action_event_projection[-1].weight)
+        nn.init.zeros_(self.action_event_projection[-1].bias)
+        nn.init.zeros_(self.reason_event_projection[-1].weight)
+        nn.init.zeros_(self.reason_event_projection[-1].bias)
+
+    def _event_context(
+        self,
+        action_nodes: torch.Tensor,
+        reason_nodes: torch.Tensor,
+        trajectory_xy: torch.Tensor,
+        trajectory_visibility: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        tracks_xy = trajectory_xy[:, 0].permute(0, 2, 1, 3)
+        visibility = trajectory_visibility[:, 0].permute(0, 2, 1)
+        action_events = build_action_interaction_events(tracks_xy, visibility)
+        reason_route = entmax15_bisect(self.reason_event_router(reason_nodes), dim=-1)
+        reason_events = torch.einsum("bra,bae->bre", reason_route, action_events)
+        if self.event_conditioning_enabled:
+            action_context = self.event_conditioning_scale * torch.tanh(
+                self.action_event_projection(action_events)
+            )
+            reason_context = self.event_conditioning_scale * torch.tanh(
+                self.reason_event_projection(reason_events)
+            )
+        else:
+            action_context = action_nodes.new_zeros(action_nodes.shape)
+            reason_context = reason_nodes.new_zeros(reason_nodes.shape)
+        return action_events, reason_route, action_context, reason_context
+
+    def _deleted_event_context(
+        self,
+        action_nodes: torch.Tensor,
+        reason_nodes: torch.Tensor,
+        trajectory_xy: torch.Tensor,
+        trajectory_visibility: torch.Tensor,
+        action_mask: torch.Tensor,
+        reason_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Recompute target-private events after deleting each selected track."""
+        xy = trajectory_xy[:, 0].permute(0, 2, 1, 3)
+        visibility = trajectory_visibility[:, 0].permute(0, 2, 1)
+        batch, frames, tracks, _ = xy.shape
+
+        def masked_events(mask: torch.Tensor) -> torch.Tensor:
+            targets = mask.shape[1]
+            expanded_xy = xy[:, None].expand(-1, targets, -1, -1, -1)
+            expanded_visibility = (
+                visibility[:, None] * mask[:, :, None].to(visibility.dtype)
+            )
+            return build_action_interaction_events(
+                expanded_xy.reshape(batch * targets, frames, tracks, 2),
+                expanded_visibility.reshape(batch * targets, frames, tracks),
+            ).reshape(batch, targets, self.num_actions, 12)
+
+        action_events = masked_events(action_mask)
+        action_index = torch.arange(self.num_actions, device=xy.device)
+        action_events = action_events[:, action_index, action_index]
+        reason_events_by_action = masked_events(reason_mask)
+        reason_route = entmax15_bisect(self.reason_event_router(reason_nodes), dim=-1)
+        reason_events = torch.einsum(
+            "bra,brae->bre", reason_route, reason_events_by_action
+        )
+        action_context = self.event_conditioning_scale * torch.tanh(
+            self.action_event_projection(action_events)
+        )
+        reason_context = self.event_conditioning_scale * torch.tanh(
+            self.reason_event_projection(reason_events)
+        )
+        if not self.event_conditioning_enabled:
+            action_context = torch.zeros_like(action_context)
+            reason_context = torch.zeros_like(reason_context)
+        return action_context, reason_context
+
+    def _event_track_attribution(
+        self,
+        action_nodes: torch.Tensor,
+        reason_nodes: torch.Tensor,
+        trajectory_xy: torch.Tensor,
+        trajectory_visibility: torch.Tensor,
+        support: torch.Tensor,
+        action_context: torch.Tensor,
+        reason_context: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Find the track whose removal changes each target's event context most."""
+        xy = trajectory_xy[:, 0].permute(0, 2, 1, 3)
+        visibility = trajectory_visibility[:, 0].permute(0, 2, 1)
+        batch, frames, tracks, _ = xy.shape
+        leave_one_out = ~torch.eye(tracks, dtype=torch.bool, device=xy.device)
+        expanded_xy = xy[:, None].expand(-1, tracks, -1, -1, -1)
+        expanded_visibility = visibility[:, None] * leave_one_out[None, :, None]
+        deleted_events = build_action_interaction_events(
+            expanded_xy.reshape(batch * tracks, frames, tracks, 2),
+            expanded_visibility.reshape(batch * tracks, frames, tracks),
+        ).reshape(batch, tracks, self.num_actions, 12)
+        deleted_action_context = self.event_conditioning_scale * torch.tanh(
+            self.action_event_projection(deleted_events)
+        ).permute(0, 2, 1, 3)
+        reason_route = entmax15_bisect(self.reason_event_router(reason_nodes), dim=-1)
+        deleted_reason_events = torch.einsum(
+            "bra,bkae->brke", reason_route, deleted_events
+        )
+        deleted_reason_context = self.event_conditioning_scale * torch.tanh(
+            self.reason_event_projection(deleted_reason_events)
+        )
+        if not self.event_conditioning_enabled:
+            deleted_action_context = torch.zeros_like(deleted_action_context)
+            deleted_reason_context = torch.zeros_like(deleted_reason_context)
+
+        def select_context(
+            full: torch.Tensor, deleted: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            impact = (full[:, :, None] - deleted).square().mean(-1).sqrt()
+            selected = impact.argmax(-1)
+            normalized = impact / impact.sum(-1, keepdim=True).clamp_min(1e-8)
+            control = self._matched_control_track(normalized, support)
+            gather = lambda index: torch.gather(
+                deleted, 2, index[..., None, None].expand(-1, -1, 1, deleted.shape[-1])
+            ).squeeze(2)
+            return selected, control, gather(selected), gather(control)
+
+        action_selected, action_control, action_selected_context, action_control_context = (
+            select_context(action_context, deleted_action_context)
+        )
+        reason_selected, reason_control, reason_selected_context, reason_control_context = (
+            select_context(reason_context, deleted_reason_context)
+        )
+        return {
+            "relational_action_event_selected_track": action_selected,
+            "relational_action_event_control_track": action_control,
+            "relational_reason_event_selected_track": reason_selected,
+            "relational_reason_event_control_track": reason_control,
+            "relational_action_event_selected_context": action_selected_context,
+            "relational_action_event_control_context": action_control_context,
+            "relational_reason_event_selected_context": reason_selected_context,
+            "relational_reason_event_control_context": reason_control_context,
+        }
 
     @staticmethod
     def _matched_control_track(
@@ -298,11 +455,22 @@ class TIDARelationalTrafficFlow(nn.Module):
             trajectory_xy, trajectory_visibility, trajectory_pair_valid,
             exclusive_displacement, anchor_weight,
         )
+        action_events, reason_event_route, action_event_context, reason_event_context = (
+            self._event_context(
+                action_nodes, reason_nodes, trajectory_xy, trajectory_visibility
+            )
+        )
+        event_attribution = self._event_track_attribution(
+            action_nodes, reason_nodes, trajectory_xy, trajectory_visibility, support,
+            action_event_context, reason_event_context,
+        )
         action_evidence, action_attention, action_support, action_pair_attention = self.action_encoder(
-            action_nodes, appearance, motion, relations, relation_weight, support, track_mask
+            action_nodes, appearance, motion, relations, relation_weight, support, track_mask,
+            action_event_context,
         )
         reason_evidence, reason_attention, reason_support, reason_pair_attention = self.reason_encoder(
-            reason_nodes, appearance, motion, relations, relation_weight, support, track_mask
+            reason_nodes, appearance, motion, relations, relation_weight, support, track_mask,
+            reason_event_context,
         )
         def bounded_candidate(
             evidence: torch.Tensor, transported_support: torch.Tensor,
@@ -347,14 +515,18 @@ class TIDARelationalTrafficFlow(nn.Module):
 
         def deleted(
             action_mask: torch.Tensor, reason_mask: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            deleted_action_context, deleted_reason_context = self._deleted_event_context(
+                action_nodes, reason_nodes, trajectory_xy, trajectory_visibility,
+                action_mask, reason_mask,
+            )
             deleted_action, _, deleted_action_support, _ = self.action_encoder(
                 action_nodes, appearance, motion, relations, relation_weight, support,
-                action_mask,
+                action_mask, deleted_action_context,
             )
             deleted_reason, _, deleted_reason_support, _ = self.reason_encoder(
                 reason_nodes, appearance, motion, relations, relation_weight, support,
-                reason_mask,
+                reason_mask, deleted_reason_context,
             )
             return (
                 bounded_candidate(
@@ -364,12 +536,20 @@ class TIDARelationalTrafficFlow(nn.Module):
                     deleted_reason, deleted_reason_support, self.reason_output, self.reason_cap,
                     self.reason_traffic_mask,
                 ),
+                deleted_action_context,
+                deleted_reason_context,
             )
 
-        selected_action_delta, selected_reason_delta = deleted(
+        (
+            selected_action_delta, selected_reason_delta,
+            selected_action_event_context, selected_reason_event_context,
+        ) = deleted(
             action_selected_mask, reason_selected_mask
         )
-        random_action_delta, random_reason_delta = deleted(
+        (
+            random_action_delta, random_reason_delta,
+            random_action_event_context, random_reason_event_context,
+        ) = deleted(
             action_random_mask, reason_random_mask
         )
         # Case-level summaries are retained for compact visualization. The
@@ -404,4 +584,13 @@ class TIDARelationalTrafficFlow(nn.Module):
             "relational_pair_features": relations,
             "relational_pair_weights": relation_weight,
             "relational_interaction_risk": interaction_risk,
+            "relational_action_events": action_events,
+            "relational_reason_event_route": reason_event_route,
+            "relational_action_event_context": action_event_context,
+            "relational_reason_event_context": reason_event_context,
+            "relational_action_selected_deleted_event_context": selected_action_event_context,
+            "relational_action_random_deleted_event_context": random_action_event_context,
+            "relational_reason_selected_deleted_event_context": selected_reason_event_context,
+            "relational_reason_random_deleted_event_context": random_reason_event_context,
+            **event_attribution,
         }
