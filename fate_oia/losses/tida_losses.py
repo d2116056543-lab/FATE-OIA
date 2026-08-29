@@ -282,6 +282,21 @@ def target_conditioned_geometric_ranking_loss(
     return torch.stack(losses).mean() if losses else geometric_delta.sum() * 0.0
 
 
+def certified_contradiction_weight(
+    contradiction_scores: torch.Tensor | None,
+    reference: torch.Tensor,
+    *,
+    threshold: float = 0.55,
+) -> torch.Tensor:
+    """Map neutral predicate evidence to zero and retain only certified negatives."""
+    if not 0.5 <= float(threshold) < 1.0:
+        raise ValueError("threshold must be in [0.5, 1.0)")
+    if contradiction_scores is None:
+        return torch.zeros_like(reference)
+    score = contradiction_scores.detach().to(reference).clamp(0.0, 1.0)
+    return ((score - float(threshold)) / (1.0 - float(threshold))).clamp(0.0, 1.0)
+
+
 def target_conditioned_pu_correction_loss(
     base_logits: torch.Tensor,
     delta: torch.Tensor,
@@ -291,14 +306,16 @@ def target_conditioned_pu_correction_loss(
     *,
     target_margin: float = 0.15,
     temperature: float = 0.20,
+    contradiction_threshold: float = 0.55,
 ) -> torch.Tensor:
     """Train reason residuals without treating every unobserved label as negative."""
     positive = observed_positive.float()
-    contradiction = (
-        torch.zeros_like(positive)
-        if contradiction_scores is None
-        else contradiction_scores.detach().clamp(0.0, 1.0) * (1.0 - positive)
-    )
+    # The predicate reasoner emits 0.5 when positive and negative evidence are
+    # balanced. Treating that neutral posterior as a negative would collapse
+    # PU learning back into ordinary hard-negative supervision.
+    contradiction = certified_contradiction_weight(
+        contradiction_scores, positive, threshold=contradiction_threshold
+    ) * (1.0 - positive)
     base = base_logits.detach()
     final = base + delta
     motion_weight = _target_motion_weight(motion_energy, base_logits.shape[1])
@@ -328,12 +345,15 @@ def target_conditioned_pu_ranking_loss(
     *,
     margin: float = 0.10,
     temperature: float = 0.10,
+    contradiction_threshold: float = 0.55,
 ) -> torch.Tensor:
     """Rank observed reasons only against contradiction-certified unlabeled rows."""
     if contradiction_scores is None:
         return delta.sum() * 0.0
     final = base_logits.detach() + delta
-    contradiction = contradiction_scores.detach().clamp(0.0, 1.0)
+    contradiction = certified_contradiction_weight(
+        contradiction_scores, observed_positive, threshold=contradiction_threshold
+    )
     motion_weight = _target_motion_weight(motion_energy, base_logits.shape[1])
     losses = []
     for label in range(base_logits.shape[1]):
@@ -688,6 +708,10 @@ def build_tida_loss_registry(
     image_branch = output.get("image_branch", {})
     contradiction = image_branch.get("contradiction_score") if isinstance(image_branch, dict) else None
     reason_weights = reason_pu_weight(reason_target, contradiction)
+    certified_negative = certified_contradiction_weight(contradiction, reason_target)
+    relational_reason_weight = (
+        reason_target.float() + (1.0 - reason_target.float()) * certified_negative
+    )
     reason_need = output.get("reason_temporal_need", torch.ones_like(reason_target))
     reason_credit_weight = reason_weights * conditional_credit_weight(reason_need)
     reason_no_harm_weight = reason_weights * conditional_no_harm_weight(reason_need)
@@ -788,7 +812,7 @@ def build_tida_loss_registry(
             output["relational_reason_random_deleted_delta"],
             reason_target,
             output["relational_reason_support"],
-            element_weight=reason_weights,
+            element_weight=relational_reason_weight,
         ),
     )
     registry.add(
@@ -797,7 +821,7 @@ def build_tida_loss_registry(
             output["pre_relational_video_reason_logits"],
             output["relational_reason_delta"],
             reason_target,
-            element_weight=reason_weights,
+            element_weight=relational_reason_weight,
         ),
     )
     registry.add(

@@ -105,6 +105,22 @@ def test_pu_correction_uses_only_certified_contradictions_as_negatives():
     assert delta.grad[0, 1] > 0
 
 
+def test_pu_correction_treats_neutral_contradiction_as_unknown():
+    base = torch.zeros(1, 2)
+    target = torch.tensor([[1.0, 0.0]])
+    delta = torch.zeros_like(base, requires_grad=True)
+    loss = target_conditioned_pu_correction_loss(
+        base,
+        delta,
+        target,
+        torch.ones(1, 3) * 0.1,
+        contradiction_scores=torch.tensor([[0.5, 0.5]]),
+    )
+    loss.backward()
+    assert delta.grad[0, 0] < 0
+    assert delta.grad[0, 1] == 0
+
+
 def test_pu_ranking_ignores_uncertified_unlabeled_pairs():
     base = torch.zeros(2, 1)
     target = torch.tensor([[1.0], [0.0]])
@@ -129,3 +145,17 @@ def test_pu_ranking_ignores_uncertified_unlabeled_pairs():
     certified.backward()
     assert delta.grad[0, 0] < 0
     assert delta.grad[1, 0] > 0
+
+
+def test_pu_ranking_ignores_neutral_unlabeled_pairs():
+    base = torch.zeros(2, 1)
+    target = torch.tensor([[1.0], [0.0]])
+    delta = torch.zeros_like(base, requires_grad=True)
+    loss = target_conditioned_pu_ranking_loss(
+        base,
+        delta,
+        target,
+        torch.ones(2, 2) * 0.1,
+        contradiction_scores=torch.full_like(target, 0.5),
+    )
+    assert loss.item() == 0.0

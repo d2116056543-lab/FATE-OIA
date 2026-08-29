@@ -32,7 +32,10 @@ from fate_oia.engine.evaluate_tida_oia import (
 from fate_oia.engine.train_aie_oia import build_model as build_aie_model, canonical_model_state_dict
 from fate_oia.engine.train_vetra_strong_refine import build_refiner
 from fate_oia.losses.tida_loss_registry import assert_owner_exact_cover
-from fate_oia.losses.tida_losses import build_tida_loss_registry
+from fate_oia.losses.tida_losses import (
+    build_tida_loss_registry,
+    certified_contradiction_weight,
+)
 from fate_oia.models.tida_oia_model import TIDAFrozenVETRAImageBase, TIDAOIAModel
 from fate_oia.models.tida_predicate_differential import ROLE_NAMES
 from fate_oia.utils.tida_artifacts import (
@@ -1450,6 +1453,24 @@ def train(args: Any) -> None:
                 output["relational_reason_random_deleted_delta"]
                 - output["relational_reason_selected_deleted_delta"]
             )
+            image_branch = output.get("image_branch", {})
+            contradiction_scores = (
+                image_branch.get("contradiction_score")
+                if isinstance(image_branch, dict) else None
+            )
+            reason_unlabeled = 1.0 - batch["reason"].float()
+            certified_negative = certified_contradiction_weight(
+                contradiction_scores, batch["reason"]
+            ) * reason_unlabeled
+            unlabeled_count = reason_unlabeled.sum().clamp_min(1.0)
+            reason_pu_direction = batch["reason"].float() - (
+                (certified_negative > 0).float() * reason_unlabeled
+            )
+            reason_pu_gap = reason_pu_direction * (
+                output["relational_reason_random_deleted_delta"]
+                - output["relational_reason_selected_deleted_delta"]
+            )
+            reason_pu_count = reason_pu_direction.ne(0).float().sum().clamp_min(1.0)
             row = {
                 "epoch": epoch, "micro_step": micro_step, "optimizer_update": optimizer_update,
                 "total_updates": total_updates, "temporal_scale": schedule["temporal_scale"],
@@ -1553,12 +1574,24 @@ def train(args: Any) -> None:
                 "relational_reason_selected_minus_random_gap": float(
                     relational_reason_deletion_gap.mean().detach().cpu()
                 ),
+                "relational_reason_selected_minus_random_pu_gap": float(
+                    reason_pu_gap.sum().div(reason_pu_count).detach().cpu()
+                ),
                 "relational_interaction_risk_mean": float(
                     output["relational_interaction_risk"].mean().detach().cpu()
                 ),
                 "relational_named_predicate_coverage": float(
                     output["terminal_semantic_predicate_ids"].unique().numel()
                     / max(model.num_predicates, 1)
+                ),
+                "reason_observed_positive_rate": float(
+                    batch["reason"].float().mean().detach().cpu()
+                ),
+                "reason_certified_negative_rate": float(
+                    ((certified_negative > 0).float() * reason_unlabeled).sum().div(unlabeled_count).detach().cpu()
+                ),
+                "reason_certified_negative_weight_mean": float(
+                    certified_negative.sum().div(unlabeled_count).detach().cpu()
                 ),
                 "action_evidence_confidence_mean": float(output["action_evidence_confidence"].mean().detach().cpu()),
                 "action_effective_trust_mean": float(output["action_effective_trust"].mean().detach().cpu()),
