@@ -47,6 +47,8 @@ class TIDALossRegistry:
         "object_intent_reason_no_harm",
         "object_intent_reason_utility",
         "object_intent_delta",
+        "reason_local_aux", "reason_local_rank", "reason_local_utility",
+        "reason_local_no_harm", "reason_local_delta",
     )
     default_weights = {
         "terminal_hist": 0.25,
@@ -116,6 +118,11 @@ class TIDALossRegistry:
         "object_intent_reason_no_harm": 0.0,
         "object_intent_reason_utility": 0.0,
         "object_intent_delta": 0.0,
+        "reason_local_aux": 0.0,
+        "reason_local_rank": 0.0,
+        "reason_local_utility": 0.0,
+        "reason_local_no_harm": 0.0,
+        "reason_local_delta": 0.0,
     }
 
     def __init__(self, weights: dict[str, float] | None = None) -> None:

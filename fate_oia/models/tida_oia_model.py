@@ -13,6 +13,7 @@ from .tida_flow_transition_bank import TIDAFlowTransitionBank
 from .tida_geometric_flow import TIDAGeometricFlowDecisionHeads, TIDAGeometricFlowEncoder
 from .tida_predicate_differential import TIDAPredicateDifferential
 from .tida_reason_reader import TIDAReasonReader
+from .tida_reason_local_temporal_query import TIDAReasonLocalTemporalQuery
 from .tida_relational_traffic_flow import (
     TIDARelationalTrafficFlow,
     select_semantic_traffic_seeds,
@@ -170,6 +171,9 @@ class TIDAOIAModel(nn.Module):
         object_intent_heads: int = 4,
         object_intent_reason_indices: tuple[int, ...] | None = None,
         object_intent_role_checkpoint: str | None = None,
+        reason_local_query_enabled: bool = False,
+        reason_local_query_cap: float = 0.08,
+        reason_local_query_utility_open_prior: float = 0.10,
     ) -> None:
         super().__init__()
         self.image_model = image_model
@@ -211,6 +215,17 @@ class TIDAOIAModel(nn.Module):
             conditional_utility_enabled=conditional_temporal_utility,
             conditional_flow_mix_cap=reason_temporal_budget_cap,
         )
+        self.reason_local_query_enabled = bool(reason_local_query_enabled)
+        self.reason_local_query = TIDAReasonLocalTemporalQuery(
+            dim=dim,
+            num_reasons=num_reasons,
+            num_heads=4,
+            cap=reason_local_query_cap,
+            utility_open_prior=reason_local_query_utility_open_prior,
+        )
+        if not self.reason_local_query_enabled:
+            for parameter in self.reason_local_query.parameters():
+                parameter.requires_grad = False
         self.confidence_aware_reason_gate = bool(confidence_aware_reason_gate)
         self.reason_gate_temperature = float(reason_gate_temperature)
         self.geometric_flow_enabled = bool(geometric_flow_enabled)
@@ -443,6 +458,11 @@ class TIDAOIAModel(nn.Module):
                 )
                 for parameter in module.parameters() if parameter.requires_grad
             ]
+        if self.reason_local_query_enabled:
+            owners["reason_local_query"] = [
+                parameter for parameter in self.reason_local_query.parameters()
+                if parameter.requires_grad
+            ]
         # Query identities are the shortcut-free prior for terminal prediction.
         owners["history_reader"] += [self.query_identity, self.predicate_identity]
         return owners
@@ -479,6 +499,8 @@ class TIDAOIAModel(nn.Module):
         terminal_semantic_patch_tokens: torch.Tensor | None = None,
         terminal_semantic_patch_xy: torch.Tensor | None = None,
         terminal_semantic_patch_weight: torch.Tensor | None = None,
+        history_reason_query_tokens: torch.Tensor | None = None,
+        terminal_reason_query_tokens: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         action_nodes = image["action_nodes_primary"].detach()
         reason_nodes = image["reason_nodes_primary"].detach()
@@ -695,6 +717,48 @@ class TIDAOIAModel(nn.Module):
             if self.confidence_aware_reason_gate
             else reason_delta_raw
         )
+        legacy_reason_delta_raw = reason_delta_raw
+        legacy_reason_delta = reason_delta
+        if self.reason_local_query_enabled:
+            if history_reason_query_tokens is None or terminal_reason_query_tokens is None:
+                raise ValueError("reason local query requires history and terminal reason reads")
+            reason_local = self.reason_local_query(
+                history_reason_query_tokens,
+                terminal_reason_query_tokens,
+                timestamps,
+                frame_valid_mask,
+                image_logits=image_reason,
+                # Candidate learning must not be blocked by the legacy route
+                # ramp. Its independently supervised deployment gate preserves
+                # the exact image fallback until the candidate proves useful.
+                temporal_scale=1.0,
+            )
+            reason_delta_raw = reason_local["reason_local_candidate_delta"]
+            reason_delta = reason_local["reason_local_deploy_delta"]
+        else:
+            zero_reason = torch.zeros_like(image_reason)
+            reason_local = {
+                "reason_local_history_summary": image_reason.new_zeros(
+                    image_reason.shape[0], image_reason.shape[1], action_nodes.shape[-1]
+                ),
+                "reason_local_target_query": image_reason.new_zeros(
+                    image_reason.shape[0], image_reason.shape[1], action_nodes.shape[-1]
+                ),
+                "reason_local_candidate_delta": zero_reason,
+                "reason_local_motion_energy": zero_reason[:, None, :],
+                "reason_local_candidate_logits": image_reason,
+                "reason_local_utility_logit": zero_reason,
+                "reason_local_utility_probability": zero_reason,
+                "reason_local_deploy_gate": zero_reason,
+                "reason_local_deploy_scale": zero_reason,
+                "reason_local_deploy_utility_inverted": zero_reason,
+                "reason_local_deploy_delta": zero_reason,
+                "reason_local_deploy_logits": image_reason,
+                "reason_local_policy_source": "disabled",
+                "reason_local_history_available": torch.zeros(
+                    image_reason.shape[0], dtype=torch.bool, device=image_reason.device
+                ),
+            }
         pre_relational_reason_delta = (
             confidence_aware_reason_delta(
                 image_reason,
@@ -706,7 +770,7 @@ class TIDAOIAModel(nn.Module):
         )
         return {
             **temporal, **innovation, **differential, **flow, **action, **reason,
-            **geometric, **traffic, **trajectory, **relational, **adaptive_boundary,
+            **geometric, **traffic, **trajectory, **relational, **adaptive_boundary, **reason_local,
             "terminal_target_evidence": terminal_target_evidence,
             "terminal_query_identity": terminal_query_identity,
             "predicate_innovation_token": xi[:, self.num_actions :],
@@ -759,6 +823,9 @@ class TIDAOIAModel(nn.Module):
             "prefix_video_reason_logits": image_reason[:, None] + prefix_reason_effective,
             "reason_temporal_delta_raw": reason_delta_raw,
             "reason_temporal_delta": reason_delta,
+            "legacy_reason_temporal_delta_raw": legacy_reason_delta_raw,
+            "legacy_reason_temporal_delta": legacy_reason_delta,
+            "legacy_video_reason_logits": image_reason + legacy_reason_delta,
             "reason_negative_suppression": (reason_delta_raw - reason_delta).clamp_max(0.0).abs(),
             "video_reason_logits": image_reason + reason_delta,
             "action_temporal_route": action["action_route"],
@@ -1160,6 +1227,13 @@ class TIDAOIAModel(nn.Module):
             terminal_semantic_patch_weight=output["terminal_semantic_patch_weight"],
             dense_trajectory_patch_tokens=dense_trajectory_patch_tokens,
             dense_trajectory_grid_hw=output["history_grid_hw"],
+            history_reason_query_tokens=self._intervene_patch_history(
+                output["history_reason_query_tokens"], intervention
+            ) if self.reason_local_query_enabled else None,
+            terminal_reason_query_tokens=(
+                output["terminal_reason_query_tokens"]
+                if self.reason_local_query_enabled else None
+            ),
         )
         if not self.object_intent_enabled:
             return rerun
@@ -1218,6 +1292,7 @@ class TIDAOIAModel(nn.Module):
         terminal_read = self.query_reader(
             target_field["patch_tokens_by_layer"], action_nodes, predicate_tokens,
             self.predicate_identity, grid_hw=target_field["grid_hw"],
+            reason_nodes=reason_nodes if self.reason_local_query_enabled else None,
         )
         terminal_patches = self.context_encoder.select_action_patches(
             target_field, terminal_read["query_attention"][:, : self.num_actions]
@@ -1238,6 +1313,7 @@ class TIDAOIAModel(nn.Module):
             context_images, action_nodes, predicate_tokens, self.predicate_identity,
             predicate_reliability=predicate_reliability,
             canonicalize_horizontal_flip=canonicalize_horizontal_flip,
+            reason_nodes=reason_nodes if self.reason_local_query_enabled else None,
         )
         target_grid_height, target_grid_width = target_field["grid_hw"]
         history_grid_height, history_grid_width = context["history_grid_hw"]
@@ -1307,6 +1383,13 @@ class TIDAOIAModel(nn.Module):
             terminal_semantic_patch_weight=terminal_semantic_patches["weights"],
             dense_trajectory_patch_tokens=dense_trajectory_patch_tokens,
             dense_trajectory_grid_hw=context["history_grid_hw"],
+            history_reason_query_tokens=(
+                self._intervene_patch_history(context["history_reason_query_tokens"], intervention)
+                if self.reason_local_query_enabled else None
+            ),
+            terminal_reason_query_tokens=(
+                terminal_read["reason_query_tokens"] if self.reason_local_query_enabled else None
+            ),
         )
         object_output: dict[str, torch.Tensor] = {}
         if self.object_intent_enabled:
@@ -1388,6 +1471,10 @@ class TIDAOIAModel(nn.Module):
             "terminal_semantic_patch_xy": terminal_semantic_patches["xy"],
             "terminal_semantic_patch_weight": terminal_semantic_patches["weights"],
             "terminal_semantic_patch_indices": terminal_semantic_patches["indices"],
+            "terminal_reason_query_tokens": (
+                terminal_read["reason_query_tokens"] if self.reason_local_query_enabled
+                else image["reason_nodes_primary"].detach()
+            ),
             "terminal_semantic_predicate_ids": terminal_semantic_patches["predicate_ids"],
             "terminal_patch_tokens_context_grid": terminal_patch_tokens_context_grid,
             "_geometric_context_images": context_images,

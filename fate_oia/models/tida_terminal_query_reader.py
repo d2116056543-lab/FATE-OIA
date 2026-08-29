@@ -62,6 +62,7 @@ class TIDATerminalQueryReader(nn.Module):
         predicate_identities: torch.Tensor,
         *,
         grid_hw: tuple[int, int],
+        reason_nodes: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor | tuple[int, ...]]:
         if patch_tokens_by_layer.ndim != 4:
             raise ValueError("patch_tokens_by_layer must be [B,S,N,D]")
@@ -76,11 +77,22 @@ class TIDATerminalQueryReader(nn.Module):
             raise ValueError("predicate_tokens shape mismatch")
         if predicate_identities.shape != (self.num_predicates, dim):
             raise ValueError("predicate_identities shape mismatch")
+        if reason_nodes is not None and (
+            reason_nodes.ndim != 3
+            or reason_nodes.shape[0] != batch
+            or reason_nodes.shape[2] != dim
+        ):
+            raise ValueError("reason_nodes must be [B,R,D]")
 
         predicate_queries = self.query_norm(
             predicate_tokens.detach() + predicate_identities.to(predicate_tokens)[None]
         )
-        query = torch.cat([action_nodes.detach(), predicate_queries], dim=1)
+        base_query = torch.cat([action_nodes.detach(), predicate_queries], dim=1)
+        query = (
+            base_query
+            if reason_nodes is None
+            else torch.cat([base_query, reason_nodes.detach()], dim=1)
+        )
         layer_attention: list[torch.Tensor] = []
         layer_update_norms: list[torch.Tensor] = []
         for layer in self.read_order:
@@ -101,11 +113,21 @@ class TIDATerminalQueryReader(nn.Module):
         final_attention = layer_attention[-1]
         masks = self._region_masks(grid_hw, final_attention.device, final_attention.dtype)
         region_mass = torch.einsum("bqn,rn->bqr", final_attention, masks)
-        return {
-            "query_tokens": query,
-            "query_attention": final_attention,
+        base_count = self.num_actions + self.num_predicates
+        result = {
+            "query_tokens": query[:, :base_count],
+            "query_attention": final_attention[:, :base_count],
             "query_attention_by_layer": torch.stack(layer_attention, dim=2),
-            "query_region_mass": region_mass,
+            "query_region_mass": region_mass[:, :base_count],
             "layer_update_norm": torch.stack(layer_update_norms),
             "layer_order": self.read_order,
         }
+        if reason_nodes is not None:
+            result.update(
+                {
+                    "reason_query_tokens": query[:, base_count:],
+                    "reason_query_attention": final_attention[:, base_count:],
+                    "reason_query_region_mass": region_mass[:, base_count:],
+                }
+            )
+        return result

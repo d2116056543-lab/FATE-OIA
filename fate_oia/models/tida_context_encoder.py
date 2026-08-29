@@ -50,6 +50,7 @@ class TIDAContextEncoder(nn.Module):
         *,
         predicate_reliability: torch.Tensor | None = None,
         canonicalize_horizontal_flip: bool = False,
+        reason_nodes: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         if self.query_reader is None:
             raise RuntimeError("query_reader is required for context encoding")
@@ -60,6 +61,7 @@ class TIDAContextEncoder(nn.Module):
         action_patch_tokens, action_patch_xy, action_patch_weights = [], [], []
         semantic_patch_tokens, semantic_patch_xy, semantic_patch_weights = [], [], []
         semantic_predicate_ids = []
+        reason_tokens, reason_attentions, reason_region_masses = [], [], []
         if predicate_reliability is None:
             predicate_reliability = predicate_tokens.new_ones(
                 batch, predicate_tokens.shape[1]
@@ -83,10 +85,33 @@ class TIDAContextEncoder(nn.Module):
                 predicate_tokens[:, None].expand(-1, repeats, -1, -1).reshape(-1, predicate_tokens.shape[1], predicate_tokens.shape[2]),
                 predicate_identities,
                 grid_hw=field["grid_hw"],
+                reason_nodes=(
+                    None
+                    if reason_nodes is None
+                    else reason_nodes[:, None]
+                    .expand(-1, repeats, -1, -1)
+                    .reshape(-1, reason_nodes.shape[1], reason_nodes.shape[2])
+                ),
             )
             tokens.append(read["query_tokens"].reshape(batch, repeats, -1, action_nodes.shape[-1]))
             attentions.append(read["query_attention"].reshape(batch, repeats, -1, field["patch_tokens_by_layer"].shape[2]))
             region_masses.append(read["query_region_mass"].reshape(batch, repeats, -1, 5))
+            if reason_nodes is not None:
+                reason_tokens.append(
+                    read["reason_query_tokens"].reshape(
+                        batch, repeats, reason_nodes.shape[1], reason_nodes.shape[2]
+                    )
+                )
+                reason_attentions.append(
+                    read["reason_query_attention"].reshape(
+                        batch, repeats, reason_nodes.shape[1], -1
+                    )
+                )
+                reason_region_masses.append(
+                    read["reason_query_region_mass"].reshape(
+                        batch, repeats, reason_nodes.shape[1], 5
+                    )
+                )
             dense_patch_fields.append(
                 field["patch_tokens_last"].reshape(batch, repeats, -1, action_nodes.shape[-1])
             )
@@ -119,7 +144,7 @@ class TIDAContextEncoder(nn.Module):
             semantic_predicate_ids.append(
                 semantic["predicate_ids"].reshape(batch, repeats, semantic_topk)
             )
-        return {
+        result = {
             "history_query_tokens": torch.cat(tokens, dim=1),
             "history_query_attention": torch.cat(attentions, dim=1),
             "history_query_region_mass": torch.cat(region_masses, dim=1),
@@ -133,6 +158,15 @@ class TIDAContextEncoder(nn.Module):
             "history_patch_tokens_last": torch.cat(dense_patch_fields, dim=1),
             "history_grid_hw": (height // self.dino_extractor.patch_size, width // self.dino_extractor.patch_size),
         }
+        if reason_nodes is not None:
+            result.update(
+                {
+                    "history_reason_query_tokens": torch.cat(reason_tokens, dim=1),
+                    "history_reason_query_attention": torch.cat(reason_attentions, dim=1),
+                    "history_reason_query_region_mass": torch.cat(reason_region_masses, dim=1),
+                }
+            )
+        return result
 
     def select_action_patches(
         self,

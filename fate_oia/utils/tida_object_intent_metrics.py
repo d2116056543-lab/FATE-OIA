@@ -248,6 +248,7 @@ def fit_object_intent_utility_policy_oof(
     fold_degradation_tolerance: float = 0.0,
     quantile_coverages: tuple[float, ...] = (),
     allow_proper_score_tie: bool = False,
+    invert_utility_for_negative_scale: bool = False,
     cap: float = 0.08,
     seed: int = 3407,
     fold_group_ids: torch.Tensor | None = None,
@@ -312,7 +313,12 @@ def fit_object_intent_utility_policy_oof(
     for fold in range(int(folds)):
         holdout = fold_ids == fold
         for index, (scale, cutoff) in enumerate(candidates):
-            selected = utility_gate[holdout] >= cutoff
+            selection_score = (
+                1.0 - utility_gate[holdout]
+                if invert_utility_for_negative_scale and scale < 0.0
+                else utility_gate[holdout]
+            )
+            selected = selection_score >= cutoff
             delta = (float(scale) * candidate_delta[holdout]).clamp(-float(cap), float(cap))
             fold_scores[fold, index] = label_f1(
                 base_logits[holdout] + selected.to(delta.dtype) * delta,
@@ -332,7 +338,12 @@ def fit_object_intent_utility_policy_oof(
         if scale == 0.0:
             candidate_benefit_rate[index].fill_(1.0)
             continue
-        selected = utility_gate >= cutoff
+        selection_score = (
+            1.0 - utility_gate
+            if invert_utility_for_negative_scale and scale < 0.0
+            else utility_gate
+        )
+        selected = selection_score >= cutoff
         delta = (float(scale) * candidate_delta).clamp(-float(cap), float(cap))
         deployed_delta = selected.to(delta.dtype) * delta
         selected_count = selected.sum(0).clamp_min(1)
@@ -432,6 +443,10 @@ def fit_object_intent_utility_policy_oof(
     return {
         "gate": base_logits.new_tensor([float(scale != 0.0) for scale, _ in policy]),
         "scale": base_logits.new_tensor([scale for scale, _ in policy]),
+        "utility_inverted": base_logits.new_tensor([
+            float(invert_utility_for_negative_scale and scale < 0.0)
+            for scale, _ in policy
+        ]),
         "cutoff": base_logits.new_tensor([cutoff for _, cutoff in policy]),
         "oof_gain": torch.stack(gains),
         "proper_score_tie_selected": base_logits.new_tensor([

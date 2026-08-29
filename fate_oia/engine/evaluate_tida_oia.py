@@ -74,6 +74,7 @@ def collect_tida_outputs(
         "image_action", "semantic_action", "geometric_action", "traffic_action", "trajectory_action",
         "semantic_trajectory_action", "video_action_base", "video_action",
         "image_reason", "semantic_reason", "geometric_reason", "video_reason",
+        "legacy_video_reason", "reason_local_candidate", "reason_local_deploy",
         "pre_relational_action", "pre_relational_reason",
         "prefix_action", "prefix_reason", "action_target", "reason_target",
     )}
@@ -86,6 +87,10 @@ def collect_tida_outputs(
         "action_temporal_need", "reason_temporal_need",
         "action_temporal_target_motion", "reason_temporal_target_motion",
         "reason_pu_weight",
+        "reason_local_candidate_delta", "reason_local_utility_logit",
+        "reason_local_utility_probability", "reason_local_deploy_gate",
+        "reason_local_deploy_scale", "reason_local_deploy_utility_inverted",
+        "reason_local_deploy_delta", "reason_local_motion_energy",
         "velocity_norm", "acceleration_norm",
         "geometric_motion_energy", "geometric_global_horizontal", "geometric_global_expansion",
         "geometric_region_motion", "geometric_action_delta", "geometric_reason_delta",
@@ -242,6 +247,9 @@ def collect_tida_outputs(
             "semantic_reason": output["semantic_video_reason_logits"],
             "geometric_reason": output["geometric_video_reason_logits"],
             "video_reason": output["video_reason_logits"],
+            "legacy_video_reason": output["legacy_video_reason_logits"],
+            "reason_local_candidate": output["reason_local_candidate_logits"],
+            "reason_local_deploy": output["reason_local_deploy_logits"],
             "pre_relational_action": output["pre_relational_video_action_logits"],
             "pre_relational_reason": output["pre_relational_video_reason_logits"],
             "prefix_action": output["prefix_video_action_logits"],
@@ -281,6 +289,16 @@ def collect_tida_outputs(
             "action_temporal_target_motion": output["action_temporal_target_motion"],
             "reason_temporal_target_motion": output["reason_temporal_target_motion"],
             "reason_pu_weight": reason_pu,
+            "reason_local_candidate_delta": output["reason_local_candidate_delta"],
+            "reason_local_motion_energy": output["reason_local_motion_energy"],
+            "reason_local_utility_logit": output["reason_local_utility_logit"],
+            "reason_local_utility_probability": output["reason_local_utility_probability"],
+            "reason_local_deploy_gate": output["reason_local_deploy_gate"],
+            "reason_local_deploy_scale": output["reason_local_deploy_scale"],
+            "reason_local_deploy_utility_inverted": output[
+                "reason_local_deploy_utility_inverted"
+            ],
+            "reason_local_deploy_delta": output["reason_local_deploy_delta"],
             "velocity_norm": output["velocity"].norm(dim=-1),
             "acceleration_norm": output["acceleration"].norm(dim=-1),
             "geometric_motion_energy": output["geometric_motion_energy"],
@@ -648,10 +666,21 @@ def collect_tida_outputs(
 
 
 def branch_metrics(rows: dict[str, Any], thresholds: torch.Tensor | float = 0.5) -> dict[str, Any]:
-    return {
+    metrics = {
         "image": aie_branch_metrics(rows["image_action"], rows["image_reason"], rows["action_target"], rows["reason_target"], threshold=thresholds),
         "video": aie_branch_metrics(rows["video_action"], rows["video_reason"], rows["action_target"], rows["reason_target"], threshold=thresholds),
     }
+    for name, key in (
+        ("legacy_reason_route", "legacy_video_reason"),
+        ("reason_local_candidate", "reason_local_candidate"),
+        ("reason_local_deploy", "reason_local_deploy"),
+    ):
+        if key in rows:
+            metrics[name] = aie_branch_metrics(
+                rows["video_action"], rows[key], rows["action_target"],
+                rows["reason_target"], threshold=thresholds,
+            )
+    return metrics
 
 
 def dynamic_slice_metrics(rows: dict[str, Any], thresholds: torch.Tensor | float = 0.5) -> dict[str, Any]:
@@ -1271,6 +1300,7 @@ def save_epoch_outputs(output_dir: Path, epoch: int, rows: dict[str, Any], metri
         "image_action", "semantic_action", "geometric_action", "traffic_action",
         "video_action_base", "video_action",
         "image_reason", "semantic_reason", "geometric_reason", "video_reason",
+        "legacy_video_reason", "reason_local_candidate", "reason_local_deploy",
         "prefix_action", "prefix_reason", "action_target", "reason_target",
         "rho", "action_delta", "reason_delta", "null_mass", "route_entropy",
         "action_evidence_confidence", "action_effective_trust",
@@ -1280,6 +1310,10 @@ def save_epoch_outputs(output_dir: Path, epoch: int, rows: dict[str, Any], metri
         "action_temporal_need", "reason_temporal_need",
         "action_temporal_target_motion", "reason_temporal_target_motion",
         "reason_pu_weight",
+        "reason_local_candidate_delta", "reason_local_utility_logit",
+        "reason_local_utility_probability", "reason_local_deploy_gate",
+        "reason_local_deploy_scale", "reason_local_deploy_utility_inverted",
+        "reason_local_deploy_delta", "reason_local_motion_energy",
         "velocity_norm", "acceleration_norm",
         "geometric_motion_energy", "geometric_global_horizontal", "geometric_global_expansion",
         "geometric_region_motion", "geometric_action_delta", "geometric_reason_delta",

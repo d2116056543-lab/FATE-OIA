@@ -297,6 +297,41 @@ def certified_contradiction_weight(
     return ((score - float(threshold)) / (1.0 - float(threshold))).clamp(0.0, 1.0)
 
 
+def reason_local_utility_calibration_loss(
+    utility_logits: torch.Tensor,
+    candidate_delta: torch.Tensor,
+    observed_positive: torch.Tensor,
+    contradiction_scores: torch.Tensor | None,
+    *,
+    contradiction_threshold: float = 0.55,
+    min_candidate_effect: float = 1.0e-4,
+) -> torch.Tensor:
+    """Calibrate candidate usefulness without turning PU unknowns into negatives."""
+    if not (
+        utility_logits.shape == candidate_delta.shape == observed_positive.shape
+    ):
+        raise ValueError("reason local utility tensors must share [B,R]")
+    positive = observed_positive.float()
+    contradiction = certified_contradiction_weight(
+        contradiction_scores,
+        positive,
+        threshold=contradiction_threshold,
+    ) * (1.0 - positive)
+    # A zero-initialized candidate has not made a decision yet. Treating its
+    # zero delta as harmful would train the deployment gate closed before the
+    # candidate branch has received a useful gradient.
+    measurable = (
+        candidate_delta.detach().abs() >= float(min_candidate_effect)
+    ).to(utility_logits.dtype)
+    supervised = (positive + contradiction) * measurable
+    sign = positive - contradiction
+    helpful = (sign * candidate_delta.detach() > 0).to(utility_logits.dtype)
+    loss = F.binary_cross_entropy_with_logits(
+        utility_logits, helpful, reduction="none"
+    )
+    return (loss * supervised).sum() / supervised.sum().clamp_min(1.0)
+
+
 def target_conditioned_pu_correction_loss(
     base_logits: torch.Tensor,
     delta: torch.Tensor,
@@ -715,6 +750,48 @@ def build_tida_loss_registry(
     reason_need = output.get("reason_temporal_need", torch.ones_like(reason_target))
     reason_credit_weight = reason_weights * conditional_credit_weight(reason_need)
     reason_no_harm_weight = reason_weights * conditional_no_harm_weight(reason_need)
+    if "reason_local_candidate_logits" in output:
+        registry.add(
+            "reason_local_aux",
+            target_conditioned_pu_correction_loss(
+                output["image_reason_logits"],
+                output["reason_local_candidate_delta"],
+                reason_target,
+                output["reason_local_motion_energy"],
+                contradiction,
+            ),
+        )
+        registry.add(
+            "reason_local_rank",
+            target_conditioned_pu_ranking_loss(
+                output["image_reason_logits"],
+                output["reason_local_candidate_delta"],
+                reason_target,
+                output["reason_local_motion_energy"],
+                contradiction,
+            ),
+        )
+        registry.add(
+            "reason_local_utility",
+            reason_local_utility_calibration_loss(
+                output["reason_local_utility_logit"],
+                output["reason_local_candidate_delta"],
+                reason_target,
+                contradiction,
+            ),
+        )
+        registry.add(
+            "reason_local_no_harm",
+            positive_label_no_harm_loss(
+                output["image_reason_logits"],
+                output["reason_local_candidate_logits"],
+                reason_target,
+            ),
+        )
+        registry.add(
+            "reason_local_delta",
+            output["reason_local_candidate_delta"].square().mean(),
+        )
     registry.add("reason_partial", reason_partial_asl_loss(output["video_reason_logits"], reason_target, contradiction))
     registry.add(
         "reason_rank",
