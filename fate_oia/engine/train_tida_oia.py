@@ -1470,6 +1470,10 @@ def train(args: Any) -> None:
                 output["relational_reason_random_deleted_delta"]
                 - output["relational_reason_selected_deleted_delta"]
             )
+            reason_soft_pu_gap = reason_pu_direction * (
+                output["relational_reason_soft_control_deleted_delta"]
+                - output["relational_reason_soft_selected_deleted_delta"]
+            )
             reason_pu_count = reason_pu_direction.ne(0).float().sum().clamp_min(1.0)
             row = {
                 "epoch": epoch, "micro_step": micro_step, "optimizer_update": optimizer_update,
@@ -1576,6 +1580,9 @@ def train(args: Any) -> None:
                 ),
                 "relational_reason_selected_minus_random_pu_gap": float(
                     reason_pu_gap.sum().div(reason_pu_count).detach().cpu()
+                ),
+                "relational_reason_soft_selected_minus_control_pu_gap": float(
+                    reason_soft_pu_gap.sum().div(reason_pu_count).detach().cpu()
                 ),
                 "relational_interaction_risk_mean": float(
                     output["relational_interaction_risk"].mean().detach().cpu()

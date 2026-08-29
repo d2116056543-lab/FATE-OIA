@@ -126,7 +126,7 @@ def test_closing_pair_gets_more_relation_weight_than_static_pair_at_same_distanc
     assert relation_weight[0, 0, 1] > relation_weight[0, 0, 2]
 
 
-def test_common_mode_is_removed_and_temporal_order_changes_relations():
+def test_action_common_mode_is_removed_but_reason_labels_do_not_compete():
     model = TIDARelationalTrafficFlow(dim=16, num_actions=4, num_reasons=7, heads=4)
     with torch.no_grad():
         model.action_output.weight.fill_(0.05)
@@ -144,10 +144,37 @@ def test_common_mode_is_removed_and_temporal_order_changes_relations():
     reversed_inputs[5] = -reversed_inputs[5].flip(3)
     reverse = model(action_nodes, reason_nodes, *reversed_inputs)
     assert torch.allclose(forward["relational_action_candidate"].mean(-1), torch.zeros(3), atol=1e-6)
-    assert torch.allclose(forward["relational_reason_candidate"].mean(-1), torch.zeros(3), atol=1e-6)
+    assert not torch.allclose(
+        forward["relational_reason_candidate"].sum(-1), torch.zeros(3), atol=1e-6
+    )
     assert not torch.allclose(
         forward["relational_action_candidate"], reverse["relational_action_candidate"]
     )
+
+
+def test_reason_soft_deletion_keeps_gradient_to_target_selection():
+    model = TIDARelationalTrafficFlow(
+        dim=16,
+        num_actions=4,
+        num_reasons=7,
+        heads=4,
+        reason_traffic_indices=(1, 5),
+    )
+    with torch.no_grad():
+        model.reason_output.weight.fill_(0.05)
+    output = model(
+        torch.randn(2, 4, 16), torch.randn(2, 7, 16), *_trajectory_inputs(batch=2)
+    )
+
+    keep_weight = output["relational_reason_soft_selected_keep_weight"]
+    keep_weight.retain_grad()
+    loss = output["relational_reason_soft_selected_deleted_delta"][:, [1, 5]].square().sum()
+    loss.backward()
+
+    assert output["relational_reason_soft_control_deleted_delta"].shape == (2, 7)
+    assert keep_weight.grad is not None
+    assert torch.isfinite(keep_weight.grad).all()
+    assert keep_weight.grad.abs().sum() > 0
 def test_target_conditioned_pair_context_is_zero_init_and_gets_first_step_gradient():
     model = TIDARelationalTrafficFlow(dim=16, num_actions=4, num_reasons=7, heads=4)
     with torch.no_grad():

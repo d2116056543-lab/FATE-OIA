@@ -87,6 +87,7 @@ class _TargetRelationalEncoder(nn.Module):
         support: torch.Tensor,
         track_mask: torch.Tensor | None,
         target_context: torch.Tensor | None = None,
+        track_weight: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if target_context is not None:
             if target_context.shape != target_nodes.shape:
@@ -129,6 +130,12 @@ class _TargetRelationalEncoder(nn.Module):
             elif track_mask.shape != score.shape:
                 raise ValueError("track_mask must be [B,K] or [B,L,K]")
             score = score.masked_fill(~track_mask, -1e4)
+        if track_weight is not None:
+            if track_weight.shape == support.shape:
+                track_weight = track_weight[:, None].expand_as(score)
+            elif track_weight.shape != score.shape:
+                raise ValueError("track_weight must be [B,K] or [B,L,K]")
+            score = score + track_weight.clamp_min(1e-6).log()
         attention = entmax15_bisect(score, dim=-1)
         evidence = torch.einsum(
             "blk,blkd->bld",
@@ -484,8 +491,10 @@ class TIDARelationalTrafficFlow(nn.Module):
             if relevance_mask is None:
                 return candidate - candidate.mean(-1, keepdim=True)
             mask = relevance_mask.to(candidate.dtype)[None]
-            active_mean = (candidate * mask).sum(-1, keepdim=True) / mask.sum().clamp_min(1.0)
-            return (candidate - active_mean) * mask
+            # Reasons are independent PU labels. Cross-label centering would
+            # turn evidence for one reason into artificial negative evidence
+            # for every other active reason in the same image.
+            return candidate * mask
 
         action_candidate = bounded_candidate(
             action_evidence, action_support, self.action_output, self.action_cap
@@ -512,6 +521,28 @@ class TIDARelationalTrafficFlow(nn.Module):
         reason_selected_mask = deletion_mask(reason_selected_track)
         action_random_mask = deletion_mask(action_random_track)
         reason_random_mask = deletion_mask(reason_random_track)
+
+        # Keep hard deletion above for audit. Training additionally receives a
+        # differentiable, mass-matched suppression so the deletion objective
+        # can teach the reason attention which track carries target evidence.
+        soft_selection = torch.softmax(reason_attention / 0.10, dim=-1)
+        selected_value = torch.gather(
+            soft_selection, 2, reason_selected_track[..., None]
+        )
+        control_value = torch.gather(
+            soft_selection, 2, reason_random_track[..., None]
+        )
+        soft_control_selection = soft_selection.scatter(
+            2, reason_selected_track[..., None], control_value
+        )
+        soft_control_selection = soft_control_selection.scatter(
+            2, reason_random_track[..., None], selected_value
+        )
+        suppression_scale = 0.95 / soft_selection.amax(-1, keepdim=True).detach().clamp_min(1e-6)
+        reason_soft_selected_keep = (1.0 - suppression_scale * soft_selection).clamp_min(0.05)
+        reason_soft_control_keep = (
+            1.0 - suppression_scale * soft_control_selection
+        ).clamp_min(0.05)
 
         def deleted(
             action_mask: torch.Tensor, reason_mask: torch.Tensor,
@@ -552,6 +583,35 @@ class TIDARelationalTrafficFlow(nn.Module):
         ) = deleted(
             action_random_mask, reason_random_mask
         )
+
+        def soft_deleted_reason(
+            keep_weight: torch.Tensor, event_context: torch.Tensor,
+        ) -> torch.Tensor:
+            deleted_reason, _, deleted_support, _ = self.reason_encoder(
+                reason_nodes,
+                appearance,
+                motion,
+                relations,
+                relation_weight,
+                support,
+                None,
+                event_context,
+                track_weight=keep_weight,
+            )
+            return bounded_candidate(
+                deleted_reason,
+                deleted_support,
+                self.reason_output,
+                self.reason_cap,
+                self.reason_traffic_mask,
+            )
+
+        soft_selected_reason_delta = soft_deleted_reason(
+            reason_soft_selected_keep, selected_reason_event_context
+        )
+        soft_control_reason_delta = soft_deleted_reason(
+            reason_soft_control_keep, random_reason_event_context
+        )
         # Case-level summaries are retained for compact visualization. The
         # complete per-target routes below are the source of audit metrics.
         target_mass = torch.cat((action_attention, reason_attention), dim=1).mean(1)
@@ -567,6 +627,10 @@ class TIDARelationalTrafficFlow(nn.Module):
             "relational_action_random_deleted_delta": random_action_delta,
             "relational_reason_selected_deleted_delta": selected_reason_delta,
             "relational_reason_random_deleted_delta": random_reason_delta,
+            "relational_reason_soft_selected_deleted_delta": soft_selected_reason_delta,
+            "relational_reason_soft_control_deleted_delta": soft_control_reason_delta,
+            "relational_reason_soft_selected_keep_weight": reason_soft_selected_keep,
+            "relational_reason_soft_control_keep_weight": reason_soft_control_keep,
             "relational_selected_track": selected_track,
             "relational_random_track": random_track,
             "relational_action_selected_track": action_selected_track,

@@ -808,8 +808,8 @@ def build_tida_loss_registry(
         "relational_reason_deletion",
         relational_deletion_contrast_loss(
             output["relational_reason_delta"],
-            output["relational_reason_selected_deleted_delta"],
-            output["relational_reason_random_deleted_delta"],
+            output["relational_reason_soft_selected_deleted_delta"],
+            output["relational_reason_soft_control_deleted_delta"],
             reason_target,
             output["relational_reason_support"],
             element_weight=relational_reason_weight,
