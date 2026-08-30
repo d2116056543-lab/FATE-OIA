@@ -623,6 +623,12 @@ def build_runtime(args: Any, evaluation_only: bool = False) -> TIDARuntime:
         reason_local_query_utility_open_prior=float(
             config["model"].get("reason_local_query_utility_open_prior", 0.10)
         ),
+        reason_local_temporal_reason_indices=tuple(
+            int(index) for index in config["model"].get(
+                "reason_local_temporal_reason_indices",
+                range(int(config["model"].get("num_reasons", 21))),
+            )
+        ),
         geometric_flow_enabled=bool(config["model"].get("geometric_flow_enabled", False)),
         geometric_flow_hidden_dim=int(config["model"].get("geometric_flow_hidden_dim", 64)),
         geometric_action_cap=float(config["model"].get("geometric_action_cap", 0.20)),
@@ -1169,9 +1175,20 @@ def calibrate_reason_local_deployment(model, calib_rows, deployment_config):
                 fold_group_ids = torch.tensor(
                     [source_index[name] for name in source_batches], dtype=torch.long
                 )
+    # Remove the label-wise common residual using train-calib only. This keeps
+    # the temporal ranking signal while preventing a generic positive shift
+    # from invalidating the image branch's locked deployment thresholds.
+    candidate_center = calib_rows["reason_local_candidate_delta"].median(0).values
+    candidate_center = (
+        candidate_center
+        * model.reason_local_query.temporal_reason_mask.detach().cpu()
+    )
+    centered_candidate = (
+        calib_rows["reason_local_candidate_delta"] - candidate_center[None]
+    ) * model.reason_local_query.temporal_reason_mask.detach().cpu()[None]
     fit = fit_object_intent_utility_policy_oof(
         calib_rows["image_reason"],
-        calib_rows["reason_local_candidate_delta"],
+        centered_candidate,
         calib_rows["reason_local_utility_probability"],
         calib_rows["reason_target"],
         thresholds[action_count:],
@@ -1212,6 +1229,7 @@ def calibrate_reason_local_deployment(model, calib_rows, deployment_config):
     model.reason_local_query.set_deployment_policy(
         fit["gate"], fit["scale"], fit["cutoff"],
         utility_inverted=fit["utility_inverted"],
+        center=candidate_center,
         source="train_calib_oof",
     )
 
@@ -1225,6 +1243,8 @@ def calibrate_reason_local_deployment(model, calib_rows, deployment_config):
         "source": "train_calib_oof",
         "test_labels_used": False,
         "threshold_source": "image_train_calib_locked_or_fitted",
+        "candidate_center": serialize(candidate_center),
+        "candidate_center_source": "train_calib_median",
         "source_fallback_reason": source_fallback_reason,
     }
 

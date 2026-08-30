@@ -74,7 +74,8 @@ def collect_tida_outputs(
         "image_action", "semantic_action", "geometric_action", "traffic_action", "trajectory_action",
         "semantic_trajectory_action", "video_action_base", "video_action",
         "image_reason", "semantic_reason", "geometric_reason", "video_reason",
-        "legacy_video_reason", "reason_local_candidate", "reason_local_deploy",
+        "legacy_video_reason", "reason_local_candidate",
+        "reason_local_centered_candidate", "reason_local_deploy",
         "pre_relational_action", "pre_relational_reason",
         "prefix_action", "prefix_reason", "action_target", "reason_target",
     )}
@@ -87,7 +88,8 @@ def collect_tida_outputs(
         "action_temporal_need", "reason_temporal_need",
         "action_temporal_target_motion", "reason_temporal_target_motion",
         "reason_pu_weight",
-        "reason_local_candidate_delta", "reason_local_utility_logit",
+        "reason_local_candidate_delta", "reason_local_centered_candidate_delta",
+        "reason_local_utility_logit",
         "reason_local_utility_probability", "reason_local_deploy_gate",
         "reason_local_deploy_scale", "reason_local_deploy_utility_inverted",
         "reason_local_deploy_delta", "reason_local_motion_energy",
@@ -249,6 +251,9 @@ def collect_tida_outputs(
             "video_reason": output["video_reason_logits"],
             "legacy_video_reason": output["legacy_video_reason_logits"],
             "reason_local_candidate": output["reason_local_candidate_logits"],
+            "reason_local_centered_candidate": output[
+                "reason_local_centered_candidate_logits"
+            ],
             "reason_local_deploy": output["reason_local_deploy_logits"],
             "pre_relational_action": output["pre_relational_video_action_logits"],
             "pre_relational_reason": output["pre_relational_video_reason_logits"],
@@ -290,6 +295,9 @@ def collect_tida_outputs(
             "reason_temporal_target_motion": output["reason_temporal_target_motion"],
             "reason_pu_weight": reason_pu,
             "reason_local_candidate_delta": output["reason_local_candidate_delta"],
+            "reason_local_centered_candidate_delta": output[
+                "reason_local_centered_candidate_delta"
+            ],
             "reason_local_motion_energy": output["reason_local_motion_energy"],
             "reason_local_utility_logit": output["reason_local_utility_logit"],
             "reason_local_utility_probability": output["reason_local_utility_probability"],
@@ -673,6 +681,7 @@ def branch_metrics(rows: dict[str, Any], thresholds: torch.Tensor | float = 0.5)
     for name, key in (
         ("legacy_reason_route", "legacy_video_reason"),
         ("reason_local_candidate", "reason_local_candidate"),
+        ("reason_local_centered_candidate", "reason_local_centered_candidate"),
         ("reason_local_deploy", "reason_local_deploy"),
     ):
         if key in rows:
@@ -1300,7 +1309,8 @@ def save_epoch_outputs(output_dir: Path, epoch: int, rows: dict[str, Any], metri
         "image_action", "semantic_action", "geometric_action", "traffic_action",
         "video_action_base", "video_action",
         "image_reason", "semantic_reason", "geometric_reason", "video_reason",
-        "legacy_video_reason", "reason_local_candidate", "reason_local_deploy",
+        "legacy_video_reason", "reason_local_candidate",
+        "reason_local_centered_candidate", "reason_local_deploy",
         "prefix_action", "prefix_reason", "action_target", "reason_target",
         "rho", "action_delta", "reason_delta", "null_mass", "route_entropy",
         "action_evidence_confidence", "action_effective_trust",
@@ -1310,7 +1320,8 @@ def save_epoch_outputs(output_dir: Path, epoch: int, rows: dict[str, Any], metri
         "action_temporal_need", "reason_temporal_need",
         "action_temporal_target_motion", "reason_temporal_target_motion",
         "reason_pu_weight",
-        "reason_local_candidate_delta", "reason_local_utility_logit",
+        "reason_local_candidate_delta", "reason_local_centered_candidate_delta",
+        "reason_local_utility_logit",
         "reason_local_utility_probability", "reason_local_deploy_gate",
         "reason_local_deploy_scale", "reason_local_deploy_utility_inverted",
         "reason_local_deploy_delta", "reason_local_motion_energy",

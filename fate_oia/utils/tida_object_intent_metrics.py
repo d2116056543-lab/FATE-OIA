@@ -291,11 +291,22 @@ def fit_object_intent_utility_policy_oof(
     ]
     if fold_group_ids is None:
         generator = torch.Generator(device="cpu").manual_seed(int(seed))
-        permutation = torch.randperm(base_logits.shape[0], generator=generator)
-        fold_ids = torch.empty(base_logits.shape[0], dtype=torch.long)
-        fold_ids[permutation] = torch.arange(base_logits.shape[0]) % int(folds)
+        fold_ids = torch.empty(
+            (base_logits.shape[0], base_logits.shape[1]), dtype=torch.long
+        )
+        # Each label owns its folds. Round-robin positives and non-positives
+        # separately so rare reasons are not accidentally concentrated in one
+        # holdout, which would make per-label stability meaningless.
+        for label in range(base_logits.shape[1]):
+            positive = target[:, label].detach().cpu() > 0.5
+            for membership in (positive, ~positive):
+                rows = membership.nonzero(as_tuple=False).flatten()
+                if not rows.numel():
+                    continue
+                order = rows[torch.randperm(rows.numel(), generator=generator)]
+                fold_ids[order, label] = torch.arange(rows.numel()) % int(folds)
         fold_ids = fold_ids.to(base_logits.device)
-        fold_strategy = "random_oof"
+        fold_strategy = "label_stratified_oof"
         source_group_count = 0
     else:
         fold_group_ids = torch.as_tensor(fold_group_ids, device=base_logits.device)
@@ -307,23 +318,35 @@ def fit_object_intent_utility_policy_oof(
             raise ValueError("leave-source-out fitting requires at least two source groups")
         folds = source_group_count
         fold_strategy = "leave_source_out"
+        fold_ids = fold_ids[:, None].expand(-1, base_logits.shape[1])
     fold_scores = base_logits.new_zeros(
         (int(folds), len(candidates), base_logits.shape[1])
     )
     for fold in range(int(folds)):
-        holdout = fold_ids == fold
-        for index, (scale, cutoff) in enumerate(candidates):
-            selection_score = (
-                1.0 - utility_gate[holdout]
-                if invert_utility_for_negative_scale and scale < 0.0
-                else utility_gate[holdout]
-            )
-            selected = selection_score >= cutoff
-            delta = (float(scale) * candidate_delta[holdout]).clamp(-float(cap), float(cap))
-            fold_scores[fold, index] = label_f1(
-                base_logits[holdout] + selected.to(delta.dtype) * delta,
-                target[holdout],
-            )
+        for label in range(base_logits.shape[1]):
+            holdout = fold_ids[:, label] == fold
+            truth = target[holdout, label] > 0.5
+            for index, (scale, cutoff) in enumerate(candidates):
+                utility = utility_gate[holdout, label]
+                selection_score = (
+                    1.0 - utility
+                    if invert_utility_for_negative_scale and scale < 0.0
+                    else utility
+                )
+                selected = selection_score >= cutoff
+                delta = (float(scale) * candidate_delta[holdout, label]).clamp(
+                    -float(cap), float(cap)
+                )
+                prediction = (
+                    base_logits[holdout, label]
+                    + selected.to(delta.dtype) * delta
+                ).sigmoid() >= locked_thresholds[label]
+                tp = (prediction & truth).sum().float()
+                fp = (prediction & ~truth).sum().float()
+                fn = (~prediction & truth).sum().float()
+                fold_scores[fold, index, label] = (
+                    2.0 * tp / (2.0 * tp + fp + fn).clamp_min(1.0)
+                )
     scores = fold_scores.mean(0)
     candidate_selected_rate = base_logits.new_zeros(scores.shape)
     candidate_benefit_rate = base_logits.new_zeros(scores.shape)

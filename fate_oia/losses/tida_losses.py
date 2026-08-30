@@ -378,14 +378,16 @@ def target_conditioned_pu_ranking_loss(
     motion_energy: torch.Tensor,
     contradiction_scores: torch.Tensor | None = None,
     *,
-    margin: float = 0.10,
-    temperature: float = 0.10,
+    margin: float = 0.005,
+    temperature: float = 0.01,
     contradiction_threshold: float = 0.55,
 ) -> torch.Tensor:
     """Rank observed reasons only against contradiction-certified unlabeled rows."""
     if contradiction_scores is None:
         return delta.sum() * 0.0
-    final = base_logits.detach() + delta
+    # Rank the temporal residual itself. Ranking final logits lets a strong
+    # image branch satisfy every pair while the temporal delta points in the
+    # wrong direction, so the local route never learns discriminative credit.
     contradiction = certified_contradiction_weight(
         contradiction_scores, observed_positive, threshold=contradiction_threshold
     )
@@ -394,8 +396,8 @@ def target_conditioned_pu_ranking_loss(
     for label in range(base_logits.shape[1]):
         positive_mask = observed_positive[:, label] > 0.5
         negative_mask = ~positive_mask
-        positive = final[positive_mask, label]
-        negative = final[negative_mask, label]
+        positive = delta[positive_mask, label]
+        negative = delta[negative_mask, label]
         negative_weight = contradiction[negative_mask, label] * motion_weight[negative_mask, label]
         if not positive.numel() or not negative.numel():
             continue

@@ -241,11 +241,13 @@ def test_utility_policy_respects_coverage_and_benefit_precision_guards():
 
 def test_utility_policy_requires_cross_fold_stability():
     samples = 100
-    generator = torch.Generator(device="cpu").manual_seed(3407)
-    permutation = torch.randperm(samples, generator=generator)
-    fold_ids = torch.empty(samples, dtype=torch.long)
-    fold_ids[permutation] = torch.arange(samples) % 5
     target = (torch.arange(samples) % 2).float()[:, None]
+    generator = torch.Generator(device="cpu").manual_seed(3407)
+    fold_ids = torch.empty(samples, dtype=torch.long)
+    for membership in (target[:, 0] > 0.5, target[:, 0] <= 0.5):
+        rows = membership.nonzero(as_tuple=False).flatten()
+        order = rows[torch.randperm(rows.numel(), generator=generator)]
+        fold_ids[order] = torch.arange(rows.numel()) % 5
     sign = 2.0 * target - 1.0
     base = 0.04 * sign
     candidate = torch.zeros(samples, 1)
@@ -273,11 +275,13 @@ def test_utility_policy_requires_cross_fold_stability():
 
 def test_utility_policy_accepts_repeatable_gain_with_quantized_neutral_folds():
     samples = 100
-    generator = torch.Generator(device="cpu").manual_seed(3407)
-    permutation = torch.randperm(samples, generator=generator)
-    fold_ids = torch.empty(samples, dtype=torch.long)
-    fold_ids[permutation] = torch.arange(samples) % 5
     target = (torch.arange(samples) % 2).float()[:, None]
+    generator = torch.Generator(device="cpu").manual_seed(3407)
+    fold_ids = torch.empty(samples, dtype=torch.long)
+    for membership in (target[:, 0] > 0.5, target[:, 0] <= 0.5):
+        rows = membership.nonzero(as_tuple=False).flatten()
+        order = rows[torch.randperm(rows.numel(), generator=generator)]
+        fold_ids[order] = torch.arange(rows.numel()) % 5
     sign = 2.0 * target - 1.0
     base = 0.04 * sign
     candidate = torch.zeros(samples, 1)

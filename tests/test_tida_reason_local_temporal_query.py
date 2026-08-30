@@ -1,12 +1,27 @@
 import torch
 import inspect
 
-from fate_oia.models.tida_reason_local_temporal_query import TIDAReasonLocalTemporalQuery
+from fate_oia.models.tida_reason_local_temporal_query import (
+    TIDAReasonLocalTemporalQuery,
+    bounded_reason_delta,
+)
 from fate_oia.models.tida_terminal_query_reader import TIDATerminalQueryReader
 from fate_oia.losses.tida_losses import reason_local_utility_calibration_loss
 from fate_oia.engine.evaluate_tida_oia import branch_metrics
 from fate_oia.engine.train_tida_oia import calibrate_reason_local_deployment
 from fate_oia.engine import train_tida_oia
+
+
+def test_reason_local_bounded_delta_preserves_small_signal_ranking():
+    raw = torch.tensor([-0.10, -0.01, 0.0, 0.01, 0.10], requires_grad=True)
+    value = bounded_reason_delta(raw, cap=0.02)
+
+    assert torch.all(value[1:] > value[:-1])
+    assert float(value.abs().max()) < 0.02
+    assert torch.allclose(value[3], torch.tensor(0.0002), atol=1e-6)
+    value.sum().backward()
+    assert torch.isfinite(raw.grad).all()
+    assert torch.all(raw.grad > 0)
 
 
 def test_query_reader_returns_target_private_reason_patch_reads():
@@ -119,6 +134,105 @@ def test_reason_local_reports_target_private_motion_energy():
     assert float(motion.std()) > 0.0
 
 
+def test_reason_local_target_query_attends_only_valid_history_frames():
+    torch.manual_seed(13)
+    module = TIDAReasonLocalTemporalQuery(dim=16, num_reasons=7, num_heads=4)
+    valid = torch.tensor(
+        [[True, True, False, False, True], [True, False, True, False, True]]
+    )
+    output = module(
+        torch.randn(2, 4, 7, 16),
+        torch.randn(2, 7, 16),
+        torch.tensor([[-2.0, -1.0, -0.5, -0.2, 0.0]]).expand(2, -1),
+        valid,
+        image_logits=torch.randn(2, 7),
+    )
+
+    attention = output["reason_local_temporal_attention"]
+    assert attention.shape == (2, 7, 4)
+    assert torch.allclose(attention.sum(-1), torch.ones(2, 7), atol=1e-6)
+    invalid = (~valid[:, :4])[:, None].expand_as(attention)
+    assert torch.count_nonzero(attention.masked_select(invalid)) == 0
+
+
+def test_reason_local_target_query_attention_is_label_specific_and_trainable():
+    torch.manual_seed(17)
+    module = TIDAReasonLocalTemporalQuery(dim=16, num_reasons=7, num_heads=4)
+    with torch.no_grad():
+        module.reason_readout_weight.normal_(0.0, 0.1)
+    shared_history = torch.randn(1, 4, 1, 16).expand(-1, -1, 7, -1).clone()
+    output = module(
+        shared_history,
+        torch.randn(1, 7, 16),
+        torch.tensor([[-2.0, -1.0, -0.5, -0.2, 0.0]]),
+        torch.ones(1, 5, dtype=torch.bool),
+        image_logits=torch.randn(1, 7),
+    )
+
+    attention = output["reason_local_temporal_attention"]
+    assert float(attention.std(dim=1).sum()) > 0.0
+    output["reason_local_candidate_logits"].sum().backward()
+    assert module.temporal_query_proj.weight.grad is not None
+    assert float(module.temporal_query_proj.weight.grad.abs().sum()) > 0.0
+
+
+def test_reason_local_temporal_ontology_mask_keeps_static_labels_exactly_zero():
+    torch.manual_seed(19)
+    module = TIDAReasonLocalTemporalQuery(
+        dim=16,
+        num_reasons=7,
+        num_heads=4,
+        temporal_reason_indices=(1, 4),
+    )
+    with torch.no_grad():
+        module.reason_readout_weight.normal_(0.0, 0.1)
+    output = module(
+        torch.randn(2, 4, 7, 16),
+        torch.randn(2, 7, 16),
+        torch.tensor([[-2.0, -1.0, -0.5, -0.2, 0.0]]).expand(2, -1),
+        torch.ones(2, 5, dtype=torch.bool),
+        image_logits=torch.randn(2, 7),
+    )
+
+    static = torch.tensor([0, 2, 3, 5, 6])
+    assert torch.count_nonzero(
+        output["reason_local_candidate_delta"][:, static]
+    ) == 0
+    assert torch.equal(
+        output["reason_local_temporal_reason_mask"],
+        torch.tensor([0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0]),
+    )
+
+
+def test_reason_local_train_calib_center_is_applied_only_with_history():
+    torch.manual_seed(23)
+    module = TIDAReasonLocalTemporalQuery(dim=16, num_reasons=7, num_heads=4)
+    center = torch.linspace(-0.01, 0.01, 7)
+    module.set_deployment_policy(
+        torch.ones(7), torch.ones(7), torch.zeros(7),
+        center=center, source="train_calib_oof",
+    )
+    image_logits = torch.randn(2, 7)
+    valid = torch.ones(2, 5, dtype=torch.bool)
+    valid[1, :4] = False
+    output = module(
+        torch.randn(2, 4, 7, 16),
+        torch.randn(2, 7, 16),
+        torch.tensor([[-2.0, -1.0, -0.5, -0.2, 0.0]]).expand(2, -1),
+        valid,
+        image_logits=image_logits,
+    )
+
+    assert torch.allclose(
+        output["reason_local_centered_candidate_delta"][0],
+        output["reason_local_candidate_delta"][0] - center,
+    )
+    assert torch.count_nonzero(
+        output["reason_local_centered_candidate_delta"][1]
+    ) == 0
+    assert torch.equal(output["reason_local_deploy_logits"][1], image_logits[1])
+
+
 def test_reason_local_deploy_policy_is_bounded_and_exactly_selective():
     module = TIDAReasonLocalTemporalQuery(
         dim=16, num_reasons=7, num_heads=4, cap=0.02
@@ -184,10 +298,9 @@ def test_reason_local_policy_is_fit_from_train_calib_and_opens_only_supported_la
     reason_target = torch.zeros(count, 7)
     reason_target[:10, 0] = 1.0
     image_reason = torch.full((count, 7), -1.0)
-    image_reason[:10, 0] = 0.01
-    image_reason[10:, 0] = 0.01
+    image_reason[:, 0] = -0.01
     candidate = torch.zeros_like(image_reason)
-    candidate[:, 0] = 0.02
+    candidate[:10, 0] = 0.02
     utility = torch.zeros_like(image_reason)
     utility[:10, 0] = 1.0
     rows = {
@@ -213,8 +326,13 @@ def test_reason_local_policy_is_fit_from_train_calib_and_opens_only_supported_la
     assert fit["test_labels_used"] is False
     assert fit["source"] == "train_calib_oof"
     assert module.deployment_label_gate[0] == 1
-    assert module.deployment_scale[0] == -1
+    assert module.deployment_scale[0] == 1
     assert torch.count_nonzero(module.deployment_label_gate[1:]) == 0
+    assert torch.allclose(
+        module.deployment_center,
+        candidate.median(0).values,
+    )
+    assert fit["candidate_center_source"] == "train_calib_median"
 
 
 def test_reason_local_policy_keeps_zero_fallback_for_proper_score_only_tie():
@@ -286,7 +404,7 @@ def test_reason_local_leave_source_out_records_single_source_fallback():
             "reason_local_policy_oof_folds": 5,
         },
     )
-    assert fit["fold_strategy"] == "random_oof"
+    assert fit["fold_strategy"] == "label_stratified_oof"
     assert fit["source_fallback_reason"] == "single_source_train_calib"
 
 

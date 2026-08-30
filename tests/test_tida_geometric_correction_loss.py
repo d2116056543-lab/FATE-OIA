@@ -159,3 +159,25 @@ def test_pu_ranking_ignores_neutral_unlabeled_pairs():
         contradiction_scores=torch.full_like(target, 0.5),
     )
     assert loss.item() == 0.0
+
+
+def test_pu_ranking_corrects_residual_even_when_base_already_separates_pair():
+    base = torch.tensor([[8.0], [-8.0]])
+    target = torch.tensor([[1.0], [0.0]])
+    contradiction = torch.tensor([[0.0], [1.0]])
+    motion = torch.ones(2, 2) * 0.1
+    wrong_delta = torch.tensor([[-0.01], [0.01]], requires_grad=True)
+    right_delta = torch.tensor([[0.01], [-0.01]])
+
+    wrong = target_conditioned_pu_ranking_loss(
+        base, wrong_delta, target, motion, contradiction_scores=contradiction
+    )
+    right = target_conditioned_pu_ranking_loss(
+        base, right_delta, target, motion, contradiction_scores=contradiction
+    )
+
+    assert wrong > right
+    assert wrong > 0.01
+    wrong.backward()
+    assert wrong_delta.grad[0, 0] < 0
+    assert wrong_delta.grad[1, 0] > 0

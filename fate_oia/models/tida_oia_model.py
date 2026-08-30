@@ -174,6 +174,7 @@ class TIDAOIAModel(nn.Module):
         reason_local_query_enabled: bool = False,
         reason_local_query_cap: float = 0.08,
         reason_local_query_utility_open_prior: float = 0.10,
+        reason_local_temporal_reason_indices: tuple[int, ...] | None = None,
     ) -> None:
         super().__init__()
         self.image_model = image_model
@@ -222,6 +223,7 @@ class TIDAOIAModel(nn.Module):
             num_heads=4,
             cap=reason_local_query_cap,
             utility_open_prior=reason_local_query_utility_open_prior,
+            temporal_reason_indices=reason_local_temporal_reason_indices,
         )
         if not self.reason_local_query_enabled:
             for parameter in self.reason_local_query.parameters():
