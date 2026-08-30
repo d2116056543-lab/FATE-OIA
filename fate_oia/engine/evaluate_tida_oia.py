@@ -1214,10 +1214,19 @@ def fit_train_calib_thresholds(rows: dict[str, Any]) -> dict[str, torch.Tensor]:
     video_logits = torch.cat([rows["video_action"], rows["video_reason"]], dim=-1)
     image_logits = torch.cat([rows["image_action"], rows["image_reason"]], dim=-1)
     targets = torch.cat([rows["action_target"], rows["reason_target"]], dim=-1)
-    return {
+    fitted = {
         "video": _best_label_threshold(video_logits, targets),
         "image": _best_label_threshold(image_logits, targets),
     }
+    if "reason_local_centered_candidate" in rows:
+        local_logits = torch.cat(
+            [rows["image_action"], rows["reason_local_centered_candidate"]], dim=-1
+        )
+        local_thresholds = _best_label_threshold(local_logits, targets)
+        # The reason-local route is forbidden from changing the action decision boundary.
+        local_thresholds[:4] = fitted["image"][:4]
+        fitted["reason_local_centered"] = local_thresholds
+    return fitted
 
 
 @torch.no_grad()

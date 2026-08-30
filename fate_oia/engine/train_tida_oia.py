@@ -907,6 +907,13 @@ def train_locked_deployment_views(test_rows, thresholds):
     }
     if "reason_local_deploy" in metrics:
         views["reason_local_deploy"] = metrics["reason_local_deploy"]
+    if (
+        "reason_local_centered_candidate" in test_rows
+        and "reason_local_centered" in thresholds
+    ):
+        views["reason_local_centered_train_calib"] = branch_metrics(
+            test_rows, thresholds["reason_local_centered"]
+        )["reason_local_centered_candidate"]
     return views
 
 
@@ -922,11 +929,15 @@ def apply_locked_image_thresholds(
     value = torch.as_tensor(locked, dtype=fitted["image"].dtype, device=fitted["image"].device)
     if value.shape != fitted["image"].shape or not ((value > 0) & (value < 1)).all():
         raise ValueError("locked image thresholds must match all action/reason labels and lie in (0,1)")
-    return {
+    resolved = {
         **fitted,
         "image_fitted_diagnostic": fitted["image"].clone(),
         "image": value,
     }
+    if "reason_local_centered" in resolved:
+        resolved["reason_local_centered"] = resolved["reason_local_centered"].clone()
+        resolved["reason_local_centered"][:4] = value[:4]
+    return resolved
 
 
 def _deployment_thresholds(calib_rows, deployment_config):
@@ -948,6 +959,10 @@ def _view_metrics(test_rows, calib_rows, deployment_config):
     return {
         "raw_fixed": raw, "deploy": deploy, "thresholds": thresholds,
         "primary_deploy_policy": "video_stable_image_train_calib_threshold",
+        "reason_local_centered_threshold_source": (
+            "train_calib_candidate_reason_plus_locked_image_action"
+            if "reason_local_centered" in thresholds else None
+        ),
         "dynamic_slices": dynamic_slice_metrics(test_rows, thresholds["image"]),
         "temporal_contribution": temporal_contribution_metrics(test_rows),
         "geometric_branches_raw_fixed": geometric_branch_metrics(test_rows),
@@ -1186,6 +1201,13 @@ def calibrate_reason_local_deployment(model, calib_rows, deployment_config):
     centered_candidate = (
         calib_rows["reason_local_candidate_delta"] - candidate_center[None]
     ) * model.reason_local_query.temporal_reason_mask.detach().cpu()[None]
+    # Keep calibration logits consistent with the center that will be used for
+    # every subsequent test forward. Threshold fitting must not see stale
+    # checkpoint-centered logits while deployment sees the newly fitted center.
+    calib_rows["reason_local_centered_candidate_delta"] = centered_candidate
+    calib_rows["reason_local_centered_candidate"] = (
+        calib_rows["image_reason"] + centered_candidate
+    )
     fit = fit_object_intent_utility_policy_oof(
         calib_rows["image_reason"],
         centered_candidate,

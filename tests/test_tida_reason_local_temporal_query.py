@@ -333,6 +333,11 @@ def test_reason_local_policy_is_fit_from_train_calib_and_opens_only_supported_la
         candidate.median(0).values,
     )
     assert fit["candidate_center_source"] == "train_calib_median"
+    expected_centered = candidate - candidate.median(0).values[None]
+    assert torch.allclose(rows["reason_local_centered_candidate_delta"], expected_centered)
+    assert torch.allclose(
+        rows["reason_local_centered_candidate"], image_reason + expected_centered
+    )
 
 
 def test_reason_local_policy_keeps_zero_fallback_for_proper_score_only_tie():
