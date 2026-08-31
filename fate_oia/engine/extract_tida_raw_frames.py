@@ -14,6 +14,16 @@ from fate_oia.datasets.bdd_oia_video import quadratic_multirate_timestamps, time
 from fate_oia.datasets.tida_clip_manifest import load_manifest
 
 
+def select_extractable_records(records, selected_names: set[str] | None = None):
+    selected = None if selected_names is None else {name.lower() for name in selected_names}
+    return [
+        record
+        for record in records
+        if record.history_available
+        and (selected is None or record.file_name.lower() in selected)
+    ]
+
+
 def decode_fixed_history(clip_path: Path, indices: torch.Tensor) -> list[Image.Image]:
     import imageio_ffmpeg
 
@@ -40,17 +50,26 @@ def decode_fixed_history(clip_path: Path, indices: torch.Tensor) -> list[Image.I
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", required=True)
-    parser.add_argument("--track-store", required=True)
+    parser.add_argument("--track-store")
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--jpeg-quality", type=int, default=92)
     parser.add_argument("--max-samples", type=int)
     parser.add_argument("--workers", type=int, default=4)
     args = parser.parse_args()
-    track_payload = torch.load(args.track_store, map_location="cpu", weights_only=True)
-    selected = {str(name).lower() for name in track_payload["file_names"]}
-    records = [row for row in load_manifest(args.manifest) if row.file_name.lower() in selected]
-    if len(records) != len(selected):
-        raise RuntimeError("raw-frame extraction records do not match track store")
+    selected = None
+    if args.track_store:
+        track_payload = torch.load(args.track_store, map_location="cpu", weights_only=True)
+        selected = {str(name).lower() for name in track_payload["file_names"]}
+    records = select_extractable_records(load_manifest(args.manifest), selected)
+    if selected is not None and len(records) != len(selected):
+        unavailable = {
+            row.file_name.lower()
+            for row in load_manifest(args.manifest)
+            if not row.history_available
+        }
+        expected = selected - unavailable
+        if len(records) != len(expected):
+            raise RuntimeError("raw-frame extraction records do not match track store")
     if args.max_samples is not None:
         records = records[: args.max_samples]
     output_root = Path(args.output_root)

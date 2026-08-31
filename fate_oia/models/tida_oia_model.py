@@ -747,8 +747,10 @@ class TIDAOIAModel(nn.Module):
                     image_reason.shape[0], image_reason.shape[1], action_nodes.shape[-1]
                 ),
                 "reason_local_candidate_delta": zero_reason,
+                "reason_local_centered_candidate_delta": zero_reason,
                 "reason_local_motion_energy": zero_reason[:, None, :],
                 "reason_local_candidate_logits": image_reason,
+                "reason_local_centered_candidate_logits": image_reason,
                 "reason_local_utility_logit": zero_reason,
                 "reason_local_utility_probability": zero_reason,
                 "reason_local_deploy_gate": zero_reason,

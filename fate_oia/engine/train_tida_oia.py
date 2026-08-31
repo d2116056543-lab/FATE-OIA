@@ -549,6 +549,11 @@ def _arg(args: Any, name: str, default: Any = None) -> Any:
     return getattr(args, name.replace("-", "_"), default)
 
 
+def _optional_partition_limit(args: Any, name: str, fallback: int | None) -> int | None:
+    value = _arg(args, name, None)
+    return fallback if value is None else int(value)
+
+
 def checkpoint_trainable_state(payload: dict[str, Any], view: str) -> dict[str, torch.Tensor]:
     if view not in {"online", "ema"}:
         raise ValueError(f"unsupported checkpoint view: {view}")
@@ -702,9 +707,15 @@ def build_runtime(args: Any, evaluation_only: bool = False) -> TIDARuntime:
     workers = int(_arg(args, "num_workers", config["data"]["num_workers"]))
     max_samples = _arg(args, "max_samples", None)
     max_eval_samples = _arg(args, "max_eval_samples", None)
-    max_calib_samples = _arg(args, "max_calib_samples", max_eval_samples)
-    max_test_samples = _arg(args, "max_test_samples", max_eval_samples)
-    max_audit_samples = _arg(args, "max_audit_samples", max_eval_samples)
+    max_calib_samples = _optional_partition_limit(
+        args, "max_calib_samples", max_eval_samples
+    )
+    max_test_samples = _optional_partition_limit(
+        args, "max_test_samples", max_eval_samples
+    )
+    max_audit_samples = _optional_partition_limit(
+        args, "max_audit_samples", max_eval_samples
+    )
     object_track_store = _arg(args, "object_track_store", None)
     frame_store_root = _arg(args, "frame_store_root", None)
     train_partitions = (

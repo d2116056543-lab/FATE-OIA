@@ -69,6 +69,10 @@ def test_full_model_returns_formal_shapes_and_zero_scale_fallback():
     assert out["video_reason_logits"].shape == (1, 21)
     assert out["history_query_tokens"].shape == (1, 14, 36, 8)
     assert torch.equal(out["action_temporal_route"], out["action_route"])
+    assert torch.equal(
+        out["reason_local_centered_candidate_logits"], out["image_reason_logits"]
+    )
+    assert torch.count_nonzero(out["reason_local_centered_candidate_delta"]) == 0
     assert torch.equal(out["video_action_logits"], out["image_action_logits"])
     assert torch.equal(out["video_reason_logits"], out["image_reason_logits"])
 
