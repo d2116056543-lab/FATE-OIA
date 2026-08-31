@@ -207,9 +207,13 @@ class BDDOIAVideoDataset(Dataset):
         timestamps[-1] = 0.0
         if not torch.all(timestamps[1:] > timestamps[:-1]):
             raise ValueError(f"actual decoded timestamps are not strictly increasing: {record.file_name}")
+        target = Image.open(record.target_image_path).convert("RGB")
         # The audited terminal JPEG is the prediction frame. Decoding the same
         # terminal video frame again wastes work and is discarded below.
-        if not self.frame_store_roots:
+        if not record.history_available:
+            decoded = [target.copy() for _ in range(len(frame_indices) - 1)]
+            decoded_valid = torch.zeros(len(frame_indices) - 1, dtype=torch.bool)
+        elif not self.frame_store_roots:
             decoded, decoded_valid = self.decoder(record.clip_path, frame_indices[:-1])
         else:
             key = Path(record.file_name).stem.lower()
@@ -218,7 +222,6 @@ class BDDOIAVideoDataset(Dataset):
             case_dir = self.frame_case_dirs[key]
             decoded = [Image.open(case_dir / f"{position:02d}.jpg").convert("RGB") for position in range(14)]
             decoded_valid = torch.ones(14, dtype=torch.bool)
-        target = Image.open(record.target_image_path).convert("RGB")
         frames = decoded + [target]
         transformed = self.transform(
             frames, training=self.training, random_value=random.Random(augmentation_seed + 1).random()

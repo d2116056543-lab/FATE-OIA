@@ -69,8 +69,14 @@ def probe_video(path: Path) -> tuple[float, int]:
 def discover_labeled_clips(
     root: str | Path, *, probe: Probe = probe_video, probe_workers: int = 1,
     progress_every: int = 0,
+    official_samples_by_split: dict[str, dict[str, object]] | None = None,
+    allow_invalid_history: bool = False,
 ) -> tuple[list[TIDAClipRecord], dict]:
     root = Path(root)
+    official = {
+        split: {str(name).lower(): sample for name, sample in samples.items()}
+        for split, samples in (official_samples_by_split or {}).items()
+    }
     records: list[TIDAClipRecord] = []
     candidates = []
     rejections: Counter[str] = Counter()
@@ -84,6 +90,18 @@ def discover_labeled_clips(
         label_counts[split] = len(labels)
         for clip in sorted(clip_dir.glob("*.mp4")):
             clip_counts[split] += 1
+            key = _clip_key(clip)
+            official_sample = official.get(split, {}).get(f"{key}.jpg".lower())
+            if official_samples_by_split is not None:
+                if official_sample is None:
+                    rejections["missing_official_sample"] += 1
+                    continue
+                candidates.append((
+                    split, clip, "official_bdd_oia_dataset",
+                    Path(str(official_sample.image_path)), key,
+                    _source_id({}, key), official_sample.action, official_sample.reason,
+                ))
+                continue
             label_path = _resolve_label(clip, label_dir)
             if label_path is None:
                 rejections["missing_label"] += 1
@@ -106,18 +124,21 @@ def discover_labeled_clips(
             if not source_id:
                 rejections["missing_source_id"] += 1
                 continue
-            candidates.append((split, clip, label_path, label, target, key, source_id, action, reason))
+            candidates.append((split, clip, str(label_path), target, key, source_id, action, reason))
 
-    def build_record(candidate):
-        split, clip, label_path, label, target, key, source_id, action, reason = candidate
-        try:
-            fps, num_frames = probe(clip)
-        except (OSError, ValueError):
-            return None, candidate
+    def build_record(candidate, *, invalid_history: bool = False):
+        split, clip, source_manifest, target, key, source_id, action, reason = candidate
+        if invalid_history:
+            fps, num_frames = 30.0, 151
+        else:
+            try:
+                fps, num_frames = probe(clip)
+            except (OSError, ValueError):
+                return None, candidate
         return TIDAClipRecord(
                 official_split=split,
                 partition="unassigned",
-                file_name=Path(str(label.get("image_name") or f"{key}.jpg")).name,
+                file_name=f"{key}.jpg",
                 target_image_path=target,
                 clip_path=clip,
                 source_video_id=source_id,
@@ -129,7 +150,9 @@ def discover_labeled_clips(
                 action=tuple(float(value) for value in action),
                 reason=tuple(float(value) for value in reason),
                 source_batch=root.name,
-                source_manifest_path=str(label_path),
+                source_manifest_path=str(source_manifest),
+                history_available=not invalid_history,
+                history_unavailable_reason="invalid_video" if invalid_history else "",
             ), None
 
     failed_probes = []
@@ -157,15 +180,25 @@ def discover_labeled_clips(
     for candidate in failed_probes:
         record, _ = build_record(candidate)
         if record is None:
-            rejections["invalid_video"] += 1
-            rejected_video_paths.append(str(candidate[1]))
+            if allow_invalid_history:
+                record, _ = build_record(candidate, invalid_history=True)
+                records.append(record)
+            else:
+                rejections["invalid_video"] += 1
+                rejected_video_paths.append(str(candidate[1]))
         else:
             records.append(record)
     accepted = Counter(record.official_split for record in records)
+    unavailable = Counter(
+        record.official_split for record in records if not record.history_available
+    )
     return records, {
         "clip_files_by_split": dict(clip_counts),
         "label_files_by_split": dict(label_counts),
         "accepted_by_split": {split: int(accepted[split]) for split in ("train", "test")},
+        "history_unavailable_by_split": {
+            split: int(unavailable[split]) for split in ("train", "test")
+        },
         "rejections": dict(rejections),
         "retried_video_probes": retried_video_probes,
         "rejected_video_paths": rejected_video_paths,
@@ -255,13 +288,27 @@ def main() -> None:
     parser.add_argument("--audit-count", type=int, default=1024)
     parser.add_argument("--seed", type=int, default=20260829)
     parser.add_argument("--probe-workers", type=int, default=8)
+    parser.add_argument("--image-config")
+    parser.add_argument("--allow-invalid-history", action="store_true")
     parser.add_argument(
         "--split-policy", choices=("official", "source_disjoint"), default="official"
     )
     args = parser.parse_args()
 
+    official_samples = None
+    if args.image_config:
+        import yaml
+        from fate_oia.engine.train_aie_oia import make_dataset
+
+        config = yaml.safe_load(Path(args.image_config).read_text(encoding="utf-8"))
+        official_samples = {
+            split: {sample.file_name: sample for sample in make_dataset(config, split).samples}
+            for split in ("train", "test")
+        }
     records, discovery = discover_labeled_clips(
-        args.dataset_root, probe_workers=args.probe_workers, progress_every=500
+        args.dataset_root, probe_workers=args.probe_workers, progress_every=500,
+        official_samples_by_split=official_samples,
+        allow_invalid_history=args.allow_invalid_history,
     )
     partitioner = (
         partition_official_split

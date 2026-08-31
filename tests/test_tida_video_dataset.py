@@ -182,3 +182,31 @@ def test_raw_frame_store_uses_semicolon_separated_fallback_roots(tmp_path):
 
     assert len(dataset.frame_store_roots) == 2
     assert sample["context_images"].shape == (14, 3, 192, 344)
+
+
+def test_history_unavailable_skips_decoder_and_is_exactly_masked(tmp_path):
+    target = tmp_path / "target.jpg"
+    Image.new("RGB", (32, 18), "white").save(target)
+    clip = tmp_path / "broken.mp4"
+    clip.write_bytes(b"broken")
+    row = {
+        "official_split": "test", "partition": "test", "file_name": "x.jpg",
+        "target_image_path": str(target), "clip_path": str(clip), "source_video_id": "x",
+        "duration_seconds": 5.0, "fps": 30.0, "num_frames": 151,
+        "target_timestamp_seconds": 5.0, "target_frame_index": 150,
+        "action": [1, 0, 0, 0], "reason": [0] * 21,
+        "history_available": False,
+        "history_unavailable_reason": "invalid_video",
+    }
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    def forbidden_decoder(_path, _indices):
+        raise AssertionError("invalid history must not be decoded")
+
+    sample = BDDOIAVideoDataset(manifest, "test", decoder=forbidden_decoder)[0]
+
+    assert sample["frame_valid_mask"][:-1].sum() == 0
+    assert sample["frame_valid_mask"][-1]
+    assert sample["clip_meta"]["history_available"] is False
+    assert sample["clip_meta"]["history_unavailable_reason"] == "invalid_video"

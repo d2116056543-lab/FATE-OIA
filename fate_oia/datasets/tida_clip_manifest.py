@@ -40,6 +40,8 @@ class TIDAClipRecord:
     source_batch: str = ""
     source_manifest_path: str = ""
     source_row_index: int = -1
+    history_available: bool = True
+    history_unavailable_reason: str = ""
 
     def __post_init__(self) -> None:
         if self.official_split not in ("train", "test"):
