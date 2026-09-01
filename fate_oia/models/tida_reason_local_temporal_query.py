@@ -53,6 +53,12 @@ class TIDAReasonLocalTemporalQuery(nn.Module):
         self.temporal_key_proj = nn.Linear(dim, dim, bias=False)
         self.temporal_value_proj = nn.Linear(dim, dim, bias=False)
         self.temporal_output_proj = nn.Linear(dim, dim, bias=False)
+        self.event_feature = nn.Sequential(
+            nn.LayerNorm(3 * dim),
+            nn.Linear(3 * dim, dim),
+            nn.GELU(),
+            nn.LayerNorm(dim),
+        )
         self.feature = nn.Sequential(
             nn.LayerNorm(4 * dim),
             nn.Linear(4 * dim, dim),
@@ -94,6 +100,100 @@ class TIDAReasonLocalTemporalQuery(nn.Module):
             "deployment_center", torch.zeros(self.num_reasons), persistent=True
         )
         self.deployment_policy_source = "strict_zero_fallback"
+
+    @staticmethod
+    def _kinematics(
+        states: torch.Tensor,
+        timestamps: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute signed velocity and acceleration on an irregular timeline."""
+        batch, reasons, frames, _ = states.shape
+        velocity = torch.zeros_like(states)
+        acceleration = torch.zeros_like(states)
+        if frames < 2:
+            return velocity, acceleration
+        dt = (timestamps[:, 1:frames] - timestamps[:, : frames - 1]).clamp_min(1e-4)
+        pair_valid = valid[:, 1:frames] & valid[:, : frames - 1]
+        velocity[:, :, 1:] = (
+            (states[:, :, 1:] - states[:, :, :-1])
+            / dt[:, None, :, None]
+            * pair_valid[:, None, :, None]
+        )
+        if frames >= 3:
+            acceleration_dt = (
+                0.5 * (dt[:, 1:] + dt[:, :-1])
+            ).clamp_min(1e-4)
+            triple_valid = pair_valid[:, 1:] & pair_valid[:, :-1]
+            acceleration[:, :, 2:] = (
+                (velocity[:, :, 2:] - velocity[:, :, 1:-1])
+                / acceleration_dt[:, None, :, None]
+                * triple_valid[:, None, :, None]
+            )
+        return velocity, acceleration
+
+    def _attend(
+        self,
+        target: torch.Tensor,
+        event_states: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch, reasons, frames, dim = event_states.shape
+        if valid.ndim == 2:
+            valid = valid[:, None].expand(-1, reasons, -1)
+        if valid.shape != (batch, reasons, frames):
+            raise ValueError("reason event validity shape mismatch")
+        query = self.temporal_query_proj(target)
+        key = self.temporal_key_proj(event_states)
+        value = self.temporal_value_proj(event_states)
+        attention_logits = torch.einsum("brd,brtd->brt", query, key) / math.sqrt(dim)
+        safe_valid = valid.clone()
+        no_history = ~safe_valid.any(-1)
+        safe_flat = safe_valid.reshape(batch * reasons, frames)
+        no_history_flat = no_history.reshape(batch * reasons)
+        safe_flat[no_history_flat, 0] = True
+        safe_valid = safe_flat.reshape(batch, reasons, frames)
+        attention_logits = attention_logits.masked_fill(
+            ~safe_valid, torch.finfo(attention_logits.dtype).min
+        )
+        attention = attention_logits.softmax(-1).masked_fill(~valid, 0.0)
+        attention = attention / attention.sum(-1, keepdim=True).clamp_min(1e-8)
+        history = self.temporal_output_proj(
+            torch.einsum("brt,brtd->brd", attention, value)
+        )
+        available = (~no_history).to(history.dtype)
+        history = history * available[..., None]
+        return history, attention, available
+
+    def _candidate_from_history(
+        self,
+        target: torch.Tensor,
+        history: torch.Tensor,
+        available: torch.Tensor,
+        temporal_scale: float | torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        difference = target - history
+        hidden = self.feature(
+            torch.cat((target, history, difference, target * history), dim=-1)
+        )
+        control_hidden = self.feature(
+            torch.cat(
+                (target, target, torch.zeros_like(target), target * target), dim=-1
+            )
+        )
+        scale = torch.as_tensor(
+            temporal_scale, device=hidden.device, dtype=hidden.dtype
+        )
+        raw = torch.einsum(
+            "brd,rd->br", hidden - control_hidden, self.reason_readout_weight
+        )
+        candidate = (
+            available
+            * scale
+            * bounded_reason_delta(raw, self.cap)
+            * self.temporal_reason_mask[None]
+        )
+        return candidate, hidden, difference
 
     @torch.no_grad()
     def set_deployment_policy(
@@ -160,52 +260,90 @@ class TIDAReasonLocalTemporalQuery(nn.Module):
         )
         target = target_reason_tokens.detach()
         history_states = encoded["history_states"]
-        query = self.temporal_query_proj(target)
-        key = self.temporal_key_proj(history_states)
-        value = self.temporal_value_proj(history_states)
-        attention_logits = torch.einsum("brd,brtd->brt", query, key) / math.sqrt(dim)
         history_valid = frame_valid_mask[:, : history_reason_tokens.shape[1]]
-        safe_valid = history_valid.clone()
-        no_history = ~safe_valid.any(-1)
-        safe_valid[no_history, 0] = True
-        attention_logits = attention_logits.masked_fill(
-            ~safe_valid[:, None], torch.finfo(attention_logits.dtype).min
+        velocity, acceleration = self._kinematics(
+            history_states, timestamps[:, : history_reason_tokens.shape[1]], history_valid
         )
-        temporal_attention = attention_logits.softmax(-1)
-        temporal_attention = temporal_attention.masked_fill(
-            ~history_valid[:, None], 0.0
-        )
-        temporal_attention = temporal_attention / temporal_attention.sum(
-            -1, keepdim=True
-        ).clamp_min(1e-8)
-        history = self.temporal_output_proj(
-            torch.einsum("brt,brtd->brd", temporal_attention, value)
-        )
-        history = history * encoded["history_valid"][:, None, None].to(history.dtype)
-        difference = target - history
-        hidden = self.feature(
-            torch.cat((target, history, difference, target * history), dim=-1)
-        )
-        # Paired target-only control prevents the residual from collapsing to
-        # a constant per-label bias. Both paths share every parameter, so only
-        # information contributed by ordered history survives the subtraction.
-        control_hidden = self.feature(
+        bounded_velocity = velocity.tanh()
+        bounded_acceleration = acceleration.tanh()
+        target_relative_change = history_states - target[:, :, None]
+        event_states = self.event_feature(
             torch.cat(
-                (target, target, torch.zeros_like(target), target * target), dim=-1
+                (
+                    target_relative_change,
+                    bounded_velocity,
+                    bounded_acceleration,
+                ),
+                dim=-1,
             )
         )
-        scale = torch.as_tensor(
-            temporal_scale, device=hidden.device, dtype=hidden.dtype
+        history, temporal_attention, available = self._attend(
+            target, event_states, history_valid
         )
-        available = encoded["history_valid"][:, None].to(hidden.dtype)
-        raw_candidate = torch.einsum(
-            "brd,rd->br", hidden - control_hidden, self.reason_readout_weight
+        candidate, hidden, _ = self._candidate_from_history(
+            target, history, available, temporal_scale
         )
-        candidate = (
-            available
-            * scale
-            * bounded_reason_delta(raw_candidate, self.cap)
-            * self.temporal_reason_mask[None]
+
+        shuffled_encoded = self.temporal_encoder(
+            history_reason_tokens.flip(1), timestamps, frame_valid_mask
+        )
+        shuffled_velocity, shuffled_acceleration = self._kinematics(
+            shuffled_encoded["history_states"],
+            timestamps[:, : history_reason_tokens.shape[1]],
+            history_valid,
+        )
+        shuffled_change = shuffled_encoded["history_states"] - target[:, :, None]
+        shuffled_states = self.event_feature(
+            torch.cat(
+                (
+                    shuffled_change,
+                    shuffled_velocity.tanh(),
+                    shuffled_acceleration.tanh(),
+                ),
+                dim=-1,
+            )
+        )
+        shuffled_valid = history_valid
+        shuffled_history, _, shuffled_available = self._attend(
+            target, shuffled_states, shuffled_valid
+        )
+        shuffled_candidate, _, _ = self._candidate_from_history(
+            target, shuffled_history, shuffled_available, temporal_scale
+        )
+
+        selected_index = temporal_attention.argmax(-1)
+        selected_valid = history_valid[:, None].expand(-1, reasons, -1).clone()
+        selected_valid.scatter_(2, selected_index[..., None], False)
+        reason_index = torch.arange(reasons, device=target.device)[None, :, None]
+        frame_index = torch.arange(
+            history_reason_tokens.shape[1], device=target.device
+        )[None, None]
+        batch_index = torch.arange(batch, device=target.device)[:, None, None]
+        control_score = torch.sin(
+            frame_index * 12.9898 + reason_index * 78.233 + batch_index * 37.719
+        )
+        control_score = control_score.masked_fill(
+            ~history_valid[:, None], torch.finfo(control_score.dtype).min
+        )
+        control_score.scatter_(2, selected_index[..., None], torch.finfo(control_score.dtype).min)
+        control_index = control_score.argmax(-1)
+        random_valid = history_valid[:, None].expand(-1, reasons, -1).clone()
+        random_valid.scatter_(2, control_index[..., None], False)
+        selected_history, _, selected_available = self._attend(
+            target, event_states, selected_valid
+        )
+        random_history, _, random_available = self._attend(
+            target, event_states, random_valid
+        )
+        selected_deleted_candidate, _, _ = self._candidate_from_history(
+            target, selected_history, selected_available, temporal_scale
+        )
+        random_deleted_candidate, _, _ = self._candidate_from_history(
+            target, random_history, random_available, temporal_scale
+        )
+        selected_minus_random_gap = (
+            (candidate - selected_deleted_candidate).abs()
+            - (candidate - random_deleted_candidate).abs()
         )
         centered_candidate = available * (
             candidate - self.deployment_center[None]
@@ -226,7 +364,7 @@ class TIDAReasonLocalTemporalQuery(nn.Module):
                 candidate.detach()[..., None],
                 candidate.detach().abs()[..., None],
                 cosine.detach()[..., None],
-                available[:, :, None].expand(-1, reasons, -1),
+                available[..., None],
             ),
             dim=-1,
         )
@@ -254,12 +392,30 @@ class TIDAReasonLocalTemporalQuery(nn.Module):
         deploy_delta = (
             deploy_gate * self.deployment_scale[None] * centered_candidate
         ).clamp(-self.cap, self.cap)
+        dynamic_mask = history_valid[:, None, :, None].to(velocity.dtype)
+        dynamic_denominator = (
+            dynamic_mask.sum((2, 3)).clamp_min(1.0) * float(dim)
+        )
+        velocity_rms = (
+            (velocity.square() * dynamic_mask).sum((2, 3))
+            / dynamic_denominator
+        ).sqrt()
+        acceleration_rms = (
+            (acceleration.square() * dynamic_mask).sum((2, 3))
+            / dynamic_denominator
+        ).sqrt()
         return {
             "reason_local_history_summary": history,
             "reason_local_temporal_attention": temporal_attention,
             "reason_local_temporal_attention_entropy": attention_entropy,
             "reason_local_target_query": target,
             "reason_local_candidate_delta": candidate,
+            "reason_local_velocity_rms": velocity_rms,
+            "reason_local_acceleration_rms": acceleration_rms,
+            "reason_local_shuffled_delta": shuffled_candidate,
+            "reason_local_selected_deleted_delta": selected_deleted_candidate,
+            "reason_local_random_deleted_delta": random_deleted_candidate,
+            "reason_local_selected_minus_random_gap": selected_minus_random_gap,
             "reason_local_centered_candidate_delta": centered_candidate,
             "reason_local_centered_candidate_logits": image_logits + centered_candidate,
             "reason_local_motion_energy": local_motion_energy,

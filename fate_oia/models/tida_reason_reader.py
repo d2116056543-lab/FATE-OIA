@@ -20,6 +20,7 @@ class TIDAReasonReader(nn.Module):
         conditional_utility_enabled: bool = False,
         conditional_flow_mix_cap: float = 0.50,
         conditional_flow_mix_floor: float = 0.0,
+        flow_mix_cap: float = 0.35,
     ) -> None:
         super().__init__()
         self.num_reasons = int(num_reasons)
@@ -39,7 +40,9 @@ class TIDAReasonReader(nn.Module):
         self.flow_value = nn.Linear(dim, dim)
         nn.init.zeros_(self.flow_value.weight)
         nn.init.zeros_(self.flow_value.bias)
-        self.flow_mix_cap = 0.35
+        if not 0.0 <= float(flow_mix_cap) <= 1.0:
+            raise ValueError("flow_mix_cap must be in [0, 1]")
+        self.flow_mix_cap = float(flow_mix_cap)
         self.temporal_utility = TIDAConditionalTemporalUtility(
             max_budget=conditional_flow_mix_cap,
             min_budget=conditional_flow_mix_floor,

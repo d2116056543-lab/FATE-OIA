@@ -21,9 +21,17 @@ def test_geometric_effectiveness_reports_subsets_anticipation_and_transport():
         "action_target": action_target, "reason_target": reason_target,
         "geometric_motion_energy": torch.arange(count, dtype=torch.float32)[:, None].expand(-1, 4),
         "geometric_action_delta": action_delta, "geometric_reason_delta": reason_delta,
+        "geometric_action_motion_attention": torch.nn.functional.one_hot(
+            torch.arange(4), num_classes=8
+        ).float()[None].expand(count, -1, -1),
+        "geometric_reason_motion_attention": torch.nn.functional.one_hot(
+            torch.arange(21) % 8, num_classes=8
+        ).float()[None].expand(count, -1, -1),
     }
     metrics = geometric_temporal_effectiveness_metrics(rows)
     assert metrics["subsets"]["high_motion"]["count"] > 0
     assert len(metrics["anticipation_curve"]) == 4
     assert metrics["target_transport"]["action_signed_margin_mean"] > 0
     assert metrics["target_transport"]["reason_signed_margin_mean"] > 0
+    assert metrics["motion_reader"]["action_top1_mass_mean"] == 1.0
+    assert metrics["motion_reader"]["action_target_attention_diversity"] > 0

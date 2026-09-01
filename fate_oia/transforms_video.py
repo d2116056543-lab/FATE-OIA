@@ -35,8 +35,9 @@ class SynchronizedVideoTransform:
     def __call__(
         self, frames: Sequence[Image.Image], *, training: bool, random_value: float | None = None
     ) -> dict[str, Any]:
-        if len(frames) != 15:
-            raise ValueError(f"expected 15 frames, got {len(frames)}")
+        if len(frames) < 2:
+            raise ValueError("video transform requires history plus one target frame")
+        target_index = len(frames) - 1
         value = random.random() if random_value is None else float(random_value)
         flipped = bool(training and value < self.flip_probability)
         normalized_geometry = (frames[-1].width / max(frames[-1].height, 1), int(flipped))
@@ -46,11 +47,11 @@ class SynchronizedVideoTransform:
             image = source.convert("RGB")
             if flipped:
                 image = ImageOps.mirror(image)
-            hw = self.target_hw if index == 14 else self.context_hw
+            hw = self.target_hw if index == target_index else self.context_hw
             boxed, geometry = _letterbox(image, hw)
             geometry["normalized_geometry"] = normalized_geometry
             meta.append(geometry)
-            if index < 14:
+            if index < target_index:
                 context.append(_normalize(boxed))
             else:
                 target = _normalize(boxed)

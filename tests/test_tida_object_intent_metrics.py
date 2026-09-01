@@ -7,6 +7,7 @@ from fate_oia.utils.tida_object_intent_metrics import (
     fit_object_intent_deployment_gates,
     fit_object_intent_utility_policy_oof,
     object_intent_traffic_metrics,
+    object_intent_policy_fold_groups,
 )
 
 
@@ -460,8 +461,10 @@ def test_policy_rows_concatenate_only_train_cohorts_and_preserve_order():
     calib = {key: torch.zeros(3, 2) for key in keys}
     audit = {key: torch.ones(4, 2) for key in keys}
     calib["source_batches"] = ["batch1", "batch1", "batch2"]
+    calib["source_video_ids"] = ["cv0", "cv1", "cv2"]
     calib["file_names"] = ["c0.mp4", "c1.mp4", "c2.mp4"]
     audit["source_batches"] = ["batch3"] * 4
+    audit["source_video_ids"] = [f"av{index}" for index in range(4)]
     audit["file_names"] = [f"a{index}.mp4" for index in range(4)]
 
     combined = concatenate_object_intent_policy_rows(
@@ -478,6 +481,33 @@ def test_policy_rows_concatenate_only_train_cohorts_and_preserve_order():
     assert combined["file_names"] == [
         "c0.mp4", "c1.mp4", "c2.mp4", "a0.mp4", "a1.mp4", "a2.mp4", "a3.mp4",
     ]
+    assert combined["source_video_ids"] == [
+        "cv0", "cv1", "cv2", "av0", "av1", "av2", "av3",
+    ]
+
+
+def test_policy_fold_groups_fall_back_to_video_identity_inside_one_domain():
+    rows = {
+        "source_batches": ["one_domain"] * 4,
+        "source_video_ids": ["video_a", "video_a", "video_b", "video_c"],
+    }
+
+    group_ids, strategy = object_intent_policy_fold_groups(rows)
+
+    assert strategy == "leave_source_video_out"
+    assert group_ids.tolist() == [0, 0, 1, 2]
+
+
+def test_policy_fold_groups_prefer_domain_when_multiple_domains_exist():
+    rows = {
+        "source_batches": ["domain_a", "domain_a", "domain_b"],
+        "source_video_ids": ["video_a", "video_b", "video_c"],
+    }
+
+    group_ids, strategy = object_intent_policy_fold_groups(rows)
+
+    assert strategy == "leave_source_batch_out"
+    assert group_ids.tolist() == [0, 0, 1]
 
 
 def test_utility_policy_leave_source_out_rejects_large_source_spurious_gain():
@@ -511,8 +541,27 @@ def test_utility_policy_leave_source_out_rejects_large_source_spurious_gain():
 
     assert random_oof["scale"].item() > 0
     assert source_oof["scale"].item() == 0
-    assert source_oof["fold_strategy"] == "leave_source_out"
+    assert source_oof["fold_strategy"] == "group_kfold"
+    assert source_oof["fold_count"] == 3
     assert source_oof["source_group_count"] == 3
+
+
+def test_utility_policy_caps_many_source_groups_to_requested_group_folds():
+    samples = 24
+    groups = torch.arange(samples) // 2
+    target = (torch.arange(samples) % 3 == 0).float()[:, None]
+    base = torch.zeros(samples, 1)
+    candidate = (2.0 * target - 1.0) * 0.01
+
+    policy = fit_object_intent_utility_policy_oof(
+        base, candidate, torch.ones_like(base), target, torch.tensor([0.5]),
+        scales=(0.0, 1.0), cutoffs=(0.0,), folds=5,
+        min_selected_benefit_rate=0.0, fold_group_ids=groups,
+    )
+
+    assert policy["source_group_count"] == 12
+    assert policy["fold_count"] == 5
+    assert policy["fold_strategy"] == "group_kfold"
 
 
 def test_policy_rows_reject_test_or_oracle_cohorts():

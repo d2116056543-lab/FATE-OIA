@@ -312,12 +312,27 @@ def fit_object_intent_utility_policy_oof(
         fold_group_ids = torch.as_tensor(fold_group_ids, device=base_logits.device)
         if fold_group_ids.ndim != 1 or fold_group_ids.shape[0] != base_logits.shape[0]:
             raise ValueError("fold_group_ids must contain one source id per row")
-        _, fold_ids = torch.unique(fold_group_ids, sorted=True, return_inverse=True)
-        source_group_count = int(fold_ids.max().item()) + 1
+        _, group_ids, group_counts = torch.unique(
+            fold_group_ids, sorted=True, return_inverse=True, return_counts=True
+        )
+        source_group_count = int(group_counts.numel())
         if source_group_count < 2:
             raise ValueError("leave-source-out fitting requires at least two source groups")
-        folds = source_group_count
-        fold_strategy = "leave_source_out"
+        folds = min(int(folds), source_group_count)
+        # Deterministic size-balanced GroupKFold: clips from one source video
+        # never cross folds, while thousands of videos do not create thousands
+        # of prohibitively expensive holdouts.
+        group_to_fold = torch.empty(
+            source_group_count, dtype=torch.long, device=base_logits.device
+        )
+        fold_load = torch.zeros(int(folds), dtype=torch.long, device=base_logits.device)
+        order = torch.argsort(group_counts.to(base_logits.device), descending=True)
+        for group_index in order.tolist():
+            fold_index = int(torch.argmin(fold_load).item())
+            group_to_fold[group_index] = fold_index
+            fold_load[fold_index] += group_counts[group_index].to(fold_load.device)
+        fold_ids = group_to_fold[group_ids]
+        fold_strategy = "group_kfold"
         fold_ids = fold_ids[:, None].expand(-1, base_logits.shape[1])
     fold_scores = base_logits.new_zeros(
         (int(folds), len(candidates), base_logits.shape[1])
@@ -515,6 +530,7 @@ def fit_object_intent_utility_policy_oof(
             {"scale": scale, "cutoff": cutoff} for scale, cutoff in candidates
         ],
         "fold_strategy": fold_strategy,
+        "fold_count": int(folds),
         "source_group_count": source_group_count,
     }
 
@@ -606,7 +622,7 @@ def concatenate_object_intent_policy_rows(
         for key in _OBJECT_INTENT_POLICY_KEYS
     }
     combined["_policy_cohort_sizes"] = sizes
-    for metadata_key in ("source_batches", "file_names"):
+    for metadata_key in ("source_batches", "source_video_ids", "file_names"):
         present = [metadata_key in rows for _, rows in cohorts]
         if any(present) and not all(present):
             raise KeyError(f"policy metadata {metadata_key} must exist in every cohort")
@@ -620,6 +636,36 @@ def concatenate_object_intent_policy_rows(
                 value for _, rows in cohorts for value in rows[metadata_key]
             ]
     return combined
+
+
+def object_intent_policy_fold_groups(
+    rows: dict[str, Any],
+) -> tuple[torch.Tensor, str]:
+    """Build leakage-safe OOF groups at the strongest available source level."""
+    source_batches = list(rows.get("source_batches") or ())
+    source_video_ids = list(rows.get("source_video_ids") or ())
+    row_count = len(source_batches) or len(source_video_ids)
+    if row_count <= 0:
+        raise ValueError(
+            "leave-source-out object-intent policy requires source metadata"
+        )
+    if source_batches and len(source_batches) != row_count:
+        raise ValueError("source_batches must contain one value per policy row")
+    if source_video_ids and len(source_video_ids) != row_count:
+        raise ValueError("source_video_ids must contain one value per policy row")
+
+    if len(set(source_batches)) >= 2:
+        names = source_batches
+        strategy = "leave_source_batch_out"
+    elif len(set(source_video_ids)) >= 2:
+        names = source_video_ids
+        strategy = "leave_source_video_out"
+    else:
+        raise ValueError(
+            "leave-source-out fitting requires at least two source groups"
+        )
+    source_index = {name: index for index, name in enumerate(sorted(set(names)))}
+    return torch.tensor([source_index[name] for name in names], dtype=torch.long), strategy
 
 
 def fit_object_intent_gates_from_rows(

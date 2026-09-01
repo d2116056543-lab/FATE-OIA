@@ -34,6 +34,60 @@ def _class_balanced_action_mean(
     return (action_mean * action_valid).sum() / action_valid.sum().clamp_min(1)
 
 
+def trajectory_residual_ranking_loss(
+    trajectory_delta: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    base_logits: torch.Tensor | None = None,
+    margin: float = 0.01,
+    temperature: float = 0.02,
+) -> torch.Tensor:
+    """Train the temporal residual direction without letting a strong base hide it."""
+    if trajectory_delta.shape != target.shape:
+        raise ValueError("trajectory delta and target must have identical [B,A] shapes")
+    if base_logits is not None and base_logits.shape != target.shape:
+        raise ValueError("base logits and target must have identical [B,A] shapes")
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
+
+    losses = []
+    for action in range(target.shape[1]):
+        positive_mask = target[:, action] > 0.5
+        negative_mask = ~positive_mask
+        positive = trajectory_delta[positive_mask, action]
+        negative = trajectory_delta[negative_mask, action]
+        if not positive.numel() or not negative.numel():
+            continue
+        pair_weight: torch.Tensor | float = 1.0
+        if base_logits is not None:
+            base_positive = base_logits.detach()[positive_mask, action]
+            base_negative = base_logits.detach()[negative_mask, action]
+            hardness = torch.sigmoid(
+                (base_negative[:, None] - base_positive[None] + 0.30) / 0.15
+            )
+            pair_weight = 0.10 + 0.90 * hardness
+        raw = F.softplus(
+            (float(margin) + negative[:, None] - positive[None]) / float(temperature)
+        ) * float(temperature)
+        if isinstance(pair_weight, torch.Tensor):
+            losses.append((raw * pair_weight).sum() / pair_weight.sum().clamp_min(1e-8))
+        else:
+            losses.append(raw.mean())
+
+    pair_loss = (
+        torch.stack(losses).mean()
+        if losses else trajectory_delta.sum() * 0.0
+    )
+    sign = 2.0 * target.float() - 1.0
+    direction = F.softplus(
+        -sign * trajectory_delta / float(temperature)
+    ) * float(temperature)
+    direction_loss = _class_balanced_action_mean(
+        direction, torch.ones_like(direction), target
+    )
+    return pair_loss + 0.25 * direction_loss
+
+
 def trajectory_boundary_correction_loss(
     base_logits: torch.Tensor,
     trajectory_delta: torch.Tensor,
@@ -141,7 +195,13 @@ def trajectory_utility_calibration_loss(
     helpful = (sign * candidate_delta.detach() > 0).to(utility_logits.dtype)
     confidence = (candidate_delta.detach().abs() / 0.02).clamp(0.0, 1.0)
     value = F.binary_cross_entropy_with_logits(utility_logits, helpful, reduction="none")
-    order_loss = _class_balanced_action_mean(value, 0.25 + 0.75 * confidence, helpful)
+    # A zero-initialized candidate has no evidence from which utility can be
+    # identified. Giving it a constant BCE weight closes the gate before the
+    # trajectory readout has taken its first useful step.
+    order_activation = (confidence.mean().detach() / 0.10).clamp(0.0, 1.0)
+    order_loss = (
+        _class_balanced_action_mean(value, confidence, helpful) * order_activation
+    )
     if state_utility_logits is None and state_candidate_delta is None:
         return order_loss
     if state_utility_logits is None or state_candidate_delta is None:
@@ -153,7 +213,9 @@ def trajectory_utility_calibration_loss(
     state_value = F.binary_cross_entropy_with_logits(
         state_utility_logits, state_helpful, reduction="none"
     )
-    state_loss = _class_balanced_action_mean(
-        state_value, 0.25 + 0.75 * state_confidence, state_helpful
+    state_activation = (state_confidence.mean().detach() / 0.10).clamp(0.0, 1.0)
+    state_loss = (
+        _class_balanced_action_mean(state_value, state_confidence, state_helpful)
+        * state_activation
     )
     return 0.5 * (order_loss + state_loss)

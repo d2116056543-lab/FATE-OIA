@@ -17,6 +17,7 @@ from .tida_flow_credit_losses import (
 )
 from .tida_traffic_trajectory_losses import (
     trajectory_boundary_correction_loss,
+    trajectory_residual_ranking_loss,
     trajectory_selected_control_loss,
     trajectory_utility_calibration_loss,
 )
@@ -297,6 +298,26 @@ def certified_contradiction_weight(
     return ((score - float(threshold)) / (1.0 - float(threshold))).clamp(0.0, 1.0)
 
 
+def reason_geometric_supervision_weight(
+    target: torch.Tensor,
+    contradiction_scores: torch.Tensor | None,
+    *,
+    threshold: float = 0.55,
+) -> torch.Tensor:
+    """Use observed positives and certified negatives for temporal correction.
+
+    Unannotated reasons are positive-unlabeled observations, so an ordinary
+    zero must not steer a target-specific motion residual downward.
+    """
+    positive = target.float()
+    certified_negative = certified_contradiction_weight(
+        contradiction_scores,
+        positive,
+        threshold=threshold,
+    )
+    return (positive + (1.0 - positive) * certified_negative).detach()
+
+
 def reason_local_utility_calibration_loss(
     utility_logits: torch.Tensor,
     candidate_delta: torch.Tensor,
@@ -410,6 +431,67 @@ def target_conditioned_pu_ranking_loss(
             float(temperature) * (raw * pair_weight).sum() / pair_weight.sum().clamp_min(1e-8)
         )
     return torch.stack(losses).mean() if losses else delta.sum() * 0.0
+
+
+def reason_local_order_credit_loss(
+    candidate_delta: torch.Tensor,
+    shuffled_delta: torch.Tensor,
+    observed_positive: torch.Tensor,
+    motion_energy: torch.Tensor,
+    contradiction_scores: torch.Tensor | None,
+    *,
+    label_mask: torch.Tensor | None = None,
+    margin: float = 0.002,
+    temperature: float = 0.01,
+) -> torch.Tensor:
+    """Require ordered events to carry more label-correct credit than a shuffle."""
+    positive = observed_positive.float()
+    contradiction = certified_contradiction_weight(
+        contradiction_scores, positive
+    ) * (1.0 - positive)
+    sign = positive - contradiction
+    weight = (positive + contradiction) * _target_motion_weight(
+        motion_energy, candidate_delta.shape[1]
+    )
+    if label_mask is not None:
+        weight = weight * label_mask.to(weight)[None]
+    advantage = sign * (candidate_delta - shuffled_delta)
+    raw = float(temperature) * F.softplus(
+        (float(margin) - advantage) / float(temperature)
+    )
+    return (raw * weight).sum() / weight.sum().clamp_min(1.0)
+
+
+def reason_local_deletion_credit_loss(
+    candidate_delta: torch.Tensor,
+    selected_deleted_delta: torch.Tensor,
+    control_deleted_delta: torch.Tensor,
+    observed_positive: torch.Tensor,
+    motion_energy: torch.Tensor,
+    contradiction_scores: torch.Tensor | None,
+    *,
+    label_mask: torch.Tensor | None = None,
+    margin: float = 0.001,
+    temperature: float = 0.01,
+) -> torch.Tensor:
+    """Make selected temporal evidence more causally useful than a control event."""
+    positive = observed_positive.float()
+    contradiction = certified_contradiction_weight(
+        contradiction_scores, positive
+    ) * (1.0 - positive)
+    sign = positive - contradiction
+    weight = (positive + contradiction) * _target_motion_weight(
+        motion_energy, candidate_delta.shape[1]
+    )
+    if label_mask is not None:
+        weight = weight * label_mask.to(weight)[None]
+    selected_drop = sign * (candidate_delta - selected_deleted_delta)
+    control_drop = sign * (candidate_delta - control_deleted_delta)
+    advantage = selected_drop - control_drop
+    raw = float(temperature) * F.softplus(
+        (float(margin) - advantage) / float(temperature)
+    )
+    return (raw * weight).sum() / weight.sum().clamp_min(1.0)
 
 
 def action_route_sparse_loss(
@@ -643,7 +725,6 @@ def build_tida_loss_registry(
         ),
     )
     registry.add("traffic_action_delta", output["traffic_action_delta_raw"].square().mean())
-    trajectory_motion = output["trajectory_speed"].mean(2).permute(0, 2, 1)
     registry.add(
         "trajectory_action_boundary",
         trajectory_boundary_correction_loss(
@@ -654,10 +735,10 @@ def build_tida_loss_registry(
     )
     registry.add(
         "trajectory_action_rank",
-        target_conditioned_geometric_ranking_loss(
-            output["semantic_video_action_logits"], output["traffic_trajectory_delta_raw"],
-            action_target, trajectory_motion, output["traffic_trajectory_support"],
-            rank_reference.get("action_logits"), rank_reference.get("action_target"),
+        trajectory_residual_ranking_loss(
+            output["traffic_trajectory_candidate_delta"],
+            action_target,
+            base_logits=output["semantic_video_action_logits"],
         ),
     )
     trajectory_controls = [
@@ -745,13 +826,117 @@ def build_tida_loss_registry(
     image_branch = output.get("image_branch", {})
     contradiction = image_branch.get("contradiction_score") if isinstance(image_branch, dict) else None
     reason_weights = reason_pu_weight(reason_target, contradiction)
-    certified_negative = certified_contradiction_weight(contradiction, reason_target)
-    relational_reason_weight = (
-        reason_target.float() + (1.0 - reason_target.float()) * certified_negative
+    relational_reason_weight = reason_geometric_supervision_weight(
+        reason_target, contradiction
     )
     reason_need = output.get("reason_temporal_need", torch.ones_like(reason_target))
     reason_credit_weight = reason_weights * conditional_credit_weight(reason_need)
     reason_no_harm_weight = reason_weights * conditional_no_harm_weight(reason_need)
+    if "action_local_candidate_logits" in output:
+        action_contradiction = 1.0 - action_target.float()
+        registry.add(
+            "action_local_aux",
+            action_macro_asl_loss(output["action_local_candidate_logits"], action_target),
+        )
+        registry.add(
+            "action_local_rank",
+            action_smooth_ap_loss(output["action_local_candidate_logits"], action_target),
+        )
+        registry.add(
+            "action_local_utility",
+            reason_local_utility_calibration_loss(
+                output["action_local_utility_logit"],
+                output["action_local_candidate_delta"],
+                action_target,
+                action_contradiction,
+            ),
+        )
+        registry.add(
+            "action_local_no_harm",
+            action_base_protect_loss(
+                output["image_action_logits"],
+                output["action_local_candidate_logits"],
+                action_target,
+                torch.zeros_like(action_target),
+            ),
+        )
+        registry.add(
+            "action_local_order",
+            reason_local_order_credit_loss(
+                output["action_local_candidate_delta"],
+                output["action_local_shuffled_delta"],
+                action_target,
+                output["action_local_motion_energy"],
+                action_contradiction,
+                label_mask=output["action_local_temporal_action_mask"],
+            ),
+        )
+        registry.add(
+            "action_local_deletion",
+            reason_local_deletion_credit_loss(
+                output["action_local_candidate_delta"],
+                output["action_local_selected_deleted_delta"],
+                output["action_local_random_deleted_delta"],
+                action_target,
+                output["action_local_motion_energy"],
+                action_contradiction,
+                label_mask=output["action_local_temporal_action_mask"],
+            ),
+        )
+        registry.add(
+            "action_local_delta",
+            output["action_local_candidate_delta"].square().mean(),
+        )
+    if "logit_flow_action_candidate_logits" in output:
+        action_flow_motion = output["logit_flow_action_temporal_features"][..., 3:7].abs().mean(-1)[:, None]
+        action_flow_contradiction = 1.0 - action_target.float()
+        registry.add(
+            "logit_flow_action_aux",
+            action_macro_asl_loss(output["logit_flow_action_candidate_logits"], action_target),
+        )
+        registry.add(
+            "logit_flow_action_rank",
+            trajectory_residual_ranking_loss(
+                output["logit_flow_action_candidate_delta"], action_target,
+                base_logits=output["image_action_logits"],
+            ),
+        )
+        registry.add(
+            "logit_flow_action_utility",
+            reason_local_utility_calibration_loss(
+                output["logit_flow_action_utility_logit"],
+                output["logit_flow_action_candidate_delta"],
+                action_target, action_flow_contradiction,
+            ),
+        )
+        action_flow_controls = [
+            reason_local_order_credit_loss(
+                output["logit_flow_action_candidate_delta"],
+                value["logit_flow_action_candidate_delta"],
+                action_target, action_flow_motion, action_flow_contradiction,
+            )
+            for value in counterfactual_outputs.values()
+            if "logit_flow_action_candidate_delta" in value
+        ]
+        registry.add(
+            "logit_flow_action_order",
+            torch.stack(action_flow_controls).mean()
+            if action_flow_controls else output["logit_flow_action_candidate_delta"].sum() * 0.0,
+            available=bool(action_flow_controls),
+            unavailable_reason=None if action_flow_controls else "counterfactual evaluated at optimizer boundary only",
+        )
+        registry.add(
+            "logit_flow_action_no_harm",
+            action_base_protect_loss(
+                output["image_action_logits"],
+                output["logit_flow_action_candidate_logits"],
+                action_target, torch.zeros_like(action_target),
+            ),
+        )
+        registry.add(
+            "logit_flow_action_delta",
+            output["logit_flow_action_candidate_delta"].square().mean(),
+        )
     if "reason_local_candidate_logits" in output:
         registry.add(
             "reason_local_aux",
@@ -791,8 +976,84 @@ def build_tida_loss_registry(
             ),
         )
         registry.add(
+            "reason_local_order",
+            reason_local_order_credit_loss(
+                output["reason_local_candidate_delta"],
+                output["reason_local_shuffled_delta"],
+                reason_target,
+                output["reason_local_motion_energy"],
+                contradiction,
+                label_mask=output["reason_local_temporal_reason_mask"],
+            ),
+        )
+        registry.add(
+            "reason_local_deletion",
+            reason_local_deletion_credit_loss(
+                output["reason_local_candidate_delta"],
+                output["reason_local_selected_deleted_delta"],
+                output["reason_local_random_deleted_delta"],
+                reason_target,
+                output["reason_local_motion_energy"],
+                contradiction,
+                label_mask=output["reason_local_temporal_reason_mask"],
+            ),
+        )
+        registry.add(
             "reason_local_delta",
             output["reason_local_candidate_delta"].square().mean(),
+        )
+    if "logit_flow_reason_candidate_logits" in output:
+        reason_flow_motion = output["logit_flow_reason_temporal_features"][..., 3:7].abs().mean(-1)[:, None]
+        registry.add(
+            "logit_flow_reason_aux",
+            target_conditioned_pu_correction_loss(
+                output["image_reason_logits"],
+                output["logit_flow_reason_candidate_delta"],
+                reason_target, reason_flow_motion, contradiction,
+            ),
+        )
+        registry.add(
+            "logit_flow_reason_rank",
+            target_conditioned_pu_ranking_loss(
+                output["image_reason_logits"],
+                output["logit_flow_reason_candidate_delta"],
+                reason_target, reason_flow_motion, contradiction,
+            ),
+        )
+        registry.add(
+            "logit_flow_reason_utility",
+            reason_local_utility_calibration_loss(
+                output["logit_flow_reason_utility_logit"],
+                output["logit_flow_reason_candidate_delta"],
+                reason_target, contradiction,
+            ),
+        )
+        reason_flow_controls = [
+            reason_local_order_credit_loss(
+                output["logit_flow_reason_candidate_delta"],
+                value["logit_flow_reason_candidate_delta"],
+                reason_target, reason_flow_motion, contradiction,
+            )
+            for value in counterfactual_outputs.values()
+            if "logit_flow_reason_candidate_delta" in value
+        ]
+        registry.add(
+            "logit_flow_reason_order",
+            torch.stack(reason_flow_controls).mean()
+            if reason_flow_controls else output["logit_flow_reason_candidate_delta"].sum() * 0.0,
+            available=bool(reason_flow_controls),
+            unavailable_reason=None if reason_flow_controls else "counterfactual evaluated at optimizer boundary only",
+        )
+        registry.add(
+            "logit_flow_reason_no_harm",
+            positive_label_no_harm_loss(
+                output["image_reason_logits"],
+                output["logit_flow_reason_candidate_logits"], reason_target,
+            ),
+        )
+        registry.add(
+            "logit_flow_reason_delta",
+            output["logit_flow_reason_candidate_delta"].square().mean(),
         )
     registry.add("reason_partial", reason_partial_asl_loss(output["video_reason_logits"], reason_target, contradiction))
     registry.add(
@@ -844,14 +1105,14 @@ def build_tida_loss_registry(
         "geometric_reason_aux",
         target_conditioned_geometric_correction_loss(
             output["semantic_video_reason_logits"], output["geometric_reason_delta_raw"],
-            reason_target, output["geometric_motion_energy"], reason_weights, target_margin=0.15,
+            reason_target, output["geometric_motion_energy"], relational_reason_weight, target_margin=0.15,
         ),
     )
     registry.add(
         "geometric_reason_rank",
         target_conditioned_geometric_ranking_loss(
             output["semantic_video_reason_logits"], output["geometric_reason_delta_raw"],
-            reason_target, output["geometric_motion_energy"], reason_weights,
+            reason_target, output["geometric_motion_energy"], relational_reason_weight,
         ),
     )
     prefix_reason = output["geometric_prefix_reason_logits_raw"].flatten(0, 1)

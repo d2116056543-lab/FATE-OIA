@@ -1,0 +1,240 @@
+experiment:
+  name: tida_liteflow_v21
+  direct_video: true
+  eval_splits: [test]
+  diagnostic_eval_splits: []
+  best_selection_split: test
+  best_selection_metric: video_stable_deploy_joint
+  internal_test_selected: false
+  publication_eligible: true
+data:
+  manifest_path: 'G:\FATE_Drive_runs\tida_full_manifest_exact4572_v19\tida_full_primary_manifest.jsonl'
+  partition_seed: 20260829
+  train_on_all_official_train: true
+  train_core_count: 13254
+  train_gradient_count: 15302
+  train_calib_count: 1024
+  train_audit_count: 1024
+  test_count: 4572
+  accepted_source_count: 19874
+  rejected_source_count: 0
+  target_height: 360
+  target_width: 640
+  context_height: 192
+  context_width: 344
+  history_frames: 5
+  clip_seconds: 5.0
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+backbone:
+  arch: vit_small
+  patch_size: 8
+  selected_layers: [3, 7, 11]
+  pretrained_weights: ckp/reference/dino_deitsmall8_pretrain.pth
+  freeze_backbone: true
+  no_grad_backbone: true
+  feature_cache_enabled: false
+  token_compression: none
+image_base:
+  checkpoint: 'F:\FATE_Drive_runs\vetra_replay_from_scratch_v2_full_20260819_retry1\checkpoint_stage_b_continued.pth'
+  config: configs/fate_oia_train_360x640_vetra_staged_from_scratch_v1.yaml
+  stage_c_deployment: 'F:\FATE_Drive_runs\vetra_replay_from_scratch_v2_full_20260819_retry1\stage_c\deploy_final_train_only\vetra_from_scratch_deploy.pth'
+  action_scale: 1.0
+  reason_scale: 0.60
+model:
+  dim: 384
+  num_actions: 4
+  num_reasons: 21
+  num_predicates: 32
+  history_encoder_mode: terminal_repeat
+  context_chunk_size: 5
+  action_evidence_trust_cap: 0.25
+  reason_evidence_trust_cap: 0.25
+  conditional_temporal_utility: false
+  action_temporal_budget_cap: 0.30
+  reason_temporal_budget_cap: 0.25
+  confidence_aware_reason_gate: true
+  reason_gate_temperature: 0.50
+  geometric_flow_enabled: true
+  geometric_flow_hidden_dim: 64
+  geometric_action_cap: 0.10
+  geometric_reason_cap: 0.08
+  traffic_action_enabled: false
+  traffic_action_cap: 0.05
+  traffic_motion_topk: 12
+  traffic_trajectory_enabled: false
+  traffic_trajectory_cap: 0.08
+  traffic_trajectory_heads: 4
+  traffic_trajectory_state_enabled: false
+  traffic_trajectory_state_strength_scale: 8.0
+  traffic_trajectory_state_cap_ratio: 1.0
+  traffic_trajectory_state_utility_open_prior: 0.10
+  relational_traffic_enabled: false
+  relational_traffic_action_cap: 0.10
+  relational_traffic_reason_cap: 0.08
+  relational_traffic_reason_indices: [1, 2, 5, 6, 7, 8, 10, 14, 16, 20]
+  relational_traffic_heads: 4
+  relational_event_conditioning_enabled: false
+  relational_event_conditioning_scale: 0.20
+  reason_local_query_enabled: false
+  reason_local_query_cap: 0.04
+  reason_local_query_utility_open_prior: 0.10
+  reason_local_temporal_reason_indices: [1, 2, 5, 6, 7, 8, 10, 14, 16, 20]
+  traffic_adaptive_boundary_enabled: false
+  traffic_adaptive_boundary_cap: 0.25
+  object_intent_enabled: false
+  object_tracker_mode: geometric_flow
+  object_intent_terminal_semantics_only: true
+  object_tracker_repository: 'E:\sbw\deps\co-tracker'
+  object_tracker_model_name: cotracker3_offline
+  object_tracker_grid_size: 8
+  object_intent_action_cap: 0.06
+  object_intent_reason_cap: 0.05
+  object_intent_heads: 4
+  object_intent_reason_indices: [1, 2, 5, 6, 7, 8, 10, 14, 16, 20]
+  object_intent_role_checkpoint: 'F:\FATE_Drive_runs\tida_object_role_head_1000_v88\checkpoint_best_role_head.pth'
+loss:
+  terminal_hist: 0.0
+  terminal_no_history: 0.0
+  terminal_gain: 0.0
+  temporal_order: 0.0
+  repeated_last_contrast: 0.0
+  flow_transition_align: 0.0
+  action_asl: 1.00
+  action_smooth_ap: 0.15
+  action_base_protect: 0.10
+  action_delta: 0.002
+  action_route_sparse: 0.0
+  action_flow_credit: 0.0
+  action_flow_no_harm: 0.0
+  action_utility_calibration: 0.0
+  reason_partial: 1.00
+  reason_rank: 0.08
+  reason_soft_f1: 0.04
+  reason_delta: 0.002
+  reason_flow_credit: 0.0
+  reason_flow_no_harm: 0.0
+  reason_positive_no_harm: 0.0
+  reason_utility_calibration: 0.0
+  reason_local_aux: 0.0
+  reason_local_rank: 0.0
+  reason_local_utility: 0.0
+  reason_local_no_harm: 0.0
+  reason_local_order: 0.0
+  reason_local_deletion: 0.0
+  reason_local_delta: 0.0
+  geometric_action_aux: 0.08
+  geometric_action_rank: 0.05
+  geometric_action_prefix: 0.02
+  geometric_action_delta: 0.001
+  geometric_reason_aux: 0.04
+  geometric_reason_rank: 0.02
+  geometric_reason_prefix: 0.02
+  geometric_reason_delta: 0.001
+  traffic_action_aux: 0.0
+  traffic_action_rank: 0.0
+  traffic_action_delta: 0.0
+  trajectory_action_boundary: 0.0
+  trajectory_action_rank: 0.0
+  trajectory_selected_control: 0.0
+  trajectory_utility_calibration: 0.0
+  trajectory_delta: 0.0
+  relational_action_aux: 0.0
+  relational_action_rank: 0.0
+  relational_action_deletion: 0.0
+  relational_action_no_harm: 0.0
+  relational_reason_aux: 0.0
+  relational_reason_rank: 0.0
+  relational_reason_deletion: 0.0
+  relational_reason_no_harm: 0.0
+  relational_delta: 0.0
+  object_intent_action_aux: 0.0
+  object_intent_action_rank: 0.0
+  object_intent_action_boundary: 0.0
+  object_intent_action_smooth_ap: 0.0
+  object_intent_action_deletion: 0.0
+  object_intent_action_pair_deletion: 0.0
+  object_intent_action_no_harm: 0.0
+  object_intent_action_utility: 0.0
+  object_intent_reason_aux: 0.0
+  object_intent_reason_rank: 0.0
+  object_intent_reason_deletion: 0.0
+  object_intent_reason_pair_deletion: 0.0
+  object_intent_reason_no_harm: 0.0
+  object_intent_reason_utility: 0.0
+  object_intent_delta: 0.0
+training:
+  seed: 20260825
+  epochs: 10
+  precision: bf16
+  optimizer: AdamW
+  weight_decay: 0.05
+  global_grad_clip: 1.0
+  warmup_ratio: 0.05
+  temporal_ramp_end_ratio: 0.15
+  flow_phases:
+    foundation_end_ratio: 0.03
+    credit_end_ratio: 0.15
+    final_phase: SAFE_JOINT
+  min_lr_ratio: 0.10
+  ema_decay: 0.998
+  no_metric_early_stop: true
+  lr:
+    geometric_action: 0.00020
+    geometric_reason: 0.00020
+    object_intent_action: 0.00012
+    object_intent_reason: 0.00025
+    object_intent_action_utility: 0.00020
+    object_intent_reason_utility: 0.00025
+    object_intent_lateral_refinement: 0.00030
+memory_probe:
+  max_reserved_gib: 43.0
+  max_growth_gib: 0.25
+  warmup_updates: 5
+  measured_updates: 20
+  candidates:
+    - {name: A, batch_size: 16, gradient_accumulation_steps: 2, context_chunk_size: 5}
+    - {name: B, batch_size: 12, gradient_accumulation_steps: 3, context_chunk_size: 5}
+    - {name: C, batch_size: 10, gradient_accumulation_steps: 3, context_chunk_size: 5}
+    - {name: D, batch_size: 8, gradient_accumulation_steps: 4, context_chunk_size: 5}
+runtime:
+  foreground_only: true
+  no_feature_cache: true
+  require_no_token_compression: true
+  test_every_epoch: true
+  expanded_test_every_epoch: false
+  save_every_epoch: true
+  intervention_interval_updates: 8
+  fixed_test_audit_samples: 64
+  print_every_optimizer_updates: 50
+  exact_resume: true
+deployment:
+  object_intent_utility_policy_use_train_audit: true
+  object_intent_min_calib_samples: 16
+  object_intent_min_nll_improvement: 0.000001
+  object_intent_min_fixed_f1_improvement: 0.0
+  object_intent_utility_oof_folds: 5
+  object_intent_utility_leave_source_out: true
+  object_intent_utility_min_oof_gain: 0.0
+  object_intent_utility_max_selected_rate: 0.50
+  object_intent_utility_min_selected_benefit_rate: 0.60
+  object_intent_utility_min_positive_fold_fraction: 0.40
+  object_intent_utility_min_non_degrading_fold_fraction: 0.80
+  object_intent_utility_fold_degradation_tolerance: 0.002
+  object_intent_utility_min_nll_improvement: 0.0
+  object_intent_utility_min_brier_improvement: 0.0
+  object_intent_action_allow_proper_score_tie: false
+  object_intent_utility_quantile_coverages: [0.25, 0.50]
+  object_intent_action_utility_scales: [0, 2, 4, 8, 16, 24]
+  object_intent_reason_utility_scales: [0, 2, 4, 8, 16]
+  object_intent_utility_cutoffs: [0.0, 0.4, 0.5, 0.6, 0.7]
+  calibration_source: train_calib
+  primary_threshold_source: image_train_calib_locked
+  reason_beta_source: [train_calib, train_audit]
+  reason_beta_candidates: [0.0, 0.25, 0.5, 0.75, 1.0]
+  test_oracle_writeback: false
+  stage_c_nested_oof: true
+  locked_image_threshold_source: v7_1_train_calib
+  locked_image_thresholds: [0.59000003, 0.65999997, 0.60000002, 0.61000001, 0.62000000, 0.63999998, 0.55000001, 0.74000001, 0.69999999, 0.5, 0.12000000, 0.64999998, 0.43000000, 0.05, 0.42000002, 0.55000001, 0.34999999, 0.56000000, 0.73000002, 0.64999998, 0.68000001, 0.61000001, 0.63, 0.68000001, 0.66999996]

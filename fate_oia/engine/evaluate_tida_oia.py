@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import time
 from typing import Any
 
 import torch
@@ -76,6 +77,9 @@ def collect_tida_outputs(
         "image_reason", "semantic_reason", "geometric_reason", "video_reason",
         "legacy_video_reason", "reason_local_candidate",
         "reason_local_centered_candidate", "reason_local_deploy",
+        "legacy_semantic_action", "action_local_candidate",
+        "action_local_centered_candidate", "action_local_deploy",
+        "logit_flow_action_candidate", "logit_flow_reason_candidate",
         "pre_relational_action", "pre_relational_reason",
         "prefix_action", "prefix_reason", "action_target", "reason_target",
     )}
@@ -87,15 +91,31 @@ def collect_tida_outputs(
         "action_temporal_budget", "reason_temporal_budget",
         "action_temporal_need", "reason_temporal_need",
         "action_temporal_target_motion", "reason_temporal_target_motion",
-        "reason_pu_weight",
+        "reason_pu_weight", "reason_contradiction_score",
         "reason_local_candidate_delta", "reason_local_centered_candidate_delta",
         "reason_local_utility_logit",
         "reason_local_utility_probability", "reason_local_deploy_gate",
         "reason_local_deploy_scale", "reason_local_deploy_utility_inverted",
         "reason_local_deploy_delta", "reason_local_motion_energy",
+        "reason_local_velocity_rms", "reason_local_acceleration_rms",
+        "reason_local_shuffled_delta", "reason_local_selected_deleted_delta",
+        "reason_local_random_deleted_delta", "reason_local_selected_minus_random_gap",
+        "action_local_candidate_delta", "action_local_centered_candidate_delta",
+        "action_local_utility_logit", "action_local_utility_probability",
+        "action_local_deploy_gate", "action_local_deploy_scale",
+        "action_local_deploy_utility_inverted", "action_local_deploy_delta",
+        "action_local_motion_energy", "action_local_shuffled_delta",
+        "action_local_selected_deleted_delta", "action_local_random_deleted_delta",
+        "action_local_selected_minus_random_gap",
+        "logit_flow_action_candidate_delta", "logit_flow_reason_candidate_delta",
+        "logit_flow_action_utility_logit", "logit_flow_reason_utility_logit",
+        "logit_flow_action_utility_probability", "logit_flow_reason_utility_probability",
+        "logit_flow_action_deploy_delta", "logit_flow_reason_deploy_delta",
+        "logit_flow_action_temporal_features", "logit_flow_reason_temporal_features",
         "velocity_norm", "acceleration_norm",
-        "geometric_motion_energy", "geometric_global_horizontal", "geometric_global_expansion",
+        "geometric_motion_energy", "geometric_residual_motion_energy", "geometric_global_horizontal", "geometric_global_expansion",
         "geometric_region_motion", "geometric_action_delta", "geometric_reason_delta",
+        "geometric_action_motion_attention", "geometric_reason_motion_attention",
         "traffic_motion_energy", "traffic_action_delta", "traffic_action_attention",
         "traffic_same_action_mass",
         "traffic_patch_displacement", "traffic_patch_common_displacement",
@@ -215,6 +235,7 @@ def collect_tida_outputs(
     dynamic_concepts: list[dict[str, Any]] = []
     file_names: list[str] = []
     source_batches: list[str] = []
+    source_video_ids: list[str] = []
     mechanism_rows: dict[str, list[float]] = {
         name: [] for name in (
             "history_off", "repeated_last", "time_shuffle", "time_reverse",
@@ -228,7 +249,16 @@ def collect_tida_outputs(
     mechanism_base = {key: [] for key in ("action", "reason", "action_target", "reason_target", "velocity")}
     mechanism_count = 0
     model.eval()
-    for batch in loader:
+    evaluation_started = time.perf_counter()
+    total_batches = len(loader)
+    for batch_index, batch in enumerate(loader, start=1):
+        if batch_index == 1 or batch_index % 32 == 0 or batch_index == total_batches:
+            print(json.dumps({
+                "event": "tida_eval_progress",
+                "batch": batch_index,
+                "total_batches": total_batches,
+                "elapsed_seconds": round(time.perf_counter() - evaluation_started, 1),
+            }), flush=True)
         batch = _device_batch(batch, device)
         output = model(
             batch["target_image"], batch["context_images"], batch["timestamps"], batch["frame_valid_mask"],
@@ -255,6 +285,14 @@ def collect_tida_outputs(
                 "reason_local_centered_candidate_logits"
             ],
             "reason_local_deploy": output["reason_local_deploy_logits"],
+            "legacy_semantic_action": output["legacy_semantic_video_action_logits"],
+            "action_local_candidate": output["action_local_candidate_logits"],
+            "action_local_centered_candidate": output[
+                "action_local_centered_candidate_logits"
+            ],
+            "action_local_deploy": output["action_local_deploy_logits"],
+            "logit_flow_action_candidate": output["logit_flow_action_candidate_logits"],
+            "logit_flow_reason_candidate": output["logit_flow_reason_candidate_logits"],
             "pre_relational_action": output["pre_relational_video_action_logits"],
             "pre_relational_reason": output["pre_relational_video_reason_logits"],
             "prefix_action": output["prefix_video_action_logits"],
@@ -276,6 +314,10 @@ def collect_tida_outputs(
             else 0.2 + 0.8 * contradiction.detach().clamp(0.0, 1.0)
         )
         reason_pu = torch.where(batch["reason"] > 0.5, torch.ones_like(reason_negative_weight), reason_negative_weight)
+        reason_contradiction = (
+            torch.zeros_like(batch["reason"])
+            if contradiction is None else contradiction.detach().clamp(0.0, 1.0)
+        )
         for key, value in {
             "rho": output["innovation_reliability"], "action_delta": output["action_temporal_delta"],
             "reason_delta": output["reason_temporal_delta"], "null_mass": output["action_null_mass"],
@@ -294,6 +336,7 @@ def collect_tida_outputs(
             "action_temporal_target_motion": output["action_temporal_target_motion"],
             "reason_temporal_target_motion": output["reason_temporal_target_motion"],
             "reason_pu_weight": reason_pu,
+            "reason_contradiction_score": reason_contradiction,
             "reason_local_candidate_delta": output["reason_local_candidate_delta"],
             "reason_local_centered_candidate_delta": output[
                 "reason_local_centered_candidate_delta"
@@ -307,14 +350,76 @@ def collect_tida_outputs(
                 "reason_local_deploy_utility_inverted"
             ],
             "reason_local_deploy_delta": output["reason_local_deploy_delta"],
+            "reason_local_velocity_rms": output["reason_local_velocity_rms"],
+            "reason_local_acceleration_rms": output["reason_local_acceleration_rms"],
+            "reason_local_shuffled_delta": output["reason_local_shuffled_delta"],
+            "reason_local_selected_deleted_delta": output[
+                "reason_local_selected_deleted_delta"
+            ],
+            "reason_local_random_deleted_delta": output[
+                "reason_local_random_deleted_delta"
+            ],
+            "reason_local_selected_minus_random_gap": output[
+                "reason_local_selected_minus_random_gap"
+            ],
+            "action_local_candidate_delta": output["action_local_candidate_delta"],
+            "action_local_centered_candidate_delta": output[
+                "action_local_centered_candidate_delta"
+            ],
+            "action_local_motion_energy": output["action_local_motion_energy"],
+            "action_local_utility_logit": output["action_local_utility_logit"],
+            "action_local_utility_probability": output["action_local_utility_probability"],
+            "action_local_deploy_gate": output["action_local_deploy_gate"],
+            "action_local_deploy_scale": output["action_local_deploy_scale"],
+            "action_local_deploy_utility_inverted": output[
+                "action_local_deploy_utility_inverted"
+            ],
+            "action_local_deploy_delta": output["action_local_deploy_delta"],
+            "action_local_shuffled_delta": output["action_local_shuffled_delta"],
+            "action_local_selected_deleted_delta": output[
+                "action_local_selected_deleted_delta"
+            ],
+            "action_local_random_deleted_delta": output[
+                "action_local_random_deleted_delta"
+            ],
+            "action_local_selected_minus_random_gap": output[
+                "action_local_selected_minus_random_gap"
+            ],
+            "logit_flow_action_candidate_delta": output["logit_flow_action_candidate_delta"],
+            "logit_flow_reason_candidate_delta": output["logit_flow_reason_candidate_delta"],
+            "logit_flow_action_utility_logit": output["logit_flow_action_utility_logit"],
+            "logit_flow_reason_utility_logit": output["logit_flow_reason_utility_logit"],
+            "logit_flow_action_utility_probability": output[
+                "logit_flow_action_utility_probability"
+            ],
+            "logit_flow_reason_utility_probability": output[
+                "logit_flow_reason_utility_probability"
+            ],
+            "logit_flow_action_deploy_delta": output["logit_flow_action_deploy_delta"],
+            "logit_flow_reason_deploy_delta": output["logit_flow_reason_deploy_delta"],
+            "logit_flow_action_temporal_features": output[
+                "logit_flow_action_temporal_features"
+            ],
+            "logit_flow_reason_temporal_features": output[
+                "logit_flow_reason_temporal_features"
+            ],
             "velocity_norm": output["velocity"].norm(dim=-1),
             "acceleration_norm": output["acceleration"].norm(dim=-1),
             "geometric_motion_energy": output["geometric_motion_energy"],
+            "geometric_residual_motion_energy": output[
+                "geometric_residual_motion_energy"
+            ],
             "geometric_global_horizontal": output["geometric_global_horizontal"],
             "geometric_global_expansion": output["geometric_global_expansion"],
             "geometric_region_motion": output["geometric_region_motion"],
             "geometric_action_delta": output["geometric_action_delta"],
             "geometric_reason_delta": output["geometric_reason_delta_effective"],
+            "geometric_action_motion_attention": output[
+                "geometric_action_motion_attention"
+            ],
+            "geometric_reason_motion_attention": output[
+                "geometric_reason_motion_attention"
+            ],
             "traffic_motion_energy": output["traffic_motion_energy"],
             "traffic_action_delta": output["traffic_action_delta"],
             "traffic_action_attention": output["traffic_action_attention"],
@@ -585,6 +690,7 @@ def collect_tida_outputs(
         source_batches.extend(
             str(meta.get("source_batch", "unknown")) for meta in batch["clip_meta"]
         )
+        source_video_ids.extend(str(value) for value in batch["source_video_id"])
         if collect_mechanism and mechanism_count < mechanism_samples:
             selected, matched = select_predicate_intervention_indices(
                 output["action_route"][..., :32],
@@ -619,7 +725,11 @@ def collect_tida_outputs(
         )
     result = {key: torch.cat(value) for key, value in store.items()} | {
         key: torch.cat(value) for key, value in diagnostics.items()
-    } | {"file_names": file_names, "source_batches": source_batches}
+    } | {
+        "file_names": file_names,
+        "source_batches": source_batches,
+        "source_video_ids": source_video_ids,
+    }
     if collect_audit_tensors:
         result.update({key: torch.cat(value) for key, value in audit_store.items()})
         result["dynamic_concepts"] = dynamic_concepts
@@ -679,14 +789,20 @@ def branch_metrics(rows: dict[str, Any], thresholds: torch.Tensor | float = 0.5)
         "video": aie_branch_metrics(rows["video_action"], rows["video_reason"], rows["action_target"], rows["reason_target"], threshold=thresholds),
     }
     for name, key in (
+        ("legacy_action_route", "legacy_semantic_action"),
+        ("action_local_candidate", "action_local_candidate"),
+        ("action_local_centered_candidate", "action_local_centered_candidate"),
+        ("action_local_deploy", "action_local_deploy"),
         ("legacy_reason_route", "legacy_video_reason"),
         ("reason_local_candidate", "reason_local_candidate"),
         ("reason_local_centered_candidate", "reason_local_centered_candidate"),
         ("reason_local_deploy", "reason_local_deploy"),
     ):
         if key in rows:
+            action_logits = rows[key] if "action" in name else rows["video_action"]
+            reason_logits = rows["video_reason"] if "action" in name else rows[key]
             metrics[name] = aie_branch_metrics(
-                rows["video_action"], rows[key], rows["action_target"],
+                action_logits, reason_logits, rows["action_target"],
                 rows["reason_target"], threshold=thresholds,
             )
     return metrics
@@ -777,6 +893,30 @@ def geometric_temporal_effectiveness_metrics(
     reason_sign = 2.0 * rows["reason_target"] - 1.0
     action_margin = action_sign * rows["geometric_action_delta"]
     reason_margin = reason_sign * rows["geometric_reason_delta"]
+    action_attention = rows.get("geometric_action_motion_attention")
+    reason_attention = rows.get("geometric_reason_motion_attention")
+
+    def attention_summary(attention: torch.Tensor | None, prefix: str) -> dict[str, float]:
+        if attention is None or attention.numel() == 0:
+            return {
+                f"{prefix}_entropy_mean": 0.0,
+                f"{prefix}_normalized_entropy_mean": 0.0,
+                f"{prefix}_top1_mass_mean": 0.0,
+                f"{prefix}_target_attention_diversity": 0.0,
+            }
+        entropy = -(attention * attention.clamp_min(1e-8).log()).sum(-1)
+        normalizer = torch.log(attention.new_tensor(float(attention.shape[-1]))).clamp_min(1.0)
+        return {
+            f"{prefix}_entropy_mean": float(entropy.mean()),
+            f"{prefix}_normalized_entropy_mean": float((entropy / normalizer).mean()),
+            f"{prefix}_top1_mass_mean": float(attention.max(-1).values.mean()),
+            f"{prefix}_target_attention_diversity": float(attention.std(1, unbiased=False).mean()),
+        }
+
+    motion_reader = {
+        **attention_summary(action_attention, "action"),
+        **attention_summary(reason_attention, "reason"),
+    }
     return {
         "motion_quantiles": {
             "p25": float(low_cut), "p50": float(torch.quantile(score, 0.5)), "p75": float(high_cut)
@@ -794,6 +934,7 @@ def geometric_temporal_effectiveness_metrics(
             "action_delta_rms": float(rows["geometric_action_delta"].square().mean().sqrt()),
             "reason_delta_rms": float(rows["geometric_reason_delta"].square().mean().sqrt()),
         },
+        "motion_reader": motion_reader,
     }
 
 
@@ -931,6 +1072,79 @@ def traffic_action_effectiveness_metrics(
             "patch_common_displacement_xy_mean": patch_common.mean((0, 1)).tolist(),
             "patch_exclusive_displacement_xy_by_action": patch_exclusive.mean((0, 1)).tolist(),
             "patch_exclusive_motion_rms_by_action": patch_exclusive.square().mean((0, 1, 3)).sqrt().tolist(),
+        },
+    }
+
+
+def logit_flow_effectiveness_metrics(
+    rows: dict[str, Any], thresholds: torch.Tensor | float = 0.5,
+) -> dict[str, Any]:
+    """Measure whether frozen per-frame predictions transport useful target evidence."""
+    action_candidate = rows["image_action"] + rows["logit_flow_action_candidate_delta"]
+    reason_candidate = rows["image_reason"] + rows["logit_flow_reason_candidate_delta"]
+    branches = {
+        "image": aie_branch_metrics(
+            rows["image_action"], rows["image_reason"],
+            rows["action_target"], rows["reason_target"], threshold=thresholds,
+        ),
+        "logit_flow_candidate": aie_branch_metrics(
+            action_candidate, reason_candidate,
+            rows["action_target"], rows["reason_target"], threshold=thresholds,
+        ),
+        "final": aie_branch_metrics(
+            rows["video_action"], rows["video_reason"],
+            rows["action_target"], rows["reason_target"], threshold=thresholds,
+        ),
+    }
+    action_sign = 2.0 * rows["action_target"] - 1.0
+    action_signed = action_sign * rows["logit_flow_action_candidate_delta"]
+    reason_positive = rows["reason_target"] > 0.5
+    reason_delta = rows["logit_flow_reason_candidate_delta"]
+    reason_positive_margin = reason_delta[reason_positive]
+    action_helpful = action_signed > 0
+    contradiction = rows.get(
+        "reason_contradiction_score", torch.zeros_like(reason_delta)
+    )
+    reason_certified_negative = (~reason_positive) & (contradiction >= 0.8)
+    reason_certified = reason_positive | reason_certified_negative
+    reason_helpful = torch.where(
+        reason_positive, reason_delta > 0, reason_delta < 0
+    )
+    certified_reason_utility = rows["logit_flow_reason_utility_probability"][reason_certified]
+    certified_reason_helpful = reason_helpful[reason_certified]
+    return {
+        "branches": branches,
+        "action_transport": {
+            "signed_margin_mean": float(action_signed.mean()),
+            "signed_margin_by_label": action_signed.mean(0).tolist(),
+            "benefit_rate": float((action_signed > 1e-4).float().mean()),
+            "harm_rate": float((action_signed < -1e-4).float().mean()),
+            "candidate_mf1_gain": branches["logit_flow_candidate"]["Act_mF1"] - branches["image"]["Act_mF1"],
+            "candidate_map_gain": branches["logit_flow_candidate"]["Act_mAP"] - branches["image"]["Act_mAP"],
+        },
+        "reason_transport": {
+            "observed_positive_margin_mean": (
+                0.0 if not reason_positive_margin.numel() else float(reason_positive_margin.mean())
+            ),
+            "observed_positive_benefit_rate": (
+                0.0 if not reason_positive_margin.numel()
+                else float((reason_positive_margin > 1e-4).float().mean())
+            ),
+            "candidate_mf1_gain": branches["logit_flow_candidate"]["Exp_mF1"] - branches["image"]["Exp_mF1"],
+            "candidate_map_gain": branches["logit_flow_candidate"]["Exp_mAP"] - branches["image"]["Exp_mAP"],
+        },
+        "utility": {
+            "action_helpfulness_auc": _binary_rank_auc(
+                rows["logit_flow_action_utility_probability"], action_helpful
+            ),
+            "reason_helpfulness_auc": _binary_rank_auc(
+                certified_reason_utility, certified_reason_helpful
+            ),
+            "reason_certified_coverage": float(reason_certified.float().mean()),
+            "reason_certified_positive_count": int(reason_positive.sum()),
+            "reason_certified_negative_count": int(reason_certified_negative.sum()),
+            "action_gate_mean": float(rows["logit_flow_action_utility_probability"].mean()),
+            "reason_gate_mean": float(rows["logit_flow_reason_utility_probability"].mean()),
         },
     }
 
@@ -1264,7 +1478,16 @@ def collect_intervention_audit(model, loader, device: torch.device, max_samples:
     }
 
 
-def save_epoch_outputs(output_dir: Path, epoch: int, rows: dict[str, Any], metrics: dict[str, Any], thresholds: dict[str, torch.Tensor], mechanism: dict[str, Any]) -> None:
+def save_epoch_outputs(
+    output_dir: Path,
+    epoch: int,
+    rows: dict[str, Any],
+    metrics: dict[str, Any],
+    thresholds: dict[str, torch.Tensor],
+    mechanism: dict[str, Any],
+    *,
+    compact_logit_flow: bool = False,
+) -> None:
     epoch_dir = output_dir / f"epoch_{epoch:03d}"
     epoch_dir.mkdir(parents=True, exist_ok=True)
     atomic_write_json(epoch_dir / "metrics_summary.json", metrics)
@@ -1314,12 +1537,22 @@ def save_epoch_outputs(output_dir: Path, epoch: int, rows: dict[str, Any], metri
         with (epoch_dir / "dynamic_concepts_test.jsonl").open("w", encoding="utf-8", newline="\n") as handle:
             for file_name, concepts in zip(rows["file_names"], rows["dynamic_concepts"]):
                 handle.write(json.dumps({"file_name": file_name, "dynamic_concepts": concepts}, ensure_ascii=False) + "\n")
-    tensor_keys = (
+    compact_tensor_keys = (
+        "image_action", "video_action", "image_reason", "video_reason",
+        "logit_flow_action_candidate", "logit_flow_reason_candidate",
+        "logit_flow_action_candidate_delta", "logit_flow_reason_candidate_delta",
+        "logit_flow_action_deploy_delta", "logit_flow_reason_deploy_delta",
+        "logit_flow_action_utility_probability", "logit_flow_reason_utility_probability",
+        "reason_contradiction_score", "action_target", "reason_target",
+        "timestamps", "frame_valid_mask",
+    )
+    full_tensor_keys = (
         "image_action", "semantic_action", "geometric_action", "traffic_action",
         "video_action_base", "video_action",
         "image_reason", "semantic_reason", "geometric_reason", "video_reason",
         "legacy_video_reason", "reason_local_candidate",
         "reason_local_centered_candidate", "reason_local_deploy",
+        "logit_flow_action_candidate", "logit_flow_reason_candidate",
         "prefix_action", "prefix_reason", "action_target", "reason_target",
         "rho", "action_delta", "reason_delta", "null_mass", "route_entropy",
         "action_evidence_confidence", "action_effective_trust",
@@ -1328,15 +1561,24 @@ def save_epoch_outputs(output_dir: Path, epoch: int, rows: dict[str, Any], metri
         "action_temporal_budget", "reason_temporal_budget",
         "action_temporal_need", "reason_temporal_need",
         "action_temporal_target_motion", "reason_temporal_target_motion",
-        "reason_pu_weight",
+        "reason_pu_weight", "reason_contradiction_score",
         "reason_local_candidate_delta", "reason_local_centered_candidate_delta",
         "reason_local_utility_logit",
         "reason_local_utility_probability", "reason_local_deploy_gate",
         "reason_local_deploy_scale", "reason_local_deploy_utility_inverted",
         "reason_local_deploy_delta", "reason_local_motion_energy",
+        "reason_local_velocity_rms", "reason_local_acceleration_rms",
+        "reason_local_shuffled_delta", "reason_local_selected_deleted_delta",
+        "reason_local_random_deleted_delta", "reason_local_selected_minus_random_gap",
+        "logit_flow_action_candidate_delta", "logit_flow_reason_candidate_delta",
+        "logit_flow_action_utility_logit", "logit_flow_reason_utility_logit",
+        "logit_flow_action_utility_probability", "logit_flow_reason_utility_probability",
+        "logit_flow_action_deploy_delta", "logit_flow_reason_deploy_delta",
+        "logit_flow_action_temporal_features", "logit_flow_reason_temporal_features",
         "velocity_norm", "acceleration_norm",
-        "geometric_motion_energy", "geometric_global_horizontal", "geometric_global_expansion",
+        "geometric_motion_energy", "geometric_residual_motion_energy", "geometric_global_horizontal", "geometric_global_expansion",
         "geometric_region_motion", "geometric_action_delta", "geometric_reason_delta",
+        "geometric_action_motion_attention", "geometric_reason_motion_attention",
         "traffic_motion_energy", "traffic_action_delta", "traffic_action_attention",
         "traffic_same_action_mass",
         "traffic_patch_displacement", "traffic_patch_common_displacement",
@@ -1443,6 +1685,7 @@ def save_epoch_outputs(output_dir: Path, epoch: int, rows: dict[str, Any], metri
         "velocity", "acceleration", "region_velocity",
         "action_temporal_route", "action_factor_contribution", "reason_temporal_route", "frame_valid_mask", "timestamps",
     )
+    tensor_keys = compact_tensor_keys if compact_logit_flow else full_tensor_keys
     for key in tensor_keys:
         if key not in rows:
             continue
@@ -1459,11 +1702,27 @@ def main() -> None:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--max-samples", type=int)
+    parser.add_argument("--max-eval-samples", type=int)
+    parser.add_argument("--max-calib-samples", type=int)
+    parser.add_argument("--max-audit-samples", type=int)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--frame-store-root")
     parser.add_argument("--collect-mechanism", action="store_true")
     args = parser.parse_args()
-    from fate_oia.engine.train_tida_oia import build_runtime
+    from fate_oia.engine.train_tida_oia import (
+        _view_metrics,
+        build_runtime,
+        calibrate_logit_flow_deployment,
+    )
 
     runtime = build_runtime(args, evaluation_only=True)
+    calib = collect_tida_outputs(
+        runtime.model, runtime.loaders["train_calib"], runtime.device
+    )
+    policy_fit = calibrate_logit_flow_deployment(
+        runtime.model, calib, runtime.config.get("deployment", {})
+    )
     rows = collect_tida_outputs(
         runtime.model,
         runtime.loaders["test"],
@@ -1471,23 +1730,8 @@ def main() -> None:
         collect_mechanism=args.collect_mechanism,
         mechanism_samples=args.max_samples or 128,
     )
-    calib = collect_tida_outputs(runtime.model, runtime.loaders["train_calib"], runtime.device)
-    thresholds = fit_train_calib_thresholds(calib)
-    metrics = {
-        "raw_fixed": branch_metrics(rows),
-        "deploy": {
-            "image": branch_metrics(rows, thresholds["image"])["image"],
-            "video": branch_metrics(rows, thresholds["video"])["video"],
-        },
-        "temporal_contribution": temporal_contribution_metrics(rows),
-        "geometric_branches_raw_fixed": geometric_branch_metrics(rows),
-        "geometric_effectiveness": geometric_temporal_effectiveness_metrics(rows),
-        "traffic_action_effectiveness": traffic_action_effectiveness_metrics(rows),
-        "trajectory_traffic_effectiveness": trajectory_traffic_effectiveness_metrics(rows),
-        "traffic_adaptive_boundary_effectiveness": (
-            traffic_adaptive_boundary_effectiveness_metrics(rows, thresholds["video"])
-        ),
-    }
+    metrics = _view_metrics(rows, calib, runtime.config.get("deployment", {}))
+    metrics["logit_flow_deployment_policy_fit"] = policy_fit
     atomic_write_json(Path(args.output_dir) / "evaluation.json", metrics)
     print(json.dumps(metrics, default=str), flush=True)
 

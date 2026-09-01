@@ -2,9 +2,25 @@ import torch
 
 from fate_oia.losses.tida_traffic_trajectory_losses import (
     trajectory_boundary_correction_loss,
+    trajectory_residual_ranking_loss,
     trajectory_selected_control_loss,
     trajectory_utility_calibration_loss,
 )
+
+
+def test_trajectory_residual_ranking_supervises_temporal_direction_without_base_shortcut():
+    target = torch.tensor([[1.0], [1.0], [0.0], [0.0]])
+    base = torch.tensor([[5.0], [4.0], [-4.0], [-5.0]])
+    aligned = torch.tensor([[0.04], [0.02], [-0.02], [-0.04]], requires_grad=True)
+    reversed_delta = -aligned.detach()
+
+    aligned_loss = trajectory_residual_ranking_loss(aligned, target, base_logits=base)
+    reversed_loss = trajectory_residual_ranking_loss(reversed_delta, target, base_logits=base)
+
+    assert aligned_loss < reversed_loss
+    aligned_loss.backward()
+    assert torch.isfinite(aligned.grad).all()
+    assert aligned.grad.abs().sum() > 0
 
 
 def test_boundary_correction_prefers_gt_aligned_trajectory_delta():
@@ -140,6 +156,30 @@ def test_utility_calibration_opens_for_helpful_and_closes_for_harmful_candidates
     assert correct_loss < reversed_loss
     correct_loss.backward()
     assert correct_logits.grad is not None and torch.isfinite(correct_logits.grad).all()
+
+
+def test_utility_calibration_waits_until_candidate_is_identifiable():
+    utility = torch.full((2, 4), 7.0, requires_grad=True)
+    candidate = torch.zeros_like(utility)
+    target = torch.tensor([[1.0, 0.0, 1.0, 0.0], [0.0, 1.0, 0.0, 1.0]])
+
+    loss = trajectory_utility_calibration_loss(utility, candidate, target)
+    loss.backward()
+
+    torch.testing.assert_close(loss, torch.zeros_like(loss))
+    torch.testing.assert_close(utility.grad, torch.zeros_like(utility))
+
+
+def test_utility_calibration_ramps_with_candidate_identifiability():
+    utility = torch.full((2, 4), 7.0)
+    target = torch.tensor([[1.0, 0.0, 1.0, 0.0], [0.0, 1.0, 0.0, 1.0]])
+    tiny = torch.full_like(utility, 1e-6)
+    identifiable = torch.full_like(utility, 0.02)
+
+    tiny_loss = trajectory_utility_calibration_loss(utility, tiny, target)
+    identifiable_loss = trajectory_utility_calibration_loss(utility, identifiable, target)
+
+    assert tiny_loss < 0.01 * identifiable_loss
 
 
 def test_split_utility_calibration_trains_order_and_state_from_their_own_detached_effects():

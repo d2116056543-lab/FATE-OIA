@@ -21,6 +21,7 @@ class TIDAActionReader(nn.Module):
         conditional_utility_enabled: bool = False,
         conditional_flow_mix_cap: float = 0.60,
         conditional_flow_mix_floor: float = 0.0,
+        flow_mix_cap: float = 0.35,
     ) -> None:
         super().__init__()
         self.num_actions = int(num_actions)
@@ -40,7 +41,9 @@ class TIDAActionReader(nn.Module):
         self.flow_key = nn.Linear(dim, dim)
         self.flow_value = nn.Linear(dim, dim)
         self.flow_output_weight = nn.Parameter(torch.zeros(num_actions, dim))
-        self.flow_mix_cap = 0.35
+        if not 0.0 <= float(flow_mix_cap) <= 1.0:
+            raise ValueError("flow_mix_cap must be in [0, 1]")
+        self.flow_mix_cap = float(flow_mix_cap)
         self.temporal_utility = TIDAConditionalTemporalUtility(
             max_budget=conditional_flow_mix_cap,
             min_budget=conditional_flow_mix_floor,

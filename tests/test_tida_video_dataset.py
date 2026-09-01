@@ -1,4 +1,5 @@
 import json
+import zipfile
 
 import torch
 from PIL import Image
@@ -38,6 +39,40 @@ def test_video_dataset_returns_formal_tensor_contract(tmp_path):
     assert decoded_indices == sample["frame_indices"][:-1].tolist()
     assert 150 not in decoded_indices
     assert sample["frame_valid_mask"].tolist()[-1] is True
+
+
+def test_video_dataset_honors_configured_sparse_history_count(tmp_path):
+    target = tmp_path / "target.jpg"
+    Image.new("RGB", (32, 18), "white").save(target)
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"stub")
+    row = {
+        "official_split": "test", "partition": "test", "file_name": "sparse.jpg",
+        "target_image_path": str(target), "clip_path": str(clip), "source_video_id": "sparse",
+        "duration_seconds": 5.0, "fps": 30.0, "num_frames": 151,
+        "target_timestamp_seconds": 5.0, "target_frame_index": 150,
+        "action": [1, 0, 0, 0], "reason": [0] * 21,
+    }
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    requested = []
+
+    def decoder(_path, indices):
+        requested.extend(indices.tolist())
+        return (
+            [Image.new("RGB", (32, 18), "white") for _ in indices],
+            torch.ones(len(indices), dtype=torch.bool),
+        )
+
+    sample = BDDOIAVideoDataset(
+        manifest, "test", decoder=decoder, history_frames=5
+    )[0]
+
+    assert len(requested) == 5
+    assert sample["context_images"].shape == (5, 3, 192, 344)
+    assert sample["timestamps"].shape == (6,)
+    assert sample["frame_valid_mask"].shape == (6,)
+    assert sample["frame_indices"].tolist() == sorted(set(sample["frame_indices"].tolist()))
 
 
 def test_sparse_capture_seeks_large_gaps_and_retrieves_only_requested_frames():
@@ -153,6 +188,46 @@ def test_raw_frame_store_bypasses_native_video_decoder(tmp_path):
     assert sample["frame_valid_mask"].all()
 
 
+def test_zip_raw_frame_store_matches_scattered_jpegs_and_bypasses_video(tmp_path):
+    target = tmp_path / "target.jpg"; Image.new("RGB", (32, 18), "white").save(target)
+    clip = tmp_path / "clip.mp4"; clip.write_bytes(b"stub")
+    row = {
+        "official_split": "test", "partition": "test", "file_name": "x.jpg",
+        "target_image_path": str(target), "clip_path": str(clip), "source_video_id": "x",
+        "duration_seconds": 5.0, "fps": 30.0, "num_frames": 151,
+        "target_timestamp_seconds": 5.0, "target_frame_index": 150,
+        "action": [1, 0, 0, 0], "reason": [0] * 21,
+    }
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    scattered = tmp_path / "scattered" / "test" / "x"; scattered.mkdir(parents=True)
+    packed = tmp_path / "packed" / "test"; packed.mkdir(parents=True)
+    for position in range(14):
+        Image.new("RGB", (32, 18), (position * 10, 5, 2)).save(
+            scattered / f"{position:02d}.jpg"
+        )
+    with zipfile.ZipFile(packed / "x.zip", "w", compression=zipfile.ZIP_STORED) as archive:
+        for position in range(14):
+            path = scattered / f"{position:02d}.jpg"
+            archive.write(path, arcname=path.name)
+
+    def forbidden_decoder(_path, _indices):
+        raise AssertionError("zip raw-frame store must bypass video decoding")
+
+    from_scattered = BDDOIAVideoDataset(
+        manifest, "test", decoder=forbidden_decoder,
+        frame_store_root=tmp_path / "scattered",
+    )[0]
+    from_zip = BDDOIAVideoDataset(
+        manifest, "test", decoder=forbidden_decoder,
+        frame_store_root=tmp_path / "packed",
+    )[0]
+
+    torch.testing.assert_close(
+        from_zip["context_images"], from_scattered["context_images"], rtol=0, atol=0
+    )
+
+
 def test_raw_frame_store_uses_semicolon_separated_fallback_roots(tmp_path):
     target = tmp_path / "target.jpg"; Image.new("RGB", (32, 18), "white").save(target)
     clip = tmp_path / "clip.mp4"; clip.write_bytes(b"stub")
@@ -182,6 +257,33 @@ def test_raw_frame_store_uses_semicolon_separated_fallback_roots(tmp_path):
 
     assert len(dataset.frame_store_roots) == 2
     assert sample["context_images"].shape == (14, 3, 192, 344)
+
+
+def test_missing_raw_frame_case_falls_back_to_native_decoder(tmp_path):
+    target = tmp_path / "target.jpg"; Image.new("RGB", (32, 18), "white").save(target)
+    clip = tmp_path / "clip.mp4"; clip.write_bytes(b"stub")
+    row = {
+        "official_split": "train", "partition": "train_core", "file_name": "missing.jpg",
+        "target_image_path": str(target), "clip_path": str(clip), "source_video_id": "source",
+        "duration_seconds": 5.0, "fps": 30.0, "num_frames": 151,
+        "target_timestamp_seconds": 5.0, "target_frame_index": 150,
+        "action": [1, 0, 0, 0], "reason": [0] * 21,
+    }
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    (tmp_path / "frames").mkdir()
+    calls = []
+
+    def decoder(_path, indices):
+        calls.append(indices.clone())
+        return [Image.new("RGB", (32, 18), "black") for _ in indices], torch.ones(len(indices), dtype=torch.bool)
+
+    sample = BDDOIAVideoDataset(
+        manifest, "train_core", decoder=decoder, frame_store_root=tmp_path / "frames"
+    )[0]
+
+    assert len(calls) == 1
+    assert sample["frame_store_hit"].item() is False
 
 
 def test_history_unavailable_skips_decoder_and_is_exactly_masked(tmp_path):

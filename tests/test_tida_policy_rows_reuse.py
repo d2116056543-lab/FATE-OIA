@@ -1,7 +1,10 @@
 import pytest
 import torch
 
-from fate_oia.engine.train_tida_oia import validate_and_slice_policy_rows
+from fate_oia.engine.train_tida_oia import (
+    object_intent_policy_cohorts_enabled,
+    validate_and_slice_policy_rows,
+)
 
 
 def _rows():
@@ -36,3 +39,13 @@ def test_policy_rows_reuse_rejects_inconsistent_lengths():
     rows["source_batches"].pop()
     with pytest.raises(ValueError, match="row count"):
         validate_and_slice_policy_rows(rows)
+
+
+def test_disabled_object_intent_skips_expensive_policy_cohorts():
+    class Model:
+        object_intent_enabled = False
+
+    config = {
+        "deployment": {"object_intent_utility_policy_use_train_audit": True}
+    }
+    assert object_intent_policy_cohorts_enabled(Model(), config) is False

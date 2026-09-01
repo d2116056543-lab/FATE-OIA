@@ -24,11 +24,22 @@ class TIDAGeometricFlowEncoder(nn.Module):
     """Fixed low-resolution motion measurement with no external flow network."""
 
     descriptor_dim = 20
+    # Three temporal summaries of raw and ego-compensated (u, v, energy,
+    # confidence), plus the local token coordinate.
+    motion_token_dim = 26
 
-    def __init__(self, hidden_dim: int = 64, flow_hw: tuple[int, int] = (45, 80)) -> None:
+    def __init__(
+        self,
+        hidden_dim: int = 64,
+        flow_hw: tuple[int, int] = (45, 80),
+        motion_token_hw: tuple[int, int] = (4, 8),
+    ) -> None:
         super().__init__()
         self.hidden_dim = int(hidden_dim)
         self.flow_hw = tuple(int(value) for value in flow_hw)
+        self.motion_token_hw = tuple(int(value) for value in motion_token_hw)
+        if min(self.motion_token_hw) < 1:
+            raise ValueError("motion_token_hw must be positive")
         if self.hidden_dim < 3 * self.descriptor_dim:
             raise ValueError(f"hidden_dim must be at least {3 * self.descriptor_dim}")
         sobel_x = torch.tensor(
@@ -38,6 +49,103 @@ class TIDAGeometricFlowEncoder(nn.Module):
         self.register_buffer("sobel_y", sobel_x.transpose(-1, -2).contiguous(), persistent=False)
         self.register_buffer("channel_scale", torch.tensor([0.229, 0.224, 0.225]), persistent=False)
         self.register_buffer("luma", torch.tensor([0.2989, 0.5870, 0.1140]), persistent=False)
+
+    def _build_motion_tokens(
+        self,
+        horizontal: torch.Tensor,
+        vertical: torch.Tensor,
+        energy: torch.Tensor,
+        confidence: torch.Tensor,
+        residual_horizontal: torch.Tensor,
+        residual_vertical: torch.Tensor,
+        residual_energy: torch.Tensor,
+        pair_valid: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Keep local motion evidence until each action/reason chooses what to read."""
+        batch, intervals = horizontal.shape[:2]
+        channels = torch.cat(
+            (
+                horizontal,
+                vertical,
+                energy,
+                confidence,
+                residual_horizontal,
+                residual_vertical,
+                residual_energy,
+                confidence,
+            ),
+            dim=2,
+        )
+        pooled = F.adaptive_avg_pool2d(
+            channels.flatten(0, 1), self.motion_token_hw
+        ).view(batch, intervals, 8, *self.motion_token_hw)
+        valid = pair_valid[:, :, None, None, None].to(pooled.dtype)
+        valid_count = valid.sum(1).clamp_min(1.0)
+        summary = (pooled * valid).sum(1) / valid_count
+
+        # Official clips are dense, but selecting the last valid interval also
+        # keeps padded or partially decoded clips semantically correct.
+        last_index = (
+            pair_valid.long()
+            * torch.arange(1, intervals + 1, device=pair_valid.device)[None]
+        ).argmax(1)
+        recent = pooled[torch.arange(batch, device=pooled.device), last_index]
+        trend = recent - summary
+
+        token_features = torch.cat((summary, recent, trend), dim=1)
+        token_features = token_features.flatten(2).transpose(1, 2)
+        y = torch.linspace(-1.0, 1.0, self.motion_token_hw[0], device=pooled.device, dtype=pooled.dtype)
+        x = torch.linspace(-1.0, 1.0, self.motion_token_hw[1], device=pooled.device, dtype=pooled.dtype)
+        yy, xx = torch.meshgrid(y, x, indexing="ij")
+        token_xy = torch.stack((xx, yy), dim=-1).flatten(0, 1)
+        token_xy = token_xy[None].expand(batch, -1, -1)
+        token_features = torch.cat((token_features, token_xy), dim=-1)
+        available = pair_valid.any(1)
+        token_mask = available[:, None].expand(-1, token_features.shape[1])
+        token_features = token_features * token_mask[..., None].to(token_features.dtype)
+        return token_features, token_xy, token_mask
+
+    @staticmethod
+    def _affine_residual_flow(
+        horizontal: torch.Tensor,
+        vertical: torch.Tensor,
+        confidence: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Remove camera-induced affine flow while retaining local motion."""
+        if not (horizontal.shape == vertical.shape == confidence.shape):
+            raise ValueError("flow and confidence tensors must share [B,T,1,H,W]")
+        batch, intervals, channels, height, width = horizontal.shape
+        if channels != 1:
+            raise ValueError("affine flow compensation expects one flow channel")
+        output_dtype = horizontal.dtype
+        # CUDA/CPU LU kernels do not support bf16. The 3x3 solve is tiny, and
+        # fp32 also prevents an unstable camera model from contaminating flow.
+        with torch.autocast(device_type=horizontal.device.type, enabled=False):
+            horizontal_fp32 = horizontal.float()
+            vertical_fp32 = vertical.float()
+            confidence_fp32 = confidence.float()
+            y = torch.linspace(-1.0, 1.0, height, device=horizontal.device)
+            x = torch.linspace(-1.0, 1.0, width, device=horizontal.device)
+            yy, xx = torch.meshgrid(y, x, indexing="ij")
+            design = torch.stack((torch.ones_like(xx), xx, yy), dim=-1).reshape(-1, 3)
+            design = design[None].expand(batch * intervals, -1, -1)
+            weight = confidence_fp32.reshape(batch * intervals, -1).clamp_min(0.0)
+            target = torch.stack(
+                (
+                    horizontal_fp32.reshape(batch * intervals, -1),
+                    vertical_fp32.reshape(batch * intervals, -1),
+                ),
+                dim=-1,
+            )
+            weighted_design = design * weight[..., None]
+            normal = design.transpose(1, 2) @ weighted_design
+            ridge = torch.eye(3, device=normal.device, dtype=normal.dtype)[None] * 1e-4
+            rhs = design.transpose(1, 2) @ (target * weight[..., None])
+            coefficients = torch.linalg.solve(normal + ridge, rhs)
+            fitted = design @ coefficients
+            residual = target - fitted
+            residual = residual.transpose(1, 2).reshape(batch, intervals, 2, height, width)
+        return residual[:, :, :1].to(output_dtype), residual[:, :, 1:].to(output_dtype)
 
     def _gray(self, frames: torch.Tensor) -> torch.Tensor:
         batch, steps, channels, height, width = frames.shape
@@ -124,6 +232,51 @@ class TIDAGeometricFlowEncoder(nn.Module):
         combined_confidence = 1.0 - (1.0 - confidence) * (1.0 - differential_confidence)
         return horizontal, vertical, combined_confidence
 
+    @staticmethod
+    def _flow_grid_tracks(
+        flow: torch.Tensor,
+        confidence: torch.Tensor,
+        frame_valid_mask: torch.Tensor,
+        grid_size: int = 4,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Propagate fixed normalized seeds through measured flow fields."""
+        batch, intervals, _, height, width = flow.shape
+        axis = torch.linspace(-0.75, 0.75, grid_size, device=flow.device, dtype=flow.dtype)
+        yy, xx = torch.meshgrid(axis, axis, indexing="ij")
+        position = torch.stack((xx, yy), dim=-1).flatten(0, 1)
+        position = position[None].expand(batch, -1, -1).clone()
+        tracks = [position]
+        visible = [frame_valid_mask[:, 0, None].expand(-1, position.shape[1])]
+        for step in range(intervals):
+            sample_grid = position[:, :, None]
+            displacement = F.grid_sample(
+                flow[:, step], sample_grid, mode="bilinear",
+                padding_mode="zeros", align_corners=True,
+            ).squeeze(-1).transpose(1, 2)
+            match_confidence = F.grid_sample(
+                confidence[:, step], sample_grid, mode="bilinear",
+                padding_mode="zeros", align_corners=True,
+            ).squeeze(1).squeeze(-1)
+            normalized = torch.stack(
+                (
+                    2.0 * displacement[..., 0] / max(width - 1, 1),
+                    2.0 * displacement[..., 1] / max(height - 1, 1),
+                ),
+                dim=-1,
+            )
+            next_position = position + normalized
+            in_bounds = next_position.abs().amax(-1) <= 1.0
+            step_visible = (
+                visible[-1]
+                & frame_valid_mask[:, step + 1, None]
+                & in_bounds
+                & (match_confidence > 1e-5)
+            )
+            position = next_position.clamp(-1.0, 1.0)
+            tracks.append(position)
+            visible.append(step_visible)
+        return torch.stack(tracks, dim=1), torch.stack(visible, dim=1)
+
     def forward(
         self,
         frames: torch.Tensor,
@@ -153,12 +306,33 @@ class TIDAGeometricFlowEncoder(nn.Module):
         horizontal = horizontal * pair_weight
         vertical = vertical * pair_weight
         flow = torch.cat((horizontal, vertical), dim=2)
+        flow_tracks_xy, flow_tracks_visibility = self._flow_grid_tracks(
+            flow, confidence * pair_weight, frame_valid_mask
+        )
 
         height, width = self.flow_hw
         y = torch.linspace(-1.0, 1.0, height, device=flow.device, dtype=flow.dtype).view(1, 1, 1, height, 1)
         x = torch.linspace(-1.0, 1.0, width, device=flow.device, dtype=flow.dtype).view(1, 1, 1, 1, width)
         energy_sq = horizontal.square() + vertical.square()
         energy = energy_sq.clamp_min(1e-12).sqrt() - 1e-6
+        residual_horizontal, residual_vertical = self._affine_residual_flow(
+            horizontal,
+            vertical,
+            confidence * pair_weight,
+        )
+        residual_energy = (
+            residual_horizontal.square() + residual_vertical.square()
+        ).clamp_min(1e-12).sqrt() - 1e-6
+        motion_tokens, motion_token_xy, motion_token_mask = self._build_motion_tokens(
+            horizontal,
+            vertical,
+            energy,
+            confidence * pair_weight,
+            residual_horizontal,
+            residual_vertical,
+            residual_energy,
+            pair_valid,
+        )
         global_horizontal = horizontal.mean((-2, -1)).squeeze(-1)
         global_vertical = vertical.mean((-2, -1)).squeeze(-1)
         expansion = (horizontal * x + vertical * y).mean((-2, -1)).squeeze(-1)
@@ -209,6 +383,9 @@ class TIDAGeometricFlowEncoder(nn.Module):
         prefix_states = prefix_states * prefix_available[..., None].to(prefix_states.dtype)
         return {
             "flow_field": flow,
+            "residual_flow_field": torch.cat((residual_horizontal, residual_vertical), dim=2),
+            "residual_motion_energy": residual_energy,
+            "residual_motion_energy_mean": residual_energy.mean((-2, -1)).squeeze(-1),
             "flow_match_confidence": confidence * pair_weight,
             "flow_descriptor_sequence": descriptor,
             "flow_state": flow_state,
@@ -217,6 +394,11 @@ class TIDAGeometricFlowEncoder(nn.Module):
             "prefix_fractions": flow_state.new_tensor((0.25, 0.50, 0.75, 1.0)),
             "pair_valid_mask": pair_valid,
             "history_available": history_available,
+            "flow_grid_tracks_xy": flow_tracks_xy,
+            "flow_grid_tracks_visibility": flow_tracks_visibility,
+            "flow_motion_tokens": motion_tokens,
+            "flow_motion_token_xy": motion_token_xy,
+            "flow_motion_token_mask": motion_token_mask,
             "global_horizontal": global_horizontal,
             "global_vertical": global_vertical,
             "global_expansion": expansion,
@@ -227,11 +409,22 @@ class TIDAGeometricFlowEncoder(nn.Module):
 
 
 class _IndependentFlowHead(nn.Module):
-    def __init__(self, hidden_dim: int, output_dim: int, cap: float) -> None:
+    def __init__(
+        self,
+        hidden_dim: int,
+        output_dim: int,
+        cap: float,
+        motion_feature_dim: int,
+        target_context_dim: int,
+    ) -> None:
         super().__init__()
         self.norm = nn.LayerNorm(hidden_dim)
         self.flow_projection = nn.Linear(hidden_dim, hidden_dim)
+        self.motion_key = nn.Linear(motion_feature_dim, hidden_dim)
+        self.motion_value = nn.Linear(motion_feature_dim, hidden_dim)
         self.target_embedding = nn.Parameter(torch.randn(output_dim, hidden_dim) * 0.02)
+        self.target_context_projection = nn.Linear(target_context_dim, hidden_dim)
+        self.target_prior_mix_logit = nn.Parameter(torch.zeros(()))
         self.context_projection = nn.Linear(2, hidden_dim)
         self.hidden = nn.Sequential(nn.GELU(), nn.Linear(hidden_dim, hidden_dim), nn.GELU())
         self.output = nn.Linear(hidden_dim, 1)
@@ -244,19 +437,57 @@ class _IndependentFlowHead(nn.Module):
         self.cap = float(cap)
 
     def forward(
-        self, state: torch.Tensor, available: torch.Tensor, base_logits: torch.Tensor | None = None
-    ) -> torch.Tensor:
+        self,
+        state: torch.Tensor,
+        available: torch.Tensor,
+        base_logits: torch.Tensor | None = None,
+        *,
+        motion_tokens: torch.Tensor | None = None,
+        motion_token_mask: torch.Tensor | None = None,
+        target_context: torch.Tensor | None = None,
+        target_attention_prior: torch.Tensor | None = None,
+        return_attention: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if base_logits is None:
             base_logits = state.new_zeros(*state.shape[:-1], self.output_dim)
         if base_logits.shape != (*state.shape[:-1], self.output_dim):
             raise ValueError("base logits do not match target-conditioned flow state")
         uncertainty = torch.exp(-base_logits.detach().abs())
         context = torch.stack((base_logits.detach(), uncertainty), dim=-1)
-        flow = self.flow_projection(self.norm(state))[..., None, :]
         target = self.target_embedding.view(*([1] * (state.ndim - 1)), self.output_dim, state.shape[-1])
-        hidden = self.hidden(flow + target + self.context_projection(context))
+        query = target + self.context_projection(context)
+        if target_context is not None:
+            if target_context.shape[:-1] != query.shape[:-1]:
+                raise ValueError("target context does not match flow target dimensions")
+            query = query + self.target_context_projection(target_context.detach())
+
+        attention = state.new_zeros(*state.shape[:-1], self.output_dim, 0)
+        if motion_tokens is None:
+            pooled = self.flow_projection(self.norm(state))[..., None, :]
+        else:
+            if motion_token_mask is None or motion_token_mask.shape != motion_tokens.shape[:-1]:
+                raise ValueError("motion token mask must match motion tokens")
+            key = self.motion_key(motion_tokens)
+            value = self.motion_value(motion_tokens)
+            score = torch.einsum("...ld,...md->...lm", query, key) / (key.shape[-1] ** 0.5)
+            score = score.masked_fill(~motion_token_mask[..., None, :], -1e4)
+            attention = score.softmax(-1) * motion_token_mask[..., None, :].to(score.dtype)
+            if target_attention_prior is not None:
+                if target_attention_prior.shape != attention.shape:
+                    raise ValueError("target attention prior must match motion attention")
+                prior = target_attention_prior.clamp_min(0.0)
+                prior = prior * motion_token_mask[..., None, :].to(prior.dtype)
+                prior = prior / prior.sum(-1, keepdim=True).clamp_min(1e-8)
+                mix = torch.sigmoid(self.target_prior_mix_logit).clamp(0.10, 0.90)
+                attention = (1.0 - mix) * attention + mix * prior
+            attention = attention / attention.sum(-1, keepdim=True).clamp_min(1e-8)
+            pooled = torch.einsum("...lm,...md->...ld", attention, value)
+        hidden = self.hidden(pooled + query)
         value = self.cap * torch.tanh(self.output(hidden).squeeze(-1)) * torch.sigmoid(self.gate(hidden).squeeze(-1))
-        return value * available[..., None].to(value.dtype)
+        value = value * available[..., None].to(value.dtype)
+        if return_attention:
+            return value, attention
+        return value
 
 
 class TIDAGeometricFlowDecisionHeads(nn.Module):
@@ -269,10 +500,16 @@ class TIDAGeometricFlowDecisionHeads(nn.Module):
         num_reasons: int = 21,
         action_cap: float = 0.20,
         reason_cap: float = 0.15,
+        motion_feature_dim: int = TIDAGeometricFlowEncoder.motion_token_dim,
+        target_context_dim: int = 384,
     ) -> None:
         super().__init__()
-        self.action_head = _IndependentFlowHead(hidden_dim, num_actions, action_cap)
-        self.reason_head = _IndependentFlowHead(hidden_dim, num_reasons, reason_cap)
+        self.action_head = _IndependentFlowHead(
+            hidden_dim, num_actions, action_cap, motion_feature_dim, target_context_dim
+        )
+        self.reason_head = _IndependentFlowHead(
+            hidden_dim, num_reasons, reason_cap, motion_feature_dim, target_context_dim
+        )
         self.action_output = self.action_head.output
         self.reason_output = self.reason_head.output
 
@@ -288,14 +525,47 @@ class TIDAGeometricFlowDecisionHeads(nn.Module):
         history_available: torch.Tensor,
         action_base_logits: torch.Tensor | None = None,
         reason_base_logits: torch.Tensor | None = None,
+        *,
+        motion_tokens: torch.Tensor | None = None,
+        motion_token_mask: torch.Tensor | None = None,
+        action_target_context: torch.Tensor | None = None,
+        reason_target_context: torch.Tensor | None = None,
+        action_target_attention_prior: torch.Tensor | None = None,
+        reason_target_attention_prior: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        action = self.action_head(flow_state, history_available, action_base_logits)
-        reason = self.reason_head(flow_state, history_available, reason_base_logits)
+        action, action_attention = self.action_head(
+            flow_state,
+            history_available,
+            action_base_logits,
+            motion_tokens=motion_tokens,
+            motion_token_mask=motion_token_mask,
+            target_context=action_target_context,
+            target_attention_prior=action_target_attention_prior,
+            return_attention=True,
+        )
+        reason, reason_attention = self.reason_head(
+            flow_state,
+            history_available,
+            reason_base_logits,
+            motion_tokens=motion_tokens,
+            motion_token_mask=motion_token_mask,
+            target_context=reason_target_context,
+            target_attention_prior=reason_target_attention_prior,
+            return_attention=True,
+        )
         return {
             "geometric_action_delta": action,
             "geometric_reason_delta": reason,
             "geometric_action_delta_rms": action.float().square().mean().sqrt(),
             "geometric_reason_delta_rms": reason.float().square().mean().sqrt(),
+            "geometric_action_motion_attention": action_attention,
+            "geometric_reason_motion_attention": reason_attention,
+            "geometric_action_motion_attention_entropy": -(
+                action_attention * action_attention.clamp_min(1e-8).log()
+            ).sum(-1),
+            "geometric_reason_motion_attention_entropy": -(
+                reason_attention * reason_attention.clamp_min(1e-8).log()
+            ).sum(-1),
         }
 
     def forward_prefixes(

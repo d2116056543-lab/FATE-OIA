@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 import random
+from io import BytesIO
+import zipfile
 from typing import Any, Callable, Sequence
 
 import torch
@@ -57,6 +59,22 @@ def timestamps_to_indices(timestamps: torch.Tensor, fps: float, target_frame_ind
     if int(indices[0]) < 0:
         raise ValueError("quadratic sampling cannot form strictly ordered frame indices")
     return indices
+
+
+def nearest_timestamp_positions(
+    source_timestamps: torch.Tensor, requested_timestamps: torch.Tensor
+) -> torch.Tensor:
+    """Map a sparse schedule onto an existing ordered temporal store."""
+    if source_timestamps.ndim != 1 or requested_timestamps.ndim != 1:
+        raise ValueError("timestamp schedules must be one-dimensional")
+    distance = (
+        requested_timestamps[:, None].float()
+        - source_timestamps[None].float()
+    ).abs()
+    positions = distance.argmin(-1)
+    if len(positions) > 1 and not torch.all(positions[1:] > positions[:-1]):
+        raise ValueError("requested schedule does not map to unique ordered positions")
+    return positions
 
 
 def _decode_selected_frames_from_capture(
@@ -133,6 +151,7 @@ class BDDOIAVideoDataset(Dataset):
         max_samples: int | None = None,
         object_track_store_path: str | Path | None = None,
         frame_store_root: str | Path | Sequence[str | Path] | None = None,
+        history_frames: int = 14,
     ) -> None:
         partitions = {partition} if isinstance(partition, str) else set(partition)
         self.records = [
@@ -146,6 +165,9 @@ class BDDOIAVideoDataset(Dataset):
         self.transform = transform or SynchronizedVideoTransform()
         self.decoder = decoder
         self.seed = int(seed)
+        self.history_frames = int(history_frames)
+        if self.history_frames < 2:
+            raise ValueError("history_frames must be at least 2")
         # Keep precomputed tracks in two contiguous shared tensors. A Python
         # dict of per-sample tensor views is re-serialized into every spawned
         # Windows DataLoader worker and can exhaust native memory.
@@ -165,6 +187,7 @@ class BDDOIAVideoDataset(Dataset):
                 raise FileNotFoundError(f"raw frame store does not exist: {root}")
         self.frame_store_root = self.frame_store_roots[0] if self.frame_store_roots else None
         self.frame_case_dirs: dict[str, Path] = {}
+        self.frame_case_archives: dict[str, Path] = {}
         for root in self.frame_store_roots:
             for partition_dir in root.iterdir():
                 if not partition_dir.is_dir():
@@ -172,6 +195,10 @@ class BDDOIAVideoDataset(Dataset):
                 for case_dir in partition_dir.iterdir():
                     if case_dir.is_dir():
                         self.frame_case_dirs.setdefault(case_dir.name.lower(), case_dir)
+                    elif case_dir.suffix.lower() == ".zip":
+                        self.frame_case_archives.setdefault(
+                            case_dir.stem.lower(), case_dir
+                        )
         if object_track_store_path is not None:
             payload = torch.load(object_track_store_path, map_location="cpu", weights_only=True)
             names = payload["file_names"]
@@ -199,7 +226,9 @@ class BDDOIAVideoDataset(Dataset):
         if isinstance(index, tuple):
             index, augmentation_seed = int(index[0]), int(index[1])
         record = self.records[index]
-        requested_timestamps = quadratic_multirate_timestamps()
+        requested_timestamps = quadratic_multirate_timestamps(
+            self.history_frames + 1
+        )
         if self.training and self.object_track_indices is None and not self.frame_store_roots:
             requested_timestamps = jitter_timestamps(requested_timestamps, random.Random(augmentation_seed))
         frame_indices = timestamps_to_indices(requested_timestamps, record.fps, record.target_frame_index)
@@ -213,15 +242,36 @@ class BDDOIAVideoDataset(Dataset):
         if not record.history_available:
             decoded = [target.copy() for _ in range(len(frame_indices) - 1)]
             decoded_valid = torch.zeros(len(frame_indices) - 1, dtype=torch.bool)
+            frame_store_hit = False
         elif not self.frame_store_roots:
             decoded, decoded_valid = self.decoder(record.clip_path, frame_indices[:-1])
+            frame_store_hit = False
         else:
             key = Path(record.file_name).stem.lower()
-            if key not in self.frame_case_dirs:
-                raise KeyError(f"raw frame stores are missing {record.file_name}")
-            case_dir = self.frame_case_dirs[key]
-            decoded = [Image.open(case_dir / f"{position:02d}.jpg").convert("RGB") for position in range(14)]
-            decoded_valid = torch.ones(14, dtype=torch.bool)
+            if key not in self.frame_case_dirs and key not in self.frame_case_archives:
+                decoded, decoded_valid = self.decoder(record.clip_path, frame_indices[:-1])
+                frame_store_hit = False
+            else:
+                stored_timestamps = quadratic_multirate_timestamps()
+                stored_positions = nearest_timestamp_positions(
+                    stored_timestamps[:-1], requested_timestamps[:-1]
+                )
+                if key in self.frame_case_dirs:
+                    case_dir = self.frame_case_dirs[key]
+                    decoded = [
+                        Image.open(case_dir / f"{int(position):02d}.jpg").convert("RGB")
+                        for position in stored_positions
+                    ]
+                else:
+                    with zipfile.ZipFile(self.frame_case_archives[key], "r") as archive:
+                        decoded = [
+                            Image.open(
+                                BytesIO(archive.read(f"{int(position):02d}.jpg"))
+                            ).convert("RGB")
+                            for position in stored_positions
+                        ]
+                decoded_valid = torch.ones(self.history_frames, dtype=torch.bool)
+                frame_store_hit = True
         frames = decoded + [target]
         transformed = self.transform(
             frames, training=self.training, random_value=random.Random(augmentation_seed + 1).random()
@@ -239,6 +289,7 @@ class BDDOIAVideoDataset(Dataset):
             "requested_timestamps": requested_timestamps,
             "frame_indices": frame_indices,
             "frame_valid_mask": frame_valid,
+            "frame_store_hit": torch.tensor(frame_store_hit, dtype=torch.bool),
             "action": torch.tensor(action, dtype=torch.float32),
             "reason": torch.tensor(reason, dtype=torch.float32),
             "file_name": record.file_name,
@@ -254,7 +305,14 @@ class BDDOIAVideoDataset(Dataset):
                 raise KeyError(f"object track store missing {record.file_name}")
             track_index = self.object_track_indices[key]
             tracks_xy = self.object_tracks_xy[track_index].clone()
-            visibility = self.object_tracks_visibility[track_index]
+            visibility = self.object_tracks_visibility[track_index].clone()
+            if tracks_xy.shape[0] != self.history_frames + 1:
+                stored_timestamps = quadratic_multirate_timestamps(tracks_xy.shape[0])
+                positions = nearest_timestamp_positions(
+                    stored_timestamps, requested_timestamps
+                )
+                tracks_xy = tracks_xy.index_select(0, positions)
+                visibility = visibility.index_select(0, positions)
             if transformed["meta"]["flipped"]:
                 tracks_xy[..., 0] = -tracks_xy[..., 0]
             result["object_tracks_xy"] = tracks_xy
@@ -263,7 +321,7 @@ class BDDOIAVideoDataset(Dataset):
 
 
 def tida_video_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
-    tensor_keys = ["target_image", "context_images", "timestamps", "requested_timestamps", "frame_indices", "frame_valid_mask", "action", "reason"]
+    tensor_keys = ["target_image", "context_images", "timestamps", "requested_timestamps", "frame_indices", "frame_valid_mask", "frame_store_hit", "action", "reason"]
     if "object_tracks_xy" in batch[0]:
         tensor_keys.extend(("object_tracks_xy", "object_tracks_visibility"))
     result = {key: torch.stack([row[key] for row in batch]) for key in tensor_keys}

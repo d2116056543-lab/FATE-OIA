@@ -23,6 +23,7 @@ from fate_oia.engine.evaluate_tida_oia import (
     fit_train_calib_thresholds,
     geometric_branch_metrics,
     geometric_temporal_effectiveness_metrics,
+    logit_flow_effectiveness_metrics,
     save_epoch_outputs,
     temporal_contribution_metrics,
     traffic_action_effectiveness_metrics,
@@ -62,6 +63,7 @@ from fate_oia.utils.tida_object_intent_metrics import (
     concatenate_object_intent_policy_rows,
     fit_object_intent_gates_from_rows,
     fit_object_intent_utility_policy_oof,
+    object_intent_policy_fold_groups,
     object_intent_traffic_metrics,
 )
 from fate_oia.utils.vetra_stage_contracts import sha256_file
@@ -76,6 +78,19 @@ class TIDARuntime:
     image_checkpoint: Path
     clip_manifest: Path
     train_sampler: TIDAStatefulRandomSampler
+
+
+_VERIFIED_IMAGE_BASELINE_REUSE_OWNERS = {
+    "object_intent_action_utility",
+    "object_intent_reason_utility",
+    "logit_flow_action",
+    "logit_flow_reason",
+}
+
+
+def verified_image_baseline_reuse_allowed(train_owners: set[str] | None) -> bool:
+    """Return whether selected owners cannot alter the frozen image-only branch."""
+    return bool(train_owners) and train_owners <= _VERIFIED_IMAGE_BASELINE_REUSE_OWNERS
 
 
 def append_rank_window(
@@ -137,6 +152,9 @@ def owner_parameter_update_norms(
         snapshots = before[owner]
         if len(parameters) != len(snapshots):
             raise ValueError(f"owner snapshot length changed: {owner}")
+        if not parameters:
+            result[owner] = 0.0
+            continue
         squared = sum(
             (parameter.detach().float() - snapshot.to(parameter).float()).square().sum()
             for parameter, snapshot in zip(parameters, snapshots)
@@ -279,7 +297,8 @@ def reason_firewall_gradient_audit(
         "object_intent_reason_deletion", "object_intent_reason_pair_deletion",
         "object_intent_reason_no_harm", "object_intent_reason_utility",
         "reason_local_aux", "reason_local_rank", "reason_local_utility",
-        "reason_local_no_harm", "reason_local_delta",
+        "reason_local_no_harm", "reason_local_order", "reason_local_deletion",
+        "reason_local_delta",
     )
     action_names = (
         "action_asl", "action_smooth_ap", "action_base_protect", "action_delta",
@@ -294,6 +313,9 @@ def reason_firewall_gradient_audit(
         "object_intent_action_smooth_ap", "object_intent_action_deletion",
         "object_intent_action_pair_deletion", "object_intent_action_no_harm",
         "object_intent_action_utility",
+        "action_local_aux", "action_local_rank", "action_local_utility",
+        "action_local_no_harm", "action_local_order", "action_local_deletion",
+        "action_local_delta",
     )
     reason_loss = sum(
         registry.rows[name].weight * registry.rows[name].value for name in reason_names if name in registry.rows
@@ -320,6 +342,7 @@ def reason_firewall_gradient_audit(
         + ([] if object_intent is None else parameters(object_intent.action_pair_encoder))
         + ([] if object_intent is None else parameters(object_intent.action_pair_output))
         + ([] if object_intent is None else parameters(object_intent.action_utility))
+        + parameters(getattr(model, "action_local_query", None))
     ) if parameter.requires_grad]
     reason_parameters = [parameter for parameter in (
         list(model.reason_reader.parameters()) + list(model.geometric_heads.reason_parameters())
@@ -375,6 +398,7 @@ def append_supervision_tensors(
         "terminal_no_history_error": output["terminal_error_no_history"],
         "history_frame_valid": output["frame_valid_mask"][:, :-1],
         "history_available": output["history_valid"],
+        "frame_store_hit": batch["frame_store_hit"],
         "image_action_margin": action_sign * output["image_action_logits"],
         "video_action_margin": action_sign * output["video_action_logits"],
         "reason_local_candidate_delta": output["reason_local_candidate_delta"],
@@ -382,6 +406,33 @@ def append_supervision_tensors(
         "reason_local_deploy_gate": output["reason_local_deploy_gate"],
         "reason_local_utility_probability": output["reason_local_utility_probability"],
         "reason_local_motion_energy": output["reason_local_motion_energy"],
+        "reason_local_velocity_rms": output["reason_local_velocity_rms"],
+        "reason_local_acceleration_rms": output["reason_local_acceleration_rms"],
+        "reason_local_shuffled_delta": output["reason_local_shuffled_delta"],
+        "reason_local_selected_deleted_delta": output[
+            "reason_local_selected_deleted_delta"
+        ],
+        "reason_local_random_deleted_delta": output[
+            "reason_local_random_deleted_delta"
+        ],
+        "reason_local_selected_minus_random_gap": output[
+            "reason_local_selected_minus_random_gap"
+        ],
+        "action_local_candidate_delta": output["action_local_candidate_delta"],
+        "action_local_deploy_delta": output["action_local_deploy_delta"],
+        "action_local_deploy_gate": output["action_local_deploy_gate"],
+        "action_local_utility_probability": output["action_local_utility_probability"],
+        "action_local_motion_energy": output["action_local_motion_energy"],
+        "action_local_shuffled_delta": output["action_local_shuffled_delta"],
+        "action_local_selected_deleted_delta": output[
+            "action_local_selected_deleted_delta"
+        ],
+        "action_local_random_deleted_delta": output[
+            "action_local_random_deleted_delta"
+        ],
+        "action_local_selected_minus_random_gap": output[
+            "action_local_selected_minus_random_gap"
+        ],
     }
     for key, value in values.items():
         store.setdefault(key, []).append(value.detach().float().cpu())
@@ -405,6 +456,7 @@ def supervision_tensor_summary(
     return {
         "history_valid_rate": float(values["history_frame_valid"].mean()),
         "history_available_rate": float(values["history_available"].mean()),
+        "frame_store_hit_rate": float(values["frame_store_hit"].float().mean()),
         "terminal_history_error": float(values["terminal_history_error"].mean()),
         "terminal_no_history_error": float(values["terminal_no_history_error"].mean()),
         "reconstruction_gain": float(
@@ -439,6 +491,44 @@ def supervision_tensor_summary(
         ),
         "reason_local_motion_energy_mean": float(
             values["reason_local_motion_energy"].mean()
+        ),
+        "reason_local_velocity_rms_mean": float(
+            values["reason_local_velocity_rms"].mean()
+        ),
+        "reason_local_acceleration_rms_mean": float(
+            values["reason_local_acceleration_rms"].mean()
+        ),
+        "reason_local_order_delta_gap": float(
+            (
+                values["reason_local_candidate_delta"]
+                - values["reason_local_shuffled_delta"]
+            ).abs().mean()
+        ),
+        "reason_local_selected_minus_random_gap_mean": float(
+            values["reason_local_selected_minus_random_gap"].mean()
+        ),
+        "action_local_candidate_delta_rms": float(
+            values["action_local_candidate_delta"].square().mean().sqrt()
+        ),
+        "action_local_deploy_delta_rms": float(
+            values["action_local_deploy_delta"].square().mean().sqrt()
+        ),
+        "action_local_deploy_gate_mean": float(values["action_local_deploy_gate"].mean()),
+        "action_local_deploy_open_rate": float(
+            (values["action_local_deploy_gate"] > 0).float().mean()
+        ),
+        "action_local_utility_probability_mean": float(
+            values["action_local_utility_probability"].mean()
+        ),
+        "action_local_motion_energy_mean": float(values["action_local_motion_energy"].mean()),
+        "action_local_order_delta_gap": float(
+            (
+                values["action_local_candidate_delta"]
+                - values["action_local_shuffled_delta"]
+            ).abs().mean()
+        ),
+        "action_local_selected_minus_random_gap_mean": float(
+            values["action_local_selected_minus_random_gap"].mean()
         ),
         "action_flow_route_mass_mean": float(values["action_flow_route_mass"].mean()),
         "reason_flow_route_mass_mean": float(values["reason_flow_route_mass"].mean()),
@@ -612,6 +702,14 @@ def build_runtime(args: Any, evaluation_only: bool = False) -> TIDARuntime:
         image_base,
         dim=int(config["model"]["dim"]),
         context_chunk_size=int(_arg(args, "context_chunk_size", config["model"]["context_chunk_size"])),
+        history_encoder_mode=str(config["model"].get("history_encoder_mode", "dino")),
+        temporal_layers=int(config["model"].get("temporal_layers", 2)),
+        temporal_heads=int(config["model"].get("temporal_heads", 4)),
+        temporal_dropout=float(config["model"].get("temporal_dropout", 0.10)),
+        action_kappa=float(config["model"].get("action_kappa", 0.15)),
+        reason_kappa=float(config["model"].get("reason_kappa", 0.12)),
+        action_flow_mix_cap=float(config["model"].get("action_flow_mix_cap", 0.35)),
+        reason_flow_mix_cap=float(config["model"].get("reason_flow_mix_cap", 0.35)),
         action_evidence_trust_cap=float(config["model"].get("action_evidence_trust_cap", 0.25)),
         reason_evidence_trust_cap=float(config["model"].get("reason_evidence_trust_cap", 0.25)),
         conditional_temporal_utility=bool(config["model"].get("conditional_temporal_utility", False)),
@@ -641,7 +739,15 @@ def build_runtime(args: Any, evaluation_only: bool = False) -> TIDARuntime:
         traffic_action_enabled=bool(config["model"].get("traffic_action_enabled", False)),
         traffic_action_cap=float(config["model"].get("traffic_action_cap", 0.15)),
         traffic_motion_topk=int(config["model"].get("traffic_motion_topk", 12)),
+        action_patch_selection=str(config["model"].get("action_patch_selection", "topk")),
+        action_patch_nms_radius=int(config["model"].get("action_patch_nms_radius", 0)),
+        action_patch_specificity_power=float(
+            config["model"].get("action_patch_specificity_power", 1.0)
+        ),
         traffic_trajectory_enabled=bool(config["model"].get("traffic_trajectory_enabled", False)),
+        traffic_trajectory_deploy_enabled=bool(
+            config["model"].get("traffic_trajectory_deploy_enabled", True)
+        ),
         traffic_trajectory_cap=float(config["model"].get("traffic_trajectory_cap", 0.08)),
         traffic_trajectory_heads=int(config["model"].get("traffic_trajectory_heads", 4)),
         traffic_trajectory_state_enabled=bool(
@@ -686,6 +792,7 @@ def build_runtime(args: Any, evaluation_only: bool = False) -> TIDARuntime:
             config["model"].get("traffic_adaptive_boundary_cap", 0.25)
         ),
         object_intent_enabled=bool(config["model"].get("object_intent_enabled", False)),
+        object_tracker_mode=str(config["model"].get("object_tracker_mode", "external")),
         object_tracker_repository=str(
             config["model"].get("object_tracker_repository", r"E:\sbw\deps\co-tracker")
         ),
@@ -702,6 +809,25 @@ def build_runtime(args: Any, evaluation_only: bool = False) -> TIDARuntime:
             )
         ),
         object_intent_role_checkpoint=config["model"].get("object_intent_role_checkpoint"),
+        object_intent_terminal_semantics_only=bool(
+            config["model"].get("object_intent_terminal_semantics_only", False)
+        ),
+        action_local_query_enabled=bool(
+            config["model"].get("action_local_query_enabled", False)
+        ),
+        action_local_query_cap=float(
+            config["model"].get("action_local_query_cap", 0.08)
+        ),
+        action_local_query_utility_open_prior=float(
+            config["model"].get("action_local_query_utility_open_prior", 0.10)
+        ),
+        logit_flow_enabled=bool(config["model"].get("logit_flow_enabled", False)),
+        logit_flow_hidden_dim=int(config["model"].get("logit_flow_hidden_dim", 64)),
+        logit_flow_action_cap=float(config["model"].get("logit_flow_action_cap", 0.05)),
+        logit_flow_reason_cap=float(config["model"].get("logit_flow_reason_cap", 0.04)),
+        legacy_semantic_routes_enabled=bool(
+            config["model"].get("legacy_semantic_routes_enabled", True)
+        ),
     ).to(device)
     batch_size = int(_arg(args, "batch_size", 2))
     workers = int(_arg(args, "num_workers", config["data"]["num_workers"]))
@@ -737,6 +863,7 @@ def build_runtime(args: Any, evaluation_only: bool = False) -> TIDARuntime:
             ),
             object_track_store_path=object_track_store,
             frame_store_root=frame_store_root,
+            history_frames=int(config["data"].get("history_frames", 14)),
         )
         for partition in ("train_core", "train_calib", "train_audit", "test")
     }
@@ -753,6 +880,7 @@ def build_runtime(args: Any, evaluation_only: bool = False) -> TIDARuntime:
             max_samples=_partition_sample_limit(
                 "expanded_test", max_samples, max_eval_samples
             ),
+            history_frames=int(config["data"].get("history_frames", 14)),
         )
     train_sampler = TIDAStatefulRandomSampler(datasets["train_core"], seed=20260821)
     loaders = {
@@ -793,10 +921,14 @@ def build_optimizer(
             raise ValueError("train_owners cannot be empty")
     groups = []
     for owner, parameters in owners.items():
+        if not parameters:
+            continue
         lr = float(config["training"]["lr"][owner])
         if train_owners is not None and owner not in train_owners:
             lr = 0.0
         groups.append({"params": parameters, "lr": lr, "base_lr": lr, "name": owner})
+    if not groups:
+        raise ValueError("model has no trainable optimizer owners")
     return torch.optim.AdamW(groups, weight_decay=float(config["training"]["weight_decay"]))
 
 
@@ -982,6 +1114,9 @@ def _view_metrics(test_rows, calib_rows, deployment_config):
         "trajectory_traffic_effectiveness": trajectory_traffic_effectiveness_metrics(
             test_rows, thresholds["image"]
         ),
+        "logit_flow_effectiveness": logit_flow_effectiveness_metrics(
+            test_rows, thresholds["image"]
+        ),
         "traffic_adaptive_boundary_effectiveness": (
             traffic_adaptive_boundary_effectiveness_metrics(
                 test_rows, thresholds["image"]
@@ -1028,20 +1163,12 @@ def calibrate_object_intent_deployment(
     if utility_available:
         action_count = policy_rows["action_target"].shape[1]
         fold_group_ids = None
+        fold_group_strategy = "random_oof"
         if bool(deployment_config.get("object_intent_utility_leave_source_out", False)):
-            source_batches = policy_rows.get("source_batches")
-            if not source_batches:
-                raise ValueError(
-                    "leave-source-out object-intent policy requires source_batches"
-                )
-            source_index = {
-                name: index for index, name in enumerate(sorted(set(source_batches)))
-            }
-            fold_group_ids = torch.tensor(
-                [source_index[name] for name in source_batches],
-                dtype=torch.long,
-                device=policy_rows["action_target"].device,
+            fold_group_ids, fold_group_strategy = object_intent_policy_fold_groups(
+                policy_rows
             )
+            fold_group_ids = fold_group_ids.to(policy_rows["action_target"].device)
         common_policy_kwargs = dict(
             scales=tuple(deployment_config.get(
                 "object_intent_action_utility_scales", [0, 4, 8, 16, 32, 64]
@@ -1073,6 +1200,7 @@ def calibrate_object_intent_deployment(
             )),
             **common_policy_kwargs,
         )
+        action_directional_policy["source_group_strategy"] = fold_group_strategy
         action_risk_policy = fit_object_intent_utility_policy_oof(
             policy_rows["pre_object_intent_action"],
             policy_rows["object_intent_action_candidate"],
@@ -1084,6 +1212,7 @@ def calibrate_object_intent_deployment(
             )),
             **common_policy_kwargs,
         )
+        action_risk_policy["source_group_strategy"] = fold_group_strategy
         action_policy = combine_object_intent_utility_policies(
             action_directional_policy, action_risk_policy
         )
@@ -1112,6 +1241,7 @@ def calibrate_object_intent_deployment(
             cap=float(model.object_intent.reason_cap),
             fold_group_ids=fold_group_ids,
         )
+        reason_directional_policy["source_group_strategy"] = fold_group_strategy
         reason_risk_policy = fit_object_intent_utility_policy_oof(
             policy_rows["pre_object_intent_reason"],
             policy_rows["object_intent_reason_candidate"],
@@ -1137,6 +1267,7 @@ def calibrate_object_intent_deployment(
             cap=float(model.object_intent.reason_cap),
             fold_group_ids=fold_group_ids,
         )
+        reason_risk_policy["source_group_strategy"] = fold_group_strategy
         reason_policy = combine_object_intent_utility_policies(
             reason_directional_policy, reason_risk_policy
         )
@@ -1179,6 +1310,11 @@ def calibrate_object_intent_deployment(
     return calibrated_rows, serializable
 
 
+def object_intent_policy_cohorts_enabled(model, config: dict[str, Any]) -> bool:
+    """Do not collect or concatenate policy cohorts for a disabled route."""
+    return bool(getattr(model, "object_intent_enabled", False))
+
+
 def calibrate_reason_local_deployment(model, calib_rows, deployment_config):
     """Fit the target-private reason route exclusively on train-calib rows."""
     if not getattr(model, "reason_local_query_enabled", False):
@@ -1187,20 +1323,13 @@ def calibrate_reason_local_deployment(model, calib_rows, deployment_config):
     action_count = int(calib_rows["action_target"].shape[1])
     fold_group_ids = None
     source_fallback_reason = None
+    source_fallback_detail = None
     if bool(deployment_config.get("reason_local_policy_leave_source_out", False)):
-        source_batches = calib_rows.get("source_batches")
-        if not source_batches:
-            source_fallback_reason = "missing_source_batches"
-        else:
-            source_index = {
-                name: index for index, name in enumerate(sorted(set(source_batches)))
-            }
-            if len(source_index) < 2:
-                source_fallback_reason = "single_source_train_calib"
-            else:
-                fold_group_ids = torch.tensor(
-                    [source_index[name] for name in source_batches], dtype=torch.long
-                )
+        try:
+            fold_group_ids, _ = object_intent_policy_fold_groups(calib_rows)
+        except ValueError as error:
+            source_fallback_reason = "single_source_train_calib"
+            source_fallback_detail = str(error)
     # Remove the label-wise common residual using train-calib only. This keeps
     # the temporal ranking signal while preventing a generic positive shift
     # from invalidating the image branch's locked deployment thresholds.
@@ -1277,6 +1406,169 @@ def calibrate_reason_local_deployment(model, calib_rows, deployment_config):
         "test_labels_used": False,
         "threshold_source": "image_train_calib_locked_or_fitted",
         "candidate_center": serialize(candidate_center),
+        "candidate_center_source": "train_calib_median",
+        "source_fallback_reason": source_fallback_reason,
+        "source_fallback_detail": source_fallback_detail,
+    }
+
+
+def calibrate_logit_flow_deployment(model, calib_rows, deployment_config):
+    """Fit the logit-flow reason deployment policy on train-calib only.
+
+    The learned reader still owns the candidate residual. Calibration only
+    removes its label-wise common shift and decides whether each label should
+    use the direct candidate or the learned utility selector. Action keeps the
+    online soft-utility path because the pilot showed that selector was useful.
+    """
+    if not getattr(model, "logit_flow_enabled", False):
+        return None
+    thresholds = _deployment_thresholds(calib_rows, deployment_config)["image"]
+    action_count = int(calib_rows["action_target"].shape[1])
+    candidate = calib_rows["logit_flow_reason_candidate_delta"]
+    center = candidate.median(0).values
+    centered = candidate - center[None]
+    calib_rows["logit_flow_reason_centered_candidate_delta"] = centered
+    calib_rows["logit_flow_reason_centered_candidate"] = (
+        calib_rows["image_reason"] + centered
+    )
+    fit = fit_object_intent_utility_policy_oof(
+        calib_rows["image_reason"],
+        centered,
+        calib_rows["logit_flow_reason_utility_probability"],
+        calib_rows["reason_target"],
+        thresholds[action_count:],
+        scales=tuple(deployment_config.get(
+            "logit_flow_policy_scales", [-1.0, -0.5, 0.0, 0.5, 1.0]
+        )),
+        cutoffs=tuple(deployment_config.get(
+            "logit_flow_policy_cutoffs", [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
+        )),
+        folds=int(deployment_config.get("logit_flow_policy_oof_folds", 5)),
+        min_oof_gain=float(deployment_config.get("logit_flow_policy_min_oof_gain", 0.0)),
+        min_selected_benefit_rate=float(deployment_config.get(
+            "logit_flow_policy_min_selected_benefit_rate", 0.5
+        )),
+        min_nll_improvement=float(deployment_config.get(
+            "logit_flow_policy_min_nll_improvement", 0.0
+        )),
+        min_brier_improvement=float(deployment_config.get(
+            "logit_flow_policy_min_brier_improvement", 0.0
+        )),
+        min_positive_fold_fraction=float(deployment_config.get(
+            "logit_flow_policy_min_positive_fold_fraction", 0.4
+        )),
+        min_non_degrading_fold_fraction=float(deployment_config.get(
+            "logit_flow_policy_min_non_degrading_fold_fraction", 0.6
+        )),
+        fold_degradation_tolerance=float(deployment_config.get(
+            "logit_flow_policy_fold_degradation_tolerance", 0.005
+        )),
+        allow_proper_score_tie=False,
+        invert_utility_for_negative_scale=True,
+        cap=float(model.reason_logit_flow.cap),
+    )
+    use_utility = (torch.as_tensor(fit["cutoff"]) > 0.0).float()
+    model.reason_logit_flow.set_deployment_policy(
+        gate=fit["gate"],
+        scale=fit["scale"],
+        cutoff=fit["cutoff"],
+        center=center,
+        use_utility=use_utility,
+        source="train_calib_oof",
+    )
+
+    def serialize(value):
+        if torch.is_tensor(value):
+            return value.detach().cpu().tolist()
+        return value
+
+    return {
+        "source": "train_calib_oof",
+        "test_labels_used": False,
+        "action": {"source": "learned_soft_utility_unchanged"},
+        "reason": {
+            **{key: serialize(value) for key, value in fit.items()},
+            "candidate_center": serialize(center),
+            "candidate_center_source": "train_calib_median",
+            "use_utility": serialize(use_utility),
+        },
+    }
+
+
+def calibrate_action_local_deployment(model, calib_rows, deployment_config):
+    """Fit the action-private temporal route using train-calib rows only."""
+    if not getattr(model, "action_local_query_enabled", False):
+        return None
+    thresholds = _deployment_thresholds(calib_rows, deployment_config)["image"]
+    center = calib_rows["action_local_candidate_delta"].median(0).values
+    centered = calib_rows["action_local_candidate_delta"] - center[None]
+    calib_rows["action_local_centered_candidate_delta"] = centered
+    calib_rows["action_local_centered_candidate"] = (
+        calib_rows["image_action"] + centered
+    )
+    fold_group_ids = None
+    source_fallback_reason = None
+    if bool(deployment_config.get("action_local_policy_leave_source_out", False)):
+        try:
+            fold_group_ids, _ = object_intent_policy_fold_groups(calib_rows)
+        except ValueError as error:
+            source_fallback_reason = str(error)
+    fit = fit_object_intent_utility_policy_oof(
+        calib_rows["image_action"],
+        centered,
+        calib_rows["action_local_utility_probability"],
+        calib_rows["action_target"],
+        thresholds[:4],
+        scales=tuple(deployment_config.get(
+            "action_local_policy_scales", [-1.0, -0.5, -0.25, 0.0, 0.25, 0.5, 1.0]
+        )),
+        cutoffs=tuple(deployment_config.get(
+            "action_local_policy_cutoffs", [0.0, 0.10, 0.20, 0.30, 0.40, 0.50]
+        )),
+        folds=int(deployment_config.get("action_local_policy_oof_folds", 5)),
+        min_oof_gain=float(deployment_config.get("action_local_policy_min_oof_gain", 0.0)),
+        max_selected_rate=float(deployment_config.get("action_local_policy_max_selected_rate", 0.5)),
+        min_selected_benefit_rate=float(deployment_config.get(
+            "action_local_policy_min_selected_benefit_rate", 0.55
+        )),
+        min_nll_improvement=float(deployment_config.get(
+            "action_local_policy_min_nll_improvement", 0.0
+        )),
+        min_brier_improvement=float(deployment_config.get(
+            "action_local_policy_min_brier_improvement", 0.0
+        )),
+        min_positive_fold_fraction=float(deployment_config.get(
+            "action_local_policy_min_positive_fold_fraction", 0.4
+        )),
+        min_non_degrading_fold_fraction=float(deployment_config.get(
+            "action_local_policy_min_non_degrading_fold_fraction", 0.8
+        )),
+        fold_degradation_tolerance=float(deployment_config.get(
+            "action_local_policy_fold_degradation_tolerance", 0.002
+        )),
+        allow_proper_score_tie=bool(deployment_config.get(
+            "action_local_policy_allow_proper_score_tie", False
+        )),
+        invert_utility_for_negative_scale=True,
+        cap=float(model.action_local_query.cap),
+        fold_group_ids=fold_group_ids,
+    )
+    model.action_local_query.set_deployment_policy(
+        fit["gate"], fit["scale"], fit["cutoff"],
+        utility_inverted=fit["utility_inverted"],
+        center=center,
+        source="train_calib_oof",
+    )
+
+    def serialize(value):
+        return value.detach().cpu().tolist() if torch.is_tensor(value) else value
+
+    return {
+        **{key: serialize(value) for key, value in fit.items()},
+        "source": "train_calib_oof",
+        "test_labels_used": False,
+        "threshold_source": "image_train_calib_locked_or_fitted",
+        "candidate_center": serialize(center),
         "candidate_center_source": "train_calib_median",
         "source_fallback_reason": source_fallback_reason,
     }
@@ -1363,7 +1655,9 @@ def train(args: Any) -> None:
     utility_only_training = (
         train_owners is not None and train_owners <= utility_only_owners
     )
-    counterfactual_free_owners = utility_only_owners | {"reason_local_query"}
+    counterfactual_free_owners = utility_only_owners | {
+        "reason_local_query", "action_local_query"
+    }
     counterfactual_free_training = (
         train_owners is not None and train_owners <= counterfactual_free_owners
     )
@@ -1440,7 +1734,8 @@ def train(args: Any) -> None:
     baseline_path = output_dir / "TIDA_IMAGE_BASELINE_COVERED_SUBSET.json"
     model.eval()
     verified_baseline_arg = _arg(args, "verified_baseline_artifact", None)
-    if utility_only_training and verified_baseline_arg:
+    baseline_reuse_allowed = verified_image_baseline_reuse_allowed(train_owners)
+    if baseline_reuse_allowed and verified_baseline_arg:
         verified_baseline_path = Path(verified_baseline_arg).resolve()
         verified = json.loads(verified_baseline_path.read_text(encoding="utf-8"))
         expected_test_count = len(runtime.loaders["test"].dataset)
@@ -1450,19 +1745,19 @@ def train(args: Any) -> None:
             and verified.get("threshold_fit_split") == "train_calib"
             and verified.get("test_labels_used_for_parameters") is False
         ):
-            raise ValueError("verified baseline artifact does not match this utility-only run")
+            raise ValueError("verified baseline artifact does not match this owner-isolated run")
         locked = config.get("deployment", {}).get("locked_image_thresholds")
         expected_labels = (
             model.object_intent.num_actions + model.object_intent.num_reasons
         )
         if locked is None or len(locked) != expected_labels:
-            raise ValueError("utility-only baseline reuse requires locked image thresholds")
+            raise ValueError("verified baseline reuse requires locked image thresholds")
         baseline_thresholds = {
             "image": torch.as_tensor(locked, dtype=torch.float32, device=device)
         }
         atomic_write_json(baseline_path, {
             **verified,
-            "reused_for_utility_only": True,
+            "reused_for_owner_isolated_training": True,
             "verified_source_path": str(verified_baseline_path),
             "verified_source_sha256": file_sha256(verified_baseline_path),
             "reuse_semantics": "metrics_only_no_feature_or_logit_cache",
@@ -1651,6 +1946,24 @@ def train(args: Any) -> None:
                 - output["relational_reason_soft_selected_deleted_delta"]
             )
             reason_pu_count = reason_pu_direction.ne(0).float().sum().clamp_min(1.0)
+            anchor_xy = output["terminal_action_patch_xy"].float()
+            anchor_distance = torch.cdist(anchor_xy, anchor_xy)
+            anchor_eye = torch.eye(
+                anchor_distance.shape[-1], device=anchor_distance.device, dtype=torch.bool
+            )
+            anchor_min_distance = anchor_distance.masked_fill(
+                anchor_eye[None, None], float("inf")
+            ).amin(-1)
+            anchor_index = output["terminal_action_patch_indices"]
+            cross_action_overlap = (
+                anchor_index[:, :, None, :, None] == anchor_index[:, None, :, None, :]
+            )
+            action_eye = torch.eye(
+                anchor_index.shape[1], device=anchor_index.device, dtype=torch.bool
+            )
+            cross_action_overlap = cross_action_overlap.masked_select(
+                (~action_eye)[None, :, :, None, None]
+            ).float().mean()
             row = {
                 "epoch": epoch, "micro_step": micro_step, "optimizer_update": optimizer_update,
                 "total_updates": total_updates, "temporal_scale": schedule["temporal_scale"],
@@ -1676,6 +1989,15 @@ def train(args: Any) -> None:
                 ),
                 "traffic_patch_effective_motion_mean": float(
                     output["traffic_patch_effective_motion"].mean().detach().cpu()
+                ),
+                "action_anchor_specificity_mean": float(
+                    output["terminal_action_patch_specificity"].mean().detach().cpu()
+                ),
+                "action_anchor_min_distance_mean": float(
+                    anchor_min_distance.mean().detach().cpu()
+                ),
+                "action_anchor_cross_action_overlap_rate": float(
+                    cross_action_overlap.detach().cpu()
                 ),
                 "traffic_trajectory_delta_rms": float(
                     output["traffic_trajectory_delta"].float().square().mean().sqrt().detach().cpu()
@@ -1781,6 +2103,24 @@ def train(args: Any) -> None:
                 "reason_delta_rms": float(output["reason_temporal_delta"].float().square().mean().sqrt().detach().cpu()),
                 "reason_evidence_confidence_mean": float(output["reason_evidence_confidence"].mean().detach().cpu()),
                 "reason_effective_trust_mean": float(output["reason_effective_trust"].mean().detach().cpu()),
+                "logit_flow_action_candidate_delta_rms": float(
+                    output["logit_flow_action_candidate_delta"].float().square().mean().sqrt().detach().cpu()
+                ),
+                "logit_flow_action_deploy_delta_rms": float(
+                    output["logit_flow_action_deploy_delta"].float().square().mean().sqrt().detach().cpu()
+                ),
+                "logit_flow_action_utility_mean": float(
+                    output["logit_flow_action_utility_probability"].mean().detach().cpu()
+                ),
+                "logit_flow_reason_candidate_delta_rms": float(
+                    output["logit_flow_reason_candidate_delta"].float().square().mean().sqrt().detach().cpu()
+                ),
+                "logit_flow_reason_deploy_delta_rms": float(
+                    output["logit_flow_reason_deploy_delta"].float().square().mean().sqrt().detach().cpu()
+                ),
+                "logit_flow_reason_utility_mean": float(
+                    output["logit_flow_reason_utility_probability"].mean().detach().cpu()
+                ),
                 "action_null_mass": float(output["action_null_mass"].mean().detach().cpu()),
                 "rank_window_samples": int(rank_window_samples),
                 "gpu_peak_reserved_gib": torch.cuda.max_memory_reserved(device) / 2**30 if device.type == "cuda" else 0.0,
@@ -2089,15 +2429,16 @@ def train(args: Any) -> None:
             online_calib = collect_tida_outputs(
                 model, runtime.loaders["train_calib"], device
             )
-            online_policy_cohorts = [("train_calib", online_calib)]
-            if bool(config.get("deployment", {}).get(
+            object_policy_enabled = object_intent_policy_cohorts_enabled(model, config)
+            online_policy_cohorts = [("train_calib", online_calib)] if object_policy_enabled else []
+            if object_policy_enabled and bool(config.get("deployment", {}).get(
                 "object_intent_utility_policy_use_train_audit", False
             )):
                 online_audit = collect_tida_outputs(
                     model, runtime.loaders["train_audit"], device
                 )
                 online_policy_cohorts.append(("train_audit", online_audit))
-            if bool(_arg(args, "policy_use_train_core", False)):
+            if object_policy_enabled and bool(_arg(args, "policy_use_train_core", False)):
                 online_core = collect_tida_outputs(
                     model, runtime.loaders["train_core"], device
                 )
@@ -2118,18 +2459,48 @@ def train(args: Any) -> None:
         online_reason_local_fit = calibrate_reason_local_deployment(
             model, online_calib, config.get("deployment", {})
         )
+        online_action_local_fit = calibrate_action_local_deployment(
+            model, online_calib, config.get("deployment", {})
+        )
+        online_logit_flow_fit = calibrate_logit_flow_deployment(
+            model, online_calib, config.get("deployment", {})
+        )
         if online_reason_local_fit is not None:
             atomic_write_json(
                 output_dir / "reason_local_deployment_policy_online.json",
                 online_reason_local_fit,
             )
+        if online_action_local_fit is not None:
+            atomic_write_json(
+                output_dir / "action_local_deployment_policy_online.json",
+                online_action_local_fit,
+            )
+        if online_logit_flow_fit is not None:
+            atomic_write_json(
+                output_dir / "logit_flow_deployment_policy_online.json",
+                online_logit_flow_fit,
+            )
+        mechanism_interval = max(
+            1, int(config["runtime"].get("mechanism_eval_interval_epochs", 1))
+        )
+        collect_epoch_mechanism = (
+            epoch == 0
+            or (epoch + 1) % mechanism_interval == 0
+            or epoch + 1 == int(_arg(args, "epochs", config["training"]["epochs"]))
+        )
         online_test = collect_tida_outputs(
             model, runtime.loaders["test"], device,
-            collect_mechanism=True, mechanism_samples=int(config["runtime"]["fixed_test_audit_samples"]),
+            collect_mechanism=collect_epoch_mechanism,
+            mechanism_samples=int(config["runtime"]["fixed_test_audit_samples"]),
             collect_audit_tensors=True,
         )
         online = _view_metrics(online_test, online_calib, config.get("deployment", {}))
-        mechanism = online_test.pop("_mechanism")
+        mechanism = online_test.pop("_mechanism", {
+            "available": False,
+            "skipped": True,
+            "reason": "scheduled_low_frequency_mechanism_audit",
+            "interval_epochs": mechanism_interval,
+        })
         expanded_metrics = None
         if (
             "expanded_test" in runtime.loaders
@@ -2145,6 +2516,8 @@ def train(args: Any) -> None:
             ema_metrics = online
             ema_object_gate_fit = online_object_gate_fit
             ema_reason_local_fit = online_reason_local_fit
+            ema_action_local_fit = online_action_local_fit
+            ema_logit_flow_fit = online_logit_flow_fit
         else:
             online_action_gate = model.object_intent.action_deploy_gate.clone()
             online_reason_gate = model.object_intent.reason_deploy_gate.clone()
@@ -2154,19 +2527,36 @@ def train(args: Any) -> None:
             online_local_inverted = (
                 model.reason_local_query.deployment_utility_inverted.clone()
             )
+            online_action_local_gate = model.action_local_query.deployment_label_gate.clone()
+            online_action_local_scale = model.action_local_query.deployment_scale.clone()
+            online_action_local_cutoff = model.action_local_query.deployment_cutoff.clone()
+            online_action_local_inverted = (
+                model.action_local_query.deployment_utility_inverted.clone()
+            )
+            online_logit_flow_policy = None
+            if getattr(model, "logit_flow_enabled", False):
+                reader = model.reason_logit_flow
+                online_logit_flow_policy = {
+                    "gate": reader.deployment_label_gate.clone(),
+                    "scale": reader.deployment_scale.clone(),
+                    "cutoff": reader.deployment_cutoff.clone(),
+                    "center": reader.deployment_center.clone(),
+                    "use_utility": reader.deployment_use_utility.clone(),
+                }
             with ema.average_parameters(model):
                 ema_calib = collect_tida_outputs(
                     model, runtime.loaders["train_calib"], device
                 )
-                ema_policy_cohorts = [("train_calib", ema_calib)]
-                if bool(config.get("deployment", {}).get(
+                object_policy_enabled = object_intent_policy_cohorts_enabled(model, config)
+                ema_policy_cohorts = [("train_calib", ema_calib)] if object_policy_enabled else []
+                if object_policy_enabled and bool(config.get("deployment", {}).get(
                     "object_intent_utility_policy_use_train_audit", False
                 )):
                     ema_audit = collect_tida_outputs(
                         model, runtime.loaders["train_audit"], device
                     )
                     ema_policy_cohorts.append(("train_audit", ema_audit))
-                if bool(_arg(args, "policy_use_train_core", False)):
+                if object_policy_enabled and bool(_arg(args, "policy_use_train_core", False)):
                     ema_core = collect_tida_outputs(
                         model, runtime.loaders["train_core"], device
                     )
@@ -2180,6 +2570,12 @@ def train(args: Any) -> None:
                     policy_rows=ema_policy_rows,
                 )
                 ema_reason_local_fit = calibrate_reason_local_deployment(
+                    model, ema_calib, config.get("deployment", {})
+                )
+                ema_action_local_fit = calibrate_action_local_deployment(
+                    model, ema_calib, config.get("deployment", {})
+                )
+                ema_logit_flow_fit = calibrate_logit_flow_deployment(
                     model, ema_calib, config.get("deployment", {})
                 )
                 ema_test = collect_tida_outputs(
@@ -2198,6 +2594,18 @@ def train(args: Any) -> None:
                 utility_inverted=online_local_inverted,
                 source="train_calib_online_restore",
             )
+            model.action_local_query.set_deployment_policy(
+                online_action_local_gate,
+                online_action_local_scale,
+                online_action_local_cutoff,
+                utility_inverted=online_action_local_inverted,
+                source="train_calib_online_restore",
+            )
+            if online_logit_flow_policy is not None:
+                model.reason_logit_flow.set_deployment_policy(
+                    **online_logit_flow_policy,
+                    source="train_calib_online_restore",
+                )
         metrics = {
             "epoch": epoch,
             "online": online,
@@ -2211,6 +2619,14 @@ def train(args: Any) -> None:
             "reason_local_deployment_policy_fit": {
                 "online": online_reason_local_fit,
                 "ema": ema_reason_local_fit,
+            },
+            "action_local_deployment_policy_fit": {
+                "online": online_action_local_fit,
+                "ema": ema_action_local_fit,
+            },
+            "logit_flow_deployment_policy_fit": {
+                "online": online_logit_flow_fit,
+                "ema": ema_logit_flow_fit,
             },
             "epoch_seconds": time.perf_counter() - epoch_start,
         }
@@ -2247,7 +2663,18 @@ def train(args: Any) -> None:
         save_checkpoint_atomic(checkpoint_epoch, payload)
         save_checkpoint_atomic(output_dir / "checkpoint_latest.pth", payload)
         atomic_write_json(output_dir / "best_epoch_source.json", best)
-        save_epoch_outputs(output_dir, epoch, online_test, metrics, online["thresholds"], mechanism)
+        save_epoch_outputs(
+            output_dir,
+            epoch,
+            online_test,
+            metrics,
+            online["thresholds"],
+            mechanism,
+            compact_logit_flow=(
+                train_owners is not None
+                and train_owners <= {"logit_flow_action", "logit_flow_reason"}
+            ),
+        )
         print(json.dumps({"event": "tida_epoch", "epoch": epoch, "selected_view": selected_name, **criteria}), flush=True)
         model.train()
         completed_epochs = epoch + 1 if epoch_exhausted else epoch

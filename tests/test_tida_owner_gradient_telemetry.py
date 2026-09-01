@@ -30,3 +30,9 @@ def test_owner_parameter_update_norms_measure_real_step_delta():
 
     result = owner_parameter_update_norms(owners, before)
     assert result == {"first": 5.0, "second": 0.0}
+
+
+def test_owner_update_norms_report_zero_for_empty_frozen_owner():
+    owners = {"frozen": []}
+    before = owner_parameter_snapshots(owners)
+    assert owner_parameter_update_norms(owners, before) == {"frozen": 0.0}
