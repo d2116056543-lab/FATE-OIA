@@ -14,6 +14,7 @@ def test_v27_launcher_binds_full_15_frame_target_private_protocol():
     assert '"--num-workers", "4"' in text
     assert '"--train-owners", "target_token_action,target_token_reason"' in text
     assert '"--run-kind", "full"' in text
+    assert "--verified-baseline-artifact" not in text
     invocation = text.index("& $python @arguments")
     assert text.rfind('$ErrorActionPreference = "Continue"', 0, invocation) >= 0
     assert '$ErrorActionPreference = "Stop"' in text[invocation:]

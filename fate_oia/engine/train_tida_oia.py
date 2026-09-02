@@ -792,8 +792,27 @@ def load_frozen_vetra_base(config: dict[str, Any], checkpoint_path: Path, device
         refiner = build_refiner(base, image_config).to(device)
         refiner.load_state_dict(stage_b["refiner"], strict=True)
         refiner.set_deployment_gain(stage_b["deployment_gain"].to(device))
+    stage_c = None
+    stage_c_path = config.get("image_base", {}).get("stage_c_deployment")
+    if stage_c_path:
+        from fate_oia.engine.evaluate_tida_stage_c_deploy import (
+            load_stage_c_deployment,
+            verify_stage_c_source,
+        )
+
+        stage_c = load_stage_c_deployment(stage_c_path, device)
+        verify_stage_c_source(stage_c, checkpoint_path)
     return TIDAFrozenVETRAImageBase(
-        base, refiner, action_scale=action_scale, reason_scale=reason_scale
+        base,
+        refiner,
+        action_scale=action_scale,
+        reason_scale=reason_scale,
+        stage_c_action_calibrator=(
+            None if stage_c is None else stage_c.action_calibrator
+        ),
+        stage_c_reason_thresholds=(
+            None if stage_c is None else stage_c.reason_thresholds
+        ),
     ).to(device)
 
 
@@ -2005,7 +2024,13 @@ def train(args: Any) -> None:
     model.eval()
     verified_baseline_arg = _arg(args, "verified_baseline_artifact", None)
     baseline_reuse_allowed = verified_image_baseline_reuse_allowed(train_owners)
-    if baseline_reuse_allowed and verified_baseline_arg:
+    stage_c_thresholds = model.image_model.stage_c_thresholds()
+    if stage_c_thresholds is not None:
+        baseline_thresholds = {"image": stage_c_thresholds.detach().to(device)}
+        manifest["image_baseline_deployment"] = "vetra_stage_c_deploy_final_train_only"
+        manifest["verified_baseline_reused"] = False
+        manifest["verified_baseline_artifact"] = None
+    elif baseline_reuse_allowed and verified_baseline_arg:
         verified_baseline_path = Path(verified_baseline_arg).resolve()
         verified = json.loads(verified_baseline_path.read_text(encoding="utf-8"))
         expected_test_count = len(runtime.loaders["test"].dataset)
@@ -2047,7 +2072,11 @@ def train(args: Any) -> None:
     action_deploy_boundary_logits = torch.logit(
         baseline_thresholds["image"][: model.num_actions].to(device).clamp(1e-5, 1.0 - 1e-5)
     )
-    manifest["trajectory_boundary_source"] = "train_calib_image_baseline"
+    manifest["trajectory_boundary_source"] = (
+        "vetra_stage_c_deploy_final_train_only"
+        if stage_c_thresholds is not None
+        else "train_calib_image_baseline"
+    )
     manifest["trajectory_action_boundary_logits"] = action_deploy_boundary_logits.detach().cpu().tolist()
     atomic_write_json(output_dir / "run_manifest.json", manifest)
     if start_epoch == 0 and not baseline_path.exists():

@@ -36,6 +36,12 @@ def test_v27_config_is_target_private_15_frame_strong_baseline_training():
         "Exp_mAP": 0.3846499542,
         "joint": 0.5684972256,
     }
+    assert config["deployment"]["locked_image_threshold_source"] == (
+        "vetra_stage_c_deploy_final_train_only"
+    )
+    assert config["deployment"]["locked_image_thresholds"][:4] == [
+        0.4799999893, 0.3549999893, 0.3799999952, 0.3050000072,
+    ]
 
     model = config["model"]
     assert model["target_token_flow_enabled"] is True

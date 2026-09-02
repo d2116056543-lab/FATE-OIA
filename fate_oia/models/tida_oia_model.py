@@ -59,12 +59,21 @@ class TIDAFrozenVETRAImageBase(nn.Module):
         *,
         action_scale: float = 1.0,
         reason_scale: float = 0.60,
+        stage_c_action_calibrator: nn.Module | None = None,
+        stage_c_reason_thresholds: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         self.image_model = image_model
         self.refiner = refiner
         self.action_scale = float(action_scale)
         self.reason_scale = float(reason_scale)
+        self.stage_c_action_calibrator = stage_c_action_calibrator
+        if (stage_c_action_calibrator is None) != (stage_c_reason_thresholds is None):
+            raise ValueError("Stage-C action calibrator and reason thresholds must be provided together")
+        self.register_buffer(
+            "stage_c_reason_thresholds",
+            None if stage_c_reason_thresholds is None else stage_c_reason_thresholds.float(),
+        )
         for parameter in self.parameters():
             parameter.requires_grad = False
         self.eval()
@@ -115,11 +124,43 @@ class TIDAFrozenVETRAImageBase(nn.Module):
             "reason_logits_final": primary["reason_logits_primary"],
         }
 
+    @property
+    def has_stage_c(self) -> bool:
+        return self.stage_c_action_calibrator is not None
+
+    def stage_c_thresholds(self) -> torch.Tensor | None:
+        if not self.has_stage_c:
+            return None
+        return torch.cat((
+            self.stage_c_action_calibrator.thresholds,
+            self.stage_c_reason_thresholds,
+        ))
+
+    def apply_stage_c(
+        self, original: dict[str, Any], flipped_canonical: dict[str, Any]
+    ) -> dict[str, Any]:
+        if not self.has_stage_c:
+            return original
+        calibrated = self.stage_c_action_calibrator(
+            original["action_logits_final"],
+            flipped_canonical["action_logits_final"],
+        )
+        return {
+            **original,
+            "action_logits_pre_stage_c": original["action_logits_final"],
+            "action_logits_flip_stage_c": flipped_canonical["action_logits_final"],
+            "action_logits_final": calibrated["action_logits"],
+            "stage_c_action_mixed_logits": calibrated.get("mixed_action_logits"),
+            "stage_c_action_combo_logits": calibrated.get("combo_logits"),
+        }
+
     def train(self, mode: bool = True):
         super().train(False)
         self.image_model.eval()
         if self.refiner is not None:
             self.refiner.eval()
+        if self.stage_c_action_calibrator is not None:
+            self.stage_c_action_calibrator.eval()
         return self
 
 
@@ -1764,6 +1805,7 @@ class TIDAOIAModel(nn.Module):
         temporal_reason_scale: float | torch.Tensor,
         intervention: str | None = None,
         canonicalize_horizontal_flip: bool = False,
+        apply_image_stage_c: bool = True,
         object_tracks_xy: torch.Tensor | None = None,
         object_tracks_visibility: torch.Tensor | None = None,
     ) -> dict[str, Any]:
@@ -1772,6 +1814,13 @@ class TIDAOIAModel(nn.Module):
             image = self.image_model.decode_from_field(target_field, action_scale=1.0, reason_scale=1.0)
             if canonicalize_horizontal_flip:
                 image = self._canonicalize_flipped_image_branch(image)
+            elif apply_image_stage_c and bool(getattr(self.image_model, "has_stage_c", False)):
+                flipped_field = self.image_model.encode_images(target_image.flip(-1))
+                flipped_image = self.image_model.decode_from_field(
+                    flipped_field, action_scale=1.0, reason_scale=1.0
+                )
+                flipped_image = self._canonicalize_flipped_image_branch(flipped_image)
+                image = self.image_model.apply_stage_c(image, flipped_image)
         action_nodes = image["action_nodes_primary"].detach()
         reason_nodes = image["reason_nodes_primary"].detach()
         predicate_tokens = image["predicate_tokens"].detach()

@@ -9,7 +9,6 @@ $python = "E:\Anaconda\envs\sbw39\python.exe"
 $config = Join-Path $repo "configs\fate_oia_train_tida_target_token_flow_v27.yaml"
 $manifest = "G:\FATE_Drive_runs\tida_full_manifest_exact4572_v19\tida_full_primary_manifest.jsonl"
 $checkpoint = "F:\FATE_Drive_runs\vetra_replay_from_scratch_v2_full_20260819_retry1\checkpoint_stage_b_continued.pth"
-$baseline = "F:\FATE_Drive_runs\tida_logit_flow_v26_full_safe_b6\TIDA_IMAGE_BASELINE_COVERED_SUBSET.json"
 $frameStores = @(
   "G:\FATE_Drive_runs\tida_raw_frames_logit_flow_v26_pilot_zip",
   "G:\FATE_Drive_runs\tida_raw_frames_primary5584_calib779_test885",
@@ -18,7 +17,7 @@ $frameStores = @(
   "H:\FATE_Drive_runs\tida_raw_frames_exact15_missing_v27"
 )
 
-foreach ($required in @($python, $config, $manifest, $checkpoint, $baseline) + $frameStores) {
+foreach ($required in @($python, $config, $manifest, $checkpoint) + $frameStores) {
   if (-not (Test-Path -LiteralPath $required)) {
     throw "Required V27 input does not exist: $required"
   }
@@ -48,7 +47,6 @@ $arguments = @(
   "--config", $config,
   "--clip-manifest", $manifest,
   "--image-checkpoint", $checkpoint,
-  "--verified-baseline-artifact", $baseline,
   "--frame-store-root", ($frameStores -join ";"),
   "--output-dir", $OutputDir,
   "--epochs", "10",

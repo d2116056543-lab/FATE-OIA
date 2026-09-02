@@ -9,6 +9,16 @@ from fate_oia.models.acpr_dino_field import ACPRDinoFieldExtractor
 from fate_oia.models.tida_oia_model import TIDAFrozenVETRAImageBase, TIDAOIAModel
 
 
+class _StageCCalibrator(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("thresholds", torch.tensor([0.48, 0.355, 0.38, 0.305]))
+
+    def forward(self, original, flipped):
+        logits = original + 0.25 * flipped
+        return {"action_logits": logits, "action_deploy_logits": logits}
+
+
 class _ImageBase(nn.Module):
     def __init__(self, dim=8):
         super().__init__()
@@ -88,6 +98,66 @@ def test_frozen_vetra_history_decoder_uses_primary_head_not_full_evidence_reread
 
     torch.testing.assert_close(decoded["action_logits_final"], torch.full((2, 4), 1.25))
     torch.testing.assert_close(decoded["reason_logits_final"], torch.full((2, 21), -0.75))
+
+
+def test_frozen_vetra_stage_c_is_real_action_path_and_exposes_thresholds():
+    reason_thresholds = torch.linspace(0.1, 0.9, 21)
+    wrapper = TIDAFrozenVETRAImageBase(
+        _ImageBase(),
+        stage_c_action_calibrator=_StageCCalibrator(),
+        stage_c_reason_thresholds=reason_thresholds,
+    )
+    original = {
+        "action_logits_final": torch.ones(2, 4),
+        "reason_logits_final": torch.randn(2, 21),
+    }
+    flipped = {
+        "action_logits_final": torch.full((2, 4), 2.0),
+        "reason_logits_final": torch.randn(2, 21),
+    }
+
+    deployed = wrapper.apply_stage_c(original, flipped)
+
+    torch.testing.assert_close(deployed["action_logits_final"], torch.full((2, 4), 1.5))
+    torch.testing.assert_close(deployed["reason_logits_final"], original["reason_logits_final"])
+    torch.testing.assert_close(
+        wrapper.stage_c_thresholds(),
+        torch.cat((_StageCCalibrator().thresholds, reason_thresholds)),
+    )
+
+
+def test_tida_forward_uses_original_and_canonical_flip_for_stage_c_image_action():
+    image_base = _ImageBase()
+    wrapper = TIDAFrozenVETRAImageBase(
+        image_base,
+        stage_c_action_calibrator=_StageCCalibrator(),
+        stage_c_reason_thresholds=torch.full((21,), 0.5),
+    )
+    roles = {
+        "static_anchor": [f"p{i}" for i in range(8)],
+        "dynamic_actor": [f"p{i}" for i in range(8, 24)],
+        "terminal_context": [f"p{i}" for i in range(24, 32)],
+    }
+    model = TIDAOIAModel(
+        wrapper, dim=8, predicate_roles=roles,
+        history_encoder_mode="terminal_repeat", context_chunk_size=2,
+    ).eval()
+
+    output = model(
+        torch.randn(1, 3, 360, 640),
+        torch.randn(1, 2, 3, 192, 344),
+        torch.linspace(-1, 0, 3).unsqueeze(0),
+        torch.ones(1, 3, dtype=torch.bool),
+        temporal_action_scale=0.0,
+        temporal_reason_scale=0.0,
+    )
+
+    expected = (
+        output["image_branch"]["action_logits_pre_stage_c"]
+        + 0.25 * output["image_branch"]["action_logits_flip_stage_c"]
+    )
+    torch.testing.assert_close(output["image_action_logits"], expected)
+    torch.testing.assert_close(output["video_action_logits"], expected)
 
 
 def test_full_model_returns_formal_shapes_and_zero_scale_fallback():
