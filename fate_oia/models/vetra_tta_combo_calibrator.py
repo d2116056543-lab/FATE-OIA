@@ -27,14 +27,24 @@ class VetraTTAComboCalibrator(nn.Module):
         self.original_weight = float(original_weight)
 
     def forward(self, original_logits: torch.Tensor, flipped_logits_remapped: torch.Tensor) -> dict[str, torch.Tensor]:
-        mixed = self.original_weight * original_logits + (1.0 - self.original_weight) * flipped_logits_remapped
-        standardized = (mixed - self.mean) / self.scale
-        combo_logits = standardized @ self.coefficient.t() + self.intercept
-        combo_probs = combo_logits.softmax(dim=-1)
-        membership = ((self.class_codes[:, None] & (1 << torch.arange(4, device=combo_logits.device))) > 0).float()
-        action_probs = combo_probs @ membership
-        action_logits = torch.logit(action_probs.clamp(1e-6, 1.0 - 1e-6))
-        deploy_logits = action_logits - torch.logit(self.thresholds.clamp(1e-6, 1.0 - 1e-6))
+        # BF16 cannot represent 1 - 1e-6, so saturated combo marginals would
+        # round to exactly one and produce infinite logits. This small frozen
+        # deployment head must retain its fitted FP32 semantics under AMP.
+        with torch.autocast(device_type=original_logits.device.type, enabled=False):
+            original = original_logits.float()
+            flipped = flipped_logits_remapped.float()
+            mixed = self.original_weight * original + (1.0 - self.original_weight) * flipped
+            standardized = (mixed - self.mean) / self.scale
+            combo_logits = standardized @ self.coefficient.t() + self.intercept
+            combo_probs = combo_logits.softmax(dim=-1)
+            membership = (
+                (self.class_codes[:, None] & (1 << torch.arange(4, device=combo_logits.device))) > 0
+            ).float()
+            action_probs = combo_probs @ membership
+            action_logits = torch.logit(action_probs.clamp(1e-6, 1.0 - 1e-6))
+            deploy_logits = action_logits - torch.logit(
+                self.thresholds.clamp(1e-6, 1.0 - 1e-6)
+            )
         return {
             "mixed_action_logits": mixed,
             "combo_logits": combo_logits,

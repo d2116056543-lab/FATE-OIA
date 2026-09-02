@@ -18,3 +18,18 @@ def test_combo_marginal_and_threshold_deploy_shapes():
     assert output["action_deploy_logits"].shape == (2, 4)
     assert torch.allclose(output["combo_probs"].sum(-1), torch.ones(2))
     assert torch.isfinite(output["action_deploy_logits"]).all()
+
+
+def test_combo_calibrator_keeps_saturated_probabilities_finite_under_bfloat16_autocast():
+    model = VetraTTAComboCalibrator(
+        mean=torch.zeros(4), scale=torch.ones(4), coefficient=torch.zeros(2, 4),
+        intercept=torch.tensor([-100.0, 100.0]), class_codes=torch.tensor([0, 15]),
+        thresholds=torch.tensor([0.48, 0.355, 0.38, 0.305]), original_weight=0.75,
+    )
+
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        output = model(torch.zeros(2, 4), torch.zeros(2, 4))
+
+    assert output["action_logits"].dtype == torch.float32
+    assert torch.isfinite(output["action_logits"]).all()
+    assert torch.isfinite(output["action_deploy_logits"]).all()
