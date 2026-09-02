@@ -545,6 +545,7 @@ def append_supervision_tensors(
                 "candidate_delta", "deploy_delta", "deploy_gate",
                 "utility_probability", "ordered_prediction_error",
                 "reversed_prediction_error", "repeated_prediction_error",
+                "shuffled_prediction_error",
             ):
                 key = f"{prefix}_{suffix}"
                 values[key] = output[key]

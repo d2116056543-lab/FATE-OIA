@@ -7,6 +7,7 @@ from torch import nn
 
 from fate_oia.models.acpr_dino_field import ACPRDinoFieldExtractor
 from fate_oia.models.tida_oia_model import TIDAFrozenVETRAImageBase, TIDAOIAModel
+from fate_oia.engine.train_tida_oia import append_supervision_tensors
 
 
 class _StageCCalibrator(nn.Module):
@@ -713,6 +714,18 @@ def test_target_token_flow_is_the_only_route_and_keeps_action_reason_firewall():
     )
     assert all(value is None or torch.count_nonzero(value) == 0 for value in action_from_reason)
     assert all(value is None or torch.count_nonzero(value) == 0 for value in reason_from_action)
+
+    telemetry = {}
+    append_supervision_tensors(
+        telemetry,
+        out,
+        {
+            "action": torch.zeros(1, 4),
+            "frame_store_hit": torch.ones(1, dtype=torch.bool),
+        },
+    )
+    assert "target_token_action_shuffled_prediction_error" in telemetry
+    assert "target_token_reason_shuffled_prediction_error" in telemetry
 
 
 def test_semantic_relational_traffic_reaches_action_and_reason_with_branch_firewall():
