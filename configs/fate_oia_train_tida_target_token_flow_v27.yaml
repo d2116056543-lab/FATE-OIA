@@ -284,7 +284,7 @@ deployment:
   target_token_policy_min_non_degrading_fold_fraction: 0.8
   target_token_policy_fold_degradation_tolerance: 0.002
   stage_c_nested_oof: true
-  locked_image_threshold_source: vetra_stage_c_deploy_final_train_only
+  locked_image_threshold_source: vetra_stage_c_train_calib_deploy_final_train_only
   locked_image_thresholds: [0.4799999893, 0.3549999893, 0.3799999952, 0.3050000072, 0.7112500072, 0.6527500153, 0.6757500172, 0.7030000091, 0.6875, 0.4835000038, 0.0242500007, 0.6754999757, 0.5055000186, 0.2834999859, 0.5500000119, 0.4034999907, 0.2770000100, 0.5665000081, 0.4844999909, 0.6362500191, 0.6094999909, 0.6244999766, 0.6629999876, 0.6105000377, 0.6592500210]
   logit_flow_policy_scales: [-1.0, -0.5, 0.0, 0.5, 1.0]
   logit_flow_policy_cutoffs: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
