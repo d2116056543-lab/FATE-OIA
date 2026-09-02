@@ -247,9 +247,23 @@ def owner_parameter_update_norms(
 @torch.no_grad()
 def module_state_sha256(module: torch.nn.Module) -> str:
     digest = hashlib.sha256()
-    for name, tensor in sorted(module.state_dict().items()):
-        value = tensor.detach().contiguous().view(torch.uint8).cpu()
+    state = module.state_dict()
+    for name, tensor in sorted(state.items()):
+        if "attn.vproj." in name:
+            canonical_name = name.replace("attn.vproj.", "attn.proj.")
+            canonical = state.get(canonical_name)
+            if (
+                canonical is not None
+                and canonical.shape == tensor.shape
+                and torch.equal(canonical, tensor)
+            ):
+                continue
+        # Canonicalize on CPU before reading bytes. Reinterpreting CUDA storage as
+        # uint8 can make device-specific storage details part of the fingerprint.
+        value = tensor.detach().cpu().contiguous()
         digest.update(name.encode("utf-8"))
+        digest.update(str(value.dtype).encode("ascii"))
+        digest.update(str(tuple(value.shape)).encode("ascii"))
         digest.update(value.numpy().tobytes())
     return digest.hexdigest()
 
