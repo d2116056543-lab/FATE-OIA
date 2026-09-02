@@ -70,7 +70,9 @@ if ($Resume) {
   $arguments += @("--resume", $Resume)
 }
 
+$ErrorActionPreference = "Continue"
 & $python @arguments 2>&1 | Tee-Object -FilePath (Join-Path $OutputDir "full_train.log")
 $exitCode = $LASTEXITCODE
+$ErrorActionPreference = "Stop"
 Set-Content -LiteralPath (Join-Path $OutputDir "process_exit_code.txt") -Value $exitCode -Encoding ascii
 exit $exitCode
