@@ -51,6 +51,10 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--track-store")
+    parser.add_argument(
+        "--selected-names-file",
+        help="UTF-8 text file containing one manifest file_name per line",
+    )
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--jpeg-quality", type=int, default=92)
     parser.add_argument("--max-samples", type=int)
@@ -60,6 +64,17 @@ def main() -> None:
     if args.track_store:
         track_payload = torch.load(args.track_store, map_location="cpu", weights_only=True)
         selected = {str(name).lower() for name in track_payload["file_names"]}
+    if args.selected_names_file:
+        if selected is not None:
+            raise ValueError("use only one of --track-store and --selected-names-file")
+        selected_path = Path(args.selected_names_file)
+        selected = {
+            line.strip().lower()
+            for line in selected_path.read_text(encoding="utf-8-sig").splitlines()
+            if line.strip()
+        }
+        if not selected:
+            raise ValueError("selected names file is empty")
     records = select_extractable_records(load_manifest(args.manifest), selected)
     if selected is not None and len(records) != len(selected):
         unavailable = {
@@ -69,7 +84,12 @@ def main() -> None:
         }
         expected = selected - unavailable
         if len(records) != len(expected):
-            raise RuntimeError("raw-frame extraction records do not match track store")
+            present = {row.file_name.lower() for row in records}
+            missing = sorted(expected - present)
+            raise RuntimeError(
+                "raw-frame extraction records do not match selected names: "
+                f"missing={len(missing)} examples={missing[:5]}"
+            )
     if args.max_samples is not None:
         records = records[: args.max_samples]
     output_root = Path(args.output_root)

@@ -221,6 +221,33 @@ def collect_tida_outputs(
             "object_intent_track_role_consistency",
             "object_intent_semantic_temporal_weights",
         )})
+    if getattr(model, "target_token_flow_enabled", False):
+        store.update({
+            "target_token_action_candidate": [],
+            "target_token_action_centered_candidate": [],
+            "target_token_action_deploy": [],
+            "target_token_reason_candidate": [],
+            "target_token_reason_centered_candidate": [],
+            "target_token_reason_deploy": [],
+        })
+        diagnostics.update({key: [] for key in (
+            "target_token_action_candidate_delta",
+            "target_token_action_deploy_delta",
+            "target_token_action_deploy_gate",
+            "target_token_action_utility_probability",
+            "target_token_action_ordered_prediction_error",
+            "target_token_action_reversed_prediction_error",
+            "target_token_action_repeated_prediction_error",
+            "target_token_action_shuffled_prediction_error",
+            "target_token_reason_candidate_delta",
+            "target_token_reason_deploy_delta",
+            "target_token_reason_deploy_gate",
+            "target_token_reason_utility_probability",
+            "target_token_reason_ordered_prediction_error",
+            "target_token_reason_reversed_prediction_error",
+            "target_token_reason_repeated_prediction_error",
+            "target_token_reason_shuffled_prediction_error",
+        )})
     audit_keys = (
         "terminal_prediction_history", "terminal_prediction_no_history", "terminal_target_evidence",
         "terminal_error_history", "terminal_error_no_history", "innovation_token",
@@ -303,6 +330,27 @@ def collect_tida_outputs(
             values.update({
                 "pre_object_intent_action": output["pre_object_intent_video_action_logits"],
                 "pre_object_intent_reason": output["pre_object_intent_video_reason_logits"],
+            })
+        if "target_token_action_candidate_logits" in output:
+            values.update({
+                "target_token_action_candidate": output[
+                    "target_token_action_candidate_logits"
+                ],
+                "target_token_action_centered_candidate": output[
+                    "target_token_action_centered_candidate_logits"
+                ],
+                "target_token_action_deploy": output[
+                    "target_token_action_deploy_logits"
+                ],
+                "target_token_reason_candidate": output[
+                    "target_token_reason_candidate_logits"
+                ],
+                "target_token_reason_centered_candidate": output[
+                    "target_token_reason_centered_candidate_logits"
+                ],
+                "target_token_reason_deploy": output[
+                    "target_token_reason_deploy_logits"
+                ],
             })
         for key, value in values.items():
             store[key].append(value.detach().float().cpu())
@@ -546,6 +594,16 @@ def collect_tida_outputs(
             "terminal_semantic_predicate_ids": output["terminal_semantic_predicate_ids"],
         }.items():
             diagnostics[key].append(value.detach().float().cpu())
+        if "target_token_action_candidate_delta" in output:
+            for prefix in ("target_token_action", "target_token_reason"):
+                for suffix in (
+                    "candidate_delta", "deploy_delta", "deploy_gate",
+                    "utility_probability", "ordered_prediction_error",
+                    "reversed_prediction_error", "repeated_prediction_error",
+                    "shuffled_prediction_error",
+                ):
+                    key = f"{prefix}_{suffix}"
+                    diagnostics[key].append(output[key].detach().float().cpu())
         if "object_intent_action_delta_scaled" in output:
             for key, value in {
                 "object_intent_action_delta": output["object_intent_action_delta_scaled"],
@@ -797,6 +855,12 @@ def branch_metrics(rows: dict[str, Any], thresholds: torch.Tensor | float = 0.5)
         ("reason_local_candidate", "reason_local_candidate"),
         ("reason_local_centered_candidate", "reason_local_centered_candidate"),
         ("reason_local_deploy", "reason_local_deploy"),
+        ("target_token_action_candidate", "target_token_action_candidate"),
+        ("target_token_action_centered_candidate", "target_token_action_centered_candidate"),
+        ("target_token_action_deploy", "target_token_action_deploy"),
+        ("target_token_reason_candidate", "target_token_reason_candidate"),
+        ("target_token_reason_centered_candidate", "target_token_reason_centered_candidate"),
+        ("target_token_reason_deploy", "target_token_reason_deploy"),
     ):
         if key in rows:
             action_logits = rows[key] if "action" in name else rows["video_action"]
@@ -837,6 +901,160 @@ def temporal_contribution_metrics(rows: dict[str, Any]) -> dict[str, Any]:
             rows["image_reason"], rows["video_reason"], rows["reason_target"], motion_score=motion,
             pu_negative_weight=rows.get("reason_pu_weight"),
         ),
+    }
+
+
+def target_token_flow_effectiveness_metrics(
+    rows: dict[str, Any], thresholds: torch.Tensor | float = 0.5
+) -> dict[str, Any]:
+    """Measure whether ordered target-private history improves terminal decisions."""
+    required = {
+        "image_action", "image_reason", "action_target", "reason_target",
+        "target_token_action_candidate", "target_token_action_deploy",
+        "target_token_reason_candidate", "target_token_reason_deploy",
+        "target_token_action_candidate_delta", "target_token_action_deploy_delta",
+        "target_token_reason_candidate_delta", "target_token_reason_deploy_delta",
+    }
+    if not required <= set(rows):
+        return {"available": False, "reason": "target_token_outputs_missing"}
+
+    threshold = torch.as_tensor(
+        thresholds, dtype=rows["image_action"].dtype,
+        device=rows["image_action"].device,
+    ).flatten()
+    if threshold.numel() == 1:
+        action_threshold = reason_threshold = threshold
+    else:
+        action_count = rows["action_target"].shape[1]
+        action_threshold = threshold[:action_count]
+        reason_threshold = threshold[action_count:]
+
+    def branch(prefix: str, base_key: str, target_key: str) -> dict[str, Any]:
+        target = rows[target_key].float()
+        candidate_delta = rows[f"{prefix}_candidate_delta"].float()
+        deploy_delta = rows[f"{prefix}_deploy_delta"].float()
+        base = rows[base_key].float()
+        sign = target.mul(2.0).sub(1.0)
+        candidate_signed = sign * candidate_delta
+        deploy_signed = sign * deploy_delta
+        ordered = rows.get(f"{prefix}_ordered_prediction_error")
+        reversed_error = rows.get(f"{prefix}_reversed_prediction_error")
+        repeated_error = rows.get(f"{prefix}_repeated_prediction_error")
+        shuffled_error = rows.get(f"{prefix}_shuffled_prediction_error")
+        gate = rows.get(f"{prefix}_deploy_gate")
+        utility = rows.get(f"{prefix}_utility_probability")
+        positive = target > 0.5
+        positive_count = int(positive.sum())
+        result = {
+            "candidate_delta_rms": float(candidate_delta.square().mean().sqrt()),
+            "deploy_delta_rms": float(deploy_delta.square().mean().sqrt()),
+            "deploy_to_base_rms_ratio": float(
+                deploy_delta.square().mean().sqrt()
+                / base.square().mean().sqrt().clamp_min(1e-8)
+            ),
+            "candidate_signed_margin_mean": float(candidate_signed.mean()),
+            "candidate_signed_margin_by_label": candidate_signed.mean(0).tolist(),
+            "deploy_signed_margin_mean": float(deploy_signed.mean()),
+            "deploy_signed_margin_by_label": deploy_signed.mean(0).tolist(),
+            "candidate_benefit_rate": float((candidate_signed > 0).float().mean()),
+            "deploy_benefit_rate": float((deploy_signed > 0).float().mean()),
+            "observed_positive_count": positive_count,
+            "observed_positive_no_harm_rate": (
+                float((deploy_delta[positive] >= 0).float().mean())
+                if positive_count else None
+            ),
+            "deploy_gate_nonzero_rate": (
+                float((gate > 0).float().mean()) if gate is not None else None
+            ),
+            "deploy_gate_mean": float(gate.mean()) if gate is not None else None,
+            "utility_probability_mean": (
+                float(utility.mean()) if utility is not None else None
+            ),
+        }
+        if utility is not None:
+            helpful = candidate_signed > 0
+            supervised = torch.ones_like(helpful, dtype=torch.bool)
+            if target_key == "reason_target":
+                contradiction = rows.get(
+                    "reason_contradiction_score", torch.zeros_like(target)
+                )
+                certified_negative = (target <= 0.5) & (contradiction >= 0.8)
+                supervised = positive | certified_negative
+                helpful = torch.where(positive, candidate_delta > 0, candidate_delta < 0)
+            result["utility_helpfulness_auc"] = _binary_rank_auc(
+                utility[supervised], helpful[supervised]
+            )
+            result["utility_supervised_rate"] = float(supervised.float().mean())
+        if ordered is not None and reversed_error is not None:
+            advantage = reversed_error.float() - ordered.float()
+            result.update({
+                "ordered_vs_reversed_advantage_mean": float(advantage.mean()),
+                "ordered_vs_reversed_win_rate": float((advantage > 0).float().mean()),
+            })
+        if ordered is not None and repeated_error is not None:
+            advantage = repeated_error.float() - ordered.float()
+            result.update({
+                "ordered_vs_repeated_advantage_mean": float(advantage.mean()),
+                "ordered_vs_repeated_win_rate": float((advantage > 0).float().mean()),
+            })
+        if ordered is not None and shuffled_error is not None:
+            advantage = shuffled_error.float() - ordered.float()
+            result.update({
+                "ordered_vs_shuffled_advantage_mean": float(advantage.mean()),
+                "ordered_vs_shuffled_win_rate": float((advantage > 0).float().mean()),
+            })
+        return result
+
+    def flips(base: torch.Tensor, deploy: torch.Tensor, target: torch.Tensor, cut):
+        base_pred = base.sigmoid() >= cut
+        deploy_pred = deploy.sigmoid() >= cut
+        positive = target > 0.5
+        return {
+            "fn_to_tp": ((~base_pred) & deploy_pred & positive).sum(0).tolist(),
+            "fp_to_tn": (base_pred & (~deploy_pred) & (~positive)).sum(0).tolist(),
+            "tp_to_fn": (base_pred & (~deploy_pred) & positive).sum(0).tolist(),
+            "tn_to_fp": ((~base_pred) & deploy_pred & (~positive)).sum(0).tolist(),
+        }
+
+    metrics = {
+        "image": aie_branch_metrics(
+            rows["image_action"], rows["image_reason"],
+            rows["action_target"], rows["reason_target"], threshold=threshold,
+        ),
+        "candidate": aie_branch_metrics(
+            rows["target_token_action_candidate"],
+            rows["target_token_reason_candidate"],
+            rows["action_target"], rows["reason_target"], threshold=threshold,
+        ),
+        "deploy": aie_branch_metrics(
+            rows["target_token_action_deploy"],
+            rows["target_token_reason_deploy"],
+            rows["action_target"], rows["reason_target"], threshold=threshold,
+        ),
+    }
+    return {
+        "available": True,
+        "metrics": metrics,
+        "action": branch(
+            "target_token_action", "image_action", "action_target"
+        ),
+        "reason": branch(
+            "target_token_reason", "image_reason", "reason_target"
+        ),
+        "decision_flips": {
+            "action": flips(
+                rows["image_action"], rows["target_token_action_deploy"],
+                rows["action_target"], action_threshold,
+            ),
+            "reason": flips(
+                rows["image_reason"], rows["target_token_reason_deploy"],
+                rows["reason_target"], reason_threshold,
+            ),
+        },
+        "pu_semantics": {
+            "reason_zero_labels_are_unlabeled": True,
+            "reason_signed_margin_over_all_labels_is_diagnostic_only": True,
+        },
     }
 
 
@@ -1496,6 +1714,14 @@ def save_epoch_outputs(
     contribution = metrics.get("online", {}).get("temporal_contribution")
     if contribution is not None:
         atomic_write_json(epoch_dir / "temporal_contribution_metrics.json", contribution)
+    target_token_effectiveness = metrics.get("online", {}).get(
+        "target_token_flow_effectiveness"
+    )
+    if target_token_effectiveness is not None:
+        atomic_write_json(
+            epoch_dir / "target_token_flow_effectiveness.json",
+            target_token_effectiveness,
+        )
     geometric_effectiveness = metrics.get("online", {}).get("geometric_effectiveness")
     if geometric_effectiveness is not None:
         atomic_write_json(epoch_dir / "geometric_temporal_effectiveness.json", geometric_effectiveness)
@@ -1684,6 +1910,21 @@ def save_epoch_outputs(
         "transition_tokens", "transition_tokens_by_scale", "motion_salience", "transition_consistency",
         "velocity", "acceleration", "region_velocity",
         "action_temporal_route", "action_factor_contribution", "reason_temporal_route", "frame_valid_mask", "timestamps",
+        "target_token_action_candidate", "target_token_action_centered_candidate",
+        "target_token_action_deploy", "target_token_reason_candidate",
+        "target_token_reason_centered_candidate", "target_token_reason_deploy",
+        "target_token_action_candidate_delta", "target_token_action_deploy_delta",
+        "target_token_action_deploy_gate", "target_token_action_utility_probability",
+        "target_token_action_ordered_prediction_error",
+        "target_token_action_reversed_prediction_error",
+        "target_token_action_repeated_prediction_error",
+        "target_token_action_shuffled_prediction_error",
+        "target_token_reason_candidate_delta", "target_token_reason_deploy_delta",
+        "target_token_reason_deploy_gate", "target_token_reason_utility_probability",
+        "target_token_reason_ordered_prediction_error",
+        "target_token_reason_reversed_prediction_error",
+        "target_token_reason_repeated_prediction_error",
+        "target_token_reason_shuffled_prediction_error",
     )
     tensor_keys = compact_tensor_keys if compact_logit_flow else full_tensor_keys
     for key in tensor_keys:

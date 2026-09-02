@@ -25,6 +25,7 @@ from .tida_temporal_encoder import TIDATemporalEncoder
 from .tida_terminal_innovation import TIDATerminalInnovation
 from .tida_terminal_query_reader import TIDATerminalQueryReader
 from .tida_logit_flow import TIDALogitFlowReader
+from .tida_target_token_flow import TIDATargetTokenFlow
 from .tida_traffic_trajectories import TIDATrafficTrajectoryBuilder
 from .tida_traffic_trajectory_head import TIDATrafficTrajectoryHead
 from .tida_traffic_boundary import TIDATrafficAdaptiveBoundary
@@ -211,6 +212,11 @@ class TIDAOIAModel(nn.Module):
         logit_flow_hidden_dim: int = 64,
         logit_flow_action_cap: float = 0.05,
         logit_flow_reason_cap: float = 0.04,
+        target_token_flow_enabled: bool = False,
+        target_token_flow_hidden_dim: int = 128,
+        target_token_flow_action_cap: float = 0.05,
+        target_token_flow_reason_cap: float = 0.04,
+        target_token_flow_utility_open_prior: float = 0.10,
         legacy_semantic_routes_enabled: bool = True,
     ) -> None:
         super().__init__()
@@ -306,6 +312,44 @@ class TIDAOIAModel(nn.Module):
             for module in (self.action_logit_flow, self.reason_logit_flow):
                 for parameter in module.parameters():
                     parameter.requires_grad = False
+        self.target_token_flow_enabled = bool(target_token_flow_enabled)
+        self.target_token_action = TIDATargetTokenFlow(
+            num_labels=num_actions,
+            dim=dim,
+            hidden_dim=target_token_flow_hidden_dim,
+            cap=target_token_flow_action_cap,
+            utility_open_prior=target_token_flow_utility_open_prior,
+        )
+        self.target_token_reason = TIDATargetTokenFlow(
+            num_labels=num_reasons,
+            dim=dim,
+            hidden_dim=target_token_flow_hidden_dim,
+            cap=target_token_flow_reason_cap,
+            utility_open_prior=target_token_flow_utility_open_prior,
+        )
+        if not self.target_token_flow_enabled:
+            for module in (self.target_token_action, self.target_token_reason):
+                for parameter in module.parameters():
+                    parameter.requires_grad = False
+        if self.target_token_flow_enabled:
+            incompatible = {
+                "legacy_semantic_routes": legacy_semantic_routes_enabled,
+                "geometric_flow": geometric_flow_enabled,
+                "traffic_action": traffic_action_enabled,
+                "traffic_trajectory": traffic_trajectory_enabled,
+                "relational_traffic": relational_traffic_enabled,
+                "traffic_adaptive_boundary": traffic_adaptive_boundary_enabled,
+                "object_intent": object_intent_enabled,
+                "reason_local_query": reason_local_query_enabled,
+                "action_local_query": action_local_query_enabled,
+                "logit_flow": logit_flow_enabled,
+            }
+            enabled = [name for name, value in incompatible.items() if value]
+            if enabled:
+                raise ValueError(
+                    "target-token flow must be the only temporal decision route: "
+                    + ", ".join(enabled)
+                )
         if self.history_encoder_mode == "terminal_repeat":
             incompatible = {
                 "traffic_action": traffic_action_enabled,
@@ -314,6 +358,7 @@ class TIDAOIAModel(nn.Module):
                 "reason_local_query": reason_local_query_enabled,
                 "action_local_query": action_local_query_enabled,
                 "logit_flow": logit_flow_enabled,
+                "target_token_flow": target_token_flow_enabled,
             }
             enabled = [name for name, value in incompatible.items() if value]
             if enabled:
@@ -589,6 +634,15 @@ class TIDAOIAModel(nn.Module):
                 parameter for parameter in self.reason_logit_flow.parameters()
                 if parameter.requires_grad
             ]
+        if self.target_token_flow_enabled:
+            owners["target_token_action"] = [
+                parameter for parameter in self.target_token_action.parameters()
+                if parameter.requires_grad
+            ]
+            owners["target_token_reason"] = [
+                parameter for parameter in self.target_token_reason.parameters()
+                if parameter.requires_grad
+            ]
         # Query identities are the shortcut-free prior for terminal prediction.
         owners["history_reader"] += [
             parameter
@@ -596,6 +650,49 @@ class TIDAOIAModel(nn.Module):
             if parameter.requires_grad
         ]
         return owners
+
+    def _apply_target_token_flow(
+        self,
+        output: dict[str, Any],
+        history_action_tokens: torch.Tensor,
+        terminal_action_tokens: torch.Tensor,
+        history_reason_tokens: torch.Tensor,
+        terminal_reason_tokens: torch.Tensor,
+        timestamps: torch.Tensor,
+        frame_valid_mask: torch.Tensor,
+        temporal_action_scale: float | torch.Tensor,
+        temporal_reason_scale: float | torch.Tensor,
+    ) -> dict[str, Any]:
+        if not self.target_token_flow_enabled:
+            return output
+        action = self.target_token_action(
+            history_action_tokens,
+            terminal_action_tokens,
+            timestamps,
+            frame_valid_mask,
+            base_logits=output["video_action_logits"],
+            temporal_scale=temporal_action_scale,
+        )
+        reason = self.target_token_reason(
+            history_reason_tokens,
+            terminal_reason_tokens,
+            timestamps,
+            frame_valid_mask,
+            base_logits=output["video_reason_logits"],
+            temporal_scale=temporal_reason_scale,
+        )
+        action_delta = action["deploy_delta"]
+        reason_delta = reason["deploy_delta"]
+        output["video_action_logits_base"] = output["video_action_logits_base"] + action_delta
+        output["video_action_logits"] = output["video_action_logits"] + action_delta
+        output["video_reason_logits"] = output["video_reason_logits"] + reason_delta
+        output["action_temporal_delta"] = output["action_temporal_delta"] + action_delta
+        output["reason_temporal_delta"] = output["reason_temporal_delta"] + reason_delta
+        output.update({
+            **{f"target_token_action_{key}": value for key, value in action.items()},
+            **{f"target_token_reason_{key}": value for key, value in reason.items()},
+        })
+        return output
 
     @staticmethod
     def _target_region_mass(attention: torch.Tensor, grid_hw: tuple[int, int]) -> torch.Tensor:
@@ -1574,16 +1671,30 @@ class TIDAOIAModel(nn.Module):
             dense_trajectory_grid_hw=output["history_grid_hw"],
             history_reason_query_tokens=self._intervene_patch_history(
                 output["history_reason_query_tokens"], intervention
-            ) if self.reason_local_query_enabled else None,
+            ) if (self.reason_local_query_enabled or self.target_token_flow_enabled) else None,
             terminal_reason_query_tokens=(
                 output["terminal_reason_query_tokens"]
-                if self.reason_local_query_enabled else None
+                if (self.reason_local_query_enabled or self.target_token_flow_enabled) else None
             ),
             terminal_action_query_tokens=(
                 output["terminal_action_query_tokens"]
-                if self.action_local_query_enabled else None
+                if (self.action_local_query_enabled or self.target_token_flow_enabled) else None
             ),
         )
+        if self.target_token_flow_enabled:
+            rerun = self._apply_target_token_flow(
+                rerun,
+                history[:, :, : self.num_actions],
+                output["terminal_action_query_tokens"],
+                self._intervene_patch_history(
+                    output["history_reason_query_tokens"], intervention
+                ),
+                output["terminal_reason_query_tokens"],
+                output["timestamps"],
+                rerun_valid,
+                temporal_action_scale,
+                temporal_reason_scale,
+            )
         if self.logit_flow_enabled:
             action_flow = self.action_logit_flow(
                 self._intervene_history_logits(
@@ -1669,7 +1780,11 @@ class TIDAOIAModel(nn.Module):
         terminal_read = self.query_reader(
             target_field["patch_tokens_by_layer"], action_nodes, predicate_tokens,
             self.predicate_identity, grid_hw=target_field["grid_hw"],
-            reason_nodes=reason_nodes if self.reason_local_query_enabled else None,
+            reason_nodes=(
+                reason_nodes
+                if (self.reason_local_query_enabled or self.target_token_flow_enabled)
+                else None
+            ),
         )
         terminal_patches = self.context_encoder.select_action_patches(
             target_field, terminal_read["query_attention"][:, : self.num_actions]
@@ -1699,7 +1814,11 @@ class TIDAOIAModel(nn.Module):
                 context_images, action_nodes, predicate_tokens, self.predicate_identity,
                 predicate_reliability=predicate_reliability,
                 canonicalize_horizontal_flip=canonicalize_horizontal_flip,
-                reason_nodes=reason_nodes if self.reason_local_query_enabled else None,
+                reason_nodes=(
+                    reason_nodes
+                    if (self.reason_local_query_enabled or self.target_token_flow_enabled)
+                    else None
+                ),
                 frozen_frame_decoder=(
                     self.image_model.decode_history_from_field
                     if self.logit_flow_enabled else None
@@ -1799,16 +1918,32 @@ class TIDAOIAModel(nn.Module):
             dense_trajectory_grid_hw=context["history_grid_hw"],
             history_reason_query_tokens=(
                 self._intervene_patch_history(context["history_reason_query_tokens"], intervention)
-                if self.reason_local_query_enabled else None
+                if (self.reason_local_query_enabled or self.target_token_flow_enabled) else None
             ),
             terminal_reason_query_tokens=(
-                terminal_read["reason_query_tokens"] if self.reason_local_query_enabled else None
+                terminal_read["reason_query_tokens"]
+                if (self.reason_local_query_enabled or self.target_token_flow_enabled)
+                else None
             ),
             terminal_action_query_tokens=(
                 terminal_read["query_tokens"][:, : self.num_actions]
-                if self.action_local_query_enabled else None
+                if (self.action_local_query_enabled or self.target_token_flow_enabled) else None
             ),
         )
+        if self.target_token_flow_enabled:
+            temporal_output = self._apply_target_token_flow(
+                temporal_output,
+                history_tokens[:, :, : self.num_actions],
+                terminal_read["query_tokens"][:, : self.num_actions],
+                self._intervene_patch_history(
+                    context["history_reason_query_tokens"], intervention
+                ),
+                terminal_read["reason_query_tokens"],
+                timestamps,
+                effective_frame_valid_mask,
+                temporal_action_scale,
+                temporal_reason_scale,
+            )
         if self.logit_flow_enabled:
             action_logit_flow = self.action_logit_flow(
                 self._intervene_history_logits(
@@ -1990,12 +2125,13 @@ class TIDAOIAModel(nn.Module):
             "terminal_semantic_patch_weight": terminal_semantic_patches["weights"],
             "terminal_semantic_patch_indices": terminal_semantic_patches["indices"],
             "terminal_reason_query_tokens": (
-                terminal_read["reason_query_tokens"] if self.reason_local_query_enabled
+                terminal_read["reason_query_tokens"]
+                if (self.reason_local_query_enabled or self.target_token_flow_enabled)
                 else image["reason_nodes_primary"].detach()
             ),
             "terminal_action_query_tokens": (
                 terminal_read["query_tokens"][:, : self.num_actions]
-                if self.action_local_query_enabled
+                if (self.action_local_query_enabled or self.target_token_flow_enabled)
                 else image["action_nodes_primary"].detach()
             ),
             "terminal_semantic_predicate_ids": terminal_semantic_patches["predicate_ids"],

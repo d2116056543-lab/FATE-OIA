@@ -59,6 +59,14 @@ class TIDALossRegistry:
         "logit_flow_reason_aux", "logit_flow_reason_rank",
         "logit_flow_reason_utility", "logit_flow_reason_order",
         "logit_flow_reason_no_harm", "logit_flow_reason_delta",
+        "target_token_action_prediction", "target_token_action_order",
+        "target_token_action_aux", "target_token_action_rank",
+        "target_token_action_utility", "target_token_action_no_harm",
+        "target_token_action_delta",
+        "target_token_reason_prediction", "target_token_reason_order",
+        "target_token_reason_aux", "target_token_reason_rank",
+        "target_token_reason_utility", "target_token_reason_no_harm",
+        "target_token_reason_delta",
     )
     default_weights = {
         "terminal_hist": 0.25,
@@ -154,6 +162,20 @@ class TIDALossRegistry:
         "logit_flow_reason_order": 0.0,
         "logit_flow_reason_no_harm": 0.0,
         "logit_flow_reason_delta": 0.0,
+        "target_token_action_prediction": 0.0,
+        "target_token_action_order": 0.0,
+        "target_token_action_aux": 0.0,
+        "target_token_action_rank": 0.0,
+        "target_token_action_utility": 0.0,
+        "target_token_action_no_harm": 0.0,
+        "target_token_action_delta": 0.0,
+        "target_token_reason_prediction": 0.0,
+        "target_token_reason_order": 0.0,
+        "target_token_reason_aux": 0.0,
+        "target_token_reason_rank": 0.0,
+        "target_token_reason_utility": 0.0,
+        "target_token_reason_no_harm": 0.0,
+        "target_token_reason_delta": 0.0,
     }
 
     def __init__(self, weights: dict[str, float] | None = None) -> None:

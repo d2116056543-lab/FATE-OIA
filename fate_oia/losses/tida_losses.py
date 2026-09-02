@@ -1055,6 +1055,129 @@ def build_tida_loss_registry(
             "logit_flow_reason_delta",
             output["logit_flow_reason_candidate_delta"].square().mean(),
         )
+    if "target_token_action_candidate_logits" in output:
+        action_control_error = torch.minimum(
+            output["target_token_action_reversed_prediction_error"],
+            output["target_token_action_repeated_prediction_error"],
+        )
+        action_control_error = torch.minimum(
+            action_control_error,
+            output["target_token_action_shuffled_prediction_error"],
+        )
+        registry.add(
+            "target_token_action_prediction",
+            output["target_token_action_ordered_prediction_error"].mean(),
+        )
+        registry.add(
+            "target_token_action_order",
+            F.relu(
+                0.02
+                + output["target_token_action_ordered_prediction_error"]
+                - action_control_error
+            ).mean(),
+        )
+        registry.add(
+            "target_token_action_aux",
+            action_macro_asl_loss(
+                output["target_token_action_candidate_logits"], action_target
+            ),
+        )
+        registry.add(
+            "target_token_action_rank",
+            action_smooth_ap_loss(
+                output["target_token_action_candidate_logits"],
+                action_target,
+                rank_reference.get("action_logits"),
+                rank_reference.get("action_target"),
+            ),
+        )
+        registry.add(
+            "target_token_action_utility",
+            reason_local_utility_calibration_loss(
+                output["target_token_action_utility_logit"],
+                output["target_token_action_candidate_delta"],
+                action_target,
+                1.0 - action_target.float(),
+            ),
+        )
+        registry.add(
+            "target_token_action_no_harm",
+            action_base_protect_loss(
+                output["image_action_logits"],
+                output["target_token_action_candidate_logits"],
+                action_target,
+                torch.zeros_like(action_target),
+            ),
+        )
+        registry.add(
+            "target_token_action_delta",
+            output["target_token_action_candidate_delta"].square().mean(),
+        )
+    if "target_token_reason_candidate_logits" in output:
+        reason_control_error = torch.minimum(
+            output["target_token_reason_reversed_prediction_error"],
+            output["target_token_reason_repeated_prediction_error"],
+        )
+        reason_control_error = torch.minimum(
+            reason_control_error,
+            output["target_token_reason_shuffled_prediction_error"],
+        )
+        registry.add(
+            "target_token_reason_prediction",
+            (output["target_token_reason_ordered_prediction_error"] * reason_weights).mean(),
+        )
+        registry.add(
+            "target_token_reason_order",
+            (
+                F.relu(
+                    0.02
+                    + output["target_token_reason_ordered_prediction_error"]
+                    - reason_control_error
+                )
+                * reason_weights
+            ).mean(),
+        )
+        registry.add(
+            "target_token_reason_aux",
+            target_conditioned_pu_correction_loss(
+                output["image_reason_logits"],
+                output["target_token_reason_candidate_delta"],
+                reason_target,
+                1.0 / (1.0 + output["target_token_reason_ordered_prediction_error"].detach()),
+                contradiction,
+            ),
+        )
+        registry.add(
+            "target_token_reason_rank",
+            target_conditioned_pu_ranking_loss(
+                output["image_reason_logits"],
+                output["target_token_reason_candidate_delta"],
+                reason_target,
+                1.0 / (1.0 + output["target_token_reason_ordered_prediction_error"].detach()),
+                contradiction,
+            ),
+        )
+        registry.add(
+            "target_token_reason_utility",
+            reason_local_utility_calibration_loss(
+                output["target_token_reason_utility_logit"],
+                output["target_token_reason_candidate_delta"],
+                reason_target,
+                contradiction,
+            ),
+        )
+        registry.add(
+            "target_token_reason_no_harm",
+            positive_label_no_harm_loss(
+                output["image_reason_logits"],
+                output["target_token_reason_candidate_logits"],
+                reason_target,
+            ),
+        )
+        registry.add(
+            "target_token_reason_delta",
+            output["target_token_reason_candidate_delta"].square().mean(),
+        )
     registry.add("reason_partial", reason_partial_asl_loss(output["video_reason_logits"], reason_target, contradiction))
     registry.add(
         "reason_rank",

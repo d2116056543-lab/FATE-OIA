@@ -592,6 +592,59 @@ def test_logit_flow_deploy_delta_is_in_final_logits_and_temporal_delta_telemetry
     assert torch.count_nonzero(out["logit_flow_reason_deploy_delta"]) > 0
 
 
+def test_target_token_flow_is_the_only_route_and_keeps_action_reason_firewall():
+    roles = {
+        "static_anchor": [f"p{i}" for i in range(8)],
+        "dynamic_actor": [f"p{i}" for i in range(8, 24)],
+        "terminal_context": [f"p{i}" for i in range(24, 32)],
+    }
+    model = TIDAOIAModel(
+        _ImageBase(), dim=8, num_actions=4, num_reasons=21, num_predicates=32,
+        predicate_roles=roles, context_chunk_size=7,
+        target_token_flow_enabled=True, target_token_flow_hidden_dim=16,
+        legacy_semantic_routes_enabled=False,
+    )
+    with torch.no_grad():
+        model.target_token_action.candidate_output_weight.fill_(0.25)
+        model.target_token_reason.candidate_output_weight.fill_(0.25)
+        model.target_token_action.set_deployment_policy(
+            torch.ones(4), torch.ones(4), torch.zeros(4), source="unit_test"
+        )
+        model.target_token_reason.set_deployment_policy(
+            torch.ones(21), torch.ones(21), torch.zeros(21), source="unit_test"
+        )
+    out = model(
+        torch.randn(1, 3, 360, 640), torch.randn(1, 14, 3, 192, 344),
+        torch.linspace(-5, 0, 15).unsqueeze(0), torch.ones(1, 15, dtype=torch.bool),
+        temporal_action_scale=1.0, temporal_reason_scale=1.0,
+    )
+    assert out["target_token_action_predicted_terminal_token"].shape == (1, 4, 8)
+    assert out["target_token_reason_predicted_terminal_token"].shape == (1, 21, 8)
+    assert torch.count_nonzero(out["target_token_action_deploy_delta"]) > 0
+    assert torch.count_nonzero(out["target_token_reason_deploy_delta"]) > 0
+    torch.testing.assert_close(
+        out["video_action_logits"] - out["image_action_logits"],
+        out["target_token_action_deploy_delta"],
+    )
+    torch.testing.assert_close(
+        out["video_reason_logits"] - out["image_reason_logits"],
+        out["target_token_reason_deploy_delta"],
+    )
+    owners = model.owner_parameters()
+    assert "target_token_action" in owners and "target_token_reason" in owners
+    assert_owner_exact_cover(model, owners)
+    action_from_reason = torch.autograd.grad(
+        out["video_reason_logits"].sum(), owners["target_token_action"],
+        allow_unused=True, retain_graph=True,
+    )
+    reason_from_action = torch.autograd.grad(
+        out["video_action_logits"].sum(), owners["target_token_reason"],
+        allow_unused=True,
+    )
+    assert all(value is None or torch.count_nonzero(value) == 0 for value in action_from_reason)
+    assert all(value is None or torch.count_nonzero(value) == 0 for value in reason_from_action)
+
+
 def test_semantic_relational_traffic_reaches_action_and_reason_with_branch_firewall():
     roles = {
         "static_anchor": [f"p{i}" for i in range(8)],
