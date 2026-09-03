@@ -47,7 +47,13 @@ def multilabel_metrics_from_logits(
     prefix: str = "",
 ) -> dict[str, Any]:
     probs = sigmoid_probs(logits)
-    conf = multilabel_confusion(probs, targets, threshold)
+    targets = targets.to(probs.device)
+    metric_threshold = (
+        threshold.to(probs.device).view(1, -1)
+        if isinstance(threshold, torch.Tensor)
+        else torch.tensor(float(threshold), device=probs.device).view(1, 1)
+    )
+    conf = multilabel_confusion(probs, targets, metric_threshold)
     eps = 1e-9
     precision = conf["tp"] / (conf["tp"] + conf["fp"] + eps)
     recall = conf["tp"] / (conf["tp"] + conf["fn"] + eps)
@@ -55,7 +61,7 @@ def multilabel_metrics_from_logits(
     valid = torch.isfinite(f1)
     aps = [binary_average_precision(probs[:, i], targets[:, i]) for i in range(targets.shape[1])]
     ap_valid = [x for x in aps if not math.isnan(x)]
-    exact = ((probs >= (threshold if isinstance(threshold, float) else threshold.view(1, -1))).float() == targets.float()).all(1).float().mean()
+    exact = ((probs >= metric_threshold).float() == targets.float()).all(1).float().mean()
     return {
         f"{prefix}mF1": float(f1[valid].mean().item()) if bool(valid.any()) else 0.0,
         f"{prefix}oF1": float((2 * conf["tp"].sum() / (2 * conf["tp"].sum() + conf["fp"].sum() + conf["fn"].sum() + eps)).item()),
