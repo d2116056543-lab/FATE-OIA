@@ -1,5 +1,5 @@
 experiment:
-  name: tida_trajectory_state_owner_v32
+  name: tida_trajectory_static_owner_v33
   direct_video: true
   eval_splits: [test]
   diagnostic_eval_splits: []

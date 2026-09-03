@@ -8,6 +8,7 @@ def test_v33_uses_real_history_against_a_repeated_terminal_control() -> None:
         "fate_oia_train_tida_trajectory_owner_v31.yaml"
     )
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert config["experiment"]["name"] == "tida_trajectory_static_owner_v33"
     model = config["model"]
     loss = config["loss"]
     training = config["training"]
