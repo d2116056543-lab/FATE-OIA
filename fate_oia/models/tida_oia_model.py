@@ -263,6 +263,7 @@ class TIDAOIAModel(nn.Module):
         target_token_flow_order_weight: float = 0.0,
         target_token_flow_candidate_temperature: float = 1.0,
         target_token_flow_independent_scale: bool = False,
+        target_token_direct_difference_enabled: bool = False,
         legacy_semantic_routes_enabled: bool = True,
     ) -> None:
         super().__init__()
@@ -372,6 +373,7 @@ class TIDAOIAModel(nn.Module):
             motion_weight=target_token_flow_motion_weight,
             order_weight=target_token_flow_order_weight,
             candidate_temperature=target_token_flow_candidate_temperature,
+            direct_difference_enabled=target_token_direct_difference_enabled,
         )
         self.target_token_reason = TIDATargetTokenFlow(
             num_labels=num_reasons,
@@ -383,6 +385,7 @@ class TIDAOIAModel(nn.Module):
             motion_weight=target_token_flow_motion_weight,
             order_weight=target_token_flow_order_weight,
             candidate_temperature=target_token_flow_candidate_temperature,
+            direct_difference_enabled=target_token_direct_difference_enabled,
         )
         if not self.target_token_flow_enabled:
             for module in (self.target_token_action, self.target_token_reason):

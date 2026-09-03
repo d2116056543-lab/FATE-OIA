@@ -1038,6 +1038,11 @@ def build_runtime(args: Any, evaluation_only: bool = False) -> TIDARuntime:
         target_token_flow_independent_scale=bool(
             config["model"].get("target_token_flow_independent_scale", False)
         ),
+        target_token_direct_difference_enabled=bool(
+            config["model"].get(
+                "target_token_direct_difference_enabled", False
+            )
+        ),
         legacy_semantic_routes_enabled=bool(
             config["model"].get("legacy_semantic_routes_enabled", True)
         ),

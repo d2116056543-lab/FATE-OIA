@@ -433,6 +433,34 @@ def target_conditioned_pu_ranking_loss(
     return torch.stack(losses).mean() if losses else delta.sum() * 0.0
 
 
+def target_token_control_margin_loss(
+    base_logits: torch.Tensor,
+    ordered_delta: torch.Tensor,
+    repeated_delta: torch.Tensor,
+    shuffled_delta: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    negative_weight: torch.Tensor | None = None,
+    margin: float = 0.01,
+) -> torch.Tensor:
+    """Require ordered temporal evidence to beat content/order controls."""
+    positive = target.float()
+    if negative_weight is None:
+        negative = 1.0 - positive
+    else:
+        negative = (1.0 - positive) * negative_weight.float().clamp(0.0, 1.0)
+    weight = positive + negative
+    sign = positive - negative
+
+    def logistic(delta: torch.Tensor) -> torch.Tensor:
+        return F.softplus(-sign * (base_logits.detach() + delta))
+
+    ordered = logistic(ordered_delta)
+    control = 0.5 * (logistic(repeated_delta) + logistic(shuffled_delta))
+    loss = F.relu(float(margin) + ordered - control) * weight
+    return loss.sum() / weight.sum().clamp_min(1.0)
+
+
 def reason_local_order_credit_loss(
     candidate_delta: torch.Tensor,
     shuffled_delta: torch.Tensor,
@@ -1068,14 +1096,21 @@ def build_tida_loss_registry(
             "target_token_action_prediction",
             output["target_token_action_ordered_prediction_error"].mean(),
         )
-        registry.add(
-            "target_token_action_order",
-            F.relu(
+        if output.get("target_token_action_direct_difference_enabled", False):
+            action_order_loss = target_token_control_margin_loss(
+                output["image_action_logits"],
+                output["target_token_action_candidate_delta"],
+                output["target_token_action_repeated_candidate_delta"],
+                output["target_token_action_shuffled_candidate_delta"],
+                action_target,
+            )
+        else:
+            action_order_loss = F.relu(
                 0.02
                 + output["target_token_action_ordered_prediction_error"]
                 - action_control_error
-            ).mean(),
-        )
+            ).mean()
+        registry.add("target_token_action_order", action_order_loss)
         registry.add(
             "target_token_action_aux",
             action_macro_asl_loss(
@@ -1126,17 +1161,25 @@ def build_tida_loss_registry(
             "target_token_reason_prediction",
             (output["target_token_reason_ordered_prediction_error"] * reason_weights).mean(),
         )
-        registry.add(
-            "target_token_reason_order",
-            (
+        if output.get("target_token_reason_direct_difference_enabled", False):
+            reason_order_loss = target_token_control_margin_loss(
+                output["image_reason_logits"],
+                output["target_token_reason_candidate_delta"],
+                output["target_token_reason_repeated_candidate_delta"],
+                output["target_token_reason_shuffled_candidate_delta"],
+                reason_target,
+                negative_weight=contradiction,
+            )
+        else:
+            reason_order_loss = (
                 F.relu(
                     0.02
                     + output["target_token_reason_ordered_prediction_error"]
                     - reason_control_error
                 )
                 * reason_weights
-            ).mean(),
-        )
+            ).mean()
+        registry.add("target_token_reason_order", reason_order_loss)
         registry.add(
             "target_token_reason_aux",
             target_conditioned_pu_correction_loss(

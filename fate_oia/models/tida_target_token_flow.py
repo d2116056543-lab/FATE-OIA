@@ -22,6 +22,7 @@ class TIDATargetTokenFlow(nn.Module):
         motion_weight: float = 0.0,
         order_weight: float = 0.0,
         candidate_temperature: float | None = 1.0,
+        direct_difference_enabled: bool = False,
     ) -> None:
         super().__init__()
         if num_labels < 1 or dim < 1 or hidden_dim < 1:
@@ -47,6 +48,7 @@ class TIDATargetTokenFlow(nn.Module):
         )
         if self.candidate_temperature <= 0.0:
             raise ValueError("target-token candidate temperature must be positive")
+        self.direct_difference_enabled = bool(direct_difference_enabled)
 
         self.input_projection = nn.Linear(dim, hidden_dim)
         self.label_embedding = nn.Parameter(torch.zeros(num_labels, hidden_dim))
@@ -70,6 +72,28 @@ class TIDATargetTokenFlow(nn.Module):
         )
         self.terminal_projection = nn.Linear(hidden_dim, dim)
         self.innovation_norm = nn.LayerNorm(dim)
+        self.direct_input_projection = nn.Linear(dim, hidden_dim, bias=False)
+        self.direct_time_projection = nn.Linear(3, hidden_dim, bias=False)
+        self.direct_temporal_depthwise = nn.Conv1d(
+            hidden_dim, hidden_dim, kernel_size=3, padding=1,
+            groups=hidden_dim, bias=False,
+        )
+        direct_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=hidden_dim * 2,
+            dropout=0.0,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.direct_temporal_attention = nn.TransformerEncoder(
+            direct_layer, num_layers=1, norm=nn.LayerNorm(hidden_dim)
+        )
+        self.direct_summary_norm = nn.LayerNorm(hidden_dim)
+        self.direct_output_weight = nn.Parameter(
+            torch.zeros(num_labels, hidden_dim)
+        )
         # Each target owns its scalar direction. Zero initialization gives an
         # exact image fallback while the terminal predictor learns immediately.
         self.candidate_output_weight = nn.Parameter(torch.zeros(num_labels, dim))
@@ -165,6 +189,86 @@ class TIDATargetTokenFlow(nn.Module):
         smooth_l1 = F.smooth_l1_loss(prediction, target, reduction="none").mean(-1)
         return cosine + smooth_l1
 
+    def _direct_difference_summary(
+        self,
+        sequence: torch.Tensor,
+        timestamps: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Encode label-private changes without reusing terminal appearance."""
+        batch, frames, labels, dim = sequence.shape
+        normalized = F.layer_norm(sequence, (dim,))
+        difference = normalized[:, 1:] - normalized[:, :-1]
+        pair_valid = valid_mask[:, 1:] & valid_mask[:, :-1]
+        change_strength = difference.square().mean(-1).sqrt()
+        delta_time = timestamps[:, 1:] - timestamps[:, :-1]
+        midpoint = 0.5 * (timestamps[:, 1:] + timestamps[:, :-1])
+        time_features = torch.stack(
+            (delta_time, delta_time.square(), midpoint), dim=-1
+        )
+        hidden = self.direct_input_projection(difference)
+        hidden = hidden + self.direct_time_projection(time_features)[:, :, None] * (
+            change_strength[..., None]
+        )
+        hidden = hidden * pair_valid[:, :, None, None].to(hidden.dtype)
+        steps = frames - 1
+        flat = hidden.permute(0, 2, 3, 1).reshape(
+            batch * labels, self.hidden_dim, steps
+        )
+        hidden = hidden + self.direct_temporal_depthwise(flat).reshape(
+            batch, labels, self.hidden_dim, steps
+        ).permute(0, 3, 1, 2)
+        encoded_input = hidden.transpose(1, 2).reshape(
+            batch * labels, steps, self.hidden_dim
+        )
+        valid = pair_valid[:, None].expand(-1, labels, -1).reshape(
+            batch * labels, steps
+        )
+        safe_valid = valid.clone()
+        unavailable = ~safe_valid.any(-1)
+        safe_valid[unavailable, 0] = True
+        encoded_input = encoded_input.clone()
+        encoded_input[unavailable, 0] = 0
+        causal = torch.triu(
+            torch.ones(steps, steps, dtype=torch.bool, device=sequence.device),
+            diagonal=1,
+        )
+        encoded = self.direct_temporal_attention(
+            encoded_input, mask=causal, src_key_padding_mask=~safe_valid
+        )
+        valid_float = valid.to(encoded.dtype)
+        mean = (encoded * valid_float[..., None]).sum(1) / valid_float.sum(
+            1, keepdim=True
+        ).clamp_min(1.0)
+        positions = torch.arange(steps, device=sequence.device)[None]
+        last_index = positions.expand_as(safe_valid).masked_fill(
+            ~safe_valid, -1
+        ).amax(-1).clamp_min(0)
+        last = encoded[torch.arange(batch * labels, device=sequence.device), last_index]
+        summary = self.direct_summary_norm(mean + last).reshape(
+            batch, labels, self.hidden_dim
+        )
+        has_change = (
+            (change_strength * pair_valid[:, :, None].to(change_strength.dtype))
+            .sum(1)
+            .gt(1e-8)
+        )
+        return summary * has_change[..., None].to(summary.dtype)
+
+    def _direct_difference_score(
+        self,
+        history: torch.Tensor,
+        terminal: torch.Tensor,
+        timestamps: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        sequence = torch.cat((history, terminal[:, None]), dim=1)
+        summary = self._direct_difference_summary(sequence, timestamps, valid_mask)
+        score = torch.einsum(
+            "blh,lh->bl", summary, self.direct_output_weight
+        ) / math.sqrt(self.hidden_dim)
+        return score, summary
+
     @torch.no_grad()
     def set_deployment_policy(
         self,
@@ -236,68 +340,126 @@ class TIDATargetTokenFlow(nn.Module):
         available = history_valid.any(-1)
         target = terminal_tokens.detach()
         base = base_logits.detach()
-        ordered = self._predict(
-            history_tokens, timestamps[:, :frames], history_valid
-        )
-        reversed_prediction = self._predict(
-            history_tokens.flip(1), timestamps[:, :frames], history_valid.flip(1)
-        )
         repeated_history = self._last_valid_repeat(history_tokens, history_valid)
-        repeated_prediction = self._predict(
-            repeated_history, timestamps[:, :frames], history_valid
-        )
         shuffle_index = torch.cat(
             (
                 torch.arange(1, frames, 2, device=history_tokens.device),
                 torch.arange(0, frames, 2, device=history_tokens.device),
             )
         )
-        shuffled_prediction = self._predict(
-            history_tokens[:, shuffle_index],
-            timestamps[:, :frames],
-            history_valid[:, shuffle_index],
+        availability = available[:, None].to(history_tokens.dtype)
+        if self.direct_difference_enabled:
+            # Direct mode has no terminal-reconstruction proxy. Keep explicit
+            # zero placeholders for the legacy artifact schema without paying
+            # for four unrelated predictor forwards.
+            ordered = torch.zeros_like(target)
+            reversed_prediction = torch.zeros_like(target)
+            repeated_prediction = torch.zeros_like(target)
+            shuffled_prediction = torch.zeros_like(target)
+            innovation_score = torch.zeros_like(base)
+            motion_score = torch.zeros_like(base)
+            order_score = torch.zeros_like(base)
+        else:
+            ordered = self._predict(
+                history_tokens, timestamps[:, :frames], history_valid
+            )
+            reversed_prediction = self._predict(
+                history_tokens.flip(1), timestamps[:, :frames], history_valid.flip(1)
+            )
+            repeated_prediction = self._predict(
+                repeated_history, timestamps[:, :frames], history_valid
+            )
+            shuffled_prediction = self._predict(
+                history_tokens[:, shuffle_index],
+                timestamps[:, :frames],
+                history_valid[:, shuffle_index],
+            )
+            innovation = self.innovation_norm(target - ordered)
+            motion = F.layer_norm(ordered - repeated_prediction, (self.dim,))
+            order = F.layer_norm(ordered - shuffled_prediction, (self.dim,))
+            innovation_score = torch.einsum(
+                "bld,ld->bl", innovation, self.candidate_output_weight
+            ) / self.candidate_temperature
+            motion_score = torch.einsum(
+                "bld,ld->bl", motion, self.candidate_output_weight
+            ) / self.candidate_temperature
+            order_score = torch.einsum(
+                "bld,ld->bl", order, self.candidate_output_weight
+            ) / self.candidate_temperature
+        repeated_candidate_delta = torch.zeros_like(base)
+        shuffled_candidate_delta = torch.zeros_like(base)
+        direct_summary = torch.zeros(
+            batch, labels, self.hidden_dim,
+            device=history_tokens.device, dtype=history_tokens.dtype,
         )
-        availability = available[:, None].to(ordered.dtype)
-        innovation = self.innovation_norm(target - ordered)
-        motion = F.layer_norm(ordered - repeated_prediction, (self.dim,))
-        order = F.layer_norm(ordered - shuffled_prediction, (self.dim,))
-        innovation_score = torch.einsum(
-            "bld,ld->bl", innovation, self.candidate_output_weight
-        ) / self.candidate_temperature
-        motion_score = torch.einsum(
-            "bld,ld->bl", motion, self.candidate_output_weight
-        ) / self.candidate_temperature
-        order_score = torch.einsum(
-            "bld,ld->bl", order, self.candidate_output_weight
-        ) / self.candidate_temperature
-        raw_delta = (
-            self.innovation_weight * innovation_score
-            + self.motion_weight * motion_score
-            + self.order_weight * order_score
-        )
+        direct_ordered_score = torch.zeros_like(base)
+        direct_repeated_score = torch.zeros_like(base)
+        direct_shuffled_score = torch.zeros_like(base)
+        if self.direct_difference_enabled:
+            direct_ordered_score, direct_summary = self._direct_difference_score(
+                history_tokens, target, timestamps, valid_mask
+            )
+            direct_repeated_score, _ = self._direct_difference_score(
+                repeated_history, target, timestamps, valid_mask
+            )
+            direct_shuffled_score, _ = self._direct_difference_score(
+                history_tokens[:, shuffle_index], target, timestamps,
+                torch.cat((history_valid[:, shuffle_index], valid_mask[:, -1:]), dim=1),
+            )
+            raw_delta = direct_ordered_score
+        else:
+            raw_delta = (
+                self.innovation_weight * innovation_score
+                + self.motion_weight * motion_score
+                + self.order_weight * order_score
+            )
         scale = torch.as_tensor(
             temporal_scale, device=raw_delta.device, dtype=raw_delta.dtype
         )
         candidate_delta = (
             availability * scale * self.cap * torch.tanh(raw_delta)
         ).clamp(-self.cap, self.cap)
+        if self.direct_difference_enabled:
+            repeated_candidate_delta = (
+                availability * scale * self.cap * torch.tanh(direct_repeated_score)
+            ).clamp(-self.cap, self.cap)
+            shuffled_candidate_delta = (
+                availability * scale * self.cap * torch.tanh(direct_shuffled_score)
+            ).clamp(-self.cap, self.cap)
         centered_candidate_delta = candidate_delta - self.deployment_center[None]
 
-        ordered_error = self._prediction_error(ordered, target)
-        reversed_error = self._prediction_error(reversed_prediction, target)
-        repeated_error = self._prediction_error(repeated_prediction, target)
-        shuffled_error = self._prediction_error(shuffled_prediction, target)
-        utility_features = torch.stack(
-            (
-                base,
-                base.abs(),
-                centered_candidate_delta.detach(),
-                centered_candidate_delta.detach().abs(),
-                ordered_error.detach(),
-                (reversed_error - ordered_error).detach(),
-            ),
-            dim=-1,
-        )
+        if self.direct_difference_enabled:
+            ordered_error = direct_ordered_score.detach().abs()
+            reversed_error = direct_shuffled_score.detach().abs()
+            repeated_error = direct_repeated_score.detach().abs()
+            shuffled_error = direct_shuffled_score.detach().abs()
+            utility_features = torch.stack(
+                (
+                    base,
+                    base.abs(),
+                    centered_candidate_delta.detach(),
+                    centered_candidate_delta.detach().abs(),
+                    (direct_ordered_score - direct_repeated_score).detach(),
+                    (direct_ordered_score - direct_shuffled_score).detach(),
+                ),
+                dim=-1,
+            )
+        else:
+            ordered_error = self._prediction_error(ordered, target)
+            reversed_error = self._prediction_error(reversed_prediction, target)
+            repeated_error = self._prediction_error(repeated_prediction, target)
+            shuffled_error = self._prediction_error(shuffled_prediction, target)
+            utility_features = torch.stack(
+                (
+                    base,
+                    base.abs(),
+                    centered_candidate_delta.detach(),
+                    centered_candidate_delta.detach().abs(),
+                    ordered_error.detach(),
+                    (reversed_error - ordered_error).detach(),
+                ),
+                dim=-1,
+            )
         utility_logit = self.utility(utility_features).squeeze(-1)
         utility_probability = utility_logit.sigmoid()
         deployment_utility = torch.where(
@@ -314,6 +476,7 @@ class TIDATargetTokenFlow(nn.Module):
             deploy_gate * self.deployment_scale[None] * centered_candidate_delta
         ).clamp(-self.cap, self.cap)
         return {
+            "direct_difference_enabled": self.direct_difference_enabled,
             "predicted_terminal_token": ordered,
             "reversed_predicted_terminal_token": reversed_prediction,
             "repeated_predicted_terminal_token": repeated_prediction,
@@ -325,6 +488,12 @@ class TIDATargetTokenFlow(nn.Module):
             "candidate_innovation_score": innovation_score,
             "candidate_motion_score": motion_score,
             "candidate_order_score": order_score,
+            "direct_temporal_summary": direct_summary,
+            "direct_ordered_score": direct_ordered_score,
+            "direct_repeated_score": direct_repeated_score,
+            "direct_shuffled_score": direct_shuffled_score,
+            "repeated_candidate_delta": repeated_candidate_delta,
+            "shuffled_candidate_delta": shuffled_candidate_delta,
             "candidate_logits": base + candidate_delta,
             "centered_candidate_delta": centered_candidate_delta,
             "centered_candidate_logits": base + centered_candidate_delta,
