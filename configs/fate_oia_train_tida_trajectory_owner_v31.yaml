@@ -1,5 +1,5 @@
 experiment:
-  name: tida_trajectory_owner_v31
+  name: tida_trajectory_state_owner_v32
   direct_video: true
   eval_splits: [test]
   diagnostic_eval_splits: []
@@ -105,7 +105,13 @@ model:
   traffic_trajectory_deploy_enabled: true
   traffic_trajectory_cap: 0.08
   traffic_trajectory_heads: 4
-  traffic_trajectory_state_enabled: false
+  # V31's strictly odd ordered-minus-reversed residual had a tiny oracle
+  # ceiling. Add the bounded geometry state path so speed, acceleration and
+  # interaction risk can help without assuming reverse time is the opposite class.
+  traffic_trajectory_state_enabled: true
+  traffic_trajectory_state_strength_scale: 8.0
+  traffic_trajectory_state_cap_ratio: 0.5
+  traffic_trajectory_state_utility_open_prior: 0.10
   relational_traffic_enabled: false
   relational_event_conditioning_enabled: false
   reason_local_query_enabled: false
