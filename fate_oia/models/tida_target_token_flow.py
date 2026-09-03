@@ -269,6 +269,34 @@ class TIDATargetTokenFlow(nn.Module):
         ) / math.sqrt(self.hidden_dim)
         return score, summary
 
+    @staticmethod
+    def _control_center_scores(
+        ordered: torch.Tensor,
+        repeated: torch.Tensor,
+        shuffled: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Remove evidence shared by the real clip and both controls."""
+        return (
+            ordered - 0.5 * (repeated + shuffled),
+            repeated - 0.5 * (ordered + shuffled),
+            shuffled - 0.5 * (ordered + repeated),
+        )
+
+    @staticmethod
+    def _destructive_shuffle_index(
+        frames: int, device: torch.device
+    ) -> torch.Tensor:
+        """Alternate newest/oldest frames so smooth forward order is removed."""
+        order: list[int] = []
+        low, high = 0, int(frames) - 1
+        while low <= high:
+            order.append(high)
+            high -= 1
+            if low <= high:
+                order.append(low)
+                low += 1
+        return torch.tensor(order, dtype=torch.long, device=device)
+
     @torch.no_grad()
     def set_deployment_policy(
         self,
@@ -347,6 +375,9 @@ class TIDATargetTokenFlow(nn.Module):
                 torch.arange(0, frames, 2, device=history_tokens.device),
             )
         )
+        direct_shuffle_index = self._destructive_shuffle_index(
+            frames, history_tokens.device
+        )
         availability = available[:, None].to(history_tokens.dtype)
         if self.direct_difference_enabled:
             # Direct mode has no terminal-reconstruction proxy. Keep explicit
@@ -403,8 +434,23 @@ class TIDATargetTokenFlow(nn.Module):
                 repeated_history, target, timestamps, valid_mask
             )
             direct_shuffled_score, _ = self._direct_difference_score(
-                history_tokens[:, shuffle_index], target, timestamps,
-                torch.cat((history_valid[:, shuffle_index], valid_mask[:, -1:]), dim=1),
+                history_tokens[:, direct_shuffle_index], target, timestamps,
+                torch.cat(
+                    (
+                        history_valid[:, direct_shuffle_index],
+                        valid_mask[:, -1:],
+                    ),
+                    dim=1,
+                ),
+            )
+            (
+                direct_ordered_score,
+                direct_repeated_score,
+                direct_shuffled_score,
+            ) = self._control_center_scores(
+                direct_ordered_score,
+                direct_repeated_score,
+                direct_shuffled_score,
             )
             raw_delta = direct_ordered_score
         else:

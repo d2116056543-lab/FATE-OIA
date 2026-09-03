@@ -83,6 +83,35 @@ def test_direct_difference_ignores_unavailable_history():
     assert torch.count_nonzero(output["candidate_delta"]) == 0
 
 
+def test_direct_difference_control_centering_removes_shared_video_bias():
+    common = torch.randn(3, 4)
+    ordered, repeated, shuffled = TIDATargetTokenFlow._control_center_scores(
+        common, common, common
+    )
+
+    assert torch.count_nonzero(ordered) == 0
+    assert torch.count_nonzero(repeated) == 0
+    assert torch.count_nonzero(shuffled) == 0
+
+    ordered_raw = torch.randn(3, 4)
+    repeated_raw = torch.randn(3, 4)
+    shuffled_raw = torch.randn(3, 4)
+    ordered, repeated, shuffled = TIDATargetTokenFlow._control_center_scores(
+        ordered_raw, repeated_raw, shuffled_raw
+    )
+    assert torch.allclose(
+        ordered + repeated + shuffled, torch.zeros_like(ordered), atol=1e-6
+    )
+
+
+def test_direct_difference_shuffle_destroys_local_forward_order():
+    index = TIDATargetTokenFlow._destructive_shuffle_index(14, torch.device("cpu"))
+
+    assert sorted(index.tolist()) == list(range(14))
+    forward_neighbors = (index[1:] - index[:-1]).eq(1).sum()
+    assert int(forward_neighbors) == 0
+
+
 def test_model_constructor_surfaces_direct_difference_mode():
     parameters = inspect.signature(TIDAOIAModel.__init__).parameters
     assert "target_token_direct_difference_enabled" in parameters
