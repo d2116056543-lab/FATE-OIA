@@ -18,6 +18,10 @@ class TIDATargetTokenFlow(nn.Module):
         num_heads: int = 4,
         cap: float = 0.05,
         utility_open_prior: float = 0.10,
+        innovation_weight: float = 1.0,
+        motion_weight: float = 0.0,
+        order_weight: float = 0.0,
+        candidate_temperature: float | None = 1.0,
     ) -> None:
         super().__init__()
         if num_labels < 1 or dim < 1 or hidden_dim < 1:
@@ -30,6 +34,19 @@ class TIDATargetTokenFlow(nn.Module):
         self.dim = int(dim)
         self.hidden_dim = int(hidden_dim)
         self.cap = float(cap)
+        branch_weights = (innovation_weight, motion_weight, order_weight)
+        if any(float(value) < 0.0 for value in branch_weights) or not any(
+            float(value) > 0.0 for value in branch_weights
+        ):
+            raise ValueError("target-token feature weights must be non-negative and non-zero")
+        self.innovation_weight = float(innovation_weight)
+        self.motion_weight = float(motion_weight)
+        self.order_weight = float(order_weight)
+        self.candidate_temperature = float(
+            math.sqrt(dim) if candidate_temperature is None else candidate_temperature
+        )
+        if self.candidate_temperature <= 0.0:
+            raise ValueError("target-token candidate temperature must be positive")
 
         self.input_projection = nn.Linear(dim, hidden_dim)
         self.label_embedding = nn.Parameter(torch.zeros(num_labels, hidden_dim))
@@ -242,8 +259,21 @@ class TIDATargetTokenFlow(nn.Module):
         )
         availability = available[:, None].to(ordered.dtype)
         innovation = self.innovation_norm(target - ordered)
-        raw_delta = torch.einsum(
+        motion = F.layer_norm(ordered - repeated_prediction, (self.dim,))
+        order = F.layer_norm(ordered - shuffled_prediction, (self.dim,))
+        innovation_score = torch.einsum(
             "bld,ld->bl", innovation, self.candidate_output_weight
+        ) / self.candidate_temperature
+        motion_score = torch.einsum(
+            "bld,ld->bl", motion, self.candidate_output_weight
+        ) / self.candidate_temperature
+        order_score = torch.einsum(
+            "bld,ld->bl", order, self.candidate_output_weight
+        ) / self.candidate_temperature
+        raw_delta = (
+            self.innovation_weight * innovation_score
+            + self.motion_weight * motion_score
+            + self.order_weight * order_score
         )
         scale = torch.as_tensor(
             temporal_scale, device=raw_delta.device, dtype=raw_delta.dtype
@@ -290,6 +320,11 @@ class TIDATargetTokenFlow(nn.Module):
             "shuffled_predicted_terminal_token": shuffled_prediction,
             "terminal_target_token": target,
             "candidate_delta": candidate_delta,
+            "candidate_pre_tanh": raw_delta,
+            "candidate_saturation": (raw_delta.abs() >= 2.0).to(raw_delta.dtype),
+            "candidate_innovation_score": innovation_score,
+            "candidate_motion_score": motion_score,
+            "candidate_order_score": order_score,
             "candidate_logits": base + candidate_delta,
             "centered_candidate_delta": centered_candidate_delta,
             "centered_candidate_logits": base + centered_candidate_delta,

@@ -1023,6 +1023,18 @@ def build_runtime(args: Any, evaluation_only: bool = False) -> TIDARuntime:
         target_token_flow_utility_open_prior=float(
             config["model"].get("target_token_flow_utility_open_prior", 0.10)
         ),
+        target_token_flow_innovation_weight=float(
+            config["model"].get("target_token_flow_innovation_weight", 1.0)
+        ),
+        target_token_flow_motion_weight=float(
+            config["model"].get("target_token_flow_motion_weight", 0.0)
+        ),
+        target_token_flow_order_weight=float(
+            config["model"].get("target_token_flow_order_weight", 0.0)
+        ),
+        target_token_flow_candidate_temperature=float(
+            config["model"].get("target_token_flow_candidate_temperature", 1.0)
+        ),
         legacy_semantic_routes_enabled=bool(
             config["model"].get("legacy_semantic_routes_enabled", True)
         ),
@@ -1840,7 +1852,9 @@ def calibrate_target_token_flow_deployment(model, calib_rows, deployment_config)
             fold_degradation_tolerance=float(deployment_config.get(
                 "target_token_policy_fold_degradation_tolerance", 0.002
             )),
-            allow_proper_score_tie=False,
+            allow_proper_score_tie=bool(deployment_config.get(
+                f"target_token_{branch}_policy_allow_proper_score_tie", False
+            )),
             invert_utility_for_negative_scale=True,
             cap=float(reader.cap),
         )

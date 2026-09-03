@@ -258,6 +258,10 @@ class TIDAOIAModel(nn.Module):
         target_token_flow_action_cap: float = 0.05,
         target_token_flow_reason_cap: float = 0.04,
         target_token_flow_utility_open_prior: float = 0.10,
+        target_token_flow_innovation_weight: float = 1.0,
+        target_token_flow_motion_weight: float = 0.0,
+        target_token_flow_order_weight: float = 0.0,
+        target_token_flow_candidate_temperature: float = 1.0,
         legacy_semantic_routes_enabled: bool = True,
     ) -> None:
         super().__init__()
@@ -360,6 +364,10 @@ class TIDAOIAModel(nn.Module):
             hidden_dim=target_token_flow_hidden_dim,
             cap=target_token_flow_action_cap,
             utility_open_prior=target_token_flow_utility_open_prior,
+            innovation_weight=target_token_flow_innovation_weight,
+            motion_weight=target_token_flow_motion_weight,
+            order_weight=target_token_flow_order_weight,
+            candidate_temperature=target_token_flow_candidate_temperature,
         )
         self.target_token_reason = TIDATargetTokenFlow(
             num_labels=num_reasons,
@@ -367,6 +375,10 @@ class TIDAOIAModel(nn.Module):
             hidden_dim=target_token_flow_hidden_dim,
             cap=target_token_flow_reason_cap,
             utility_open_prior=target_token_flow_utility_open_prior,
+            innovation_weight=target_token_flow_innovation_weight,
+            motion_weight=target_token_flow_motion_weight,
+            order_weight=target_token_flow_order_weight,
+            candidate_temperature=target_token_flow_candidate_temperature,
         )
         if not self.target_token_flow_enabled:
             for module in (self.target_token_action, self.target_token_reason):

@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import torch
 
+import fate_oia.engine.train_tida_oia as train_engine
 from fate_oia.engine.train_tida_oia import calibrate_target_token_flow_deployment
 from fate_oia.models.tida_target_token_flow import TIDATargetTokenFlow
 
@@ -51,3 +52,49 @@ def test_target_token_policy_uses_train_calib_and_keeps_zero_fallback():
     assert not torch.count_nonzero(model.target_token_reason.deployment_label_gate)
     assert not torch.count_nonzero(model.target_token_action.deployment_scale)
     assert not torch.count_nonzero(model.target_token_reason.deployment_scale)
+
+
+def test_target_token_policy_forwards_train_calib_proper_score_tie_setting(monkeypatch):
+    captured = []
+
+    def fake_fit(base_logits, *_args, **kwargs):
+        captured.append(kwargs["allow_proper_score_tie"])
+        labels = base_logits.shape[1]
+        zero = base_logits.new_zeros(labels)
+        return {
+            "gate": zero,
+            "scale": zero,
+            "cutoff": zero,
+            "utility_inverted": zero,
+        }
+
+    monkeypatch.setattr(train_engine, "fit_object_intent_utility_policy_oof", fake_fit)
+    action_target = torch.zeros(10, 4)
+    reason_target = torch.zeros(10, 21)
+    calib = {
+        "action_target": action_target,
+        "reason_target": reason_target,
+        "image_action": action_target.clone(),
+        "image_reason": reason_target.clone(),
+        "video_action": action_target.clone(),
+        "video_reason": reason_target.clone(),
+        "target_token_action_candidate_delta": action_target.clone(),
+        "target_token_reason_candidate_delta": reason_target.clone(),
+        "target_token_action_utility_probability": action_target.clone(),
+        "target_token_reason_utility_probability": reason_target.clone(),
+    }
+    model = SimpleNamespace(
+        target_token_flow_enabled=True,
+        target_token_action=TIDATargetTokenFlow(4, dim=4, hidden_dim=4),
+        target_token_reason=TIDATargetTokenFlow(21, dim=4, hidden_dim=4),
+    )
+    deployment = {
+        "locked_image_thresholds": [0.5] * 25,
+        "locked_image_threshold_source": "train_calib_fixture",
+        "target_token_action_policy_allow_proper_score_tie": True,
+        "target_token_reason_policy_allow_proper_score_tie": False,
+    }
+
+    train_engine.calibrate_target_token_flow_deployment(model, calib, deployment)
+
+    assert captured == [True, False]

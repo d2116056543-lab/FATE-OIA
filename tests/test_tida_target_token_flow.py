@@ -1,4 +1,5 @@
 import torch
+from types import MethodType
 
 from fate_oia.models.tida_target_token_flow import TIDATargetTokenFlow
 
@@ -105,3 +106,51 @@ def test_target_token_flow_does_not_backpropagate_into_frozen_token_sources():
     assert history.grad is None
     assert terminal.grad is None
     assert logits.grad is None
+
+
+def test_target_token_flow_keeps_order_signal_when_terminal_prediction_is_exact():
+    reader = TIDATargetTokenFlow(
+        num_labels=4,
+        dim=16,
+        hidden_dim=16,
+        cap=0.05,
+        innovation_weight=0.0,
+        motion_weight=1.0,
+        order_weight=1.0,
+    )
+    history, terminal, logits, timestamps, valid = _inputs()
+    predictions = [
+        terminal,
+        terminal,
+        terminal.roll(1, dims=-1),
+        terminal.roll(2, dims=-1),
+    ]
+
+    def fixed_predictions(self, *_args):
+        return predictions.pop(0)
+
+    reader._predict = MethodType(fixed_predictions, reader)
+    with torch.no_grad():
+        reader.candidate_output_weight.copy_(
+            torch.linspace(-0.5, 0.5, 16).expand(4, -1)
+        )
+    output = reader(history, terminal, timestamps, valid, base_logits=logits)
+
+    assert torch.count_nonzero(output["candidate_innovation_score"]) == 0
+    assert torch.count_nonzero(output["candidate_motion_score"]) > 0
+    assert torch.count_nonzero(output["candidate_order_score"]) > 0
+    assert torch.count_nonzero(output["candidate_delta"]) > 0
+
+
+def test_target_token_flow_reports_finite_saturation_diagnostics():
+    reader = TIDATargetTokenFlow(num_labels=4, dim=16, hidden_dim=16, cap=0.05)
+    history, terminal, logits, timestamps, valid = _inputs()
+    with torch.no_grad():
+        reader.candidate_output_weight.normal_(std=0.25)
+
+    output = reader(history, terminal, timestamps, valid, base_logits=logits)
+
+    assert output["candidate_pre_tanh"].shape == logits.shape
+    assert output["candidate_saturation"].shape == logits.shape
+    assert torch.isfinite(output["candidate_pre_tanh"]).all()
+    assert torch.all((output["candidate_saturation"] >= 0) & (output["candidate_saturation"] <= 1))

@@ -232,6 +232,11 @@ def collect_tida_outputs(
         })
         diagnostics.update({key: [] for key in (
             "target_token_action_candidate_delta",
+            "target_token_action_candidate_pre_tanh",
+            "target_token_action_candidate_saturation",
+            "target_token_action_candidate_innovation_score",
+            "target_token_action_candidate_motion_score",
+            "target_token_action_candidate_order_score",
             "target_token_action_deploy_delta",
             "target_token_action_deploy_gate",
             "target_token_action_utility_probability",
@@ -240,6 +245,11 @@ def collect_tida_outputs(
             "target_token_action_repeated_prediction_error",
             "target_token_action_shuffled_prediction_error",
             "target_token_reason_candidate_delta",
+            "target_token_reason_candidate_pre_tanh",
+            "target_token_reason_candidate_saturation",
+            "target_token_reason_candidate_innovation_score",
+            "target_token_reason_candidate_motion_score",
+            "target_token_reason_candidate_order_score",
             "target_token_reason_deploy_delta",
             "target_token_reason_deploy_gate",
             "target_token_reason_utility_probability",
@@ -598,6 +608,9 @@ def collect_tida_outputs(
             for prefix in ("target_token_action", "target_token_reason"):
                 for suffix in (
                     "candidate_delta", "deploy_delta", "deploy_gate",
+                    "candidate_pre_tanh", "candidate_saturation",
+                    "candidate_innovation_score", "candidate_motion_score",
+                    "candidate_order_score",
                     "utility_probability", "ordered_prediction_error",
                     "reversed_prediction_error", "repeated_prediction_error",
                     "shuffled_prediction_error",
@@ -971,6 +984,15 @@ def target_token_flow_effectiveness_metrics(
                 float(utility.mean()) if utility is not None else None
             ),
         }
+        for suffix in (
+            "candidate_pre_tanh", "candidate_saturation",
+            "candidate_innovation_score", "candidate_motion_score",
+            "candidate_order_score",
+        ):
+            value = rows.get(f"{prefix}_{suffix}")
+            if value is not None:
+                result[f"{suffix}_mean"] = float(value.float().mean())
+                result[f"{suffix}_abs_mean"] = float(value.float().abs().mean())
         if utility is not None:
             helpful = candidate_signed > 0
             supervised = torch.ones_like(helpful, dtype=torch.bool)
@@ -1914,12 +1936,18 @@ def save_epoch_outputs(
         "target_token_action_deploy", "target_token_reason_candidate",
         "target_token_reason_centered_candidate", "target_token_reason_deploy",
         "target_token_action_candidate_delta", "target_token_action_deploy_delta",
+        "target_token_action_candidate_pre_tanh", "target_token_action_candidate_saturation",
+        "target_token_action_candidate_innovation_score",
+        "target_token_action_candidate_motion_score", "target_token_action_candidate_order_score",
         "target_token_action_deploy_gate", "target_token_action_utility_probability",
         "target_token_action_ordered_prediction_error",
         "target_token_action_reversed_prediction_error",
         "target_token_action_repeated_prediction_error",
         "target_token_action_shuffled_prediction_error",
         "target_token_reason_candidate_delta", "target_token_reason_deploy_delta",
+        "target_token_reason_candidate_pre_tanh", "target_token_reason_candidate_saturation",
+        "target_token_reason_candidate_innovation_score",
+        "target_token_reason_candidate_motion_score", "target_token_reason_candidate_order_score",
         "target_token_reason_deploy_gate", "target_token_reason_utility_probability",
         "target_token_reason_ordered_prediction_error",
         "target_token_reason_reversed_prediction_error",
