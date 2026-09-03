@@ -93,6 +93,7 @@ model:
   target_token_flow_motion_weight: 0.50
   target_token_flow_order_weight: 0.50
   target_token_flow_candidate_temperature: 19.59591794
+  target_token_flow_independent_scale: true
   geometric_flow_enabled: false
   traffic_action_enabled: false
   traffic_trajectory_enabled: false

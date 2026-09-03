@@ -262,6 +262,7 @@ class TIDAOIAModel(nn.Module):
         target_token_flow_motion_weight: float = 0.0,
         target_token_flow_order_weight: float = 0.0,
         target_token_flow_candidate_temperature: float = 1.0,
+        target_token_flow_independent_scale: bool = False,
         legacy_semantic_routes_enabled: bool = True,
     ) -> None:
         super().__init__()
@@ -358,6 +359,9 @@ class TIDAOIAModel(nn.Module):
                 for parameter in module.parameters():
                     parameter.requires_grad = False
         self.target_token_flow_enabled = bool(target_token_flow_enabled)
+        self.target_token_flow_independent_scale = bool(
+            target_token_flow_independent_scale
+        )
         self.target_token_action = TIDATargetTokenFlow(
             num_labels=num_actions,
             dim=dim,
@@ -718,13 +722,19 @@ class TIDAOIAModel(nn.Module):
     ) -> dict[str, Any]:
         if not self.target_token_flow_enabled:
             return output
+        action_scale = (
+            1.0 if self.target_token_flow_independent_scale else temporal_action_scale
+        )
+        reason_scale = (
+            1.0 if self.target_token_flow_independent_scale else temporal_reason_scale
+        )
         action = self.target_token_action(
             history_action_tokens,
             terminal_action_tokens,
             timestamps,
             frame_valid_mask,
             base_logits=output["video_action_logits"],
-            temporal_scale=temporal_action_scale,
+            temporal_scale=action_scale,
         )
         reason = self.target_token_reason(
             history_reason_tokens,
@@ -732,7 +742,7 @@ class TIDAOIAModel(nn.Module):
             timestamps,
             frame_valid_mask,
             base_logits=output["video_reason_logits"],
-            temporal_scale=temporal_reason_scale,
+            temporal_scale=reason_scale,
         )
         action_delta = action["deploy_delta"]
         reason_delta = reason["deploy_delta"]

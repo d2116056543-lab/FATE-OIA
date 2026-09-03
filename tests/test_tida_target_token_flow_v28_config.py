@@ -17,6 +17,7 @@ def test_v28_keeps_the_strong_image_contract_and_uses_non_self_cancelling_flow()
     assert model["target_token_flow_motion_weight"] == 0.50
     assert model["target_token_flow_order_weight"] == 0.50
     assert 19.5 < model["target_token_flow_candidate_temperature"] < 19.7
+    assert model["target_token_flow_independent_scale"] is True
     assert config["deployment"]["target_token_action_policy_allow_proper_score_tie"] is True
     assert config["deployment"]["target_token_reason_policy_allow_proper_score_tie"] is False
     assert config["training"]["target_token_predictive_epochs"] == 0
