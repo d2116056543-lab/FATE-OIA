@@ -221,6 +221,8 @@ class TIDAOIAModel(nn.Module):
         traffic_trajectory_state_strength_scale: float = 8.0,
         traffic_trajectory_state_cap_ratio: float = 1.0,
         traffic_trajectory_state_utility_open_prior: float = 0.10,
+        traffic_trajectory_credit_mode: str = "ordered_vs_reverse",
+        traffic_trajectory_static_utility_open_prior: float = 0.10,
         relational_traffic_enabled: bool = False,
         relational_traffic_action_cap: float = 0.12,
         relational_traffic_reason_cap: float = 0.10,
@@ -464,6 +466,8 @@ class TIDAOIAModel(nn.Module):
             state_strength_scale=traffic_trajectory_state_strength_scale,
             state_cap_ratio=traffic_trajectory_state_cap_ratio,
             state_utility_open_prior=traffic_trajectory_state_utility_open_prior,
+            credit_mode=traffic_trajectory_credit_mode,
+            static_utility_open_prior=traffic_trajectory_static_utility_open_prior,
         )
         self.relational_traffic_enabled = bool(relational_traffic_enabled)
         self.relational_traffic = TIDARelationalTrafficFlow(
@@ -588,6 +592,7 @@ class TIDAOIAModel(nn.Module):
                 for module in (
                     self.traffic_trajectory_head.utility_projection,
                     self.traffic_trajectory_head.state_utility_projection,
+                    self.traffic_trajectory_head.static_utility_projection,
                 )
                 for parameter in module.parameters()
             }
@@ -600,6 +605,7 @@ class TIDAOIAModel(nn.Module):
                 for module in (
                     self.traffic_trajectory_head.utility_projection,
                     self.traffic_trajectory_head.state_utility_projection,
+                    self.traffic_trajectory_head.static_utility_projection,
                 )
                 for parameter in module.parameters()
                 if parameter.requires_grad

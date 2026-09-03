@@ -933,6 +933,12 @@ def build_runtime(args: Any, evaluation_only: bool = False) -> TIDARuntime:
         ),
         traffic_trajectory_cap=float(config["model"].get("traffic_trajectory_cap", 0.08)),
         traffic_trajectory_heads=int(config["model"].get("traffic_trajectory_heads", 4)),
+        traffic_trajectory_credit_mode=str(
+            config["model"].get("traffic_trajectory_credit_mode", "ordered_vs_reverse")
+        ),
+        traffic_trajectory_static_utility_open_prior=float(
+            config["model"].get("traffic_trajectory_static_utility_open_prior", 0.10)
+        ),
         traffic_trajectory_state_enabled=bool(
             config["model"].get("traffic_trajectory_state_enabled", True)
         ),

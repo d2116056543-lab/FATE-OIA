@@ -276,3 +276,48 @@ def test_motion_state_uses_an_independent_conservatively_initialized_utility_gat
         out["traffic_trajectory_state_effective_delta"],
         out["traffic_trajectory_state_utility_gate"] * out["traffic_trajectory_state_delta"],
     )
+
+
+def test_static_control_credit_is_exactly_zero_for_repeated_terminal_history():
+    args = list(_inputs(batch=1, tracks=3, frames=5))
+    args[1] = args[1][..., -1:, :].expand_as(args[1]).clone()
+    args[2] = args[2][..., -1:, :].expand_as(args[2]).clone()
+    args[5] = torch.zeros_like(args[5])
+    args[6] = torch.zeros_like(args[6])
+    head = TIDATrafficTrajectoryHead(
+        dim=16, num_actions=4, num_heads=4,
+        state_enabled=False, credit_mode="ordered_vs_static",
+    )
+    with torch.no_grad():
+        head.static_output.weight.fill_(0.05)
+        head.static_output.bias.fill_(0.75)
+    out = head(*args, base_action_logits=torch.zeros(1, 4))
+    assert torch.allclose(out["traffic_trajectory_credit_logit"], torch.zeros(1, 4), atol=1e-7)
+    assert torch.allclose(out["traffic_trajectory_delta"], torch.zeros(1, 4), atol=1e-7)
+
+
+def test_static_control_credit_uses_real_history_instead_of_reverse_as_opposite_label():
+    args = _inputs(batch=1, tracks=3, frames=5)
+    head = TIDATrafficTrajectoryHead(
+        dim=16, num_actions=4, num_heads=4,
+        state_enabled=False, credit_mode="ordered_vs_static",
+    )
+    with torch.no_grad():
+        head.static_output.weight.fill_(0.05)
+    out = head(*args, base_action_logits=torch.zeros(1, 4))
+    assert torch.count_nonzero(out["traffic_trajectory_credit_logit"].abs() > 1e-7) > 0
+    assert torch.count_nonzero(out["traffic_trajectory_candidate_delta"].abs() > 1e-9) > 0
+    assert torch.count_nonzero(out["traffic_trajectory_control_delta"]) == 0
+
+
+def test_static_control_zero_initialized_output_receives_first_step_gradient():
+    args = _inputs(batch=1, tracks=3, frames=5)
+    head = TIDATrafficTrajectoryHead(
+        dim=16, num_actions=4, num_heads=4,
+        state_enabled=False, credit_mode="ordered_vs_static",
+    )
+    out = head(*args, base_action_logits=torch.zeros(1, 4))
+    assert torch.count_nonzero(out["traffic_trajectory_delta"]) == 0
+    out["traffic_trajectory_candidate_delta"].sum().backward()
+    assert head.static_output.weight.grad is not None
+    assert head.static_output.weight.grad.abs().sum() > 0

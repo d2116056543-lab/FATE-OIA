@@ -105,10 +105,12 @@ model:
   traffic_trajectory_deploy_enabled: true
   traffic_trajectory_cap: 0.08
   traffic_trajectory_heads: 4
-  # V31's strictly odd ordered-minus-reversed residual had a tiny oracle
-  # ceiling. Add the bounded geometry state path so speed, acceleration and
-  # interaction risk can help without assuming reverse time is the opposite class.
-  traffic_trajectory_state_enabled: true
+  # Terminal decisions persist under reversed playback, so reverse is not a
+  # valid opposite-label control. Credit only information absent from a
+  # repeated-terminal clip and keep the failed V32 direct state path disabled.
+  traffic_trajectory_credit_mode: ordered_vs_static
+  traffic_trajectory_static_utility_open_prior: 0.10
+  traffic_trajectory_state_enabled: false
   traffic_trajectory_state_strength_scale: 8.0
   traffic_trajectory_state_cap_ratio: 0.5
   traffic_trajectory_state_utility_open_prior: 0.10

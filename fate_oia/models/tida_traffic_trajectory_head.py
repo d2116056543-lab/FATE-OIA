@@ -21,22 +21,30 @@ class TIDATrafficTrajectoryHead(nn.Module):
         state_strength_scale: float = 8.0,
         state_cap_ratio: float = 1.0,
         state_utility_open_prior: float = 0.10,
+        credit_mode: str = "ordered_vs_reverse",
+        static_utility_open_prior: float = 0.10,
     ) -> None:
         super().__init__()
         if (
             dim <= 0 or num_actions <= 0 or num_heads <= 0 or dim % num_heads or cap <= 0
             or state_strength_scale <= 0 or not 0 <= state_cap_ratio <= 1
             or not 0 < state_utility_open_prior < 0.5
+            or credit_mode not in {"ordered_vs_reverse", "ordered_vs_static"}
+            or not 0 < static_utility_open_prior < 0.5
         ):
             raise ValueError("invalid trajectory head dimensions")
         self.dim = int(dim)
         self.num_actions = int(num_actions)
         self.cap = float(cap)
         self.state_enabled = bool(state_enabled)
+        self.credit_mode = str(credit_mode)
         self.state_strength_scale = float(state_strength_scale)
         self.state_cap_ratio = float(state_cap_ratio)
         self.state_utility_prior_logit = math.log(
             float(state_utility_open_prior) / (1.0 - float(state_utility_open_prior))
+        )
+        self.static_utility_prior_logit = math.log(
+            float(static_utility_open_prior) / (1.0 - float(static_utility_open_prior))
         )
         self.action_identity = nn.Parameter(torch.randn(num_actions, dim) * 0.02)
         self.motion_projection = nn.Sequential(nn.Linear(9, dim), nn.GELU(), nn.LayerNorm(dim))
@@ -66,6 +74,13 @@ class TIDATrafficTrajectoryHead(nn.Module):
         self.state_output = nn.Linear(dim, 1)
         self.utility_projection = nn.Linear(dim, 1)
         self.state_utility_projection = nn.Linear(dim, 1)
+        # Keep the new credit semantics checkpoint-isolated from the trained
+        # ordered-vs-reverse decoder. Zero output preserves exact fallback.
+        self.static_readout = nn.Sequential(
+            nn.LayerNorm(4 * dim), nn.Linear(4 * dim, dim), nn.GELU()
+        )
+        self.static_output = nn.Linear(dim, 1)
+        self.static_utility_projection = nn.Linear(dim, 1)
         self.trust_raw = nn.Parameter(torch.zeros(num_actions))
         nn.init.zeros_(self.order_gate_projection.weight)
         nn.init.zeros_(self.order_gate_projection.bias)
@@ -77,6 +92,10 @@ class TIDATrafficTrajectoryHead(nn.Module):
         nn.init.constant_(self.utility_projection.bias, math.log(999.0))
         nn.init.zeros_(self.state_utility_projection.weight)
         nn.init.zeros_(self.state_utility_projection.bias)
+        nn.init.zeros_(self.static_output.weight)
+        nn.init.zeros_(self.static_output.bias)
+        nn.init.zeros_(self.static_utility_projection.weight)
+        nn.init.zeros_(self.static_utility_projection.bias)
         if not self.state_enabled:
             for module in (
                 self.state_projection, self.state_output, self.state_utility_projection
@@ -322,17 +341,6 @@ class TIDATrafficTrajectoryHead(nn.Module):
             action_nodes, trajectory_appearance, trajectory_xy, trajectory_visibility,
             trajectory_pair_valid, common_displacement, exclusive_displacement, anchor_weight,
         )
-        reversed_order = self._encode_trajectory(
-            action_nodes,
-            trajectory_appearance.flip(3),
-            trajectory_xy.flip(3),
-            trajectory_visibility.flip(3),
-            trajectory_pair_valid.flip(3),
-            -common_displacement.flip(1),
-            -exclusive_displacement.flip(3),
-            anchor_weight,
-        )
-        order_contrast = ordered["context"] - reversed_order["context"]
         action_identity = self.action_identity[None].expand(batch, -1, -1)
 
         def credit_features(contrast: torch.Tensor) -> torch.Tensor:
@@ -341,15 +349,56 @@ class TIDATrafficTrajectoryHead(nn.Module):
                 (contrast, magnitude, action_identity * contrast, action_identity * magnitude), dim=-1
             )
 
-        hidden = self.readout(credit_features(order_contrast))
-        reverse_hidden = self.readout(credit_features(-order_contrast))
+        if self.credit_mode == "ordered_vs_static":
+            static_appearance = trajectory_appearance[..., -1:, :].expand_as(
+                trajectory_appearance
+            )
+            static_xy = trajectory_xy[..., -1:, :].expand_as(trajectory_xy)
+            static_visibility = trajectory_visibility[..., -1:].expand_as(
+                trajectory_visibility
+            )
+            static_control = self._encode_trajectory(
+                action_nodes,
+                static_appearance,
+                static_xy,
+                static_visibility,
+                trajectory_pair_valid,
+                torch.zeros_like(common_displacement),
+                torch.zeros_like(exclusive_displacement),
+                anchor_weight,
+            )
+            order_contrast = ordered["context"] - static_control["context"]
+            static_features = credit_features(order_contrast)
+            hidden = self.static_readout(static_features)
+            zero_hidden = self.static_readout(torch.zeros_like(static_features))
+            # Paired subtraction cancels every learned bias and guarantees that
+            # repeated-terminal clips cannot manufacture temporal evidence.
+            evidence_logit = (
+                self.static_output(hidden) - self.static_output(zero_hidden)
+            ).squeeze(-1)
+            control_logit = torch.zeros_like(evidence_logit)
+            control_context = static_control
+        else:
+            control_context = self._encode_trajectory(
+                action_nodes,
+                trajectory_appearance.flip(3),
+                trajectory_xy.flip(3),
+                trajectory_visibility.flip(3),
+                trajectory_pair_valid.flip(3),
+                -common_displacement.flip(1),
+                -exclusive_displacement.flip(3),
+                anchor_weight,
+            )
+            order_contrast = ordered["context"] - control_context["context"]
+            hidden = self.readout(credit_features(order_contrast))
+            reverse_hidden = self.readout(credit_features(-order_contrast))
+            ordered_readout = self.output(hidden).squeeze(-1)
+            reversed_readout = self.output(reverse_hidden).squeeze(-1)
+            # Temporal credit must exclude any order-independent class prior or output bias.
+            evidence_logit = 0.5 * (ordered_readout - reversed_readout)
+            control_logit = -evidence_logit
         state_hidden = self.state_projection(ordered["motion_state_features"])
         trust = torch.sigmoid(self.trust_raw)[None].expand(batch, -1)
-        ordered_readout = self.output(hidden).squeeze(-1)
-        reversed_readout = self.output(reverse_hidden).squeeze(-1)
-        # Temporal credit must exclude any order-independent class prior or output bias.
-        evidence_logit = 0.5 * (ordered_readout - reversed_readout)
-        control_logit = -evidence_logit
         order_rms = order_contrast.square().mean(-1).sqrt()
         learned_order_gate = torch.sigmoid(
             self.order_gate_projection(
@@ -359,7 +408,7 @@ class TIDATrafficTrajectoryHead(nn.Module):
         order_strength = 1.0 - torch.exp(-order_rms)
         order_gate = order_strength * (0.5 + 0.5 * learned_order_gate)
         uncertainty_gate = 0.25 + 0.75 * torch.exp(-base_action_logits.detach().abs())
-        trajectory_support = 0.5 * (ordered["support"] + reversed_order["support"])
+        trajectory_support = 0.5 * (ordered["support"] + control_context["support"])
         support_gate = trajectory_support / (trajectory_support + 0.05)
         order_budget = self.cap * trust * support_gate * order_gate * uncertainty_gate
         order_delta = order_budget * torch.tanh(evidence_logit)
@@ -380,7 +429,13 @@ class TIDATrafficTrajectoryHead(nn.Module):
         candidate_control_delta = order_control_delta.clamp(-self.cap, self.cap)
         # Preserve the proven order branch while preventing a newly introduced
         # state branch from inheriting its compatibility-biased, almost-open gate.
-        order_utility_logit = self.utility_projection(hidden).squeeze(-1)
+        if self.credit_mode == "ordered_vs_static":
+            order_utility_logit = (
+                self.static_utility_projection(hidden).squeeze(-1)
+                + self.static_utility_prior_logit
+            )
+        else:
+            order_utility_logit = self.utility_projection(hidden).squeeze(-1)
         order_utility_gate = torch.sigmoid(order_utility_logit)
         state_utility_logit = (
             self.state_utility_projection(state_hidden).squeeze(-1)

@@ -3,7 +3,7 @@ from pathlib import Path
 import yaml
 
 
-def test_v32_adds_bounded_direct_motion_state_to_the_trajectory_owner() -> None:
+def test_v33_uses_real_history_against_a_repeated_terminal_control() -> None:
     config_path = Path(__file__).parents[1] / "configs" / (
         "fate_oia_train_tida_trajectory_owner_v31.yaml"
     )
@@ -14,7 +14,9 @@ def test_v32_adds_bounded_direct_motion_state_to_the_trajectory_owner() -> None:
 
     assert model["traffic_trajectory_enabled"] is True
     assert model["traffic_trajectory_deploy_enabled"] is True
-    assert model["traffic_trajectory_state_enabled"] is True
+    assert model["traffic_trajectory_credit_mode"] == "ordered_vs_static"
+    assert model["traffic_trajectory_static_utility_open_prior"] == 0.10
+    assert model["traffic_trajectory_state_enabled"] is False
     assert model["traffic_trajectory_state_strength_scale"] == 8.0
     assert model["traffic_trajectory_state_cap_ratio"] == 0.5
     assert model["traffic_trajectory_state_utility_open_prior"] == 0.10
