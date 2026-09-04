@@ -47,6 +47,13 @@ def test_action_rank_memory_rejects_wrong_shape_and_can_reset() -> None:
     assert memory.snapshot() is None
 
 
+def test_zero_capacity_explicitly_disables_cross_update_memory() -> None:
+    memory = TIDAActionRankMemory(capacity=0, num_actions=4, device="cpu")
+    memory.enqueue(torch.randn(2, 4), torch.zeros(2, 4))
+    assert len(memory) == 0
+    assert memory.snapshot() is None
+
+
 def test_trainer_uses_cross_update_rank_memory_instead_of_clearing_each_update() -> None:
     from fate_oia.engine import train_tida_oia
 

@@ -321,3 +321,53 @@ def test_static_control_zero_initialized_output_receives_first_step_gradient():
     out["traffic_trajectory_candidate_delta"].sum().backward()
     assert head.static_output.weight.grad is not None
     assert head.static_output.weight.grad.abs().sum() > 0
+
+
+def test_multi_track_branch_is_zero_effect_but_trainable_on_first_step():
+    args = _inputs(batch=1, tracks=3, frames=5)
+    head = TIDATrafficTrajectoryHead(
+        dim=16, num_actions=4, num_heads=4,
+        state_enabled=False, credit_mode="ordered_vs_static",
+        multi_track_enabled=True,
+    )
+    out = head(*args, base_action_logits=torch.zeros(1, 4))
+    assert torch.count_nonzero(out["traffic_trajectory_multi_track_credit"]) == 0
+    out["traffic_trajectory_candidate_delta"].sum().backward()
+    assert head.multi_track_output.weight.grad is not None
+    assert head.multi_track_output.weight.grad.abs().sum() > 0
+
+
+def test_multi_track_summary_does_not_collapse_with_focused_attention():
+    args = _inputs(batch=2, tracks=3, frames=5)
+    head = TIDATrafficTrajectoryHead(
+        dim=16, num_actions=4, num_heads=4,
+        state_enabled=False, credit_mode="ordered_vs_static",
+        multi_track_enabled=True, multi_track_floor=0.10,
+    )
+    out = head(*args, base_action_logits=torch.zeros(2, 4))
+    focused_effective = torch.exp(
+        -(out["trajectory_attention"].clamp_min(1e-12)
+          * out["trajectory_attention"].clamp_min(1e-12).log()).sum(-1)
+    )
+    assert torch.all(out["trajectory_multi_track_effective_count"] > focused_effective)
+    assert torch.all(out["trajectory_multi_track_weights"] > 0)
+
+
+def test_multi_track_credit_is_zero_for_repeated_terminal_history():
+    args = list(_inputs(batch=1, tracks=3, frames=5))
+    args[1] = args[1][..., -1:, :].expand_as(args[1]).clone()
+    args[2] = args[2][..., -1:, :].expand_as(args[2]).clone()
+    args[5] = torch.zeros_like(args[5])
+    args[6] = torch.zeros_like(args[6])
+    head = TIDATrafficTrajectoryHead(
+        dim=16, num_actions=4, num_heads=4,
+        state_enabled=False, credit_mode="ordered_vs_static",
+        multi_track_enabled=True,
+    )
+    with torch.no_grad():
+        head.multi_track_output.weight.fill_(0.05)
+        head.multi_track_output.bias.fill_(0.75)
+    out = head(*args, base_action_logits=torch.zeros(1, 4))
+    torch.testing.assert_close(
+        out["traffic_trajectory_multi_track_credit"], torch.zeros(1, 4), atol=1e-7, rtol=0
+    )

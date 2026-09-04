@@ -134,6 +134,8 @@ def collect_tida_outputs(
         "traffic_trajectory_support", "trajectory_support_gate",
         "trajectory_order_gate", "trajectory_uncertainty_gate",
         "trajectory_attention",
+        "traffic_trajectory_multi_track_credit", "trajectory_multi_track_weights",
+        "trajectory_multi_track_effective_count",
         "trajectory_speed", "trajectory_acceleration", "trajectory_radial_motion",
         "trajectory_order_contrast_rms",
         "trajectory_cycle_confidence", "trajectory_common_displacement",
@@ -522,6 +524,13 @@ def collect_tida_outputs(
             "trajectory_order_gate": output["trajectory_order_gate"],
             "trajectory_uncertainty_gate": output["trajectory_uncertainty_gate"],
             "trajectory_attention": output["trajectory_attention"],
+            "traffic_trajectory_multi_track_credit": output[
+                "traffic_trajectory_multi_track_credit"
+            ],
+            "trajectory_multi_track_weights": output["trajectory_multi_track_weights"],
+            "trajectory_multi_track_effective_count": output[
+                "trajectory_multi_track_effective_count"
+            ],
             "trajectory_speed": output["trajectory_speed"],
             "trajectory_acceleration": output["trajectory_acceleration"],
             "trajectory_radial_motion": output["trajectory_radial_motion"],
@@ -1858,6 +1867,8 @@ def save_epoch_outputs(
         "traffic_trajectory_support", "trajectory_support_gate",
         "trajectory_order_gate", "trajectory_uncertainty_gate",
         "trajectory_attention",
+        "traffic_trajectory_multi_track_credit", "trajectory_multi_track_weights",
+        "trajectory_multi_track_effective_count",
         "trajectory_speed", "trajectory_acceleration", "trajectory_radial_motion",
         "trajectory_order_contrast_rms",
         "trajectory_cycle_confidence", "trajectory_common_displacement",

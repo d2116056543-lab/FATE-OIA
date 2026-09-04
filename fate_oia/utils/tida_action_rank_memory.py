@@ -13,8 +13,8 @@ class TIDAActionRankMemory:
         num_actions: int,
         device: torch.device | str,
     ) -> None:
-        if capacity <= 0:
-            raise ValueError("capacity must be positive")
+        if capacity < 0:
+            raise ValueError("capacity must be non-negative")
         if num_actions <= 0:
             raise ValueError("num_actions must be positive")
         self.capacity = int(capacity)
@@ -35,6 +35,8 @@ class TIDAActionRankMemory:
             raise ValueError(f"action logits must have shape {expected}")
         if targets.shape != logits.shape:
             raise ValueError(f"action targets must have shape {expected}")
+        if self.capacity == 0:
+            return
         logits = logits.detach().to(device=self.device, dtype=self._logits.dtype)
         targets = targets.detach().to(device=self.device, dtype=self._targets.dtype)
         if logits.shape[0] >= self.capacity:

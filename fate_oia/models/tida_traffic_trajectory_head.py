@@ -23,6 +23,8 @@ class TIDATrafficTrajectoryHead(nn.Module):
         state_utility_open_prior: float = 0.10,
         credit_mode: str = "ordered_vs_reverse",
         static_utility_open_prior: float = 0.10,
+        multi_track_enabled: bool = False,
+        multi_track_floor: float = 0.10,
     ) -> None:
         super().__init__()
         if (
@@ -31,6 +33,7 @@ class TIDATrafficTrajectoryHead(nn.Module):
             or not 0 < state_utility_open_prior < 0.5
             or credit_mode not in {"ordered_vs_reverse", "ordered_vs_static"}
             or not 0 < static_utility_open_prior < 0.5
+            or not 0 < multi_track_floor < 1
         ):
             raise ValueError("invalid trajectory head dimensions")
         self.dim = int(dim)
@@ -38,6 +41,8 @@ class TIDATrafficTrajectoryHead(nn.Module):
         self.cap = float(cap)
         self.state_enabled = bool(state_enabled)
         self.credit_mode = str(credit_mode)
+        self.multi_track_enabled = bool(multi_track_enabled)
+        self.multi_track_floor = float(multi_track_floor)
         self.state_strength_scale = float(state_strength_scale)
         self.state_cap_ratio = float(state_cap_ratio)
         self.state_utility_prior_logit = math.log(
@@ -81,6 +86,10 @@ class TIDATrafficTrajectoryHead(nn.Module):
         )
         self.static_output = nn.Linear(dim, 1)
         self.static_utility_projection = nn.Linear(dim, 1)
+        self.multi_track_readout = nn.Sequential(
+            nn.LayerNorm(4 * dim), nn.Linear(4 * dim, dim), nn.GELU()
+        )
+        self.multi_track_output = nn.Linear(dim, 1)
         self.trust_raw = nn.Parameter(torch.zeros(num_actions))
         nn.init.zeros_(self.order_gate_projection.weight)
         nn.init.zeros_(self.order_gate_projection.bias)
@@ -96,6 +105,8 @@ class TIDATrafficTrajectoryHead(nn.Module):
         nn.init.zeros_(self.static_output.bias)
         nn.init.zeros_(self.static_utility_projection.weight)
         nn.init.zeros_(self.static_utility_projection.bias)
+        nn.init.zeros_(self.multi_track_output.weight)
+        nn.init.zeros_(self.multi_track_output.bias)
         if not self.state_enabled:
             for module in (
                 self.state_projection, self.state_output, self.state_utility_projection
@@ -288,6 +299,26 @@ class TIDATrafficTrajectoryHead(nn.Module):
         attention = torch.where(has_track, attention, torch.zeros_like(attention))
         context = torch.einsum("bak,bakd->bad", attention, self.value(relation))
         track_support = (confidence * pair_weight).sum(-1) / pair_weight.sum(-1).clamp_min(1.0)
+        # The focused route is intentionally sparse, but traffic decisions can
+        # depend on several agents. Build a separate support-weighted summary
+        # with a small valid-track floor so a dominant anchor cannot erase all
+        # alternative trajectories before the trainable residual sees them.
+        multi_track_raw = track_valid.to(anchor_prior.dtype) * (
+            anchor_prior.sqrt() + self.multi_track_floor
+        ) * (track_support.detach() + self.multi_track_floor)
+        multi_track_weight = multi_track_raw / multi_track_raw.sum(
+            -1, keepdim=True
+        ).clamp_min(1e-8)
+        multi_track_mean = torch.einsum("bak,bakd->bad", multi_track_weight, relation)
+        multi_track_variance = torch.einsum(
+            "bak,bakd->bad",
+            multi_track_weight,
+            (relation - multi_track_mean[..., None, :]).square(),
+        )
+        multi_track_summary = torch.cat(
+            (multi_track_mean, multi_track_variance.clamp_min(1e-8).sqrt()), dim=-1
+        )
+        multi_track_effective_count = multi_track_weight.square().sum(-1).clamp_min(1e-8).reciprocal()
         return {
             "context": context,
             "support": (attention * track_support).sum(-1),
@@ -301,6 +332,9 @@ class TIDATrafficTrajectoryHead(nn.Module):
             "interaction_risk": interaction_risk,
             "interaction_summary": interaction_summary,
             "motion_state_features": motion_state_features,
+            "multi_track_summary": multi_track_summary,
+            "multi_track_weight": multi_track_weight,
+            "multi_track_effective_count": multi_track_effective_count,
         }
 
     def forward(
@@ -397,6 +431,24 @@ class TIDATrafficTrajectoryHead(nn.Module):
             # Temporal credit must exclude any order-independent class prior or output bias.
             evidence_logit = 0.5 * (ordered_readout - reversed_readout)
             control_logit = -evidence_logit
+        multi_track_contrast = (
+            ordered["multi_track_summary"] - control_context["multi_track_summary"]
+        )
+        multi_track_features = torch.cat(
+            (multi_track_contrast, multi_track_contrast.abs()), dim=-1
+        )
+        multi_track_hidden = self.multi_track_readout(multi_track_features)
+        multi_track_zero_hidden = self.multi_track_readout(
+            torch.zeros_like(multi_track_features)
+        )
+        multi_track_credit = (
+            self.multi_track_output(multi_track_hidden)
+            - self.multi_track_output(multi_track_zero_hidden)
+        ).squeeze(-1)
+        if self.multi_track_enabled:
+            evidence_logit = evidence_logit + multi_track_credit
+        else:
+            multi_track_credit = torch.zeros_like(evidence_logit)
         state_hidden = self.state_projection(ordered["motion_state_features"])
         trust = torch.sigmoid(self.trust_raw)[None].expand(batch, -1)
         order_rms = order_contrast.square().mean(-1).sqrt()
@@ -483,4 +535,7 @@ class TIDATrafficTrajectoryHead(nn.Module):
             "trajectory_interaction_risk": ordered["interaction_risk"],
             "trajectory_interaction_summary": ordered["interaction_summary"],
             "trajectory_order_contrast_rms": order_rms,
+            "traffic_trajectory_multi_track_credit": multi_track_credit,
+            "trajectory_multi_track_weights": ordered["multi_track_weight"],
+            "trajectory_multi_track_effective_count": ordered["multi_track_effective_count"],
         }

@@ -940,6 +940,12 @@ def build_runtime(args: Any, evaluation_only: bool = False) -> TIDARuntime:
         traffic_trajectory_static_utility_open_prior=float(
             config["model"].get("traffic_trajectory_static_utility_open_prior", 0.10)
         ),
+        traffic_trajectory_multi_track_enabled=bool(
+            config["model"].get("traffic_trajectory_multi_track_enabled", False)
+        ),
+        traffic_trajectory_multi_track_floor=float(
+            config["model"].get("traffic_trajectory_multi_track_floor", 0.10)
+        ),
         traffic_trajectory_state_enabled=bool(
             config["model"].get("traffic_trajectory_state_enabled", True)
         ),
@@ -2455,6 +2461,12 @@ def train(args: Any) -> None:
                 "reason_effective_trust_mean": float(output["reason_effective_trust"].mean().detach().cpu()),
                 "logit_flow_action_candidate_delta_rms": float(
                     output["logit_flow_action_candidate_delta"].float().square().mean().sqrt().detach().cpu()
+                ),
+                "traffic_trajectory_multi_track_credit_rms": float(
+                    output["traffic_trajectory_multi_track_credit"].float().square().mean().sqrt().detach().cpu()
+                ),
+                "trajectory_multi_track_effective_count_mean": float(
+                    output["trajectory_multi_track_effective_count"].float().mean().detach().cpu()
                 ),
                 "logit_flow_action_deploy_delta_rms": float(
                     output["logit_flow_action_deploy_delta"].float().square().mean().sqrt().detach().cpu()

@@ -223,6 +223,8 @@ class TIDAOIAModel(nn.Module):
         traffic_trajectory_state_utility_open_prior: float = 0.10,
         traffic_trajectory_credit_mode: str = "ordered_vs_reverse",
         traffic_trajectory_static_utility_open_prior: float = 0.10,
+        traffic_trajectory_multi_track_enabled: bool = False,
+        traffic_trajectory_multi_track_floor: float = 0.10,
         relational_traffic_enabled: bool = False,
         relational_traffic_action_cap: float = 0.12,
         relational_traffic_reason_cap: float = 0.10,
@@ -468,6 +470,8 @@ class TIDAOIAModel(nn.Module):
             state_utility_open_prior=traffic_trajectory_state_utility_open_prior,
             credit_mode=traffic_trajectory_credit_mode,
             static_utility_open_prior=traffic_trajectory_static_utility_open_prior,
+            multi_track_enabled=traffic_trajectory_multi_track_enabled,
+            multi_track_floor=traffic_trajectory_multi_track_floor,
         )
         self.relational_traffic_enabled = bool(relational_traffic_enabled)
         self.relational_traffic = TIDARelationalTrafficFlow(
@@ -1356,6 +1360,7 @@ class TIDAOIAModel(nn.Module):
             "traffic_trajectory_delta": torch.zeros_like(image_action),
             "traffic_trajectory_control_delta": torch.zeros_like(image_action),
             "traffic_trajectory_credit_logit": torch.zeros_like(image_action),
+            "traffic_trajectory_multi_track_credit": torch.zeros_like(image_action),
             "traffic_trajectory_control_logit": torch.zeros_like(image_action),
             "traffic_trajectory_candidate_delta": torch.zeros_like(image_action),
             "traffic_trajectory_order_delta": torch.zeros_like(image_action),
@@ -1376,6 +1381,8 @@ class TIDAOIAModel(nn.Module):
             "trajectory_order_gate": image_action.new_zeros(batch, actions),
             "trajectory_uncertainty_gate": image_action.new_zeros(batch, actions),
             "trajectory_attention": image_action.new_zeros(batch, actions, tracks),
+            "trajectory_multi_track_weights": image_action.new_zeros(batch, actions, tracks),
+            "trajectory_multi_track_effective_count": image_action.new_zeros(batch, actions),
             "trajectory_tokens": image_action.new_zeros(batch, actions, tracks, dim),
             "trajectory_direction_histogram": image_action.new_zeros(batch, actions, tracks, 8),
             "trajectory_speed": image_action.new_zeros(batch, actions, tracks, intervals),
