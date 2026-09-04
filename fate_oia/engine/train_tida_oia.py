@@ -50,6 +50,7 @@ from fate_oia.utils.tida_artifacts import (
     save_checkpoint_atomic,
     seed_tida_run,
 )
+from fate_oia.utils.tida_action_rank_memory import TIDAActionRankMemory
 from fate_oia.utils.tida_contracts import (
     resolve_schedule_total_updates,
     schedule_values,
@@ -2122,7 +2123,11 @@ def train(args: Any) -> None:
     scaler_enabled = device.type == "cuda"
     model.train()
     optimizer.zero_grad(set_to_none=True)
-    rank_window: dict[str, list[torch.Tensor]] = {}
+    rank_memory = TIDAActionRankMemory(
+        capacity=int(config["training"].get("action_rank_memory_capacity", 1024)),
+        num_actions=model.num_actions,
+        device=device,
+    )
     forward_timer = TIDAForwardTimer(model, device)
     frozen_image_hash = module_state_sha256(model.image_model)
     print_interval = int(config["runtime"]["print_every_optimizer_updates"])
@@ -2132,6 +2137,7 @@ def train(args: Any) -> None:
     for epoch in training_epoch_indices(
         start_epoch, epochs, evaluation_only=evaluation_only
     ):
+        rank_memory.reset()
         if runtime.train_sampler.epoch != epoch:
             raise RuntimeError("train sampler epoch and trainer epoch differ")
         epoch_start = time.perf_counter()
@@ -2191,7 +2197,7 @@ def train(args: Any) -> None:
                     batch["reason"],
                     counterfactual_errors=counterfactual_errors,
                     counterfactual_outputs=counterfactual_outputs,
-                    rank_reference=rank_window_reference(rank_window),
+                    rank_reference=rank_memory.snapshot(),
                     weights=(
                         target_token_phase_loss_weights(config, epoch)
                         if getattr(model, "target_token_flow_enabled", False)
@@ -2214,11 +2220,7 @@ def train(args: Any) -> None:
                 telemetry_samples += int(batch["target_image"].shape[0])
                 append_supervision_tensors(telemetry_tensors, output, batch)
             _apply_initial_owner_firewall(model, schedule["temporal_scale"])
-            append_rank_window(
-                rank_window,
-                output["video_action_logits"],
-                batch["action"],
-            )
+            rank_memory.enqueue(output["video_action_logits"], batch["action"])
             micro_count += 1
             runtime.train_sampler.mark_consumed(int(batch["target_image"].shape[0]))
             should_update = micro_count == grad_accum or micro_step + 1 == epoch_batch_count
@@ -2245,7 +2247,7 @@ def train(args: Any) -> None:
                 if owner_before is not None else None
             )
             optimizer_update += 1; micro_count = 0
-            rank_window_samples = sum(value.shape[0] for value in rank_window.get("action_logits", []))
+            rank_window_samples = len(rank_memory)
             action_sign = 2.0 * batch["action"].float() - 1.0
             reason_sign = 2.0 * batch["reason"].float() - 1.0
             relational_action_deletion_gap = action_sign * (
@@ -2681,7 +2683,6 @@ def train(args: Any) -> None:
             if optimizer_update % print_interval == 0:
                 print(json.dumps({"event": "tida_batch", **row}, ensure_ascii=False), flush=True)
             forward_timer.active = False
-            clear_rank_window(rank_window)
             previous_iteration_end = time.perf_counter()
             if max_optimizer_updates is not None and optimizer_update >= int(max_optimizer_updates):
                 break

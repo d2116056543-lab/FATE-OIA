@@ -225,6 +225,7 @@ loss:
   object_intent_reason_utility: 0.0
   object_intent_delta: 0.0
 training:
+  action_rank_memory_capacity: 1024
   seed: 20260902
   epochs: 10
   batch_size: 6
