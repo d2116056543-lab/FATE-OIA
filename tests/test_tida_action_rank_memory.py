@@ -52,6 +52,8 @@ def test_trainer_uses_cross_update_rank_memory_instead_of_clearing_each_update()
 
     source = Path(train_tida_oia.__file__).read_text(encoding="utf-8")
     assert "action_rank_memory_capacity" in source
+    assert 'action_rank_memory_reference", "video"' in source
     assert "rank_reference=rank_memory.snapshot()" in source
-    assert "rank_memory.enqueue(output[\"video_action_logits\"], batch[\"action\"])" in source
+    assert 'output["image_action_logits"]' in source
+    assert 'rank_memory.enqueue(rank_memory_logits, batch["action"])' in source
     assert "clear_rank_window(rank_window)" not in source

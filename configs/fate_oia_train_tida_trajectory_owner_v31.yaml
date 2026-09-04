@@ -226,6 +226,7 @@ loss:
   object_intent_delta: 0.0
 training:
   action_rank_memory_capacity: 1024
+  action_rank_memory_reference: image_anchor
   seed: 20260902
   epochs: 10
   batch_size: 6

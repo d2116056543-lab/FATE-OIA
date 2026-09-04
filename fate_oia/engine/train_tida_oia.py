@@ -2010,6 +2010,12 @@ def train(args: Any) -> None:
         "batch_size": int(_arg(args, "batch_size", 2)),
         "context_chunk_size": int(_arg(args, "context_chunk_size", config["model"]["context_chunk_size"])),
         "num_workers": int(_arg(args, "num_workers", config["data"]["num_workers"])),
+        "action_rank_memory": {
+            "capacity": int(config["training"].get("action_rank_memory_capacity", 1024)),
+            "reference": str(config["training"].get("action_rank_memory_reference", "video")),
+            "detached": True,
+            "reset_each_epoch": True,
+        },
         "command_line": [sys.executable, *sys.argv], "precision": config["training"]["precision"],
         "predicate_role_sha256": file_sha256(predicate_role_path), "config_sha256": file_sha256(config_path),
         "split_sha256": file_sha256(runtime.clip_manifest), "selected_layers": config["backbone"]["selected_layers"],
@@ -2128,6 +2134,11 @@ def train(args: Any) -> None:
         num_actions=model.num_actions,
         device=device,
     )
+    rank_memory_reference = str(
+        config["training"].get("action_rank_memory_reference", "video")
+    )
+    if rank_memory_reference not in {"video", "image_anchor"}:
+        raise ValueError("action_rank_memory_reference must be video or image_anchor")
     forward_timer = TIDAForwardTimer(model, device)
     frozen_image_hash = module_state_sha256(model.image_model)
     print_interval = int(config["runtime"]["print_every_optimizer_updates"])
@@ -2220,7 +2231,12 @@ def train(args: Any) -> None:
                 telemetry_samples += int(batch["target_image"].shape[0])
                 append_supervision_tensors(telemetry_tensors, output, batch)
             _apply_initial_owner_firewall(model, schedule["temporal_scale"])
-            rank_memory.enqueue(output["video_action_logits"], batch["action"])
+            rank_memory_logits = (
+                output["image_action_logits"]
+                if rank_memory_reference == "image_anchor"
+                else output["video_action_logits"]
+            )
+            rank_memory.enqueue(rank_memory_logits, batch["action"])
             micro_count += 1
             runtime.train_sampler.mark_consumed(int(batch["target_image"].shape[0]))
             should_update = micro_count == grad_accum or micro_step + 1 == epoch_batch_count
