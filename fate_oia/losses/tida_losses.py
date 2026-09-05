@@ -767,6 +767,7 @@ def build_tida_loss_registry(
             output["traffic_trajectory_candidate_delta"],
             action_target,
             base_logits=output["semantic_video_action_logits"],
+            deploy_boundary_logits=deploy_action_boundary_logits,
         ),
     )
     trajectory_controls = [
@@ -806,6 +807,8 @@ def build_tida_loss_registry(
             output["traffic_trajectory_utility_logit"],
             output["traffic_trajectory_order_delta"],
             action_target,
+            base_logits=output["semantic_video_action_logits"],
+            deploy_boundary_logits=deploy_action_boundary_logits,
             state_utility_logits=output["traffic_trajectory_state_utility_logit"],
             state_candidate_delta=output["traffic_trajectory_state_delta"],
         ),
@@ -1014,6 +1017,27 @@ def build_tida_loss_registry(
                 label_mask=output["reason_local_temporal_reason_mask"],
             ),
         )
+        if "reason_local_action_condition_delta" in output:
+            registry.add(
+                "reason_local_action_condition_aux",
+                target_conditioned_pu_correction_loss(
+                    output["image_reason_logits"],
+                    output["reason_local_action_condition_delta"],
+                    reason_target,
+                    output["reason_local_motion_energy"],
+                    contradiction,
+                ),
+            )
+            registry.add(
+                "reason_local_action_condition_rank",
+                target_conditioned_pu_ranking_loss(
+                    output["image_reason_logits"],
+                    output["reason_local_action_condition_delta"],
+                    reason_target,
+                    output["reason_local_motion_energy"],
+                    contradiction,
+                ),
+            )
         registry.add(
             "reason_local_deletion",
             reason_local_deletion_credit_loss(

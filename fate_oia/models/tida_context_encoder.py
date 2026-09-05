@@ -105,6 +105,7 @@ class TIDAContextEncoder(nn.Module):
         semantic_patch_tokens, semantic_patch_xy, semantic_patch_weights = [], [], []
         semantic_predicate_ids = []
         reason_tokens, reason_attentions, reason_region_masses = [], [], []
+        reason_patch_tokens, reason_patch_xy, reason_patch_weights = [], [], []
         image_action_logits, image_reason_logits = [], []
         if predicate_reliability is None:
             predicate_reliability = predicate_tokens.new_ones(
@@ -167,6 +168,25 @@ class TIDAContextEncoder(nn.Module):
                         batch, repeats, reason_nodes.shape[1], 5
                     )
                 )
+                reason_selected = self.select_action_patches(
+                    field, read["reason_query_attention"]
+                )
+                reason_topk = reason_selected["tokens"].shape[2]
+                reason_patch_tokens.append(
+                    reason_selected["tokens"].reshape(
+                        batch, repeats, reason_nodes.shape[1], reason_topk, -1
+                    )
+                )
+                reason_patch_xy.append(
+                    reason_selected["xy"].reshape(
+                        batch, repeats, reason_nodes.shape[1], reason_topk, 2
+                    )
+                )
+                reason_patch_weights.append(
+                    reason_selected["weights"].reshape(
+                        batch, repeats, reason_nodes.shape[1], reason_topk
+                    )
+                )
             dense_patch_fields.append(
                 field["patch_tokens_last"].reshape(batch, repeats, -1, action_nodes.shape[-1])
             )
@@ -227,6 +247,9 @@ class TIDAContextEncoder(nn.Module):
                     "history_reason_query_tokens": torch.cat(reason_tokens, dim=1),
                     "history_reason_query_attention": torch.cat(reason_attentions, dim=1),
                     "history_reason_query_region_mass": torch.cat(reason_region_masses, dim=1),
+                    "history_reason_patch_tokens": torch.cat(reason_patch_tokens, dim=1),
+                    "history_reason_patch_xy": torch.cat(reason_patch_xy, dim=1),
+                    "history_reason_patch_weight": torch.cat(reason_patch_weights, dim=1),
                 }
             )
         if frozen_frame_decoder is not None:

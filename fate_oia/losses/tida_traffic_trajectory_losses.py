@@ -39,14 +39,17 @@ def trajectory_residual_ranking_loss(
     target: torch.Tensor,
     *,
     base_logits: torch.Tensor | None = None,
+    deploy_boundary_logits: torch.Tensor | None = None,
     margin: float = 0.01,
     temperature: float = 0.02,
 ) -> torch.Tensor:
-    """Train the temporal residual direction without letting a strong base hide it."""
+    """Train complementary residuals on errors the frozen image owner still makes."""
     if trajectory_delta.shape != target.shape:
         raise ValueError("trajectory delta and target must have identical [B,A] shapes")
     if base_logits is not None and base_logits.shape != target.shape:
         raise ValueError("base logits and target must have identical [B,A] shapes")
+    if deploy_boundary_logits is not None and deploy_boundary_logits.shape != (target.shape[1],):
+        raise ValueError("deploy_boundary_logits must be [A]")
     if temperature <= 0:
         raise ValueError("temperature must be positive")
 
@@ -60,12 +63,21 @@ def trajectory_residual_ranking_loss(
             continue
         pair_weight: torch.Tensor | float = 1.0
         if base_logits is not None:
-            base_positive = base_logits.detach()[positive_mask, action]
-            base_negative = base_logits.detach()[negative_mask, action]
-            hardness = torch.sigmoid(
-                (base_negative[:, None] - base_positive[None] + 0.30) / 0.15
+            boundary = (
+                base_logits.new_zeros(())
+                if deploy_boundary_logits is None
+                else deploy_boundary_logits.to(base_logits)[action]
             )
-            pair_weight = 0.10 + 0.90 * hardness
+            adjusted = base_logits.detach()[:, action] - boundary
+            base_positive = adjusted[positive_mask]
+            base_negative = adjusted[negative_mask]
+            # Easy pairs already owned by the image model must not train a
+            # redundant label classifier. Retain only near-boundary and
+            # misordered pairs where temporal evidence can add information.
+            hardness = torch.sigmoid(
+                (base_negative[:, None] - base_positive[None] + 0.10) / 0.10
+            )
+            pair_weight = hardness
         raw = F.softplus(
             (float(margin) + negative[:, None] - positive[None]) / float(temperature)
         ) * float(temperature)
@@ -82,9 +94,17 @@ def trajectory_residual_ranking_loss(
     direction = F.softplus(
         -sign * trajectory_delta / float(temperature)
     ) * float(temperature)
-    direction_loss = _class_balanced_action_mean(
-        direction, torch.ones_like(direction), target
-    )
+    if base_logits is None:
+        correction_need = torch.ones_like(direction)
+    else:
+        boundary = (
+            base_logits.new_zeros((target.shape[1],))
+            if deploy_boundary_logits is None
+            else deploy_boundary_logits.to(base_logits)
+        )
+        base_margin = sign * (base_logits.detach() - boundary.view(1, -1))
+        correction_need = torch.sigmoid((0.50 - base_margin) / 0.15)
+    direction_loss = _class_balanced_action_mean(direction, correction_need, target)
     return pair_loss + 0.25 * direction_loss
 
 
@@ -181,6 +201,8 @@ def trajectory_utility_calibration_loss(
     candidate_delta: torch.Tensor,
     target: torch.Tensor,
     *,
+    base_logits: torch.Tensor | None = None,
+    deploy_boundary_logits: torch.Tensor | None = None,
     state_utility_logits: torch.Tensor | None = None,
     state_candidate_delta: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -191,9 +213,25 @@ def trajectory_utility_calibration_loss(
     """
     if not (utility_logits.shape == candidate_delta.shape == target.shape):
         raise ValueError("trajectory utility tensors must have identical [B,A] shapes")
+    if base_logits is not None and base_logits.shape != target.shape:
+        raise ValueError("base logits and target must have identical [B,A] shapes")
+    if deploy_boundary_logits is not None and deploy_boundary_logits.shape != (target.shape[1],):
+        raise ValueError("deploy_boundary_logits must be [A]")
     sign = 2.0 * target.float() - 1.0
     helpful = (sign * candidate_delta.detach() > 0).to(utility_logits.dtype)
     confidence = (candidate_delta.detach().abs() / 0.02).clamp(0.0, 1.0)
+    if base_logits is not None:
+        boundary = (
+            base_logits.new_zeros((target.shape[1],))
+            if deploy_boundary_logits is None
+            else deploy_boundary_logits.to(base_logits)
+        )
+        base_margin = sign * (base_logits.detach() - boundary.view(1, -1))
+        # Utility matters near deployment flips and on image-model errors, not
+        # on already-certain examples whose temporal direction is redundant.
+        correction_need = torch.sigmoid((0.75 - base_margin.abs()) / 0.15)
+        image_error = torch.sigmoid(-base_margin / 0.15)
+        confidence = confidence * (0.05 + 0.65 * correction_need + 0.30 * image_error)
     value = F.binary_cross_entropy_with_logits(utility_logits, helpful, reduction="none")
     # A zero-initialized candidate has no evidence from which utility can be
     # identified. Giving it a constant BCE weight closes the gate before the

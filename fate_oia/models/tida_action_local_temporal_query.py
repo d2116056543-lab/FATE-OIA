@@ -44,6 +44,7 @@ class TIDAActionLocalTemporalQuery(TIDAReasonLocalTemporalQuery):
         *,
         image_logits: torch.Tensor,
         temporal_scale: float | torch.Tensor = 1.0,
+        shuffled_history_tokens: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor | str]:
         reason_output = super().forward(
             history_action_tokens,
@@ -52,6 +53,7 @@ class TIDAActionLocalTemporalQuery(TIDAReasonLocalTemporalQuery):
             frame_valid_mask,
             image_logits=image_logits,
             temporal_scale=temporal_scale,
+            shuffled_history_tokens=shuffled_history_tokens,
         )
         output: dict[str, torch.Tensor | str] = {}
         for key, value in reason_output.items():

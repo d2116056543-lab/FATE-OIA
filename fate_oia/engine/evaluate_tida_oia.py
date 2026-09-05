@@ -76,6 +76,7 @@ def collect_tida_outputs(
         "semantic_trajectory_action", "video_action_base", "video_action",
         "image_reason", "semantic_reason", "geometric_reason", "video_reason",
         "legacy_video_reason", "reason_local_candidate",
+        "reason_local_action_condition",
         "reason_local_centered_candidate", "reason_local_deploy",
         "legacy_semantic_action", "action_local_candidate",
         "action_local_centered_candidate", "action_local_deploy",
@@ -93,6 +94,8 @@ def collect_tida_outputs(
         "action_temporal_target_motion", "reason_temporal_target_motion",
         "reason_pu_weight", "reason_contradiction_score",
         "reason_local_candidate_delta", "reason_local_centered_candidate_delta",
+        "reason_local_action_condition_delta",
+        "reason_local_action_condition_attention",
         "reason_local_utility_logit",
         "reason_local_utility_probability", "reason_local_deploy_gate",
         "reason_local_deploy_scale", "reason_local_deploy_utility_inverted",
@@ -135,6 +138,7 @@ def collect_tida_outputs(
         "trajectory_order_gate", "trajectory_uncertainty_gate",
         "trajectory_attention",
         "traffic_trajectory_multi_track_credit", "trajectory_multi_track_weights",
+        "traffic_trajectory_track_token_scores", "traffic_trajectory_track_token_credit",
         "trajectory_multi_track_effective_count",
         "trajectory_speed", "trajectory_acceleration", "trajectory_radial_motion",
         "trajectory_order_contrast_rms",
@@ -330,6 +334,9 @@ def collect_tida_outputs(
             "video_reason": output["video_reason_logits"],
             "legacy_video_reason": output["legacy_video_reason_logits"],
             "reason_local_candidate": output["reason_local_candidate_logits"],
+            "reason_local_action_condition": output[
+                "reason_local_action_condition_logits"
+            ],
             "reason_local_centered_candidate": output[
                 "reason_local_centered_candidate_logits"
             ],
@@ -408,6 +415,12 @@ def collect_tida_outputs(
             "reason_pu_weight": reason_pu,
             "reason_contradiction_score": reason_contradiction,
             "reason_local_candidate_delta": output["reason_local_candidate_delta"],
+            "reason_local_action_condition_delta": output[
+                "reason_local_action_condition_delta"
+            ],
+            "reason_local_action_condition_attention": output[
+                "reason_local_action_condition_attention"
+            ],
             "reason_local_centered_candidate_delta": output[
                 "reason_local_centered_candidate_delta"
             ],
@@ -527,6 +540,12 @@ def collect_tida_outputs(
             "traffic_trajectory_multi_track_credit": output[
                 "traffic_trajectory_multi_track_credit"
             ],
+            "traffic_trajectory_track_token_scores": output[
+                "traffic_trajectory_track_token_scores"
+            ],
+            "traffic_trajectory_track_token_credit": output[
+                "traffic_trajectory_track_token_credit"
+            ],
             "trajectory_multi_track_weights": output["trajectory_multi_track_weights"],
             "trajectory_multi_track_effective_count": output[
                 "trajectory_multi_track_effective_count"
@@ -623,6 +642,19 @@ def collect_tida_outputs(
             "terminal_semantic_predicate_ids": output["terminal_semantic_predicate_ids"],
         }.items():
             diagnostics[key].append(value.detach().float().cpu())
+        for prefix in ("action", "reason"):
+            for suffix in (
+                "track_attention",
+                "track_available",
+                "track_effective_count",
+                "track_motion_rms",
+                "track_attention_entropy",
+            ):
+                key = f"{prefix}_{suffix}"
+                if key in output:
+                    diagnostics.setdefault(key, []).append(
+                        output[key].detach().float().cpu()
+                    )
         if "target_token_action_candidate_delta" in output:
             for prefix in ("target_token_action", "target_token_reason"):
                 for suffix in (
@@ -881,25 +913,26 @@ def branch_metrics(rows: dict[str, Any], thresholds: torch.Tensor | float = 0.5)
         "image": aie_branch_metrics(rows["image_action"], rows["image_reason"], rows["action_target"], rows["reason_target"], threshold=thresholds),
         "video": aie_branch_metrics(rows["video_action"], rows["video_reason"], rows["action_target"], rows["reason_target"], threshold=thresholds),
     }
-    for name, key in (
-        ("legacy_action_route", "legacy_semantic_action"),
-        ("action_local_candidate", "action_local_candidate"),
-        ("action_local_centered_candidate", "action_local_centered_candidate"),
-        ("action_local_deploy", "action_local_deploy"),
-        ("legacy_reason_route", "legacy_video_reason"),
-        ("reason_local_candidate", "reason_local_candidate"),
-        ("reason_local_centered_candidate", "reason_local_centered_candidate"),
-        ("reason_local_deploy", "reason_local_deploy"),
-        ("target_token_action_candidate", "target_token_action_candidate"),
-        ("target_token_action_centered_candidate", "target_token_action_centered_candidate"),
-        ("target_token_action_deploy", "target_token_action_deploy"),
-        ("target_token_reason_candidate", "target_token_reason_candidate"),
-        ("target_token_reason_centered_candidate", "target_token_reason_centered_candidate"),
-        ("target_token_reason_deploy", "target_token_reason_deploy"),
+    for name, key, task in (
+        ("legacy_action_route", "legacy_semantic_action", "action"),
+        ("action_local_candidate", "action_local_candidate", "action"),
+        ("action_local_centered_candidate", "action_local_centered_candidate", "action"),
+        ("action_local_deploy", "action_local_deploy", "action"),
+        ("legacy_reason_route", "legacy_video_reason", "reason"),
+        ("reason_local_candidate", "reason_local_candidate", "reason"),
+        ("reason_local_action_condition", "reason_local_action_condition", "reason"),
+        ("reason_local_centered_candidate", "reason_local_centered_candidate", "reason"),
+        ("reason_local_deploy", "reason_local_deploy", "reason"),
+        ("target_token_action_candidate", "target_token_action_candidate", "action"),
+        ("target_token_action_centered_candidate", "target_token_action_centered_candidate", "action"),
+        ("target_token_action_deploy", "target_token_action_deploy", "action"),
+        ("target_token_reason_candidate", "target_token_reason_candidate", "reason"),
+        ("target_token_reason_centered_candidate", "target_token_reason_centered_candidate", "reason"),
+        ("target_token_reason_deploy", "target_token_reason_deploy", "reason"),
     ):
         if key in rows:
-            action_logits = rows[key] if "action" in name else rows["video_action"]
-            reason_logits = rows["video_reason"] if "action" in name else rows[key]
+            action_logits = rows[key] if task == "action" else rows["video_action"]
+            reason_logits = rows["video_reason"] if task == "action" else rows[key]
             metrics[name] = aie_branch_metrics(
                 action_logits, reason_logits, rows["action_target"],
                 rows["reason_target"], threshold=thresholds,
@@ -1813,7 +1846,9 @@ def save_epoch_outputs(
         "logit_flow_action_candidate_delta", "logit_flow_reason_candidate_delta",
         "logit_flow_action_deploy_delta", "logit_flow_reason_deploy_delta",
         "logit_flow_action_utility_probability", "logit_flow_reason_utility_probability",
+        "action_track_motion_rms", "reason_track_motion_rms",
         "reason_contradiction_score", "action_target", "reason_target",
+        "reason_local_action_condition", "reason_local_action_condition_delta",
         "timestamps", "frame_valid_mask",
     )
     full_tensor_keys = (
@@ -1821,7 +1856,10 @@ def save_epoch_outputs(
         "video_action_base", "video_action",
         "image_reason", "semantic_reason", "geometric_reason", "video_reason",
         "legacy_video_reason", "reason_local_candidate",
+        "reason_local_action_condition",
         "reason_local_centered_candidate", "reason_local_deploy",
+        "action_local_candidate", "action_local_centered_candidate",
+        "action_local_deploy",
         "logit_flow_action_candidate", "logit_flow_reason_candidate",
         "prefix_action", "prefix_reason", "action_target", "reason_target",
         "rho", "action_delta", "reason_delta", "null_mass", "route_entropy",
@@ -1833,6 +1871,8 @@ def save_epoch_outputs(
         "action_temporal_target_motion", "reason_temporal_target_motion",
         "reason_pu_weight", "reason_contradiction_score",
         "reason_local_candidate_delta", "reason_local_centered_candidate_delta",
+        "reason_local_action_condition_delta",
+        "reason_local_action_condition_attention",
         "reason_local_utility_logit",
         "reason_local_utility_probability", "reason_local_deploy_gate",
         "reason_local_deploy_scale", "reason_local_deploy_utility_inverted",
@@ -1840,6 +1880,19 @@ def save_epoch_outputs(
         "reason_local_velocity_rms", "reason_local_acceleration_rms",
         "reason_local_shuffled_delta", "reason_local_selected_deleted_delta",
         "reason_local_random_deleted_delta", "reason_local_selected_minus_random_gap",
+        "action_local_candidate_delta", "action_local_centered_candidate_delta",
+        "action_local_motion_energy", "action_local_utility_logit",
+        "action_local_utility_probability", "action_local_deploy_gate",
+        "action_local_deploy_scale", "action_local_deploy_utility_inverted",
+        "action_local_deploy_delta", "action_local_shuffled_delta",
+        "action_local_selected_deleted_delta", "action_local_random_deleted_delta",
+        "action_local_selected_minus_random_gap",
+        "action_track_attention", "action_track_available",
+        "action_track_effective_count", "action_track_motion_rms",
+        "action_track_attention_entropy",
+        "reason_track_attention", "reason_track_available",
+        "reason_track_effective_count", "reason_track_motion_rms",
+        "reason_track_attention_entropy",
         "logit_flow_action_candidate_delta", "logit_flow_reason_candidate_delta",
         "logit_flow_action_utility_logit", "logit_flow_reason_utility_logit",
         "logit_flow_action_utility_probability", "logit_flow_reason_utility_probability",
@@ -1868,6 +1921,7 @@ def save_epoch_outputs(
         "trajectory_order_gate", "trajectory_uncertainty_gate",
         "trajectory_attention",
         "traffic_trajectory_multi_track_credit", "trajectory_multi_track_weights",
+        "traffic_trajectory_track_token_scores", "traffic_trajectory_track_token_credit",
         "trajectory_multi_track_effective_count",
         "trajectory_speed", "trajectory_acceleration", "trajectory_radial_motion",
         "trajectory_order_contrast_rms",

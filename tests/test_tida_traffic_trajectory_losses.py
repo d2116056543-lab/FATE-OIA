@@ -23,6 +23,46 @@ def test_trajectory_residual_ranking_supervises_temporal_direction_without_base_
     assert aligned.grad.abs().sum() > 0
 
 
+def test_trajectory_residual_ranking_focuses_on_base_errors_not_easy_duplicates():
+    target = torch.tensor([[1.0], [1.0], [0.0], [0.0]])
+    delta = torch.tensor([[0.02], [0.01], [-0.01], [-0.02]])
+    easy_base = torch.tensor([[5.0], [4.0], [-4.0], [-5.0]])
+    misranked_base = -easy_base
+
+    easy = trajectory_residual_ranking_loss(delta, target, base_logits=easy_base)
+    needs_correction = trajectory_residual_ranking_loss(
+        delta, target, base_logits=misranked_base
+    )
+
+    assert easy < 0.05 * needs_correction
+
+
+def test_trajectory_residual_ranking_corrects_near_boundary_deploy_errors():
+    target = torch.tensor([[1.0], [0.0]])
+    base = torch.tensor([[0.20], [0.30]])
+    boundary = torch.tensor([0.25])
+    aligned = torch.tensor([[0.02], [-0.02]], requires_grad=True)
+    opposed = -aligned.detach()
+
+    aligned_loss = trajectory_residual_ranking_loss(
+        aligned,
+        target,
+        base_logits=base,
+        deploy_boundary_logits=boundary,
+    )
+    opposed_loss = trajectory_residual_ranking_loss(
+        opposed,
+        target,
+        base_logits=base,
+        deploy_boundary_logits=boundary,
+    )
+
+    assert aligned_loss < opposed_loss
+    aligned_loss.backward()
+    assert aligned.grad[0, 0] < 0
+    assert aligned.grad[1, 0] > 0
+
+
 def test_boundary_correction_prefers_gt_aligned_trajectory_delta():
     base = torch.tensor([[-0.1, 0.1], [0.2, -0.2]])
     target = torch.tensor([[1.0, 0.0], [1.0, 0.0]])
@@ -180,6 +220,28 @@ def test_utility_calibration_ramps_with_candidate_identifiability():
     identifiable_loss = trajectory_utility_calibration_loss(utility, identifiable, target)
 
     assert tiny_loss < 0.01 * identifiable_loss
+
+
+def test_utility_calibration_prioritizes_deploy_boundary_errors():
+    target = torch.tensor([[1.0], [1.0]])
+    candidate = torch.tensor([[0.02], [0.02]])
+    utility = torch.zeros_like(candidate, requires_grad=True)
+    # The first sample is confidently correct; the second is just below the
+    # train-calib deployment boundary and needs temporal evidence.
+    base = torch.tensor([[4.0], [0.19]])
+    boundary = torch.tensor([0.20])
+
+    loss = trajectory_utility_calibration_loss(
+        utility,
+        candidate,
+        target,
+        base_logits=base,
+        deploy_boundary_logits=boundary,
+    )
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert utility.grad[1, 0].abs() > 4.0 * utility.grad[0, 0].abs()
 
 
 def test_split_utility_calibration_trains_order_and_state_from_their_own_detached_effects():

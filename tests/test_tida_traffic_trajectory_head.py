@@ -1,6 +1,9 @@
 import torch
 
-from fate_oia.models.tida_traffic_trajectory_head import TIDATrafficTrajectoryHead
+from fate_oia.models.tida_traffic_trajectory_head import (
+    TIDATrafficTrajectoryHead,
+    signed_track_logmeanexp,
+)
 
 
 def _inputs(batch=2, actions=4, tracks=3, frames=5, dim=16):
@@ -371,3 +374,40 @@ def test_multi_track_credit_is_zero_for_repeated_terminal_history():
     torch.testing.assert_close(
         out["traffic_trajectory_multi_track_credit"], torch.zeros(1, 4), atol=1e-7, rtol=0
     )
+
+
+def test_signed_track_logmeanexp_is_zero_permutation_invariant_and_directional():
+    weights = torch.tensor([[[0.5, 0.3, 0.2]]])
+    zeros = torch.zeros_like(weights)
+    torch.testing.assert_close(
+        signed_track_logmeanexp(zeros, weights, temperature=0.25),
+        torch.zeros(1, 1),
+        atol=1e-7,
+        rtol=0,
+    )
+    scores = torch.tensor([[[0.8, -0.2, -0.1]]])
+    positive = signed_track_logmeanexp(scores, weights, temperature=0.25)
+    order = torch.tensor([2, 0, 1])
+    permuted = signed_track_logmeanexp(
+        scores.index_select(-1, order), weights.index_select(-1, order), temperature=0.25
+    )
+    torch.testing.assert_close(positive, permuted)
+    assert positive.item() > 0
+    assert signed_track_logmeanexp(-scores, weights, temperature=0.25).item() < 0
+
+
+def test_per_track_signed_branch_is_zero_effect_but_trainable():
+    args = _inputs(batch=1, tracks=3, frames=5)
+    head = TIDATrafficTrajectoryHead(
+        dim=16,
+        num_actions=4,
+        num_heads=4,
+        state_enabled=False,
+        credit_mode="ordered_vs_static",
+        multi_track_token_credit_enabled=True,
+    )
+    out = head(*args, base_action_logits=torch.zeros(1, 4))
+    assert torch.count_nonzero(out["traffic_trajectory_track_token_credit"]) == 0
+    out["traffic_trajectory_candidate_delta"].sum().backward()
+    assert head.track_token_output.weight.grad is not None
+    assert head.track_token_output.weight.grad.abs().sum() > 0

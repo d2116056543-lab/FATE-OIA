@@ -26,6 +26,12 @@ class TIDAReasonLocalTemporalQuery(nn.Module):
         cap: float = 0.08,
         utility_open_prior: float = 0.10,
         temporal_reason_indices: tuple[int, ...] | None = None,
+        directional_enabled: bool = False,
+        action_condition_enabled: bool = False,
+        action_condition_mode: str = "scalar",
+        action_condition_input_scale: float = 1.0,
+        action_condition_cap: float = 0.01,
+        num_actions: int = 4,
     ) -> None:
         super().__init__()
         if dim <= 0 or num_reasons <= 0 or num_heads <= 0 or dim % num_heads:
@@ -34,6 +40,21 @@ class TIDAReasonLocalTemporalQuery(nn.Module):
             raise ValueError("invalid reason local-query deployment settings")
         self.num_reasons = int(num_reasons)
         self.cap = float(cap)
+        self.directional_enabled = bool(directional_enabled)
+        self.action_condition_enabled = bool(action_condition_enabled)
+        self.action_condition_mode = str(action_condition_mode).strip().lower()
+        self.action_condition_input_scale = float(action_condition_input_scale)
+        self.action_condition_cap = float(action_condition_cap)
+        self.num_actions = int(num_actions)
+        if self.action_condition_mode not in {"scalar", "token"}:
+            raise ValueError("action condition mode must be scalar or token")
+        if (
+            self.num_actions <= 0
+            or self.action_condition_input_scale <= 0
+            or self.action_condition_cap <= 0
+            or self.action_condition_cap > self.cap
+        ):
+            raise ValueError("action condition dimensions and scale must be positive")
         if temporal_reason_indices is None:
             temporal_reason_indices = tuple(range(self.num_reasons))
         if any(index < 0 or index >= self.num_reasons for index in temporal_reason_indices):
@@ -71,6 +92,44 @@ class TIDAReasonLocalTemporalQuery(nn.Module):
         self.reason_readout_weight = nn.Parameter(
             torch.zeros(self.num_reasons, dim)
         )
+        # A separate signed path prevents temporal direction from being
+        # averaged away by the event-attention summary. Zero initialization
+        # preserves exact compatibility while receiving gradient immediately.
+        self.directional_readout_weight = nn.Parameter(
+            torch.zeros(self.num_reasons, 3 * dim),
+            requires_grad=self.directional_enabled,
+        )
+        # This bridge can only read detached action-temporal evidence. Its
+        # zero initialization preserves the exact image/reason fallback while
+        # allowing reason supervision to learn label-specific temporal credit.
+        self.action_condition_weight = nn.Parameter(
+            torch.zeros(self.num_reasons, self.num_actions),
+            requires_grad=(
+                self.action_condition_enabled and self.action_condition_mode == "scalar"
+            ),
+        )
+        # Token matching preserves the action identity and temporal content that
+        # a four-logit residual discards. The final readout is zero initialized,
+        # so enabling this path remains an exact image-model fallback.
+        self.action_token_query_proj = nn.Linear(dim, dim, bias=False)
+        self.action_token_key_proj = nn.Linear(dim, dim, bias=False)
+        self.action_token_value_proj = nn.Linear(dim, dim, bias=False)
+        self.action_token_readout_weight = nn.Parameter(
+            torch.zeros(self.num_reasons, dim),
+            requires_grad=(
+                self.action_condition_enabled and self.action_condition_mode == "token"
+            ),
+        )
+        token_path_trainable = (
+            self.action_condition_enabled and self.action_condition_mode == "token"
+        )
+        for layer in (
+            self.action_token_query_proj,
+            self.action_token_key_proj,
+            self.action_token_value_proj,
+        ):
+            for parameter in layer.parameters():
+                parameter.requires_grad = token_path_trainable
         self.utility = nn.Sequential(
             nn.LayerNorm(dim + 6),
             nn.Linear(dim + 6, dim // 2),
@@ -165,12 +224,67 @@ class TIDAReasonLocalTemporalQuery(nn.Module):
         history = history * available[..., None]
         return history, attention, available
 
+    @staticmethod
+    def _signed_directional_summary(
+        states: torch.Tensor,
+        timestamps: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> torch.Tensor:
+        """Keep first/second-order direction before any temporal pooling."""
+        batch, reasons, frames, dim = states.shape
+        if valid.ndim == 2:
+            valid = valid[:, None].expand(-1, reasons, -1)
+        if valid.shape != (batch, reasons, frames):
+            raise ValueError("reason directional validity shape mismatch")
+        if frames < 2:
+            return states.new_zeros(batch, reasons, 3 * dim)
+
+        first_index = valid.to(torch.int64).argmax(-1)
+        last_index = frames - 1 - valid.flip(-1).to(torch.int64).argmax(-1)
+        gather_shape = (batch, reasons, 1, dim)
+        first = states.gather(
+            2, first_index[..., None, None].expand(gather_shape)
+        ).squeeze(2)
+        last = states.gather(
+            2, last_index[..., None, None].expand(gather_shape)
+        ).squeeze(2)
+        available = valid.sum(-1) >= 2
+        endpoint = (last - first) * available[..., None]
+
+        dt = (timestamps[:, 1:frames] - timestamps[:, : frames - 1]).clamp_min(1e-4)
+        pair_valid = valid[..., 1:] & valid[..., :-1]
+        velocity = (states[..., 1:, :] - states[..., :-1, :]) / dt[:, None, :, None]
+        recency = torch.linspace(
+            0.25, 1.0, frames - 1, device=states.device, dtype=states.dtype
+        )
+        velocity_weight = pair_valid.to(states.dtype) * recency
+        mean_velocity = (velocity * velocity_weight[..., None]).sum(-2) / (
+            velocity_weight.sum(-1, keepdim=True).clamp_min(1e-8)
+        )
+
+        mean_acceleration = torch.zeros_like(mean_velocity)
+        if frames >= 3:
+            acceleration_dt = 0.5 * (dt[:, 1:] + dt[:, :-1]).clamp_min(1e-4)
+            acceleration = (
+                velocity[..., 1:, :] - velocity[..., :-1, :]
+            ) / acceleration_dt[:, None, :, None]
+            triple_valid = pair_valid[..., 1:] & pair_valid[..., :-1]
+            acceleration_weight = triple_valid.to(states.dtype) * recency[1:]
+            mean_acceleration = (
+                acceleration * acceleration_weight[..., None]
+            ).sum(-2) / acceleration_weight.sum(-1, keepdim=True).clamp_min(1e-8)
+        return torch.cat(
+            (endpoint.tanh(), mean_velocity.tanh(), mean_acceleration.tanh()), dim=-1
+        )
+
     def _candidate_from_history(
         self,
         target: torch.Tensor,
         history: torch.Tensor,
+        directional_summary: torch.Tensor,
         available: torch.Tensor,
         temporal_scale: float | torch.Tensor,
+        extra_raw: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         difference = target - history
         hidden = self.feature(
@@ -187,6 +301,14 @@ class TIDAReasonLocalTemporalQuery(nn.Module):
         raw = torch.einsum(
             "brd,rd->br", hidden - control_hidden, self.reason_readout_weight
         )
+        if self.directional_enabled:
+            raw = raw + torch.einsum(
+                "brd,rd->br", directional_summary, self.directional_readout_weight
+            )
+        if extra_raw is not None:
+            if extra_raw.shape != raw.shape:
+                raise ValueError("extra reason-local raw contribution shape mismatch")
+            raw = raw + extra_raw
         candidate = (
             available
             * scale
@@ -194,6 +316,62 @@ class TIDAReasonLocalTemporalQuery(nn.Module):
             * self.temporal_reason_mask[None]
         )
         return candidate, hidden, difference
+
+    def _action_condition_candidate(
+        self,
+        raw: torch.Tensor,
+        available: torch.Tensor,
+        temporal_scale: float | torch.Tensor,
+    ) -> torch.Tensor:
+        # Keep this small residual in FP32. Under BF16 it can otherwise be
+        # rounded away when added inside the much larger content branch.
+        scale = torch.as_tensor(
+            temporal_scale, device=raw.device, dtype=torch.float32
+        )
+        # Unlike the legacy content residual, action deltas are already small
+        # bounded logits. Preserve their local magnitude while still enforcing
+        # the independent reason-branch cap.
+        bounded = self.action_condition_cap * torch.tanh(
+            raw.float() / self.action_condition_cap
+        )
+        return (
+            available.float()
+            * scale
+            * bounded
+            * self.temporal_reason_mask[None].float()
+        )
+
+    @property
+    def action_condition_primary_parameter(self) -> nn.Parameter:
+        if self.action_condition_mode == "token":
+            return self.action_token_readout_weight
+        return self.action_condition_weight
+
+    def _action_token_condition_raw(
+        self,
+        reason_target: torch.Tensor,
+        action_history: torch.Tensor,
+        action_target: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch, reasons, dim = reason_target.shape
+        if action_history.shape != (batch, self.num_actions, dim):
+            raise ValueError("action condition history summary shape mismatch")
+        if action_target.shape != action_history.shape:
+            raise ValueError("action condition target token shape mismatch")
+        # The action branch is an evidence provider, never a parameter owner of
+        # the reason loss. Detaching here enforces the firewall dynamically.
+        reason_target = reason_target.detach().float()
+        relative_action = (action_history.detach() - action_target.detach()).float()
+        query = self.action_token_query_proj(reason_target)
+        key = self.action_token_key_proj(relative_action)
+        value = self.action_token_value_proj(relative_action)
+        attention = torch.einsum("brd,bad->bra", query, key) / math.sqrt(float(dim))
+        attention = attention.softmax(-1)
+        context = torch.einsum("bra,bad->brd", attention, value)
+        raw = torch.einsum(
+            "brd,rd->br", context, self.action_token_readout_weight.float()
+        )
+        return raw, attention
 
     @torch.no_grad()
     def set_deployment_policy(
@@ -246,6 +424,16 @@ class TIDAReasonLocalTemporalQuery(nn.Module):
         *,
         image_logits: torch.Tensor,
         temporal_scale: float | torch.Tensor = 1.0,
+        shuffled_history_tokens: torch.Tensor | None = None,
+        action_condition_delta: torch.Tensor | None = None,
+        shuffled_action_condition_delta: torch.Tensor | None = None,
+        selected_deleted_action_condition_delta: torch.Tensor | None = None,
+        random_deleted_action_condition_delta: torch.Tensor | None = None,
+        action_condition_history_summary: torch.Tensor | None = None,
+        shuffled_action_condition_history_summary: torch.Tensor | None = None,
+        selected_deleted_action_condition_history_summary: torch.Tensor | None = None,
+        random_deleted_action_condition_history_summary: torch.Tensor | None = None,
+        action_condition_target_tokens: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         if history_reason_tokens.ndim != 4:
             raise ValueError("history_reason_tokens must be [B,T,R,D]")
@@ -254,6 +442,61 @@ class TIDAReasonLocalTemporalQuery(nn.Module):
             raise ValueError("target_reason_tokens shape mismatch")
         if reasons != self.num_reasons or image_logits.shape != (batch, reasons):
             raise ValueError("reason count or image logits shape mismatch")
+
+        action_condition_inputs = (
+            action_condition_delta,
+            shuffled_action_condition_delta,
+            selected_deleted_action_condition_delta,
+            random_deleted_action_condition_delta,
+        )
+        zero_attention = image_logits.new_zeros(
+            batch, reasons, self.num_actions, dtype=torch.float32
+        )
+        action_condition_attention = zero_attention
+        if self.action_condition_enabled and self.action_condition_mode == "scalar":
+            if any(value is None for value in action_condition_inputs):
+                raise ValueError(
+                    "enabled reason action conditioning requires all counterfactual action deltas"
+                )
+            for value in action_condition_inputs:
+                if value.shape != (batch, self.num_actions):
+                    raise ValueError("action condition delta shape mismatch")
+            with torch.autocast(device_type=image_logits.device.type, enabled=False):
+                action_condition_raws = tuple(
+                    torch.einsum(
+                        "ba,ra->br",
+                        value.detach().float() * self.action_condition_input_scale,
+                        self.action_condition_weight.float(),
+                    )
+                    for value in action_condition_inputs
+                )
+        elif self.action_condition_enabled:
+            token_inputs = (
+                action_condition_history_summary,
+                shuffled_action_condition_history_summary,
+                selected_deleted_action_condition_history_summary,
+                random_deleted_action_condition_history_summary,
+            )
+            if action_condition_target_tokens is None or any(
+                value is None for value in token_inputs
+            ):
+                raise ValueError(
+                    "token action conditioning requires target and all counterfactual summaries"
+                )
+            with torch.autocast(device_type=image_logits.device.type, enabled=False):
+                token_results = tuple(
+                    self._action_token_condition_raw(
+                        target_reason_tokens,
+                        value,
+                        action_condition_target_tokens,
+                    )
+                    for value in token_inputs
+                )
+            action_condition_raws = tuple(value[0] for value in token_results)
+            action_condition_attention = token_results[0][1]
+        else:
+            zero_raw = image_logits.new_zeros(batch, reasons)
+            action_condition_raws = (zero_raw, zero_raw, zero_raw, zero_raw)
 
         encoded = self.temporal_encoder(
             history_reason_tokens, timestamps, frame_valid_mask
@@ -280,12 +523,23 @@ class TIDAReasonLocalTemporalQuery(nn.Module):
         history, temporal_attention, available = self._attend(
             target, event_states, history_valid
         )
-        candidate, hidden, _ = self._candidate_from_history(
-            target, history, available, temporal_scale
+        directional_summary = self._signed_directional_summary(
+            history_states, timestamps[:, : history_reason_tokens.shape[1]], history_valid
         )
+        content_candidate, hidden, _ = self._candidate_from_history(
+            target, history, directional_summary, available, temporal_scale
+        )
+        action_condition_candidate = self._action_condition_candidate(
+            action_condition_raws[0], available, temporal_scale
+        )
+        candidate = content_candidate.float() + action_condition_candidate
 
+        if shuffled_history_tokens is None:
+            shuffled_history_tokens = history_reason_tokens.flip(1)
+        if shuffled_history_tokens.shape != history_reason_tokens.shape:
+            raise ValueError("shuffled_history_tokens shape mismatch")
         shuffled_encoded = self.temporal_encoder(
-            history_reason_tokens.flip(1), timestamps, frame_valid_mask
+            shuffled_history_tokens, timestamps, frame_valid_mask
         )
         shuffled_velocity, shuffled_acceleration = self._kinematics(
             shuffled_encoded["history_states"],
@@ -307,8 +561,23 @@ class TIDAReasonLocalTemporalQuery(nn.Module):
         shuffled_history, _, shuffled_available = self._attend(
             target, shuffled_states, shuffled_valid
         )
-        shuffled_candidate, _, _ = self._candidate_from_history(
-            target, shuffled_history, shuffled_available, temporal_scale
+        shuffled_directional_summary = self._signed_directional_summary(
+            shuffled_encoded["history_states"],
+            timestamps[:, : history_reason_tokens.shape[1]],
+            shuffled_valid,
+        )
+        shuffled_content_candidate, shuffled_hidden, _ = self._candidate_from_history(
+            target,
+            shuffled_history,
+            shuffled_directional_summary,
+            shuffled_available,
+            temporal_scale,
+        )
+        shuffled_action_condition_candidate = self._action_condition_candidate(
+            action_condition_raws[1], shuffled_available, temporal_scale
+        )
+        shuffled_candidate = (
+            shuffled_content_candidate.float() + shuffled_action_condition_candidate
         )
 
         selected_index = temporal_attention.argmax(-1)
@@ -335,11 +604,41 @@ class TIDAReasonLocalTemporalQuery(nn.Module):
         random_history, _, random_available = self._attend(
             target, event_states, random_valid
         )
-        selected_deleted_candidate, _, _ = self._candidate_from_history(
-            target, selected_history, selected_available, temporal_scale
+        selected_directional_summary = self._signed_directional_summary(
+            history_states,
+            timestamps[:, : history_reason_tokens.shape[1]],
+            selected_valid,
         )
-        random_deleted_candidate, _, _ = self._candidate_from_history(
-            target, random_history, random_available, temporal_scale
+        random_directional_summary = self._signed_directional_summary(
+            history_states,
+            timestamps[:, : history_reason_tokens.shape[1]],
+            random_valid,
+        )
+        selected_deleted_content_candidate, selected_hidden, _ = self._candidate_from_history(
+            target,
+            selected_history,
+            selected_directional_summary,
+            selected_available,
+            temporal_scale,
+        )
+        random_deleted_content_candidate, random_hidden, _ = self._candidate_from_history(
+            target,
+            random_history,
+            random_directional_summary,
+            random_available,
+            temporal_scale,
+        )
+        selected_deleted_candidate = (
+            selected_deleted_content_candidate.float()
+            + self._action_condition_candidate(
+                action_condition_raws[2], selected_available, temporal_scale
+            )
+        )
+        random_deleted_candidate = (
+            random_deleted_content_candidate.float()
+            + self._action_condition_candidate(
+                action_condition_raws[3], random_available, temporal_scale
+            )
         )
         selected_minus_random_gap = (
             (candidate - selected_deleted_candidate).abs()
@@ -406,10 +705,21 @@ class TIDAReasonLocalTemporalQuery(nn.Module):
         ).sqrt()
         return {
             "reason_local_history_summary": history,
+            "reason_local_shuffled_history_summary": shuffled_hidden,
+            "reason_local_selected_deleted_history_summary": selected_hidden,
+            "reason_local_random_deleted_history_summary": random_hidden,
             "reason_local_temporal_attention": temporal_attention,
             "reason_local_temporal_attention_entropy": attention_entropy,
             "reason_local_target_query": target,
             "reason_local_candidate_delta": candidate,
+            "reason_local_content_candidate_delta": content_candidate,
+            "reason_local_action_condition_delta": action_condition_candidate,
+            "reason_local_action_condition_attention": action_condition_attention,
+            "reason_local_action_condition_logits": (
+                image_logits.float() + action_condition_candidate
+            ),
+            "reason_local_directional_summary": directional_summary,
+            "reason_local_directional_summary_rms": directional_summary.square().mean(-1).sqrt(),
             "reason_local_velocity_rms": velocity_rms,
             "reason_local_acceleration_rms": acceleration_rms,
             "reason_local_shuffled_delta": shuffled_candidate,

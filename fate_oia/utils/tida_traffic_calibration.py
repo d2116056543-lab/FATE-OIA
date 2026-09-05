@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 
 from .tida_contracts import _best_label_threshold
+from .tida_object_intent_metrics import fit_object_intent_utility_policy_oof
 
 
 def _binary_f1(logits: torch.Tensor, target: torch.Tensor, threshold: torch.Tensor) -> float:
@@ -52,6 +53,86 @@ def apply_action_traffic_utility(
         raise ValueError("one scale and utility cutoff are required per action")
     selected = utility_gate >= cutoffs.to(utility_gate).view(1, -1)
     return semantic_logits + scales.to(semantic_logits).view(1, -1) * candidate_delta * selected
+
+
+def fit_complementary_trajectory_policy(
+    base_logits: torch.Tensor,
+    candidate_delta: torch.Tensor,
+    utility_gate: torch.Tensor,
+    target: torch.Tensor,
+    locked_thresholds: torch.Tensor,
+    *,
+    scales: tuple[float, ...] = (-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0),
+    cutoffs: tuple[float, ...] = (0.0, 0.3, 0.4, 0.5, 0.6, 0.7),
+    folds: int = 5,
+    min_oof_gain: float = 0.0,
+    min_positive_fold_fraction: float = 0.6,
+    min_non_degrading_fold_fraction: float = 0.8,
+    fold_degradation_tolerance: float = 0.002,
+    max_selected_rate: float = 0.75,
+    min_selected_benefit_rate: float = 0.52,
+    cap: float = 0.08,
+) -> dict[str, torch.Tensor | list[dict[str, float]]]:
+    """Fit a train-only no-harm policy after removing common residual bias."""
+    if not (
+        base_logits.shape == candidate_delta.shape == utility_gate.shape == target.shape
+    ):
+        raise ValueError("trajectory policy tensors must share [N,A]")
+    center = candidate_delta.detach().median(0).values
+    centered = candidate_delta - center[None]
+    fitted = fit_object_intent_utility_policy_oof(
+        base_logits,
+        centered,
+        utility_gate,
+        target,
+        locked_thresholds,
+        scales=scales,
+        cutoffs=cutoffs,
+        folds=folds,
+        min_oof_gain=min_oof_gain,
+        max_selected_rate=max_selected_rate,
+        min_selected_benefit_rate=min_selected_benefit_rate,
+        min_nll_improvement=0.0,
+        min_brier_improvement=0.0,
+        min_positive_fold_fraction=min_positive_fold_fraction,
+        min_non_degrading_fold_fraction=min_non_degrading_fold_fraction,
+        fold_degradation_tolerance=fold_degradation_tolerance,
+        allow_proper_score_tie=True,
+        invert_utility_for_negative_scale=True,
+        cap=cap,
+    )
+    fitted["center"] = center
+    fitted["center_source"] = "train_calib_median"
+    fitted["test_labels_used"] = False
+    return fitted
+
+
+def apply_complementary_trajectory_policy(
+    base_logits: torch.Tensor,
+    candidate_delta: torch.Tensor,
+    utility_gate: torch.Tensor,
+    policy: dict[str, torch.Tensor],
+    *,
+    cap: float = 0.08,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Apply a policy fitted on train-calib and return logits, delta, selection."""
+    if not (base_logits.shape == candidate_delta.shape == utility_gate.shape):
+        raise ValueError("trajectory deployment tensors must share [N,A]")
+    center = torch.as_tensor(policy["center"]).to(candidate_delta)
+    gate = torch.as_tensor(policy["gate"]).to(candidate_delta)
+    scale = torch.as_tensor(policy["scale"]).to(candidate_delta)
+    cutoff = torch.as_tensor(policy["cutoff"]).to(candidate_delta)
+    inverted = torch.as_tensor(policy.get("utility_inverted", torch.zeros_like(gate))).to(
+        candidate_delta
+    )
+    if any(value.shape != (base_logits.shape[1],) for value in (center, gate, scale, cutoff, inverted)):
+        raise ValueError("trajectory policy must contain one value per action")
+    score = torch.where(inverted[None] > 0.5, 1.0 - utility_gate, utility_gate)
+    selected = (gate[None] > 0.0) & (score >= cutoff[None])
+    deployed_delta = gate[None] * selected.to(candidate_delta.dtype) * (
+        scale[None] * (candidate_delta - center[None])
+    ).clamp(-float(cap), float(cap))
+    return base_logits + deployed_delta, deployed_delta, selected
 
 
 def fit_action_traffic_calibration(

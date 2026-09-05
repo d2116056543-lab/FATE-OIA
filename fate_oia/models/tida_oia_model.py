@@ -15,6 +15,7 @@ from .tida_predicate_differential import TIDAPredicateDifferential
 from .tida_reason_reader import TIDAReasonReader
 from .tida_reason_local_temporal_query import TIDAReasonLocalTemporalQuery
 from .tida_action_local_temporal_query import TIDAActionLocalTemporalQuery
+from .tida_track_conditioned_projector import TIDATrackConditionedProjector
 from .tida_relational_traffic_flow import (
     TIDARelationalTrafficFlow,
     select_semantic_traffic_seeds,
@@ -225,6 +226,8 @@ class TIDAOIAModel(nn.Module):
         traffic_trajectory_static_utility_open_prior: float = 0.10,
         traffic_trajectory_multi_track_enabled: bool = False,
         traffic_trajectory_multi_track_floor: float = 0.10,
+        traffic_trajectory_track_token_credit_enabled: bool = False,
+        traffic_trajectory_track_token_temperature: float = 0.25,
         relational_traffic_enabled: bool = False,
         relational_traffic_action_cap: float = 0.12,
         relational_traffic_reason_cap: float = 0.10,
@@ -250,9 +253,21 @@ class TIDAOIAModel(nn.Module):
         reason_local_query_cap: float = 0.08,
         reason_local_query_utility_open_prior: float = 0.10,
         reason_local_temporal_reason_indices: tuple[int, ...] | None = None,
+        reason_local_directional_enabled: bool = False,
+        reason_local_action_condition_enabled: bool = False,
+        reason_local_action_condition_mode: str = "scalar",
+        reason_local_action_condition_input_scale: float = 1.0,
+        reason_local_action_condition_cap: float = 0.01,
         action_local_query_enabled: bool = False,
         action_local_query_cap: float = 0.08,
         action_local_query_utility_open_prior: float = 0.10,
+        track_conditioned_local_query_enabled: bool = False,
+        track_attention_temperature: float = 1.0,
+        track_attention_topk: int | None = None,
+        track_confidence_power: float = 0.0,
+        reason_track_attention_temperature: float | None = None,
+        reason_track_attention_topk: int | None = None,
+        reason_track_confidence_power: float | None = None,
         logit_flow_enabled: bool = False,
         logit_flow_hidden_dim: int = 64,
         logit_flow_action_cap: float = 0.05,
@@ -335,6 +350,12 @@ class TIDAOIAModel(nn.Module):
             cap=reason_local_query_cap,
             utility_open_prior=reason_local_query_utility_open_prior,
             temporal_reason_indices=reason_local_temporal_reason_indices,
+            directional_enabled=reason_local_directional_enabled,
+            action_condition_enabled=reason_local_action_condition_enabled,
+            action_condition_mode=reason_local_action_condition_mode,
+            action_condition_input_scale=reason_local_action_condition_input_scale,
+            action_condition_cap=reason_local_action_condition_cap,
+            num_actions=num_actions,
         )
         if not self.reason_local_query_enabled:
             for parameter in self.reason_local_query.parameters():
@@ -350,6 +371,47 @@ class TIDAOIAModel(nn.Module):
         if not self.action_local_query_enabled:
             for parameter in self.action_local_query.parameters():
                 parameter.requires_grad = False
+        if (
+            self.reason_local_query.action_condition_enabled
+            and self.reason_local_query.action_condition_mode == "token"
+            and not self.action_local_query_enabled
+        ):
+            raise ValueError(
+                "token-conditioned reason query requires action_local_query_enabled"
+            )
+        self.track_conditioned_local_query_enabled = bool(
+            track_conditioned_local_query_enabled
+        )
+        self.action_track_projector = TIDATrackConditionedProjector(
+            dim=dim,
+            num_targets=num_actions,
+            attention_temperature=track_attention_temperature,
+            attention_topk=track_attention_topk,
+            confidence_power=track_confidence_power,
+        )
+        self.reason_track_projector = TIDATrackConditionedProjector(
+            dim=dim,
+            num_targets=num_reasons,
+            attention_temperature=(
+                track_attention_temperature
+                if reason_track_attention_temperature is None
+                else reason_track_attention_temperature
+            ),
+            attention_topk=(
+                track_attention_topk
+                if reason_track_attention_topk is None
+                else reason_track_attention_topk
+            ),
+            confidence_power=(
+                track_confidence_power
+                if reason_track_confidence_power is None
+                else reason_track_confidence_power
+            ),
+        )
+        if not self.track_conditioned_local_query_enabled:
+            for module in (self.action_track_projector, self.reason_track_projector):
+                for parameter in module.parameters():
+                    parameter.requires_grad = False
         self.logit_flow_enabled = bool(logit_flow_enabled)
         self.action_logit_flow = TIDALogitFlowReader(
             num_labels=num_actions, hidden_dim=logit_flow_hidden_dim,
@@ -406,6 +468,7 @@ class TIDAOIAModel(nn.Module):
                 "object_intent": object_intent_enabled,
                 "reason_local_query": reason_local_query_enabled,
                 "action_local_query": action_local_query_enabled,
+                "track_conditioned_local_query": track_conditioned_local_query_enabled,
                 "logit_flow": logit_flow_enabled,
             }
             enabled = [name for name, value in incompatible.items() if value]
@@ -421,6 +484,7 @@ class TIDAOIAModel(nn.Module):
                 "relational_traffic": relational_traffic_enabled,
                 "reason_local_query": reason_local_query_enabled,
                 "action_local_query": action_local_query_enabled,
+                "track_conditioned_local_query": track_conditioned_local_query_enabled,
                 "logit_flow": logit_flow_enabled,
                 "target_token_flow": target_token_flow_enabled,
             }
@@ -472,6 +536,8 @@ class TIDAOIAModel(nn.Module):
             static_utility_open_prior=traffic_trajectory_static_utility_open_prior,
             multi_track_enabled=traffic_trajectory_multi_track_enabled,
             multi_track_floor=traffic_trajectory_multi_track_floor,
+            multi_track_token_credit_enabled=traffic_trajectory_track_token_credit_enabled,
+            multi_track_token_temperature=traffic_trajectory_track_token_temperature,
         )
         self.relational_traffic_enabled = bool(relational_traffic_enabled)
         self.relational_traffic = TIDARelationalTrafficFlow(
@@ -690,11 +756,21 @@ class TIDAOIAModel(nn.Module):
                 parameter for parameter in self.reason_local_query.parameters()
                 if parameter.requires_grad
             ]
+            if self.track_conditioned_local_query_enabled:
+                owners["reason_local_query"].extend(
+                    parameter for parameter in self.reason_track_projector.parameters()
+                    if parameter.requires_grad
+                )
         if self.action_local_query_enabled:
             owners["action_local_query"] = [
                 parameter for parameter in self.action_local_query.parameters()
                 if parameter.requires_grad
             ]
+            if self.track_conditioned_local_query_enabled:
+                owners["action_local_query"].extend(
+                    parameter for parameter in self.action_track_projector.parameters()
+                    if parameter.requires_grad
+                )
         if self.logit_flow_enabled:
             owners["logit_flow_action"] = [
                 parameter for parameter in self.action_logit_flow.parameters()
@@ -802,6 +878,12 @@ class TIDAOIAModel(nn.Module):
         terminal_semantic_patch_tokens: torch.Tensor | None = None,
         terminal_semantic_patch_xy: torch.Tensor | None = None,
         terminal_semantic_patch_weight: torch.Tensor | None = None,
+        history_reason_patch_tokens: torch.Tensor | None = None,
+        history_reason_patch_xy: torch.Tensor | None = None,
+        history_reason_patch_weight: torch.Tensor | None = None,
+        terminal_reason_patch_tokens: torch.Tensor | None = None,
+        terminal_reason_patch_xy: torch.Tensor | None = None,
+        terminal_reason_patch_weight: torch.Tensor | None = None,
         history_reason_query_tokens: torch.Tensor | None = None,
         terminal_reason_query_tokens: torch.Tensor | None = None,
         terminal_action_query_tokens: torch.Tensor | None = None,
@@ -896,7 +978,8 @@ class TIDAOIAModel(nn.Module):
         traffic_action_delta_raw = traffic["traffic_action_delta"]
         traffic_action_delta = traffic_action_delta_raw * temporal_action_scale
         trajectory = self._empty_traffic_trajectory(image_action, history_tokens.shape[1] + 1)
-        if self.traffic_trajectory_enabled:
+        trajectory_field = None
+        if self.traffic_trajectory_enabled or self.track_conditioned_local_query_enabled:
             required = (
                 history_action_patch_tokens, history_action_patch_xy, history_action_patch_weight,
                 terminal_action_patch_tokens, terminal_action_patch_xy, terminal_action_patch_weight,
@@ -911,8 +994,10 @@ class TIDAOIAModel(nn.Module):
                 dense_patch_tokens=dense_trajectory_patch_tokens,
                 dense_grid_hw=dense_trajectory_grid_hw,
             )
+            trajectory = {**trajectory, **trajectory_field}
+        if self.traffic_trajectory_enabled:
             trajectory = {
-                **trajectory_field,
+                **trajectory,
                 **self.traffic_trajectory_head(
                     action_nodes,
                     trajectory_field["trajectory_appearance"],
@@ -935,7 +1020,8 @@ class TIDAOIAModel(nn.Module):
         )
         traffic_trajectory_control_delta = traffic_trajectory_control_delta_raw * temporal_action_scale
         relational = self._empty_relational_traffic(image_action, image_reason)
-        if self.relational_traffic_enabled:
+        semantic_field = None
+        if self.relational_traffic_enabled or self.track_conditioned_local_query_enabled:
             semantic_required = (
                 history_semantic_patch_tokens,
                 history_semantic_patch_xy,
@@ -958,6 +1044,11 @@ class TIDAOIAModel(nn.Module):
                 dense_patch_tokens=dense_trajectory_patch_tokens,
                 dense_grid_hw=dense_trajectory_grid_hw,
             )
+            relational = {
+                **relational,
+                **{f"semantic_{key}": value for key, value in semantic_field.items()},
+            }
+        if self.relational_traffic_enabled:
             relational_output = self.relational_traffic(
                     action_nodes,
                     reason_nodes,
@@ -970,11 +1061,8 @@ class TIDAOIAModel(nn.Module):
                     semantic_field["trajectory_anchor_weight"],
                 )
             relational = {
+                **relational,
                 **relational_output,
-                **{
-                    f"semantic_{key}": value
-                    for key, value in semantic_field.items()
-                },
             }
         relational_action_delta = relational["relational_action_delta"] * temporal_action_scale
         relational_reason_delta = relational["relational_reason_delta"] * temporal_reason_scale
@@ -982,16 +1070,39 @@ class TIDAOIAModel(nn.Module):
         if self.action_local_query_enabled:
             if terminal_action_query_tokens is None:
                 raise ValueError("action local query requires terminal action visual reads")
+            action_track = {}
+            action_local_history = history_tokens[:, :, : self.num_actions]
+            action_local_shuffled_history = None
+            if self.track_conditioned_local_query_enabled:
+                if trajectory_field is None:
+                    raise RuntimeError("track-conditioned action query requires trajectory field")
+                projected_action_tracks = self.action_track_projector(
+                    terminal_action_query_tokens.detach(),
+                    trajectory_field["trajectory_appearance"],
+                    trajectory_field["trajectory_xy"],
+                    trajectory_field["trajectory_visibility"],
+                    trajectory_field["trajectory_exclusive_displacement"],
+                    action_specific=True,
+                )
+                action_local_history = projected_action_tracks["track_conditioned_tokens"][:, :-1]
+                action_local_shuffled_history = projected_action_tracks[
+                    "track_shuffled_conditioned_tokens"
+                ][:, :-1]
+                action_track = {
+                    f"action_{key}": value for key, value in projected_action_tracks.items()
+                }
             action_local = self.action_local_query(
-                history_tokens[:, :, : self.num_actions],
+                action_local_history,
                 terminal_action_query_tokens,
                 timestamps,
                 frame_valid_mask,
                 image_logits=image_action,
                 temporal_scale=1.0,
+                shuffled_history_tokens=action_local_shuffled_history,
             )
             semantic_action_delta = action_local["action_local_deploy_delta"]
         else:
+            action_track = {}
             zero_action = torch.zeros_like(image_action)
             semantic_action_delta = legacy_semantic_action_delta
             action_local = {
@@ -1078,8 +1189,83 @@ class TIDAOIAModel(nn.Module):
         if self.reason_local_query_enabled:
             if history_reason_query_tokens is None or terminal_reason_query_tokens is None:
                 raise ValueError("reason local query requires history and terminal reason reads")
+            reason_track = {}
+            reason_local_history = history_reason_query_tokens
+            reason_local_shuffled_history = None
+            if self.track_conditioned_local_query_enabled:
+                reason_patch_required = (
+                    history_reason_patch_tokens,
+                    history_reason_patch_xy,
+                    history_reason_patch_weight,
+                    terminal_reason_patch_tokens,
+                    terminal_reason_patch_xy,
+                    terminal_reason_patch_weight,
+                )
+                if any(value is None for value in reason_patch_required):
+                    raise RuntimeError(
+                        "track-conditioned reason query requires reason-specific patch anchors"
+                    )
+                reason_trajectory_field = self.traffic_trajectory_builder(
+                    torch.cat(
+                        (history_reason_patch_tokens, terminal_reason_patch_tokens[:, None]),
+                        dim=1,
+                    ),
+                    torch.cat(
+                        (history_reason_patch_xy, terminal_reason_patch_xy[:, None]), dim=1
+                    ),
+                    torch.cat(
+                        (history_reason_patch_weight, terminal_reason_patch_weight[:, None]),
+                        dim=1,
+                    ),
+                    frame_valid_mask,
+                    dense_patch_tokens=dense_trajectory_patch_tokens,
+                    dense_grid_hw=dense_trajectory_grid_hw,
+                )
+                projected_reason_tracks = self.reason_track_projector(
+                    terminal_reason_query_tokens.detach(),
+                    reason_trajectory_field["trajectory_appearance"],
+                    reason_trajectory_field["trajectory_xy"],
+                    reason_trajectory_field["trajectory_visibility"],
+                    reason_trajectory_field["trajectory_exclusive_displacement"],
+                    action_specific=True,
+                )
+                reason_local_history = projected_reason_tracks["track_conditioned_tokens"][:, :-1]
+                reason_local_shuffled_history = projected_reason_tracks[
+                    "track_shuffled_conditioned_tokens"
+                ][:, :-1]
+                reason_track = {
+                    f"reason_{key}": value for key, value in projected_reason_tracks.items()
+                }
+                reason_track.update(
+                    {
+                        f"reason_trajectory_{key}": value
+                        for key, value in reason_trajectory_field.items()
+                    }
+                )
+            action_token_condition_kwargs = {}
+            if (
+                self.reason_local_query.action_condition_enabled
+                and self.reason_local_query.action_condition_mode == "token"
+            ):
+                action_token_condition_kwargs = {
+                    "action_condition_history_summary": action_local[
+                        "action_local_history_summary"
+                    ],
+                    "shuffled_action_condition_history_summary": action_local[
+                        "action_local_shuffled_history_summary"
+                    ],
+                    "selected_deleted_action_condition_history_summary": action_local[
+                        "action_local_selected_deleted_history_summary"
+                    ],
+                    "random_deleted_action_condition_history_summary": action_local[
+                        "action_local_random_deleted_history_summary"
+                    ],
+                    "action_condition_target_tokens": action_local[
+                        "action_local_target_query"
+                    ],
+                }
             reason_local = self.reason_local_query(
-                history_reason_query_tokens,
+                reason_local_history,
                 terminal_reason_query_tokens,
                 timestamps,
                 frame_valid_mask,
@@ -1088,10 +1274,23 @@ class TIDAOIAModel(nn.Module):
                 # ramp. Its independently supervised deployment gate preserves
                 # the exact image fallback until the candidate proves useful.
                 temporal_scale=1.0,
+                shuffled_history_tokens=reason_local_shuffled_history,
+                action_condition_delta=action_local["action_local_candidate_delta"],
+                shuffled_action_condition_delta=action_local[
+                    "action_local_shuffled_delta"
+                ],
+                selected_deleted_action_condition_delta=action_local[
+                    "action_local_selected_deleted_delta"
+                ],
+                random_deleted_action_condition_delta=action_local[
+                    "action_local_random_deleted_delta"
+                ],
+                **action_token_condition_kwargs,
             )
             reason_delta_raw = reason_local["reason_local_candidate_delta"]
             reason_delta = reason_local["reason_local_deploy_delta"]
         else:
+            reason_track = {}
             zero_reason = torch.zeros_like(image_reason)
             reason_local = {
                 "reason_local_history_summary": image_reason.new_zeros(
@@ -1101,6 +1300,16 @@ class TIDAOIAModel(nn.Module):
                     image_reason.shape[0], image_reason.shape[1], action_nodes.shape[-1]
                 ),
                 "reason_local_candidate_delta": zero_reason,
+                "reason_local_content_candidate_delta": zero_reason,
+                "reason_local_action_condition_delta": zero_reason,
+                "reason_local_action_condition_attention": image_reason.new_zeros(
+                    image_reason.shape[0], image_reason.shape[1], self.num_actions
+                ),
+                "reason_local_action_condition_logits": image_reason,
+                "reason_local_directional_summary": image_reason.new_zeros(
+                    image_reason.shape[0], image_reason.shape[1], 3 * action_nodes.shape[-1]
+                ),
+                "reason_local_directional_summary_rms": zero_reason,
                 "reason_local_velocity_rms": zero_reason,
                 "reason_local_acceleration_rms": zero_reason,
                 "reason_local_shuffled_delta": zero_reason,
@@ -1138,7 +1347,7 @@ class TIDAOIAModel(nn.Module):
         return {
             **temporal, **innovation, **differential, **flow, **action, **reason,
             **geometric, **traffic, **trajectory, **relational, **adaptive_boundary,
-            **action_local, **reason_local,
+            **action_local, **reason_local, **action_track, **reason_track,
             "terminal_target_evidence": terminal_target_evidence,
             "terminal_query_identity": terminal_query_identity,
             "predicate_innovation_token": xi[:, self.num_actions :],
@@ -1361,6 +1570,7 @@ class TIDAOIAModel(nn.Module):
             "traffic_trajectory_control_delta": torch.zeros_like(image_action),
             "traffic_trajectory_credit_logit": torch.zeros_like(image_action),
             "traffic_trajectory_multi_track_credit": torch.zeros_like(image_action),
+            "traffic_trajectory_track_token_credit": torch.zeros_like(image_action),
             "traffic_trajectory_control_logit": torch.zeros_like(image_action),
             "traffic_trajectory_candidate_delta": torch.zeros_like(image_action),
             "traffic_trajectory_order_delta": torch.zeros_like(image_action),
@@ -1383,6 +1593,7 @@ class TIDAOIAModel(nn.Module):
             "trajectory_attention": image_action.new_zeros(batch, actions, tracks),
             "trajectory_multi_track_weights": image_action.new_zeros(batch, actions, tracks),
             "trajectory_multi_track_effective_count": image_action.new_zeros(batch, actions),
+            "traffic_trajectory_track_token_scores": image_action.new_zeros(batch, actions, tracks),
             "trajectory_tokens": image_action.new_zeros(batch, actions, tracks, dim),
             "trajectory_direction_histogram": image_action.new_zeros(batch, actions, tracks, 8),
             "trajectory_speed": image_action.new_zeros(batch, actions, tracks, intervals),
@@ -1445,6 +1656,7 @@ class TIDAOIAModel(nn.Module):
         terminal_read: dict[str, torch.Tensor],
         terminal_patches: dict[str, torch.Tensor],
         terminal_semantic_patches: dict[str, torch.Tensor],
+        terminal_reason_patches: dict[str, torch.Tensor] | None,
         target_field: dict[str, Any],
         history_frames: int,
     ) -> dict[str, Any]:
@@ -1487,6 +1699,8 @@ class TIDAOIAModel(nn.Module):
         }
         if "reason_query_tokens" in terminal_read:
             reason_tokens = terminal_read["reason_query_tokens"].detach()
+            if terminal_reason_patches is None:
+                raise RuntimeError("reason terminal-repeat context requires reason patch anchors")
             result.update(
                 {
                     "history_reason_query_tokens": repeat_history(reason_tokens),
@@ -1495,6 +1709,15 @@ class TIDAOIAModel(nn.Module):
                     ),
                     "history_reason_query_region_mass": repeat_history(
                         terminal_read["reason_query_region_mass"].detach()
+                    ),
+                    "history_reason_patch_tokens": repeat_history(
+                        terminal_reason_patches["tokens"].detach()
+                    ),
+                    "history_reason_patch_xy": repeat_history(
+                        terminal_reason_patches["xy"].detach()
+                    ),
+                    "history_reason_patch_weight": repeat_history(
+                        terminal_reason_patches["weights"].detach()
                     ),
                 }
             )
@@ -1723,6 +1946,17 @@ class TIDAOIAModel(nn.Module):
         semantic_patch_weight = self._intervene_patch_history(
             output["history_semantic_patch_weight"], intervention
         )
+        reason_patch_tokens = reason_patch_xy = reason_patch_weight = None
+        if self.reason_local_query_enabled or self.target_token_flow_enabled:
+            reason_patch_tokens = self._intervene_patch_history(
+                output["history_reason_patch_tokens"], intervention
+            )
+            reason_patch_xy = self._intervene_patch_history(
+                output["history_reason_patch_xy"], intervention
+            )
+            reason_patch_weight = self._intervene_patch_history(
+                output["history_reason_patch_weight"], intervention
+            )
         dense_history = self._intervene_patch_history(
             output["history_patch_tokens_last"], intervention
         )
@@ -1746,6 +1980,12 @@ class TIDAOIAModel(nn.Module):
             terminal_semantic_patch_tokens=output["terminal_semantic_patch_tokens"],
             terminal_semantic_patch_xy=output["terminal_semantic_patch_xy"],
             terminal_semantic_patch_weight=output["terminal_semantic_patch_weight"],
+            history_reason_patch_tokens=reason_patch_tokens,
+            history_reason_patch_xy=reason_patch_xy,
+            history_reason_patch_weight=reason_patch_weight,
+            terminal_reason_patch_tokens=output.get("terminal_reason_patch_tokens"),
+            terminal_reason_patch_xy=output.get("terminal_reason_patch_xy"),
+            terminal_reason_patch_weight=output.get("terminal_reason_patch_weight"),
             dense_trajectory_patch_tokens=dense_trajectory_patch_tokens,
             dense_trajectory_grid_hw=output["history_grid_hw"],
             history_reason_query_tokens=self._intervene_patch_history(
@@ -1887,12 +2127,18 @@ class TIDAOIAModel(nn.Module):
             grid_hw=target_field["grid_hw"],
             topk=self.context_encoder.motion_topk,
         )
+        terminal_reason_patches = None
+        if self.reason_local_query_enabled or self.target_token_flow_enabled:
+            terminal_reason_patches = self.context_encoder.select_action_patches(
+                target_field, terminal_read["reason_query_attention"]
+            )
 
         if self.history_encoder_mode == "terminal_repeat":
             context = self._terminal_repeat_context(
                 terminal_read,
                 terminal_patches,
                 terminal_semantic_patches,
+                terminal_reason_patches,
                 target_field,
                 context_images.shape[1],
             )
@@ -2001,6 +2247,30 @@ class TIDAOIAModel(nn.Module):
             terminal_semantic_patch_tokens=terminal_semantic_patches["tokens"],
             terminal_semantic_patch_xy=terminal_semantic_patches["xy"],
             terminal_semantic_patch_weight=terminal_semantic_patches["weights"],
+            history_reason_patch_tokens=(
+                self._intervene_patch_history(context["history_reason_patch_tokens"], intervention)
+                if self.reason_local_query_enabled or self.target_token_flow_enabled
+                else None
+            ),
+            history_reason_patch_xy=(
+                self._intervene_patch_history(context["history_reason_patch_xy"], intervention)
+                if self.reason_local_query_enabled or self.target_token_flow_enabled
+                else None
+            ),
+            history_reason_patch_weight=(
+                self._intervene_patch_history(context["history_reason_patch_weight"], intervention)
+                if self.reason_local_query_enabled or self.target_token_flow_enabled
+                else None
+            ),
+            terminal_reason_patch_tokens=(
+                terminal_reason_patches["tokens"] if terminal_reason_patches is not None else None
+            ),
+            terminal_reason_patch_xy=(
+                terminal_reason_patches["xy"] if terminal_reason_patches is not None else None
+            ),
+            terminal_reason_patch_weight=(
+                terminal_reason_patches["weights"] if terminal_reason_patches is not None else None
+            ),
             dense_trajectory_patch_tokens=dense_trajectory_patch_tokens,
             dense_trajectory_grid_hw=context["history_grid_hw"],
             history_reason_query_tokens=(
@@ -2211,6 +2481,15 @@ class TIDAOIAModel(nn.Module):
             "terminal_semantic_patch_xy": terminal_semantic_patches["xy"],
             "terminal_semantic_patch_weight": terminal_semantic_patches["weights"],
             "terminal_semantic_patch_indices": terminal_semantic_patches["indices"],
+            "terminal_reason_patch_tokens": (
+                terminal_reason_patches["tokens"] if terminal_reason_patches is not None else None
+            ),
+            "terminal_reason_patch_xy": (
+                terminal_reason_patches["xy"] if terminal_reason_patches is not None else None
+            ),
+            "terminal_reason_patch_weight": (
+                terminal_reason_patches["weights"] if terminal_reason_patches is not None else None
+            ),
             "terminal_reason_query_tokens": (
                 terminal_read["reason_query_tokens"]
                 if (self.reason_local_query_enabled or self.target_token_flow_enabled)

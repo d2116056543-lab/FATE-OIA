@@ -1,0 +1,338 @@
+experiment:
+  name: tida_action_token_conditioned_reason_v46
+  direct_video: true
+  eval_splits: [test]
+  diagnostic_eval_splits: []
+  best_selection_split: test
+  best_selection_metric: video_stable_deploy_joint
+  internal_test_selected: false
+  publication_eligible: true
+data:
+  manifest_path: 'G:\FATE_Drive_runs\tida_full_manifest_exact4572_v19\tida_full_primary_manifest.jsonl'
+  partition_seed: 20260829
+  train_on_all_official_train: true
+  train_core_count: 13254
+  train_gradient_count: 15302
+  train_calib_count: 1024
+  train_audit_count: 1024
+  test_count: 4572
+  accepted_source_count: 19874
+  rejected_source_count: 0
+  target_height: 360
+  target_width: 640
+  context_height: 192
+  context_width: 344
+  history_frames: 14
+  history_unavailable_fallback: exact_terminal_image
+  history_unavailable_expected_count: 35
+  history_unavailable_test_expected_count: 6
+  clip_seconds: 5.0
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 3
+backbone:
+  arch: vit_small
+  patch_size: 8
+  selected_layers: [3, 7, 11]
+  pretrained_weights: ckp/reference/dino_deitsmall8_pretrain.pth
+  freeze_backbone: true
+  no_grad_backbone: true
+  feature_cache_enabled: false
+  token_compression: none
+image_base:
+  checkpoint: 'E:\sbw\FATE_Drive\fate_oia_acpr_pact_oia_v1_probe_worktree\.background_runs\pact_oia_v1_probe_control\checkpoint_epoch_000.pth'
+  checkpoint_sha256: c50eef09e31178feac633553ff7b062ae9a11cc4a2bade30ebb671b8fe0394c9
+  config: configs/fate_oia_train_360x640_pact_oia_v1_probe_control.yaml
+  stage_c_deployment: 'E:\sbw\FATE_Drive\fate_oia_tida_site_v20_worktree\.background_runs\vetra_strong_stage_c_compat.pth'
+  stage_c_deployment_sha256: e7593829d6ccc98390a057eaf0c3ee2de40c05507e8920f8bbf6f1aebaf772ae
+  expected_stage_c_metrics:
+    Act_mF1: 0.7329825973
+    Act_oF1: 0.7537140521
+    Act_mAP: 0.7981665067
+    Exp_mF1: 0.4076889130
+    Exp_oF1: 0.5748781054
+    Exp_mAP: 0.3842171068
+    joint: 0.5703357551
+  action_scale: 1.0
+  reason_scale: 0.60
+model:
+  dim: 384
+  num_actions: 4
+  num_reasons: 21
+  num_predicates: 32
+  history_encoder_mode: dino
+  context_chunk_size: 3
+  temporal_layers: 1
+  temporal_heads: 4
+  temporal_dropout: 0.05
+  action_kappa: 0.08
+  reason_kappa: 0.06
+  action_flow_mix_cap: 0.10
+  reason_flow_mix_cap: 0.08
+  action_evidence_trust_cap: 0.15
+  reason_evidence_trust_cap: 0.15
+  conditional_temporal_utility: true
+  action_temporal_budget_cap: 0.15
+  reason_temporal_budget_cap: 0.12
+  confidence_aware_reason_gate: true
+  reason_gate_temperature: 0.50
+  legacy_semantic_routes_enabled: false
+  reason_local_query_enabled: true
+  reason_local_action_condition_enabled: true
+  reason_local_action_condition_mode: token
+  # Normalize the bounded action delta (cap=0.05) before the detached bridge.
+  reason_local_action_condition_input_scale: 20.0
+  reason_local_action_condition_cap: 0.01
+  reason_local_query_cap: 0.04
+  reason_local_query_utility_open_prior: 0.10
+  reason_local_temporal_reason_indices: [1, 5, 6, 7, 8, 10, 13, 14, 16, 19, 20]
+  action_local_query_enabled: true
+  action_local_query_cap: 0.05
+  action_local_query_utility_open_prior: 0.10
+  # Action retains the stronger V39 dense trajectory reader. Reason uses
+  # sparse confidence-weighted trajectories anchored by each reason's own
+  # terminal visual attention, rather than one shared semantic track pool.
+  track_conditioned_local_query_enabled: true
+  track_attention_temperature: 1.0
+  track_attention_topk: null
+  track_confidence_power: 0.0
+  reason_track_attention_temperature: 0.50
+  reason_track_attention_topk: 4
+  reason_track_confidence_power: 1.0
+  logit_flow_enabled: false
+  target_token_flow_enabled: false
+  geometric_flow_enabled: false
+  traffic_action_enabled: false
+  traffic_trajectory_enabled: false
+  traffic_trajectory_deploy_enabled: false
+  traffic_trajectory_cap: 0.08
+  traffic_trajectory_heads: 4
+  traffic_trajectory_credit_mode: ordered_vs_static
+  traffic_trajectory_static_utility_open_prior: 0.10
+  traffic_trajectory_multi_track_enabled: false
+  traffic_trajectory_multi_track_floor: 0.10
+  traffic_trajectory_track_token_credit_enabled: false
+  traffic_trajectory_track_token_temperature: 0.25
+  traffic_trajectory_state_enabled: false
+  traffic_trajectory_state_strength_scale: 8.0
+  traffic_trajectory_state_cap_ratio: 0.5
+  traffic_trajectory_state_utility_open_prior: 0.10
+  relational_traffic_enabled: false
+  relational_event_conditioning_enabled: false
+  traffic_adaptive_boundary_enabled: false
+  object_intent_enabled: false
+  object_tracker_mode: external
+loss:
+  terminal_hist: 0.0
+  terminal_no_history: 0.0
+  terminal_gain: 0.0
+  temporal_order: 0.0
+  repeated_last_contrast: 0.0
+  flow_transition_align: 0.0
+  action_asl: 0.0
+  action_smooth_ap: 0.0
+  action_base_protect: 0.0
+  action_delta: 0.0
+  action_route_sparse: 0.0
+  action_flow_credit: 0.0
+  action_flow_no_harm: 0.0
+  action_utility_calibration: 0.0
+  action_local_aux: 0.50
+  action_local_rank: 0.15
+  action_local_utility: 0.05
+  action_local_no_harm: 0.10
+  action_local_order: 0.10
+  action_local_deletion: 0.05
+  action_local_delta: 0.002
+  logit_flow_action_aux: 0.0
+  logit_flow_action_rank: 0.0
+  logit_flow_action_utility: 0.0
+  logit_flow_action_order: 0.0
+  logit_flow_action_no_harm: 0.0
+  logit_flow_action_delta: 0.0
+  reason_partial: 0.0
+  reason_rank: 0.0
+  reason_soft_f1: 0.0
+  reason_delta: 0.0
+  reason_flow_credit: 0.0
+  reason_flow_no_harm: 0.0
+  reason_positive_no_harm: 0.0
+  reason_utility_calibration: 0.0
+  reason_local_aux: 0.50
+  # Dedicated PU and ranking supervision prevents the stronger content path
+  # from absorbing all credit intended for the detached action bridge.
+  reason_local_action_condition_aux: 0.10
+  reason_local_action_condition_rank: 0.05
+  reason_local_rank: 0.15
+  reason_local_utility: 0.05
+  reason_local_no_harm: 0.10
+  reason_local_order: 0.10
+  reason_local_deletion: 0.05
+  reason_local_delta: 0.002
+  logit_flow_reason_aux: 0.0
+  logit_flow_reason_rank: 0.0
+  logit_flow_reason_utility: 0.0
+  logit_flow_reason_order: 0.0
+  logit_flow_reason_no_harm: 0.0
+  logit_flow_reason_delta: 0.0
+  target_token_action_prediction: 0.0
+  target_token_action_order: 0.0
+  target_token_action_aux: 0.0
+  target_token_action_rank: 0.0
+  target_token_action_utility: 0.0
+  target_token_action_no_harm: 0.0
+  target_token_action_delta: 0.0
+  target_token_reason_prediction: 0.0
+  target_token_reason_order: 0.0
+  target_token_reason_aux: 0.0
+  target_token_reason_rank: 0.0
+  target_token_reason_utility: 0.0
+  target_token_reason_no_harm: 0.0
+  target_token_reason_delta: 0.0
+  geometric_action_aux: 0.0
+  geometric_action_rank: 0.0
+  geometric_action_prefix: 0.0
+  geometric_action_delta: 0.0
+  geometric_reason_aux: 0.0
+  geometric_reason_rank: 0.0
+  geometric_reason_prefix: 0.0
+  geometric_reason_delta: 0.0
+  traffic_action_aux: 0.0
+  traffic_action_rank: 0.0
+  traffic_action_delta: 0.0
+  trajectory_action_boundary: 0.0
+  trajectory_action_rank: 0.0
+  trajectory_selected_control: 0.0
+  trajectory_utility_calibration: 0.0
+  trajectory_delta: 0.0
+  relational_action_aux: 0.0
+  relational_action_rank: 0.0
+  relational_action_deletion: 0.0
+  relational_action_no_harm: 0.0
+  relational_reason_aux: 0.0
+  relational_reason_rank: 0.0
+  relational_reason_deletion: 0.0
+  relational_reason_no_harm: 0.0
+  relational_delta: 0.0
+  object_intent_action_aux: 0.0
+  object_intent_action_rank: 0.0
+  object_intent_action_boundary: 0.0
+  object_intent_action_smooth_ap: 0.0
+  object_intent_action_deletion: 0.0
+  object_intent_action_pair_deletion: 0.0
+  object_intent_action_no_harm: 0.0
+  object_intent_action_utility: 0.0
+  object_intent_reason_aux: 0.0
+  object_intent_reason_rank: 0.0
+  object_intent_reason_deletion: 0.0
+  object_intent_reason_pair_deletion: 0.0
+  object_intent_reason_no_harm: 0.0
+  object_intent_reason_utility: 0.0
+  object_intent_delta: 0.0
+training:
+  action_rank_memory_capacity: 0
+  action_rank_memory_reference: video
+  seed: 20260905
+  epochs: 10
+  batch_size: 6
+  gradient_accumulation_steps: 5
+  formal_train_owners: [action_local_query, reason_local_query]
+  target_token_predictive_epochs: 0
+  precision: bf16
+  optimizer: AdamW
+  weight_decay: 0.03
+  global_grad_clip: 1.0
+  warmup_ratio: 0.05
+  temporal_ramp_end_ratio: 0.08
+  flow_phases:
+    foundation_end_ratio: 0.0
+    credit_end_ratio: 0.08
+    final_phase: SAFE_JOINT
+  min_lr_ratio: 0.10
+  ema_decay: 0.998
+  no_metric_early_stop: true
+  lr:
+    history_reader: 0.00005
+    temporal_encoder: 0.00005
+    innovation_predictor: 0.00005
+    predicate_differential: 0.00005
+    flow_transition: 0.000075
+    temporal_action: 0.00010
+    temporal_reason: 0.000075
+    geometric_action: 0.00010
+    geometric_reason: 0.00010
+    traffic_action: 0.00010
+    traffic_trajectory: 0.00010
+    traffic_trajectory_utility: 0.00030
+    relational_traffic_action: 0.00030
+    relational_traffic_reason: 0.00020
+    traffic_adaptive_boundary: 0.00010
+    object_intent_action: 0.00010
+    object_intent_reason: 0.00010
+    object_intent_action_utility: 0.00020
+    object_intent_reason_utility: 0.00020
+    object_intent_lateral_refinement: 0.00010
+    action_local_query: 0.00020
+    reason_local_query: 0.00015
+    logit_flow_action: 0.00030
+    logit_flow_reason: 0.00020
+    target_token_action: 0.00030
+    target_token_reason: 0.00020
+memory_probe:
+  max_reserved_gib: 43.0
+  max_growth_gib: 0.25
+  warmup_updates: 3
+  measured_updates: 10
+  candidates:
+    - {name: A, batch_size: 10, gradient_accumulation_steps: 3, context_chunk_size: 3}
+    - {name: B, batch_size: 8, gradient_accumulation_steps: 4, context_chunk_size: 3}
+    - {name: C, batch_size: 6, gradient_accumulation_steps: 5, context_chunk_size: 3}
+runtime:
+  foreground_only: true
+  no_feature_cache: true
+  require_no_token_compression: true
+  test_every_epoch: true
+  expanded_test_every_epoch: false
+  save_every_epoch: true
+  intervention_interval_updates: 8
+  fixed_test_audit_samples: 32
+  mechanism_eval_interval_epochs: 1
+  print_every_optimizer_updates: 10
+  exact_resume: true
+deployment:
+  calibration_source: train_calib
+  primary_threshold_source: image_train_calib_locked
+  reason_beta_source: [train_calib, train_audit]
+  reason_beta_candidates: [0.0, 0.25, 0.5, 0.75, 1.0]
+  test_oracle_writeback: false
+  stage_c_nested_oof: true
+  locked_image_threshold_source: vetra_strong_refine_train_calib_oof_tta_combo
+  locked_image_thresholds: [0.4749999940, 0.4250000119, 0.3249999881, 0.3350000083, 0.7149999738, 0.6549999714, 0.6750000119, 0.6999999881, 0.6800000072, 0.4699999988, 0.0099999998, 0.6800000072, 0.4950000048, 0.2399999946, 0.5500000119, 0.3899999857, 0.2500000000, 0.5500000119, 0.4650000036, 0.6250000000, 0.6050000191, 0.6200000048, 0.6600000262, 0.6000000238, 0.6600000262]
+  action_local_policy_scales: [-1.0, -0.5, -0.25, 0.0, 0.25, 0.5, 1.0]
+  action_local_policy_cutoffs: [0.0, 0.10, 0.20, 0.30, 0.40, 0.50]
+  action_local_policy_oof_folds: 5
+  action_local_policy_min_oof_gain: 0.0
+  action_local_policy_max_selected_rate: 0.50
+  action_local_policy_min_selected_benefit_rate: 0.55
+  action_local_policy_min_nll_improvement: 0.0
+  action_local_policy_min_brier_improvement: 0.0
+  action_local_policy_min_positive_fold_fraction: 0.60
+  action_local_policy_min_non_degrading_fold_fraction: 0.80
+  action_local_policy_fold_degradation_tolerance: 0.002
+  action_local_policy_allow_proper_score_tie: false
+  action_local_policy_leave_source_out: true
+  reason_local_policy_scales: [-1.0, -0.5, -0.25, 0.0, 0.25, 0.5, 1.0]
+  reason_local_policy_cutoffs: [0.0, 0.05, 0.10, 0.15, 0.20, 0.30, 0.40, 0.50]
+  reason_local_policy_oof_folds: 5
+  reason_local_policy_min_oof_gain: 0.0
+  reason_local_policy_max_selected_rate: 0.50
+  reason_local_policy_min_selected_benefit_rate: 0.55
+  reason_local_policy_min_nll_improvement: 0.0
+  reason_local_policy_min_brier_improvement: 0.0
+  reason_local_policy_min_positive_fold_fraction: 0.60
+  reason_local_policy_min_non_degrading_fold_fraction: 0.80
+  reason_local_policy_fold_degradation_tolerance: 0.002
+  reason_local_policy_allow_proper_score_tie: false
+  reason_local_policy_negative_scale_uses_inverted_utility: true
+  reason_local_policy_leave_source_out: true

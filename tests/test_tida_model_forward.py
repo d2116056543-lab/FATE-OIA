@@ -300,6 +300,47 @@ def test_action_local_query_uses_terminal_visual_read_and_protects_image_base():
     assert model.action_local_query.action_readout_weight.grad.abs().sum() > 0
 
 
+def test_reason_track_reader_uses_reason_specific_trajectory_groups():
+    roles = {
+        "static_anchor": [f"p{i}" for i in range(8)],
+        "dynamic_actor": [f"p{i}" for i in range(8, 24)],
+        "terminal_context": [f"p{i}" for i in range(24, 32)],
+    }
+    model = TIDAOIAModel(
+        _ImageBase(),
+        dim=8,
+        predicate_roles=roles,
+        context_chunk_size=2,
+        reason_local_query_enabled=True,
+        action_local_query_enabled=True,
+        track_conditioned_local_query_enabled=True,
+        track_attention_topk=4,
+        reason_track_attention_topk=3,
+        reason_track_confidence_power=1.0,
+    )
+    out = model(
+        torch.randn(1, 3, 360, 640),
+        torch.randn(1, 3, 3, 192, 344),
+        torch.linspace(-3, 0, 4).unsqueeze(0),
+        torch.ones(1, 4, dtype=torch.bool),
+        temporal_action_scale=0.0,
+        temporal_reason_scale=0.0,
+    )
+
+    assert out["reason_trajectory_trajectory_appearance"].shape[1] == 21
+    assert out["reason_track_attention"].shape[:3] == (1, 21, 4)
+    assert (out["reason_track_attention"] > 0).sum(-1).max() <= 3
+    assert out["reason_track_motion_rms"].shape == (1, 21)
+    rerun = model.rerun_temporal_from_output(
+        out,
+        "time_reverse",
+        temporal_action_scale=0.0,
+        temporal_reason_scale=0.0,
+    )
+    assert rerun["reason_track_attention"].shape[:3] == (1, 21, 4)
+    assert torch.isfinite(rerun["reason_local_candidate_logits"]).all()
+
+
 def test_object_intent_transport_reaches_final_logits_with_task_firewall():
     roles = {
         "static_anchor": [f"p{i}" for i in range(8)],

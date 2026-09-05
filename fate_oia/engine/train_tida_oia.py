@@ -57,6 +57,10 @@ from fate_oia.utils.tida_contracts import (
     validate_training_protocol,
 )
 from fate_oia.utils.tida_stateful_sampler import TIDAStatefulRandomSampler
+from fate_oia.utils.tida_traffic_calibration import (
+    apply_complementary_trajectory_policy,
+    fit_complementary_trajectory_policy,
+)
 from fate_oia.utils.tida_relational_traffic_metrics import relational_traffic_metrics
 from fate_oia.utils.tida_object_intent_metrics import (
     apply_object_intent_gates_to_rows,
@@ -69,6 +73,7 @@ from fate_oia.utils.tida_object_intent_metrics import (
     object_intent_traffic_metrics,
 )
 from fate_oia.utils.vetra_stage_contracts import sha256_file
+from fate_oia.utils.aie_metrics import aie_branch_metrics
 
 
 @dataclass
@@ -84,6 +89,8 @@ class TIDARuntime:
 
 
 _VERIFIED_IMAGE_BASELINE_REUSE_OWNERS = {
+    "action_local_query",
+    "reason_local_query",
     "object_intent_action_utility",
     "object_intent_reason_utility",
     "logit_flow_action",
@@ -392,7 +399,8 @@ def reason_firewall_gradient_audit(
         "object_intent_reason_aux", "object_intent_reason_rank",
         "object_intent_reason_deletion", "object_intent_reason_pair_deletion",
         "object_intent_reason_no_harm", "object_intent_reason_utility",
-        "reason_local_aux", "reason_local_rank", "reason_local_utility",
+        "reason_local_aux", "reason_local_action_condition_aux",
+        "reason_local_action_condition_rank", "reason_local_rank", "reason_local_utility",
         "reason_local_no_harm", "reason_local_order", "reason_local_deletion",
         "reason_local_delta",
         "target_token_reason_prediction", "target_token_reason_order",
@@ -514,6 +522,15 @@ def append_supervision_tensors(
         "reason_local_motion_energy": output["reason_local_motion_energy"],
         "reason_local_velocity_rms": output["reason_local_velocity_rms"],
         "reason_local_acceleration_rms": output["reason_local_acceleration_rms"],
+        "reason_local_directional_summary_rms": output[
+            "reason_local_directional_summary_rms"
+        ],
+        "reason_local_action_condition_delta": output[
+            "reason_local_action_condition_delta"
+        ],
+        "reason_local_action_condition_attention": output[
+            "reason_local_action_condition_attention"
+        ],
         "reason_local_shuffled_delta": output["reason_local_shuffled_delta"],
         "reason_local_selected_deleted_delta": output[
             "reason_local_selected_deleted_delta"
@@ -550,6 +567,17 @@ def append_supervision_tensors(
             ):
                 key = f"{prefix}_{suffix}"
                 values[key] = output[key]
+    for prefix in ("action", "reason"):
+        for suffix in (
+            "track_attention",
+            "track_available",
+            "track_effective_count",
+            "track_motion_rms",
+            "track_attention_entropy",
+        ):
+            key = f"{prefix}_{suffix}"
+            if key in output:
+                values[key] = output[key]
     for key, value in values.items():
         store.setdefault(key, []).append(value.detach().float().cpu())
 
@@ -581,6 +609,9 @@ def supervision_tensor_summary(
     target_reason_deploy = values.get(
         "target_token_reason_deploy_delta", torch.zeros_like(values["reason_delta"])
     )
+    action_condition_attention = values[
+        "reason_local_action_condition_attention"
+    ].clamp_min(1e-12)
     return {
         "history_valid_rate": float(values["history_frame_valid"].mean()),
         "history_available_rate": float(values["history_available"].mean()),
@@ -661,6 +692,20 @@ def supervision_tensor_summary(
         ),
         "reason_local_acceleration_rms_mean": float(
             values["reason_local_acceleration_rms"].mean()
+        ),
+        "reason_local_directional_summary_rms_mean": float(
+            values["reason_local_directional_summary_rms"].mean()
+        ),
+        "reason_local_action_condition_delta_rms": float(
+            values["reason_local_action_condition_delta"].square().mean().sqrt()
+        ),
+        "reason_local_action_condition_attention_entropy_mean": float(
+            -(action_condition_attention * action_condition_attention.log())
+            .sum(-1)
+            .mean()
+        ),
+        "reason_local_action_condition_attention_max_mean": float(
+            action_condition_attention.max(-1).values.mean()
         ),
         "reason_local_order_delta_gap": float(
             (
@@ -946,6 +991,12 @@ def build_runtime(args: Any, evaluation_only: bool = False) -> TIDARuntime:
         traffic_trajectory_multi_track_floor=float(
             config["model"].get("traffic_trajectory_multi_track_floor", 0.10)
         ),
+        traffic_trajectory_track_token_credit_enabled=bool(
+            config["model"].get("traffic_trajectory_track_token_credit_enabled", False)
+        ),
+        traffic_trajectory_track_token_temperature=float(
+            config["model"].get("traffic_trajectory_track_token_temperature", 0.25)
+        ),
         traffic_trajectory_state_enabled=bool(
             config["model"].get("traffic_trajectory_state_enabled", True)
         ),
@@ -1017,6 +1068,27 @@ def build_runtime(args: Any, evaluation_only: bool = False) -> TIDARuntime:
         action_local_query_utility_open_prior=float(
             config["model"].get("action_local_query_utility_open_prior", 0.10)
         ),
+        track_conditioned_local_query_enabled=bool(
+            config["model"].get("track_conditioned_local_query_enabled", False)
+        ),
+        track_attention_temperature=float(
+            config["model"].get("track_attention_temperature", 1.0)
+        ),
+        track_attention_topk=config["model"].get("track_attention_topk"),
+        track_confidence_power=float(
+            config["model"].get("track_confidence_power", 0.0)
+        ),
+        reason_track_attention_temperature=(
+            float(config["model"]["reason_track_attention_temperature"])
+            if "reason_track_attention_temperature" in config["model"]
+            else None
+        ),
+        reason_track_attention_topk=config["model"].get("reason_track_attention_topk"),
+        reason_track_confidence_power=(
+            float(config["model"]["reason_track_confidence_power"])
+            if "reason_track_confidence_power" in config["model"]
+            else None
+        ),
         logit_flow_enabled=bool(config["model"].get("logit_flow_enabled", False)),
         logit_flow_hidden_dim=int(config["model"].get("logit_flow_hidden_dim", 64)),
         logit_flow_action_cap=float(config["model"].get("logit_flow_action_cap", 0.05)),
@@ -1055,6 +1127,21 @@ def build_runtime(args: Any, evaluation_only: bool = False) -> TIDARuntime:
             config["model"].get(
                 "target_token_direct_difference_enabled", False
             )
+        ),
+        reason_local_directional_enabled=bool(
+            config["model"].get("reason_local_directional_enabled", False)
+        ),
+        reason_local_action_condition_enabled=bool(
+            config["model"].get("reason_local_action_condition_enabled", False)
+        ),
+        reason_local_action_condition_mode=str(
+            config["model"].get("reason_local_action_condition_mode", "scalar")
+        ),
+        reason_local_action_condition_input_scale=float(
+            config["model"].get("reason_local_action_condition_input_scale", 1.0)
+        ),
+        reason_local_action_condition_cap=float(
+            config["model"].get("reason_local_action_condition_cap", 0.01)
         ),
         legacy_semantic_routes_enabled=bool(
             config["model"].get("legacy_semantic_routes_enabled", True)
@@ -1284,6 +1371,23 @@ def train_locked_deployment_views(test_rows, thresholds):
     }
     if "reason_local_deploy" in metrics:
         views["reason_local_deploy"] = metrics["reason_local_deploy"]
+    if "action_local_candidate" in metrics:
+        views["action_local_direct_candidate"] = metrics["action_local_candidate"]
+    if "reason_local_action_condition" in metrics:
+        views["reason_local_action_condition_direct_candidate"] = metrics[
+            "reason_local_action_condition"
+        ]
+    if (
+        "action_local_candidate" in test_rows
+        and "reason_local_action_condition" in test_rows
+    ):
+        views["action_token_joint_direct_candidate"] = aie_branch_metrics(
+            test_rows["action_local_candidate"],
+            test_rows["reason_local_action_condition"],
+            test_rows["action_target"],
+            test_rows["reason_target"],
+            threshold=thresholds["image"],
+        )
     if (
         "reason_local_centered_candidate" in test_rows
         and "reason_local_centered" in thresholds
@@ -1329,6 +1433,77 @@ def _deployment_thresholds(calib_rows, deployment_config):
     return thresholds
 
 
+def fit_trajectory_deployment_policy(calib_rows, deployment_config):
+    """Lock a complementary action policy using train-calib labels only."""
+    if not bool(deployment_config.get("trajectory_policy_enabled", False)):
+        return calib_rows, None
+    thresholds = _deployment_thresholds(calib_rows, deployment_config)["image"][:4]
+    policy = fit_complementary_trajectory_policy(
+        calib_rows["semantic_action"],
+        calib_rows["traffic_trajectory_candidate_delta"],
+        calib_rows["traffic_trajectory_utility_gate"],
+        calib_rows["action_target"],
+        thresholds,
+        scales=tuple(deployment_config.get(
+            "trajectory_policy_scales", [-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0]
+        )),
+        cutoffs=tuple(deployment_config.get(
+            "trajectory_policy_cutoffs", [0.0, 0.3, 0.4, 0.5, 0.6, 0.7]
+        )),
+        folds=int(deployment_config.get("trajectory_policy_oof_folds", 5)),
+        min_oof_gain=float(deployment_config.get("trajectory_policy_min_oof_gain", 0.0)),
+        min_positive_fold_fraction=float(deployment_config.get(
+            "trajectory_policy_min_positive_fold_fraction", 0.6
+        )),
+        min_non_degrading_fold_fraction=float(deployment_config.get(
+            "trajectory_policy_min_non_degrading_fold_fraction", 0.8
+        )),
+        fold_degradation_tolerance=float(deployment_config.get(
+            "trajectory_policy_fold_degradation_tolerance", 0.002
+        )),
+        max_selected_rate=float(deployment_config.get(
+            "trajectory_policy_max_selected_rate", 0.75
+        )),
+        min_selected_benefit_rate=float(deployment_config.get(
+            "trajectory_policy_min_selected_benefit_rate", 0.52
+        )),
+        cap=float(deployment_config.get("trajectory_policy_cap", 0.08)),
+    )
+    return apply_trajectory_deployment_policy_to_rows(
+        calib_rows, policy, cap=float(deployment_config.get("trajectory_policy_cap", 0.08))
+    ), policy
+
+
+def apply_trajectory_deployment_policy_to_rows(rows, policy, *, cap: float = 0.08):
+    """Replace only the trajectory action contribution; reason remains firewalled."""
+    if policy is None:
+        return rows
+    rows = dict(rows)
+    rows["video_action_before_trajectory_policy"] = rows["video_action"]
+    deployed, delta, selected = apply_complementary_trajectory_policy(
+        rows["semantic_action"],
+        rows["traffic_trajectory_candidate_delta"],
+        rows["traffic_trajectory_utility_gate"],
+        policy,
+        cap=cap,
+    )
+    rows["video_action"] = deployed
+    rows["video_action_base"] = deployed
+    rows["traffic_trajectory_delta"] = delta
+    rows["traffic_trajectory_deploy_delta"] = delta
+    rows["traffic_trajectory_policy_selected"] = selected.to(delta.dtype)
+    return rows
+
+
+def serialize_trajectory_policy(policy):
+    if policy is None:
+        return None
+    return {
+        key: value.detach().cpu().tolist() if torch.is_tensor(value) else value
+        for key, value in policy.items()
+    }
+
+
 def _view_metrics(test_rows, calib_rows, deployment_config):
     thresholds = _deployment_thresholds(calib_rows, deployment_config)
     raw = branch_metrics(test_rows)
@@ -1336,6 +1511,10 @@ def _view_metrics(test_rows, calib_rows, deployment_config):
     return {
         "raw_fixed": raw, "deploy": deploy, "thresholds": thresholds,
         "primary_deploy_policy": "video_stable_image_train_calib_threshold",
+        "direct_candidate_threshold_source": "locked_image_train_calib_only",
+        "direct_candidate_policy_status": (
+            "diagnostic_candidate_not_oof_selected_primary"
+        ),
         "reason_local_centered_threshold_source": (
             "train_calib_candidate_reason_plus_locked_image_action"
             if "reason_local_centered" in thresholds else None
@@ -2067,12 +2246,7 @@ def train(args: Any) -> None:
     verified_baseline_arg = _arg(args, "verified_baseline_artifact", None)
     baseline_reuse_allowed = verified_image_baseline_reuse_allowed(train_owners)
     stage_c_thresholds = model.image_model.stage_c_thresholds()
-    if stage_c_thresholds is not None:
-        baseline_thresholds = {"image": stage_c_thresholds.detach().to(device)}
-        manifest["image_baseline_deployment"] = "vetra_stage_c_deploy_final_train_only"
-        manifest["verified_baseline_reused"] = False
-        manifest["verified_baseline_artifact"] = None
-    elif baseline_reuse_allowed and verified_baseline_arg:
+    if baseline_reuse_allowed and verified_baseline_arg:
         verified_baseline_path = Path(verified_baseline_arg).resolve()
         verified = json.loads(verified_baseline_path.read_text(encoding="utf-8"))
         expected_test_count = len(runtime.loaders["test"].dataset)
@@ -2104,6 +2278,11 @@ def train(args: Any) -> None:
         manifest["verified_baseline_artifact_sha256"] = file_sha256(
             verified_baseline_path
         )
+    elif stage_c_thresholds is not None:
+        baseline_thresholds = {"image": stage_c_thresholds.detach().to(device)}
+        manifest["image_baseline_deployment"] = "vetra_stage_c_deploy_final_train_only"
+        manifest["verified_baseline_reused"] = False
+        manifest["verified_baseline_artifact"] = None
     else:
         baseline_calib_rows = collect_tida_outputs(
             model, runtime.loaders["train_calib"], device, temporal_scale=0.0
@@ -2256,6 +2435,20 @@ def train(args: Any) -> None:
                         parameter.grad.mul_(correction)
             owners = model.owner_parameters()
             owner_gradients = owner_gradient_norms(owners)
+            directional_parameter = model.reason_local_query.directional_readout_weight
+            directional_gradient_norm = (
+                0.0
+                if directional_parameter.grad is None
+                else float(directional_parameter.grad.detach().float().norm().cpu())
+            )
+            action_condition_parameter = (
+                model.reason_local_query.action_condition_primary_parameter
+            )
+            action_condition_gradient_norm = (
+                0.0
+                if action_condition_parameter.grad is None
+                else float(action_condition_parameter.grad.detach().float().norm().cpu())
+            )
             owner_before = owner_parameter_snapshots(owners) if telemetry_window else None
             dino_parameters = list(model.image_model.foundation.dino.parameters())
             dino_gradient = gradient_norm(dino_parameters, [parameter.grad for parameter in dino_parameters])
@@ -2329,6 +2522,22 @@ def train(args: Any) -> None:
                 "loss_total": float(registry.total().detach().cpu()), "losses": registry.artifact(),
                 "grad_norm": float(grad_norm.detach().cpu()),
                 "owner_gradient_norms": owner_gradients,
+                "reason_local_directional_enabled": bool(
+                    model.reason_local_query.directional_enabled
+                ),
+                "reason_local_directional_weight_grad_norm": directional_gradient_norm,
+                "reason_local_directional_weight_norm": float(
+                    directional_parameter.detach().float().norm().cpu()
+                ),
+                "reason_local_action_condition_enabled": bool(
+                    model.reason_local_query.action_condition_enabled
+                ),
+                "reason_local_action_condition_weight_grad_norm": (
+                    action_condition_gradient_norm
+                ),
+                "reason_local_action_condition_weight_norm": float(
+                    action_condition_parameter.detach().float().norm().cpu()
+                ),
                 "rho_mean": float(output["innovation_reliability"].mean().detach().cpu()),
                 "rho_nonzero_rate": float((output["innovation_reliability"] > 0).float().mean().detach().cpu()),
                 "action_delta_rms": float(output["action_temporal_delta"].float().square().mean().sqrt().detach().cpu()),
@@ -2464,6 +2673,9 @@ def train(args: Any) -> None:
                 ),
                 "traffic_trajectory_multi_track_credit_rms": float(
                     output["traffic_trajectory_multi_track_credit"].float().square().mean().sqrt().detach().cpu()
+                ),
+                "traffic_trajectory_track_token_credit_rms": float(
+                    output["traffic_trajectory_track_token_credit"].float().square().mean().sqrt().detach().cpu()
                 ),
                 "trajectory_multi_track_effective_count_mean": float(
                     output["trajectory_multi_track_effective_count"].float().mean().detach().cpu()
@@ -2829,6 +3041,9 @@ def train(args: Any) -> None:
         online_target_token_fit = calibrate_target_token_flow_deployment(
             model, online_calib, config.get("deployment", {})
         )
+        online_calib, online_trajectory_policy = fit_trajectory_deployment_policy(
+            online_calib, config.get("deployment", {})
+        )
         if online_reason_local_fit is not None:
             atomic_write_json(
                 output_dir / "reason_local_deployment_policy_online.json",
@@ -2863,6 +3078,11 @@ def train(args: Any) -> None:
             mechanism_samples=int(config["runtime"]["fixed_test_audit_samples"]),
             collect_audit_tensors=True,
         )
+        online_test = apply_trajectory_deployment_policy_to_rows(
+            online_test,
+            online_trajectory_policy,
+            cap=float(config.get("deployment", {}).get("trajectory_policy_cap", 0.08)),
+        )
         online = _view_metrics(online_test, online_calib, config.get("deployment", {}))
         mechanism = online_test.pop("_mechanism", {
             "available": False,
@@ -2878,6 +3098,11 @@ def train(args: Any) -> None:
             expanded_rows = collect_tida_outputs(
                 model, runtime.loaders["expanded_test"], device
             )
+            expanded_rows = apply_trajectory_deployment_policy_to_rows(
+                expanded_rows,
+                online_trajectory_policy,
+                cap=float(config.get("deployment", {}).get("trajectory_policy_cap", 0.08)),
+            )
             expanded_metrics = _view_metrics(
                 expanded_rows, online_calib, config.get("deployment", {})
             )
@@ -2888,6 +3113,7 @@ def train(args: Any) -> None:
             ema_action_local_fit = online_action_local_fit
             ema_logit_flow_fit = online_logit_flow_fit
             ema_target_token_fit = online_target_token_fit
+            ema_trajectory_policy = online_trajectory_policy
         else:
             online_action_gate = model.object_intent.action_deploy_gate.clone()
             online_reason_gate = model.object_intent.reason_deploy_gate.clone()
@@ -2966,8 +3192,16 @@ def train(args: Any) -> None:
                 ema_target_token_fit = calibrate_target_token_flow_deployment(
                     model, ema_calib, config.get("deployment", {})
                 )
+                ema_calib, ema_trajectory_policy = fit_trajectory_deployment_policy(
+                    ema_calib, config.get("deployment", {})
+                )
                 ema_test = collect_tida_outputs(
                     model, runtime.loaders["test"], device
+                )
+                ema_test = apply_trajectory_deployment_policy_to_rows(
+                    ema_test,
+                    ema_trajectory_policy,
+                    cap=float(config.get("deployment", {}).get("trajectory_policy_cap", 0.08)),
                 )
                 ema_metrics = _view_metrics(
                     ema_test, ema_calib, config.get("deployment", {})
@@ -3028,6 +3262,10 @@ def train(args: Any) -> None:
             "target_token_deployment_policy_fit": {
                 "online": online_target_token_fit,
                 "ema": ema_target_token_fit,
+            },
+            "trajectory_deployment_policy_fit": {
+                "online": serialize_trajectory_policy(online_trajectory_policy),
+                "ema": serialize_trajectory_policy(ema_trajectory_policy),
             },
             "epoch_seconds": time.perf_counter() - epoch_start,
         }

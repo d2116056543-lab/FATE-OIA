@@ -8,6 +8,25 @@ from torch import nn
 from .acpr_sparse_ops import entmax15_bisect
 
 
+def signed_track_logmeanexp(
+    scores: torch.Tensor,
+    weights: torch.Tensor,
+    *,
+    temperature: float,
+) -> torch.Tensor:
+    """Aggregate competing positive/negative track evidence without early pooling."""
+    if scores.shape != weights.shape:
+        raise ValueError("scores and weights must have identical shapes")
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
+    normalized = weights.clamp_min(0)
+    normalized = normalized / normalized.sum(-1, keepdim=True).clamp_min(1e-8)
+    log_weight = normalized.clamp_min(1e-12).log()
+    positive = temperature * torch.logsumexp(log_weight + scores / temperature, dim=-1)
+    negative = temperature * torch.logsumexp(log_weight - scores / temperature, dim=-1)
+    return 0.5 * (positive - negative)
+
+
 class TIDATrafficTrajectoryHead(nn.Module):
     """Convert identity-consistent traffic trajectories into an action-only residual."""
 
@@ -25,6 +44,8 @@ class TIDATrafficTrajectoryHead(nn.Module):
         static_utility_open_prior: float = 0.10,
         multi_track_enabled: bool = False,
         multi_track_floor: float = 0.10,
+        multi_track_token_credit_enabled: bool = False,
+        multi_track_token_temperature: float = 0.25,
     ) -> None:
         super().__init__()
         if (
@@ -34,6 +55,7 @@ class TIDATrafficTrajectoryHead(nn.Module):
             or credit_mode not in {"ordered_vs_reverse", "ordered_vs_static"}
             or not 0 < static_utility_open_prior < 0.5
             or not 0 < multi_track_floor < 1
+            or multi_track_token_temperature <= 0
         ):
             raise ValueError("invalid trajectory head dimensions")
         self.dim = int(dim)
@@ -43,6 +65,10 @@ class TIDATrafficTrajectoryHead(nn.Module):
         self.credit_mode = str(credit_mode)
         self.multi_track_enabled = bool(multi_track_enabled)
         self.multi_track_floor = float(multi_track_floor)
+        self.multi_track_token_credit_enabled = bool(multi_track_token_credit_enabled)
+        self.multi_track_token_temperature = float(multi_track_token_temperature)
+        if self.multi_track_enabled and self.multi_track_token_credit_enabled:
+            raise ValueError("pooled and per-track multi-track credit cannot both be enabled")
         self.state_strength_scale = float(state_strength_scale)
         self.state_cap_ratio = float(state_cap_ratio)
         self.state_utility_prior_logit = math.log(
@@ -90,6 +116,10 @@ class TIDATrafficTrajectoryHead(nn.Module):
             nn.LayerNorm(4 * dim), nn.Linear(4 * dim, dim), nn.GELU()
         )
         self.multi_track_output = nn.Linear(dim, 1)
+        self.track_token_readout = nn.Sequential(
+            nn.LayerNorm(4 * dim), nn.Linear(4 * dim, dim), nn.GELU()
+        )
+        self.track_token_output = nn.Linear(dim, 1)
         self.trust_raw = nn.Parameter(torch.zeros(num_actions))
         nn.init.zeros_(self.order_gate_projection.weight)
         nn.init.zeros_(self.order_gate_projection.bias)
@@ -107,6 +137,8 @@ class TIDATrafficTrajectoryHead(nn.Module):
         nn.init.zeros_(self.static_utility_projection.bias)
         nn.init.zeros_(self.multi_track_output.weight)
         nn.init.zeros_(self.multi_track_output.bias)
+        nn.init.zeros_(self.track_token_output.weight)
+        nn.init.zeros_(self.track_token_output.bias)
         if not self.state_enabled:
             for module in (
                 self.state_projection, self.state_output, self.state_utility_projection
@@ -449,6 +481,32 @@ class TIDATrafficTrajectoryHead(nn.Module):
             evidence_logit = evidence_logit + multi_track_credit
         else:
             multi_track_credit = torch.zeros_like(evidence_logit)
+        track_contrast = ordered["tokens"] - control_context["tokens"]
+        action_identity_by_track = action_identity[:, :, None].expand_as(track_contrast)
+        track_features = torch.cat(
+            (
+                track_contrast,
+                track_contrast.abs(),
+                action_identity_by_track * track_contrast,
+                action_identity_by_track * track_contrast.abs(),
+            ),
+            dim=-1,
+        )
+        track_hidden = self.track_token_readout(track_features)
+        track_zero_hidden = self.track_token_readout(torch.zeros_like(track_features))
+        track_scores = (
+            self.track_token_output(track_hidden) - self.track_token_output(track_zero_hidden)
+        ).squeeze(-1)
+        track_token_credit = signed_track_logmeanexp(
+            track_scores,
+            ordered["multi_track_weight"],
+            temperature=self.multi_track_token_temperature,
+        )
+        if self.multi_track_token_credit_enabled:
+            evidence_logit = evidence_logit + track_token_credit
+        else:
+            track_scores = torch.zeros_like(track_scores)
+            track_token_credit = torch.zeros_like(evidence_logit)
         state_hidden = self.state_projection(ordered["motion_state_features"])
         trust = torch.sigmoid(self.trust_raw)[None].expand(batch, -1)
         order_rms = order_contrast.square().mean(-1).sqrt()
@@ -536,6 +594,8 @@ class TIDATrafficTrajectoryHead(nn.Module):
             "trajectory_interaction_summary": ordered["interaction_summary"],
             "trajectory_order_contrast_rms": order_rms,
             "traffic_trajectory_multi_track_credit": multi_track_credit,
+            "traffic_trajectory_track_token_scores": track_scores,
+            "traffic_trajectory_track_token_credit": track_token_credit,
             "trajectory_multi_track_weights": ordered["multi_track_weight"],
             "trajectory_multi_track_effective_count": ordered["multi_track_effective_count"],
         }

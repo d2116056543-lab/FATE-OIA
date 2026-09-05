@@ -11,12 +11,32 @@ from fate_oia.engine.train_tida_oia import build_runtime
 from fate_oia.utils.tida_artifacts import atomic_write_json
 
 
+ALL_SPLITS = ("train_calib", "train_audit", "test")
+
+
+def normalize_requested_splits(splits: list[str] | None) -> tuple[str, ...]:
+    requested = ALL_SPLITS if splits is None else tuple(splits)
+    invalid = sorted(set(requested).difference(ALL_SPLITS))
+    if invalid:
+        raise ValueError(f"unsupported TTA collection splits: {invalid}")
+    if not requested:
+        raise ValueError("at least one TTA collection split is required")
+    return tuple(dict.fromkeys(requested))
+
+
 def _device_batch(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
     return {key: value.to(device, non_blocking=True) if torch.is_tensor(value) else value for key, value in batch.items()}
 
 
 @torch.no_grad()
-def collect_split(model, loader, device: torch.device) -> dict[str, Any]:
+def collect_split(
+    model,
+    loader,
+    device: torch.device,
+    *,
+    split: str = "unknown",
+    print_every_batches: int = 100,
+) -> dict[str, Any]:
     tensor_keys = (
         "action_original", "action_flip", "image_action_original", "image_action_flip",
         "reason_original", "image_reason_original", "action_target", "reason_target",
@@ -25,17 +45,19 @@ def collect_split(model, loader, device: torch.device) -> dict[str, Any]:
     file_names: list[str] = []
     concept_rows: list[dict[str, Any]] = []
     model.eval()
-    for batch in loader:
+    for batch_index, batch in enumerate(loader, start=1):
         batch = _device_batch(batch, device)
         original = model(
             batch["target_image"], batch["context_images"], batch["timestamps"], batch["frame_valid_mask"],
             temporal_action_scale=1.0, temporal_reason_scale=1.0,
+            apply_image_stage_c=False,
         )
         flipped = model(
             batch["target_image"].flip(-1), batch["context_images"].flip(-1),
             batch["timestamps"], batch["frame_valid_mask"],
             temporal_action_scale=1.0, temporal_reason_scale=1.0,
             canonicalize_horizontal_flip=True,
+            apply_image_stage_c=False,
         )
         values = {
             "action_original": original["video_action_logits"],
@@ -62,6 +84,14 @@ def collect_split(model, loader, device: torch.device) -> dict[str, Any]:
                 "video_reason_logits": original["video_reason_logits"][index].detach().float().cpu().tolist(),
             })
         file_names.extend(batch["file_name"])
+        if print_every_batches > 0 and batch_index % print_every_batches == 0:
+            print(json.dumps({
+                "event": "tida_tta_progress",
+                "split": split,
+                "batch": batch_index,
+                "total_batches": len(loader),
+                "samples": len(file_names),
+            }), flush=True)
     return {key: torch.cat(values) for key, values in store.items()} | {
         "file_names": file_names, "dynamic_concepts": concept_rows,
     }
@@ -90,18 +120,31 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--context-chunk-size", type=int, default=5)
     parser.add_argument("--num-workers", type=int, default=6)
+    parser.add_argument("--frame-store-root")
     parser.add_argument("--max-calib-samples", type=int)
     parser.add_argument("--max-audit-samples", type=int)
     parser.add_argument("--max-test-samples", type=int)
+    parser.add_argument("--splits", nargs="+", choices=ALL_SPLITS)
+    parser.add_argument("--print-every-batches", type=int, default=100)
     args = parser.parse_args()
     runtime = build_runtime(args, evaluation_only=True)
     output_dir = Path(args.output_dir)
-    for split in ("train_calib", "train_audit", "test"):
-        save_split(output_dir, split, collect_split(runtime.model, runtime.loaders[split], runtime.device))
+    requested_splits = normalize_requested_splits(args.splits)
+    for split in requested_splits:
+        rows = collect_split(
+            runtime.model,
+            runtime.loaders[split],
+            runtime.device,
+            split=split,
+            print_every_batches=args.print_every_batches,
+        )
+        save_split(output_dir, split, rows)
     atomic_write_json(output_dir / "tta_collection_manifest.json", {
         "pass": True, "parameter_fit_splits": ["train_calib", "train_audit"],
         "evaluation_split": "test", "test_labels_used_for_parameter_fit": False,
         "reason_tta": "original_only", "horizontal_flip_canonicalized": True,
+        "collected_splits": list(requested_splits),
+        "frame_store_root": args.frame_store_root,
     })
 
 

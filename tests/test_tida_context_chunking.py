@@ -29,3 +29,11 @@ def test_context_encoder_surfaces_private_reason_history_without_changing_base_q
     assert out["history_query_tokens"].shape == (1, 4, 36, 8)
     assert out["history_reason_query_tokens"].shape == (1, 4, 21, 8)
     assert out["history_reason_query_attention"].shape[:3] == (1, 4, 21)
+    assert out["history_reason_patch_tokens"].shape[:4] == (1, 4, 21, 12)
+    assert out["history_reason_patch_xy"].shape == (1, 4, 21, 12, 2)
+    assert out["history_reason_patch_weight"].shape == (1, 4, 21, 12)
+    assert torch.allclose(
+        out["history_reason_patch_weight"].sum(-1),
+        torch.ones(1, 4, 21),
+        atol=1e-5,
+    )
