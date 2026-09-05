@@ -921,6 +921,7 @@ def branch_metrics(rows: dict[str, Any], thresholds: torch.Tensor | float = 0.5)
         ("legacy_reason_route", "legacy_video_reason", "reason"),
         ("reason_local_candidate", "reason_local_candidate", "reason"),
         ("reason_local_action_condition", "reason_local_action_condition", "reason"),
+        ("reason_local_action_condition_scaled", "reason_local_action_condition_scaled", "reason"),
         ("reason_local_centered_candidate", "reason_local_centered_candidate", "reason"),
         ("reason_local_deploy", "reason_local_deploy", "reason"),
         ("target_token_action_candidate", "target_token_action_candidate", "action"),
@@ -1849,6 +1850,7 @@ def save_epoch_outputs(
         "action_track_motion_rms", "reason_track_motion_rms",
         "reason_contradiction_score", "action_target", "reason_target",
         "reason_local_action_condition", "reason_local_action_condition_delta",
+        "reason_local_action_condition_scaled",
         "timestamps", "frame_valid_mask",
     )
     full_tensor_keys = (
@@ -1857,6 +1859,7 @@ def save_epoch_outputs(
         "image_reason", "semantic_reason", "geometric_reason", "video_reason",
         "legacy_video_reason", "reason_local_candidate",
         "reason_local_action_condition",
+        "reason_local_action_condition_scaled",
         "reason_local_centered_candidate", "reason_local_deploy",
         "action_local_candidate", "action_local_centered_candidate",
         "action_local_deploy",
@@ -2067,6 +2070,7 @@ def main() -> None:
         _view_metrics,
         build_runtime,
         calibrate_logit_flow_deployment,
+        calibrate_reason_local_deployment,
     )
 
     runtime = build_runtime(args, evaluation_only=True)
@@ -2074,6 +2078,9 @@ def main() -> None:
         runtime.model, runtime.loaders["train_calib"], runtime.device
     )
     policy_fit = calibrate_logit_flow_deployment(
+        runtime.model, calib, runtime.config.get("deployment", {})
+    )
+    reason_local_fit = calibrate_reason_local_deployment(
         runtime.model, calib, runtime.config.get("deployment", {})
     )
     rows = collect_tida_outputs(
@@ -2085,6 +2092,7 @@ def main() -> None:
     )
     metrics = _view_metrics(rows, calib, runtime.config.get("deployment", {}))
     metrics["logit_flow_deployment_policy_fit"] = policy_fit
+    metrics["reason_local_deployment_policy_fit"] = reason_local_fit
     atomic_write_json(Path(args.output_dir) / "evaluation.json", metrics)
     print(json.dumps(metrics, default=str), flush=True)
 

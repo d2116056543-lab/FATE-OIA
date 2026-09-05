@@ -1377,6 +1377,10 @@ def train_locked_deployment_views(test_rows, thresholds):
         views["reason_local_action_condition_direct_candidate"] = metrics[
             "reason_local_action_condition"
         ]
+    if "reason_local_action_condition_scaled" in metrics:
+        views["reason_local_action_condition_scaled_train_calib"] = metrics[
+            "reason_local_action_condition_scaled"
+        ]
     if (
         "action_local_candidate" in test_rows
         and "reason_local_action_condition" in test_rows
@@ -1384,6 +1388,17 @@ def train_locked_deployment_views(test_rows, thresholds):
         views["action_token_joint_direct_candidate"] = aie_branch_metrics(
             test_rows["action_local_candidate"],
             test_rows["reason_local_action_condition"],
+            test_rows["action_target"],
+            test_rows["reason_target"],
+            threshold=thresholds["image"],
+        )
+    if (
+        "action_local_candidate" in test_rows
+        and "reason_local_action_condition_scaled" in test_rows
+    ):
+        views["action_token_joint_scaled_train_calib"] = aie_branch_metrics(
+            test_rows["action_local_candidate"],
+            test_rows["reason_local_action_condition_scaled"],
             test_rows["action_target"],
             test_rows["reason_target"],
             threshold=thresholds["image"],
@@ -1431,6 +1446,60 @@ def _deployment_thresholds(calib_rows, deployment_config):
             source=deployment_config.get("locked_image_threshold_source", ""),
         )
     return thresholds
+
+
+def fit_reason_action_condition_scale(calib_rows, thresholds, scales):
+    """Select one global bridge scale using train-calib labels only."""
+    required = {
+        "image_action", "image_reason", "reason_local_action_condition_delta",
+        "action_target", "reason_target",
+    }
+    missing = sorted(required.difference(calib_rows))
+    if missing:
+        return {
+            "selected_scale": 0.0,
+            "selection_split": "train_calib",
+            "test_labels_used": False,
+            "available": False,
+            "missing_items": missing,
+            "candidates": [],
+        }
+    candidates = sorted({0.0, *(float(value) for value in scales)})
+    rows = []
+    for scale in candidates:
+        metric = aie_branch_metrics(
+            calib_rows["image_action"],
+            calib_rows["image_reason"]
+            + scale * calib_rows["reason_local_action_condition_delta"],
+            calib_rows["action_target"],
+            calib_rows["reason_target"],
+            threshold=thresholds,
+        )
+        rows.append({
+            "scale": scale,
+            "Exp_mF1": float(metric["Exp_mF1"]),
+            "Exp_oF1": float(metric["Exp_oF1"]),
+            "Exp_mAP": float(metric["Exp_mAP"]),
+        })
+    baseline = next(row for row in rows if row["scale"] == 0.0)
+    eligible = [
+        row for row in rows
+        if row["Exp_mAP"] + 1e-12 >= baseline["Exp_mAP"]
+    ]
+    selected = max(
+        eligible,
+        key=lambda row: (row["Exp_mF1"], row["Exp_mAP"], -abs(row["scale"])),
+    )
+    return {
+        "selected_scale": selected["scale"],
+        "selection_split": "train_calib",
+        "test_labels_used": False,
+        "available": True,
+        "ranking_guard": "Exp_mAP_not_below_scale_0",
+        "baseline": baseline,
+        "selected": selected,
+        "candidates": rows,
+    }
 
 
 def fit_trajectory_deployment_policy(calib_rows, deployment_config):
@@ -1506,6 +1575,12 @@ def serialize_trajectory_policy(policy):
 
 def _view_metrics(test_rows, calib_rows, deployment_config):
     thresholds = _deployment_thresholds(calib_rows, deployment_config)
+    scale = float(calib_rows.get("_reason_action_condition_scale", 0.0))
+    if "reason_local_action_condition_delta" in test_rows:
+        test_rows["reason_local_action_condition_scaled"] = (
+            test_rows["image_reason"]
+            + scale * test_rows["reason_local_action_condition_delta"]
+        )
     raw = branch_metrics(test_rows)
     deploy = train_locked_deployment_views(test_rows, thresholds)
     return {
@@ -1515,6 +1590,7 @@ def _view_metrics(test_rows, calib_rows, deployment_config):
         "direct_candidate_policy_status": (
             "diagnostic_candidate_not_oof_selected_primary"
         ),
+        "reason_action_condition_train_calib_scale": scale,
         "reason_local_centered_threshold_source": (
             "train_calib_candidate_reason_plus_locked_image_action"
             if "reason_local_centered" in thresholds else None
@@ -1736,6 +1812,17 @@ def calibrate_reason_local_deployment(model, calib_rows, deployment_config):
     if not getattr(model, "reason_local_query_enabled", False):
         return None
     thresholds = _deployment_thresholds(calib_rows, deployment_config)["image"]
+    action_condition_scale_fit = fit_reason_action_condition_scale(
+        calib_rows,
+        thresholds,
+        deployment_config.get(
+            "reason_local_action_condition_scales",
+            [0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0],
+        ),
+    )
+    calib_rows["_reason_action_condition_scale"] = float(
+        action_condition_scale_fit["selected_scale"]
+    )
     action_count = int(calib_rows["action_target"].shape[1])
     fold_group_ids = None
     source_fallback_reason = None
@@ -1825,6 +1912,7 @@ def calibrate_reason_local_deployment(model, calib_rows, deployment_config):
         "candidate_center_source": "train_calib_median",
         "source_fallback_reason": source_fallback_reason,
         "source_fallback_detail": source_fallback_detail,
+        "action_condition_scale_fit": action_condition_scale_fit,
     }
 
 

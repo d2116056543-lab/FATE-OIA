@@ -20,6 +20,9 @@ def test_v43_uses_action_conditioned_reason_without_v42_directional_path():
     assert model["reason_local_action_condition_cap"] == 0.01
     assert config["loss"]["reason_local_action_condition_aux"] == 0.10
     assert config["loss"]["reason_local_action_condition_rank"] == 0.05
+    assert config["deployment"]["reason_local_action_condition_scales"] == [
+        0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0,
+    ]
     assert model.get("reason_local_directional_enabled", False) is False
     assert model["action_local_query_enabled"] is True
     assert model["reason_local_query_enabled"] is True

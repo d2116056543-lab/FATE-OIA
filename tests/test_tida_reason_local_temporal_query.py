@@ -10,6 +10,7 @@ from fate_oia.losses.tida_losses import reason_local_utility_calibration_loss
 from fate_oia.engine.evaluate_tida_oia import branch_metrics, save_epoch_outputs
 from fate_oia.engine.train_tida_oia import (
     calibrate_reason_local_deployment,
+    fit_reason_action_condition_scale,
     train_locked_deployment_views,
 )
 from fate_oia.engine import train_tida_oia
@@ -622,6 +623,15 @@ def test_training_saves_optimizer_boundary_checkpoint_before_evaluation():
     assert checkpoint < evaluation
 
 
+def test_standalone_evaluator_fits_reason_local_policy_before_test_forward():
+    source = inspect.getsource(__import__(
+        "fate_oia.engine.evaluate_tida_oia", fromlist=["main"]
+    ).main)
+    calibration = source.index("calibrate_reason_local_deployment(")
+    test_forward = source.index('runtime.loaders["test"]')
+    assert calibration < test_forward
+
+
 def test_reason_local_utility_ignores_unknown_negatives_but_learns_certified_signs():
     utility = torch.zeros(1, 3, requires_grad=True)
     candidate = torch.tensor([[0.10, -0.10, 0.10]])
@@ -709,6 +719,55 @@ def test_train_locked_views_expose_action_token_direct_candidates():
     assert "action_token_joint_direct_candidate" in views
     assert views["action_token_joint_direct_candidate"]["Act_mAP"] >= 0.0
     assert views["action_token_joint_direct_candidate"]["Exp_mAP"] >= 0.0
+
+
+def test_action_condition_scale_uses_train_calib_with_ranking_guard():
+    count = 42
+    target = ((torch.arange(count)[:, None] + torch.arange(21)[None]) % 2).float()
+    rows = {
+        "image_action": torch.zeros(count, 4),
+        "image_reason": torch.zeros(count, 21),
+        "reason_local_action_condition_delta": torch.where(target > 0, 1.0, -1.0),
+        "action_target": torch.zeros(count, 4),
+        "reason_target": target,
+    }
+    fit = fit_reason_action_condition_scale(
+        rows, torch.full((25,), 0.5), [0.0, 0.5, 1.0]
+    )
+    assert fit["available"] is True
+    assert fit["selection_split"] == "train_calib"
+    assert fit["test_labels_used"] is False
+    assert fit["selected_scale"] > 0.0
+    assert fit["selected"]["Exp_mAP"] >= fit["baseline"]["Exp_mAP"]
+
+
+def test_action_condition_scale_missing_rows_safely_falls_back_to_zero():
+    fit = fit_reason_action_condition_scale(
+        {"image_reason": torch.zeros(2, 21)}, torch.full((25,), 0.5), [1.0]
+    )
+    assert fit["available"] is False
+    assert fit["selected_scale"] == 0.0
+    assert fit["test_labels_used"] is False
+
+
+def test_train_locked_views_expose_train_calib_scaled_reason_candidate():
+    rows = {
+        "image_action": torch.randn(8, 4),
+        "video_action": torch.randn(8, 4),
+        "action_local_candidate": torch.randn(8, 4),
+        "image_reason": torch.randn(8, 21),
+        "video_reason": torch.randn(8, 21),
+        "reason_local_action_condition_scaled": torch.randn(8, 21),
+        "action_target": torch.randint(0, 2, (8, 4)).float(),
+        "reason_target": torch.randint(0, 2, (8, 21)).float(),
+    }
+    thresholds = {
+        "image": torch.full((25,), 0.5),
+        "video": torch.full((25,), 0.5),
+    }
+    views = train_locked_deployment_views(rows, thresholds)
+    assert "reason_local_action_condition_scaled_train_calib" in views
+    assert "action_token_joint_scaled_train_calib" in views
 
 
 def test_epoch_artifacts_save_independent_action_conditioned_reason_tensors(tmp_path):

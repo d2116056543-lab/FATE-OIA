@@ -301,6 +301,7 @@ runtime:
   print_every_optimizer_updates: 10
   exact_resume: true
 deployment:
+  reason_local_action_condition_scales: [0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
   calibration_source: train_calib
   primary_threshold_source: image_train_calib_locked
   reason_beta_source: [train_calib, train_audit]
