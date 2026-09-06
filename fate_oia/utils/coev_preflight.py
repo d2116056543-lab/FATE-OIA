@@ -153,6 +153,7 @@ def real_rgb_probe(cfg: dict, out: Path) -> dict:
     initial={name:p.detach().clone() for name,p in model.named_parameters() if p.requires_grad}
     loss_rows=[];component_nonzero={name:False for name in ("action_task","reason_task","ground","match")}
     last_batch=None
+    probe_started=time.perf_counter()
     for update in range(updates):
         optimizer.zero_grad(set_to_none=True)
         for _ in range(accum):
@@ -164,6 +165,12 @@ def real_rgb_probe(cfg: dict, out: Path) -> dict:
             for name in component_nonzero: component_nonzero[name] |= bool(torch.isfinite(losses[name]) and losses[name].abs()>1e-10)
         torch.nn.utils.clip_grad_norm_(model.parameters(),cfg["training"]["grad_clip"]);optimizer.step();scheduler.step()
         loss_rows.append(float(losses["total"].detach()))
+        if (update+1)%10==0 or update+1==updates:
+            elapsed=time.perf_counter()-probe_started
+            print(json.dumps({"event":"coev_probe_progress","update":update+1,"total_updates":updates,
+                "loss":loss_rows[-1],"elapsed_seconds":elapsed,
+                "samples_per_second":batch*accum*(update+1)/max(elapsed,1e-9),
+                "peak_reserved_gib":torch.cuda.max_memory_reserved()/2**30}),flush=True)
     updates_by_owner={};prefixes={"dino9":"visual_field.backbone.blocks.8","dino10":"visual_field.backbone.blocks.9",
         "dino11":"visual_field.backbone.blocks.10","dino12":"visual_field.backbone.blocks.11","decoder":"video_decoder",
         "predicate":"predicate_observer","matcher":"correspondence_observer","readout":"evidence_readout"}
@@ -195,7 +202,9 @@ def memory(cfg: dict, out: Path) -> dict:
         train,test,_=loaders(cfg,batch,max(128,batch*accum),batch)
         iterator=iter(train);torch.cuda.reset_peak_memory_stats();times=[];load_times=[];losses=[]
         try:
-            for update in range(warmup+measured):
+            total_trial_updates=warmup+measured
+            trial_started=time.perf_counter()
+            for update in range(total_trial_updates):
                 tick=time.perf_counter();opt.zero_grad(set_to_none=True);load_elapsed=0.0
                 for _ in range(accum):
                     load_tick=time.perf_counter()
@@ -206,6 +215,13 @@ def memory(cfg: dict, out: Path) -> dict:
                     (value/accum).backward();losses.append(float(value.detach()))
                 torch.nn.utils.clip_grad_norm_(model.parameters(),cfg["training"]["grad_clip"]);opt.step();torch.cuda.synchronize()
                 if update>=warmup: times.append(time.perf_counter()-tick);load_times.append(load_elapsed)
+                report_every=10 if measured>=100 else 5
+                if (update+1)%report_every==0 or update+1==total_trial_updates:
+                    elapsed=time.perf_counter()-trial_started
+                    print(json.dumps({"event":"coev_memory_progress","batch_size":batch,"grad_accum":accum,
+                        "update":update+1,"total_updates":total_trial_updates,"loss":float(value.detach()),
+                        "elapsed_seconds":elapsed,"samples_per_second":batch*accum*(update+1)/max(elapsed,1e-9),
+                        "peak_reserved_gib":torch.cuda.max_memory_reserved()/2**30}),flush=True)
             test_shape=None
             if include_test:
                 model.eval();inputs,_=next(iter(test))

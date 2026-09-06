@@ -15,6 +15,13 @@ from fate_oia.transforms_video import SynchronizedVideoTransform
 from fate_oia.utils.coev_contracts import CoEVInputs, CoEVTargets, flip_labels
 
 
+def _configure_decode_stream(stream) -> None:
+    # Two codec threads per loader worker improve H.264 decode throughput while
+    # preserving presentation-order PTS and avoiding 56-core oversubscription.
+    stream.thread_type = "AUTO"
+    stream.codec_context.thread_count = 2
+
+
 def requested_times() -> torch.Tensor:
     # Denser near the target while still covering the full five-second interval.
     u = torch.linspace(0, 1, 15)
@@ -26,6 +33,7 @@ def probe_video_pts(path: str | Path) -> dict[str, float | int | bool]:
     pts = []
     with av.open(str(path)) as container:
         stream = container.streams.video[0]
+        _configure_decode_stream(stream)
         for frame in container.decode(stream):
             if frame.pts is not None:
                 pts.append(float(frame.pts * stream.time_base))
@@ -41,7 +49,8 @@ def probe_endpoint_alignment(path: str | Path, target_path: str | Path, target_i
     import av
     frames=[]
     with av.open(str(path)) as container:
-        for frame in container.decode(container.streams.video[0]):frames.append(frame)
+        stream = container.streams.video[0]; _configure_decode_stream(stream)
+        for frame in container.decode(stream):frames.append(frame)
     target=np.asarray(Image.open(target_path).convert("RGB"),dtype=np.float32)/255.0
     candidates=sorted({index for center in (target_index,len(frames)-1) for index in range(center-2,center+3) if 0<=index<len(frames)})
     rows=[]
@@ -62,6 +71,7 @@ def decode_with_actual_pts(path: str | Path, relative_times: torch.Tensor,
     frames, pts = [], []
     with av.open(str(path)) as container:
         stream = container.streams.video[0]
+        _configure_decode_stream(stream)
         for frame in container.decode(stream):
             if frame.pts is None: continue
             frames.append(frame); pts.append(float(frame.pts * stream.time_base))

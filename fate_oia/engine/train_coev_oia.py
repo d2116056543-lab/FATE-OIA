@@ -25,9 +25,10 @@ def load_config(path: str | Path) -> dict[str, Any]:
     return yaml.safe_load(Path(path).read_text(encoding="utf-8"))
 
 
-def build_model(cfg: dict[str, Any]) -> CoEVOIAModel:
+def build_model(cfg: dict[str, Any], use_mock_dino: bool = False) -> CoEVOIAModel:
     return CoEVOIAModel(cfg["backbone"]["pretrained_weights"], cfg["model"]["history_chunk_size"],
-                        cfg["model"]["reason_soft_bias_verified"])
+                        cfg["model"]["reason_soft_bias_verified"], use_mock_dino,
+                        cfg["backbone"]["activation_checkpointing"])
 
 
 def build_optimizer(model: CoEVOIAModel, cfg: dict[str, Any]) -> torch.optim.Optimizer:

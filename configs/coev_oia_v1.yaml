@@ -27,8 +27,8 @@ data:
   expected_history_missing: 3481
   expected_test_history_missing: 802
   max_endpoint_mse: 0.01
-  num_workers: 4
-  prefetch_factor: 3
+  num_workers: 8
+  prefetch_factor: 4
   persistent_workers: true
   pin_memory: true
 backbone:
@@ -38,14 +38,16 @@ backbone:
   frozen_blocks: 8
   trainable_blocks: [9, 10, 11, 12]
   selected_layers_1based: [4, 8, 12]
-  activation_checkpointing: true
+  # A real-RGB profile measured 27.75/36.47 GiB allocated/reserved at B=2,
+  # so recomputation is unnecessary on the 48 GiB RTX 5880.
+  activation_checkpointing: false
 model:
   dim: 384
   class_queries: 25
   spatial_blocks_per_frame: 2
   temporal_layers: 3
   # Mathematically equivalent DINO batching; avoids 14*B one-frame launches.
-  history_chunk_size: 8
+  history_chunk_size: 16
   reason_soft_bias_verified: false
   predicates: [vehicle, pedestrian, bicycle, traffic_light_red, traffic_light_green, traffic_sign, drivable, lane]
   primitive_count: 14
@@ -86,7 +88,10 @@ runtime:
   eval_progress_batches: 32
 memory_probe:
   target_reserved_gib: [43.0, 45.0]
-  candidates: [[1,32], [2,16], [4,8], [8,4]]
+  # Short pre-screening rejected B=4 (55.09/59.96 GiB allocated/reserved).
+  # Keep the fastest measured safe effective-batch-32 candidate for the
+  # contractually required 10+30 screen and 200-update stress run.
+  candidates: [[2,16]]
   warmup_updates: 10
   measured_updates: 30
   stress_updates: 200

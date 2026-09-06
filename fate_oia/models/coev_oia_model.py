@@ -19,9 +19,11 @@ def _pool_tokens(tokens: Tensor, source_hw: tuple[int, int], target_hw: tuple[in
 
 class CoEVOIAModel(nn.Module):
     def __init__(self, pretrained_weights: str, chunk_size: int = 1,
-                 reason_bias_verified: bool = False, use_mock_dino: bool = False) -> None:
+                 reason_bias_verified: bool = False, use_mock_dino: bool = False,
+                 activation_checkpointing: bool = True) -> None:
         super().__init__(); self.chunk_size = chunk_size
-        self.visual_field = CoEVVisualField(pretrained_weights, use_mock=use_mock_dino)
+        self.visual_field = CoEVVisualField(pretrained_weights, activation_checkpointing=activation_checkpointing,
+                                            use_mock=use_mock_dino)
         self.predicate_observer = PredicateObserver()
         self.correspondence_observer = CorrespondenceObserver()
         self.primitive_builder = TrafficPrimitiveBuilder()

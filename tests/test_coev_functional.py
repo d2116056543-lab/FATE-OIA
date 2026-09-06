@@ -1,7 +1,7 @@
 import torch
 
 from fate_oia.engine.evaluate_coev_oia import is_better
-from fate_oia.engine.train_coev_oia import build_optimizer
+from fate_oia.engine.train_coev_oia import build_model, build_optimizer
 from fate_oia.losses.coev_losses import CoEVLoss, binary_gce
 from fate_oia.models.coev_observers import PredicateObserver, fit_background_affine, inverse_grid_sample_affine
 from fate_oia.models.coev_oia_model import CoEVOIAModel
@@ -33,9 +33,10 @@ def test_binary_gce_is_finite_and_best_tie_uses_map_then_epoch():
 
 
 def test_mock_factory_has_one_backbone_and_exact_optimizer_cover():
-    cfg={"backbone":{"pretrained_weights":"unused"},"model":{"history_chunk_size":1,"reason_soft_bias_verified":False},
+    cfg={"backbone":{"pretrained_weights":"unused","activation_checkpointing":False},"model":{"history_chunk_size":1,"reason_soft_bias_verified":False},
          "training":{"lr_upper_dino":1e-5,"lr_new_modules":2e-4,"weight_decay":.05}}
-    model=CoEVOIAModel("unused",use_mock_dino=True); opt=build_optimizer(model,cfg)
+    model=build_model(cfg,use_mock_dino=True); opt=build_optimizer(model,cfg)
+    assert model.visual_field.activation_checkpointing is False
     ids=[id(p) for g in opt.param_groups for p in g["params"]]
     assert len(ids)==len(set(ids))==sum(p.requires_grad for p in model.parameters())
     assert {g["owner"] for g in opt.param_groups} == {"upper_decay","upper_no_decay","new_decay","new_no_decay"}
