@@ -5,6 +5,10 @@ description: Fail-closed audit for TIDA-OIA video and Flow Credit implementation
 
 # TIDA-OIA V1 Strict Implementation Audit Skill
 
+> Legacy scope only. This skill must not gate, configure, or launch COEV-OIA v1.
+> In particular, its frozen legacy task model, 885-test, image fallback and
+> historical Stage-C requirements are forbidden in the COEV formal call graph.
+
 ## 2026-08-22 Flow Credit Addendum
 
 This addendum is mandatory for branch `tida_oia_flow_credit_v1` and takes priority over conflicting V1 text.

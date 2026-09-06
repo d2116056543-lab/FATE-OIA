@@ -26,6 +26,7 @@ class GroundingPaths:
     label_json: str | None
     drivable_map: str | None
     semantic_seg: str | None
+    lane_json: str | None = None
 
 
 class BDD100KGroundingIndex:
@@ -48,6 +49,11 @@ class BDD100KGroundingIndex:
                     stem = stem[: -len(suffix)]
                     break
             self.seg_map.setdefault(stem, p)
+        self.lane_map = {}
+        for folder in ("bdd100k_lane_labels","bdd100k_lane"):
+            directory=self.root/folder
+            for p in directory.rglob("*.json") if directory.exists() else []:
+                self.lane_map.setdefault(p.stem,p)
 
     def lookup(self, bdd_oia_file_name: str) -> GroundingPaths:
         base = bdd_oia_base_stem(bdd_oia_file_name)
@@ -55,6 +61,7 @@ class BDD100KGroundingIndex:
             label_json=str(self.label_map[base]) if base in self.label_map else None,
             drivable_map=str(self.drivable_map[base]) if base in self.drivable_map else None,
             semantic_seg=str(self.seg_map[base]) if base in self.seg_map else None,
+            lane_json=str(self.lane_map[base]) if base in self.lane_map else None,
         )
 
     def audit_file_names(self, file_names: list[str]) -> dict[str, float | int]:
@@ -62,6 +69,7 @@ class BDD100KGroundingIndex:
         label = sum(1 for x in file_names if self.lookup(x).label_json)
         drive = sum(1 for x in file_names if self.lookup(x).drivable_map)
         seg = sum(1 for x in file_names if self.lookup(x).semantic_seg)
+        lane = sum(1 for x in file_names if self.lookup(x).lane_json)
         return {
             "total": n,
             "label_json": label,
@@ -70,4 +78,6 @@ class BDD100KGroundingIndex:
             "drivable_map_rate": drive / n if n else 0.0,
             "semantic_seg": seg,
             "semantic_seg_rate": seg / n if n else 0.0,
+            "lane_json":lane,
+            "lane_json_rate":lane/n if n else 0.0,
         }

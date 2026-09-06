@@ -1,0 +1,92 @@
+experiment:
+  name: coev_oia_v1
+  branch: tida_site_v20
+  starting_sha: f33d7d5a52848bf52f41b844f865588ab49f1672
+  internal_test_selected: true
+  publication_eligible: false
+  spec_sha256:
+    00_README_and_Codex_Start.md: 1e86b9bd4edf13f32e82e5c7f17bb34107971a75438c8062ad45597851c71cd2
+    01_Research_and_Architecture.md: 07084870c7d404f396a679cd1ed613858bacf594aa63be81eb3e057192afc0e8
+    02_Code_Level_Implementation.md: 289a7b48bbfe546773b38621a65c370ff1a078340aa68187a89e9b4761ef4eeb
+    04_Foreground_Training_Protocol.md: 14fe1bc54078784951ff61a2ff6fa2406f492a206cedf36fa92f7d99dd12c1f5
+    05_Literature_and_Evidence.md: 64df8624e3d8afd9abf936194a44e802dcc0a62e936ac7f32137767c119bf585
+    SKILL.md: 32429064f9ffe61775d527f284646024cb5b55f7b6afb818329b90cdac159dbb
+data:
+  # Same 19,874 target rows; only histories failing decoded endpoint identity are masked unavailable.
+  manifest_path: 'G:\FATE_Drive_runs\coev_oia_v1\coev_identity_screened_manifest.jsonl'
+  grounding_root: 'E:\sbw\BDD100K'
+  train_partitions: [train_core, train_calib, train_audit]
+  train_count: 15302
+  historical_image_train_count: 16082
+  historical_image_data_root: 'E:\sbw\BDD-OIA\data'
+  historical_image_raw_root: 'E:\sbw\BDD-OIA'
+  test_count: 4572
+  history_frames: 14
+  target_hw: [360, 640]
+  history_hw: [256, 448]
+  expected_history_missing: 3481
+  expected_test_history_missing: 802
+  max_endpoint_mse: 0.01
+  num_workers: 4
+  prefetch_factor: 3
+  persistent_workers: true
+  pin_memory: true
+backbone:
+  arch: vit_small
+  patch_size: 8
+  pretrained_weights: 'E:\sbw\FATE_Drive\fate_oia_acpr_gem_v1_worktree\ckp\reference\dino_deitsmall8_pretrain.pth'
+  frozen_blocks: 8
+  trainable_blocks: [9, 10, 11, 12]
+  selected_layers_1based: [4, 8, 12]
+  activation_checkpointing: true
+model:
+  dim: 384
+  class_queries: 25
+  spatial_blocks_per_frame: 2
+  temporal_layers: 3
+  # Mathematically equivalent DINO batching; avoids 14*B one-frame launches.
+  history_chunk_size: 8
+  reason_soft_bias_verified: false
+  predicates: [vehicle, pedestrian, bicycle, traffic_light_red, traffic_light_green, traffic_sign, drivable, lane]
+  primitive_count: 14
+  path_windows_seconds: [1.0, 5.0]
+  factor_count: 238
+loss:
+  action: 1.0
+  reason: 1.0
+  grounding: 0.20
+  matching: 0.05
+  visual_aux_ratio: 0.25
+  evidence_aux_ratio: 0.25
+  reason_gce_ratio: 0.20
+training:
+  seed: 20260906
+  epochs: 24
+  effective_batch: 32
+  optimizer: AdamW
+  lr_upper_dino: 0.00001
+  lr_new_modules: 0.0002
+  weight_decay: 0.05
+  warmup_ratio: 0.05
+  warmup_updates: 575
+  total_updates: 11496
+  min_lr_ratio: 0.10
+  precision: bf16
+  grad_clip: 1.0
+  eval_split: test
+  threshold: 0.5
+  no_metric_early_stop: true
+runtime:
+  output_dir: 'G:\FATE_Drive_runs\coev_oia_v1'
+  foreground_only: true
+  feature_cache_enabled: false
+  token_compression: none
+  save_every_updates: 100
+  log_every_updates: 20
+  eval_progress_batches: 32
+memory_probe:
+  target_reserved_gib: [43.0, 45.0]
+  candidates: [[1,32], [2,16], [4,8], [8,4]]
+  warmup_updates: 10
+  measured_updates: 30
+  stress_updates: 200
