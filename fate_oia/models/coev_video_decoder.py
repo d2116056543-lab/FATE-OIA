@@ -126,9 +126,11 @@ class CoEVVideoDecoder(nn.Module):
                 predicate_maps: Tensor | None = None) -> dict[str, Tensor | int]:
         hfields = [fields[f"history_task{x}"] for x in (4, 8, 12)]
         tfields = [fields[f"target_task{x}"] for x in (4, 8, 12)]
-        per_frame = []
-        for i in range(14):
-            per_frame.append(self.read_frame([x[:, i] for x in hfields],fields["history_grid_hw"]))
-        per_frame.append(self.read_frame(tfields,fields["target_grid_hw"]))
-        return self.read_history(torch.stack(per_frame, 1), actual_t, valid, hfields, tfields,
+        b, t, n, d = hfields[0].shape
+        # Spatial processing is frame-independent; folding B*T into the batch
+        # is exactly equivalent and avoids 14 repeated attention launches.
+        history_q = self.read_frame([x.reshape(b * t, n, d) for x in hfields],
+                                    fields["history_grid_hw"]).view(b, t, 25, d)
+        target_q = self.read_frame(tfields, fields["target_grid_hw"]).unsqueeze(1)
+        return self.read_history(torch.cat((history_q, target_q), 1), actual_t, valid, hfields, tfields,
                                  fields["history_grid_hw"],fields["target_grid_hw"],predicate_maps)

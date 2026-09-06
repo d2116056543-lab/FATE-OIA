@@ -23,3 +23,16 @@ def test_action_spatial_support_is_canonical_and_left_right_mirror():
     model=CoEVVideoDecoder(dim=12);support=model.class_spatial_support((16,28),torch.device("cpu"),torch.float32)
     assert torch.equal(support[2].flip(-1),support[3])
     assert support[0,-1,14]==1 and support[0,0,14]==0
+
+
+def test_vectorized_spatial_frames_equal_explicit_per_frame_calls():
+    torch.manual_seed(17)
+    model = CoEVVideoDecoder(dim=12, temporal_layers=1).eval()
+    b, t, n, d = 2, 14, 6, 12
+    fields = [torch.randn(b, t, n, d) for _ in range(3)]
+    explicit = torch.stack([
+        model.read_frame([layer[:, frame] for layer in fields], (2, 3))
+        for frame in range(t)
+    ], 1)
+    folded = model.read_frame([layer.reshape(b * t, n, d) for layer in fields], (2, 3))
+    assert torch.allclose(explicit, folded.view(b, t, 25, d), atol=1e-6, rtol=1e-5)
