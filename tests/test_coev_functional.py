@@ -1,4 +1,5 @@
 import torch
+import vision_transformer as vits
 
 from fate_oia.engine.evaluate_coev_oia import is_better
 from fate_oia.engine.train_coev_oia import build_model, build_optimizer
@@ -6,6 +7,21 @@ from fate_oia.losses.coev_losses import CoEVLoss, binary_gce
 from fate_oia.models.coev_observers import PredicateObserver, fit_background_affine, inverse_grid_sample_affine
 from fate_oia.models.coev_oia_model import CoEVOIAModel
 from fate_oia.utils.coev_contracts import CoEVTargets
+
+
+def test_coev_fused_dino_attention_matches_reference_without_retaining_maps():
+    torch.manual_seed(7)
+    attention=vits.Attention(32,num_heads=4,qkv_bias=True).eval()
+    values=torch.randn(2,17,32)
+    expected,expected_map=attention(values)
+    assert expected_map is not None
+    attention.use_fused_attention=True
+    attention.retain_attention_map=False
+    attention.retain_internal_state=False
+    actual,actual_map=attention(values)
+    assert actual_map is None and attention.get_attention_map() is None
+    assert attention.input is None and attention.v is None and attention.vproj is None
+    assert torch.allclose(actual,expected,atol=2e-6,rtol=2e-5)
 
 
 def test_predicates_are_independent_sigmoids_and_grounding_owner_is_live():

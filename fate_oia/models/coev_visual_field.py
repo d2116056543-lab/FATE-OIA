@@ -27,6 +27,11 @@ class CoEVVisualField(nn.Module):
         else:
             self.backbone = vits.vit_small(patch_size=patch_size, num_classes=0)
             dino_utils.load_pretrained_weights(self.backbone, pretrained_weights, "teacher", "vit_small", patch_size)
+        for block in self.backbone.blocks:
+            if hasattr(block, "attn"):
+                block.attn.use_fused_attention = True
+                block.attn.retain_attention_map = False
+                block.attn.retain_internal_state = False
         self.measurement_norm = nn.LayerNorm(384)
         self.task_norm = nn.LayerNorm(384)
         if not use_mock:

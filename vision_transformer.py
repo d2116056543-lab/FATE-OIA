@@ -20,6 +20,7 @@ from functools import partial
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from utils import trunc_normal_
 
@@ -80,6 +81,11 @@ class Attention(nn.Module):
 
         self.attn_gradients = None
         self.attention_map = None
+        # Opt-in only: attribution code elsewhere in the repository relies on
+        # retained attention maps. Direct-image video training does not.
+        self.use_fused_attention = False
+        self.retain_attention_map = True
+        self.retain_internal_state = True
 
     # below are added by hongbo
         self.weighted_norm = None
@@ -122,16 +128,36 @@ class Attention(nn.Module):
 
     def forward(self, x, register_hook=False, attention_mask_idxs = None):
         B, N, C = x.shape # (1, 3601, 384)
-        self.save_input(x)
+        if self.retain_internal_state:
+            self.save_input(x)
+        else:
+            self.input = None
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4) # (3, B, num_heads, N, C // num_heads)
         q, k, v = qkv[0], qkv[1], qkv[2] # (B, num_heads, N, C // num_heads)
-        self.save_v(v)
+        if self.retain_internal_state:
+            self.save_v(v)
+        else:
+            self.v = None
+
+        if self.use_fused_attention and not register_hook and attention_mask_idxs is None:
+            self.attention_map = None
+            dropout_p = self.attn_drop.p if self.training else 0.0
+            x = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p, scale=self.scale)
+            x = x.transpose(1, 2).reshape(B, N, C)
+            if self.retain_internal_state:
+                self.save_proj(self.proj)
+            else:
+                self.vproj = None
+            x = self.proj(x)
+            x = self.proj_drop(x)
+            return x, None
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
-        self.save_attention_map(attn)
+        if self.retain_attention_map:
+            self.save_attention_map(attn)
         if register_hook:
             attn.register_hook(self.save_attn_gradients)
 
@@ -141,7 +167,10 @@ class Attention(nn.Module):
 
         x = (attn @ v).transpose(1, 2).reshape(B, N, C) # concat all heads
         
-        self.save_proj(self.proj)
+        if self.retain_internal_state:
+            self.save_proj(self.proj)
+        else:
+            self.vproj = None
 
         x = self.proj(x)
         x = self.proj_drop(x)
