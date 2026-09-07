@@ -21,6 +21,8 @@ def test_fixed_training_protocol_and_no_cache_compression():
     assert cfg["runtime"]["feature_cache_enabled"] is False and cfg["runtime"]["token_compression"]=="none"
     assert cfg["runtime"]["eval_batch_size"]==8
     assert cfg["training"]["threshold"]==.5 and cfg["training"]["no_metric_early_stop"] is True
+    assert cfg["memory_probe"]["selected"]==[16,2]
+    assert cfg["memory_probe"]["measured_samples_per_second"]["batch16"] > cfg["memory_probe"]["measured_samples_per_second"]["batch8"]
     assert "COEV_EPOCH_BUDGET_AMENDMENT.md" in cfg["experiment"]["spec_sha256"]
 
 

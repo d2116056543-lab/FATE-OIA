@@ -117,10 +117,16 @@ runtime:
       data_audit_sha256: 9b8815e0e4b49f741430ebe21cceb4885eeb8796d06b99b1e00142574fc1a63f
     reason: proportional_per_epoch_test_budget_only
 memory_probe:
-  target_reserved_gib: [43.0, 45.0]
-  # Nine-frame fused-SDPA probes measured B=2 faster than B=4 and B=8 even
-  # though all fit comfortably. Select by measured throughput, not occupancy.
-  candidates: [[2,16]]
+  target_reserved_gib: [28.0, 34.0]
+  # Update-100 real-video probe selected B=16 by measured throughput.
+  candidates: [[2,16], [4,8], [8,4], [16,2]]
+  selected: [16,2]
+  measured_samples_per_second:
+    batch2: 0.3827667271
+    batch4: 0.4284346307
+    batch8: 0.4473963725
+    batch16: 0.4715342516
+  selected_peak_reserved_gib: 31.03515625
   warmup_updates: 10
   measured_updates: 30
   stress_updates: 200
