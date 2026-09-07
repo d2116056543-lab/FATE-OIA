@@ -39,6 +39,9 @@ def test_preflight_binds_epoch_budget_amendment_and_dino_runtime_source():
 def test_foreground_supervisor_is_attached_and_has_heartbeat():
     source=Path("fate_oia/utils/coev_supervisor.py").read_text(encoding="utf-8")
     assert "subprocess.Popen" in source and "coev_supervisor_heartbeat" in source and "child_pid" in source
+    assert "console_lines.put_nowait" in source and "log.write(line)" in source
+    assert source.index("log.write(line)") < source.index("console_lines.put_nowait(line)")
+    assert "daemon=True" in source
     for forbidden in ("DETACHED_PROCESS","CREATE_NEW_PROCESS_GROUP","start_new_session","Start-Process","TaskScheduler","nohup"):
         assert forbidden not in source
     launcher=Path("scripts/run_coev_foreground.ps1").read_text(encoding="utf-8")

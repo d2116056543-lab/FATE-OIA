@@ -33,21 +33,32 @@ def main() -> None:
     if free_gib<20: raise RuntimeError(f"insufficient output disk space: {free_gib:.2f} GiB")
     process=subprocess.Popen(command,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,bufsize=1)
     status_path=output/"supervisor_status.json";run_id=f"coev-{int(time.time())}-{process.pid}"
-    lines: queue.Queue[str]=queue.Queue();assert process.stdout is not None
+    lines: queue.Queue[str]=queue.Queue();console_lines: queue.Queue[str]=queue.Queue(maxsize=256);assert process.stdout is not None
     def consume() -> None:
         for line in process.stdout: lines.put(line)
+    def consume_console() -> None:
+        while True:
+            line=console_lines.get()
+            try: print(line,end="",flush=True)
+            except (BrokenPipeError,OSError): return
     reader=threading.Thread(target=consume,name="coev-stdout-reader");reader.start();last=time.time()
+    threading.Thread(target=consume_console,name="coev-console-writer",daemon=True).start()
     atomic_status(status_path,{"run_id":run_id,"parent_pid":os.getpid(),"child_pid":process.pid,"attached":True,"command":command,"started":last,"last_event":last})
     log_path=output/"full_train.log"
     try:
         with log_path.open("a",encoding="utf-8",buffering=1) as log:
             while process.poll() is None or not lines.empty():
                 try:
-                    line=lines.get(timeout=60);print(line,end="",flush=True);log.write(line);last=time.time()
+                    line=lines.get(timeout=60);log.write(line);log.flush();last=time.time()
                     atomic_status(status_path,{"run_id":run_id,"parent_pid":os.getpid(),"child_pid":process.pid,"attached":True,"command":command,"last_event":last})
+                    try: console_lines.put_nowait(line)
+                    except queue.Full: pass
                 except queue.Empty:
                     heartbeat=json.dumps({"event":"coev_supervisor_heartbeat","run_id":run_id,"child_pid":process.pid,"seconds_since_output":time.time()-last})+"\n"
-                    print(heartbeat,end="",flush=True);log.write(heartbeat)
+                    log.write(heartbeat);log.flush()
+                    atomic_status(status_path,{"run_id":run_id,"parent_pid":os.getpid(),"child_pid":process.pid,"attached":True,"command":command,"last_event":time.time(),"seconds_since_child_output":time.time()-last})
+                    try: console_lines.put_nowait(heartbeat)
+                    except queue.Full: pass
         code=process.wait();reader.join()
     except KeyboardInterrupt:
         process.terminate();code=process.wait();reader.join()
