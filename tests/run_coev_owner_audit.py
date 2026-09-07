@@ -48,7 +48,9 @@ def main() -> None:
     result={}
     history_grads=torch.autograd.grad(losses["action_task"],output["history_gradient_fields"],retain_graph=True,allow_unused=True)
     result["selected_block_hook_counts"]=hook_counts
-    result["history_layer_frame_grad"]=[{"early":float(g[:,0].float().norm()),"middle":float(g[:,6].float().norm()),"late":float(g[:,13].float().norm())} for g in history_grads]
+    result["history_layer_frame_grad"]=[{"early":float(g[:,0].float().norm()),
+        "middle":float(g[:,g.shape[1]//2].float().norm()),
+        "late":float(g[:,g.shape[1]-1].float().norm())} for g in history_grads]
     for loss_name in ("action_task","reason_task","ground","match"):
         params=[p for values in owners.values() for p in values]
         grads=torch.autograd.grad(losses[loss_name],params,retain_graph=True,allow_unused=True)

@@ -22,6 +22,9 @@ def test_preflight_binds_epoch_budget_amendment_and_dino_runtime_source():
     assert '"vision_transformer.py"' in source
     assert '"docs/superpowers/plans/2026-09-07-coev-epoch-budget-amendment.md"' in source
     assert "amendment_hash_matches_spec" in source
+    owner=Path("tests/run_coev_owner_audit.py").read_text(encoding="utf-8")
+    assert "g[:,13]" not in owner and "g[:,6]" not in owner
+    assert "g.shape[1]//2" in owner and "g.shape[1]-1" in owner
 
 
 def test_foreground_supervisor_is_attached_and_has_heartbeat():
