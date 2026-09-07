@@ -1,9 +1,13 @@
 from pathlib import Path
 
 import numpy as np
+import torch
 import yaml
 
+from types import SimpleNamespace
+
 from fate_oia.engine.evaluate_coev_oia import _intervention_flips
+from fate_oia.engine.train_coev_oia import fixed_multilabel_subset_indices
 from fate_oia.utils.coev_contracts import formal_total_updates
 
 
@@ -64,5 +68,35 @@ def test_intervention_flip_metrics_accept_numpy_scores_and_count_all_directions(
 def test_eval_uses_independent_batch_and_bf16_without_changing_training_batch():
     train_source=Path("fate_oia/engine/train_coev_oia.py").read_text(encoding="utf-8")
     eval_source=Path("fate_oia/engine/evaluate_coev_oia.py").read_text(encoding="utf-8")
-    assert 'batch_size=int(cfg["runtime"].get("eval_batch_size",batch_size))' in train_source
+    assert 'batch_size=int(cfg["runtime"].get("eval_batch_size",1))' in train_source
     assert 'enabled=device.type == "cuda"' in eval_source
+
+
+def test_epoch_test_budget_is_proportional_fixed_and_final_eval_is_full():
+    cfg=yaml.safe_load(Path("configs/coev_oia_v1.yaml").read_text(encoding="utf-8"))
+    budget=cfg["data"]["test_epoch_budget"]
+    assert budget["enabled"] is True
+    assert budget["sample_count"]==1912
+    assert abs(budget["sample_count"] / cfg["data"]["test_count"] -
+               cfg["data"]["epoch_budget"]["epoch_size"] / cfg["data"]["train_count"]) < .001
+    assert abs(cfg["runtime"]["traffic_audit_samples_per_epoch"] / 512 -
+               cfg["data"]["epoch_budget"]["epoch_size"] / cfg["data"]["train_count"]) < .001
+    assert cfg["runtime"]["final_full_test_metrics"] is True
+    source=Path("fate_oia/engine/train_coev_oia.py").read_text(encoding="utf-8")
+    assert 'evaluation_scope="fixed_stratified_epoch_subset"' in source
+    assert 'output/"final_metrics_full_test.json"' in source
+
+
+def test_fixed_multilabel_test_subset_is_deterministic_and_preserves_labels():
+    records=[]
+    for index in range(100):
+        action=[int(index % 2 == 0),int(index % 3 == 0),int(index % 5 == 0),int(index % 7 == 0)]
+        reason=[int(index % divisor == 0) for divisor in range(2,23)]
+        records.append(SimpleNamespace(action=action,reason=reason,history_available=index % 4 != 0))
+    first=fixed_multilabel_subset_indices(records,42,77,32)
+    second=fixed_multilabel_subset_indices(records,42,77,32)
+    assert first==second and len(first)==len(set(first))==42
+    selected=torch.tensor([records[i].action+records[i].reason for i in first])
+    pool=torch.tensor([r.action+r.reason for r in records])
+    assert torch.all(selected.sum(0)>0)
+    assert float((selected.float().mean(0)-pool.float().mean(0)).abs().mean()) < .08

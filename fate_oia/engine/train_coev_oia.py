@@ -11,7 +11,7 @@ from typing import Any
 import numpy as np
 import torch
 import yaml
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from fate_oia.datasets.coev_video_dataset import CoEVVideoDataset, coev_collate
 from fate_oia.engine.evaluate_coev_oia import evaluate, final_intervention_diagnostics, is_better
@@ -73,11 +73,40 @@ def write_epoch_row(path: Path, row: dict[str,Any]) -> None:
     temp.write_text("".join(json.dumps(value)+"\n" for value in existing),encoding="utf-8");temp.replace(path)
 
 
+def fixed_multilabel_subset_indices(records, sample_count: int, seed: int,
+                                    candidate_draws: int = 128) -> list[int]:
+    """Choose one reproducible test subset close to full-set label prevalence."""
+    if not 0 < sample_count <= len(records):
+        raise ValueError("test sample_count must be within the full test set")
+    labels=torch.tensor([list(record.action)+list(record.reason) for record in records],dtype=torch.float64)
+    prevalence=labels.mean(0)
+    scale=(prevalence*(1-prevalence)+1/len(records)).sqrt()
+    history=torch.tensor([bool(record.history_available) for record in records],dtype=torch.float64)
+    best: tuple[float,list[int]] | None=None
+    for draw in range(int(candidate_draws)):
+        generator=torch.Generator().manual_seed(int(seed)+draw)
+        selected=torch.randperm(len(records),generator=generator)[:sample_count]
+        selected_labels=labels[selected]
+        missing=((labels.sum(0)>0)&(selected_labels.sum(0)==0)).sum().item()
+        distribution=float(((selected_labels.mean(0)-prevalence).abs()/scale).mean())
+        history_error=float((history[selected].mean()-history.mean()).abs())
+        score=1000.0*missing+distribution+.1*history_error
+        candidate=selected.sort().values.tolist()
+        if best is None or score < best[0]: best=(score,candidate)
+    assert best is not None
+    return best[1]
+
+
+def _eval_loader(dataset, cfg: dict[str,Any], common: dict[str,Any]) -> DataLoader:
+    return DataLoader(dataset,batch_size=int(cfg["runtime"].get("eval_batch_size",1)),shuffle=False,
+                      generator=torch.Generator().manual_seed(77),**common)
+
+
 def loaders(cfg: dict[str, Any], batch_size: int, max_train: int | None = None, max_test: int | None = None):
     data = cfg["data"]
     history_frames=int(data["history_frames"])
     train = CoEVVideoDataset(data["manifest_path"], data["train_partitions"], True, data["grounding_root"], cfg["training"]["seed"], max_train,history_frames)
-    test = CoEVVideoDataset(data["manifest_path"], "test", False, None, cfg["training"]["seed"], max_test,history_frames)
+    full_test = CoEVVideoDataset(data["manifest_path"], "test", False, None, cfg["training"]["seed"], max_test,history_frames)
     budget=data.get("epoch_budget",{})
     if max_train is None and budget.get("enabled"):
         sampler = CoEVBudgetedStratifiedSampler(train,seed=cfg["training"]["seed"],metadata_path=budget["novelty_metadata_path"],
@@ -89,9 +118,14 @@ def loaders(cfg: dict[str, Any], batch_size: int, max_train: int | None = None, 
     if data["num_workers"]:
         common.update(persistent_workers=data["persistent_workers"], prefetch_factor=data["prefetch_factor"])
     train_loader=DataLoader(train,batch_size=batch_size,sampler=sampler,**common)
-    test_loader=DataLoader(test,batch_size=int(cfg["runtime"].get("eval_batch_size",batch_size)),shuffle=False,
-                           generator=torch.Generator().manual_seed(77),**common)
-    return train_loader,test_loader,sampler
+    test=full_test
+    test_budget=data.get("test_epoch_budget",{})
+    if max_test is None and test_budget.get("enabled"):
+        indices=fixed_multilabel_subset_indices(full_test.records,int(test_budget["sample_count"]),
+                                                int(test_budget["seed"]),int(test_budget["candidate_draws"]))
+        test=Subset(full_test,indices)
+    test_loader=_eval_loader(test,cfg,common)
+    return train_loader,test_loader,full_test,common,sampler
 
 
 def main() -> None:
@@ -110,7 +144,7 @@ def main() -> None:
     if not ready.get("pass"): raise RuntimeError("FULL_TRAIN_READY is not passing")
     seed = cfg["training"]["seed"]; random.seed(seed); np.random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
     device = torch.device("cuda"); model = build_model(cfg).to(device); loss_fn = CoEVLoss(); optimizer = build_optimizer(model, cfg)
-    train_loader, test_loader, sampler = loaders(cfg, args.batch_size, args.max_train, args.max_test)
+    train_loader, test_loader, full_test, loader_common, sampler = loaders(cfg, args.batch_size, args.max_train, args.max_test)
     total = cfg["training"]["total_updates"]; warmup = cfg["training"]["warmup_updates"]
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda u: lr_factor(u, total, warmup, cfg["training"]["min_lr_ratio"]))
     output = Path(cfg["runtime"]["output_dir"]); output.mkdir(parents=True, exist_ok=True)
@@ -125,7 +159,8 @@ def main() -> None:
         "identity":identity,"spec_sha256":cfg["experiment"]["spec_sha256"],"total_updates":cfg["training"]["total_updates"],
         "warmup_updates":cfg["training"]["warmup_updates"],"foreground_only":cfg["runtime"]["foreground_only"],
         "history_frames":cfg["data"]["history_frames"],"temporal_span_seconds":cfg["data"]["temporal_span_seconds"],
-        "epoch_budget":cfg["data"]["epoch_budget"]},indent=2),encoding="utf-8")
+        "epoch_budget":cfg["data"]["epoch_budget"],"test_epoch_budget":cfg["data"].get("test_epoch_budget"),
+        "per_epoch_test_count":len(test_loader.dataset),"full_test_count":len(full_test)},indent=2),encoding="utf-8")
     epoch0 = update = 0; best = None; best_epoch = None
     if args.resume:
         state = torch.load(args.resume, map_location="cpu"); model.load_state_dict(state["model"]); optimizer.load_state_dict(state["optimizer"])
@@ -205,19 +240,26 @@ def main() -> None:
             epoch_sampler_stats["pool_covered_after_epoch_rate"] = float((sampler.exposure > 0).float().mean())
             epoch_sampler_stats["exposure_min_after_epoch"] = int(sampler.exposure.min())
             epoch_sampler_stats["exposure_max_after_epoch"] = int(sampler.exposure.max())
-        metrics, _ = evaluate(model, test_loader, device); metrics.update(epoch=epoch, raw_fixed_0p5=True, internal_test_selected=True)
+        metrics, _ = evaluate(model, test_loader, device); metrics.update(epoch=epoch, raw_fixed_0p5=True,
+            internal_test_selected=True,evaluation_scope="fixed_stratified_epoch_subset",
+            full_test_count=len(full_test),per_epoch_test_count=len(test_loader.dataset))
         write_epoch_row(output/"metrics_summary.jsonl",metrics)
         write_epoch_row(output/"sampler_epoch_stats.jsonl",epoch_sampler_stats)
         traffic=final_intervention_diagnostics(model,test_loader,device,cfg["runtime"]["traffic_audit_samples_per_epoch"])
-        traffic["epoch"]=epoch;write_epoch_row(output/"traffic_interventions_test512.jsonl",traffic)
+        traffic["epoch"]=epoch;write_epoch_row(output/"traffic_interventions_epoch_subset.jsonl",traffic)
         state = {"model":model.state_dict(),"optimizer":optimizer.state_dict(),"scheduler":scheduler.state_dict(),"sampler":sampler.state_dict(),"rng":capture_rng(),"epoch":epoch+1,"global_update":update,"best":best,"best_epoch":best_epoch,"optimizer_boundary":True,"identity":identity,"total_updates":total}
         if is_better(metrics,best,epoch,best_epoch): best,best_epoch=metrics,epoch; state["best"],state["best_epoch"]=best,best_epoch; atomic_torch_save(state,output/"checkpoint_best_joint.pth")
         atomic_torch_save(state, output/"checkpoint_latest.pth")
     formal = epochs == cfg["training"]["epochs"] and args.max_train is None and args.max_test is None
     if formal:
         best_state=torch.load(output/"checkpoint_best_joint.pth",map_location="cpu");model.load_state_dict(best_state["model"])
-        final_limit=len(test_loader.dataset) if cfg["runtime"]["final_traffic_audit_full_test"] else cfg["runtime"]["traffic_audit_samples_per_epoch"]
-        diagnostics=final_intervention_diagnostics(model,test_loader,device,final_limit)
+        full_test_loader=_eval_loader(full_test,cfg,loader_common)
+        if cfg["runtime"].get("final_full_test_metrics",True):
+            final_metrics,_=evaluate(model,full_test_loader,device)
+            final_metrics.update(evaluation_scope="full_test",sample_count=len(full_test),best_epoch=best_epoch)
+            (output/"final_metrics_full_test.json").write_text(json.dumps(final_metrics,indent=2),encoding="utf-8")
+        final_limit=len(full_test) if cfg["runtime"]["final_traffic_audit_full_test"] else cfg["runtime"]["traffic_audit_samples_per_epoch"]
+        diagnostics=final_intervention_diagnostics(model,full_test_loader,device,final_limit)
         (output/"final_interventions_full_test.json").write_text(json.dumps(diagnostics,indent=2),encoding="utf-8")
         (output/"TRAIN_COMPLETED.json").write_text(json.dumps({"epochs":epochs,"test_evaluations":epochs,"best":best,"best_epoch":best_epoch,"final_diagnostics":True}),encoding="utf-8")
 

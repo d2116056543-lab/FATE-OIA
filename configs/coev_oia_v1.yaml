@@ -31,6 +31,12 @@ data:
     quotas: {dynamic: 3200, balanced: 1920, static: 1280}
     missing_history_quota: 320
     candidate_draws: 12
+  # Match the per-epoch train exposure ratio while retaining one final full-test report.
+  test_epoch_budget:
+    enabled: true
+    sample_count: 1912
+    seed: 20260907
+    candidate_draws: 128
   target_hw: [360, 640]
   history_hw: [256, 448]
   expected_history_missing: 3481
@@ -97,7 +103,8 @@ runtime:
   save_every_updates: 100
   log_every_updates: 20
   eval_progress_batches: 32
-  traffic_audit_samples_per_epoch: 512
+  traffic_audit_samples_per_epoch: 214
+  final_full_test_metrics: true
   final_traffic_audit_full_test: true
 memory_probe:
   target_reserved_gib: [43.0, 45.0]
