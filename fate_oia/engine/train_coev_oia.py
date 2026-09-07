@@ -85,10 +85,13 @@ def loaders(cfg: dict[str, Any], batch_size: int, max_train: int | None = None, 
             missing_history_quota=budget["missing_history_quota"],candidate_draws=budget["candidate_draws"])
     else:
         sampler = TIDAStatefulRandomSampler(train, seed=cfg["training"]["seed"])
-    common = dict(batch_size=batch_size, num_workers=data["num_workers"], pin_memory=data["pin_memory"], collate_fn=coev_collate)
+    common = dict(num_workers=data["num_workers"], pin_memory=data["pin_memory"], collate_fn=coev_collate)
     if data["num_workers"]:
         common.update(persistent_workers=data["persistent_workers"], prefetch_factor=data["prefetch_factor"])
-    return DataLoader(train, sampler=sampler, **common), DataLoader(test, shuffle=False, generator=torch.Generator().manual_seed(77), **common), sampler
+    train_loader=DataLoader(train,batch_size=batch_size,sampler=sampler,**common)
+    test_loader=DataLoader(test,batch_size=int(cfg["runtime"].get("eval_batch_size",batch_size)),shuffle=False,
+                           generator=torch.Generator().manual_seed(77),**common)
+    return train_loader,test_loader,sampler
 
 
 def main() -> None:

@@ -90,6 +90,7 @@ training:
   no_metric_early_stop: true
 runtime:
   output_dir: 'G:\FATE_Drive_runs\coev_oia_v1'
+  eval_batch_size: 8
   foreground_only: true
   feature_cache_enabled: false
   token_compression: none
