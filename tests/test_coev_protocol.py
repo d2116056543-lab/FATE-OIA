@@ -35,6 +35,9 @@ def test_foreground_supervisor_is_attached_and_has_heartbeat():
     assert "subprocess.Popen" in source and "coev_supervisor_heartbeat" in source and "child_pid" in source
     for forbidden in ("DETACHED_PROCESS","CREATE_NEW_PROCESS_GROUP","start_new_session","Start-Process","TaskScheduler","nohup"):
         assert forbidden not in source
+    launcher=Path("scripts/run_coev_foreground.ps1").read_text(encoding="utf-8")
+    assert '$PythonExe = "E:\\Anaconda\\envs\\sbw39\\python.exe"' in launcher
+    assert '& $PythonExe @argsList' in launcher
 
 
 def test_only_test_is_evaluated_and_completion_is_strict():
