@@ -21,13 +21,16 @@ from fate_oia.losses.coev_losses import CoEVLoss
 
 
 REQUIRED = (
+ "vision_transformer.py",
  "fate_oia/models/coev_visual_field.py", "fate_oia/models/coev_observers.py", "fate_oia/models/coev_path_lift.py",
  "fate_oia/models/coev_video_decoder.py", "fate_oia/models/coev_evidence_readout.py", "fate_oia/models/coev_oia_model.py",
  "fate_oia/datasets/coev_video_dataset.py", "fate_oia/datasets/coev_grounding_targets.py", "fate_oia/losses/coev_losses.py",
  "fate_oia/engine/train_coev_oia.py", "fate_oia/engine/evaluate_coev_oia.py", "fate_oia/explain/coev_interventions.py",
  "fate_oia/engine/audit_coev_endpoint_identity.py", "fate_oia/engine/repair_coev_endpoint_clips.py",
  "fate_oia/utils/coev_contracts.py", "fate_oia/utils/coev_checkpoint.py", "fate_oia/utils/coev_preflight.py",
+ "fate_oia/utils/coev_budget_sampler.py", "fate_oia/engine/build_coev_novelty_metadata.py",
  "fate_oia/utils/coev_supervisor.py", "configs/coev_oia_v1.yaml", "scripts/run_coev_foreground.ps1",
+ "docs/superpowers/plans/2026-09-07-coev-epoch-budget-amendment.md",
  ".codex/skills/coev-oia-v1-implementation-audit/SKILL.md")
 
 
@@ -77,7 +80,7 @@ def data_audit(cfg: dict) -> dict:
     stride = max(1, len(available) // 32); pts_rows=[]; pts_errors=[]
     for record in available[::stride][:32]:
         try:
-            decoded, actual_t, valid = decode_with_actual_pts(record.clip_path, requested_times(),record.target_frame_index)
+            decoded, actual_t, valid = decode_with_actual_pts(record.clip_path, requested_times(cfg["data"]["history_frames"]+1),record.target_frame_index)
             raw_pts = probe_video_pts(record.clip_path)
             alignment=probe_endpoint_alignment(record.clip_path,record.target_image_path,record.target_frame_index)
             target=np.asarray(Image.open(record.target_image_path).convert("RGB"),dtype=np.float32)/255.0
@@ -106,12 +109,19 @@ def data_audit(cfg: dict) -> dict:
     historical=BDDOIAMultiTaskDataset(cfg["data"]["historical_image_data_root"],cfg["data"]["historical_image_raw_root"],"train")
     historical_ids={row.file_name.lower() for row in historical.samples};video_train_ids=set(ids(train))
     historical_only=sorted(historical_ids-video_train_ids);video_only=sorted(video_train_ids-historical_ids)
+    budget=cfg["data"].get("epoch_budget",{});novelty_path=Path(budget.get("novelty_metadata_path",""))
+    novelty_rows=[json.loads(line) for line in novelty_path.read_text(encoding="utf-8").splitlines() if line.strip()] if novelty_path.is_file() else []
+    novelty_ids=[str(row.get("file_name","")).lower() for row in novelty_rows]
+    novelty_forbidden=sum(any(key in row for key in ("action","reason","action_4","reason_21")) for row in novelty_rows)
+    novelty_errors=sum("error" in row for row in novelty_rows)
+    novelty_ok=(not budget.get("enabled") or (len(novelty_rows)==len(train) and len(set(novelty_ids))==len(train)
+                and set(novelty_ids)==set(ids(train)) and novelty_forbidden==0 and novelty_errors==0))
     ok = (len(train) == cfg["data"]["train_count"] and len(test) == cfg["data"]["test_count"]
           and missing == cfg["data"]["expected_history_missing"] and missing_test == cfg["data"]["expected_test_history_missing"]
           and not set(ids(train)) & set(ids(test)) and duplicate_targets == 0 and bool(pts_rows) and not pts_errors
           and max((row["endpoint_mse"] for row in pts_rows),default=1.0)<=cfg["data"]["max_endpoint_mse"]
           and all(len(row.action)==4 and len(row.reason)==21 for row in rows)
-          and len(historical_ids)==cfg["data"]["historical_image_train_count"])
+          and len(historical_ids)==cfg["data"]["historical_image_train_count"] and novelty_ok)
     return {"pass":ok,"train_count":len(train),"test_count":len(test),"union_count":len({*ids(train),*ids(test)}),
             "train_id_sha256":digest(ids(train)),"test_id_sha256":digest(ids(test)),"target_overlap":len(set(ids(train))&set(ids(test))),
             "source_video_overlap":len(train_source & test_source),"history_missing":missing,"test_history_missing":missing_test,
@@ -123,6 +133,10 @@ def data_audit(cfg: dict) -> dict:
             "selected_actual_dt_quantiles":quantiles,"cfr_like_ratio":cfr_like/max(1,len(pts_rows)),"pts_samples":pts_rows,
             "weak_target_sample_count":len(weak),"weak_label_coverage":weak_coverage,
             "weak_label_warnings":[name for name,row in weak_coverage.items() if row["positive"]+row["negative"]==0],
+            "epoch_budget":{"enabled":bool(budget.get("enabled")),"epoch_size":budget.get("epoch_size"),
+                "novelty_metadata_path":str(novelty_path),"metadata_rows":len(novelty_rows),
+                "metadata_sha256":sha(novelty_path) if novelty_path.is_file() else None,
+                "forbidden_task_label_fields":novelty_forbidden,"decode_errors":novelty_errors,"pass":novelty_ok},
             "split_policy_note":"Official target split is preserved; source-video overlap is reported and not silently rewritten."}
 
 
@@ -285,19 +299,22 @@ def main() -> None:
     for remote in subprocess.check_output(["git","remote"],text=True).splitlines():
         lookup=subprocess.run(["git","ls-remote",remote,f"refs/heads/{branch}"],text=True,capture_output=True)
         if lookup.returncode==0 and lookup.stdout.strip().split("\t")[0:1]==[local_head]: remote_matches.append(remote)
-    skill_matches=sha(REQUIRED[-1])==cfg["experiment"]["spec_sha256"]["SKILL.md"]
+    skill_matches=sha(".codex/skills/coev-oia-v1-implementation-audit/SKILL.md")==cfg["experiment"]["spec_sha256"]["SKILL.md"]
+    amendment_matches=(sha("docs/superpowers/plans/2026-09-07-coev-epoch-budget-amendment.md")
+                       == cfg["experiment"]["spec_sha256"]["COEV_EPOCH_BUDGET_AMENDMENT.md"])
     launch=(memory_payload.get("stress") or {})
     checks={"data":not any("data_audit" in x for x in missing+failed+stale),
             "functional":not any(any(name in x for name in ("functional_audit","real_smoke","owner_gradient","real_rgb","visual_audit")) for x in missing+failed+stale),
             "memory":not any("memory_profile" in x for x in missing+failed+stale),"supervisor":Path("fate_oia/utils/coev_supervisor.py").is_file(),
             "git":not(untracked or dirty) and bool(remote_matches),"mutation":not any("mutation_kill" in x for x in missing+failed+stale),
-            "identity":not stale and skill_matches}
+            "identity":not stale and skill_matches and amendment_matches}
     requirements=requirement_matrix(out,checks)
-    payload={"schema":"coev_ready_v1","pass":not(missing or failed or untracked or stale or dirty) and bool(remote_matches) and skill_matches and len(requirements)==40 and all(x["pass"] for x in requirements.values()),
+    payload={"schema":"coev_ready_v1","pass":not(missing or failed or untracked or stale or dirty) and bool(remote_matches) and skill_matches and amendment_matches and len(requirements)==40 and all(x["pass"] for x in requirements.values()),
              "missing":missing,"failed":failed,"untracked":untracked,"stale_artifacts":stale,"dirty_required_sources":dirty,
              "source_commit":subprocess.check_output(["git","rev-parse","HEAD"],text=True).strip(),"source_hashes":{x:sha(x) for x in REQUIRED if Path(x).is_file()},
              "config_sha256":sha(a.config),"data_identity_sha256":sha(out/"data_audit.json") if (out/"data_audit.json").is_file() else None,
-             "spec_sha256":cfg["experiment"]["spec_sha256"],"skill_hash_matches_spec":skill_matches,"branch":branch,
+             "spec_sha256":cfg["experiment"]["spec_sha256"],"skill_hash_matches_spec":skill_matches,
+             "amendment_hash_matches_spec":amendment_matches,"branch":branch,
              "remote_head_matches":remote_matches,"launch_configuration":{"batch_size":launch.get("batch_size"),
                  "gradient_accumulation_steps":launch.get("grad_accum"),"effective_batch":cfg["training"]["effective_batch"]},
              "requirements":requirements,"missing_items":[key for key,value in requirements.items() if not value["pass"]]}

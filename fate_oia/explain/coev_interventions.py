@@ -13,7 +13,8 @@ def input_intervention(model, inputs, kind: str, *, generator: torch.Generator |
     if kind == "history_off": valid[:, :-1] = False
     elif kind == "repeated_last": history[:] = torch.nn.functional.interpolate(inputs.target_rgb, (256, 448)).unsqueeze(1)
     elif kind in ("shuffle", "reverse"):
-        order = torch.arange(14, device=history.device).flip(0) if kind == "reverse" else torch.randperm(14, generator=generator, device=history.device)
+        count = history.shape[1]
+        order = torch.arange(count, device=history.device).flip(0) if kind == "reverse" else torch.randperm(count, generator=generator, device=history.device)
         history, valid[:, :-1] = history[:, order], valid[:, order]
     elif kind.startswith("frame_delete:"):
         valid[:, int(kind.split(":")[1])] = False

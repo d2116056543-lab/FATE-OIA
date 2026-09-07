@@ -22,9 +22,11 @@ def _configure_decode_stream(stream) -> None:
     stream.codec_context.thread_count = 2
 
 
-def requested_times() -> torch.Tensor:
+def requested_times(total_frames: int = 15) -> torch.Tensor:
     # Denser near the target while still covering the full five-second interval.
-    u = torch.linspace(0, 1, 15)
+    if total_frames < 2:
+        raise ValueError("total_frames must include history and target")
+    u = torch.linspace(0, 1, total_frames)
     return -5.0 * (1.0 - u).square()
 
 
@@ -84,7 +86,7 @@ def decode_with_actual_pts(path: str | Path, relative_times: torch.Tensor,
     desired = target + relative_times.double()
     indices = torch.stack([(pts_t - x).abs().argmin() for x in desired])
     actual = (pts_t[indices] - target).float(); actual[-1] = 0
-    valid = torch.ones(15, dtype=torch.bool)
+    valid = torch.ones(relative_times.numel(), dtype=torch.bool)
     valid[1:] &= indices[1:] != indices[:-1]
     return [frames[int(i)].to_image().convert("RGB") for i in indices], actual, valid
 
@@ -92,11 +94,13 @@ def decode_with_actual_pts(path: str | Path, relative_times: torch.Tensor,
 class CoEVVideoDataset(Dataset):
     def __init__(self, manifest_path: str | Path, partitions: str | Sequence[str], training: bool,
                  grounding_root: str | Path | None = None, seed: int = 20260906,
-                 max_samples: int | None = None) -> None:
+                 max_samples: int | None = None, history_frames: int = 14) -> None:
         wanted = {partitions} if isinstance(partitions, str) else set(partitions)
         self.records = [r for r in load_manifest(manifest_path) if r.partition in wanted]
         if max_samples is not None: self.records = self.records[:max_samples]
         self.training = training; self.seed = seed; self.epoch = 0
+        self.history_frames = int(history_frames)
+        self.sample_times = requested_times(self.history_frames + 1)
         self.transform = SynchronizedVideoTransform(target_hw=(360, 640), context_hw=(256, 448))
         self.grounding = CoEVGroundingTargetBuilder(grounding_root) if training and grounding_root else None
 
@@ -114,12 +118,12 @@ class CoEVVideoDataset(Dataset):
         record = self.records[index]
         target = Image.open(record.target_image_path).convert("RGB")
         if record.history_available:
-            frames, actual_t, valid = decode_with_actual_pts(record.clip_path, requested_times(),record.target_frame_index)
+            frames, actual_t, valid = decode_with_actual_pts(record.clip_path, self.sample_times,record.target_frame_index)
             frames[-1] = target
         else:
-            frames = [target.copy() for _ in range(15)]
-            actual_t = requested_times(); actual_t[-1] = 0
-            valid = torch.zeros(15, dtype=torch.bool); valid[-1] = True
+            frames = [target.copy() for _ in range(self.history_frames + 1)]
+            actual_t = self.sample_times.clone(); actual_t[-1] = 0
+            valid = torch.zeros(self.history_frames + 1, dtype=torch.bool); valid[-1] = True
         rng = torch.Generator().manual_seed(self._seed(record) if sampler_seed is None else sampler_seed)
         flip_value = float(torch.rand((), generator=rng))
         if self.training:

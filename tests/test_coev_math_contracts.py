@@ -9,7 +9,7 @@ def test_flip_is_involution_and_schedule_is_fixed():
     a, r = torch.arange(4), torch.arange(21)
     aa, rr = flip_labels(*flip_labels(a, r))
     assert torch.equal(aa, a) and torch.equal(rr, r)
-    assert formal_total_updates(15302) == (479, 11496)
+    assert formal_total_updates(6400, epochs=18) == (200, 3600)
 
 
 def test_path_lift_shapes_persistence_and_direction():

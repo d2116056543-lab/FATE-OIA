@@ -23,7 +23,8 @@ def norm(parameters, grads) -> float:
 def main() -> None:
     parser=argparse.ArgumentParser();parser.add_argument("--config",default="configs/coev_oia_v1.yaml");parser.add_argument("--output",required=True);args=parser.parse_args()
     cfg=load_config(args.config)
-    ds=CoEVVideoDataset(cfg["data"]["manifest_path"],["train_core","train_calib","train_audit"],True,cfg["data"]["grounding_root"],max_samples=1)
+    ds=CoEVVideoDataset(cfg["data"]["manifest_path"],["train_core","train_calib","train_audit"],True,cfg["data"]["grounding_root"],max_samples=1,
+                        history_frames=cfg["data"]["history_frames"])
     inputs,targets=coev_collate([ds[0]]); inputs=inputs.to("cuda"); targets=targets.to("cuda")
     model=build_model(cfg).cuda().train();model.capture_gradient_diagnostics=True
     hook_counts={"block4":0,"block8":0,"block12":0};handles=[]

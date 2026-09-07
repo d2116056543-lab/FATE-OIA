@@ -101,16 +101,17 @@ class CoEVVideoDecoder(nn.Module):
         x = self.temporal(x, src_key_padding_mask=padding)
         last = x[:, -1].view(b, labels, d)
         last = last + self.class_interaction(last, last, last, need_weights=False)[0]
+        history_frames = history_fields[0].shape[1]
         chunks = [self._decorate(history_fields[layer][:,i],layer,history_hw,actual_t[:,i])
-                  for i in range(14) for layer in range(3)]
+                  for i in range(history_frames) for layer in range(3)]
         chunks += [self._decorate(target_fields[layer],layer,target_hw,actual_t[:,-1]) for layer in range(3)]
         key_valid = [valid[:, i:i+1].expand(-1, history_fields[0].shape[2])
-                     for i in range(14) for _ in history_fields]
+                     for i in range(history_frames) for _ in history_fields]
         key_valid += [torch.ones(b, x.shape[1], dtype=torch.bool, device=x.device) for x in target_fields]
         bias_chunks = None
         if predicate_maps is not None:
             bias_chunks = []
-            for i in range(15):
+            for i in range(history_frames + 1):
                 for f in range(3):
                     n = chunks[i * 3 + f].shape[1]
                     support = torch.einsum("lp,bphw->blhw", self.class_fact_support, predicate_maps[:, i])
@@ -128,7 +129,7 @@ class CoEVVideoDecoder(nn.Module):
         tfields = [fields[f"target_task{x}"] for x in (4, 8, 12)]
         b, t, n, d = hfields[0].shape
         # Spatial processing is frame-independent; folding B*T into the batch
-        # is exactly equivalent and avoids 14 repeated attention launches.
+        # is exactly equivalent and avoids repeated per-history-frame launches.
         history_q = self.read_frame([x.reshape(b * t, n, d) for x in hfields],
                                     fields["history_grid_hw"]).view(b, t, 25, d)
         target_q = self.read_frame(tfields, fields["target_grid_hw"]).unsqueeze(1)

@@ -19,6 +19,16 @@ def test_full_patch_reread_has_layer_space_time_identity_and_masks_invalid_histo
     assert len(model.layer_proj)==3 and model.layer_id.shape==(3,12)
 
 
+def test_nine_frame_decoder_uses_all_eight_history_frames_and_target():
+    decoder=CoEVVideoDecoder(dim=12,temporal_layers=1)
+    frame_q=torch.randn(1,9,25,12);times=torch.linspace(-5,0,9).unsqueeze(0)
+    valid=torch.ones(1,9,dtype=torch.bool)
+    history=[torch.randn(1,8,4,12) for _ in range(3)];target=[torch.randn(1,6,12) for _ in range(3)]
+    out=decoder.read_history(frame_q,times,valid,history,target,(2,2),(2,3))
+    assert out["q_video"].shape==(1,25,12)
+    assert out["full_history_kv_length"]==8*4*3+6*3
+
+
 def test_action_spatial_support_is_canonical_and_left_right_mirror():
     model=CoEVVideoDecoder(dim=12);support=model.class_spatial_support((16,28),torch.device("cpu"),torch.float32)
     assert torch.equal(support[2].flip(-1),support[3])

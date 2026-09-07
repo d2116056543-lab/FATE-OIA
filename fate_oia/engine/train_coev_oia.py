@@ -18,6 +18,7 @@ from fate_oia.engine.evaluate_coev_oia import evaluate, final_intervention_diagn
 from fate_oia.losses.coev_losses import CoEVLoss
 from fate_oia.models.coev_oia_model import CoEVOIAModel
 from fate_oia.utils.coev_checkpoint import atomic_torch_save, capture_rng, restore_rng, runtime_identity, verify_resume_identity
+from fate_oia.utils.coev_budget_sampler import CoEVBudgetedStratifiedSampler
 from fate_oia.utils.tida_stateful_sampler import TIDAStatefulRandomSampler
 
 
@@ -74,9 +75,16 @@ def write_epoch_row(path: Path, row: dict[str,Any]) -> None:
 
 def loaders(cfg: dict[str, Any], batch_size: int, max_train: int | None = None, max_test: int | None = None):
     data = cfg["data"]
-    train = CoEVVideoDataset(data["manifest_path"], data["train_partitions"], True, data["grounding_root"], cfg["training"]["seed"], max_train)
-    test = CoEVVideoDataset(data["manifest_path"], "test", False, None, cfg["training"]["seed"], max_test)
-    sampler = TIDAStatefulRandomSampler(train, seed=cfg["training"]["seed"])
+    history_frames=int(data["history_frames"])
+    train = CoEVVideoDataset(data["manifest_path"], data["train_partitions"], True, data["grounding_root"], cfg["training"]["seed"], max_train,history_frames)
+    test = CoEVVideoDataset(data["manifest_path"], "test", False, None, cfg["training"]["seed"], max_test,history_frames)
+    budget=data.get("epoch_budget",{})
+    if max_train is None and budget.get("enabled"):
+        sampler = CoEVBudgetedStratifiedSampler(train,seed=cfg["training"]["seed"],metadata_path=budget["novelty_metadata_path"],
+            epoch_size=budget["epoch_size"],quotas=budget["quotas"],
+            missing_history_quota=budget["missing_history_quota"],candidate_draws=budget["candidate_draws"])
+    else:
+        sampler = TIDAStatefulRandomSampler(train, seed=cfg["training"]["seed"])
     common = dict(batch_size=batch_size, num_workers=data["num_workers"], pin_memory=data["pin_memory"], collate_fn=coev_collate)
     if data["num_workers"]:
         common.update(persistent_workers=data["persistent_workers"], prefetch_factor=data["prefetch_factor"])
@@ -112,7 +120,9 @@ def main() -> None:
         "test_only_eval":True,"threshold":.5,"internal_test_selected":True,"publication_eligible":False,
         "feature_cache_enabled":False,"token_compression":"none","pretrained_weights":cfg["backbone"]["pretrained_weights"],
         "identity":identity,"spec_sha256":cfg["experiment"]["spec_sha256"],"total_updates":cfg["training"]["total_updates"],
-        "warmup_updates":cfg["training"]["warmup_updates"],"foreground_only":cfg["runtime"]["foreground_only"]},indent=2),encoding="utf-8")
+        "warmup_updates":cfg["training"]["warmup_updates"],"foreground_only":cfg["runtime"]["foreground_only"],
+        "history_frames":cfg["data"]["history_frames"],"temporal_span_seconds":cfg["data"]["temporal_span_seconds"],
+        "epoch_budget":cfg["data"]["epoch_budget"]},indent=2),encoding="utf-8")
     epoch0 = update = 0; best = None; best_epoch = None
     if args.resume:
         state = torch.load(args.resume, map_location="cpu"); model.load_state_dict(state["model"]); optimizer.load_state_dict(state["optimizer"])
@@ -125,11 +135,13 @@ def main() -> None:
     scaler_ctx = lambda: torch.autocast("cuda", dtype=torch.bfloat16)
     for epoch in range(epoch0, epochs):
         train_loader.dataset.set_epoch(epoch); model.train(); optimizer.zero_grad(set_to_none=True); group = []
+        epoch_sampler_stats=sampler.current_stats() if hasattr(sampler,"current_stats") else {"epoch":epoch,"selected_count":len(train_loader.dataset)}
+        epoch_target=len(sampler)+sampler.consumed
         last_batch_end=time.perf_counter()
         for micro, (inputs, targets) in enumerate(train_loader):
             load_seconds=time.perf_counter()-last_batch_end
             group.append((inputs, targets)); group_samples = sum(x.action.shape[0] for _, x in group)
-            boundary = len(group) == args.grad_accum or sampler.consumed + group_samples == len(train_loader.dataset)
+            boundary = len(group) == args.grad_accum or sampler.consumed + group_samples == epoch_target
             if not boundary: continue
             before = sampler.consumed
             last_out = None; log_due=(update+1) % cfg["runtime"]["log_every_updates"] == 0
@@ -153,9 +165,10 @@ def main() -> None:
                             "decoder":module_grad_norm(model.video_decoder),"predicate":module_grad_norm(model.predicate_observer),
                             "matcher":module_grad_norm(model.correspondence_observer),"readout":module_grad_norm(model.evidence_readout)}
                 for field in last_out.get("history_gradient_fields", ()):
+                    middle=field.shape[1]//2;late=field.shape[1]-1
                     history_grad.append({"early":float(field.grad[:,0].float().norm()) if field.grad is not None else 0.0,
-                                         "middle":float(field.grad[:,6].float().norm()) if field.grad is not None else 0.0,
-                                         "late":float(field.grad[:,13].float().norm()) if field.grad is not None else 0.0})
+                                         "middle":float(field.grad[:,middle].float().norm()) if field.grad is not None else 0.0,
+                                         "late":float(field.grad[:,late].float().norm()) if field.grad is not None else 0.0})
                 contribution=last_out["factor_contribution"].float()
                 cancellation_ratio=float(contribution.abs().sum(-1).mean()/contribution.sum(-1).abs().mean().clamp_min(1e-8))
             grad = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["training"]["grad_clip"])
@@ -185,16 +198,24 @@ def main() -> None:
             group = []
             model.capture_gradient_diagnostics=False; last_batch_end=time.perf_counter()
         if sampler.epoch_complete: sampler.advance_epoch()
+        if hasattr(sampler, "exposure"):
+            epoch_sampler_stats["pool_covered_after_epoch_rate"] = float((sampler.exposure > 0).float().mean())
+            epoch_sampler_stats["exposure_min_after_epoch"] = int(sampler.exposure.min())
+            epoch_sampler_stats["exposure_max_after_epoch"] = int(sampler.exposure.max())
         metrics, _ = evaluate(model, test_loader, device); metrics.update(epoch=epoch, raw_fixed_0p5=True, internal_test_selected=True)
         write_epoch_row(output/"metrics_summary.jsonl",metrics)
+        write_epoch_row(output/"sampler_epoch_stats.jsonl",epoch_sampler_stats)
+        traffic=final_intervention_diagnostics(model,test_loader,device,cfg["runtime"]["traffic_audit_samples_per_epoch"])
+        traffic["epoch"]=epoch;write_epoch_row(output/"traffic_interventions_test512.jsonl",traffic)
         state = {"model":model.state_dict(),"optimizer":optimizer.state_dict(),"scheduler":scheduler.state_dict(),"sampler":sampler.state_dict(),"rng":capture_rng(),"epoch":epoch+1,"global_update":update,"best":best,"best_epoch":best_epoch,"optimizer_boundary":True,"identity":identity,"total_updates":total}
         if is_better(metrics,best,epoch,best_epoch): best,best_epoch=metrics,epoch; state["best"],state["best_epoch"]=best,best_epoch; atomic_torch_save(state,output/"checkpoint_best_joint.pth")
         atomic_torch_save(state, output/"checkpoint_latest.pth")
     formal = epochs == cfg["training"]["epochs"] and args.max_train is None and args.max_test is None
     if formal:
         best_state=torch.load(output/"checkpoint_best_joint.pth",map_location="cpu");model.load_state_dict(best_state["model"])
-        diagnostics=final_intervention_diagnostics(model,test_loader,device,256)
-        (output/"final_interventions_test256.json").write_text(json.dumps(diagnostics,indent=2),encoding="utf-8")
+        final_limit=len(test_loader.dataset) if cfg["runtime"]["final_traffic_audit_full_test"] else cfg["runtime"]["traffic_audit_samples_per_epoch"]
+        diagnostics=final_intervention_diagnostics(model,test_loader,device,final_limit)
+        (output/"final_interventions_full_test.json").write_text(json.dumps(diagnostics,indent=2),encoding="utf-8")
         (output/"TRAIN_COMPLETED.json").write_text(json.dumps({"epochs":epochs,"test_evaluations":epochs,"best":best,"best_epoch":best_epoch,"final_diagnostics":True}),encoding="utf-8")
 
 

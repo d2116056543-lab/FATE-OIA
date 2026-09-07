@@ -65,8 +65,9 @@ class CoEVOIAModel(nn.Module):
         fxy, fmass, fok = __import__("fate_oia.models.coev_observers", fromlist=["matched_expectation"]).matched_expectation(corr["forward"])
         rxy, _, _ = __import__("fate_oia.models.coev_observers", fromlist=["matched_expectation"]).matched_expectation(corr["reverse"])
         coords = torch.stack((xx, yy), -1).reshape(-1, 2)
-        reverse_map = rxy.view(b * 14, 16, 28, 2).permute(0, 3, 1, 2)
-        composed = F.grid_sample(reverse_map, fxy.view(b * 14, 16, 28, 2), align_corners=True).permute(0, 2, 3, 1).reshape_as(fxy)
+        pair_count = corr["forward"].shape[1]
+        reverse_map = rxy.view(b * pair_count, 16, 28, 2).permute(0, 3, 1, 2)
+        composed = F.grid_sample(reverse_map, fxy.view(b * pair_count, 16, 28, 2), align_corners=True).permute(0, 2, 3, 1).reshape_as(fxy)
         base = torch.stack((xx, yy), -1).reshape(1, 1, -1, 2)
         cycle = F.smooth_l1_loss(composed, base.expand_as(composed), reduction="none").mean(-1)
         adjacent_valid=inputs.valid[:,:-1]&inputs.valid[:,1:]
@@ -74,9 +75,10 @@ class CoEVOIAModel(nn.Module):
         cycle = (cycle * cycle_valid.float()).sum() / cycle_valid.float().sum().clamp_min(1)
         # Adjacent-frame low-resolution photometric consistency at expected coordinates.
         rgb = torch.cat((inputs.history_rgb, F.interpolate(inputs.target_rgb, (256, 448)).unsqueeze(1)), 1)
-        small = F.interpolate(rgb.flatten(0, 1), (16, 28), mode="bilinear", align_corners=False).view(b, 15, 3, 16, 28)
-        sample_grid = fxy.view(b * 14, 16, 28, 2)
-        sampled = F.grid_sample(small[:, 1:].flatten(0, 1), sample_grid, align_corners=True).view(b, 14, 3, 16, 28)
+        total_frames = rgb.shape[1]
+        small = F.interpolate(rgb.flatten(0, 1), (16, 28), mode="bilinear", align_corners=False).view(b, total_frames, 3, 16, 28)
+        sample_grid = fxy.view(b * pair_count, 16, 28, 2)
+        sampled = F.grid_sample(small[:, 1:].flatten(0, 1), sample_grid, align_corners=True).view(b, pair_count, 3, 16, 28)
         photo_by_pair=torch.sqrt((sampled-small[:,:-1]).square()+1e-6).mean((2,3,4))
         photo=(photo_by_pair*adjacent_valid.float()).sum()/adjacent_valid.float().sum().clamp_min(1)
         return {"match_synthetic_ce": synthetic_ce, "match_photo": photo, "match_cycle": cycle,

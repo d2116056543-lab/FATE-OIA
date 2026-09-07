@@ -15,7 +15,8 @@ from fate_oia.utils.coev_preflight import source_identity
 def main() -> None:
     parser=argparse.ArgumentParser();parser.add_argument("--config",default="configs/coev_oia_v1.yaml");parser.add_argument("--output",required=True);args=parser.parse_args()
     cfg = load_config(args.config)
-    dataset = CoEVVideoDataset(cfg["data"]["manifest_path"], "test", False, max_samples=1)
+    dataset = CoEVVideoDataset(cfg["data"]["manifest_path"], "test", False, max_samples=1,
+                               history_frames=cfg["data"]["history_frames"])
     started = time.time(); row = dataset[0]; decode = time.time() - started
     inputs, _ = coev_collate([row]); model = build_model(cfg).cuda().eval()
     torch.cuda.reset_peak_memory_stats(); started = time.time()
@@ -31,7 +32,13 @@ def main() -> None:
                       "finite": bool(output["logits"].isfinite().all()),
                       "correspondence_quality_rate":float(output["correspondence_quality_rate"].mean()),
                       "peak_reserved_gib": torch.cuda.max_memory_reserved() / 2**30}
-    result["pass"]=result["finite"] and result["full_history_kv_length"]==86064 and result["logits_shape"]==[1,25]
+    history_frames = int(cfg["data"]["history_frames"])
+    expected_kv_length = history_frames * 3 * 32 * 56 + 3 * 45 * 80
+    result["expected_full_history_kv_length"] = expected_kv_length
+    result["pass"] = (result["finite"]
+                      and result["full_history_kv_length"] == expected_kv_length
+                      and result["logits_shape"] == [1, 25]
+                      and result["predicate_maps_shape"][:2] == [1, history_frames + 1])
     result["audit_identity"]=source_identity(args.config)
     path=Path(args.output);path.parent.mkdir(parents=True,exist_ok=True);temp=path.with_suffix(path.suffix+".tmp")
     temp.write_text(json.dumps(result,indent=2),encoding="utf-8");temp.replace(path);print(json.dumps(result,indent=2))

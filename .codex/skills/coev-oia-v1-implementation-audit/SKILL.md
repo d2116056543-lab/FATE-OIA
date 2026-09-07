@@ -9,7 +9,7 @@ description: Fail-closed layer, data, gradient, mathematical, runtime, Git and f
 
 ## 0. 最高优先级边界
 
-用户本轮要求：当前worktree、tida_site_v20、不新增worktree；任务从头训练，只允许通用DINO预训练；原始RGB无派生cache；48GBGPU真实profile；每轮test、test选best；前台监督24轮，不因指标弱随意终止。
+用户本轮要求：当前worktree、tida_site_v20、不新增worktree；任务从头训练，只允许通用DINO预训练；原始RGB无派生cache；48GBGPU真实profile；每轮test、test选best；按`2026-09-07-coev-epoch-budget-amendment.md`前台监督18轮，不因指标弱随意终止。
 
 旧Skill的“新worktree、冻结旧任务模型、885test、history_off复现旧image、10epoch+StageC”等条款**只适用于旧任务**。本次发现这些语义进入新factory或audit，直接FAIL。
 
@@ -129,7 +129,7 @@ J. 读出贡献重构与节点删除精确；原始输入删除须重算不能�
 
 ## 7. 真实RGB功能验证
 
-使用训练集固定128条、真实DINO和15帧，至少100次optimizer updates；所有任务和辅助loss均为正式配方，schedule分母仍是正式24轮total updates。probe模型/optimizer与正式模型分开，probe结束丢弃；正式训练重新按seed构造，不能偷偷从probe继承任务权重。
+使用训练集固定128条、真实DINO和配置规定的9帧，至少100次optimizer updates；所有任务和辅助loss均为正式配方，schedule分母仍是正式18轮、3600 total updates。probe模型/optimizer与正式模型分开，probe结束丢弃；正式训练重新按seed构造，不能偷偷从probe继承任务权重。
 
 检查实测覆盖、更新、finite、输入依赖、干预重算。可以做32条小集合可拟合性测试，但不能要求无效/未知观察预测所有标签；对不充分证据项只验直接梯度和有监督的映射，不用全任务高分假门槛。
 
@@ -155,9 +155,9 @@ source/config/spec/data/Skill hashes一致后才输出FULL_TRAIN_READY。正式�
 
 保持前台附着父子进程，stdout/stderr持续消费；warnings不是失败，Python真实exitcode才是进程结果。每20updates/评估32batches输出heartbeat；监控data/fwd/backward/保存阶段，不能因评估沉默误杀。
 
-24轮每轮test完整，检查模型、sampler、scheduler和source hash；不按test走势改结构/超参，不因早期弱结果擅停，不因已达目标提前结束。任务故障暂停更新、保全状态、修复最小实现错误并恢复；超过安全恢复范围记BLOCKED_EXTERNAL，而不是无限重启或空口“继续监督”。
+18轮每轮test完整，昂贵交通干预每轮固定512条且最终best全量复测；检查模型、sampler、scheduler和source hash；不按test走势改结构/超参，不因早期弱结果擅停，不因已达目标提前结束。任务故障暂停更新、保全状态、修复最小实现错误并恢复；超过安全恢复范围记BLOCKED_EXTERNAL，而不是无限重启或空口“继续监督”。
 
-TRAIN_COMPLETED要求：24/24有效epoch、24次完整test指标、best_joint严格可加载且视图一致、最终诊断、所有阶段真实exitcode、最终Git与artifact检查。指标是否超过目标单独报告，绝不自动生成GOAL_ACHIEVED。
+TRAIN_COMPLETED要求：18/18有效epoch、18次完整test指标、best_joint严格可加载且视图一致、最终best完整交通诊断、所有阶段真实exitcode、最终Git与artifact检查。指标是否超过目标单独报告，绝不自动生成GOAL_ACHIEVED。
 
 ## 11. 输出JSON合同示意（字段说明，不是预置PASS）
 

@@ -24,13 +24,16 @@ def main() -> None:
     parser=argparse.ArgumentParser();parser.add_argument("--config",default="configs/coev_oia_v1.yaml")
     parser.add_argument("--output-dir",required=True);parser.add_argument("--human-reviewed",action="store_true");args=parser.parse_args()
     cfg=load_config(args.config);root=Path(args.output_dir);root.mkdir(parents=True,exist_ok=True)
-    data=CoEVVideoDataset(cfg["data"]["manifest_path"],cfg["data"]["train_partitions"],False,max_samples=128)
+    data=CoEVVideoDataset(cfg["data"]["manifest_path"],cfg["data"]["train_partitions"],False,max_samples=128,
+                          history_frames=cfg["data"]["history_frames"])
     indices=torch.linspace(0,len(data)-1,16).round().long().tolist();model=build_model(cfg).cuda().eval();records=[]
     for case,index in enumerate(indices):
         inputs,_=coev_collate([data[index]])
         with torch.no_grad(),torch.autocast("cuda",dtype=torch.bfloat16): output=model(inputs.to("cuda"))
         case_dir=root/f"case_{case:02d}";case_dir.mkdir(exist_ok=True)
-        frames=[as_image(inputs.history_rgb[0,i]).resize((224,128)) for i in (0,4,8,13)]
+        count=inputs.history_rgb.shape[1]
+        frame_indices=sorted({0,count//3,(2*count)//3,count-1})
+        frames=[as_image(inputs.history_rgb[0,i]).resize((224,128)) for i in frame_indices]
         frames.append(as_image(inputs.target_rgb[0]).resize((224,128)))
         contact=Image.new("RGB",(224*5,128));
         for i,image in enumerate(frames):contact.paste(image,(224*i,0))
@@ -41,7 +44,7 @@ def main() -> None:
         curves=Image.new("RGB",(640,320),"white");draw=ImageDraw.Draw(curves);values=output["primitive_value"][0].float().cpu().clamp(-1,1)
         colors=[(int((i*71)%255),int((i*131)%255),int((i*191)%255)) for i in range(14)]
         for primitive in range(14):
-            points=[(int(i*639/14),int((1-float(values[i,primitive]))*159.5)) for i in range(15)]
+            points=[(int(i*639/max(1,len(values)-1)),int((1-float(values[i,primitive]))*159.5)) for i in range(len(values))]
             draw.line(points,fill=colors[primitive],width=2)
         curves.save(case_dir/"primitive_curves.png")
         arrows=frames[-1].resize((448,256));draw=ImageDraw.Draw(arrows);expected,_,ok=matched_expectation(output["matcher_forward"][:, -1])

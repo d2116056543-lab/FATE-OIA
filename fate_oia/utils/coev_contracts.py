@@ -34,12 +34,13 @@ class CoEVInputs:
         b = self.target_rgb.shape[0]
         if self.target_rgb.shape != (b, 3, 360, 640):
             raise ValueError(f"target_rgb must be [B,3,360,640], got {tuple(self.target_rgb.shape)}")
-        if self.history_rgb.shape != (b, 14, 3, 256, 448):
-            raise ValueError(f"history_rgb must be [B,14,3,256,448], got {tuple(self.history_rgb.shape)}")
-        if self.actual_t.shape != (b, 15) or self.actual_t.dtype != torch.float32:
-            raise ValueError("actual_t must be FP32 [B,15]")
-        if self.valid.shape != (b, 15) or self.valid.dtype != torch.bool:
-            raise ValueError("valid must be bool [B,15]")
+        history_frames = self.history_rgb.shape[1]
+        if self.history_rgb.shape != (b, history_frames, 3, 256, 448) or history_frames < 1:
+            raise ValueError(f"history_rgb must be [B,T,3,256,448], got {tuple(self.history_rgb.shape)}")
+        if self.actual_t.shape != (b, history_frames + 1) or self.actual_t.dtype != torch.float32:
+            raise ValueError("actual_t must be FP32 [B,T+1]")
+        if self.valid.shape != (b, history_frames + 1) or self.valid.dtype != torch.bool:
+            raise ValueError("valid must be bool [B,T+1]")
         if not torch.allclose(self.actual_t[:, -1], torch.zeros_like(self.actual_t[:, -1])):
             raise ValueError("target time must be exactly zero")
         return self
