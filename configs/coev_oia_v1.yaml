@@ -106,6 +106,16 @@ runtime:
   traffic_audit_samples_per_epoch: 214
   final_full_test_metrics: true
   final_traffic_audit_full_test: true
+  # One-time, exact identity bridge for the running update-100 checkpoint.
+  # The only behavioral change is the proportional epoch evaluation budget.
+  resume_eval_budget_migration:
+    enabled: true
+    from_identity:
+      git_head: 8ba19176579442bc7167aaee3f80d54d1ebc351d
+      git_tree: 09e06b5d42ff1726ec5112ac1b0e91daebf4ce12
+      config_sha256: d4887e32784296e82d54351a4e596a47842cdcadea12c90e0b28eb7f55629af2
+      data_audit_sha256: 9b8815e0e4b49f741430ebe21cceb4885eeb8796d06b99b1e00142574fc1a63f
+    reason: proportional_per_epoch_test_budget_only
 memory_probe:
   target_reserved_gib: [43.0, 45.0]
   # Nine-frame fused-SDPA probes measured B=2 faster than B=4 and B=8 even

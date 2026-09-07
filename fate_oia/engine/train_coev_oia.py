@@ -102,6 +102,20 @@ def _eval_loader(dataset, cfg: dict[str,Any], common: dict[str,Any]) -> DataLoad
                       generator=torch.Generator().manual_seed(77),**common)
 
 
+def verify_resume_or_eval_budget_migration(saved: dict[str,Any], current: dict[str,Any],
+                                           migration: dict[str,Any] | None) -> bool:
+    try:
+        verify_resume_identity(saved,current)
+        return False
+    except RuntimeError:
+        expected=(migration or {}).get("from_identity",{})
+        if not (migration or {}).get("enabled") or saved != expected:
+            raise
+        if saved.get("data_audit_sha256") != current.get("data_audit_sha256"):
+            raise RuntimeError("eval-budget migration cannot change the audited dataset")
+        return True
+
+
 def loaders(cfg: dict[str, Any], batch_size: int, max_train: int | None = None, max_test: int | None = None):
     data = cfg["data"]
     history_frames=int(data["history_frames"])
@@ -152,7 +166,7 @@ def main() -> None:
     if ready.get("source_commit") != identity["git_head"] or ready.get("config_sha256") != identity["config_sha256"]:
         raise RuntimeError("ready manifest is stale for the current HEAD/config")
     (output/"config_resolved.yaml").write_text(yaml.safe_dump(cfg,sort_keys=False),encoding="utf-8")
-    (output/"run_manifest.json").write_text(json.dumps({"config":args.config,"seed":seed,"epochs":args.epochs or cfg["training"]["epochs"],
+    run_manifest={"config":args.config,"seed":seed,"epochs":args.epochs or cfg["training"]["epochs"],
         "batch_size":args.batch_size,"gradient_accumulation_steps":args.grad_accum,"effective_batch":args.batch_size*args.grad_accum,
         "test_only_eval":True,"threshold":.5,"internal_test_selected":True,"publication_eligible":False,
         "feature_cache_enabled":False,"token_compression":"none","pretrained_weights":cfg["backbone"]["pretrained_weights"],
@@ -160,15 +174,19 @@ def main() -> None:
         "warmup_updates":cfg["training"]["warmup_updates"],"foreground_only":cfg["runtime"]["foreground_only"],
         "history_frames":cfg["data"]["history_frames"],"temporal_span_seconds":cfg["data"]["temporal_span_seconds"],
         "epoch_budget":cfg["data"]["epoch_budget"],"test_epoch_budget":cfg["data"].get("test_epoch_budget"),
-        "per_epoch_test_count":len(test_loader.dataset),"full_test_count":len(full_test)},indent=2),encoding="utf-8")
+        "per_epoch_test_count":len(test_loader.dataset),"full_test_count":len(full_test)}
     epoch0 = update = 0; best = None; best_epoch = None
     if args.resume:
         state = torch.load(args.resume, map_location="cpu"); model.load_state_dict(state["model"]); optimizer.load_state_dict(state["optimizer"])
         if not state.get("optimizer_boundary", False): raise RuntimeError("resume checkpoint is not at an optimizer boundary")
-        verify_resume_identity(state["identity"], identity)
+        migrated=verify_resume_or_eval_budget_migration(state["identity"],identity,cfg["runtime"].get("resume_eval_budget_migration"))
+        run_manifest["resume_identity_migration"]={"used":migrated,"saved_identity":state["identity"],
+            "reason":cfg["runtime"].get("resume_eval_budget_migration",{}).get("reason") if migrated else None}
         if state["total_updates"] != cfg["training"]["total_updates"]: raise RuntimeError("resume total_updates mismatch")
         scheduler.load_state_dict(state["scheduler"]); sampler.load_state_dict(state["sampler"]); restore_rng(state["rng"])
         epoch0, update, best, best_epoch = state["epoch"], state["global_update"], state["best"], state["best_epoch"]
+        if migrated: print(json.dumps({"event":"coev_eval_budget_resume_migration","from":state["identity"],"to":identity}),flush=True)
+    (output/"run_manifest.json").write_text(json.dumps(run_manifest,indent=2),encoding="utf-8")
     epochs = args.epochs or cfg["training"]["epochs"]
     scaler_ctx = lambda: torch.autocast("cuda", dtype=torch.bfloat16)
     for epoch in range(epoch0, epochs):

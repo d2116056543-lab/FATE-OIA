@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 import torch
 
+from fate_oia.engine.train_coev_oia import verify_resume_or_eval_budget_migration
 from fate_oia.utils.coev_checkpoint import atomic_torch_save, capture_rng, restore_rng, verify_resume_identity
 from fate_oia.utils.tida_stateful_sampler import TIDAStatefulRandomSampler
 
@@ -30,6 +31,17 @@ def test_resume_identity_mismatch_is_fatal():
     verify_resume_identity({"git_head":"a","config_sha256":"b"},{"git_head":"a","config_sha256":"b"})
     with pytest.raises(RuntimeError,match="identity mismatch"):
         verify_resume_identity({"git_head":"a","config_sha256":"b"},{"git_head":"x","config_sha256":"b"})
+
+
+def test_only_exact_eval_budget_identity_migration_is_allowed():
+    old={"git_head":"old","git_tree":"tree","config_sha256":"old-cfg","data_audit_sha256":"data"}
+    new={"git_head":"new","git_tree":"new-tree","config_sha256":"new-cfg","data_audit_sha256":"data"}
+    migration={"enabled":True,"from_identity":old}
+    assert verify_resume_or_eval_budget_migration(old,new,migration) is True
+    with pytest.raises(RuntimeError):
+        verify_resume_or_eval_budget_migration({**old,"config_sha256":"other"},new,migration)
+    with pytest.raises(RuntimeError):
+        verify_resume_or_eval_budget_migration(old,{**new,"data_audit_sha256":"other"},migration)
 
 
 def test_optimizer_boundary_resume_matches_uninterrupted_next_updates():
